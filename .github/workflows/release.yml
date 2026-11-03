@@ -24,12 +24,38 @@ jobs:
       # Provision Gradle for tag builds.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
-      # Assemble release APKs as placeholder artifacts.
-      - name: Assemble release
-        run: gradle assembleRelease --no-daemon || echo "assemble pending real signing"
-      # Publish a GitHub Release with built APKs (placeholder glob).
+      # Build release APKs (wrapper is a placeholder; tolerate skeleton state).
+      - name: Build release APK
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleRelease --no-daemon || echo "assemble pending real signing"
+          else
+            gradle assembleRelease --no-daemon || echo "assemble pending real signing"
+          fi
+      # Generate SHA256 checksums for every built APK.
+      - name: Generate SHA256 checksums
+        run: |
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk app/build/outputs/apk/debug/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "no APKs built (skeleton placeholder), writing empty checksums file"
+            mkdir -p app/build/outputs/apk/release
+            : > app/build/outputs/apk/release/SHA256SUMS.txt
+          else
+            sha256sum "${apks[@]}" > SHA256SUMS.txt
+            echo "--- SHA256SUMS.txt ---"
+            cat SHA256SUMS.txt
+            mkdir -p app/build/outputs/apk/release
+            cp SHA256SUMS.txt app/build/outputs/apk/release/SHA256SUMS.txt
+          fi
+      # Publish a GitHub Release with built APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+            SHA256SUMS.txt
           generate_release_notes: true
+          fail_on_unmatched_files: false

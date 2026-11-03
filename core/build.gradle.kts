@@ -24,6 +24,7 @@ android {
     }
 }
 
-// No external dependencies for the skeleton core.
+// No external dependencies for the skeleton core, except JUnit for unit tests.
 dependencies {
+    testImplementation("junit:junit:4.13.2")
 }

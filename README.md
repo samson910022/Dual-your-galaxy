@@ -1,5 +1,7 @@
 # Galaxy-Dual-app-Plus
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > 三星 Dual 雙開工具：自動提權路由，LSPosed 優先、Shizuku 降級，絕不觸碰 Secure Folder。
 
 ## 目標 (Goals)
@@ -51,10 +53,26 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 2. 否則偵測 Shizuku 是否可用 → `Privilege.SHELL`。
 3. 否則 → `Privilege.NONE`，僅顯示唯讀狀態，不執行寫入。
 
+## 自動模式 (Auto Mode)
+
+開機 / 開 App 時自動依序探測，無需手動切換：
+
+- 有 LSPosed（模組已勾選並啟用）→ 自動掛載 hook 通道（`Privilege.ROOT`），直接走系統注入 / `su -c`。
+- 沒有 LSPosed 但 Shizuku 可用 → 自動降級走 Shizuku 通道（`Privilege.SHELL`），執行 `pm install-existing / uninstall --user / path --user`。
+- 兩者皆無 → `Privilege.NONE` 唯讀模式，寫入按鈕停用；稍後啟用任一通道後，下次 `refresh()` 自動切換。
+
+詳見 [docs/USAGE.md](docs/USAGE.md) 第 1、4 節。
+
 ## 不碰 Secure Folder (Policy)
 
 - 本專案不會存取 `/data/media/0/../knox`、Knox 容器、Secure Folder 內部資料。
 - 不提供 Knox 規避、KnoxPatch 式補丁、Knox 熔斷規避。
+
+## 免責聲明 (Disclaimer)
+
+- 本專案不碰 Secure Folder / Knox：不讀寫、不掛載、不繞過 Knox 容器；任何 Knox 熔斷規避皆明確不在範圍內。
+- 需 ROOT + LSPosed 或 Shizuku 環境才能寫入；操作系統服務本來就有風險（請先備份），後果自負。
+- 僅供學習研究與個人裝置使用；請遵守當地法規與三星服務條款。
 
 ## Credits
 

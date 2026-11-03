@@ -1,6 +1,7 @@
 # Credits & References
 
-This project contains **only original code** under MIT license.
+> License: MIT — Copyright (c) 2026 samson910022. See [../LICENSE](../LICENSE).
+> This project contains **only original code** under MIT license.
 The following projects were used as **idea-level references only**.
 No source code was copied from GPL-licensed projects.
 
@@ -16,9 +17,10 @@ No source code was copied from GPL-licensed projects.
 - `RikkaApps/Shizuku` — Apache-2.0 — Shizuku shell fallback integration pattern.
 - `salvogiangri/KnoxPatch` — GPL-3.0 — Mentioned only to explicitly exclude; no Knox bypass is implemented.
 
-## License Statement
+## License Statement (MIT)
 
 - All files in `app/`, `core/`, `hook/` are newly written for this project under MIT.
+- MIT License text: see [../LICENSE](../LICENSE), Copyright (c) 2026 samson910022.
 - Third-party ideas were reimplemented from scratch and do not trigger license contagion.
 - If any reference updates its license, this file will be revised accordingly.
 
