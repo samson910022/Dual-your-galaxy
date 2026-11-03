@@ -53,13 +53,15 @@ class DualViewModel(private val repo: DualRepository) {
         try {
             // DualRepository resolves the dual user id internally.
             val res = repo.clone(pkg.trim())
-            val ok = PmOutputParser.isSuccess(res.out + res.err, res.exit)
-            state = if (ok) {
-                val current = if (state.cloned.contains(pkg.trim())) state.cloned else state.cloned + pkg.trim()
-                state.copy(loading = false, cloned = current, msg = "cloned: ${pkg.trim()}")
+            val combined: String = res.out + res.err
+            val ok: Boolean = PmOutputParser.isSuccess(combined, res.exit)
+            if (ok) {
+                val trimmed: String = pkg.trim()
+                val current: List<String> = if (state.cloned.contains(trimmed)) state.cloned else state.cloned + trimmed
+                state = state.copy(loading = false, cloned = current, msg = "cloned: $trimmed")
             } else {
-                val reason = res.err.ifEmpty { res.out.ifEmpty { "clone failed" } }
-                state.copy(loading = false, msg = reason)
+                val reason: String = res.err.ifEmpty { res.out.ifEmpty { "clone failed" } }
+                state = state.copy(loading = false, msg = reason)
             }
         } catch (e: Exception) {
             state = state.copy(loading = false, msg = "clone failed: ${e.message}")
@@ -77,9 +79,10 @@ class DualViewModel(private val repo: DualRepository) {
         try {
             // DualRepository resolves the dual user id internally.
             val res = repo.remove(pkg.trim())
-            val ok = PmOutputParser.isSuccess(res.out + res.err, res.exit)
-            state = if (ok) {
-                state.copy(loading = false, cloned = state.cloned - pkg.trim(), msg = "removed: ${pkg.trim()}")
+            val combined: String = res.out + res.err
+            val ok: Boolean = PmOutputParser.isSuccess(combined, res.exit)
+            if (ok) {
+                state = state.copy(loading = false, cloned = state.cloned.filterNot { it == pkg.trim() }, msg = "removed: ${pkg.trim()}")
             } else {
                 val reason = res.err.ifEmpty { res.out.ifEmpty { "remove failed" } }
                 state = state.copy(loading = false, msg = reason)

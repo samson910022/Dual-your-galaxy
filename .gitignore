@@ -14,4 +14,8 @@ captures/
 *.hprof
 *.keystore
 *.jks
+*.p12
+keystore.properties
+release-key.properties
+*.key.properties
 local.defaults.properties

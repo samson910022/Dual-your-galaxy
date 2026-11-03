@@ -9,16 +9,12 @@ pluginManagement {
 }
 
 // Enable version catalog sharing across modules.
+// Default libs catalog auto-loads gradle/libs.versions.toml, no manual import.
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
-    }
-    versionCatalogs {
-        create("libs") {
-            from(files("gradle/libs.versions.toml"))
-        }
     }
 }
 
