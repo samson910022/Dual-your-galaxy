@@ -1,0 +1,17 @@
+# Gradle / Android standard ignore rules.
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+app/build/
+core/build/
+hook/build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+*.keystore
+*.jks
+local.defaults.properties

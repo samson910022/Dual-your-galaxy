@@ -1,0 +1,31 @@
+# CI: build and lint the skeleton on every push/PR.
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the repository.
+      - uses: actions/checkout@v4
+      # Provision JDK 17 required by AGP 8.x and Kotlin 2.x.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # Provision Gradle (wrapper jar is a placeholder in this repo).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+      # Compile all modules; fails fast on skeleton errors.
+      - name: Build with Gradle
+        run: gradle build --no-daemon
+      # Lint placeholder: runs Android lint once real sources land.
+      - name: Android Lint (placeholder)
+        run: gradle lint --no-daemon || echo "lint pending real sources"

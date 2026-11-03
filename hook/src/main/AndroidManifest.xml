@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hook manifest placeholder: declares LSPosed module metadata. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Minimum and target Xposed API versions for LSPosed. -->
+        <meta-data
+            android:name="xposedminapi"
+            android:value="102" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Galaxy Dual Plus hook (skeleton)" />
+        <!-- Recommended scopes are also listed in resources/META-INF/xposed/scope.list. -->
+        <meta-data
+            android:name="xposedscope"
+            android:value="system;com.samsung.android.da.daagent;com.android.settings" />
+    </application>
+</manifest>

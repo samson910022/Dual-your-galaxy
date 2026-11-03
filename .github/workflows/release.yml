@@ -1,0 +1,35 @@
+# Release: builds APKs and attaches them to a GitHub Release on tags.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Check out the tagged commit.
+      - uses: actions/checkout@v4
+      # Provision JDK 17 to match the build matrix.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # Provision Gradle for tag builds.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+      # Assemble release APKs as placeholder artifacts.
+      - name: Assemble release
+        run: gradle assembleRelease --no-daemon || echo "assemble pending real signing"
+      # Publish a GitHub Release with built APKs (placeholder glob).
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true

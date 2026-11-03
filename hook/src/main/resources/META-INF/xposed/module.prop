@@ -1,0 +1,10 @@
+# LSPosed module metadata (legacy module.prop format).
+id=com.galaxydual.plus.hook
+name=Galaxy Dual Plus Hook
+version=0.1.0
+versionCode=1
+author=samson910022
+description=Samsung Dual whitelist hook skeleton (Xposed API 102)
+minApiVersion=102
+targetApiVersion=102
+scope=system;com.samsung.android.da.daagent;com.android.settings
