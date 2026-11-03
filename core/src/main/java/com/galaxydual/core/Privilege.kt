@@ -1,20 +1,39 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
-// Privilege level selected by PrivilegeRouter.
-// NONE: read-only, SHELL: Shizuku/ADB shell, ROOT: LSPosed/su channel.
+// Privilege level selected by the router.
+// NONE: read-only, no write channel.
+// SHELL: Shizuku / ADB shell channel.
+// ROOT: LSPosed hook or su channel (highest privilege).
 enum class Privilege {
     NONE,
     SHELL,
     ROOT,
 }
 
-// Pure selector: prefers ROOT over SHELL over NONE.
-// hookActive means the LSPosed module is enabled; shizukuAlive means binder is reachable.
-fun routePrivilege(hookActive: Boolean, shizukuAlive: Boolean): Privilege {
-    // Highest privilege wins; no side effects in this function.
-    return when {
-        hookActive -> Privilege.ROOT
-        shizukuAlive -> Privilege.SHELL
-        else -> Privilege.NONE
+// Result of probing the device for available elevation channels.
+// dualUserId is the Android user id hosting the dual clone, or -1 when unknown.
+data class ProbeResult(
+    val level: Privilege,
+    val hasShizuku: Boolean,
+    val hasRoot: Boolean,
+    val dualUserId: Int = -1,
+)
+
+// Pure privilege selector, no side effects.
+// LSPosed auto-mount and su root both grant ROOT; Shizuku grants SHELL.
+fun routePrivilege(hasLsposed: Boolean, hasShizuku: Boolean, hasRoot: Boolean): Privilege {
+    return if (hasLsposed || hasRoot) {
+        Privilege.ROOT
+    } else if (hasShizuku) {
+        Privilege.SHELL
+    } else {
+        Privilege.NONE
     }
+}
+
+// Backward-compatible overload for callers using the older 2-arg form.
+// hookActive maps to hasLsposed, shizukuAlive maps to hasShizuku.
+fun routePrivilege(hookActive: Boolean, shizukuAlive: Boolean): Privilege {
+    return routePrivilege(hasLsposed = hookActive, hasShizuku = shizukuAlive, hasRoot = false)
 }
