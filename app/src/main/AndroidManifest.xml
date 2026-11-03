@@ -1,6 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- App manifest placeholder: single launcher activity skeleton. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- App manifest: launcher activity plus Shizuku provider and dual-app permissions. -->
+<!-- MANAGE_EXTERNAL_STORAGE is for GitHub sideload builds only; no Play release, so no Play policy filing. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.galaxydual.plus">
+
+    <!-- Needed to enumerate installed packages for clone source picking. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- Needed to trigger package install flows into the dual profile. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- GitHub sideload builds only: stage APKs on shared storage. Not uploaded to Play. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Shizuku shell fallback channel (downgrade path when LSPosed is absent). -->
+    <uses-permission android:name="moe.shizuku.manager.permission.APIV2" />
 
     <application
         android:label="Galaxy Dual Plus"
@@ -13,5 +25,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Shizuku binder provider; required for Shizuku API V2 to attach. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>
