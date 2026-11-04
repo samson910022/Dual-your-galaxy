@@ -1,4 +1,11 @@
-# Release: builds APKs and attaches them to a GitHub Release on tags.
+# Release: builds signed APKs and attaches them to a GitHub Release on tags.
+#
+# Signing (Phase E1, issue #5): the release keystore is restored from the
+# SIGN_STORE_BASE64 secret and injected into Gradle via SIGN_STORE_FILE plus
+# SIGN_STORE_PASSWORD / SIGN_KEY_ALIAS / SIGN_KEY_PASSWORD. No keystore or key
+# material is ever committed (see docs/KEY_MANAGEMENT.md). Any missing secret,
+# unsigned output, or apksigner failure stops the job before publishing.
+# STATUS: SIGN_* secrets not yet configured in GitHub — any v* tag fails by design until then; green non-tag CI does not prove the release signing path; re-verify with one tag dry-run after configuring secrets.
 name: Release
 
 on:
@@ -24,34 +31,93 @@ jobs:
       # Provision Gradle for tag builds.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+      # Restore the release keystore from secrets; fail fast when any secret
+      # is missing instead of producing an unsigned build.
+      - name: Restore release keystore
+        env:
+          SIGN_STORE_BASE64: ${{ secrets.SIGN_STORE_BASE64 }}
+          SIGN_STORE_PASSWORD: ${{ secrets.SIGN_STORE_PASSWORD }}
+          SIGN_KEY_ALIAS: ${{ secrets.SIGN_KEY_ALIAS }}
+          SIGN_KEY_PASSWORD: ${{ secrets.SIGN_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${SIGN_STORE_BASE64:-}" ] || missing+=("SIGN_STORE_BASE64")
+          [ -n "${SIGN_STORE_PASSWORD:-}" ] || missing+=("SIGN_STORE_PASSWORD")
+          [ -n "${SIGN_KEY_ALIAS:-}" ] || missing+=("SIGN_KEY_ALIAS")
+          [ -n "${SIGN_KEY_PASSWORD:-}" ] || missing+=("SIGN_KEY_PASSWORD")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing required signing secrets: ${missing[*]}; refusing unsigned release build."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/signing"
+          echo "$SIGN_STORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
+          chmod 600 "$RUNNER_TEMP/signing/release.jks"
+          echo "SIGN_STORE_FILE=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
       # Build release APKs with the committed wrapper (pinned Gradle 8.7); fail fast on errors.
       - name: Build release APK
+        env:
+          SIGN_STORE_PASSWORD: ${{ secrets.SIGN_STORE_PASSWORD }}
+          SIGN_KEY_ALIAS: ${{ secrets.SIGN_KEY_ALIAS }}
+          SIGN_KEY_PASSWORD: ${{ secrets.SIGN_KEY_PASSWORD }}
         run: |
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
-      # Generate SHA256 checksums for every built APK.
+      # Gate: every release APK must carry a valid signature; unsigned or
+      # unverifiable output stops the job before any checksum or publish step.
+      - name: Verify release signatures
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No release APKs built; refusing to publish an empty release."
+            exit 1
+          fi
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/apksigner"
+          if [ ! -x "$apksigner" ]; then
+            echo "::error::apksigner not found under \$ANDROID_HOME/build-tools; cannot verify signatures."
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/verified_apks.txt"
+          for apk in "${apks[@]}"; do
+            echo "--- verifying $apk ---"
+            if "$apksigner" verify --verbose --print-certs "$apk"; then
+              echo "$apk" >> "$RUNNER_TEMP/verified_apks.txt"
+            else
+              echo "::error::Signature verification FAILED for $apk; refusing to publish."
+              exit 1
+            fi
+          done
+          echo "--- verified APKs ---"
+          cat "$RUNNER_TEMP/verified_apks.txt"
+      # Generate a single SHA256SUMS.txt (issue #5: only one) in the release dir
+      # with bare file names so `sha256sum -c` verifies directly. Zero verified
+      # APKs is a failure: never write or publish an empty SHA256SUMS.
       - name: Generate SHA256 checksums
         run: |
-          shopt -s nullglob
-          apks=(app/build/outputs/apk/release/*.apk app/build/outputs/apk/debug/*.apk)
-          if [ ${#apks[@]} -eq 0 ]; then
-            echo "no APKs built (skeleton placeholder), writing empty checksums file"
-            mkdir -p app/build/outputs/apk/release
-            : > app/build/outputs/apk/release/SHA256SUMS.txt
-          else
-            sha256sum "${apks[@]}" > SHA256SUMS.txt
-            echo "--- SHA256SUMS.txt ---"
-            cat SHA256SUMS.txt
-            mkdir -p app/build/outputs/apk/release
-            cp SHA256SUMS.txt app/build/outputs/apk/release/SHA256SUMS.txt
+          set -euo pipefail
+          mapfile -t apks < "$RUNNER_TEMP/verified_apks.txt"
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No verified APKs; refusing to write an empty SHA256SUMS."
+            exit 1
           fi
-      # Publish a GitHub Release with built APKs + SHA256.
+          rm -f SHA256SUMS.txt app/build/outputs/apk/release/SHA256SUMS.txt
+          (
+            cd app/build/outputs/apk/release
+            names=()
+            for a in "${apks[@]}"; do names+=("$(basename "$a")"); done
+            sha256sum "${names[@]}" > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+            echo "--- SHA256SUMS.txt (release dir, bare names) ---"
+            cat SHA256SUMS.txt
+          )
+      # Publish a GitHub Release with verified APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
-            SHA256SUMS.txt
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
