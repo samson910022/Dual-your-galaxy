@@ -19,13 +19,13 @@ sealed interface ProfilesSnapshot {
 // Unknown together (both false, kept for compatibility). Callers that must
 // display "confirmed absent" differently from "cannot check" use verifyState.
 sealed interface VerifyState {
-    // `pm path` confirms a package: line.
+    // `pm list packages` ground truth contains the package (exact match).
     data object Installed : VerifyState
 
-    // The path probe ran cleanly but shows no package: line: confirmed absent.
+    // The list probe ran cleanly but the package is absent: confirmed absent.
     data object NotInstalled : VerifyState
 
-    // The probe could not run or its output failed isSuccess: no knowledge.
+    // The probe could not run (non-zero exit): no knowledge.
     data class Unknown(val detail: String = "") : VerifyState
 }
 
@@ -161,9 +161,9 @@ class DualRepository(
         return null
     }
 
-    // Double-checks installation via `pm path --user <dualId> <pkg>`.
-    // Returns true only when exit is 0, output parses as success,
-    // and stdout contains a "package:" path line.
+    // Double-checks installation via `pm list packages --user <dualId>`
+    // ground truth (exact membership). Returns true only when the probe
+    // exits 0 and the parsed set contains the package.
     suspend fun verify(pkg: String): Boolean {
         val dualId = resolveDualUserId()
         if (dualId < 0) return false
@@ -184,11 +184,13 @@ class DualRepository(
         }
 
     // Tri-state variant of verify(pkg, dualId): Installed only when the
-    // `pm path` probe runs cleanly AND shows a package: line; NotInstalled
-    // when the probe runs cleanly but shows none (confirmed absent); Unknown
-    // when the id is guard-refused, the package token is invalid, or the
-    // probe channel itself fails isSuccess. C1 guard and C2 isSuccess rule
-    // are unchanged; only the result granularity is new.
+    // `pm list packages` probe exits 0 AND the parsed set contains the
+    // package (exact match); NotInstalled when the probe exits 0 but the
+    // set lacks it (confirmed absent); Unknown when the id is
+    // guard-refused, the package token is invalid, or the probe exits
+    // non-zero (channel failure). C1 guard is unchanged; the shared C2
+    // isSuccess rule is intentionally NOT applied to the list probe here
+    // (see verifyOnProfiles): only the result granularity is new.
     suspend fun verifyState(pkg: String, dualId: Int): VerifyState {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return VerifyState.Unknown(snap.detail)
@@ -222,11 +224,12 @@ class DualRepository(
     }
 
     // Pinned clone (Phase C3, issue #9): resolves the dual id ONCE via the C1
-    // resolver, then runs install-existing AND the `pm path` re-check against
-    // that same id -- never one guess for the write and another for the
-    // check. Success is reported only when the re-check confirms Installed;
-    // a clean-but-absent re-check is VerifyFailed (fake success, issue #9),
-    // a failed re-check channel is VerifyUnknown. Neither is added to cloned.
+    // resolver, then runs install-existing AND the `pm list packages`
+    // re-check against that same id -- never one guess for the write and
+    // another for the check. Success is reported only when the re-check
+    // confirms Installed; a clean-but-absent re-check is VerifyFailed (fake
+    // success, issue #9), a failed re-check channel is VerifyUnknown.
+    // Neither is added to cloned.
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
@@ -280,24 +283,64 @@ class DualRepository(
         }
     }
 
-    // Runs the `pm path` re-check for an already-pinned id WITHOUT
-    // re-listing profiles: containment was established by this call's own
-    // snapshot, so no second guess can drift to another user. Invalid package
-    // tokens and builder refusals map to Unknown (fail closed), never throw.
+    // Runs the `pm list packages --user <dualId>` re-check for an
+    // already-pinned id WITHOUT re-listing profiles: containment was
+    // established by this call's own snapshot, so no second guess can drift
+    // to another user. Invalid package tokens and builder refusals map to
+    // Unknown (fail closed), never throw.
+    //
+    // Probe choice (third round, real-device proven): the re-check uses
+    // `pm list packages --user <dualId>` (buildListPackages) plus exact
+    // `pkg in parsePackages(out)` membership -- NOT `pm path --user N <pkg>`.
+    // Right after `pm uninstall` succeeds, `pm path` can fail consecutively
+    // with non-zero exit and empty out/err inside the teardown settling
+    // window (three back-to-back probes all non-zero: no retry count saves
+    // it), while `pm list packages` on the same window stays deterministic
+    // ground truth (exit 0 with the package simply absent). Membership is an
+    // exact set lookup so a superstring never mis-hits (com.example.app2
+    // does not imply com.example.app).
+    //
+    // Exit-only semantics: exit != 0 (after retries below) maps to Unknown
+    // (detail kept); exit == 0 with the package present is Installed, and
+    // exit == 0 without it is NotInstalled -- even when the output carries
+    // an error-ish text. The shared C2 isSuccess rule is deliberately NOT
+    // used here: absence text is absence evidence, and folding it into
+    // Unknown would turn a confirmed removal into "unknown" (remove) or a
+    // fake clone success into "unknown" instead of VerifyFailed (clone).
+    // Every other flow (list/install/uninstall/packages) keeps isSuccess.
+    //
+    // Retry (retained): a non-zero list probe is retried at most twice with
+    // a 1500 ms settle wait before reporting Unknown, covering transient
+    // binder/timeout blips. gateway.run is a blocking suspend with no
+    // dispatcher assumption, hence Thread.sleep (core has no
+    // kotlinx-coroutines dependency for delay). Only three consecutive
+    // non-zero exits map to Unknown.
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
         }
-        val cmd = try {
-            PmOutputParser.buildPathCheck(pkg.trim(), dualId)
+        val clean = pkg.trim()
+        try {
+            ShellEscaper.escapePackage(clean)
         } catch (e: IllegalArgumentException) {
             return VerifyState.Unknown(e.message ?: "invalid package")
         }
-        val res = gateway.run(cmd)
-        if (!PmOutputParser.isSuccess(res.out + res.err, res.exit)) {
-            return VerifyState.Unknown(res.err.ifEmpty { res.out.ifEmpty { "verify failed" } })
+        val cmd = try {
+            PmOutputParser.buildListPackages(dualId)
+        } catch (e: IllegalArgumentException) {
+            return VerifyState.Unknown(e.message ?: "invalid package")
         }
-        return if (res.out.lines().any { it.trim().startsWith("package:") }) {
+        var res = gateway.run(cmd)
+        var attempts = 1
+        while (res.exit != 0 && attempts < 3) {
+            Thread.sleep(1500)
+            res = gateway.run(cmd)
+            attempts++
+        }
+        if (res.exit != 0) {
+            return VerifyState.Unknown(res.err.ifEmpty { res.out.ifEmpty { "verify failed (exit=${res.exit})" } })
+        }
+        return if (clean in PmOutputParser.parsePackages(res.out)) {
             VerifyState.Installed
         } else {
             VerifyState.NotInstalled
