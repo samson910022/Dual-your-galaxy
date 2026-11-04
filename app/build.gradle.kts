@@ -149,4 +149,10 @@ dependencies {
     // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    // Phase F2 (issue #6): observable state (StateFlow + viewModelScope) and
+    // lifecycle-aware collection in MainActivity (lifecycleScope/viewModels).
+    implementation(libs.coroutines.android)
+    implementation(libs.lifecycle.viewmodel.ktx)
+    implementation(libs.lifecycle.runtime.ktx)
+    implementation(libs.activity.ktx)
 }
