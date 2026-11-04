@@ -37,3 +37,21 @@ fun routePrivilege(hasLsposed: Boolean, hasShizuku: Boolean, hasRoot: Boolean): 
 fun routePrivilege(hookActive: Boolean, shizukuAlive: Boolean): Privilege {
     return routePrivilege(hasLsposed = hookActive, hasShizuku = shizukuAlive, hasRoot = false)
 }
+
+// Pure readiness gate: is the selected gateway's channel proven?
+// H3 (F4b): a ROOT executor is satisfied by su OR the LSPosed self-scope
+// mark (the hook carries no pm channel itself; install/remove still run
+// through the su/Shizuku gateway and report failures via CmdResult).
+// A NoOp (NONE) executor is never ready: hook-only devices stay read-only.
+fun channelReadyFor(
+    gateway: Privilege,
+    hasRoot: Boolean,
+    hasShizuku: Boolean,
+    hasHook: Boolean,
+): Boolean {
+    return when (gateway) {
+        Privilege.ROOT -> hasRoot || hasHook
+        Privilege.SHELL -> hasShizuku
+        Privilege.NONE -> false
+    }
+}

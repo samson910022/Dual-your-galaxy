@@ -11,8 +11,8 @@
 
 - [已支援] profile 解析安全邊界（只認唯一 DUAL、永不選 user 0）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [待實機驗證] App 內一鍵 clone 真通道（F4a 已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
-  `DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating，選不到仍維持 `NoOp`＋唯讀 fail-closed；`hasLsposed` 維持保守 `false`（F4b／後續）；binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測皆未驗）。
+- [待實機驗證] App 內一鍵 clone 真通道（F4a 已接線＋H3 hook 自報 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
+  `DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating（含 `HookElevator` 自報：`channelReadyFor` [已支援]，ROOT 由 su 或 hook 任一滿足，NONE 永不就緒），選不到仍維持 `NoOp`＋唯讀 fail-closed；hook 自報經自 scope prefs（`HookStatusProvider`，per-user，[待實機驗證]）；binder round-trip、授權四情境、su 實機行為、端到端 pm、自報 round-trip 皆未驗）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
 - [待實機驗證] LSPosed 載入、Shizuku 四情境（有／無 binder × 有／無授權，含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端）。
@@ -24,12 +24,12 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 
 ## 1. 提權優先順序（`core` 純函數 [已支援]＋真通道 F4a 已接線 [待實機驗證] DEVICE-UNVERIFIED）
 
-路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）F4a 已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`、SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`；`hasLsposed` 維持保守 `false`，F4b／後續），
-以下順序為接線後預期行為，全部切換 [待實機驗證]（binder round-trip、授權四情境、su 實機行為、LSPosed 啟用偵測皆未驗）：
+路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）已接真 gateway＋hook 自報（ROOT→`SuCmdGateway` 經 `su -c` 或 hook 自報經 `HookElevator`＋`HookStatusProvider` 自 scope prefs，[待實機驗證]；SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，`channelReadyFor` [已支援]），
+以下順序為接線後預期行為，全部切換 [待實機驗證]（binder round-trip、授權四情境、su 實機行為、自報 round-trip 皆未驗）：
 
-1. **LSPosed 優先（ROOT）**：偵測到本模組在 LSPosed 中已勾選並啟用 → `Privilege.ROOT`
-   - 走 hook 通道（或 `su -c`，F4a 的 `SuCmdGateway` 經 `su -c` 已接線），目標是呼叫三星雙開服務；但現階段 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故 hook 通道永不被選；hook 為
-     observe-only（見上文引用），LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證] DEVICE-UNVERIFIED，不可描述為已能擴展包名。
+1. **LSPosed 優先（ROOT）**：偵測到本模組在 LSPosed 中已勾選並啟用（自 scope prefs 自報，per-user，[待實機驗證]）→ `Privilege.ROOT`
+   - 顯示走 hook 通道、執行仍走 `su -c`（`SuCmdGateway` 已接線）或 Shizuku 實例（hook 無 pm 通道，執行復用 su／Shizuku，hook-only＋NoOp 仍唯讀）；hook 為
+     observe-only（見上文引用），自報 round-trip＋su 實機行為 [待實機驗證] DEVICE-UNVERIFIED，不可描述為已能擴展包名。
 2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
      binder round-trip、四情境 [待實機驗證] DEVICE-UNVERIFIED。
@@ -37,12 +37,14 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 
 ```kotlin
 // Pure routing logic, no side effects (see core/Privilege.kt).
-// App 端現狀：hasLsposed 維持保守 false（跨進程啟用訊號需實機驗證，F4b／後續），hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。
-val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, hasRoot = hasRoot)
+// App 端現狀（H3）：hasHook 由 HookElevator 自報（自 scope prefs，per-user，
+// fail-closed，[待實機驗證]），hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。
+val privilege = routePrivilege(hasLsposed = hasHook, hasShizuku = shizukuAlive, hasRoot = hasRoot)
+val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive, hasHook)
 ```
 
-Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；F4a 後探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
-`refresh()`／`recheckPrivilege()` 可觸發重探並更新顯示（privilege／`channelReady`），但不更換 gateway 實例（Factory 為啟動時靜態選擇；跨通道切換待 F4b）——`hasLsposed` 保守 `false` 故不切 hook ROOT 通道；顯示更新本身 [待實機驗證] DEVICE-UNVERIFIED。
+Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上（＋`HookElevator` 自報），`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed，hook-only＋NoOp 仍唯讀）。
+`refresh()`／`recheckPrivilege()` 可觸發重探並更新顯示（privilege／`hookActive`／`channelReady`），但不更換 gateway 實例（Factory 為啟動時靜態選擇；跨通道切換待後續）——顯示更新本身 [待實機驗證] DEVICE-UNVERIFIED。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
@@ -102,11 +104,11 @@ adb shell pm uninstall --user 95 com.example.chat
 - 本 App 的 `DualRepository.clone/remove/verify` 即為上述三指令的程式化封裝（[已支援]：`core` 層＋單元測試；
   App 內一鍵 F4a 已接線（`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed，JVM 組裝測試覆蓋）但 [待實機驗證] DEVICE-UNVERIFIED：binder round-trip、授權四情境、su 實機行為、端到端 pm 皆未驗）。
 
-## 4. LSPosed 優先模式（F4a 已接線但 `hasLsposed` 保守 `false`，[待實機驗證] DEVICE-UNVERIFIED）
+## 4. LSPosed 優先模式（H3 自報已接線，[待實機驗證] DEVICE-UNVERIFIED）
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
-  作用域勾三星雙開相關進程後重啟；F4a 後 su ROOT 通道已接（su 檔存在即選 `SuCmdGateway`，`SuElevator` 以 `id -u`＝0 探測通過才 `channelReady`），但 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故勾選模組不會切 hook 通道；LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證]，無實機證據。
-- 同時有 LSPosed 與 Shizuku 時路由設計為永遠選 LSPosed（`routePrivilege` 純函數 [已支援]）；但 Factory 現階段永不選 hook 通道（同上 `hasLsposed = false`）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
+  作用域勾 `system`＋`com.samsung.android.da.daagent`＋本模組自包（release／debug，見 `docs/HOOK.md` §1.4）後重啟；H3 後 hook 自報已接（自 scope prefs mark 經 `HookStatusProvider`→`HookElevator` 參與路由，`Hook` 行顯示啟用態；pm 執行仍走 `SuCmdGateway`／`ShizukuCmdGateway` 實例，hook-only＋NoOp 仍唯讀 fail-closed）；LSPosed 載入／自報 round-trip＋su 實機行為 [待實機驗證]，無實機證據。
+- 同時有 LSPosed 與 Shizuku 時路由設計為永遠選 LSPosed（`routePrivilege` 純函數 [已支援]）；Factory 仍按 su→Shizuku→NoOp 選執行 gateway（hook 無 pm 通道，執行復用 su／Shizuku；`channelReadyFor` 純函數 [已支援]：ROOT 由 su 或 hook 任一滿足）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
   絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
 
@@ -121,8 +123,8 @@ adb shell pm uninstall --user 95 com.example.chat
 
 ## English Summary
 
-- Privilege routing (tested pure function + F4a wired channels [DEVICE-UNVERIFIED]): LSPosed (ROOT) first, su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
-  fallback, else read-only (NONE) with `NoOp` fail-closed. Factory selects by probe; `channelReady` is true only when the selected channel's probe passes; `hasLsposed` stays conservative false (F4b); binder round-trip, all four auth scenarios, su behavior, end-to-end pm, and LSPosed enable detection are unverified.
+- Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): LSPosed self-report (ROOT) via `HookElevator` + `HookStatusProvider` (self-scope prefs, per-user), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
+  fallback, else read-only (NONE) with `NoOp` fail-closed. Factory selects the executor by probe (hook carries no pm channel; execution reuses su/Shizuku, hook-only + NoOp stays read-only); `channelReady` is true only when the selected channel's probe passes (`channelReadyFor`, tested); hook self-report round-trip, binder round-trip, all four auth scenarios, su behavior, and end-to-end pm are unverified.
 - Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (status switches only when the Shizuku probe passes; otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm path --user`;
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).

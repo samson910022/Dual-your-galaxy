@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import android.content.Context
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -38,8 +39,52 @@ class DualHook : XposedModule() {
             detach()
             return
         }
+        // Self scope (H3): LSPosed injected this module into its own UI
+        // process. Mark the per-user private prefs flag (best-effort) so the
+        // app side can report "hook active" without IPC. DEVICE-UNVERIFIED.
+        if (HookState.shouldMarkSelf(param.packageName)) {
+            markSelfActive()
+            return
+        }
         if (param.packageName == DA_AGENT_PACKAGE) {
             hookWhiteListApps(param.defaultClassLoader)
+        }
+    }
+
+    // Writes the self-scope active mark into this process's own private
+    // prefs. Best-effort: any failure only skips the mark (fail closed).
+    // Uses the current application via ActivityThread reflection so no
+    // Xposed-internal Context plumbing is needed.
+    // Race note: if the application object is not published yet when
+    // onPackageLoaded runs, this start misses its mark and the app reads the
+    // previous start's mark (or inactive on fresh install). Every process
+    // start re-runs onPackageLoaded, so a miss self-heals on the next start
+    // within FRESH_WINDOW_MS; exec still needs a live su/Shizuku probe.
+    // TODO(DEVICE-UNVERIFIED): if on-device logs show repeated null here,
+    // add an Application.onCreate hook fallback for the self package.
+    private fun markSelfActive() {
+        try {
+            val app = Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? Context ?: run {
+                logi("self mark skipped: no current application")
+                return
+            }
+            val prefs = app.getSharedPreferences(HookState.PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit()
+                .putBoolean(HookState.KEY_ACTIVE, true)
+                .putLong(HookState.KEY_TIMESTAMP_MS, System.currentTimeMillis())
+                .apply()
+            try {
+                @Suppress("DEPRECATION")
+                val info = app.packageManager.getPackageInfo(app.packageName, 0)
+                prefs.edit().putString(HookState.KEY_VERSION, info.versionName ?: "unknown").apply()
+            } catch (_: Throwable) {
+                // Version is diagnostic only; the active+timestamp mark stands.
+            }
+            logi("self-scope active mark written")
+        } catch (t: Throwable) {
+            logi("self mark skipped: ${t.message}")
         }
     }
 
@@ -248,9 +293,12 @@ class DualHook : XposedModule() {
         const val DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE
 
         // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
-        // NOTE: com.android.settings was removed (D2): no settings-side hook
-        // exists, so scoping it only widened the injection surface. SYSTEM_SCOPE
-        // never matches onPackageLoaded; it is kept here for scope.list parity.
+        // H3 adds the module's own UI packages (self scope) for the per-user
+        // active mark (see HookState); the mark write is the only behavior in
+        // self processes. NOTE: com.android.settings stays out (D2): no
+        // settings-side hook exists, so scoping it would only widen the
+        // injection surface. SYSTEM_SCOPE never matches onPackageLoaded; it is
+        // kept here for scope.list parity.
         val SUPPORTED_SCOPES: Set<String> = HookScopes.SUPPORTED_SCOPES
 
         // System-service candidates tried in order; first loadable class wins.

@@ -7,6 +7,8 @@ import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.Elevator
+import com.galaxydual.core.HookElevator
+import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.PmOutputParser
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
@@ -57,6 +59,10 @@ enum class MsgKind {
 data class UiState(
     // Routed elevation level from the elevator probes (ROOT/SHELL/NONE).
     val privilege: Privilege = Privilege.NONE,
+    // H3: LSPosed self-scope report (HookElevator probe). Display + routing
+    // only: pm execution still reuses the su/Shizuku gateway, so a hook-only
+    // device with a NoOp executor stays read-only. DEVICE-UNVERIFIED.
+    val hookActive: Boolean = false,
     // False until the selected real gateway's own probe succeeds (F4a): a
     // su-backed repo needs the su probe (ROOT), a Shizuku-backed repo the
     // Shizuku probe (SHELL); a NoOp repo (NONE) is never ready. Fail closed.
@@ -96,8 +102,9 @@ class DualViewModel(
     // Checked by class (not by probing the repo) so core stays untouched.
     private val gatewayPrivilege: Privilege = Privilege.NONE,
     // Elevators probed in order; F4a injects elevators backed by the real
-    // su/Shizuku gateways, so probes honestly verify each channel.
-    private val elevators: List<Elevator> = listOf(SuElevator(), ShizukuElevator()),
+    // su/Shizuku gateways, so probes honestly verify each channel. H3 adds a
+    // HookElevator backed by the self-scope prefs mark (HookStatusProvider).
+    private val elevators: List<Elevator> = listOf(SuElevator(), ShizukuElevator(), HookElevator()),
 ) : ViewModel() {
     private val _state = MutableStateFlow(
         UiState(
@@ -415,14 +422,21 @@ class DualViewModel(
     // itself (su repo needs the su/ROOT probe, Shizuku repo the
     // Shizuku/SHELL probe, NoOp repo never). A selected-but-unproven channel
     // stays read-only: fail closed, never a fake working channel.
+    // H3 (F4b): a HookElevator-backed hook mark also satisfies a ROOT
+    // executor (hook carries no pm channel itself; install/remove reuse the
+    // su/Shizuku gateway, whose failures still surface as CmdResult errors).
     // DEVICE-UNVERIFIED: probe/exec round-trips never ran on a device.
     private suspend fun probeChannels() {
         var hasRoot = false
         var hasShizuku = false
+        var hasHook = false
         for (elevator in elevators) {
             try {
                 when (elevator.probe().level) {
-                    Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
+                    Privilege.ROOT -> when (elevator) {
+                        is SuElevator -> hasRoot = true
+                        is HookElevator -> hasHook = true
+                    }
                     Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
                     Privilege.NONE -> Unit
                 }
@@ -432,19 +446,17 @@ class DualViewModel(
         }
         // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
         // the router encodes that priority, probes only feed it.
-        // TODO(F4b): hasLsposed stays conservatively false: detecting whether
-        // this module is actually enabled inside the LSPosed manager is a
-        // cross-process signal that needs a real device to verify. Until
-        // then the hook channel is never selected (see factory below).
-        val routed = routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
-        val ready = when (gatewayPrivilege) {
-            Privilege.ROOT -> hasRoot
-            Privilege.SHELL -> hasShizuku
-            Privilege.NONE -> false
-        }
+        // H3: hasHook comes from the self-scope prefs mark (per-user,
+        // fail-closed); hook-active display/route still needs a real device
+        // to verify (DEVICE-UNVERIFIED).
+        val routed = routePrivilege(hasLsposed = hasHook, hasShizuku = hasShizuku, hasRoot = hasRoot)
+        // H3: pure gate in core (unit-tested by ChannelReadyTest): ROOT is
+        // satisfied by su OR hook, SHELL by Shizuku, NONE never.
+        val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku, hasHook)
         _state.update {
             it.copy(
                 privilege = routed,
+                hookActive = hasHook,
                 channelReady = ready,
                 msg = if (ready) {
                     ""
