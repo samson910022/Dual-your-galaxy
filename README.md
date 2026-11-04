@@ -4,13 +4,13 @@
 
 > 三星 Dual 雙開工具（開發中腳手架，未經實機驗證）：設計目標為自動提權路由，
 > LSPosed 優先、Shizuku 降級，絕不觸碰 Secure Folder。
-> 目前僅路由純函數與命令封裝有單元測試；App 接線與實機流程尚未完成（見下文「實作狀態」）。
+> 目前路由純函數、命令封裝與真通道組裝有單元測試；App 真通道 F4a 已接線但全部分支未經實機驗證（見下文「實作狀態」）。
 
 ## 目標 (Goals)
 
 - 在三星 One UI 裝置上啟用並管理 **Dual Messenger / Dual App** 雙開（目標，未經實機驗證）。
-- 提權策略（設計目標，接線未完成）：**LSPosed 優先（ROOT / 系統注入），Shizuku 降級（Shell / ADB 權限）**。
-- 無 ROOT、無 LSPosed 時，設計上自動降級為 Shizuku 模式執行 `pm` 指令（`core` 純函數已實作，App 端綁定待實作）。
+- 提權策略（F4a 真通道已接線，[待實機驗證] DEVICE-UNVERIFIED）：**LSPosed 優先（ROOT / 系統注入，但 `hasLsposed` 維持保守 `false`，F4b／後續），su ROOT（`SuCmdGateway` 經 `su -c`），Shizuku 降級（Shell，`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除）**。
+- 無 ROOT、無 LSPosed 時，設計上自動降級為 Shizuku 模式執行 `pm` 指令（`core` 純函數 [已支援]；App 端 F4a 已接線 [待實機驗證]：Factory 在無 su 且 binder＋授權具備時選 `ShizukuCmdGateway`，探測通過才 `channelReady`）。
 - **不碰 Secure Folder（Knox 容器）**：不讀寫、不掛載、不繞過 Knox。
 - 模組化設計：`app`（UI）、`core`（提權抽象與命令閘道）、`hook`（LSPosed 注入）。
 
@@ -22,7 +22,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 ```
 
 - `core`：定義 `Privilege`（NONE/SHELL/ROOT）、`CmdGateway` 介面、`PmOutputParser` 解析器。
-- `app`：UI 層（`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集＋Shizuku binder／授權生命週期接線；但倉庫仍為 `NoOpGateway`，探測跑在 NoOp 佔位 elevator 上恆回 NONE，`channelReady` 恆 `false` 一律拒寫；真通道 gateway 待 F4 接入），目標是透過 `core` 選擇最佳可用提權通道。
+- `app`：UI 層（`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集＋Shizuku binder／授權生命週期接線；F4a 已接入真 gateway［待實機驗證］DEVICE-UNVERIFIED：ROOT→`SuCmdGateway`（`su -c` argv 單參直傳）、SHELL→`ShizukuCmdGateway`（UserService `GalaxyExecService`，`newProcess` 在 13.1.5 已移除故不用）；`DualViewModelFactory` 按 su 檔存在／Shizuku binder＋授權選擇、選不到回 `NoOpGateway` fail-closed；`SuElevator`／`ShizukuElevator` 用同一 gateway 實例探測真通道，`channelReady` 僅所選通道探測通過才 `true`（不再恆 `false`）；`hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），hook 通道現階段永不被選），目標是透過 `core` 選擇最佳可用提權通道。
 - `hook`：LSPosed 模組佔位，hook 三星雙開白名單與服務，僅在已授權環境載入；政策集合預設為空，屬 observe-only（會安裝、會記 log，但不改變行為），詳見 [docs/HOOK.md](docs/HOOK.md) 第 1.1 節。
 
 詳見 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
@@ -34,7 +34,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 - [已支援] profile 解析安全邊界（`resolveDualUserId`：只認唯一 DUAL、永不選 user 0、多 DUAL／無 DUAL 直接拒絕寫入，見 `DualSafetyTest`）。
 - [已支援] `pm` 命令封裝（`DualRepository.cloneVerified / removeVerified / refresh`：單快照釘選＋`pm path` 二次確認，見 `CloneVerifyRefreshTest`）。
 - [已支援] lint／CI 閘門（`./gradlew` 固定 8.7、fail-fast quality gates、DEX 檢查）。
-- [待實作] App 內一鍵 clone 真通道（`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；`DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在，但倉庫仍為 `NoOpGateway`，`channelReady` 恆 `false` 一律拒寫；真通道 gateway 待 F4 接入）。
+- [待實機驗證] App 內一鍵 clone 真通道（F4a 已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；`DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），Factory 選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` 改由各通道探測結果 gating（不再恆 `false`）；`hasLsposed` 維持保守 `false`（F4b／後續實機驗證）；binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測皆未驗）。
 - [待實作] 非空 whitelist policy（`EXTRA_WHITELIST_PACKAGES` 預設為空，hook 為 observe-only；接上政策來源前不放寬任何包名）。
 - [待實機驗證] LSPosed 載入（system／daagent scope 注入、重啟後 log 確認，無實機）。
 - [待實機驗證] Shizuku 四情境（有／無 binder × 有／無授權，以及重啟後重啟動流程，無實機）。
@@ -64,21 +64,21 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 > 注意：本倉庫已提交完整 Gradle wrapper（固定 8.7），CI 與本機一律使用 `./gradlew`；CI 另以 `gradle/actions/setup-gradle` 提供快取，無需自行安裝 Gradle。
 
-## 提權路由 (Privilege Routing) — 設計意圖＋`core` 純函數，App 接線待實作
+## 提權路由 (Privilege Routing) — `core` 純函數 [已支援]＋App 真通道已接線 [待實機驗證] DEVICE-UNVERIFIED
 
-路由純函數（`routePrivilege`，[已支援]，單元測試覆蓋）依序判斷；App 端探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）已接但跑在 NoOp 佔位 elevator 上，真通道綁定（[待實作]，待 F4）完成前不代表可用流程：
+路由純函數（`routePrivilege`，[已支援]，單元測試覆蓋）依序判斷；App 端探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）F4a 已接真 gateway（`SuCmdGateway` 經 `su -c`、`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，不再恆 `false`；`hasLsposed` 維持保守 `false`，跨進程啟用訊號需實機驗證，F4b／後續）。以下順序仍是設計＋純函數行為，App 端切換全數 [待實機驗證]（binder round-trip、授權四情境、su 實機行為、LSPosed 啟用偵測皆未驗）：
 
 1. 偵測 LSPosed 模組是否啟用 → `Privilege.ROOT`。
 2. 否則偵測 Shizuku 是否可用 → `Privilege.SHELL`。
 3. 否則 → `Privilege.NONE`，僅顯示唯讀狀態，不執行寫入。
 
-## 自動模式 (Auto Mode) — 設計目標，[待實作]＋[待實機驗證]
+## 自動模式 (Auto Mode) — 真通道已接線，全部 [待實機驗證] DEVICE-UNVERIFIED
 
-以下為真通道接通後的預期行為；現階段探測跑在 NoOp 佔位 elevator 上恆回 NONE（`hasLsposed = false` 寫死、`Su`／`ShizukuElevator` 無真 gateway），倉庫為 `NoOpGateway` 且 `channelReady` 恆 `false` 一律拒寫（按鈕已存在但寫入被 `isWritable()` 攔下），無自動切換實機證據：
+F4a 已接線：ROOT→`SuCmdGateway`（`su -c`）、SHELL→`ShizukuCmdGateway`（UserService，`newProcess` 在 13.1.5 已移除）；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`（不再恆 `false`，未通過／選不到時仍 `false` 拒寫，按鈕寫入被 `isWritable()` 攔下）；`hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故 hook 通道現階段永不被選。以下為接線後預期行為，無自動切換實機證據（binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測皆未驗）：
 
-- 有 LSPosed（模組已勾選並啟用）→ 預期取 `Privilege.ROOT`，走 hook 通道或 `su -c`（[待實機驗證]：LSPosed 載入未驗證；hook 現為 observe-only，不放寬任何包名，見 [docs/HOOK.md](docs/HOOK.md)）。
-- 沒有 LSPosed 但 Shizuku 可用 → 預期降級走 Shizuku 通道（`Privilege.SHELL`），執行 `pm install-existing / uninstall --user / path --user`（Shizuku binder／授權生命週期已接，真通道 gateway［待實作］，待 F4；[待實機驗證]：Shizuku 四情境無實機）。
-- 兩者皆無 → `Privilege.NONE` 唯讀模式（[已支援]：路由與 `NoOpGateway` 拒寫；現階段因 `channelReady` 恆 `false`，Clone／Remove 一律被拒（按鈕已存在，`refresh()`／`recheckPrivilege()` 已接但無法切出 NONE），真通道切換屬 [待實作]＋[待實機驗證]）。
+- 有 LSPosed（模組已勾選並啟用）→ 路由設計取 `Privilege.ROOT`，走 hook 通道或 `su -c`；但現階段 `hasLsposed = false` 保守值使 hook 通道不被選（F4b／後續 [待實機驗證]），su ROOT 通道需 su 檔存在被選中且 `SuElevator`（`id -u`＝0）探測通過才 `channelReady`（[待實機驗證]：LSPosed 載入／啟用偵測、su 實機行為未驗；hook 現為 observe-only，不放寬任何包名，見 [docs/HOOK.md](docs/HOOK.md)）。
+- 沒有 LSPosed 但 Shizuku 可用 → 預期降級走 Shizuku 通道（`Privilege.SHELL`），執行 `pm install-existing / uninstall --user / path --user`（Shizuku binder／授權生命週期已接＋F4a 真 gateway 已接［待實機驗證］；Factory 在無 su 且 binder alive＋已授權時選 `ShizukuCmdGateway`，`ShizukuElevator` 探測通過才 `channelReady`；[待實機驗證]：binder round-trip、授權四情境無實機）。
+- 兩者皆無 → `Privilege.NONE` 唯讀模式（[已支援]：路由與 `NoOpGateway` 拒寫＋`channelReady` false fail-closed；不再恆 `false`——所選真通道探測通過即為 `true`；注意 Factory 為啟動時靜態選擇，之後 `refresh()`／`recheckPrivilege()` 重探僅更新顯示（privilege／`channelReady`／msg），不更換 gateway 實例——跨通道切換待 F4b；顯示更新本身 [待實機驗證] DEVICE-UNVERIFIED）。
 
 詳見 [docs/USAGE.md](docs/USAGE.md) 第 1、4 節。
 
@@ -90,7 +90,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## 免責聲明 (Disclaimer)
 
 - 本專案不碰 Secure Folder / Knox：不讀寫、不掛載、不繞過 Knox 容器；任何 Knox 熔斷規避皆明確不在範圍內。
-- 寫入設計上需 ROOT + LSPosed 或 Shizuku 環境；但現階段 `channelReady` 恆為 `false`，一律拒寫（`isWritable()` fail-closed），即使裝置已有 ROOT／Shizuku 環境也一樣，待 F4 接入真通道後才可能寫入；操作系統服務本來就有風險（請先備份），後果自負。
+- 寫入設計上需 ROOT 或 Shizuku 環境，且 F4a 後需所選真通道探測通過（`channelReady` true）＋privilege 非 NONE（`isWritable()` fail-closed）；在 ROOT／Shizuku 裝置上有可能寫入（不再恆拒寫，選不到／探測未過時仍拒寫），但全部分支 DEVICE-UNVERIFIED（binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測皆未驗）；操作系統服務本來就有風險（請先備份），後果自負。
 - 僅供學習研究與個人裝置使用；請遵守當地法規與三星服務條款。
 
 ## Credits
@@ -102,11 +102,11 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 Galaxy-Dual-app-Plus is a scaffold towards enabling Samsung Dual Messenger / Dual Apps
 via a privilege router (LSPosed first, Shizuku fallback). It never touches Secure Folder (Knox).
-Modules: `app` (UI wired with Clone/Remove/Refresh/permission buttons + StateFlow + Shizuku lifecycle, but still NoOp-backed with channelReady always false, read-only), `core` (privilege abstraction, tested), `hook` (LSPosed module,
+Modules: `app` (UI wired with Clone/Remove/Refresh/permission buttons + StateFlow + Shizuku lifecycle; F4a true-channel wired [DEVICE-UNVERIFIED]: ROOT via `SuCmdGateway` (`su -c`), SHELL via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5), factory selects by probe with `NoOp` fail-closed fallback, `channelReady` true only when the selected channel's probe passes, `hasLsposed` stays conservative false pending F4b), `core` (privilege abstraction, tested), `hook` (LSPosed module,
 API 102, observe-only placeholder with empty policy).
-Status: routing pure function, `pm` command encapsulation, and lint/CI gates are implemented
-with unit tests; in-app one-click true channel and non-empty whitelist policy are TODO;
-LSPosed load, Shizuku scenarios, and on-device dual flows are unverified on real hardware.
+Status: routing pure function, `pm` command encapsulation, gateway assembly JVM tests, and lint/CI gates are implemented
+with unit tests; in-app one-click true channel is wired but DEVICE-UNVERIFIED and non-empty whitelist policy is TODO;
+LSPosed load/enable detection, Shizuku binder round-trip plus all four auth scenarios, su behavior, and end-to-end on-device dual flows are unverified on real hardware.
 Nothing marked TODO/unverified is claimed as working. See `docs/CREDITS.md` for references.
 All skeleton code is original and MIT-licensed. See `docs/CREDITS.md` for references.
 

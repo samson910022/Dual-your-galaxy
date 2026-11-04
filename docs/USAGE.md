@@ -11,9 +11,9 @@
 
 - [已支援] profile 解析安全邊界（只認唯一 DUAL、永不選 user 0）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [待實作] App 內一鍵 clone 真通道（`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
-  `DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在，但倉庫仍為 `NoOpGateway`，`channelReady` 恆 `false` 一律拒寫；真通道 gateway 待 F4 接入）、
-  非空 whitelist policy（預設為空，hook 為 observe-only）。
+- [待實機驗證] App 內一鍵 clone 真通道（F4a 已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
+  `DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating，選不到仍維持 `NoOp`＋唯讀 fail-closed；`hasLsposed` 維持保守 `false`（F4b／後續）；binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測皆未驗）。
+- [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
 - [待實機驗證] LSPosed 載入、Shizuku 四情境（有／無 binder × 有／無授權，含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端）。
 
@@ -22,27 +22,27 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 但不改變任何行為、不放寬任何包名；接上政策來源前，本文凡提及「hook 通道／白名單放寬」
 皆指設計意圖，不是現有效果。
 
-## 1. 提權優先順序（設計目標＋`core` 純函數，自動接線 [待實作]）
+## 1. 提權優先順序（`core` 純函數 [已支援]＋真通道 F4a 已接線 [待實機驗證] DEVICE-UNVERIFIED）
 
-路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）已接但跑在 NoOp 佔位上，真通道綁定（[待實作]，待 F4）完成前，
-以下為預期行為而非可用流程：
+路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）F4a 已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`、SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`；`hasLsposed` 維持保守 `false`，F4b／後續），
+以下順序為接線後預期行為，全部切換 [待實機驗證]（binder round-trip、授權四情境、su 實機行為、LSPosed 啟用偵測皆未驗）：
 
 1. **LSPosed 優先（ROOT）**：偵測到本模組在 LSPosed 中已勾選並啟用 → `Privilege.ROOT`
-   - 設計上走 hook 通道（或 `su -c`），目標是呼叫三星雙開服務；現階段 hook 為
-     observe-only（見上文引用），LSPosed 載入 [待實機驗證]，不可描述為已能擴展包名。
+   - 走 hook 通道（或 `su -c`，F4a 的 `SuCmdGateway` 經 `su -c` 已接線），目標是呼叫三星雙開服務；但現階段 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故 hook 通道永不被選；hook 為
+     observe-only（見上文引用），LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證] DEVICE-UNVERIFIED，不可描述為已能擴展包名。
 2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
-   - 設計上走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`）；
-     App 端綁定 [待實作]，四情境 [待實機驗證]。
-3. **NONE（唯讀）**：兩者皆無 → 不執行任何寫入，只顯示狀態（[已支援]：`NoOpGateway` 拒寫）。
+   - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
+     binder round-trip、四情境 [待實機驗證] DEVICE-UNVERIFIED。
+3. **NONE（唯讀）**：選不到通道 → 不執行任何寫入，只顯示狀態（[已支援]：`NoOpGateway` 拒寫＋`channelReady` false fail-closed；不再恆 `false`——所選真通道探測通過即為 `true`）。
 
 ```kotlin
 // Pure routing logic, no side effects (see core/Privilege.kt).
-val privilege = routePrivilege(hasLsposed = hookActive, hasShizuku = shizukuAlive, hasRoot = false)
+// App 端現狀：hasLsposed 維持保守 false（跨進程啟用訊號需實機驗證，F4b／後續），hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。
+val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, hasRoot = hasRoot)
 ```
 
-Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；但探測跑在 NoOp 佔位 elevator 上恆回 NONE，`channelReady` 恆 `false` 一律拒寫。真通道接通後，LSPosed 啟用可於下次
-`refresh()`／`recheckPrivilege()` 切回 ROOT——此切換 [待實作]（待 F4）＋
-實機切換 [待實機驗證]。
+Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；F4a 後探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
+`refresh()`／`recheckPrivilege()` 可觸發重探並更新顯示（privilege／`channelReady`），但不更換 gateway 實例（Factory 為啟動時靜態選擇；跨通道切換待 F4b）——`hasLsposed` 保守 `false` 故不切 hook ROOT 通道；顯示更新本身 [待實機驗證] DEVICE-UNVERIFIED。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
@@ -56,8 +56,8 @@ Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋S
    - Shizuku 會顯示 6 位數配對碼；在系統跳出的「無線調試配對」對話框輸入配對碼。
    - 配對成功後回到 Shizuku 點「啟動」，看到版本號即表示 binder 已就緒。
 5. 在 Shizuku 的「授權應用」中找到 **Galaxy Dual Plus** 並允許。
-6. 回到本 App 點 `refresh()`；真通道接通後標題列預期從 `(NONE)` 變為 `(SHELL)`
-   （現階段探測跑在 NoOp 佔位 elevator 上恆回 NONE，`channelReady` 恆 `false`，此切換 [待實作]（待 F4）＋[待實機驗證]，不可視為已可用）。
+6. 回到本 App 點 `refresh()`；F4a 接線後，已授權 binder 下 Factory 選 `ShizukuCmdGateway` 且 `ShizukuElevator` 探測通過時，標題列預期從 `(NONE)` 變為 `(SHELL)`
+   （選不到／探測未過則維持 `(NONE)` 唯讀 fail-closed；此切換 [待實機驗證] DEVICE-UNVERIFIED，不可視為已可用）。
 
 > 每次重開機後需重複步驟 4（Shizuku 需重新啟動）；配對碼只需配對過一次，
 > 同一 Wi-Fi 下重啟一般直接按「啟動」即可。
@@ -100,15 +100,13 @@ adb shell pm uninstall --user 95 com.example.chat
 - `install-existing` 僅對已存在於主 profile 的 package 有效；全新 APK 請先在主 profile 正常安裝一次。
 - 指令失敗時請看 `msg` 欄（`Failure` / `Unknown package` / `not installed` 皆視為失敗）。
 - 本 App 的 `DualRepository.clone/remove/verify` 即為上述三指令的程式化封裝（[已支援]：`core` 層＋單元測試；
-  App 內一鍵真通道 [待實作]（待 F4），端到端 [待實機驗證]）。
+  App 內一鍵 F4a 已接線（`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed，JVM 組裝測試覆蓋）但 [待實機驗證] DEVICE-UNVERIFIED：binder round-trip、授權四情境、su 實機行為、端到端 pm 皆未驗）。
 
-## 4. LSPosed 優先模式（設計目標，[待實作]＋[待實機驗證]）
+## 4. LSPosed 優先模式（F4a 已接線但 `hasLsposed` 保守 `false`，[待實機驗證] DEVICE-UNVERIFIED）
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
-  作用域勾三星雙開相關進程後重啟；真通道接通後 App 預期自動以 `ROOT` 執行，不再走 Shizuku
-  （現階段 Shizuku 生命週期＋探測框架已接，但 gateway 仍為 NoOp，`channelReady` 恆 `false`；真通道 [待實作]＋無實機證據）。
-- 同時有 LSPosed 與 Shizuku 時設計為永遠選 LSPosed；停用模組後設計為下次啟動自動降級 Shizuku
-  （同上，[待實作]＋[待實機驗證]）。
+  作用域勾三星雙開相關進程後重啟；F4a 後 su ROOT 通道已接（su 檔存在即選 `SuCmdGateway`，`SuElevator` 以 `id -u`＝0 探測通過才 `channelReady`），但 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故勾選模組不會切 hook 通道；LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證]，無實機證據。
+- 同時有 LSPosed 與 Shizuku 時路由設計為永遠選 LSPosed（`routePrivilege` 純函數 [已支援]）；但 Factory 現階段永不選 hook 通道（同上 `hasLsposed = false`）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
   絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
 
@@ -116,19 +114,19 @@ adb shell pm uninstall --user 95 com.example.chat
 
 | 症狀 | 原因 / 解法 |
 | --- | --- |
-| 標題列顯示 `(NONE)`（[待實作]：真通道接入前恆為 NONE） | 現階段探測跑在 NoOp 佔位上恆回 NONE，`channelReady` 恆 `false`；重做第 2 節裝置設定／重啟授權後 `refresh()`／`recheckPrivilege()` 也無法改變狀態，屬預期佔位行為，無需反覆排查。待 F4 接入真通道後才會切換 |
+| 標題列顯示 `(NONE)`（F4a 已接線，[待實機驗證]） | `(NONE)` 僅表示所選通道探測未通過（NoOp 回退／su 缺失／binder 未連線或未授權／探測失敗，fail-closed 唯讀）；重做第 2 節裝置設定／授權後 `refresh()`／`recheckPrivilege()` 會重探，真通道探測通過即切換——但切換本身 DEVICE-UNVERIFIED，未經實機驗證 |
 | `no dual profile` | 三星尚未建立雙開 profile；先到系統設定開啟 Dual Messenger 任一 App |
 | `Failure [INSTALL_FAILED_...]` | 來源 APK 不存在或儲存空間不足；先確認主 profile 已安裝該 App |
 | Play 審查相關警告 | 本專案不發 Play 版，請一律使用 GitHub Release 的 APK |
 
 ## English Summary
 
-- Privilege routing (design + tested pure function): LSPosed (ROOT) first, Shizuku (SHELL)
-  fallback, else read-only (NONE). In-app probe/lifecycle framework is wired but runs on NoOp placeholders (always NONE, channelReady always false); true-channel wiring is TODO; on-device switching is unverified.
-- Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (no status change until the F4 true channel lands).
+- Privilege routing (tested pure function + F4a wired channels [DEVICE-UNVERIFIED]): LSPosed (ROOT) first, su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
+  fallback, else read-only (NONE) with `NoOp` fail-closed. Factory selects by probe; `channelReady` is true only when the selected channel's probe passes; `hasLsposed` stays conservative false (F4b); binder round-trip, all four auth scenarios, su behavior, end-to-end pm, and LSPosed enable detection are unverified.
+- Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (status switches only when the Shizuku probe passes; otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm path --user`;
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).
-  `core` encapsulation is unit-tested; in-app one-click true channel is TODO; end-to-end is unverified.
+  `core` encapsulation plus gateway assembly are unit-tested; in-app one-click true channel is wired but DEVICE-UNVERIFIED; end-to-end is unverified.
 - Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
   any package yet.
 - GitHub sideload builds only; no Play release, so `MANAGE_EXTERNAL_STORAGE` needs no Play filing.

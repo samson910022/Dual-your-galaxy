@@ -18,11 +18,10 @@ package com.galaxydual.plus
 // routes into vm.recheckPrivilege() (plus vm.refresh() when the channel may
 // be usable), so the state always tracks the live binder.
 //
-// Execution seam (unchanged from F2): the repository behind the ViewModel is
-// still NoOpGateway-backed (see DualViewModelFactory TODO). Probes honestly
-// report NONE, writes stay refused, and the UI shows 通道待接 until a real
-// Shizuku/su CmdGateway lands. No fake exec is implemented here on purpose:
-// without a device the true channel cannot be verified.
+// Execution seam (F4a): the repository behind the ViewModel is the
+// factory-selected real gateway (su/Shizuku UserService) with NoOp fallback.
+// Probes verify each channel and channelReady gates writes; without a device
+// the exec round-trip is DEVICE-UNVERIFIED (see gateway file headers).
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
@@ -43,18 +42,20 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.NoOpGateway
+import com.galaxydual.core.CmdGateway
+import com.galaxydual.core.ShizukuElevator
+import com.galaxydual.core.SuElevator
+import java.io.File
 import kotlinx.coroutines.launch
 import rikka.shizuku.Shizuku
 
 // Observes DualViewModel.state, drives Shizuku binder/permission lifecycle,
 // and renders the dual-app screen. All shell work stays in the ViewModel.
 class MainActivity : ComponentActivity() {
-    // ViewModel with the F2 placeholder repository. No hardcoded privilege
+    // ViewModel with the F4a real-channel repository. No hardcoded privilege
     // flags here: the ViewModel probes elevators and routes the decision.
-    // TODO(F4): replace DualViewModelFactory's NoOpGateway-backed repository
-    // with the real Shizuku binder / su CmdGateway once the true channel
-    // lands (needs a real device to verify newProcess exec end to end).
-    private val vm: DualViewModel by viewModels { DualViewModelFactory() }
+    // DEVICE-UNVERIFIED: gateway selection/exec never ran on a device.
+    private val vm: DualViewModel by viewModels { DualViewModelFactory(packageName) }
 
     private lateinit var privilegeView: TextView
     private lateinit var shizukuView: TextView
@@ -79,7 +80,7 @@ class MainActivity : ComponentActivity() {
         Shizuku.OnBinderReceivedListener { onShizukuChanged(reread = true) }
 
     // Binder death: the channel is gone. Re-probe only (probe honestly
-    // reports NONE + 通道待接); a refresh right now could only fail.
+    // reports NONE + 通道未就緒); a refresh right now could only fail.
     private val binderDeadListener =
         Shizuku.OnBinderDeadListener { onShizukuChanged(reread = false) }
 
@@ -262,7 +263,7 @@ class MainActivity : ComponentActivity() {
     // state, and the MsgKind-styled status line.
     private fun render(s: UiState) {
         val channel =
-            if (!s.channelReady) "${s.privilege}（通道待接）" else s.privilege.toString()
+            if (!s.channelReady) "${s.privilege}（通道未就緒）" else s.privilege.toString()
         privilegeView.text = "權限：$channel"
         // Title mirrors the routed privilege for quick manual verification.
         title = "GalaxyDual Plus ($channel)"
@@ -306,19 +307,62 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Builds the F3 ViewModel with the honest placeholder repository: NoOpGateway
-// runs nothing and reports denial, so the app is read-only until F4.
-// TODO(F4): construct DualRepository with the real Shizuku/su gateway (needs
-// a real device: Shizuku.newProcess exec + permission flow verified end to
-// end) and pass its declared privilege into DualViewModel(gatewayPrivilege
-// = ...). The UI and Shizuku lifecycle above already route through
-// recheckPrivilege/refresh, so only this factory and the gateway change.
-private class DualViewModelFactory : ViewModelProvider.Factory {
+// Builds the F4a ViewModel with the real-channel gateway selection.
+// DEVICE-UNVERIFIED: selection/exec never ran on a device.
+//
+// Selection (synchronous, main-thread safe: stat + binder ping only, no
+// exec): ROOT first per router priority, then SHELL, else fail closed.
+// - su binary present (canonical paths) -> SuCmdGateway (ROOT).
+// - else Shizuku binder alive AND authorized -> ShizukuCmdGateway (SHELL).
+// - else NoOpGateway (NONE): read-only, channelReady stays false.
+// The hook channel is never selected: there is no app-side evidence signal
+// for LSPosed activation yet (DualViewModel keeps hasLsposed=false, F4b).
+// The su check is a file-presence heuristic, NOT proof su works: the real
+// SuElevator/ShizukuElevator probes (wired below with the same instances)
+// verify each channel, and DualViewModel flips channelReady only when the
+// selected channel's own probe succeeds -- a wrong guess stays read-only.
+// TODO(F4b): dynamic re-selection (swap the repo gateway when later probes
+// disagree with the startup pick, e.g. su guess wrong but Shizuku works).
+private class DualViewModelFactory(private val appPackageName: String) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(DualViewModel::class.java)) {
-            return DualViewModel(DualRepository(NoOpGateway())) as T
+            val su = SuCmdGateway()
+            val shizuku = ShizukuCmdGateway(appPackageName)
+            val selected: CmdGateway = when {
+                suBinaryPresent() -> su
+                shizukuAuthorizedNow() -> shizuku
+                else -> NoOpGateway()
+            }
+            return DualViewModel(
+                DualRepository(selected),
+                gatewayPrivilege = selected.privilege,
+                elevators = listOf(SuElevator(su), ShizukuElevator(shizuku)),
+            ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
+    }
+
+    companion object {
+        // Canonical su locations; presence heuristic only (see header).
+        private val SU_PATHS = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su")
+
+        internal fun suBinaryPresent(): Boolean =
+            SU_PATHS.any {
+                try {
+                    File(it).exists()
+                } catch (_: Exception) {
+                    false
+                }
+            }
+
+        // Live binder + granted permission, read synchronously (never cached).
+        internal fun shizukuAuthorizedNow(): Boolean =
+            try {
+                Shizuku.pingBinder() &&
+                    Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            } catch (_: Exception) {
+                false
+            }
     }
 }
