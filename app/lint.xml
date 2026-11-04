@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  本 App 核心功能即列舉/管理已安裝套件（雙開 clone 來源挑選 / verify 需 pm list packages），
+  QUERY_ALL_PACKAGES 為功能必需而非寬鬆宣告；本專案經 GitHub sideload 發佈、不上架 Play，
+  不受 Play 該政策限制，故將 QueryAllPackagesPermission 降為 warning 而非移除權限。
+  注意：只降這一個 check，不做全域 abortOnError=false，也不加 baseline 掩蓋其他問題。
+-->
+<lint>
+    <issue id="QueryAllPackagesPermission" severity="warning" />
+</lint>
