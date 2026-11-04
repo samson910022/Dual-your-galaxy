@@ -19,7 +19,7 @@ class DualSafetyTest {
     private class FakeGateway(
         var listUsersOutput: String = "",
         var listUsersExit: Int = 0,
-        var pathOutput: String = "ok",
+        var listPackagesOutput: String = "package:com.example.chat",
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -28,8 +28,8 @@ class DualSafetyTest {
             commands.add(cmd)
             return if (cmd == DualRepository.CMD_LIST_USERS) {
                 CmdResult(exit = listUsersExit, out = listUsersOutput, err = "")
-            } else if (cmd.startsWith("pm path")) {
-                CmdResult(exit = 0, out = pathOutput, err = "")
+            } else if (cmd.startsWith("pm list packages")) {
+                CmdResult(exit = 0, out = listPackagesOutput, err = "")
             } else {
                 CmdResult(exit = 0, out = "ok", err = "")
             }
@@ -185,7 +185,7 @@ class DualSafetyTest {
     // clone/remove. Explicit 0 and stale ids return false gracefully (no throw,
     // previously verify(pkg, 0) threw IllegalArgumentException from the command
     // builder) without ever probing the bad id; the happy path still runs
-    // `pm path --user <dualId>` and parses the package: line.
+    // `pm list packages --user <dualId>` and checks exact membership.
     @Test
     fun explicitVerify_isGuardedLikeCloneRemove() {
         val gateway = FakeGateway(
@@ -208,12 +208,13 @@ class DualSafetyTest {
             gateway.commands.none { it.contains("--user 0") || it.contains("--user 150") },
         )
 
-        // Happy path still works: `pm path` with a package: line verifies true.
+        // Happy path still works: `pm list packages` containing the package
+        // verifies true.
         gateway.commands.clear()
-        gateway.pathOutput = "package:/data/app/com.example.chat/base.apk"
+        gateway.listPackagesOutput = "package:com.example.chat"
         assertTrue(runSuspend { repo.verify("com.example.chat", 95) })
         assertEquals(
-            listOf("pm path --user 95 com.example.chat"),
+            listOf("pm list packages --user 95"),
             gateway.writeCommands(),
         )
     }

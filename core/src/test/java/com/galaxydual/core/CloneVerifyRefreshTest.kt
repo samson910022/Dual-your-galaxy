@@ -90,9 +90,9 @@ class CloneVerifyRefreshTest {
         val gateway = FakeGateway(
             installOut = "Package com.example.chat installed for user: 95",
             installExit = 0,
-            // Clean empty probe: isSuccess true, no package: line -> absent.
-            pathOut = "",
-            pathExit = 0,
+            // Clean empty listing: exit 0, parsed set lacks the package.
+            listPackagesOut = "",
+            listPackagesExit = 0,
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
@@ -151,7 +151,7 @@ class CloneVerifyRefreshTest {
     fun cloneVerified_pinsSingleSnapshotForInstallAndVerify() {
         val gateway = FakeGateway(
             installOut = "Package com.example.chat installed for user: 95",
-            pathOut = "package:/data/app/com.example.chat/base.apk",
+            listPackagesOut = "package:com.example.chat\n",
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
@@ -162,7 +162,7 @@ class CloneVerifyRefreshTest {
         assertEquals(
             listOf(
                 "pm install-existing --user 95 com.example.chat",
-                "pm path --user 95 com.example.chat",
+                "pm list packages --user 95",
             ),
             writes,
         )
@@ -173,9 +173,9 @@ class CloneVerifyRefreshTest {
     fun removeVerified_pinsSingleSnapshotForUninstallAndRecheck() {
         val gateway = FakeGateway(
             uninstallOut = "Success",
-            // Absent after removal: clean empty probe.
-            pathOut = "",
-            pathExit = 0,
+            // Absent after removal: clean empty listing.
+            listPackagesOut = "",
+            listPackagesExit = 0,
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
@@ -184,7 +184,7 @@ class CloneVerifyRefreshTest {
         assertEquals(
             listOf(
                 "pm uninstall --user 95 com.example.chat",
-                "pm path --user 95 com.example.chat",
+                "pm list packages --user 95",
             ),
             gateway.writeCommands(),
         )
@@ -196,7 +196,7 @@ class CloneVerifyRefreshTest {
     fun removeVerified_stillPresent_isNotSuccess() {
         val gateway = FakeGateway(
             uninstallOut = "Success",
-            pathOut = "package:/data/app/com.example.chat/base.apk",
+            listPackagesOut = "package:com.example.chat\n",
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
@@ -205,16 +205,131 @@ class CloneVerifyRefreshTest {
 
     // Remove with an uncheckable re-check channel is unknown (fail closed),
     // and a failed uninstall stays failed even if probed later via refresh.
+    // List-probe channel failure is exit != 0 only: exit-0 output that simply
+    // lacks the package (even error-ish text) is confirmed-absent, not
+    // unknown (exit-only semantics; isSuccess is not applied to the probe).
     @Test
     fun removeVerified_unknownRecheck_isNotSuccess() {
         val gateway = FakeGateway(
             uninstallOut = "Success",
-            pathOut = "Failure [INSTALL_FAILED_INVALID_APK: bad]",
-            pathExit = 0,
+            listPackagesOut = "",
+            listPackagesErr = "error: closed",
+            listPackagesExit = 1,
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+    }
+
+    // (a) remove: uninstall ok + list exit 0 whose output lacks the package
+    // (here an absent-package error text, no package: line) is confirmed
+    // absent -> Success, not VerifyUnknown. Proves isSuccess is NOT applied
+    // to the probe: absence text is absence evidence.
+    @Test
+    fun removeVerified_absentErrorText_isSuccess() {
+        val gateway = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "Unknown package: com.example.chat",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+    }
+
+    // (b) remove: uninstall ok + list exit 0 empty is confirmed absent
+    // -> Success.
+    @Test
+    fun removeVerified_emptyList_isSuccess() {
+        val gateway = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "",
+            listPackagesErr = "",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+    }
+
+    // (c) remove: uninstall ok + list non-zero exit is an uncheckable
+    // channel -> VerifyUnknown (detail kept), never Success.
+    @Test
+    fun removeVerified_nonZeroExit_isVerifyUnknown() {
+        val gateway = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "",
+            listPackagesErr = "error: closed",
+            listPackagesExit = 1,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertEquals("error: closed", (outcome as RemoveOutcome.VerifyUnknown).detail)
+    }
+
+    // (d) clone: install ok + list exit 0 that lacks the package (absent
+    // text, no package: line) is confirmed absent -> VerifyFailed, never
+    // VerifyUnknown.
+    @Test
+    fun cloneVerified_absentErrorText_isVerifyFailed() {
+        val gateway = FakeGateway(
+            installOut = "Package com.example.chat installed for user: 95",
+            installExit = 0,
+            listPackagesOut = "Unknown package: com.example.chat",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
+    }
+
+    // (e) clone: install ok + list exit 0 that contains the package is
+    // confirmed present -> Success.
+    @Test
+    fun cloneVerified_packageLine_isSuccess() {
+        val gateway = FakeGateway(
+            installOut = "Package com.example.chat installed for user: 95",
+            installExit = 0,
+            listPackagesOut = "package:com.example.chat\n",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is CloneOutcome.Success)
+    }
+
+    // (f) exact match: the probe is `pkg in parsePackages(out)`, never a
+    // substring search -- a listing that contains only com.example.app2 must
+    // NOT verify com.example.app (clone -> VerifyFailed, remove -> Success).
+    @Test
+    fun recheck_exactMatch_noSubstringHit() {
+        val cloneGateway = FakeGateway(
+            installOut = "Package com.example.app installed for user: 95",
+            installExit = 0,
+            listPackagesOut = "package:com.example.app2\n",
+            listPackagesExit = 0,
+        )
+        val cloneOutcome = runSuspend { DualRepository(cloneGateway).cloneVerified("com.example.app") }
+        assertTrue("superstring must not verify, got: $cloneOutcome", cloneOutcome is CloneOutcome.VerifyFailed)
+
+        val removeGateway = FakeGateway(
+            uninstallOut = "Success",
+            uninstallExit = 0,
+            listPackagesOut = "package:com.example.app2\n",
+            listPackagesExit = 0,
+        )
+        val removeOutcome = runSuspend { DualRepository(removeGateway).removeVerified("com.example.app") }
+        assertTrue("superstring must not block removal, got: $removeOutcome", removeOutcome is RemoveOutcome.Success)
+
+        // And the reverse direction still verifies: exact entry present.
+        val presentGateway = FakeGateway(
+            listPackagesOut = "package:com.example.app\npackage:com.example.app2\n",
+            listPackagesExit = 0,
+        )
+        assertTrue(
+            runSuspend { DualRepository(presentGateway).verifyState("com.example.app", 95) } is VerifyState.Installed,
+        )
     }
 
     @Test
@@ -260,23 +375,26 @@ class CloneVerifyRefreshTest {
     }
 
     // Tri-state verify: installed / confirmed-absent / uncheckable.
+    // Exit-only semantics on the list probe: exit 0 + contains -> Installed,
+    // exit 0 + lacks -> NotInstalled, non-zero (x3, see VerifyRetryTest) ->
+    // Unknown. Guard refusal (owner id) is Unknown, never a probe of user 0.
     @Test
     fun verifyState_distinguishesAbsentFromUnknown() {
-        val gateway = FakeGateway(pathOut = "package:/data/app/com.example.chat/base.apk")
+        val gateway = FakeGateway(listPackagesOut = "package:com.example.chat\n")
         val repo = DualRepository(gateway)
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Installed)
 
-        gateway.pathOut = ""
-        gateway.pathExit = 0
+        gateway.listPackagesOut = ""
+        gateway.listPackagesExit = 0
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.NotInstalled)
 
-        gateway.pathExit = 1
-        gateway.pathErr = "error"
+        gateway.listPackagesExit = 1
+        gateway.listPackagesErr = "error"
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown)
 
         // Guard refusal (owner id) is Unknown, never a probe of user 0.
-        gateway.pathExit = 0
-        gateway.pathErr = ""
+        gateway.listPackagesExit = 0
+        gateway.listPackagesErr = ""
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 0) } is VerifyState.Unknown)
         assertTrue(gateway.commands.none { it.contains("--user 0") })
     }
