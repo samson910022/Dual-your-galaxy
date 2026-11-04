@@ -62,6 +62,41 @@ jobs:
           else
             gradle :core:assembleDebug --no-daemon || echo "core assemble pending real sources / wrapper placeholder"
           fi
+      # Build the app APK so the DEX check below has app-debug.apk on clean runners.
+      - name: Assemble app debug
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew :app:assembleDebug --no-daemon
+          else
+            gradle :app:assembleDebug --no-daemon
+          fi
+      # B2: verify ShizukuProvider survives into the built DEX (guards provider dep regressions).
+      # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
+      - name: APK ShizukuProvider DEX check
+        run: |
+          set -e
+          echo "== (a) manifest declares rikka.shizuku.ShizukuProvider =="
+          grep -F "rikka.shizuku.ShizukuProvider" app/src/main/AndroidManifest.xml
+          echo "== (b) DEX contains ShizukuProvider =="
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "FAIL: $APK not found; run :app:assembleDebug first"
+            exit 1
+          fi
+          FOUND=0
+          for dex in $(unzip -l "$APK" | grep -o 'classes[0-9]*\.dex'); do
+            echo "--- scanning $dex ---"
+            if unzip -p "$APK" "$dex" | grep -q "ShizukuProvider"; then
+              echo "FOUND ShizukuProvider in $dex"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "FAIL: ShizukuProvider class string not found in $APK"
+            exit 1
+          fi
+          echo "PASS: ShizukuProvider present in manifest and DEX"
       # ktlint placeholder: passes when the plugin is not applied yet.
       - name: ktlint (placeholder)
         run: |

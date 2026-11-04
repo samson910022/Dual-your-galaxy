@@ -40,4 +40,7 @@ android {
 // App depends on core for privilege routing and parsing.
 dependencies {
     implementation(project(":core"))
+    // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
 }
