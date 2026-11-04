@@ -1,4 +1,4 @@
-# CI: build and lint the skeleton on every push/PR.
+# CI: build, test, and lint on every push/PR.
 name: Android CI
 
 on:
@@ -6,6 +6,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Phase A1: least-privilege top-level permissions (checkout + cache only need read).
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -20,7 +24,8 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      # Provision Gradle (wrapper jar is a placeholder in this repo).
+      # Provision Gradle: the pinned 8.7 wrapper (./gradlew + gradle-wrapper.jar)
+      # fixes the version, so runner preinstalled updates cannot change it.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
       # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
@@ -53,24 +58,13 @@ jobs:
                   ok = False
           sys.exit(0 if ok else 1)
           PY
-      # Compile the pure-Kotlin core module; wrapper is a placeholder so fall back gracefully.
-      - name: Assemble core debug (placeholder)
+      # Compile all modules (app APK + hook/core AARs). No swallow-echo fallback here:
+      # any compilation failure must propagate a nonzero exit code and fail the job.
+      # Phase A2: wrapper is committed, so always use ./gradlew (pinned Gradle 8.7).
+      - name: Assemble app, hook, core (debug)
         run: |
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-            ./gradlew :core:assembleDebug --no-daemon || echo "core assemble pending real sources"
-          else
-            gradle :core:assembleDebug --no-daemon || echo "core assemble pending real sources / wrapper placeholder"
-          fi
-      # Build the app APK so the DEX check below has app-debug.apk on clean runners.
-      - name: Assemble app debug
-        run: |
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-            ./gradlew :app:assembleDebug --no-daemon
-          else
-            gradle :app:assembleDebug --no-daemon
-          fi
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug :hook:assembleDebug :core:assembleDebug --no-daemon
       # B2: verify ShizukuProvider survives into the built DEX (guards provider dep regressions).
       # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
       - name: APK ShizukuProvider DEX check
@@ -97,11 +91,36 @@ jobs:
             exit 1
           fi
           echo "PASS: ShizukuProvider present in manifest and DEX"
-      # ktlint placeholder: passes when the plugin is not applied yet.
-      - name: ktlint (placeholder)
+      # Run :core unit tests (PmOutputParserTest, JUnit4). Failures fail the job.
+      - name: Unit tests (core debug)
         run: |
-          if [ -f ./gradlew ]; then
-            ./gradlew ktlintCheck --no-daemon || echo "ktlint pending real sources"
-          else
-            gradle ktlintCheck --no-daemon || echo "ktlint pending real sources"
-          fi
+          chmod +x ./gradlew
+          ./gradlew :core:testDebugUnitTest --no-daemon
+      # Always keep test reports, even when the test step fails.
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: warn
+      # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
+      # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
+      # Android Lint task built into AGP. If the `lint` task ever stops existing,
+      # Gradle exits nonzero and this step fails the job (no silent fallback).
+      - name: Android Lint (AGP built-in)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew lint --no-daemon
+      # Always keep lint reports, even when the lint step fails.
+      - name: Upload lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            **/build/reports/lint-results*.html
+            **/build/reports/lint-results*.xml
+          if-no-files-found: warn

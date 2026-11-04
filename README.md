@@ -38,14 +38,14 @@ hook -> XposedModule (DualHook, apiVersion 102)
 git clone https://github.com/samson910022/Galaxy-Dual-app-Plus.git
 cd Galaxy-Dual-app-Plus
 
-# Build (requires full Gradle wrapper jar, see gradle/wrapper/README.md)
+# Build (Gradle 8.7 via the committed wrapper, see gradle/wrapper/README.md)
 ./gradlew assembleDebug
 
 # Install
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-> 注意：本倉庫 `gradle/wrapper/` 僅含佔位說明，CI 會使用官方 `gradle/gradle-build-action` 取得 Gradle，無需提交 wrapper jar。
+> 注意：本倉庫已提交完整 Gradle wrapper（固定 8.7），CI 與本機一律使用 `./gradlew`；CI 另以 `gradle/actions/setup-gradle` 提供快取，無需自行安裝 Gradle。
 
 ## 提權路由 (Privilege Routing)
 

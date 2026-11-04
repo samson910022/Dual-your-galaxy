@@ -7,12 +7,13 @@ plugins {
 // Application-specific Android configuration.
 android {
     namespace = "com.galaxydual.plus"
-    compileSdk = 34
+    // SDK levels are single-sourced from gradle/libs.versions.toml.
+    compileSdk = libs.versions.compileSdk.get().toInt()
 
     defaultConfig {
         applicationId = "com.galaxydual.plus"
-        minSdk = 29
-        targetSdk = 34
+        minSdk = libs.versions.minSdk.get().toInt()
+        targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.0.1"
     }

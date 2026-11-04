@@ -24,15 +24,11 @@ jobs:
       # Provision Gradle for tag builds.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
-      # Build release APKs (wrapper is a placeholder; tolerate skeleton state).
+      # Build release APKs with the committed wrapper (pinned Gradle 8.7); fail fast on errors.
       - name: Build release APK
         run: |
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleRelease --no-daemon || echo "assemble pending real signing"
-          else
-            gradle assembleRelease --no-daemon || echo "assemble pending real signing"
-          fi
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
       # Generate SHA256 checksums for every built APK.
       - name: Generate SHA256 checksums
         run: |
