@@ -16,8 +16,8 @@ class PmOutputParserTest {
         """.trimIndent()
         val profiles = PmOutputParser.parseUsers(output)
         assertEquals(2, profiles.size)
-        assertEquals(DualProfile(userId = 0, label = "Owner"), profiles[0])
-        assertEquals(DualProfile(userId = 95, label = "DUAL_APP"), profiles[1])
+        assertEquals(DualProfile(userId = 0, label = "Owner", flags = "13"), profiles[0])
+        assertEquals(DualProfile(userId = 95, label = "DUAL_APP", flags = "400"), profiles[1])
     }
 
     @Test
