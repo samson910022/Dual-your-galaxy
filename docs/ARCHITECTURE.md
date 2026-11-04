@@ -30,14 +30,24 @@ val privilege: Privilege = when {
 - Router is a pure function of two probes: `isHookActive()` and `isShizukuAlive()`.
 - UI disables write actions when privilege is `NONE`.
 
-## Executor (CmdGateway)
+## Executor (CmdGateway) — F4a 真通道已接線 [DEVICE-UNVERIFIED]
 
-- `CmdGateway` interface exposes `run(cmd: List<String>): CmdResult`.
-- Implementations:
-  - `ShellGateway`: delegates to Shizuku `newProcess` when `SHELL` is granted.
-  - `RootGateway`: delegates to hooked service or `su -c` when `ROOT` is granted.
-  - `NoOpGateway`: returns failure when `NONE`, prevents accidental writes.
+- `CmdGateway` interface exposes `run(cmd: String): CmdResult` as the primary
+  entry point (`run(argv: List<String>)` is a convenience overload that joins
+  argv with spaces; prefer `run(String)`).
+- Implementations (app side, all DEVICE-UNVERIFIED: no on-device round-trip):
+  - `ShizukuCmdGateway`: SHELL channel via the Shizuku UserService
+    `GalaxyExecService` (`Shizuku#newProcess` was removed in Shizuku API
+    13.1.5; the official guide mandates UserService instead -- F4a implements
+    exactly that).
+  - `SuCmdGateway`: ROOT channel via `su -c` (core-built command passed
+    verbatim as the single `-c` argument, argv form, no extra shell layer).
+  - `NoOpGateway` (core): returns failure when `NONE`, prevents accidental writes.
 - Callers never branch on ROOT vs SHELL directly; they call the injected gateway.
+- Selection is static at startup (`DualViewModelFactory`: su file presence
+  first, else Shizuku binder alive + authorized, else `NoOp` fail-closed);
+  later recheck/refresh only re-probes and updates the display, never swaps
+  the gateway instance (cross-channel switching pending F4b).
 
 ## PmOutputParser
 

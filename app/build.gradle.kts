@@ -155,4 +155,8 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.ktx)
     implementation(libs.lifecycle.runtime.ktx)
     implementation(libs.activity.ktx)
+    // Phase F4a (issue #6): JVM unit tests for the device-free parts of the
+    // true channels (su argv assembly, Shizuku error mapping, capture helper).
+    // Same pinned junit:junit:4.13.2 the core module already uses (cached).
+    testImplementation("junit:junit:4.13.2")
 }
