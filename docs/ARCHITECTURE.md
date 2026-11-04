@@ -44,10 +44,16 @@ val privilege: Privilege = when {
     verbatim as the single `-c` argument, argv form, no extra shell layer).
   - `NoOpGateway` (core): returns failure when `NONE`, prevents accidental writes.
 - Callers never branch on ROOT vs SHELL directly; they call the injected gateway.
-- Selection is static at startup (`DualViewModelFactory`: su file presence
-  first, else Shizuku binder alive + authorized, else `NoOp` fail-closed);
-  later recheck/refresh only re-probes and updates the display, never swaps
-  the gateway instance (cross-channel switching pending F4b).
+- Selection (F4b-P1): the persisted `ChannelPreference` (AUTO default,
+  `SharedPreferences`) is resolved via `assembleChannel` both at startup
+  (`DualViewModelFactory`) and on re-selection (`DualViewModel.selectChannel`
+  swaps the repo gateway under opMutex, then re-probes + refreshes);
+  `recheckPrivilege()` re-resolves AUTO when the environment changed. AUTO
+  keeps the F4a order (su file presence first, else Shizuku binder alive +
+  authorized, else `NoOp` fail-closed; hook never auto-selected). Explicit
+  LSPosed maps to the NoOp placeholder with the picker UI + file-marker
+  enable detection done in P2 (hook writes /data/system marker, app reads
+  direct + gateway cat; whitelist policy still pending).
 
 ## PmOutputParser
 
