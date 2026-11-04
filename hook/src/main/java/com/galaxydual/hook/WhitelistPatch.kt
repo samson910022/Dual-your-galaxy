@@ -18,8 +18,8 @@ package com.galaxydual.hook
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
-// share the list without extra sync. If H3 ever ships a non-empty policy,
-// prefer replace-with-copy for the list case.
+// share the list without extra sync. If a future change ever ships a
+// non-empty policy, prefer replace-with-copy for the list case.
 object WhitelistPatch {
 
     // Outcome of attempting to merge [extra] into a static field value.

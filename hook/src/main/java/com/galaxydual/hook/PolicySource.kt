@@ -6,7 +6,7 @@ package com.galaxydual.hook
 // DualHook cannot depend on :core (D1) and must not do IPC inside
 // intercept(); this object owns the only policy decision: which package set
 // is effective for the current call. Today the effective set is the compiled
-// static seed (still empty = observe-only). Phase H3 wires a RemotePreferences
+// static seed (still empty = observe-only). A future change could pass a
 // snapshot in as [remote]: validated the same way, merged over the seed,
 // never shrinking it.
 //
@@ -17,8 +17,8 @@ object PolicySource {
     private val PKG = Regex("^[a-zA-Z0-9._-]+$")
 
     // Compiled static seed. Empty = observe-only placeholder (current state).
-    // H3 may add well-known Samsung-safe defaults here after on-device proof;
-    // until then it stays empty.
+    // A future change may add well-known Samsung-safe defaults here, but only
+    // after on-device proof; until then it stays empty.
     val STATIC_SEED: Set<String> = emptySet()
 
     fun isValidPackage(pkg: String): Boolean =
@@ -34,8 +34,8 @@ object PolicySource {
 
     // Effective policy: sanitized seed + sanitized remote snapshot.
     // Union-only: entries are never removed by the remote side.
-    // TODO(H3-perf): cache the merged set and recompute only when the remote
-    // snapshot changes; today the seed is empty so the fast path below
+    // TODO(future-perf): cache the merged set and recompute only when the
+    // remote snapshot changes; today the seed is empty so the fast path below
     // short-circuits with zero allocation.
     fun effective(seed: Set<String?> = STATIC_SEED, remote: Set<String?> = emptySet()): Set<String> {
         if (seed.isEmpty() && remote.isEmpty()) return emptySet()
