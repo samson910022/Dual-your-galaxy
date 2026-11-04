@@ -7,10 +7,11 @@ plugins {
 // Library config for the Xposed module artifact.
 android {
     namespace = "com.galaxydual.hook"
-    compileSdk = 34
+    // SDK levels are single-sourced from gradle/libs.versions.toml.
+    compileSdk = libs.versions.compileSdk.get().toInt()
 
     defaultConfig {
-        minSdk = 29
+        minSdk = libs.versions.minSdk.get().toInt()
         // Keeps the Xposed entry point from obfuscation. Resource files under
         // src/main/resources (META-INF/xposed/java_init.list, scope.list,
         // module.prop) are packaged into the APK/AAR automatically by AGP.
