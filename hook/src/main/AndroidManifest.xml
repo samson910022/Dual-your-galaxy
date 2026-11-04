@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- LSPosed module declaration: label plus manager meta-data. -->
+<!-- LSPosed module declaration: manager meta-data only (no android:label). -->
+<!-- D1 single-APK: :app is the only APK, so its "Galaxy Dual Plus" label wins; -->
+<!-- this library manifest contributes just the xposed meta-data below. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <application android:label="Galaxy Dual Plus Hook">
+    <application>
         <!-- Marks this APK as an Xposed module. -->
         <meta-data
             android:name="xposedmodule"
@@ -20,6 +22,6 @@
         <!-- Recommended scopes; authoritative list is META-INF/xposed/scope.list. -->
         <meta-data
             android:name="xposedscope"
-            android:value="system;com.samsung.android.da.daagent;com.android.settings" />
+            android:value="system;com.samsung.android.da.daagent" />
     </application>
 </manifest>

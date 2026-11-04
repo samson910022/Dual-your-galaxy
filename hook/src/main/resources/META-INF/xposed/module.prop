@@ -1,6 +1,8 @@
 # LSPosed module configuration (Java properties format).
-id=com.galaxydual.plus.hook
-version=0.1.0
+# D1 single-APK: id must equal the final APK applicationId (app/build.gradle.kts),
+# version must stay in sync with the app versionName.
+id=com.galaxydual.plus
+version=0.0.1
 versionCode=1
 author=samson910022
 description=Galaxy Dual Plus hook: Samsung Dual whitelist extension (MIT, no Knox access)

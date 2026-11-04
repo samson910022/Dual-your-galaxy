@@ -91,11 +91,51 @@ jobs:
             exit 1
           fi
           echo "PASS: ShizukuProvider present in manifest and DEX"
-      # Run :core unit tests (PmOutputParserTest, JUnit4). Failures fail the job.
+      # D1: verify the hook entry survives into the single APK (guards packaging regressions).
+      # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
+      - name: APK hook entry check
+        run: |
+          set -e
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "FAIL: $APK not found; run :app:assembleDebug first"
+            exit 1
+          fi
+          echo "== (a) META-INF/xposed resources present in APK =="
+          for entry in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
+            if unzip -l "$APK" | grep -Fq "$entry"; then
+              echo "FOUND $entry"
+            else
+              echo "FAIL: $entry missing in $APK"
+              exit 1
+            fi
+          done
+          echo "== (b) java_init.list points at DualHook =="
+          if unzip -p "$APK" META-INF/xposed/java_init.list | grep -Fq "com.galaxydual.hook.DualHook"; then
+            echo "FOUND DualHook entry in java_init.list"
+          else
+            echo "FAIL: DualHook entry missing in META-INF/xposed/java_init.list"
+            exit 1
+          fi
+          echo "== (c) DEX contains DualHook =="
+          FOUND=0
+          for dex in $(unzip -l "$APK" | grep -o 'classes[0-9]*\.dex'); do
+            echo "--- scanning $dex ---"
+            if unzip -p "$APK" "$dex" | grep -q "DualHook"; then
+              echo "FOUND DualHook in $dex"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "FAIL: DualHook class string not found in $APK"
+            exit 1
+          fi
+          echo "PASS: hook entry (DualHook + xposed resources) present in APK"
+      # Run :core + :hook unit tests. Failures fail the job.
       - name: Unit tests (core debug)
         run: |
           chmod +x ./gradlew
-          ./gradlew :core:testDebugUnitTest --no-daemon
+          ./gradlew :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
         if: always()

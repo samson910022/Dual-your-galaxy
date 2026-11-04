@@ -41,6 +41,9 @@ android {
 // App depends on core for privilege routing and parsing.
 dependencies {
     implementation(project(":core"))
+    // D1 single-APK: hook ships inside this APK so DualHook +
+    // META-INF/xposed/* install as one LSPosed module + UI artifact.
+    implementation(project(":hook"))
     // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
