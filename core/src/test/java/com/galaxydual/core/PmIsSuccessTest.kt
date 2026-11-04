@@ -21,15 +21,15 @@ class PmIsSuccessTest {
         var listUsersOut: String = "",
         var listUsersErr: String = "",
         var listUsersExit: Int = 0,
-        var pathOutput: String = "ok",
+        var listPackagesOutput: String = "package:com.example.chat",
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
 
         override suspend fun run(cmd: String): CmdResult =
             if (cmd == DualRepository.CMD_LIST_USERS) {
                 CmdResult(exit = listUsersExit, out = listUsersOut, err = listUsersErr)
-            } else if (cmd.startsWith("pm path")) {
-                CmdResult(exit = 0, out = pathOutput, err = "")
+            } else if (cmd.startsWith("pm list packages")) {
+                CmdResult(exit = 0, out = listPackagesOutput, err = "")
             } else {
                 CmdResult(exit = 0, out = "ok", err = "")
             }
@@ -254,30 +254,33 @@ class PmIsSuccessTest {
         assertEquals(95, runSuspend { repo.resolveDualUserId() })
     }
 
-    // verify() end to end with a failure-named package path: true.
+    // verify() end to end with a failure-named package: exact list membership
+    // still verifies true (no substring/isSuccess misjudgment).
     @Test
     fun verify_withFailureNamedPackagePath_isTrue() {
         val gateway = FakeGateway(
             listUsersOut = "Users:\n" +
                 "\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{95:DUAL_APP:400} running\n",
-            pathOutput = "package:/data/app/com.failure.app/base.apk",
+            listPackagesOutput = "package:com.failure.app",
         )
         val repo = DualRepository(gateway)
         assertTrue(runSuspend { repo.verify("com.failure.app", 95) })
     }
 
-    // verify() still false on real pm errors even with exit 0.
+    // verify() is false when the clean listing lacks the package: absence
+    // text is absence evidence (the list probe uses exit-only semantics,
+    // never isSuccess).
     @Test
     fun verify_withPmError_isFalse() {
         val gateway = FakeGateway(
             listUsersOut = "Users:\n" +
                 "\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{95:DUAL_APP:400} running\n",
-            pathOutput = "Failure [INSTALL_FAILED_INVALID_APK: bad]",
+            listPackagesOutput = "Failure [INSTALL_FAILED_INVALID_APK: bad]",
         )
         val repo = DualRepository(gateway)
-        // No package: line either, but isSuccess must already reject it.
+        // No package:com.example.chat line, so confirmed absent.
         assertFalse(runSuspend { repo.verify("com.example.chat", 95) })
     }
 }

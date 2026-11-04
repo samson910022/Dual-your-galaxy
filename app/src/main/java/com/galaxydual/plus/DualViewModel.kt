@@ -283,7 +283,7 @@ class DualViewModel(
                                 it.copy(
                                     loading = false,
                                     msg = "clone result unknown: " +
-                                        "cannot verify $trimmed for user ${res.dualId}",
+                                        "cannot verify $trimmed for user ${res.dualId}: ${res.detail}",
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }
@@ -376,7 +376,7 @@ class DualViewModel(
                                     loading = false,
                                     msg = "remove result unknown: " +
                                         "cannot verify removal of $trimmed " +
-                                        "for user ${res.dualId}",
+                                        "for user ${res.dualId}: ${res.detail}",
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }

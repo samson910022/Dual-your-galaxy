@@ -206,6 +206,10 @@ object PmOutputParser {
     }
 
     // Builds `pm path --user <dualId> <pkg>` for second-check verification.
+    // Retained as public API for compatibility even though verifyOnProfiles
+    // no longer calls it (third round: the re-check uses `pm list packages`
+    // ground truth because `pm path` is unreliable inside the post-uninstall
+    // teardown window). Kept, not deleted, so external callers keep compiling.
     fun buildPathCheck(pkg: String, dualId: Int): String {
         val p = ShellEscaper.escapePackage(pkg)
         val u = ShellEscaper.escapeUserId(dualId)
