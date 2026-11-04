@@ -28,9 +28,13 @@ android {
 }
 
 // LibXposed API is compileOnly so the host LSPosed framework provides it at runtime.
+// NOTE: no :core dependency (D1) — hook sources never import com.galaxydual.core
+// (verified by grep), keeping the hook free of app-side logic.
 dependencies {
-    implementation(project(":core"))
     compileOnly("io.github.libxposed:api:102.0.0")
     // Optional compile-time annotations used by the API surface (e.g. @SinceApi).
     compileOnly("io.github.libxposed:annotation:1.0.0")
+    // JVM unit tests for framework-free hook logic (WhitelistPolicy).
+    // Same JUnit version as :core; no new dependency versions introduced.
+    testImplementation("junit:junit:4.13.2")
 }
