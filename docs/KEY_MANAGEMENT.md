@@ -16,8 +16,72 @@ Backup:
 - Loss = cannot update Play/GitHub releases with same signature.
 
 CI / Release:
-- GitHub Actions uses `SIGN_STORE_BASE64`, `SIGN_STORE_PASSWORD`, `SIGN_KEY_ALIAS`, `SIGN_KEY_PASSWORD` secrets.
-- Local sign: `apksigner sign --ks ~/.android-keys/Galaxy-Dual-app-Plus-release.jks --out app-release-signed.apk app-release-unsigned.apk`
-- Verify: `apksigner verify --print-certs app-release-signed.apk`
+- GitHub Actions secrets (all required):
 
-Related: `.gitignore` blocks `*.jks/*.keystore/*.p12/*key*.properties`.
+  | Secret | Purpose |
+  | --- | --- |
+  | `SIGN_STORE_BASE64` | Base64 of the keystore file itself |
+  | `SIGN_STORE_PASSWORD` | Keystore password (`apksigner --ks-pass`) |
+  | `SIGN_KEY_ALIAS` | Key alias (`apksigner --ks-key-alias`) |
+  | `SIGN_KEY_PASSWORD` | Key password (`apksigner --key-pass`) |
+
+- Fail-closed by design: if any secret is missing on a tag build, the
+  signing step fails the job and nothing is published. There is no
+  `unsigned` fallback asset — do not add one.
+- STATUS: SIGN_* secrets not yet configured in GitHub — any v* tag fails by design until then; green non-tag CI does not prove the release signing path; re-verify with one tag dry-run after configuring secrets.
+- Local sign (complete — pass alias and both passwords explicitly):
+
+  ```bash
+  apksigner sign \
+    --ks ~/.android-keys/Galaxy-Dual-app-Plus-release.jks \
+    --ks-key-alias galaxy-dual-plus \
+    --ks-pass:env SIGN_STORE_PASSWORD \
+    --key-pass:env SIGN_KEY_PASSWORD \
+    --out app-release-signed.apk app-release-unsigned.apk
+  ```
+
+  `--ks-pass:pass` / `--key-pass:pass` put the secret in shell history —
+  prefer `:env` / `:file` forms. The Gradle-style
+  `~/.android-keys/Galaxy-Dual-app-Plus-release.properties`
+  (`storeFile/storePassword/keyAlias/keyPassword`) is not read by
+  `apksigner` directly; export its values as env vars first.
+- Signature versions: `apksigner` enables v1 (JAR signing) + v2 (APK
+  Signature Scheme v2) by default. Keep the default for sideload
+  installs (widest compatibility). Explicit form:
+  `--v1-signing-enabled true --v2-signing-enabled true`.
+- `.jks` vs PKCS12: the file keeps the historical `.jks` extension but
+  its actual format is PKCS12 (`keytool -list` reports `Type: PKCS12`).
+  Java/`apksigner` detect format by content, so the extension does not
+  matter — do not rename it casually, paths reference this name.
+
+Verify (two different things — do not confuse):
+- Certificate fingerprint = signing-key identity, stable across builds
+  signed by the same key. Canonical value is the `SHA256 (public)` line
+  at the top of this file. Check with:
+
+  ```bash
+  apksigner verify --print-certs app-release-signed.apk
+  # compare the SHA-256 digest of certificate with the canonical value
+  ```
+
+- APK file checksum = integrity of one specific file, changes every
+  build. Check with:
+
+  ```bash
+  sha256sum -c app-release-signed.apk.sha256
+  ```
+
+  A fingerprint mismatch means a different key; a checksum mismatch
+  means a corrupted/modified file. Transcribe fingerprints exactly —
+  one hex digit off is a different value.
+
+Key rotation / leak response:
+- Rotation = new identity: existing installs will NOT update silently
+  (signature mismatch); users must uninstall/reinstall. Update this doc
+  fingerprint, CI secrets, and announce the new fingerprint out-of-band.
+- Suspected leak: stop signing with the key, rotate
+  `SIGN_STORE_*`/`SIGN_KEY_*` secrets immediately, audit which releases
+  were signed with the exposed key, and record the incident (date,
+  scope, new fingerprint) here or in the release notes.
+
+Related: `.gitignore` blocks `*.jks`/`*.keystore`/`*.p12`/`*.key.properties` (+ `keystore.properties`/`release-key.properties`).
