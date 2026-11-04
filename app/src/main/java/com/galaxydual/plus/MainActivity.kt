@@ -22,6 +22,7 @@ package com.galaxydual.plus
 // factory-selected real gateway (su/Shizuku UserService) with NoOp fallback.
 // Probes verify each channel and channelReady gates writes; without a device
 // the exec round-trip is DEVICE-UNVERIFIED (see gateway file headers).
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
@@ -41,6 +42,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.DualRepository
+import com.galaxydual.core.HookElevator
 import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.ShizukuElevator
@@ -55,9 +57,10 @@ class MainActivity : ComponentActivity() {
     // ViewModel with the F4a real-channel repository. No hardcoded privilege
     // flags here: the ViewModel probes elevators and routes the decision.
     // DEVICE-UNVERIFIED: gateway selection/exec never ran on a device.
-    private val vm: DualViewModel by viewModels { DualViewModelFactory(packageName) }
+    private val vm: DualViewModel by viewModels { DualViewModelFactory(packageName, applicationContext) }
 
     private lateinit var privilegeView: TextView
+    private lateinit var hookView: TextView
     private lateinit var shizukuView: TextView
     private lateinit var profilesView: TextView
     private lateinit var clonedView: TextView
@@ -171,6 +174,8 @@ class MainActivity : ComponentActivity() {
         }
 
         privilegeView = TextView(this).apply { textSize = 18f }
+        // H3: hook self-report line (fail-closed display; DEVICE-UNVERIFIED).
+        hookView = TextView(this)
         shizukuView = TextView(this)
         profilesView = TextView(this)
         clonedView = TextView(this)
@@ -213,6 +218,7 @@ class MainActivity : ComponentActivity() {
         }
 
         root.addView(privilegeView)
+        root.addView(hookView)
         root.addView(shizukuView)
         root.addView(profilesView)
         root.addView(clonedView)
@@ -259,12 +265,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Renders one UiState: privilege indicator, both lists, button enabled
-    // state, and the MsgKind-styled status line.
+    // Renders one UiState: privilege indicator, hook line, both lists, button
+    // enabled state, and the MsgKind-styled status line.
     private fun render(s: UiState) {
         val channel =
             if (!s.channelReady) "${s.privilege}（通道未就緒）" else s.privilege.toString()
         privilegeView.text = "權限：$channel"
+        hookView.text = if (s.hookActive) {
+            "Hook：已啟用（LSPosed 自報，待實機驗證）"
+        } else {
+            "Hook：未啟用（需 LSPosed 勾選本模組＋重啟）"
+        }
         // Title mirrors the routed privilege for quick manual verification.
         title = "GalaxyDual Plus ($channel)"
         profilesView.text = if (s.profiles.isEmpty()) {
@@ -307,23 +318,28 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Builds the F4a ViewModel with the real-channel gateway selection.
-// DEVICE-UNVERIFIED: selection/exec never ran on a device.
+// Builds the F4a ViewModel with the real-channel gateway selection, plus the
+// H3 hook elevator (F4b). DEVICE-UNVERIFIED: selection/exec never ran on a device.
 //
-// Selection (synchronous, main-thread safe: stat + binder ping only, no
-// exec): ROOT first per router priority, then SHELL, else fail closed.
+// Selection (synchronous, main-thread safe: stat + binder ping + prefs read,
+// no exec): ROOT first per router priority, then SHELL, else fail closed.
 // - su binary present (canonical paths) -> SuCmdGateway (ROOT).
 // - else Shizuku binder alive AND authorized -> ShizukuCmdGateway (SHELL).
 // - else NoOpGateway (NONE): read-only, channelReady stays false.
-// The hook channel is never selected: there is no app-side evidence signal
-// for LSPosed activation yet (DualViewModel keeps hasLsposed=false, F4b).
-// The su check is a file-presence heuristic, NOT proof su works: the real
-// SuElevator/ShizukuElevator probes (wired below with the same instances)
-// verify each channel, and DualViewModel flips channelReady only when the
-// selected channel's own probe succeeds -- a wrong guess stays read-only.
-// TODO(F4b): dynamic re-selection (swap the repo gateway when later probes
+// The hook channel carries no pm execution: when the self-scope mark reports
+// hookActive, the executor is still the su/Shizuku instance above (a hook-only
+// device with NoOp stays read-only). The su check is a file-presence
+// heuristic, NOT proof su works: the real SuElevator/ShizukuElevator/
+// HookElevator probes (wired below with the same instances) verify each
+// channel, and DualViewModel flips channelReady only when the selected
+// channel's own probe succeeds (ROOT satisfied by su OR hook) -- a wrong guess
+// stays read-only.
+// TODO: dynamic re-selection (swap the repo gateway when later probes
 // disagree with the startup pick, e.g. su guess wrong but Shizuku works).
-private class DualViewModelFactory(private val appPackageName: String) : ViewModelProvider.Factory {
+private class DualViewModelFactory(
+    private val appPackageName: String,
+    private val appContext: Context,
+) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(DualViewModel::class.java)) {
@@ -334,14 +350,19 @@ private class DualViewModelFactory(private val appPackageName: String) : ViewMod
                 shizukuAuthorizedNow() -> shizuku
                 else -> NoOpGateway()
             }
+            val hookElevator = HookElevator { hookStatus.isHookActive() }
             return DualViewModel(
                 DualRepository(selected),
                 gatewayPrivilege = selected.privilege,
-                elevators = listOf(SuElevator(su), ShizukuElevator(shizuku)),
+                elevators = listOf(SuElevator(su), ShizukuElevator(shizuku), hookElevator),
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }
+
+    // Reused across probes: SharedPreferences reads hit the in-memory cache
+    // after the first load, so per-probe cost is a map lookup, not disk I/O.
+    private val hookStatus = HookStatusProvider(appContext.applicationContext)
 
     companion object {
         // Canonical su locations; presence heuristic only (see header).

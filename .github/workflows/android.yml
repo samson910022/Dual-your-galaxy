@@ -148,11 +148,11 @@ jobs:
           grep -F "SUPPORTED_SCOPES" hook/src/main/java/com/galaxydual/hook/DualHook.kt | grep -F "= HookScopes.SUPPORTED_SCOPES"
           echo "== manifest xposedscope =="
           grep -F "xposedscope" hook/src/main/AndroidManifest.xml
-          # scope.list must be exactly the two recommended scopes, in order.
-          printf 'system\ncom.samsung.android.da.daagent\n' > /tmp/expected_scope.list
+          # scope.list must be exactly the recommended scopes, in order.
+          printf 'system\ncom.samsung.android.da.daagent\ncom.galaxydual.plus\ncom.galaxydual.plus.debug\n' > /tmp/expected_scope.list
           diff -u /tmp/expected_scope.list hook/src/main/resources/META-INF/xposed/scope.list
-          # Manifest must carry the same two scopes (semicolon-joined).
-          grep -F 'android:value="system;com.samsung.android.da.daagent"' hook/src/main/AndroidManifest.xml
+          # Manifest must carry the same scopes (semicolon-joined).
+          grep -F 'android:value="system;com.samsung.android.da.daagent;com.galaxydual.plus;com.galaxydual.plus.debug"' hook/src/main/AndroidManifest.xml
           # module.prop fail-safe marker + version sync with app versionName.
           grep -F 'exceptionMode=protective' hook/src/main/resources/META-INF/xposed/module.prop
           APP_VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n 1 | tr -d ' \r')

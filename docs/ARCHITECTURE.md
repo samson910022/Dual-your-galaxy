@@ -26,12 +26,13 @@ val privilege: Privilege = when {
 }
 ```
 
-> Honesty note (H1/F4b) [待實機驗證]: the pseudocode above is the design intent. The
-> app-side `hasLsposed` probe is still conservatively `false`
-> (`DualViewModel.probeChannels` TODO F4b): the hook channel is never
-> selected yet, so `Privilege.ROOT` today only comes from su. The hook
-> module itself is an observe-only placeholder (empty policy) until the
-> RemotePreferences policy source is wired (see `docs/HOOK.md` §1.1).
+> Honesty note (H3) [待實機驗證]: the app-side hook flag is now wired
+> (`HookElevator` over the self-scope prefs mark, `DualViewModel.probeChannels`
+> feeds `routePrivilege(hasLsposed = hasHook)` and `channelReadyFor` [已支援]).
+> The hook channel still carries no pm execution: install/remove reuse the
+> su/Shizuku gateway (hook-only + NoOp stays read-only). The hook module
+> itself is an observe-only placeholder (empty policy) until a non-empty
+> policy source is wired (see `docs/HOOK.md` §1.1).
 > DEVICE-UNVERIFIED: no on-device hook load has been observed.
 
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (LSPosed / su).

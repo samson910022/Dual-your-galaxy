@@ -6,12 +6,12 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// Phase H1: scope parity lock.
+// Phase H1+H3: scope parity lock.
 //
 // Fail-closed rule: the recommended LSPosed scopes must stay exactly
-// {system, daagent}. Adding an unused scope (e.g. com.android.settings with
-// no settings-side hook) only widens the injection surface; removing a needed
-// scope silently disables system_server / daagent hooks.
+// {system, daagent} + self packages. Adding an unused scope (e.g.
+// com.android.settings with no settings-side hook) only widens the injection
+// surface; removing a needed scope silently disables hooks.
 //
 // HookScopes is pure JVM (no android.*/LibXposed imports) so it loads on the
 // plain unit-test classpath; DualHook itself cannot load here (compileOnly
@@ -26,7 +26,7 @@ class ScopeParityTest {
             setOf(
                 HookScopes.SYSTEM_SCOPE,
                 HookScopes.DA_AGENT_PACKAGE,
-            ),
+            ) + HookState.SELF_PACKAGES,
             HookScopes.SUPPORTED_SCOPES,
         )
     }
@@ -39,6 +39,15 @@ class ScopeParityTest {
     @Test
     fun daAgentPackageConstantUnchanged() {
         assertEquals("com.samsung.android.da.daagent", HookScopes.DA_AGENT_PACKAGE)
+    }
+
+    @Test
+    fun selfPackagesContainReleaseAndDebug() {
+        assertEquals(
+            setOf("com.galaxydual.plus", "com.galaxydual.plus.debug"),
+            HookState.SELF_PACKAGES,
+        )
+        assertTrue(HookScopes.SUPPORTED_SCOPES.containsAll(HookState.SELF_PACKAGES))
     }
 
     @Test

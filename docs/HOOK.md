@@ -75,16 +75,18 @@ Hook Builder 統一使用
  （`Set` 不再降級為 `List`，其餘 `Collection`／未知回傳一律只觀察不改並打 log）。
   命中未知方法時僅多一條 log，不改變行為。
 
-### 1.4 非目標進程：`detach()`
+### 1.4 非目標進程：`detach()`（H3 含自報 scope）
 
 `onPackageLoaded` 第一件事就是檢查 `SUPPORTED_SCOPES`；不在名單內的進程
 立即呼叫 **`detach()`**，該 entry 在此進程不再收到後續生命週期回調
 （已安裝的 hook 不受影響）。`SUPPORTED_SCOPES` 與
-`META-INF/xposed/scope.list` 兩行保持一致：
+`META-INF/xposed/scope.list` 四行保持一致：
 
 ```
 system
 com.samsung.android.da.daagent
+com.galaxydual.plus
+com.galaxydual.plus.debug
 ```
 
 system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_server，
@@ -93,6 +95,13 @@ system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_
 直接返回、**絕不 `detach()`**（避免在 system_server 內自斷後續回調）。
 `com.android.settings` 已移除：目前沒有任何 settings 側 hook，
 留空 scope 只會擴大注入面；將來真有 settings 側檢查再加回。
+
+自報 scope（H3 [待實機驗證]）：`com.galaxydual.plus[.debug]` 是模組自身的
+UI 進程。LSPosed 注入自家進程時只寫自家 `MODE_PRIVATE` prefs
+（`HookState`：`hook_active`＋時間戳＋版本，見 `HookStatusProvider`），
+不 hook 任何系統查詢、不碰安裝／移除路徑；各 Android 用戶（user 0／95）
+各自自報、無跨用戶讀寫。App 側以此 flag 經 `HookElevator` 參與路由顯示，
+pm 執行仍走 su／Shizuku 通道（hook-only＋NoOp 仍唯讀）。
 
 ## 2. Scope 勾選教學
 
