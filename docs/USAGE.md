@@ -51,11 +51,16 @@ adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh
 `UserInfo{...}` / `dualUserId` 為準（常見為 95 / 150，機型而異）。
 
 ```bash
-# 1. 列出所有 profile，確認雙開 userId（找 DUAL 字樣或非 0 的 id）
+# 1. 列出所有 profile，確認雙開 userId：只認 DUAL 字樣，且絕對不可選 user 0。
+#    若沒有 DUAL 字樣、或出現多個 DUAL（無法唯一確定），請停手：
+#    先到系統設定開啟 Dual Messenger 任一 App 再重列，切勿猜「第一個非 0 的 id」
+#    （那可能是 Work profile 或其他無關使用者，寫錯目標會動到別人的資料）。
 adb shell pm list users
 #   Users:
 #     UserInfo{0:Owner:13} running
 #     UserInfo{95:DUAL_APP:400} running
+#   上例唯一 DUAL 為 95；user 0（Owner）永遠不可作為 --user 目標，
+#   本 App 的 resolveDualUserId / clone / remove 遇到上述情況會直接拒絕寫入。
 
 # 2. 將已安裝的 App 複製進雙開 profile（不會動到 Secure Folder）
 adb shell pm install-existing --user 95 com.example.chat
