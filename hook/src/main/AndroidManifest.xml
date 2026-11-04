@@ -22,6 +22,6 @@
         <!-- Recommended scopes; authoritative list is META-INF/xposed/scope.list. -->
         <meta-data
             android:name="xposedscope"
-            android:value="system;com.samsung.android.da.daagent;com.galaxydual.plus;com.galaxydual.plus.debug" />
+            android:value="system;com.samsung.android.da.daagent" />
     </application>
 </manifest>

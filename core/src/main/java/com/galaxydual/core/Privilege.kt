@@ -39,18 +39,19 @@ fun routePrivilege(hookActive: Boolean, shizukuAlive: Boolean): Privilege {
 }
 
 // Pure readiness gate: is the selected gateway's channel proven?
-// H3 (F4b): a ROOT executor is satisfied by su OR the LSPosed self-scope
-// mark (the hook carries no pm channel itself; install/remove still run
-// through the su/Shizuku gateway and report failures via CmdResult).
-// A NoOp (NONE) executor is never ready: hook-only devices stay read-only.
+// H4 reconciliation with #19 (F4b-P2 principle, locked by ChannelReadyTest):
+// the hook-enable signal is DISPLAY-ONLY and never satisfies readiness.
+// A ROOT executor needs its own su probe (hasRoot); SHELL needs Shizuku;
+// a NoOp (NONE) executor is never ready. Rationale: a present marker is
+// existence+scope evidence from a file that survives reboots, not proof of
+// a live, effective hook, so it must never grant privilege (or readiness).
 fun channelReadyFor(
     gateway: Privilege,
     hasRoot: Boolean,
     hasShizuku: Boolean,
-    hasHook: Boolean,
 ): Boolean {
     return when (gateway) {
-        Privilege.ROOT -> hasRoot || hasHook
+        Privilege.ROOT -> hasRoot
         Privilege.SHELL -> hasShizuku
         Privilege.NONE -> false
     }

@@ -86,40 +86,11 @@ class SuElevator(
     }
 }
 
-// LSPosed hook (ROOT display) elevator over an injected active flag.
-//
-// Phase H3 (F4b): the flag comes from the app-side HookStatusProvider, which
-// reads the self-scope prefs written by the hook's own onPackageLoaded branch
-// (per-user, MODE_PRIVATE, no IPC). The hook channel carries no pm execution:
-// install/remove still run through SuCmdGateway/ShizukuCmdGateway, so
-// dualUserId stays -1 here and the ViewModel reuses the su/Shizuku gateway
-// instance when this probe passes. Pure function of the flag: JVM-testable.
-// DEVICE-UNVERIFIED: self-scope prefs round-trip never ran on a device.
-class HookElevator(
-    private val activeProvider: () -> Boolean = { false },
-) : Elevator {
-    override val level: Privilege = Privilege.ROOT
-
-    override suspend fun probe(): ProbeResult {
-        val active = try {
-            activeProvider()
-        } catch (_: Exception) {
-            false
-        }
-        return if (active) {
-            ProbeResult(
-                level = Privilege.ROOT,
-                hasShizuku = false,
-                hasRoot = true,
-                dualUserId = -1,
-            )
-        } else {
-            ProbeResult(
-                level = Privilege.NONE,
-                hasShizuku = false,
-                hasRoot = false,
-                dualUserId = -1,
-            )
-        }
-    }
-}
+// NOTE (H4 reconciliation with #19): an LSPosed Elevator was evaluated (H3:
+// HookElevator over a self-scope prefs flag) and deliberately dropped. The
+// F4b-P2 file marker (HookMarker, scopes system_server/daagent, proven by
+// installed-hook counts) is the single hook-active signal, and by the #19
+// principle it is DISPLAY-ONLY: it never enters privilege routing
+// (hasLsposed stays false) and never satisfies channel readiness. A present
+// marker is existence+scope evidence, not proof of a live, effective hook.
+// Keeping a hook Elevator would risk granting privilege on that weaker claim.

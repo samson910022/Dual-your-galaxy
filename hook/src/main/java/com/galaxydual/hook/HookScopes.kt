@@ -20,9 +20,11 @@ object HookScopes {
     const val DA_AGENT_PACKAGE = "com.samsung.android.da.daagent"
 
     // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
-    // H3 adds the module's own UI packages (self scope) so the hook can
-    // write its per-user active mark into its own private prefs (see
-    // HookState): release + debug (applicationIdSuffix ".debug") variants.
+    // H3 self-scope packages were evaluated and dropped (H4): the F4b-P2 file
+    // marker (HookMarker, scopes system_server/daagent, proven by installed
+    // hook counts + real-device S24 EACCES evidence) is the single hook-active
+    // signal; a self-process prefs mark would add injection surface for weaker
+    // (self-only) evidence. Keep this set minimal.
     // NOTE: com.android.settings stays out (D2): no settings-side hook
     // exists, so scoping it would only widen the injection surface.
     // SYSTEM_SCOPE never matches onPackageLoaded; it is kept here for
@@ -30,5 +32,5 @@ object HookScopes {
     val SUPPORTED_SCOPES: Set<String> = setOf(
         SYSTEM_SCOPE,
         DA_AGENT_PACKAGE,
-    ) + HookState.SELF_PACKAGES
+    )
 }
