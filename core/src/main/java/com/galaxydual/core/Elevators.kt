@@ -12,9 +12,9 @@ interface Elevator {
     suspend fun probe(): ProbeResult
 }
 
-// Shizuku (SHELL) elevator placeholder.
-// TODO: bind rikka.shizuku.Shizuku in the app module and forward its
-// newProcess() output into a CmdGateway that is injected here.
+// Shizuku (SHELL) elevator over an injected CmdGateway.
+// App side provides ShizukuCmdGateway (UserService GalaxyExecService;
+// Shizuku#newProcess was removed in 13.1.5, not used). DEVICE-UNVERIFIED.
 class ShizukuElevator(
     private val gateway: CmdGateway = NoOpGateway(),
 ) : Elevator {
@@ -46,9 +46,9 @@ class ShizukuElevator(
     }
 }
 
-// Superuser (ROOT) elevator placeholder over a `su`-backed gateway.
-// TODO: implement the injected gateway with `su -c <cmd>` (or the LSPosed
-// hook channel) in the app module; this class only assembles command strings.
+// Superuser (ROOT) elevator over an injected CmdGateway.
+// App side provides SuCmdGateway (`su -c` argv single-arg passthrough).
+// This class only assembles command strings. DEVICE-UNVERIFIED.
 class SuElevator(
     private val gateway: CmdGateway = NoOpGateway(),
 ) : Elevator {

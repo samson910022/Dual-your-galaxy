@@ -40,8 +40,9 @@ enum class MsgKind {
     // Post-write re-check disagrees (fake success / still installed).
     VERIFY,
 
-    // Channel itself failed or the result is unknowable; includes the honest
-    // "channel pending" placeholder until a real gateway lands (F3).
+    // Channel itself failed, the result is unknowable, or the selected
+    // channel is not ready (F4a wired: gateway picked at startup, probe not
+    // passed / NoOp fallback stays read-only).
     CHANNEL,
 
     // The install/uninstall command reported failure, or an unexpected
@@ -56,8 +57,9 @@ enum class MsgKind {
 data class UiState(
     // Routed elevation level from the elevator probes (ROOT/SHELL/NONE).
     val privilege: Privilege = Privilege.NONE,
-    // False until a REAL Shizuku/su CmdGateway is wired (F3). While false the
-    // state is an honest read-only placeholder, never a working channel.
+    // False until the selected real gateway's own probe succeeds (F4a): a
+    // su-backed repo needs the su probe (ROOT), a Shizuku-backed repo the
+    // Shizuku probe (SHELL); a NoOp repo (NONE) is never ready. Fail closed.
     val channelReady: Boolean = false,
     // All Android profiles parsed from `pm list users`.
     val profiles: List<DualProfile> = emptyList(),
@@ -87,19 +89,19 @@ data class UiState(
 // functions launching in viewModelScope; the Activity just calls them.
 class DualViewModel(
     private val repo: DualRepository,
-    // Declared privilege of the gateway backing `repo`. Defaults to NONE to
-    // match the default NoOpGateway-backed repository; F3 passes the real
-    // gateway's privilege (SHELL/ROOT) when it injects the real repository.
+    // Declared privilege of the gateway backing `repo`. F4a wires the real
+    // gateway's privilege here (ROOT for SuCmdGateway, SHELL for
+    // ShizukuCmdGateway, NONE for the NoOp fallback); probeChannels() flips
+    // channelReady only when that same channel's probe succeeds.
     // Checked by class (not by probing the repo) so core stays untouched.
     private val gatewayPrivilege: Privilege = Privilege.NONE,
-    // Elevators probed in order; defaults are the core NoOp-backed
-    // placeholders, so probes honestly report NONE until F3 injects
-    // elevators backed by a real Shizuku/su gateway.
+    // Elevators probed in order; F4a injects elevators backed by the real
+    // su/Shizuku gateways, so probes honestly verify each channel.
     private val elevators: List<Elevator> = listOf(SuElevator(), ShizukuElevator()),
 ) : ViewModel() {
     private val _state = MutableStateFlow(
         UiState(
-            msg = "通道待接：Shizuku/su 真通道尚未接入，目前為唯讀佔位",
+            msg = "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀",
             msgKind = MsgKind.CHANNEL,
         ),
     )
@@ -407,13 +409,13 @@ class DualViewModel(
     // Probes elevation channels (ROOT first, then SHELL) and routes the
     // privilege decision via the shared core router. Must run under opMutex.
     //
-    // TODO(F3): when real Shizuku (binder) / su CmdGateway implementations
-    // exist in the app module, map the routed level to a real gateway here
-    // (SHELL -> Shizuku gateway, ROOT -> su/hook gateway), swap the
-    // repository over, and flip channelReady to true. Until then the
-    // effective channel stays NoOpGateway-backed: privilege shows the routed
-    // decision but writes stay disabled and the UI shows 通道待接 -- honest
-    // placeholder, never a fake working channel.
+    // Phase F4a (issue #6): the factory injects elevators backed by the real
+    // su/Shizuku gateways, so these probes verify the actual channels.
+    // channelReady is true ONLY when the repo's own gateway channel proved
+    // itself (su repo needs the su/ROOT probe, Shizuku repo the
+    // Shizuku/SHELL probe, NoOp repo never). A selected-but-unproven channel
+    // stays read-only: fail closed, never a fake working channel.
+    // DEVICE-UNVERIFIED: probe/exec round-trips never ran on a device.
     private suspend fun probeChannels() {
         var hasRoot = false
         var hasShizuku = false
@@ -430,17 +432,28 @@ class DualViewModel(
         }
         // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
         // the router encodes that priority, probes only feed it.
-        // hasLsposed=false for now: hook presence has no app-side signal yet;
-        // F3 wires the real detection (LSPosed scope check) alongside the
-        // real gateways (see TODO above).
+        // TODO(F4b): hasLsposed stays conservatively false: detecting whether
+        // this module is actually enabled inside the LSPosed manager is a
+        // cross-process signal that needs a real device to verify. Until
+        // then the hook channel is never selected (see factory below).
         val routed = routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
+        val ready = when (gatewayPrivilege) {
+            Privilege.ROOT -> hasRoot
+            Privilege.SHELL -> hasShizuku
+            Privilege.NONE -> false
+        }
         _state.update {
             it.copy(
                 privilege = routed,
-                // Still false: no real gateway is wired in F2 (see TODO above).
-                channelReady = false,
-                msg = "通道待接：Shizuku/su 真通道尚未接入，目前為唯讀佔位",
-                msgKind = MsgKind.CHANNEL,
+                channelReady = ready,
+                msg = if (ready) {
+                    ""
+                } else if (gatewayPrivilege == Privilege.NONE) {
+                    "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀"
+                } else {
+                    "通道未就緒：已選 ${gatewayPrivilege} 通道但探測未通過，寫入已禁用"
+                },
+                msgKind = if (ready) MsgKind.NONE else MsgKind.CHANNEL,
             )
         }
     }
@@ -454,7 +467,7 @@ class DualViewModel(
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "通道待接：Shizuku/su 真通道尚未接入，寫入已禁用",
+                    msg = "通道未就緒：未選中真通道或所選通道探測未通過，寫入已禁用",
                     msgKind = MsgKind.CHANNEL,
                 )
             }
