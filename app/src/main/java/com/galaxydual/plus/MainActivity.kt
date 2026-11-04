@@ -4,9 +4,12 @@ package com.galaxydual.plus
 // F3 entry point (issue #6): real dual-app screen bound to DualViewModel.
 //
 // UI is programmatic views (no Compose, no new dependencies): a privilege
-// indicator, the profiles/cloned lists, a package input with clone/remove
-// buttons, a refresh button, a Shizuku permission button, and a status line
-// styled per MsgKind.
+// indicator, a Shizuku binder line, a channel picker (Auto/Root/Shizuku/
+// LSPosed buttons + current-channel line + LSPosed hook-status line), the
+// profiles/cloned lists, a package input with clone/remove buttons, a
+// refresh button, a Shizuku permission button, and a status line styled per
+// MsgKind. Persistence: the picker selection is stored in SharedPreferences
+// by the factory/selectChannel, so a restart remembers it.
 //
 // Shizuku lifecycle: binder received/dead listeners are registered in onCreate
 // (received is sticky, so an already-live binder fires immediately) and
@@ -28,6 +31,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -42,9 +46,6 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.DualRepository
-import com.galaxydual.core.HookElevator
-import com.galaxydual.core.NoOpGateway
-import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import java.io.File
@@ -57,11 +58,12 @@ class MainActivity : ComponentActivity() {
     // ViewModel with the F4a real-channel repository. No hardcoded privilege
     // flags here: the ViewModel probes elevators and routes the decision.
     // DEVICE-UNVERIFIED: gateway selection/exec never ran on a device.
-    private val vm: DualViewModel by viewModels { DualViewModelFactory(packageName, applicationContext) }
+    private val vm: DualViewModel by viewModels { DualViewModelFactory(applicationContext, packageName) }
 
     private lateinit var privilegeView: TextView
-    private lateinit var hookView: TextView
     private lateinit var shizukuView: TextView
+    private lateinit var channelView: TextView
+    private lateinit var hookView: TextView
     private lateinit var profilesView: TextView
     private lateinit var clonedView: TextView
     private lateinit var pkgInput: EditText
@@ -69,6 +71,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var removeBtn: Button
     private lateinit var refreshBtn: Button
     private lateinit var permBtn: Button
+    private lateinit var autoBtn: Button
+    private lateinit var rootBtn: Button
+    private lateinit var shizukuBtn: Button
+    private lateinit var lsposedBtn: Button
     private lateinit var msgView: TextView
     private var defaultMsgColor: Int = Color.BLACK
 
@@ -174,9 +180,14 @@ class MainActivity : ComponentActivity() {
         }
 
         privilegeView = TextView(this).apply { textSize = 18f }
-        // H3: hook self-report line (fail-closed display; DEVICE-UNVERIFIED).
-        hookView = TextView(this)
         shizukuView = TextView(this)
+        // Phase F4b-P2 (issue #6): channel picker display. channelView shows
+        // the persisted selection (SharedPreferences via the factory, so a
+        // restart remembers it); hookView shows the hook-enable signal only
+        // in LSPosed mode (GONE otherwise). The four buttons call
+        // vm.selectChannel(pref), which persists + swaps + re-probes.
+        channelView = TextView(this)
+        hookView = TextView(this)
         profilesView = TextView(this)
         clonedView = TextView(this)
         pkgInput = EditText(this).apply {
@@ -202,6 +213,25 @@ class MainActivity : ComponentActivity() {
             text = "請求 Shizuku 授權"
             setOnClickListener { requestShizukuPermission() }
         }
+        // Channel picker: exactly the four ChannelPreference values (NoOp is
+        // a fail-closed fallback, never a menu entry). Programmatic buttons
+        // in the existing style; labels stay short for one horizontal row.
+        autoBtn = Button(this).apply {
+            text = "Auto"
+            setOnClickListener { vm.selectChannel(ChannelPreference.AUTO) }
+        }
+        rootBtn = Button(this).apply {
+            text = "Root"
+            setOnClickListener { vm.selectChannel(ChannelPreference.ROOT) }
+        }
+        shizukuBtn = Button(this).apply {
+            text = "Shizuku"
+            setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU) }
+        }
+        lsposedBtn = Button(this).apply {
+            text = "LSPosed"
+            setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED) }
+        }
         msgView = TextView(this).apply { textSize = 15f }
         defaultMsgColor = msgView.currentTextColor
 
@@ -216,10 +246,25 @@ class MainActivity : ComponentActivity() {
             addView(refreshBtn, rowParams())
             addView(permBtn, rowParams())
         }
+        // Picker row 1: Auto + Root; row 2: Shizuku + LSPosed (two rows keep
+        // labels legible on narrow screens, same weight style as above).
+        val channelRow1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(autoBtn, rowParams())
+            addView(rootBtn, rowParams())
+        }
+        val channelRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(shizukuBtn, rowParams())
+            addView(lsposedBtn, rowParams())
+        }
 
         root.addView(privilegeView)
-        root.addView(hookView)
         root.addView(shizukuView)
+        root.addView(channelView)
+        root.addView(hookView)
+        root.addView(channelRow1)
+        root.addView(channelRow2)
         root.addView(profilesView)
         root.addView(clonedView)
         root.addView(pkgInput)
@@ -265,19 +310,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Renders one UiState: privilege indicator, hook line, both lists, button
-    // enabled state, and the MsgKind-styled status line.
+    // Renders one UiState: privilege indicator, Shizuku line (live), channel
+    // picker state + hook signal, both lists, button enabled state, and the
+    // MsgKind-styled status line.
     private fun render(s: UiState) {
         val channel =
             if (!s.channelReady) "${s.privilege}（通道未就緒）" else s.privilege.toString()
         privilegeView.text = "權限：$channel"
-        hookView.text = if (s.hookActive) {
-            "Hook：已啟用（LSPosed 自報，待實機驗證）"
-        } else {
-            "Hook：未啟用（需 LSPosed 勾選本模組＋重啟）"
-        }
         // Title mirrors the routed privilege for quick manual verification.
         title = "GalaxyDual Plus ($channel)"
+        // Picker state: persisted selection (restart remembers it via
+        // SharedPreferences; see factory). Always shown so the user can tell
+        // which channel the lists/privilege above were produced with.
+        channelView.text = "通道：${s.channel}（選擇已持久化，重啟 App 記住）"
+        // Hook signal: LSPosed mode only. Active shows recorded scopes;
+        // inactive shows 未偵測到 plus the enable hint. The placeholder note
+        // stays visible so the mode is never mistaken for a working channel.
+        if (s.channel == ChannelPreference.LSPOSED) {
+            hookView.visibility = View.VISIBLE
+            val status = if (s.hookActive) {
+                "已啟用（${s.hookScopes.sorted().joinToString(", ")}）"
+            } else {
+                "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
+            }
+            hookView.text = "LSPosed Hook：$status；寫入通道為佔位（NoOp），" +
+                "待 whitelist 政策分支，寫入已禁用"
+        } else {
+            hookView.visibility = View.GONE
+        }
         profilesView.text = if (s.profiles.isEmpty()) {
             "Profiles：—"
         } else {
@@ -318,51 +378,67 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Builds the F4a ViewModel with the real-channel gateway selection, plus the
-// H3 hook elevator (F4b). DEVICE-UNVERIFIED: selection/exec never ran on a device.
+// Builds the F4b-P1 ViewModel with the persisted channel selection.
+// DEVICE-UNVERIFIED: selection/exec never ran on a device.
 //
-// Selection (synchronous, main-thread safe: stat + binder ping + prefs read,
-// no exec): ROOT first per router priority, then SHELL, else fail closed.
-// - su binary present (canonical paths) -> SuCmdGateway (ROOT).
-// - else Shizuku binder alive AND authorized -> ShizukuCmdGateway (SHELL).
-// - else NoOpGateway (NONE): read-only, channelReady stays false.
-// The hook channel carries no pm execution: when the self-scope mark reports
-// hookActive, the executor is still the su/Shizuku instance above (a hook-only
-// device with NoOp stays read-only). The su check is a file-presence
-// heuristic, NOT proof su works: the real SuElevator/ShizukuElevator/
-// HookElevator probes (wired below with the same instances) verify each
-// channel, and DualViewModel flips channelReady only when the selected
-// channel's own probe succeeds (ROOT satisfied by su OR hook) -- a wrong guess
-// stays read-only.
-// TODO: dynamic re-selection (swap the repo gateway when later probes
-// disagree with the startup pick, e.g. su guess wrong but Shizuku works).
+// Selection reuses assembleChannel (ChannelPreference.kt), the same path
+// DualViewModel.selectChannel() uses, so startup and re-selection can never
+// disagree: the persisted preference (SharedPreferences, default AUTO) is
+// resolved with the live environment -- AUTO keeps the F4a order (su file
+// presence first, else Shizuku binder alive + authorized, else NoOp
+// fail-closed); explicit Root/Shizuku win regardless of probes (probes fail
+// closed later); explicit LSPosed is still the NoOp placeholder.
+// The hook channel is never auto-selected: there is no app-side evidence
+// signal for LSPosed activation yet (DualViewModel keeps hasLsposed=false).
+// The su check is a file-presence heuristic, NOT proof su works: the real
+// SuElevator/ShizukuElevator probes (wired below with the same instances)
+// verify each channel, and DualViewModel flips channelReady only when the
+// selected channel's own probe succeeds -- a wrong guess stays read-only.
+// P1 closes the F4a "static startup pick" gap: selectChannel() swaps the
+// repo gateway under opMutex, and recheckPrivilege() re-resolves AUTO.
+// F4b-P2 (issue #6): the picker UI above calls selectChannel() for all four
+// preferences; the LSPosed hook-enable signal comes from the marker file
+// (HookStateProvider, refreshed on every probe) and is display-only. The
+// LSPosed gateway stays the NoOp placeholder: the real hook gateway (plus
+// the whitelist policy branch) is still future work.
+// DEVICE-UNVERIFIED: marker read + LSPosed placeholder behavior never ran
+// on a device (staleness/SELinux limits documented in HookMarker).
 private class DualViewModelFactory(
-    private val appPackageName: String,
     private val appContext: Context,
+    private val appPackageName: String,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(DualViewModel::class.java)) {
-            val su = SuCmdGateway()
-            val shizuku = ShizukuCmdGateway(appPackageName)
-            val selected: CmdGateway = when {
-                suBinaryPresent() -> su
-                shizukuAuthorizedNow() -> shizuku
-                else -> NoOpGateway()
-            }
-            val hookElevator = HookElevator { hookStatus.isHookActive() }
+            // Application context: the factory is Activity-scoped but the
+            // prefs handle must not pin the Activity.
+            val prefs = appContext.applicationContext.getSharedPreferences(
+                CHANNEL_PREFS_NAME,
+                Context.MODE_PRIVATE,
+            )
+            val pref = loadChannelPreference(prefs)
+            val asm = assembleChannel(pref, suBinaryPresent(), shizukuAuthorizedNow(), appPackageName)
             return DualViewModel(
-                DualRepository(selected),
-                gatewayPrivilege = selected.privilege,
-                elevators = listOf(SuElevator(su), ShizukuElevator(shizuku), hookElevator),
+                repo = DualRepository(asm.gateway),
+                gatewayPrivilege = asm.gateway.privilege,
+                elevators = listOf(SuElevator(asm.suGateway), ShizukuElevator(asm.shizukuGateway)),
+                preference = pref,
+                appPackageName = appPackageName,
+                persistPreference = { p ->
+                    try {
+                        prefs.saveChannelPreference(p)
+                    } catch (_: Exception) {
+                        // Best effort: the in-memory swap already happened.
+                    }
+                },
+                suPresentCheck = { suBinaryPresent() },
+                shizukuAuthCheck = { shizukuAuthorizedNow() },
+                activeGateway = asm.gateway,
+                currentChannel = asm.channel,
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }
-
-    // Reused across probes: SharedPreferences reads hit the in-memory cache
-    // after the first load, so per-probe cost is a map lookup, not disk I/O.
-    private val hookStatus = HookStatusProvider(appContext.applicationContext)
 
     companion object {
         // Canonical su locations; presence heuristic only (see header).

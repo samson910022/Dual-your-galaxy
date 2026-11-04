@@ -19,7 +19,8 @@
   決策為 union-only（只增不減），包名校驗與 `core/ShellEscaper` 同規則；
   靜態欄位合併由純函數 `WhitelistPatch` 執行（`MutableList` 原地追加、
   `String[]` 重建替換，其餘一律放棄並記 log）。`remote` 快照目前為空
- （H3 才接 RemotePreferences 唯讀＋變更監聽），行為與空種子完全一致
+ （無政策來源已接線；未來工作才考慮 RemotePreferences 唯讀＋變更監聽），
+  行為與空種子完全一致
   [待實機驗證]。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
@@ -75,18 +76,16 @@ Hook Builder 統一使用
  （`Set` 不再降級為 `List`，其餘 `Collection`／未知回傳一律只觀察不改並打 log）。
   命中未知方法時僅多一條 log，不改變行為。
 
-### 1.4 非目標進程：`detach()`（H3 含自報 scope）
+### 1.4 非目標進程：`detach()`（H4：自報 scope 已退場，見下）
 
 `onPackageLoaded` 第一件事就是檢查 `SUPPORTED_SCOPES`；不在名單內的進程
 立即呼叫 **`detach()`**，該 entry 在此進程不再收到後續生命週期回調
 （已安裝的 hook 不受影響）。`SUPPORTED_SCOPES` 與
-`META-INF/xposed/scope.list` 四行保持一致：
+`META-INF/xposed/scope.list` 兩行保持一致：
 
 ```
 system
 com.samsung.android.da.daagent
-com.galaxydual.plus
-com.galaxydual.plus.debug
 ```
 
 system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_server，
@@ -96,12 +95,15 @@ system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_
 `com.android.settings` 已移除：目前沒有任何 settings 側 hook，
 留空 scope 只會擴大注入面；將來真有 settings 側檢查再加回。
 
-自報 scope（H3 [待實機驗證]）：`com.galaxydual.plus[.debug]` 是模組自身的
-UI 進程。LSPosed 注入自家進程時只寫自家 `MODE_PRIVATE` prefs
-（`HookState`：`hook_active`＋時間戳＋版本，見 `HookStatusProvider`），
-不 hook 任何系統查詢、不碰安裝／移除路徑；各 Android 用戶（user 0／95）
-各自自報、無跨用戶讀寫。App 側以此 flag 經 `HookElevator` 參與路由顯示，
-pm 執行仍走 su／Shizuku 通道（hook-only＋NoOp 仍唯讀）。
+自報 scope（H3 評估、H4 退場）：自 scope prefs 自報方案已由 F4b-P2
+file marker（`HookMarker`：`/data/system` 主＋`/data/local/tmp` 備，
+scope `system_server`／`daagent`，按實際安裝數寫入，見本文件 §1.2／§1.3
+與 `HookMarker.kt`）取代，不再注入自家 UI 進程。理由：file marker 有
+S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detected"），
+是目標 hook 存活證據；自家 prefs 只能證明自注入，需額外 2 scope 的
+注入面卻換來更弱的證據。hook 啟用訊號的唯一來源是 file marker，
+App 側經 `HookStateProvider` 讀取、僅顯示、永不進入路由
+（`hasLsposed` 恆 `false`，見 `DualViewModel.probeChannels`）。
 
 ## 2. Scope 勾選教學
 
@@ -120,24 +122,39 @@ pm 執行仍走 su／Shizuku 通道（hook-only＋NoOp 仍唯讀）。
    adb install --user 95 app/build/outputs/apk/debug/app-debug.apk
    ```
 
-### 2.2 LSPosed 勾選
+### 2.2 LSPosed 勾選（＋ App 內通道選擇）
 
 1. 打開 LSPosed 管理器 → 模組 → 勾選 **Galaxy Dual Plus Hook**（啟用）。
-2. 作用域（Scope）勾選以下兩項：
+2. 作用域（Scope）勾選以下兩項（H4：自家包自報已退場，file marker 為唯一訊號）：
    - `system`（系統框架，必勾，否則 system_server hook 不生效）
    - `com.samsung.android.da.daagent`（三星雙開代理）
 3. 若管理器支援按用戶啟用：主用戶與雙開用戶（user 95）**兩邊都要啟用**。
    不同 LSPosed 版本 UI 不同（全局作用域＋按用戶開關，或按用戶各自勾選），
    原則不變：兩個用戶都要開、都要含 `system`。
+4. App 內通道選擇（F4b-P1 手動 picker，見 `docs/USAGE.md` §4）：打開 App，
+   用四按鈕（自動／ROOT／Shizuku／LSPosed）選擇通道；LSPosed 模式顯示
+   Hook marker 行（`已啟用（system_server, daagent）`／`未偵測到`），
+   該行僅顯示、永不授權——LSPosed 通道為 NoOp 佔位，寫入一律拒絕。
 
 ### 2.3 重啟需求
 
 - **首次啟用／改動作用域後必須重啟**：`system_server` 注入只在開機時發生，
   不重啟等於沒 hook。建議直接完整重啟手機（軟重啟若管理器支援亦可）。
 - 僅更新模組 APK（未改 scope）：API 102 支援 hot reload，但系統進程建議仍重啟一次確認。
-- 驗證：重啟後 `adb logcat | grep GalaxyDualHook` 應看到
-  `hooked ...#getAllWhitelistedPackages` 等行；看不到＝類名／方法名與目前
+- 驗證 hook 安裝：重啟後 `adb logcat | grep GalaxyDualHook` 應看到
+  `hooked ...#getAllWhitelistedPackages` 等行＋
+  `marker wrote scope=...` 行；看不到＝類名／方法名與目前
   One UI 版本對不上，回報時請附上 `service list` 與版本號。
+- 驗證 marker 檔案（需 ROOT／shell 讀權限；App 讀不到即顯示「未偵測到」，
+  屬正常 fail-closed，不代表 hook 沒裝）：
+  ```bash
+  adb shell su -c 'cat /data/system/galaxydual_hook.active' 2>/dev/null \
+    || adb shell cat /data/local/tmp/galaxydual_hook.active
+  # 期望輸出（scope 依實際安裝而定）：
+  # scope=daagent,system_server
+  # timeMs=1710000000000
+  ```
+  App 內 LSPosed 模式的 Hook 行顯示同一內容（`已啟用（…）`／`未偵測到`）。
 
 ## 3. 免責聲明
 

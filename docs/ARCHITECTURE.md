@@ -26,14 +26,16 @@ val privilege: Privilege = when {
 }
 ```
 
-> Honesty note (H3) [待實機驗證]: the app-side hook flag is now wired
-> (`HookElevator` over the self-scope prefs mark, `DualViewModel.probeChannels`
-> feeds `routePrivilege(hasLsposed = hasHook)` and `channelReadyFor` [已支援]).
-> The hook channel still carries no pm execution: install/remove reuse the
-> su/Shizuku gateway (hook-only + NoOp stays read-only). The hook module
-> itself is an observe-only placeholder (empty policy) until a non-empty
-> policy source is wired (see `docs/HOOK.md` §1.1).
-> DEVICE-UNVERIFIED: no on-device hook load has been observed.
+> Honesty note (H4) [待實機驗證]: the router pseudocode above is the design
+> intent. The app-side hook flag does NOT feed routing: `routePrivilege` is
+> called with `hasLsposed = false` and readiness via `channelReadyFor`
+> ([已支援] pure gate, unit-tested) ignores any hook signal -- a present file
+> marker is existence+scope evidence, not proof of a live hook, so it must
+> never grant privilege (#19 principle). Hook state rides separately in
+> `UiState.hookActive/hookScopes` (F4b-P2 file marker, display-only) for the
+> LSPosed picker row. The hook module itself is an observe-only placeholder
+> (empty policy) until a non-empty policy source is wired (see `docs/HOOK.md`
+> §1.1). DEVICE-UNVERIFIED: no on-device hook load has been observed.
 
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (LSPosed / su).
 - Router is a pure function of two probes: `isHookActive()` and `isShizukuAlive()`.
@@ -53,10 +55,16 @@ val privilege: Privilege = when {
     verbatim as the single `-c` argument, argv form, no extra shell layer).
   - `NoOpGateway` (core): returns failure when `NONE`, prevents accidental writes.
 - Callers never branch on ROOT vs SHELL directly; they call the injected gateway.
-- Selection is static at startup (`DualViewModelFactory`: su file presence
-  first, else Shizuku binder alive + authorized, else `NoOp` fail-closed);
-  later recheck/refresh only re-probes and updates the display, never swaps
-  the gateway instance (cross-channel switching pending F4b).
+- Selection (F4b-P1): the persisted `ChannelPreference` (AUTO default,
+  `SharedPreferences`) is resolved via `assembleChannel` both at startup
+  (`DualViewModelFactory`) and on re-selection (`DualViewModel.selectChannel`
+  swaps the repo gateway under opMutex, then re-probes + refreshes);
+  `recheckPrivilege()` re-resolves AUTO when the environment changed. AUTO
+  keeps the F4a order (su file presence first, else Shizuku binder alive +
+  authorized, else `NoOp` fail-closed; hook never auto-selected). Explicit
+  LSPosed maps to the NoOp placeholder with the picker UI + file-marker
+  enable detection done in P2 (hook writes /data/system marker, app reads
+  direct + gateway cat; whitelist policy still pending).
 
 ## PmOutputParser
 
