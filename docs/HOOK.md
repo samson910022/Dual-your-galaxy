@@ -13,9 +13,14 @@
 
 - 原本回傳 `true`／已在名單 → 保持不變。
 - 原本回傳 `false`／不在名單 → 僅當該包名在模組政策集合內才放行。
-- 目前政策集合（`EXTRA_WHITELIST_PACKAGES`）預設為**空**，即 hooks 為
-  observe-only 佔位：會安裝、會記 log，但不改變任何行為。
-  接上政策來源（例如 RemotePreferences）後才真正放寬。
+- 目前政策集合（`EXTRA_WHITELIST_PACKAGES`，經 `PolicySource.effective(seed, remote)`
+  決策）預設為**空**，即 hooks 為 observe-only 佔位：會安裝、會記 log，
+  但不改變任何行為。接上政策來源（例如 RemotePreferences）後才真正放寬。
+  決策為 union-only（只增不減），包名校驗與 `core/ShellEscaper` 同規則；
+  靜態欄位合併由純函數 `WhitelistPatch` 執行（`MutableList` 原地追加、
+  `String[]` 重建替換，其餘一律放棄並記 log）。`remote` 快照目前為空
+ （H3 才接 RemotePreferences 唯讀＋變更監聽），行為與空種子完全一致
+  [待實機驗證]。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。

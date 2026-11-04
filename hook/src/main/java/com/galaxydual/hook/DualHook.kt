@@ -1,3 +1,4 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
 import android.util.Log
@@ -138,6 +139,9 @@ class DualHook : XposedModule() {
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown signatures
     // stay observe-only with a log line; nothing is ever narrowed here.
+    // H2: the effective set is PolicySource.effective(seed + remote). The
+    // remote snapshot is empty until H3 wires RemotePreferences, so behavior
+    // today is identical to the static seed (observe-only when empty).
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         val desc = try {
@@ -150,44 +154,59 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             emptyList()
         }
-        return WhitelistPolicy.apply(result, args, EXTRA_WHITELIST_PACKAGES, desc, ::logi)
+        return WhitelistPolicy.apply(result, args, effectivePolicy(), desc, ::logi)
     }
 
-    // Merges EXTRA entries into DUAL_APP_WHITELIST_PACKAGES after class init.
-    // Every give-up path logs why (locatable diagnostics); success logs how
-    // many entries were added. The original whitelist is never shrunk.
+    // Effective policy for this process: static seed (+ RemotePreferences
+    // snapshot once H3 wires it). Single seam for H3; IPC-free. NOTE: not
+    // covered by JVM tests (instantiating DualHook needs the framework); the
+    // decision logic inside PolicySource/WhitelistPatch is what tests lock.
+    internal fun effectivePolicy(): Set<String> =
+        PolicySource.effective(EXTRA_WHITELIST_PACKAGES, remotePolicySnapshot())
+
+    // Remote snapshot hook: empty until H3 wires LibXposed RemotePreferences
+    // (hook-side read-only + change listener into a volatile cache).
+    // Kept as a separate function so H3 touches exactly one seam.
+    internal fun remotePolicySnapshot(): Set<String> = emptySet()
+
+    // Merges policy entries into DUAL_APP_WHITELIST_PACKAGES after class init.
+    // Thin reflective shell over the pure WhitelistPatch decision object
+    // (unit-tested): every give-up path logs why (locatable diagnostics);
+    // success logs how many entries were added. The original whitelist is
+    // never shrunk.
     private fun patchWhitelistField(target: Class<*>) {
-        if (EXTRA_WHITELIST_PACKAGES.isEmpty()) return
+        val extra = effectivePolicy()
+        if (extra.isEmpty()) return
         try {
             val field = target.getDeclaredField(WHITELIST_FIELD_NAME)
+            // Static check BEFORE get(null): an instance field's get(null)
+            // throws IllegalArgumentException, which would mask the precise
+            // "not static" diagnosis. WhitelistPatch keeps its own isStatic
+            // guard as defense-in-depth for direct callers/tests.
             if (!Modifier.isStatic(field.modifiers)) {
                 logi("skip patch $WHITELIST_FIELD_NAME on ${target.name}: field is not static")
                 return
             }
             field.isAccessible = true
-            val current = field.get(null)
-            if (current is MutableList<*>) {
-                @Suppress("UNCHECKED_CAST")
-                val list = current as MutableList<String>
-                val add = EXTRA_WHITELIST_PACKAGES.filter { !list.contains(it) }
-                list.addAll(add)
-                logi("patched $WHITELIST_FIELD_NAME on ${target.name} (MutableList): +${add.size} entries")
-            } else if (current != null && current.javaClass.isArray &&
-                current.javaClass.componentType == String::class.java
-            ) {
-                @Suppress("UNCHECKED_CAST")
-                val arr = current as Array<String>
-                val add = EXTRA_WHITELIST_PACKAGES.filter { !arr.contains(it) }
-                field.set(
-                    null,
-                    (arr.toList() + add).toTypedArray(),
-                )
-                logi("patched $WHITELIST_FIELD_NAME on ${target.name} (String[]): +${add.size} entries")
-            } else {
-                logi(
-                    "skip patch $WHITELIST_FIELD_NAME on ${target.name}: unsupported type " +
-                        (current?.javaClass?.name ?: "null"),
-                )
+            val current = try {
+                field.get(null)
+            } catch (t: Throwable) {
+                logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
+                return
+            }
+            when (val outcome = WhitelistPatch.apply(current, true, extra, WHITELIST_FIELD_NAME, target.name)) {
+                is WhitelistPatch.Outcome.PatchedInPlace ->
+                    logi("patched $WHITELIST_FIELD_NAME on ${target.name} (MutableList): +${outcome.added} entries")
+                is WhitelistPatch.Outcome.Replaced -> {
+                    try {
+                        field.set(null, outcome.value)
+                    } catch (t: Throwable) {
+                        logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
+                        return
+                    }
+                    logi("patched $WHITELIST_FIELD_NAME on ${target.name} (String[]): +${outcome.added} entries")
+                }
+                is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason)
             }
         } catch (t: Throwable) {
             // Leave the original whitelist untouched on any reflection mismatch.
@@ -254,9 +273,11 @@ class DualHook : XposedModule() {
         private const val HOOK_ID_PREFIX = "galaxydual:"
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"
 
-        // Placeholder policy set: empty = observe-only. Wire to RemotePreferences
-        // (or a managed config) when a real allowlist source is added.
+        // Static policy seed: empty = observe-only. H2 routes it through
+        // PolicySource.effective(seed, remote); the remote snapshot stays empty
+        // until H3 wires RemotePreferences. Union-only: entries are never
+        // removed. H3 adding seed defaults flows through automatically.
         @JvmField
-        val EXTRA_WHITELIST_PACKAGES: Set<String> = emptySet()
+        val EXTRA_WHITELIST_PACKAGES: Set<String> = PolicySource.STATIC_SEED
     }
 }
