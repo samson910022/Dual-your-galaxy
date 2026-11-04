@@ -7,10 +7,11 @@ plugins {
 // Android defaults shared by all modules.
 android {
     namespace = "com.galaxydual.core"
-    compileSdk = 34
+    // SDK levels are single-sourced from gradle/libs.versions.toml.
+    compileSdk = libs.versions.compileSdk.get().toInt()
 
     defaultConfig {
-        minSdk = 29
+        minSdk = libs.versions.minSdk.get().toInt()
         // Consumer ProGuard rules are empty for this skeleton.
         consumerProguardFiles("consumer-rules.pro")
     }
