@@ -1,0 +1,150 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+//
+// Phase F4b-P1 (issue #6): channel-selection model, persistence, and dynamic
+// re-selection assembly. Phase F4b-P2 adds the picker UI (MainActivity) and
+// the hook-enable display (HookStateProvider); the LSPosed gateway mapping
+// below is UNCHANGED (still the NoOp placeholder).
+//
+// Design:
+// - ChannelPreference has exactly four values (AUTO / ROOT / SHIZUKU /
+//   LSPOSED). NoOp is only the fail-closed fallback gateway, never a menu
+//   entry, so it is NOT a preference value.
+// - Persistence is framework SharedPreferences (zero new dependencies):
+//   explicit prefs file + key, default AUTO, unknown/blank stored values
+//   fall back to AUTO. The string mapping is pure Kotlin so JVM unit tests
+//   cover it; only load/save touch the Android stub.
+// - Auto semantics are unchanged from the F4a factory: su file presence
+//   first, then Shizuku binder alive + authorized, else NoOp fail-closed.
+//   The hook channel is never auto-selected (conservative continuation:
+//   the marker signal is display-only evidence, see HookMarker, and must
+//   never grant privilege without on-device verification).
+// - LSPOSED explicitly selected resolves to LSPOSED_PLACEHOLDER, which still
+//   builds a NoOp gateway (whitelist policy branch pending -- writes refused
+//   with the reason stated, never executed).
+package com.galaxydual.plus
+
+import android.content.SharedPreferences
+import com.galaxydual.core.CmdGateway
+import com.galaxydual.core.NoOpGateway
+
+// User-visible channel choice. Exactly four values; NoOp stays a fallback
+// only and never enters the picker menu (P2).
+enum class ChannelPreference {
+    AUTO,
+    ROOT,
+    SHIZUKU,
+    LSPOSED,
+}
+
+// Gateway actually built for a preference after Auto resolution.
+enum class ResolvedChannel {
+    ROOT,
+    SHIZUKU,
+    NOOP,
+    // Explicit LSPosed choice until the P2 hook channel lands.
+    LSPOSED_PLACEHOLDER,
+}
+
+// Explicit SharedPreferences file + key (default AUTO). Both constants are
+// part of the persistence contract: renaming either orphans stored choices.
+const val CHANNEL_PREFS_NAME = "dual_channel_prefs"
+const val CHANNEL_PREF_KEY = "channel_preference"
+
+// Stable stored form (lowercase literals, never the enum name directly, so a
+// future rename/reorder cannot orphan stored choices).
+fun ChannelPreference.toStored(): String = when (this) {
+    ChannelPreference.AUTO -> "auto"
+    ChannelPreference.ROOT -> "root"
+    ChannelPreference.SHIZUKU -> "shizuku"
+    ChannelPreference.LSPOSED -> "lsposed"
+}
+
+// Parses a stored value; null/blank/unknown (including the legacy "noop" or
+// any future value) falls back to AUTO. Pure: covered by JVM unit tests.
+fun channelPreferenceFromStored(raw: String?): ChannelPreference =
+    when (raw?.trim()?.lowercase()) {
+        "root" -> ChannelPreference.ROOT
+        "shizuku" -> ChannelPreference.SHIZUKU
+        "lsposed" -> ChannelPreference.LSPOSED
+        else -> ChannelPreference.AUTO
+    }
+
+// Reads the persisted choice (default AUTO). Thin wrapper over the pure
+// mapping above; never called on JVM tests (Android stub would throw).
+fun loadChannelPreference(prefs: SharedPreferences): ChannelPreference =
+    channelPreferenceFromStored(prefs.getString(CHANNEL_PREF_KEY, null))
+
+// Persists the choice so a process restart remembers it. Async apply: the
+// in-memory preference is already updated by the caller.
+fun SharedPreferences.saveChannelPreference(pref: ChannelPreference) {
+    edit().putString(CHANNEL_PREF_KEY, pref.toStored()).apply()
+}
+
+// Resolves a preference to the gateway channel to build. Pure: covered by
+// JVM unit tests.
+// - AUTO: su presence first, then Shizuku authorized, else NOOP (F4a order,
+//   hook never auto-selected).
+// - Explicit ROOT/SHIZUKU win regardless of probes (probes fail closed
+//   later when the channel is actually unusable).
+// - Explicit LSPOSED is a placeholder until P2 (hook enable detection).
+fun ChannelPreference.resolveChannel(suPresent: Boolean, shizukuAuthorized: Boolean): ResolvedChannel =
+    when (this) {
+        ChannelPreference.ROOT -> ResolvedChannel.ROOT
+        ChannelPreference.SHIZUKU -> ResolvedChannel.SHIZUKU
+        ChannelPreference.LSPOSED -> ResolvedChannel.LSPOSED_PLACEHOLDER
+        ChannelPreference.AUTO -> when {
+            suPresent -> ResolvedChannel.ROOT
+            shizukuAuthorized -> ResolvedChannel.SHIZUKU
+            else -> ResolvedChannel.NOOP
+        }
+    }
+
+// Builds the gateway for a resolved channel. Constructor-only, no I/O, so
+// JVM-constructible (same pattern as GatewayAssemblyTest). LSPosed builds
+// NoOp by policy until the whitelist branch lands (F4b-P2): the placeholder
+// must never be mistaken for an executable channel -- DualViewModel refuses
+// writes under it with the reason stated.
+// TODO(hook-channel): return the real LSPosed hook gateway for
+// LSPOSED_PLACEHOLDER once the whitelist policy branch is verified on-device.
+fun buildGatewayForChannel(channel: ResolvedChannel, packageName: String): CmdGateway =
+    when (channel) {
+        ResolvedChannel.ROOT -> SuCmdGateway()
+        ResolvedChannel.SHIZUKU -> ShizukuCmdGateway(packageName)
+        ResolvedChannel.NOOP -> NoOpGateway()
+        ResolvedChannel.LSPOSED_PLACEHOLDER -> NoOpGateway()
+    }
+
+// One assembly: the selected gateway plus the fresh su/Shizuku instances
+// backing the probes. The selected gateway SHARES its instance with the
+// matching elevator gateway (ROOT -> suGateway, SHIZUKU -> shizukuGateway)
+// so probes verify the actual channel the repo uses.
+data class ChannelAssembly(
+    val gateway: CmdGateway,
+    val suGateway: SuCmdGateway,
+    val shizukuGateway: ShizukuCmdGateway,
+    val channel: ResolvedChannel,
+)
+
+// Single source of truth for preference -> live gateways. Used by both the
+// startup factory and DualViewModel.selectChannel, so Auto order and the
+// LSPosed placeholder can never drift between the two paths.
+fun assembleChannel(
+    preference: ChannelPreference,
+    suPresent: Boolean,
+    shizukuAuthorized: Boolean,
+    packageName: String,
+): ChannelAssembly {
+    val suGateway = SuCmdGateway()
+    val shizukuGateway = ShizukuCmdGateway(packageName)
+    val channel = preference.resolveChannel(suPresent, shizukuAuthorized)
+    val gateway: CmdGateway = when (channel) {
+        ResolvedChannel.ROOT -> suGateway
+        ResolvedChannel.SHIZUKU -> shizukuGateway
+        // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only) until the
+        // whitelist policy branch is verified on-device; see TODO above.
+        ResolvedChannel.NOOP,
+        ResolvedChannel.LSPOSED_PLACEHOLDER,
+        -> NoOpGateway()
+    }
+    return ChannelAssembly(gateway, suGateway, shizukuGateway, channel)
+}

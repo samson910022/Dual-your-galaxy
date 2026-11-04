@@ -18,8 +18,23 @@ import java.lang.reflect.Modifier
 class DualHook : XposedModule() {
 
     // System server entry: hook the Samsung dual-app service whitelist queries.
+    //
+    // Phase F4b-P2 (issue #6): when at least one hook installs, best-effort
+    // record the hook-active marker (HookMarker, scope "system_server") so
+    // the app UI can show LSPosed enable state without any IPC. markActive
+    // never throws by contract; the extra try/catch is a defensive seam only.
+    // Honesty: a stale marker from a previous boot (file survives reboots)
+    // can read "active" until rewritten -- the app labels the signal as
+    // existence+scope evidence, staleness hardening stays DEVICE-UNVERIFIED.
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
-        hookDualAppManagerService(param.classLoader)
+        val installed = hookDualAppManagerService(param.classLoader)
+        if (installed > 0) {
+            try {
+                HookMarker.markActive(HookMarker.SCOPE_SYSTEM_SERVER, onLog = ::logi)
+            } catch (_: Throwable) {
+                // Defensive only: markActive never throws by contract.
+            }
+        }
     }
 
     // Called for every loaded package; filters to recommended scopes only.
@@ -38,32 +53,52 @@ class DualHook : XposedModule() {
             return
         }
         if (param.packageName == DA_AGENT_PACKAGE) {
-            hookWhiteListApps(param.defaultClassLoader)
+            // Phase F4b-P2: same marker contract as system_server above,
+            // scope "daagent". Both processes read-merge-write the same file,
+            // so each installed scope survives the other's write.
+            val installed = hookWhiteListApps(param.defaultClassLoader)
+            if (installed > 0) {
+                try {
+                    HookMarker.markActive(HookMarker.SCOPE_DAAGENT, onLog = ::logi)
+                } catch (_: Throwable) {
+                    // Defensive only: markActive never throws by contract.
+                }
+            }
         }
     }
 
     // Hooks DualAppManagerService#getAllWhitelistedPackages and
     // #isInstalledWhitelistedPackage when present on this Samsung ROM.
-    private fun hookDualAppManagerService(classLoader: ClassLoader) {
+    // Returns the number of installed hooks (0 = nothing hooked, so the
+    // caller skips the active-marker write and stays honestly undetected).
+    private fun hookDualAppManagerService(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, SERVICE_CLASS_CANDIDATES)
-            ?: return logi("DualAppManagerService not present, skip system_server hooks")
+        if (target == null) {
+            logi("DualAppManagerService not present, skip system_server hooks")
+            return 0
+        }
         // Hook whitelist query methods only; install/remove paths are never hooked.
+        var installed = 0
         for (methodName in SERVICE_WHITELIST_METHODS) {
             val overloads = target.declaredMethods.filter { it.name == methodName }
             if (overloads.isEmpty()) {
                 logi("method not found: ${target.name}#$methodName")
                 continue
             }
-            overloads.forEach { hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName) }
+            overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) installed++ }
         }
+        return installed
     }
 
-    // Hooks the daagent-side whitelist holder reflectively.
-    private fun hookWhiteListApps(classLoader: ClassLoader) {
+    // Hooks the daagent-side whitelist holder reflectively. Returns the
+    // number of installed hooks (clinit patch hook + query-method hooks);
+    // 0 keeps the caller from writing the active marker.
+    private fun hookWhiteListApps(classLoader: ClassLoader): Int {
         val target = try {
             classLoader.loadClass(WHITE_LIST_APPS_CLASS)
         } catch (_: Throwable) {
-            return logi("$WHITE_LIST_APPS_CLASS not present, skip daagent hooks")
+            logi("$WHITE_LIST_APPS_CLASS not present, skip daagent hooks")
+            return 0
         }
         // Best-effort diagnostics: confirm the expected constant exists.
         try {
@@ -73,6 +108,7 @@ class DualHook : XposedModule() {
             logi("field $WHITELIST_FIELD_NAME not found on $WHITE_LIST_APPS_CLASS")
         }
         // Patch the static whitelist right after <clinit> finishes.
+        var installed = 0
         try {
             hookClassInitializer(target)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -82,6 +118,7 @@ class DualHook : XposedModule() {
                     patchWhitelistField(target)
                     null
                 }
+            installed++
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }
@@ -92,11 +129,14 @@ class DualHook : XposedModule() {
         // does not understand stay observe-only (see WhitelistPolicy.apply).
         target.declaredMethods
             .filter { it.name.contains("hitelist", ignoreCase = true) }
-            .forEach { hookWithDeoptimize(it, HOOK_ID_PREFIX + it.name) }
+            .forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + it.name)) installed++ }
+        return installed
     }
 
     // Installs one hook with best-effort inlining protection and fail-safe
-    // exception mode.
+    // exception mode. Returns true only when the hook installed (the P2
+    // active marker counts these; a failed install keeps the module honestly
+    // "not detected" instead of claiming enable state it never earned).
     //
     // Honesty note: deoptimize(Executable) exists, but without caller identity
     // info we can only deoptimize the hooked callee itself (best-effort);
@@ -104,7 +144,7 @@ class DualHook : XposedModule() {
     // inlined before this runs may still bypass the hook. The anti-inline
     // effect is unverified on-device (no Samsung test unit); the return value
     // is logged so a no-op is visible instead of silently swallowed.
-    private fun hookWithDeoptimize(method: Method, hookId: String) {
+    private fun hookWithDeoptimize(method: Method, hookId: String): Boolean {
         try {
             try {
                 val deoptimized = deoptimize(method)
@@ -130,8 +170,10 @@ class DualHook : XposedModule() {
                 .setId(hookId)
                 .intercept { chain -> interceptWhitelistCall(chain) }
             logi("hooked ${method.declaringClass.name}#${method.name}")
+            return true
         } catch (t: Throwable) {
             logi("hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
+            return false
         }
     }
 
