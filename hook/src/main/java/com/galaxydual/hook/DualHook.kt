@@ -217,24 +217,22 @@ class DualHook : XposedModule() {
     companion object {
         private const val TAG = "GalaxyDualHook"
 
-        // LSPosed scope pseudo-name for system_server (served via
-        // onSystemServerStarting; never arrives as an onPackageLoaded name).
-        const val SYSTEM_SCOPE = "system"
+        // Scope constants are single-sourced in HookScopes (pure JVM, unit-
+        // testable). Kept here as aliases so existing call sites and the CI
+        // scope-parity grep keep working.
+        const val SYSTEM_SCOPE = HookScopes.SYSTEM_SCOPE
 
         // Real framework package name LSPosed delivers for the system_server
         // process via onPackageLoaded. Listed here only so the early-return
         // above stays in sync; it is NOT a hook target and must never detach.
-        const val ANDROID_PACKAGE = "android"
-        const val DA_AGENT_PACKAGE = "com.samsung.android.da.daagent"
+        const val ANDROID_PACKAGE = HookScopes.ANDROID_PACKAGE
+        const val DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE
 
         // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
         // NOTE: com.android.settings was removed (D2): no settings-side hook
         // exists, so scoping it only widened the injection surface. SYSTEM_SCOPE
         // never matches onPackageLoaded; it is kept here for scope.list parity.
-        val SUPPORTED_SCOPES = setOf(
-            SYSTEM_SCOPE,
-            DA_AGENT_PACKAGE,
-        )
+        val SUPPORTED_SCOPES: Set<String> = HookScopes.SUPPORTED_SCOPES
 
         // System-service candidates tried in order; first loadable class wins.
         // Class names differ across One UI releases, so all access is reflective.

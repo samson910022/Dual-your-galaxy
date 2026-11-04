@@ -26,6 +26,14 @@ val privilege: Privilege = when {
 }
 ```
 
+> Honesty note (H1/F4b) [待實機驗證]: the pseudocode above is the design intent. The
+> app-side `hasLsposed` probe is still conservatively `false`
+> (`DualViewModel.probeChannels` TODO F4b): the hook channel is never
+> selected yet, so `Privilege.ROOT` today only comes from su. The hook
+> module itself is an observe-only placeholder (empty policy) until the
+> RemotePreferences policy source is wired (see `docs/HOOK.md` §1.1).
+> DEVICE-UNVERIFIED: no on-device hook load has been observed.
+
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (LSPosed / su).
 - Router is a pure function of two probes: `isHookActive()` and `isShizukuAlive()`.
 - UI disables write actions when privilege is `NONE`.

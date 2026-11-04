@@ -131,6 +131,76 @@ jobs:
             exit 1
           fi
           echo "PASS: hook entry (DualHook + xposed resources) present in APK"
+      # H1 scope parity: scope.list <-> HookScopes/DualHook <-> manifest.
+      # Single source of truth is HookScopes.kt; DualHook companions delegate.
+      - name: Scope parity (hook scopes)
+        run: |
+          set -e
+          echo "== scope.list =="
+          cat hook/src/main/resources/META-INF/xposed/scope.list
+          echo "== HookScopes (single source of truth) =="
+          grep -F "SYSTEM_SCOPE = " hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          grep -F "DA_AGENT_PACKAGE = " hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          grep -F "SUPPORTED_SCOPES" -A 5 hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          echo "== DualHook delegation =="
+          grep -F "SYSTEM_SCOPE = HookScopes.SYSTEM_SCOPE" hook/src/main/java/com/galaxydual/hook/DualHook.kt
+          grep -F "DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE" hook/src/main/java/com/galaxydual/hook/DualHook.kt
+          grep -F "SUPPORTED_SCOPES" hook/src/main/java/com/galaxydual/hook/DualHook.kt | grep -F "= HookScopes.SUPPORTED_SCOPES"
+          echo "== manifest xposedscope =="
+          grep -F "xposedscope" hook/src/main/AndroidManifest.xml
+          # scope.list must be exactly the two recommended scopes, in order.
+          printf 'system\ncom.samsung.android.da.daagent\n' > /tmp/expected_scope.list
+          diff -u /tmp/expected_scope.list hook/src/main/resources/META-INF/xposed/scope.list
+          # Manifest must carry the same two scopes (semicolon-joined).
+          grep -F 'android:value="system;com.samsung.android.da.daagent"' hook/src/main/AndroidManifest.xml
+          # module.prop fail-safe marker + version sync with app versionName.
+          grep -F 'exceptionMode=protective' hook/src/main/resources/META-INF/xposed/module.prop
+          APP_VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n 1 | tr -d ' \r')
+          MOD_VER=$(grep -oP '^version=\K.*' hook/src/main/resources/META-INF/xposed/module.prop | head -n 1 | tr -d ' \r')
+          echo "app versionName=$APP_VER module.prop version=$MOD_VER"
+          test "$APP_VER" = "$MOD_VER"
+          echo "PASS: scope parity + module fail-safe + version sync"
+      # H1 honesty gate: unverified features must never be claimed as working.
+      - name: Honesty gate (no unverified claims)
+        run: |
+          set -e
+          echo "== forbid claiming unverified dual support as done =="
+          # Banned phrases in code/docs (DEVICE-UNVERIFIED / [待實機驗證] required instead).
+          # Exclude build outputs and VCS metadata for speed and to avoid binary noise.
+          if grep -rn --exclude-dir=.git --exclude-dir=build --exclude-dir=.gradle --include='*.kt' --include='*.md' --include='*.xml' --include='*.kts' -E '已支援雙開|已驗證可用|穩定支援 One ?UI|實機驗證通過' . ; then
+            echo "FAIL: unverified success claim found (use [待實機驗證]/DEVICE-UNVERIFIED instead)"
+            exit 1
+          fi
+          echo "PASS: honesty gate"
+      # H1 no-touch gates: Knox/Secure Folder + GPL code containment.
+      # Scope is intentionally */src/main + *.kt: policy docs (docs/, README)
+      # may name these projects/systems to declare them out of scope, and
+      # tests may assert the gates themselves; executable sources must not.
+      - name: Knox no-touch gate
+        run: |
+          set -e
+          echo "== Knox/Secure Folder must only appear in policy docs =="
+          # Allowed only in policy declarations (docs + manifest description);
+          # never in hook/core/app executable sources.
+          # \b is a GNU grep extension (runner is ubuntu-latest); it keeps
+          # short tokens (edm/mdm/persona) from false-positive on words like
+          # "declaredMethods".
+          if grep -rni --include='*.kt' -E 'knox|secure_?folder|timakeystore|dualspa|enterprise_container|sec_container|container_?agent|knox_container|\bedm\b|\bmdm\b|\bpersona\b|warranty.*void.*0x1|defex|/data/knox|/mnt/knox|/data/media/0/../knox' hook/src/main app/src/main core/src/main ; then
+            echo "FAIL: Knox-related reference in executable sources"
+            exit 1
+          fi
+          echo "PASS: Knox no-touch"
+      - name: GPL containment gate
+        run: |
+          set -e
+          echo "== GPL project code must not leak into sources =="
+          # Docs (CREDITS/HOOK/README) may reference idea-only projects by name;
+          # executable sources must stay original MIT.
+          if grep -rn --include='*.kt' -E 'DualClone|CloneCat|AppDualZuku|JingMatrix|KnoxPatch|edtweak|dual-manager|dual-apps' hook/src app/src core/src ; then
+            echo "FAIL: third-party project reference in executable sources (docs only)"
+            exit 1
+          fi
+          echo "PASS: GPL containment"
       # Run :core + :hook unit tests. Failures fail the job.
       - name: Unit tests (core debug)
         run: |
