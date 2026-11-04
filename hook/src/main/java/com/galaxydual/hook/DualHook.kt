@@ -181,9 +181,9 @@ class DualHook : XposedModule() {
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown signatures
     // stay observe-only with a log line; nothing is ever narrowed here.
-    // H2: the effective set is PolicySource.effective(seed + remote). The
-    // remote snapshot is empty until H3 wires RemotePreferences, so behavior
-    // today is identical to the static seed (observe-only when empty).
+    // H2: the effective set is PolicySource.effective(seed + remote). No remote
+    // source is wired, so behavior today is identical to the static seed
+    // (observe-only when empty).
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         val desc = try {
@@ -293,12 +293,12 @@ class DualHook : XposedModule() {
         const val DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE
 
         // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
-        // H3 adds the module's own UI packages (self scope) for the per-user
-        // active mark (see HookState); the mark write is the only behavior in
-        // self processes. NOTE: com.android.settings stays out (D2): no
-        // settings-side hook exists, so scoping it would only widen the
-        // injection surface. SYSTEM_SCOPE never matches onPackageLoaded; it is
-        // kept here for scope.list parity.
+        // H4: self-scope packages (H3) were evaluated and retired; the F4b-P2
+        // file marker is the single hook-active signal (see HOOK.md §1.4).
+        // NOTE: com.android.settings stays out (D2): no settings-side hook
+        // exists, so scoping it would only widen the injection surface.
+        // SYSTEM_SCOPE never matches onPackageLoaded; it is kept here for
+        // scope.list parity.
         val SUPPORTED_SCOPES: Set<String> = HookScopes.SUPPORTED_SCOPES
 
         // System-service candidates tried in order; first loadable class wins.
