@@ -23,7 +23,8 @@ class ShizukuElevator(
     // Command used to list profiles; kept as a constant for testability.
     val listUsersCmd: String = "pm list users"
 
-    // Probe: `pm list users` must exit 0; dual id is the first non-owner profile.
+    // Probe: `pm list users` must exit 0; dual id resolved via the shared
+    // C1 safety boundary (exactly one DUAL-labeled non-zero profile, else -1).
     override suspend fun probe(): ProbeResult {
         val res = gateway.run(listUsersCmd)
         if (res.exit != 0) {
@@ -35,13 +36,12 @@ class ShizukuElevator(
             )
         }
         val profiles = PmOutputParser.parseUsers(res.out)
-        val dual = profiles.firstOrNull { it.label.contains("DUAL", ignoreCase = true) }
-            ?: profiles.firstOrNull { it.userId != 0 }
+        val dualId = PmOutputParser.resolveDualUserId(profiles)
         return ProbeResult(
             level = Privilege.SHELL,
             hasShizuku = true,
             hasRoot = false,
-            dualUserId = dual?.userId ?: -1,
+            dualUserId = dualId,
         )
     }
 }
@@ -73,8 +73,7 @@ class SuElevator(
         val usersRes = gateway.run(listUsersCmd)
         val dualId = if (usersRes.exit == 0) {
             val profiles = PmOutputParser.parseUsers(usersRes.out)
-            (profiles.firstOrNull { it.label.contains("DUAL", ignoreCase = true) }
-                ?: profiles.firstOrNull { it.userId != 0 })?.userId ?: -1
+            PmOutputParser.resolveDualUserId(profiles)
         } else {
             -1
         }

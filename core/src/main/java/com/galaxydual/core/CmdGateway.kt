@@ -40,7 +40,7 @@ class NoOpGateway : CmdGateway {
 
 // Validates and escapes shell arguments; rejects anything outside the allowlist.
 // Package names, permissions and ops may only contain [a-zA-Z0-9._-].
-// User ids must be non-negative integers.
+// User ids must be positive dual profile ids (never 0: the owner profile is off-limits).
 object ShellEscaper {
     private val SAFE_TOKEN = Regex("^[a-zA-Z0-9._-]+$")
     private val DIGITS = Regex("^[0-9]+$")
@@ -52,14 +52,21 @@ object ShellEscaper {
     }
 
     // Validates a numeric user id and renders it as a string.
+    // C1 safety boundary (issue #2, P0): user 0 (owner profile) is rejected here
+    // on purpose. All pm command builders (install-existing / uninstall / grant /
+    // appops / path) funnel through this function, so no write path can ever be
+    // assembled against the owner profile; callers must resolve a real dual id
+    // first (PmOutputParser.resolveDualUserId) or fail closed.
     fun escapeUserId(userId: Int): String {
-        require(userId >= 0) { "invalid userId: $userId" }
+        require(userId > 0) { "invalid userId (must be a dual profile id, never 0): $userId" }
         return userId.toString()
     }
 
-    // Validates a raw user id string containing only digits.
+    // Compat-only raw variant; prefer escapeUserId(Int). Same >0 dual-id policy:
+    // all-zero inputs ("0", "00", ...) are rejected like userId == 0 above.
     fun escapeUserIdRaw(raw: String): String {
         require(raw.isNotEmpty() && DIGITS.matches(raw)) { "invalid userId: $raw" }
+        require(raw.trimStart('0').isNotEmpty()) { "invalid userId (must be a dual profile id, never 0): $raw" }
         return raw
     }
 
