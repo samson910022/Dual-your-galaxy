@@ -280,12 +280,21 @@ class ShizukuCmdGateway(
             binder
         }
 
-    // One exec round-trip with a bounded wait. Dead binder / RemoteException /
-    // timeout all map to explicit CmdResult errors; the stale cache is dropped
-    // so the next call rebinds instead of reusing a dead handle.
+    // One exec round-trip with a bounded client wait. Dead binder /
+    // RemoteException / timeout all map to explicit CmdResult errors; the
+    // stale cache is dropped so the next call rebinds instead of reusing a
+    // dead handle.
     //
-    // Late-result isolation (PR-3 stage 1, issue #24): the wait above is
-    // withTimeoutOrNull, so after EXEC_TIMEOUT_MS the caller stops waiting and
+    // Bounded deadline (PR-32 P1-2): the Parcel transact below is a
+    // synchronous binder.transact(flags=0) that Dispatchers.IO cannot
+    // interrupt, so the previous withTimeoutOrNull wrapper did not bound the
+    // client wait (a hung transact kept the caller suspended past the
+    // deadline). The block now runs via awaitBounded(EXEC_TIMEOUT_MS)
+    // (Future.get on a per-call "shizuku-transact-N" daemon thread): the client
+    // wait always returns by the deadline with null, while the Binder call
+    // itself is never force-stopped.
+    //
+    // Late-result isolation: after the deadline the caller stops waiting and
     // this returns timedOut() (exit != 0, "shizuku: exec timed out..."). That
     // outcome is UNKNOWN by construction, never authoritative: the repository
     // judges it through the trusted parse (#22 owns that rule -- a non-zero /
@@ -295,49 +304,58 @@ class ShizukuCmdGateway(
     // gateway itself never retries internally, so a timeout never triggers a
     // single delayed resend that may overlap a still-running service call.
     // The orphaned transact, if the binder thread is still blocked in it after
-    // cancellation, owns its Parcel pair (recycled in finally below); its late
-    // reply is discarded, never applied to state. dropBindingLocked() on the
-    // timeout path additionally guarantees the next run() rebinds fresh
-    // instead of reusing the timed-out handle.
+    // the deadline, owns its Parcel pair (recycled in finally below); its
+    // late reply is discarded, never applied to state -- the await future's
+    // late value is dropped and touches no shared holder.
+    // dropBindingLocked() on the timeout path additionally guarantees the
+    // next run() rebinds fresh instead of reusing the timed-out handle.
+    // A delivered write is never blindly resent by this gateway.
     private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
         if (!binder.isBinderAlive) {
             bindMutex.withLock { dropBindingLocked() }
             return ShizukuExecErrors.binderDead()
         }
         return try {
-            val out = withTimeoutOrNull(ShizukuExecProtocol.EXEC_TIMEOUT_MS) {
-                withContext(Dispatchers.IO) {
-                    val data = Parcel.obtain()
-                    val reply = Parcel.obtain()
-                    try {
-                        data.writeString(cmd)
-                        binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
-                        // No readException(): the service writes a raw int exit
-                        // first, which readException would misread as an
-                        // exception code on any non-zero exit.
-                        // The service side truncates via buildResult/capped() in
-                        // SuCmdGateway.kt: whenever truncated=true the marker
-                        // text is appended to the streams, and the wire layout
-                        // only carries (exit, stdout, stderr). Mirror the
-                        // marker into CmdResult.truncated via decodeExecReply()
-                        // so parsers can tell "clean empty" from "cut off"
-                        // without changing any caller.
-                        val execExit = reply.readInt()
-                        val execOut = reply.readString() ?: ""
-                        val execErr = reply.readString() ?: ""
-                        decodeExecReply(execExit, execOut, execErr)
-                    } finally {
-                        reply.recycle()
-                        data.recycle()
-                    }
+            val out = awaitBounded(ShizukuExecProtocol.EXEC_TIMEOUT_MS) {
+                val data = Parcel.obtain()
+                val reply = Parcel.obtain()
+                try {
+                    data.writeString(cmd)
+                    binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
+                    // No readException(): the service writes a raw int exit
+                    // first, which readException would misread as an
+                    // exception code on any non-zero exit.
+                    // The service side truncates via buildResult/capped() in
+                    // SuCmdGateway.kt: whenever truncated=true the marker
+                    // text is appended to the streams, and the wire layout
+                    // only carries (exit, stdout, stderr). Mirror the
+                    // marker into CmdResult.truncated via decodeExecReply()
+                    // so parsers can tell "clean empty" from "cut off"
+                    // without changing any caller.
+                    val execExit = reply.readInt()
+                    val execOut = reply.readString() ?: ""
+                    val execErr = reply.readString() ?: ""
+                    decodeExecReply(execExit, execOut, execErr)
+                } finally {
+                    reply.recycle()
+                    data.recycle()
                 }
             }
             out ?: run {
                 bindMutex.withLock { dropBindingLocked() }
                 ShizukuExecErrors.timedOut()
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: InterruptedException) {
+            // awaitBounded restores the interrupt flag before rethrowing; this
+            // path converts the interrupt into a value return (remoteFailed),
+            // so consume the flag here -- otherwise it would linger on the
+            // pooled Dispatchers.IO worker that runs this gateway.
+            Thread.interrupted()
+            bindMutex.withLock { dropBindingLocked() }
+            ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName)
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
             bindMutex.withLock { dropBindingLocked() }
             ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName)
         }
