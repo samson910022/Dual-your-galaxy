@@ -279,25 +279,37 @@ class DualRepository(
     // - Confirmed(id): clean channels whose CLONE claims agree on one id.
     // - Absent: 僅當兩來源對所有相關 user 給出明確且一致的非 CLONE 類型
     //   （每條 claim 皆為 OTHER、無 UNKNOWN、兩源 user 集合相同、無 CLONE、
-    //   無衝突），且 property 不指向仍可能存在的 clone（有正值 id 但 typed
+    //   無衝突），且 property 無具體指向（任何非 null 含 0 但 typed
     //   無對應 Confirmed 即 Unknown）；其餘一律 Unknown，絕不清空舊單。
+    //   另收 pmIds 否決（見參數）：pm 快照多出的戶即 typed 漏戶，不得 Absent。
     // - Unknown: 通道截斷/失敗（exit/identity 閘）、輸出不可信、證據矛盾
-    //   （Refused）、單源 clone、型別缺失、集合不一致、property 指向不明。
+    //   （Refused）、單源 clone、型別缺失、集合不一致、property 指向不明
+    //   （含拋出而無回應的 property 通道）、pm 快照否決。
     // Never throws except on coroutine cancellation. The legacy Int entries
     // above are untouched; this is purely additive.
     // NOTE (p25-rebase adapt): the Int path above stays delegated to the
     // shared fetcher (single source, no duplication); only this typed entry
     // runs its own three gateway calls because it needs per-channel failure
     // reasons the Int seam cannot carry.
-    suspend fun resolveDualUserIdTyped(): DualIdResolution {
+    // @param pmIds pm 快照戶集合（VM 傳 profiles id 集合；null 表無快照不否決）：
+    //   Absent 須另滿足 pmIds==null 或 pmIds 為 verboseIds 子集，否則 pm
+    //   多出的戶即 typed 漏戶，一律 Unknown（雙 verbose 一致漏戶誤報修正）。
+    //   加法參數（預設 null），舊呼叫端語意不變。
+    suspend fun resolveDualUserIdTyped(pmIds: Set<Int>? = null): DualIdResolution {
         val verboseRes = try {
             gateway.run(CMD_USER_LIST_VERBOSE)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualIdResolution.Unknown("typed channel interrupted: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             return DualIdResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
         }
         val dumpsysRes = try {
             gateway.run(CMD_DUMPSYS_USER)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualIdResolution.Unknown("typed channel interrupted: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             return DualIdResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
@@ -321,24 +333,29 @@ class DualRepository(
         }
         val propRes = try {
             gateway.run(CMD_GETPROP_DUAL)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualIdResolution.Unknown("typed property channel interrupted: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            null
+            // M1 拋出與乾淨空值區分：gateway 拋出（無回應）不得視為無聲明，
+            // 直接 Unknown；只有「identity 閘通過＋解析為 null 的非 null
+            // propRes」才是無聲明（見下方 propertyId==null 放行 Absent）。
+            return DualIdResolution.Unknown("typed property channel threw: ${e.message ?: e.javaClass.simpleName}")
         }
         // 截斷 property 非「無聲明」：切掉的 payload 可能藏 mismatch，fail closed。
-        if (propRes != null && propRes.truncated) {
+        if (propRes.truncated) {
             return DualIdResolution.Unknown("typed property channel truncated identity evidence")
         }
         // property 通道亦走身分閘：髒輸出即 Unknown（canonical 經缺 property
-        // 走向 Unknown，此處直接 Unknown 以擋住後續誤判 Absent；拋出而得 null
-        // 則視為無聲明，沿舊流程）。
-        if (propRes != null &&
-            !PmOutputParser.isIdentityChannelOk(propRes.out + "\n" + propRes.err, propRes.exit)
-        ) {
+        // 走向 Unknown，此處直接 Unknown 以擋住後續誤判 Absent；拋出已在上
+        // 方直接 Unknown，不再落到 null 視為無聲明）。
+        if (!PmOutputParser.isIdentityChannelOk(propRes.out + "\n" + propRes.err, propRes.exit)) {
             return DualIdResolution.Unknown("typed property channel reports failure")
         }
-        val propertyId = propRes
-            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        // 無聲明僅指「identity 閘通過＋解析為 null 的非 null propRes」
+        // （乾淨空輸出，如空字串）；拋出/截斷/髒輸出已在上方 Unknown。
+        val propertyId = PmOutputParser.parseDualPropertyId(propRes.out)
         val verboseClaims = SamsungProfileAdapter.parseUserListVerbose(verboseRes.out)
         val dumpsysClaims = SamsungProfileAdapter.parseDumpsysUser(dumpsysRes.out)
         val candidates = verboseClaims + dumpsysClaims
@@ -349,7 +366,7 @@ class DualRepository(
                 // P1-1（False Absent 修正）：Absent 僅當兩源皆有真實區塊、無
                 // 任何 CLONE 聲稱、每條 claim 皆為明確 OTHER（無 UNKNOWN）、兩
                 // 源 user 集合完全一致（無衝突/缺戶），且 property 無具體指向
-                // （有正值 id 但無 Confirmed 即為仍可能存在的 clone）；其餘
+                // （任何非 null 含 0 但無 Confirmed 即為仍可能存在的 clone）；其餘
                 // （型別缺失、集合不一致、property 指向不明等）一律 Unknown。
                 if (candidates.any { it.userType == ProfileUserType.CLONE }) {
                     return DualIdResolution.Unknown("insufficient identity evidence")
@@ -369,6 +386,11 @@ class DualRepository(
                 }
                 if (propertyId != null) {
                     return DualIdResolution.Unknown("insufficient identity evidence")
+                }
+                // M2 pm 否決：pm 快照多出的戶即雙 verbose 一致漏戶，不得 Absent。
+                // null 表無快照不否決；否則須 pmIds 為 verboseIds 子集。
+                if (pmIds != null && !verboseIds.containsAll(pmIds)) {
+                    return DualIdResolution.Unknown("pm snapshot contains ids missing from typed channels")
                 }
                 DualIdResolution.Absent
             }
