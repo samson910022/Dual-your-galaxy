@@ -19,12 +19,23 @@
 // - 時間一律 wall-clock (System.currentTimeMillis)：有回撥/偽造風險，僅為
 //   存在性證據，絕不作授權依據。needsRefresh 把未來時間戳 (now < queryTime)
 //   視為需重查；marker 時間遠舊於查詢時間者顯示加註舊資料提醒。
+// - i18n 缺口 (刻意保留現狀)：診斷摘要/下一步皆為硬編碼繁中常數
+//   (DiagnoseStrings)，未抽 res/values string resources；未來需在地化時
+//   把該表換成資源查詢即可，穩定碼 (stableId) 不受影響。
 package com.galaxydual.plus
 
 import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RemoveOutcome
 import com.galaxydual.hook.HookMarker
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+// 無目標哨兵：verified dualId 未知時 (resolveDualUserId 回 -1，見
+// DualRepository/PmOutputParser 契約：Confirmed 以外一律 -1) 的佔位值。
+// 取代散落的 -1 字面量 (targetId/pinnedTarget 預設與比較處)；語意不變。
+const val NO_TARGET_ID: Int = -1
 
 // 清單新鮮度：FRESH=本次查詢可信；STALE=舊資料 (目標已變/通道已失/過期)；
 // UNKNOWN=從未成功查到或上次查詢不可信。
@@ -36,12 +47,12 @@ enum class InventoryFreshness {
 
 // 清單快照：refresh 的 ground truth 附帶何時、何地查的。
 // - source: 查詢命令 (如 "pm list packages --user 95")，失敗時為 "pm list users"。
-// - targetId: 查證過的 dualId (-1=無目標)。
+// - targetId: 查證過的 dualId (NO_TARGET_ID=無目標)。
 // - queryTimeMs: wall-clock (nowMs)，0=從未查詢。
 // - freshness/count: 見上；count 為成功列舉筆數 (UNKNOWN/STALE 仍保留舊筆數語意由呼叫端決定)。
 data class InventorySnapshot(
     val source: String = "",
-    val targetId: Int = -1,
+    val targetId: Int = NO_TARGET_ID,
     val queryTimeMs: Long = 0L,
     val freshness: InventoryFreshness = InventoryFreshness.UNKNOWN,
     val count: Int = 0,
@@ -52,36 +63,42 @@ data class InventorySnapshot(
 }
 
 // 新鮮度是否需要重查：UNKNOWN/STALE 直接要；FRESH 依 maxAge 過期也要。
-// 純函數，MainActivity.onResume 的自動重查判斷共用。
+// 呼叫者：DualViewModel.markStaleIfAgedLocked (經 onForeground) 與
+// probeChannels 的 FRESH 補標 STALE (舊資料不謊稱新鮮)。
+// 清單过期閾值 (5 分鐘)：前後台切換/短暫離開期間的 FRESH 仍視為可用，
+// 達閾值即視為過期重查，避免陳舊目標誤導後續寫入。
 const val INVENTORY_STALE_AFTER_MS: Long = 5L * 60L * 1000L
 
-fun InventorySnapshot.needsRefresh(nowMs: Long, maxAgeMs: Long = INVENTORY_STALE_AFTER_MS): Boolean =
+// maxAgeMs 參數保留供測試/特殊呼叫端覆寫；生產唯一用途為預設值
+// (INVENTORY_STALE_AFTER_MS)，現行生產呼叫端皆用預設。
+fun InventorySnapshot.needsRefresh(now: Long, maxAgeMs: Long = INVENTORY_STALE_AFTER_MS): Boolean =
     when (freshness) {
         InventoryFreshness.UNKNOWN -> true
         InventoryFreshness.STALE -> true
         // FRESH 仍受零時間/時鐘偏移/过期三重保護：從未查詢、未來時間戳
         // (wall-clock 回撥或偽造，見檔頭限制)、或存活達 maxAgeMs 者皆需重查。
-        InventoryFreshness.FRESH -> queryTimeMs <= 0L || nowMs < queryTimeMs ||
-            (nowMs - queryTimeMs) >= maxAgeMs
+        InventoryFreshness.FRESH -> queryTimeMs <= 0L || now < queryTimeMs ||
+            (now - queryTimeMs) >= maxAgeMs
     }
 
 // 舊資料標 STALE (FRESH->STALE，原 target/queryTime 保留供追溯)；
 // 否則新建 UNKNOWN (記錄這次查詢的 source，不謊稱新鮮)。
-// UNKNOWN 分支保留舊身份/筆數供追溯：呼叫端傳入有效 target (>=0) 才覆寫
-// (傳 -1 表未知，回退保留 this.targetId，傳入的 targetId 不再丟棄)；
+// UNKNOWN 分支保留舊身份/筆數供追溯：呼叫端傳入有效 target (非哨兵) 才覆寫
+// (傳 NO_TARGET_ID 表未知，回退保留 this.targetId，傳入的 targetId 不再丟棄)；
 // count 一律保留舊筆數，與 FRESH->STALE 一致 (舊資料不謊稱新鮮亦不丟失)。
 // DualViewModel.refreshLocked 各失敗分支共用。
-fun InventorySnapshot.staleOrUnknownLocked(
+// (原名 staleOrUnknownLocked；測試無引用故改名，語意/行為不變。)
+fun InventorySnapshot.toStaleOrUnknown(
     now: Long,
     source: String,
-    targetId: Int = -1,
+    targetId: Int = NO_TARGET_ID,
 ): InventorySnapshot =
     if (freshness == InventoryFreshness.FRESH) {
         copy(freshness = InventoryFreshness.STALE)
     } else {
         InventorySnapshot(
             source = source,
-            targetId = if (targetId >= 0) targetId else this.targetId,
+            targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
             queryTimeMs = now,
             freshness = InventoryFreshness.UNKNOWN,
             count = this.count,
@@ -100,11 +117,26 @@ enum class OpPhase {
 data class LastOperation(
     val opId: String = "",
     val appKey: String = "",
-    val pinnedTarget: Int = -1,
+    val pinnedTarget: Int = NO_TARGET_ID,
     val phase: OpPhase = OpPhase.UNKNOWN,
     val timeMs: Long = 0L,
     val detail: String = "",
 )
+
+// wall-clock 顯示格式 (純函數，僅顯示層用)：刻意用 yyyy-MM-dd HH:mm：
+// 避開匯出 redactPaths 對 / 的改寫 (SHORT 格式含 / 會被誤傷為 <path>)。
+// 0/負值表從未查詢，null (可空多載) 表未知。輸出只含數字/-/:/空格，不含 /；
+// 測試不得鎖定確切字串 (契約只保證「從未查詢」分支與非空)。
+// 使用 java.text/java.util (JVM/Android 內建)，不加其他依賴。
+internal fun formatTimeMs(ms: Long): String =
+    if (ms <= 0L) {
+        "從未查詢"
+    } else {
+        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(ms))
+    }
+
+internal fun formatTimeMs(ms: Long?): String =
+    if (ms == null) "從未查詢" else formatTimeMs(ms)
 
 // Hook 時間證據 (沿用 HookStateProvider 四態 + scope)：
 // - queriedAtMs: App 何時跑的診斷 (wall-clock)。
@@ -128,13 +160,21 @@ fun HookDiagnosis.toEvidence(queriedAtMs: Long): HookEvidence = HookEvidence(
     viaGateway = viaGateway,
 )
 
-// Hook 時間證據純文字 (歷史 marker 語意不變，另加時間行)。
+// Hook 時間證據純文字 (有意變更：歷史 marker 狀態/範圍語意不變，時間行由 raw epoch 改為格式化顯示)。
 // marker 遠舊於查詢時間 (差值超過清單过期閾值) 多半是重啟前舊資料：
 // 附加提醒，僅存在性證據，不代表本次開機生效。
+// 時間行經 formatTimeMs (有意變更：0/null 顯示「從未查詢」為空態明確化；
+// marker 時間文案由 raw 數字改為格式化時間為可讀性/可追溯性)；
+// viaGateway 為真時附加「（經真通道讀取）」(MainActivity 內聯寫法統一至此，理由：單一來源免分叉)。
 fun HookEvidence.displayText(): String {
     val base = HookDiagnosis(status, scopes).displayText()
-    val timePart = if (markerTimeMs != null) "；marker timeMs=$markerTimeMs" else "；marker 時間未知"
-    val qPart = if (queriedAtMs > 0L) "；查詢於 $queriedAtMs" else ""
+    return base + timeEvidenceText()
+}
+
+// 時間證據後綴 (internal 供 MainActivity hook 行共用，免內聯重寫)。
+internal fun HookEvidence.timeEvidenceText(): String {
+    val timePart = if (markerTimeMs != null) "；marker時間=${formatTimeMs(markerTimeMs)}" else "；marker 時間未知"
+    val qPart = "；查詢於 ${formatTimeMs(queriedAtMs)}"
     val stalePart = if (markerTimeMs != null && markerTimeMs > 0L && queriedAtMs > 0L &&
         (queriedAtMs - markerTimeMs) > INVENTORY_STALE_AFTER_MS
     ) {
@@ -142,10 +182,15 @@ fun HookEvidence.displayText(): String {
     } else {
         ""
     }
-    return base + timePart + qPart + stalePart
+    val viaPart = if (viaGateway) "（經真通道讀取）" else ""
+    return timePart + qPart + stalePart + viaPart
 }
 
 // 診斷穩定錯誤碼：一旦發布永不改名/重用 (字串即契約，UI/匯出/測試皆以此為準)。
+// OK vs null 契約 (寫死)：null 表「無事件」(UI 顯示就緒、匯出寫 OK)；
+// DiagnoseCode.OK 保留給映射完整性 (toDiagnoseCode 的 Success 分支)，
+// toDiagnoseEvent 遇 OK 一律回 null，diagnoseEvent(OK) 只供文案表自查，
+// 不得寫入 UiState.diagnose。
 enum class DiagnoseCode(val stableId: String) {
     OK("OK"),
     CHANNEL_ERROR("E_CHANNEL"),
@@ -160,6 +205,8 @@ enum class DiagnoseCode(val stableId: String) {
 
 // 診斷事件：穩定碼 + 繁中摘要/下一步 + 可展開 exit/技術 detail。
 // techDetail 大小受限 (MAX_DIAG_DETAIL_CHARS)，建構一律經 diagnoseEvent() 截斷。
+// exit 前向相容佔位：Phase 1 起透傳 (outcome 若攜帶結構化 exit 經 exit 參數
+// 傳入)，現行 outcome 尚無 exit 欄位、尚無呼叫端填真實 exit；欄位保留不刪。
 data class DiagnoseEvent(
     val code: DiagnoseCode,
     val summaryZh: String,
@@ -171,26 +218,36 @@ data class DiagnoseEvent(
 const val MAX_DIAG_DETAIL_CHARS: Int = 2000
 const val MAX_DIAG_EXPORT_CHARS: Int = 4000
 
-private fun capDetail(raw: String): String =
+internal fun capDetail(raw: String): String =
     if (raw.length <= MAX_DIAG_DETAIL_CHARS) raw else raw.take(MAX_DIAG_DETAIL_CHARS)
 
-// 穩定碼 -> 繁中摘要/下一步 (純函數，測試鎖定文案關鍵字)。
+// 繁中摘要/下一步常數表 (同檔頂層 object)：9 組穩定碼各一對，diagnoseEvent
+// 改引用此表 (文案一字不差)；i18n 缺口見檔頭 (無 res/values)。
+object DiagnoseStrings {
+    // 契約：每碼恰一對 (summary, nextStep)；diagnoseEvent 以 getValue 取，
+    // 缺碼即拋 (fail-fast，缺文案不可靜默空字串)。
+    val TABLE: Map<DiagnoseCode, Pair<String, String>> = mapOf(
+        DiagnoseCode.OK to ("就緒" to "無需處理"),
+        DiagnoseCode.CHANNEL_ERROR to ("通道錯誤：命令執行失敗" to "檢查授權後點「重新連線並更新」重試"),
+        DiagnoseCode.NO_DUAL to ("找不到雙開 profile" to "確認雙開已建立後點「重新連線並更新」"),
+        DiagnoseCode.VERIFY_MISMATCH to ("驗證不一致：寫入回報成功但重查不符" to "點「重新連線並更新」重查，不要重複寫入"),
+        DiagnoseCode.VERIFY_UNKNOWN to ("結果未知：寫入後無法查證" to "點「重新連線並更新」重新查證後再決定"),
+        DiagnoseCode.STILL_INSTALLED to ("移除未生效：套件仍在" to "點「重新連線並更新」重查後再試一次移除"),
+        DiagnoseCode.OP_FAILED to ("操作失敗：命令回報失敗" to "檢查訊息後重試，或點「重新連線並更新」"),
+        DiagnoseCode.INVALID_INPUT to ("輸入無效或拒絕寫入" to "修正輸入或切換到可用通道後重試"),
+        DiagnoseCode.PROBE_FAILED to ("探測未通過：通道唯讀" to "檢查授權後點「重新連線並更新」重試"),
+    )
+}
+
+// 穩定碼 -> 繁中摘要/下一步 (純函數，測試鎖定文案關鍵字；文案源自
+// DiagnoseStrings，OK 分支保留僅供完整性，見 DiagnoseCode 契約註解)。
+// exit 同 DiagnoseEvent 註解：前向相容佔位，現行呼叫端皆傳預設 null。
 fun diagnoseEvent(
     code: DiagnoseCode,
     exit: Int? = null,
     techDetail: String = "",
 ): DiagnoseEvent {
-    val (summary, next) = when (code) {
-        DiagnoseCode.OK -> "就緒" to "無需處理"
-        DiagnoseCode.CHANNEL_ERROR -> "通道錯誤：命令執行失敗" to "檢查授權後點「重新連線並更新」重試"
-        DiagnoseCode.NO_DUAL -> "找不到雙開 profile" to "確認雙開已建立後點「重新連線並更新」"
-        DiagnoseCode.VERIFY_MISMATCH -> "驗證不一致：寫入回報成功但重查不符" to "點「重新連線並更新」重查，不要重複寫入"
-        DiagnoseCode.VERIFY_UNKNOWN -> "結果未知：寫入後無法查證" to "點「重新連線並更新」重新查證後再決定"
-        DiagnoseCode.STILL_INSTALLED -> "移除未生效：套件仍在" to "點「重新連線並更新」重查後再試一次移除"
-        DiagnoseCode.OP_FAILED -> "操作失敗：命令回報失敗" to "檢查訊息後重試，或點「重新連線並更新」"
-        DiagnoseCode.INVALID_INPUT -> "輸入無效或拒絕寫入" to "修正輸入或切換到可用通道後重試"
-        DiagnoseCode.PROBE_FAILED -> "探測未通過：通道唯讀" to "檢查授權後點「重新連線並更新」重試"
-    }
+    val (summary, next) = DiagnoseStrings.TABLE.getValue(code)
     return DiagnoseEvent(code, summary, next, exit, capDetail(techDetail))
 }
 
@@ -223,8 +280,9 @@ fun RemoveOutcome.toDiagnoseCode(): DiagnoseCode = when (this) {
 }
 
 // CloneOutcome -> DiagnoseEvent (exit/techDetail 可展開，大小受限)。
-// 契約：outcome 若攜帶 exit 經 exit 參數透傳 (現行 outcome 尚無 exit 欄位，
-// 呼叫端有結構化 exit 時傳入，預設 null 不斷舊呼叫端)；VerifyFailed 的 tech
+// 契約：outcome 若攜帶 exit 經 exit 參數透傳 (前向相容佔位；現行 outcome
+// 尚無 exit 欄位，呼叫端有結構化 exit 時傳入，預設 null 不斷舊呼叫端)；
+// OK 遇碼即回 null (見 DiagnoseCode 契約)；VerifyFailed 的 tech
 // 改用 redactPackage() 後包名+dualId (包名由呼叫端經 pkg 傳入，缺省空字串
 // 時沿用舊泛稱)。
 fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
@@ -242,7 +300,8 @@ fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseE
     return diagnoseEvent(code, exit = exit, techDetail = tech)
 }
 
-// RemoveOutcome -> DiagnoseEvent (契約同上；StillInstalled 的 tech 改用
+// RemoveOutcome -> DiagnoseEvent (契約同上：exit 前向相容佔位，現行尚無
+// 呼叫端填真實 exit；OK 遇碼即回 null；StillInstalled 的 tech 改用
 // redactPackage() 後包名+dualId)。
 fun RemoveOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
     val code = toDiagnoseCode()
@@ -326,13 +385,13 @@ fun buildDiagnosticExport(state: UiState): String {
     sb.appendLine(
         "清單：${state.inventory.freshness} target=${state.inventory.targetId} " +
             "筆數=${state.inventory.count} 來源=${state.inventory.source} " +
-            "查詢於=${state.inventory.queryTimeMs}",
+            "查詢於=${formatTimeMs(state.inventory.queryTimeMs)}",
     )
     val last = state.lastOperation
     if (last != null) {
         sb.appendLine(
             "上次操作：${last.opId} ${redactPackage(last.appKey)} " +
-                "target=${last.pinnedTarget} 相位=${last.phase} 時間=${last.timeMs}",
+                "target=${last.pinnedTarget} 相位=${last.phase} 時間=${formatTimeMs(last.timeMs)}",
         )
         if (last.detail.isNotEmpty()) sb.appendLine("操作細節：${last.detail}")
     } else {
@@ -340,7 +399,8 @@ fun buildDiagnosticExport(state: UiState): String {
     }
     sb.appendLine(
         "Hook：${state.hookStatus} 範圍=${state.hookScopes.sorted().joinToString(",")} " +
-            "marker時間=${state.hookMarkerTimeMs ?: "未知"} 查詢於=${state.hookQueriedAtMs}",
+            "marker時間=${state.hookMarkerTimeMs?.let { formatTimeMs(it) } ?: "未知"} " +
+            "查詢於=${formatTimeMs(state.hookQueriedAtMs)}",
     )
     sb.appendLine("通道：偏好=${state.channel} 實際=${state.resolvedGateway} 執行身份=${state.execIdentity}")
     // 兩道遮蔽 (順序固定：先包名後路徑)，與 sanitizeForDisplay/本機顯示一致。
