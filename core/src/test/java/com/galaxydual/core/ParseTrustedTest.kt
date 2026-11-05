@@ -145,4 +145,189 @@ class ParseTrustedTest {
         )
         assertEquals(TrustedList.TrustedFull(listOf("com.example.chat")), clean)
     }
+
+    // P22 fix M1: unknown stdout format with exit 0 is Unknown, never
+    // TrustedEmpty (fail closed: usage/help text proves nothing about absence).
+    @Test
+    fun unknownFormat_withExitZero_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "usage: pm list packages [--user N]",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected listing format"),
+        )
+    }
+
+    // P22 fix M2: malformed package: payload is Unknown on the trusted path
+    // only (parsePackages() itself stays tolerant). Payload must match
+    // ^[A-Za-z0-9._-]+$ (same charset as ShellEscaper.SAFE_TOKEN).
+    @Test
+    fun malformedPackageLine_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package: unknown package",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name malformed line, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("malformed package line"),
+        )
+
+        // Non-error-semantic malformed payload (slash) is also Unknown via M2.
+        val slash = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.foo/bar",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $slash", slash is TrustedList.Unknown)
+        assertTrue(
+            "reason must name malformed line, got: \"${(slash as TrustedList.Unknown).reason}\"",
+            slash.reason.contains("malformed"),
+        )
+    }
+
+    // P22 fix: ALREADY_EXISTS has NO exception in listing context (it is
+    // install-only idempotent-success); any Failure line makes the snapshot
+    // untrusted even with exit 0.
+    @Test
+    fun alreadyExists_inListing_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "Failure [INSTALL_FAILED_ALREADY_EXISTS: existing package]",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name error semantics, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("error-semantic"),
+        )
+    }
+
+    // P22 fix M1 err side: a non-blank err stream with zero packages is a
+    // dirty channel -> Unknown (fail closed), even when no error keyword
+    // matches. Also covers the err-side [truncated] marker.
+    @Test
+    fun dirtyErrWithoutErrorKeyword_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "",
+            err = "some warning marker",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected listing format"),
+        )
+
+        val marker = PmOutputParser.parsePackagesTrusted(
+            out = "",
+            err = "partial output\n[truncated]",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $marker", marker is TrustedList.Unknown)
+        assertTrue(
+            "marker must read as truncation, got: \"${(marker as TrustedList.Unknown).reason}\"",
+            marker.reason.contains("truncat", ignoreCase = true),
+        )
+    }
+
+    // Truncated has priority over non-zero exit (step 1 before step 2).
+    @Test
+    fun truncated_hasPriorityOverNonZeroExit() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.example.chat",
+            err = "",
+            exit = 1,
+            truncated = true,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "truncated must win, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.startsWith("truncated"),
+        )
+    }
+
+    // R1: non-zero detail keeps the first stderr (else stdout) line; empty
+    // streams keep the bare exit code.
+    @Test
+    fun nonZeroExit_detailKeepsFirstStderrLine() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "",
+            err = "error: closed\nsecond line",
+            exit = 1,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        val detail = (res as TrustedList.Unknown).reason
+        assertTrue("detail must carry exit code, got: \"$detail\"", detail.contains("exit=1"))
+        assertTrue("detail must carry stderr hint, got: \"$detail\"", detail.contains("error: closed"))
+
+        val fromOut = PmOutputParser.parsePackagesTrusted(
+            out = "usage failed",
+            err = "",
+            exit = 2,
+            truncated = false,
+        )
+        assertTrue(
+            "detail must fall back to stdout, got: \"${(fromOut as TrustedList.Unknown).reason}\"",
+            fromOut.reason.contains("usage failed"),
+        )
+        assertTrue(
+            "detail must carry exit code, got: \"${fromOut.reason}\"",
+            fromOut.reason.contains("exit=2"),
+        )
+
+        val bare = PmOutputParser.parsePackagesTrusted(
+            out = "",
+            err = "",
+            exit = 1,
+            truncated = false,
+        )
+        assertEquals("verify failed (exit=1)", (bare as TrustedList.Unknown).reason)
+    }
+
+    // Pin: bare "package:" with an empty payload is Unknown (malformed),
+    // never TrustedEmpty.
+    @Test
+    fun emptyPackagePayload_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name malformed line, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("malformed"),
+        )
+    }
+
+    // Pin: a lone "Success" line with zero packages is Unknown
+    // (unexpected format), never TrustedEmpty.
+    @Test
+    fun loneSuccessLine_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "Success",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected listing format"),
+        )
+    }
 }

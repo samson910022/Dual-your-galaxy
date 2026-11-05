@@ -596,7 +596,9 @@ class DualRepository(
         val cmd = try {
             PmOutputParser.buildListPackages(dualId)
         } catch (e: IllegalArgumentException) {
-            return VerifyState.Unknown(e.message ?: "invalid package")
+            // Unreachable in practice: dualId was already verified/pinned, so
+            // only an invalid userId could throw here (never a package token).
+            return VerifyState.Unknown(e.message ?: "invalid userId")
         }
         var res = gateway.run(cmd)
         var attempts = 1
@@ -607,9 +609,10 @@ class DualRepository(
         }
         // Trusted tri-state (PR-2 stage 2, issue #22): the final probe result
         // is judged by parsePackagesTrusted, not by exit code alone. A clean
-        // listing that lacks the package -- TrustedEmpty, or TrustedFull of
-        // other packages (including a filtered-style empty) -- is confirmed
-        // absent (NotInstalled); only an untrusted capture (truncated,
+        // full listing (buildListPackages has no filter parameter) that lacks
+        // the package -- TrustedEmpty, or TrustedFull of other packages --
+        // is confirmed absent (NotInstalled); only such a full listing may
+        // use this mapping. An untrusted capture (truncated,
         // non-zero after the retries above, or error-semantic text such as
         // "Unknown package"/SecurityException/Failure with exit 0) is
         // Unknown. Membership stays an exact set lookup (superstrings never
