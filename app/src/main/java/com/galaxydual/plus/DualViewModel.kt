@@ -2981,6 +2981,7 @@ class DualViewModel(
                 }
             } finally {
                 if (selectJob === myJob) selectJob = null
+            }
         }
         selectJob = job
     }
