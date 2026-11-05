@@ -55,6 +55,12 @@ class InventorySelectionTest {
         // 分身用戶（模擬批次中途分身消失；-1 停用）。identity 解析在 install
         // 之前，故首項仍打一次裝置，後續項才 NoDual。
         var vanishDualAfterInstalls: Int = -1,
+        // Phase B #2 測試鉤子：當 installCalls 達到此數後，身份通道整體切到
+        // 新 dualId（模擬批次中途 95→96；-1 停用）。users/verbose/dumpsys/
+        // prop 四通道同步切（否則 cloneVerified 的 snapshot 檢查會先以 NoDual
+        // 擋掉，測不到跨 user 寫入的防線）。
+        var switchDualIdAfterInstalls: Int = -1,
+        var switchDualIdTo: Int = 96,
         // B2 測試鉤子：install 分支在 IO 執行緒上停留此毫秒數，讓首批慢批次
         // 在持有 inFlight key 時可被併發第二批/單筆觀測到。預設 0（無行為變化）。
         var installDelayMs: Long = 0L,
@@ -63,11 +69,21 @@ class InventorySelectionTest {
         val installCalls = mutableListOf<String>()
         val uninstallCalls = mutableListOf<String>()
 
-        private fun usersOut(): String =
-            "Users:\n\tUserInfo{0:Owner:13} running\n" +
-                "\tUserInfo{$dualId:DualApp:400} running\n"
+        private fun effectiveDualId(): Int =
+            if (switchDualIdAfterInstalls >= 0 && installCalls.size >= switchDualIdAfterInstalls) {
+                switchDualIdTo
+            } else {
+                dualId
+            }
+
+        private fun usersOut(): String {
+            val id = effectiveDualId()
+            return "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                "\tUserInfo{$id:DualApp:400} running\n"
+        }
 
         private fun verboseOut(): String {
+            val id = effectiveDualId()
             if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} running:\n" +
@@ -78,13 +94,14 @@ class InventorySelectionTest {
                 "  UserInfo{0:Owner:13} running:\n" +
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} running:\n" +
+                "  UserInfo{$id:DualApp:400} running:\n" +
                 "    Serial: 15\n" +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
         }
 
         private fun dumpsysOut(): String {
+            val id = effectiveDualId()
             if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
@@ -93,7 +110,7 @@ class InventorySelectionTest {
             return "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$id:DualApp:400} serialNo=15:\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
         }
@@ -109,7 +126,7 @@ class InventorySelectionTest {
             cmd == DualRepository.CMD_DUMPSYS_USER ->
                 CmdResult(exit = 0, out = dumpsysOut(), err = "")
             cmd == DualRepository.CMD_GETPROP_DUAL ->
-                CmdResult(exit = 0, out = "$dualId\n", err = "")
+                CmdResult(exit = 0, out = "${effectiveDualId()}\n", err = "")
             cmd.startsWith("pm install-existing") -> {
                 val pkg = cmd.trim().split(" ").last()
                 installCalls.add(pkg)
@@ -329,6 +346,8 @@ class InventorySelectionTest {
         )
 
         // 重啟：新 ViewModel，同一 store；catalog 含 chat/mail/extra，不含 gone。
+        // Phase B #1：恢復需已驗證目標，先 refresh 驗證 95（refresh 自動補觸恢復；
+        // 顯式 restore 為冪等重試）。
         val vm2 = makeVm(gw, clock, backend.store())
         await { vm2.state.value.channelReady }
         vm2.setSourceCatalog(
@@ -338,6 +357,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.extra", "Extra", 0, false),
             ),
         )
+        vm2.refresh()
+        await { "0:com.example.chat" in vm2.state.value.selectedKeys }
         vm2.restoreSelection(95)
         await { "0:com.example.chat" in vm2.state.value.selectedKeys }
         assertEquals(
@@ -349,7 +370,8 @@ class InventorySelectionTest {
         assertEquals("restore must not uninstall", 0, gw.uninstallCalls.size)
 
         // 已有手動勾選時 restore 永不覆蓋：先勾選再設 catalog（同步阻斷
-        // setSourceCatalog 的自動補恢復），restore 必須是同步 no-op。
+        // setSourceCatalog 的自動補恢復），restore 必須是 no-op（未驗證亦拒絕，
+        // 已驗證亦不覆蓋非空勾選）。
         val vm3 = makeVm(gw, clock, backend.store())
         await { vm3.state.value.channelReady }
         vm3.toggleSelection("0:com.example.extra")
@@ -360,6 +382,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.extra", "Extra", 0, false),
             ),
         )
+        vm3.refresh()
+        await { !vm3.state.value.loading && vm3.state.value.inventory.targetId == 95 }
         vm3.restoreSelection(95)
         await { vm3.state.value.selectedKeys == setOf("0:com.example.extra") }
         assertEquals(
@@ -392,10 +416,14 @@ class InventorySelectionTest {
         // 空 catalog 上恢復是同步 no-op：early-return 發生在任何 I/O 懸掛點
         // 之前，且此時 opMutex 空閒（channelReady 已在探測退出時寫入），故在
         // Unconfined 下呼叫執行緒內即完成——直接斷言，不 sleep 輪詢。
+        // Phase B #1：未驗證 inventory 下亦拒絕（不燒 marker），故此處仍為空。
         vm.restoreSelection(95)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
-        // 後載非空 catalog：顯式重試仍能恢復（setSourceCatalog 亦會補觸一次）。
+        // 後載非空 catalog：Phase B #1 要求先驗證（refresh）再恢復；
+        // setSourceCatalog 在未驗證時不再用 snapshot 回退，需 refresh 補觸。
         vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { "0:com.example.chat" in vm.state.value.selectedKeys }
         vm.restoreSelection(95)
         await { "0:com.example.chat" in vm.state.value.selectedKeys }
         assertEquals(
@@ -537,13 +565,21 @@ class InventorySelectionTest {
         assertTrue(report.items.single().outcome is CloneOutcome.VerifyUnknown)
         assertFalse(vm.state.value.cloned.contains("com.example.myst"))
         assertTrue(vm.state.value.msg.contains("未知 1"))
-        // M1/M2: unknown-only 批次 phase UNKNOWN + VERIFY_UNKNOWN diagnose，無成功不標 STALE。
+        // M1/M2: unknown-only 批次 phase UNKNOWN + VERIFY_UNKNOWN diagnose。
+        // Phase B #3：VerifyUnknown 可能=已寫入未驗證（install 成功但重查通道
+        // 失敗），故 unknown 亦標 STALE（此前僅 success>0 才標）。此例起點為
+        // UNKNOWN（未 refresh），STALE 規則下 UNKNOWN→STALE（舊資料不謊稱新鮮）。
         val lastU = vm.state.value.lastOperation
         assertNotNull(lastU)
         assertEquals("batch:clone", lastU!!.opId)
         assertEquals(OpPhase.UNKNOWN, lastU.phase)
         assertEquals("批次 1 項：成功 0/失敗 0/未知 1", lastU.detail)
         assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+        assertEquals(
+            "unknown may mean written-but-unverified, must not stay FRESH",
+            InventoryFreshness.STALE,
+            vm.state.value.inventory.freshness,
+        )
     }
 
     // M1 全成功清 diagnose： failed==0 && unknown==0 則 diagnose=null，
@@ -820,5 +856,191 @@ class InventorySelectionTest {
         val many = (0 until 201).map { "0:com.example.app$it" }.toSet()
         vm.selectVisible(many)
         assertTrue(vm.state.value.selectedKeys.containsAll(many))
+    }
+
+    // Phase B #1a：未驗證 catalog 到達不恢復；驗證後 refresh 補觸恢復。
+    @Test
+    fun catalogUnverified_noRestore_refreshRestores() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95,
+                setOf("0:com.example.chat", "0:com.example.mail"), 1000L,
+            ),
+        )
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        // 此時 inventory 仍未驗證（probe 不寫 inventory，需 refresh 才驗證）。
+        assertTrue(vm.state.value.inventory.targetId <= 0)
+        vm.setSourceCatalog(catalog())
+        Thread.sleep(300)
+        assertTrue(
+            "unverified catalog must not restore via snapshot fallback",
+            vm.state.value.selectedKeys.isEmpty(),
+        )
+        vm.refresh()
+        await { "0:com.example.chat" in vm.state.value.selectedKeys }
+        assertEquals(
+            setOf("0:com.example.chat", "0:com.example.mail"),
+            vm.state.value.selectedKeys,
+        )
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // Phase B #1b：95→96，refresh 清空舊勾選＋可恢復新目標存檔。
+    @Test
+    fun targetChange_clearsOldSelectionAndRestoresNew() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.chat"), 1000L,
+            ),
+        )
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { "0:com.example.chat" in vm.state.value.selectedKeys }
+        // 新目標存檔（覆寫舊檔，模擬 96 的保存）＋裝置切到 96。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 96, setOf("0:com.example.mail"), 2000L,
+            ),
+        )
+        gw.dualId = 96
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                "0:com.example.mail" in vm.state.value.selectedKeys
+        }
+        assertEquals(
+            "old target selection must not survive",
+            setOf("0:com.example.mail"),
+            vm.state.value.selectedKeys,
+        )
+        assertTrue(vm.state.value.msg.contains("目標已變更"))
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // Phase B #1c：無 dual（未知）時保存/恢復拒絕，已驗證後正常。
+    @Test
+    fun noDualThenDual_unknownRefuses_verifiedWorks() {
+        val backend = MapBackend()
+        // 預存 95 快照：未驗證時 restoreSelection(95) 必須是 no-op（舊碼會恢復）。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.chat"), 1000L,
+            ),
+        )
+        val gw = FakeRepo()
+        gw.vanishDualAfterInstalls = 0
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId <= 0 }
+        // inventory 未驗證時即使傳入已知目標亦不恢復（待驗證後由 refresh 補觸）。
+        vm.restoreSelection(95)
+        Thread.sleep(200)
+        assertTrue(
+            "unverified inventory must not restore even for a known target",
+            vm.state.value.selectedKeys.isEmpty(),
+        )
+        // 未知目標讀取永不破壞已存資料；顯式未知 target 恢復是 no-op。
+        vm.restoreSelection(-1)
+        Thread.sleep(200)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        // 回到空倉：後續 persist(0)/assertNull 仍驗空倉語義；亦避免 refresh
+        // 自動恢復預存快照干擾尾段驗證路徑（toggle 會反選已恢復的勾）。
+        assertTrue(backend.store().clear())
+        // 前置守衛：targetId<=0 直接拒絕（非未知語義拒絕）。
+        vm.persistSelection(0)
+        await { vm.state.value.msg.isNotEmpty() }
+        assertNull(
+            "unknown save must not create a snapshot",
+            backend.store().loadSnapshot(),
+        )
+        // 分身出現：恢復驗證路徑。
+        gw.vanishDualAfterInstalls = -1
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.chat")
+        vm.persistSelection(95)
+        await { vm.state.value.msg.startsWith("已保存選取") }
+        assertEquals(setOf("0:com.example.chat"), backend.store().loadSelected(95))
+    }
+
+    // Phase B #2：批次中途 95→96，首項成功後漂移即停，第二項零裝置寫入。
+    @Test
+    fun batch_targetDrift_stopsWithPartial() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        gw.switchDualIdAfterInstalls = 1
+        gw.switchDualIdTo = 96
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+            ),
+        )
+        vm.toggleSelection("0:com.example.a1")
+        vm.toggleSelection("0:com.example.a2")
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(
+            "drift must stop before the second item: no fake outcome",
+            1, report.items.size,
+        )
+        assertTrue(report.items.single().outcome is CloneOutcome.Success)
+        assertEquals(1, report.successCount)
+        assertEquals(
+            "second item must never reach the device",
+            listOf("com.example.a1"), gw.installCalls,
+        )
+        val last = vm.state.value.lastOperation
+        assertNotNull(last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.FAILED, last.phase)
+        assertTrue("detail must name the target change: ${last.detail}", last.detail.contains("目標已變更"))
+        assertTrue("msg must name the target change: ${vm.state.value.msg}", vm.state.value.msg.contains("目標已變更"))
+        assertTrue("msg must show progress X/Y: ${vm.state.value.msg}", vm.state.value.msg.contains("已完成 1/共 2"))
+        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+    }
+
+    // Phase B #3：FRESH→unknown，全 unknown 批次後 freshness 非 FRESH。
+    @Test
+    fun freshThenUnknown_marksStale() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.myst", "Myst", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        gw.failListPackages = true
+        vm.toggleSelection("0:com.example.myst")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(1, report.unknownCount)
+        assertTrue(
+            "VerifyUnknown may mean written-but-unverified, must mark STALE",
+            vm.state.value.inventory.freshness != InventoryFreshness.FRESH,
+        )
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
     }
 }
