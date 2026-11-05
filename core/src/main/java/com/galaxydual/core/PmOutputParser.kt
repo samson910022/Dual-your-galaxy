@@ -132,11 +132,68 @@ object PmOutputParser {
     // - A DUAL-labeled user 0 is never selected (owner profile is off-limits).
     // - Zero or ambiguous (>1) candidates resolve to -1 (unknown/refused).
     // Pure function: no I/O, no Android dependency.
+    //
+    // DEPRECATED (PR-1 stage 2, issue #21): label-only identification is unsafe.
+    // A user-renamed profile or a ROM-named Work/Secondary/Secure Folder entry
+    // can carry a DUAL substring without being a clone profile, and a renamed
+    // clone can drop the substring. All production paths now resolve via
+    // resolveDualUserIdVerified() (dual-source type evidence via
+    // SamsungProfileAdapter.resolveDual); this entry is kept only so existing
+    // callers keep compiling and must not be used for new authorization.
+    @Deprecated(
+        message = "Label-only identification is unsafe (issue #21): use " +
+            "resolveDualUserIdVerified(userListVerbose, dumpsysUser, propertyId) " +
+            "which requires cross-source CLONE type agreement.",
+        ReplaceWith(
+            "resolveDualUserIdVerified(userListVerbose, dumpsysUser, propertyId)",
+        ),
+    )
     fun resolveDualUserId(profiles: List<DualProfile>): Int {
         val candidates = profiles.filter {
             it.userId != 0 && it.label.contains("DUAL", ignoreCase = true)
         }
         return if (candidates.size == 1) candidates[0].userId else -1
+    }
+
+    // Verified dual-profile resolution (PR-1 stage 2, issue #21).
+    // Parses both verbose channels and requires cross-source CLONE agreement
+    // via SamsungProfileAdapter.resolveDual: Confirmed(HIGH) maps to its userId,
+    // Unknown/Refused both map to -1 (fail closed, never guess a target).
+    // The pm-list label is never read here (display-only by contract).
+    //
+    // @param userListVerbose raw `cmd user list -v` output.
+    // @param dumpsysUser raw `dumpsys user` output.
+    // @param propertyId optional system-property dual id (e.g. parsed from
+    //   `getprop sys.dualapp.profile_id` via parseDualPropertyId); null means
+    //   "no property claim" (missing/unreadable), which still allows a
+    //   two-channel agreement to confirm (single-source never confirms).
+    fun resolveDualUserIdVerified(
+        userListVerbose: String,
+        dumpsysUser: String,
+        propertyId: Int? = null,
+    ): Int {
+        val candidates =
+            SamsungProfileAdapter.parseUserListVerbose(userListVerbose) +
+                SamsungProfileAdapter.parseDumpsysUser(dumpsysUser)
+        return when (val resolution = SamsungProfileAdapter.resolveDual(candidates, propertyId)) {
+            is DualResolution.Confirmed -> resolution.userId
+            is DualResolution.Unknown -> -1
+            is DualResolution.Refused -> -1
+        }
+    }
+
+    // Parses `getprop sys.dualapp.profile_id` output into a property claim.
+    // Returns the numeric id on a clean integer payload, null when the property
+    // is missing, empty, or in an unknown format (no claim, never throws).
+    // Negative values mean "no claim" and are normalized to null so callers
+    // never mistake them for a target.
+    fun parseDualPropertyId(propOutput: String): Int? {
+        val token = propOutput.trim()
+        if (token.isEmpty()) return null
+        // getprop echoes a single line; take the first line only.
+        val first = token.lineSequence().first().trim()
+        val id = first.toIntOrNull() ?: return null
+        return if (id >= 0) id else null
     }
 
     // Parses `pm list users` output into one entry per UserInfo{...} line.

@@ -23,8 +23,16 @@ class ShizukuElevator(
     // Command used to list profiles; kept as a constant for testability.
     val listUsersCmd: String = "pm list users"
 
-    // Probe: `pm list users` must exit 0; dual id resolved via the shared
-    // C1 safety boundary (exactly one DUAL-labeled non-zero profile, else -1).
+    // Verified-identity channels (PR-1 stage 2, issue #21): shared with
+    // DualRepository (same command strings, same adapter, no label read).
+    val userListVerboseCmd: String = DualRepository.CMD_USER_LIST_VERBOSE
+    val dumpsysUserCmd: String = DualRepository.CMD_DUMPSYS_USER
+    val getpropDualCmd: String = DualRepository.CMD_GETPROP_DUAL
+
+    // Probe: `pm list users` must exit 0; dual id resolved via the verified
+    // cross-source boundary (exactly one CLONE-typed non-zero id agreeing
+    // across `cmd user list -v` + `dumpsys user` (+ property when present),
+    // else -1). The pm-list label is never read.
     override suspend fun probe(): ProbeResult {
         val res = gateway.run(listUsersCmd)
         if (res.exit != 0) {
@@ -35,14 +43,41 @@ class ShizukuElevator(
                 dualUserId = -1,
             )
         }
-        val profiles = PmOutputParser.parseUsers(res.out)
-        val dualId = PmOutputParser.resolveDualUserId(profiles)
+        val dualId = resolveVerifiedDualId()
         return ProbeResult(
             level = Privilege.SHELL,
             hasShizuku = true,
             hasRoot = false,
             dualUserId = dualId,
         )
+    }
+
+    // Shared identity source: fetches both verbose channels plus the dual
+    // property and maps Confirmed -> id, Unknown/Refused/channel failure ->
+    // -1 (fail closed). Never reads the pm-list label.
+    private suspend fun resolveVerifiedDualId(): Int {
+        val verboseRes = try {
+            gateway.run(userListVerboseCmd)
+        } catch (_: Exception) {
+            return -1
+        }
+        val dumpsysRes = try {
+            gateway.run(dumpsysUserCmd)
+        } catch (_: Exception) {
+            return -1
+        }
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
+        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) return -1
+        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
+        val propRes = try {
+            gateway.run(getpropDualCmd)
+        } catch (_: Exception) {
+            null
+        }
+        val propertyId = propRes
+            ?.takeIf { it.exit == 0 }
+            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        return PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
     }
 }
 
@@ -58,7 +93,14 @@ class SuElevator(
     val whoAmICmd: String = "id -u"
     val listUsersCmd: String = "pm list users"
 
-    // Probe: `id -u` must print 0; then resolve the dual profile id.
+    // Verified-identity channels (same shared source as ShizukuElevator and
+    // DualRepository; see above).
+    val userListVerboseCmd: String = DualRepository.CMD_USER_LIST_VERBOSE
+    val dumpsysUserCmd: String = DualRepository.CMD_DUMPSYS_USER
+    val getpropDualCmd: String = DualRepository.CMD_GETPROP_DUAL
+
+    // Probe: `id -u` must print 0; then resolve the dual profile id via the
+    // verified cross-source boundary (never the pm-list label).
     override suspend fun probe(): ProbeResult {
         val idRes = gateway.run(whoAmICmd)
         val isRoot = idRes.exit == 0 && idRes.out.trim() == "0"
@@ -71,18 +113,47 @@ class SuElevator(
             )
         }
         val usersRes = gateway.run(listUsersCmd)
-        val dualId = if (usersRes.exit == 0) {
-            val profiles = PmOutputParser.parseUsers(usersRes.out)
-            PmOutputParser.resolveDualUserId(profiles)
-        } else {
-            -1
+        if (usersRes.exit != 0) {
+            return ProbeResult(
+                level = Privilege.ROOT,
+                hasShizuku = false,
+                hasRoot = true,
+                dualUserId = -1,
+            )
         }
+        val dualId = resolveVerifiedDualId()
         return ProbeResult(
             level = Privilege.ROOT,
             hasShizuku = false,
             hasRoot = true,
             dualUserId = dualId,
         )
+    }
+
+    // Same shared identity source as ShizukuElevator (fail closed to -1).
+    private suspend fun resolveVerifiedDualId(): Int {
+        val verboseRes = try {
+            gateway.run(userListVerboseCmd)
+        } catch (_: Exception) {
+            return -1
+        }
+        val dumpsysRes = try {
+            gateway.run(dumpsysUserCmd)
+        } catch (_: Exception) {
+            return -1
+        }
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
+        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) return -1
+        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
+        val propRes = try {
+            gateway.run(getpropDualCmd)
+        } catch (_: Exception) {
+            null
+        }
+        val propertyId = propRes
+            ?.takeIf { it.exit == 0 }
+            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        return PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
     }
 }
 

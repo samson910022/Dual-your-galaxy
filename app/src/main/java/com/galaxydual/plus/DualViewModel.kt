@@ -9,7 +9,6 @@ import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
-import com.galaxydual.core.PmOutputParser
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RemoveOutcome
@@ -228,9 +227,12 @@ class DualViewModel(
                     }
                 is ProfilesSnapshot.Loaded -> {
                     val profiles = snap.profiles
-                    // Pure resolve on this snapshot: no second gateway call,
-                    // so the id below cannot drift from what we display.
-                    val dualId = PmOutputParser.resolveDualUserId(profiles)
+                    // Verified identity only: the id comes from the repo's
+                    // cross-source resolver, never from the pm-list label
+                    // (display-only by contract), so the display layer makes
+                    // no label judgment and shares one verified target with
+                    // the listing below.
+                    val dualId = repo.resolveDualUserId()
                     if (dualId < 0) {
                         _state.update {
                             it.copy(

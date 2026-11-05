@@ -72,6 +72,15 @@ class DualRepository(
     companion object {
         // Command used to enumerate profiles.
         const val CMD_LIST_USERS = "pm list users"
+
+        // Verified-identity channels (PR-1 stage 2, issue #21): the two verbose
+        // sources whose CLONE type tokens must agree, plus the Samsung dual
+        // property. All are shell-readable on supported builds; when any typed
+        // channel is unavailable the resolver refuses (fail closed) instead of
+        // falling back to the pm-list label.
+        const val CMD_USER_LIST_VERBOSE = "cmd user list -v"
+        const val CMD_DUMPSYS_USER = "dumpsys user"
+        const val CMD_GETPROP_DUAL = "getprop sys.dualapp.profile_id"
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
@@ -98,12 +107,50 @@ class DualRepository(
         return ProfilesSnapshot.Loaded(PmOutputParser.parseUsers(res.out))
     }
 
-    // Resolves the dual profile id via the shared C1 safety boundary
-    // (PmOutputParser.resolveDualUserId): exactly one DUAL-labeled non-zero
-    // profile, otherwise -1. No "first non-zero user" fallback by design.
-    suspend fun resolveDualUserId(): Int {
-        val profiles = listProfiles()
-        return PmOutputParser.resolveDualUserId(profiles)
+    // Resolves the dual profile id via the verified cross-source boundary
+    // (PR-1 stage 2, issue #21): `cmd user list -v` + `dumpsys user` must agree
+    // on one CLONE-typed non-zero id (SamsungProfileAdapter.resolveDual);
+    // the `pm list users` label is never an authorization source. Returns the
+    // Confirmed id, or -1 when Unknown/Refused (fail closed). No "first
+    // non-zero user" fallback by design.
+    suspend fun resolveDualUserId(): Int = fetchVerifiedDualId()
+
+    // Explicit verified entry (same fetch as resolveDualUserId): raw verbose
+    // outputs are gateway-owned, so this suspend variant fetches them itself.
+    // For pure parsing without I/O use
+    // PmOutputParser.resolveDualUserIdVerified(userListVerbose, dumpsysUser,
+    // propertyId) directly.
+    suspend fun resolveDualUserIdVerified(): Int = fetchVerifiedDualId()
+
+    // Single shared identity fetch: runs both verbose channels plus the dual
+    // property, then maps Confirmed -> id, Unknown/Refused -> -1. A failed
+    // typed channel (non-zero exit or error-semantic output) yields -1 without
+    // guessing; a missing/unparseable property is "no claim" (null) and still
+    // allows a two-channel agreement to confirm (single source never does).
+    // Never throws: gateway errors collapse to -1 (fail closed).
+    private suspend fun fetchVerifiedDualId(): Int {
+        val verboseRes = try {
+            gateway.run(CMD_USER_LIST_VERBOSE)
+        } catch (_: Exception) {
+            return -1
+        }
+        val dumpsysRes = try {
+            gateway.run(CMD_DUMPSYS_USER)
+        } catch (_: Exception) {
+            return -1
+        }
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
+        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) return -1
+        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
+        val propRes = try {
+            gateway.run(CMD_GETPROP_DUAL)
+        } catch (_: Exception) {
+            null
+        }
+        val propertyId = propRes
+            ?.takeIf { it.exit == 0 }
+            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        return PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
     }
 
     // Clones a package into the dual profile via `pm install-existing`.
@@ -114,9 +161,10 @@ class DualRepository(
     }
 
     // Clones a package into an explicit dual profile id.
-    // C1 guard: refuses dualId 0 (owner) and any id absent from the current
-    // `pm list users` snapshot, so a stale or mistyped id can never redirect
-    // the write at the wrong profile.
+    // Verified-dual guard: refuses dualId 0 (owner), ids absent from the
+    // current `pm list users` snapshot, and ids that are not the Confirmed
+    // cross-source target, so a stale, mistyped, or non-Dual id can never
+    // redirect the write at the wrong profile.
     suspend fun clone(pkg: String, dualId: Int): CmdResult {
         checkExplicitDualId(dualId)?.let { return it }
         val cmd = PmOutputParser.buildInstallExisting(pkg, dualId)
@@ -131,17 +179,21 @@ class DualRepository(
     }
 
     // Removes the clone from an explicit dual profile id.
-    // Same C1 guard as clone(pkg, dualId): see checkExplicitDualId.
+    // Same verified-dual guard as clone(pkg, dualId): see checkExplicitDualId.
     suspend fun remove(pkg: String, dualId: Int): CmdResult {
         checkExplicitDualId(dualId)?.let { return it }
         val cmd = PmOutputParser.buildUninstall(pkg, dualId)
         return gateway.run(cmd)
     }
 
-    // Validates an explicit dual profile id against the current snapshot.
+    // Validates an explicit dual profile id against the current snapshot AND the
+    // verified cross-source identity (PR-1 stage 2, issue #21).
     // Returns a refusal CmdResult, or null when the id is safe to target.
     // Refuses dualId 0 (owner profile, must never be written) and any id not
-    // present in this call's `pm list users` snapshot (stale/mistyped id).
+    // present in this call's `pm list users` snapshot (stale/mistyped id),
+    // plus any id that is not the currently Confirmed dual target (exists but
+    // non-Dual: Work/Secondary/Secure Folder, renamed DUAL-label, type
+    // conflict, property mismatch, or unknown). Existence alone never suffices.
     private suspend fun checkExplicitDualId(dualId: Int): CmdResult? {
         if (dualId <= 0) {
             return CmdResult(
@@ -158,6 +210,15 @@ class DualRepository(
                 err = "refused: unknown dual profile id ($dualId), not in current snapshot",
             )
         }
+        val verified = fetchVerifiedDualId()
+        if (verified != dualId) {
+            return CmdResult(
+                exit = 1,
+                out = "",
+                err = "refused: id $dualId is not the verified dual target" +
+                    " (verified=${if (verified < 0) "none" else verified})",
+            )
+        }
         return null
     }
 
@@ -167,15 +228,26 @@ class DualRepository(
     suspend fun verify(pkg: String): Boolean {
         val dualId = resolveDualUserId()
         if (dualId < 0) return false
-        return verify(pkg, dualId)
+        return verifyState(pkg, dualId) is VerifyState.Installed
     }
 
     // Verifies against an explicit dual profile id.
-    // Same C1 guard as clone(pkg, dualId)/remove(pkg, dualId): refuses dualId 0
-    // (owner) and any id absent from the current snapshot without running any
-    // command (returns false). Read-only path, but consistency first: a stale
-    // or mistyped id must never be probed, and callers get graceful false
-    // instead of an IllegalArgumentException from the command builder.
+    // Same verified-dual guard as clone(pkg, dualId)/remove(pkg, dualId):
+    // refuses dualId 0 (owner), ids absent from the current snapshot, and ids
+    // that are not the currently Confirmed dual target (exists but non-Dual)
+    // without running any command (returns false). Read-only path, but
+    // consistency first: a stale, mistyped, or non-Dual id must never be
+    // probed, and callers get graceful false instead of an
+    // IllegalArgumentException from the command builder.
+    //
+    // DEPRECATED (PR-1 stage 2, issue #21): the Boolean folds NotInstalled and
+    // Unknown together (both false). Callers that must tell "confirmed absent"
+    // apart from "cannot check" must use verifyState(pkg, dualId) instead
+    // (tri-state contract is owned by PR-2, issue #22, and is unchanged here).
+    @Deprecated(
+        message = "Boolean verify folds NotInstalled and Unknown; use verifyState for tri-state.",
+        ReplaceWith("verifyState(pkg, dualId)"),
+    )
     suspend fun verify(pkg: String, dualId: Int): Boolean =
         when (val state = verifyState(pkg, dualId)) {
             is VerifyState.Installed -> true
@@ -199,19 +271,22 @@ class DualRepository(
     }
 
     // Lists the dual profile's actual packages (ground truth for refresh).
-    // Null means unknown: no dual profile, channel failure, or guard refusal.
-    // Non-null (possibly empty) is authoritative: refresh rebuilds `cloned`
-    // from it, so external installs/removals sync and a fresh ViewModel
-    // discovers pre-existing clones. Uses `pm list packages --user <dualId>`
-    // (see PmOutputParser.buildListPackages); per-package `pm path` probing
-    // alone could never discover names nobody asked about.
+    // Null means unknown: no verified dual profile, channel failure, or guard
+    // refusal. Non-null (possibly empty) is authoritative: refresh rebuilds
+    // `cloned` from it, so external installs/removals sync and a fresh
+    // ViewModel discovers pre-existing clones. Uses `pm list packages
+    // --user <dualId>` (see PmOutputParser.buildListPackages); per-package
+    // `pm path` probing alone could never discover names nobody asked about.
+    // Resolution is verified cross-source (stage 2): a DUAL-labeled but
+    // untyped id never authorizes a listing.
     suspend fun listClonedPackages(): List<String>? {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return null
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = PmOutputParser.resolveDualUserId(profiles)
+        val dualId = fetchVerifiedDualId()
         if (dualId < 0) return null
-        return listOnProfiles(dualId, profiles)
+        if (profiles.none { it.userId == dualId }) return null
+        return listProbe(dualId)
     }
 
     // Explicit-id variant with the same C1 guard as clone(pkg, dualId):
@@ -223,19 +298,22 @@ class DualRepository(
         return listOnProfiles(dualId, (snap as ProfilesSnapshot.Loaded).profiles)
     }
 
-    // Pinned clone (Phase C3, issue #9): resolves the dual id ONCE via the C1
-    // resolver, then runs install-existing AND the `pm list packages`
-    // re-check against that same id -- never one guess for the write and
-    // another for the check. Success is reported only when the re-check
-    // confirms Installed; a clean-but-absent re-check is VerifyFailed (fake
-    // success, issue #9), a failed re-check channel is VerifyUnknown.
-    // Neither is added to cloned.
+    // Pinned clone (Phase C3, issue #9): resolves the verified dual id ONCE via
+    // the cross-source resolver, then runs install-existing AND the
+    // `pm list packages` re-check against that same id -- never one guess for
+    // the write and another for the check. Success is reported only when the
+    // re-check confirms Installed; a clean-but-absent re-check is VerifyFailed
+    // (fake success, issue #9), a failed re-check channel is VerifyUnknown.
+    // Neither is added to cloned. Unknown/Refused identity maps to NoDual
+    // (fail closed); the pinned re-check itself does not re-resolve identity
+    // so the write and the check cannot drift to different users.
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = PmOutputParser.resolveDualUserId(profiles)
+        val dualId = fetchVerifiedDualId()
         if (dualId < 0) return CloneOutcome.NoDual
+        if (profiles.none { it.userId == dualId }) return CloneOutcome.NoDual
         val clean = pkg.trim()
         val installCmd = try {
             PmOutputParser.buildInstallExisting(clean, dualId)
@@ -246,14 +324,14 @@ class DualRepository(
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
-        return when (val state = verifyOnProfiles(clean, dualId, profiles)) {
+        return when (val state = verifyListProbe(clean, dualId)) {
             is VerifyState.Installed -> CloneOutcome.Success(dualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, state.detail)
         }
     }
 
-    // Pinned remove (Phase C3, issue #9): same single-snapshot pinning as
+    // Pinned remove (Phase C3, issue #9): same single-verified-id pinning as
     // cloneVerified. Only a post-uninstall re-check of NotInstalled counts as
     // removed; still-present is StillInstalled, an uncheckable channel is
     // VerifyUnknown (caller keeps the entry: fail closed). A failed uninstall
@@ -264,8 +342,9 @@ class DualRepository(
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = PmOutputParser.resolveDualUserId(profiles)
+        val dualId = fetchVerifiedDualId()
         if (dualId < 0) return RemoveOutcome.NoDual
+        if (profiles.none { it.userId == dualId }) return RemoveOutcome.NoDual
         val clean = pkg.trim()
         val uninstallCmd = try {
             PmOutputParser.buildUninstall(clean, dualId)
@@ -276,7 +355,7 @@ class DualRepository(
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
         }
-        return when (val state = verifyOnProfiles(clean, dualId, profiles)) {
+        return when (val state = verifyListProbe(clean, dualId)) {
             is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, state.detail)
@@ -319,6 +398,28 @@ class DualRepository(
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
         }
+        // Verified-dual gate (stage 2): existence alone never suffices. The id
+        // must equal the currently Confirmed cross-source target; a present
+        // but non-Dual id (Work/Secondary/Secure Folder, renamed DUAL-label,
+        // type conflict, property mismatch) maps to Unknown (fail closed),
+        // never to a probe of the wrong user.
+        val verified = fetchVerifiedDualId()
+        if (verified != dualId) {
+            return VerifyState.Unknown(
+                "refused: id $dualId is not the verified dual target" +
+                    " (verified=${if (verified < 0) "none" else verified})",
+            )
+        }
+        return verifyListProbe(pkg, dualId)
+    }
+
+    // List-only re-check for an already-verified id (pinned flows): runs the
+    // `pm list packages --user <dualId>` probe WITHOUT re-resolving identity,
+    // so the write and the check share one verified target and cannot drift.
+    // All tri-state/exit-only/retry semantics are identical to the explicit
+    // path below (PR-2 owns that contract; stage 2 only changes WHO may be
+    // probed, never HOW the probe is judged).
+    private suspend fun verifyListProbe(pkg: String, dualId: Int): VerifyState {
         val clean = pkg.trim()
         try {
             ShellEscaper.escapePackage(clean)
@@ -349,8 +450,17 @@ class DualRepository(
 
     // Runs `pm list packages --user <dualId>` for an already-pinned snapshot.
     // Guard-refused ids and failed listings yield null (unknown), never throw.
+    // Stage 2 adds the verified-dual gate: existence alone never suffices.
     private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>): List<String>? {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
+        val verified = fetchVerifiedDualId()
+        if (verified != dualId) return null
+        return listProbe(dualId)
+    }
+
+    // List-only probe for an already-verified id (auto listing path): no
+    // identity re-resolution, same isSuccess ground-truth semantics as before.
+    private suspend fun listProbe(dualId: Int): List<String>? {
         val cmd = try {
             PmOutputParser.buildListPackages(dualId)
         } catch (e: IllegalArgumentException) {
