@@ -58,6 +58,8 @@ class DiagnoseFreshnessPhase5Test {
         val uninstalledPkgs: MutableSet<String> = mutableSetOf(),
         var failListAfterUninstall: Boolean = false,
         var sawUninstall: Boolean = false,
+        // P2-8：超長輸入拒絕不斷言 install/uninstall 用。
+        var sawInstall: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         var listUsersCalls = 0
@@ -132,7 +134,7 @@ class DiagnoseFreshnessPhase5Test {
                     if (ownerOnlyTyped) CmdResult(exit = 0, out = "", err = "")
                     else CmdResult(exit = 0, out = "${effId()}\n", err = "")
                 cmd.startsWith("pm install-existing") ->
-                    CmdResult(exit = 0, out = "Success", err = "")
+                    CmdResult(exit = 0, out = "Success", err = "").also { sawInstall = true }
                 cmd.startsWith("pm uninstall") ->
                     CmdResult(exit = 0, out = "Success", err = "").also {
                         sawUninstall = true
@@ -915,40 +917,45 @@ class DiagnoseFreshnessPhase5Test {
 
     // ---- 12. Phase 3 ----
 
+    // P2-8：超長輸入拒絕執行（取代舊 take(256) 靜默截斷）：trim 後超過
+    // MAX_PACKAGE_INPUT_CHARS 即 INVALID_INPUT，不建 op、不調 repo
+    //（零 install）、不寫 lastOperation，只設 diagnose+msg。
     @Test
-    fun phase3_longCloneInput_bounded256() {
+    fun phase3_longCloneInput_rejectedAsInvalid() {
         val gw = FakeRepo()
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
+        vm.clone("com.example.chat")
+        await { vm.state.value.lastOperation?.opId == "clone:com.example.chat" }
+        val base = vm.state.value.lastOperation!!
+        gw.sawInstall = false
+
         val longPkg = "com.example." + "x".repeat(500)
+        assertTrue("test input must exceed the limit", longPkg.trim().length > MAX_PACKAGE_INPUT_CHARS)
         vm.clone(longPkg)
-        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
-        val last = vm.state.value.lastOperation!!
-        assertTrue(
-            "appKey must be bounded at 256, got ${last.appKey.length}",
-            last.appKey.length <= 256,
-        )
-        assertEquals("trim-then-take must keep exactly 256", 256, last.appKey.length)
-        assertEquals(DiagnoseCode.VERIFY_MISMATCH, vm.state.value.diagnose?.code)
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.INVALID_INPUT }
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertFalse("overlong clone must run zero installs", gw.sawInstall)
+        assertEquals("overlong clone must not touch lastOperation", base, vm.state.value.lastOperation)
     }
 
+    // P2-8：破壞性 remove 同式——超長 requestRemove 即 INVALID_INPUT
+    // 拒絕（零 uninstall、無 pending、lastOperation 不變）。
     @Test
-    fun phase3_longRemoveInput_pendingBounded256() {
+    fun phase3_longRemoveInput_rejectedAsInvalid() {
         val longPkg = "com.example." + "x".repeat(500)
-        // 新 base P2 安裝門檻：截斷後 (256) 的包須在 fake 清單內才開 dialog。
-        val gw = FakeRepo(listExtra = listOf(longPkg.take(256)))
+        assertTrue("test input must exceed the limit", longPkg.trim().length > MAX_PACKAGE_INPUT_CHARS)
+        val gw = FakeRepo(listExtra = listOf("com.example.chat"))
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
         vm.requestRemove(longPkg)
-        await { vm.state.value.pendingRemove != null }
-        val pending = vm.state.value.pendingRemove!!
-        assertTrue(
-            "pending pkg must be bounded at 256, got ${pending.pkg.length}",
-            pending.pkg.length <= 256,
-        )
-        assertEquals(256, pending.pkg.length)
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.INVALID_INPUT }
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertNull("overlong request must set no pending", vm.state.value.pendingRemove)
+        assertFalse("overlong request must run zero uninstalls", gw.sawUninstall)
+        assertNull("overlong request must not touch lastOperation", vm.state.value.lastOperation)
     }
 
     @Test

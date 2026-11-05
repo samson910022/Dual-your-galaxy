@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
+import com.galaxydual.core.DualIdResolution
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
@@ -795,11 +796,22 @@ class DualViewModel(
         // returns the result for probeChannels to reuse (previously each
         // probed all elevators: double `su -c` cost + double auth-prompt risk).
         // Phase 2: 鏈式共用一次 loading (probe 保留 busy，refresh 結尾才清除)。
+        // P2-4: swap 前記錄 resolved，納入 probe 的 FRESH 失效判斷。
+        val resolvedBeforeOp = currentChannel
         if (preference == ChannelPreference.AUTO) {
             val probe = swapAutoLocked()
-            probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
+            probeChannels(
+                probe,
+                allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                keepLoadingOnExit = true,
+                resolvedBeforeOp = resolvedBeforeOp,
+            )
         } else {
-            probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
+            probeChannels(
+                allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                keepLoadingOnExit = true,
+                resolvedBeforeOp = resolvedBeforeOp,
+            )
         }
         refreshLocked()
     }
@@ -892,52 +904,29 @@ class DualViewModel(
                     // Verified identity only: the id comes from the repo's
                     // cross-source resolver, never from the pm-list label
                     // (display-only by contract), so the display layer makes
-                    // no label judgment. Two separate fetches under the hood
-                    // (resolve here plus re-verification inside
-                    // listClonedPackages(dualId)); drift between them returns
-                    // unknown (fail closed), never a write to the wrong user
-                    // (refresh itself is read-only).
-                    val dualId = onIo { repo.resolveDualUserId() }
+                    // no label judgment and shares one verified target with
+                    // the listing below.
+                    // P2-5 (verified -1 誤判修正)：-1 一律視為「無法確認」。
+                    // 舊碼用 Int 哨兵 (resolveDualUserId 回 -1) 再以快照有無
+                    // 猜 NO_DUAL/CHANNEL_ERROR：typed 通道單獨失敗時也會回 -1，
+                    // 快照正常有戶就被誤判為「確認無 dual」並清空 cloned。
+                    // 現改走 typed 入口 resolveDualUserIdTyped()：Confirmed
+                    // (正值) 才取 id 查核；Absent（通道乾淨且確認無 dual）且
+                    // 快照可用才報 NO_DUAL 並清空；其餘（Unknown 全域，含舊
+                    // -1；或 Absent 但快照為空不可信）一律保留舊 cloned、報
+                    // CHANNEL_ERROR，不謊稱無 dual。
+                    val idRes = onIo { repo.resolveDualUserIdTyped() }
+                    val dualId = (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
                     if (dualId <= NO_TARGET_ID) {
                         val now = nowMs()
-                        // NO_DUAL/CHANNEL_ERROR 鑑別 (repo 簽名不動，僅用手頭
-                        // Loaded 快照)：快照為空 (連 owner 都列不出，快照不可信)
-                        // ->CHANNEL_ERROR 且不清 cloned (比照 listing-unknown
-                        // 分支保留舊值)；快照正常有戶但 verified 為哨兵 -> 真正確認
-                        // 無可用 dual -> NO_DUAL 並清空。
-                        // 限制：typed 身份通道 (verbose/dumpsys) 單獨失敗時仍
-                        // 可能誤判為 NO_DUAL；完整區分需 repo 攜帶失敗原因，
-                        // 刻意不動 repo 簽名。
-                        val snapshotUsable = profiles.isNotEmpty()
+                        // 真正確認無 dual 的唯一條件：typed 稱 Absent 且快照
+                        // 可用（列得出戶）。Unknown 全域走 CHANNEL_ERROR；
+                        // 空快照（連 owner 都列不出，快照不可信）時即使 typed
+                        // 稱 Absent 也不得報 NO_DUAL（快照本身已證通道有問題）。
+                        val confirmedAbsent =
+                            idRes is DualIdResolution.Absent && profiles.isNotEmpty()
                         _state.update { cur ->
-                            val next = if (!snapshotUsable) {
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                    "refresh result unknown: " +
-                                        "cannot confirm dual profile",
-                                    MsgKind.CHANNEL,
-                                    cur.degradeNote,
-                                )
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    // Phase C P2: `pm list users` returned
-                                    // (Loaded, albeit empty) so readable;
-                                    // only the identity is unverifiable.
-                                    pmReadable = true,
-                                    inventory = cur.inventory.toStaleOrUnknown(
-                                        now = now,
-                                        source = DualRepository.CMD_LIST_USERS,
-                                        targetId = cur.inventory.targetId,
-                                    ),
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.CHANNEL_ERROR,
-                                        techDetail = "verified dual id unknown " +
-                                            "and profiles snapshot empty",
-                                    ),
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
-                            } else {
+                            val next = if (confirmedAbsent) {
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "no dual profile",
                                     MsgKind.NO_DUAL,
@@ -960,7 +949,42 @@ class DualViewModel(
                                     ),
                                     diagnose = diagnoseEvent(
                                         DiagnoseCode.NO_DUAL,
-                                        techDetail = "verified dual id unknown",
+                                        techDetail = "typed resolution absent",
+                                    ),
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
+                                )
+                            } else {
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "refresh result unknown: " +
+                                        "cannot confirm dual profile",
+                                    MsgKind.CHANNEL,
+                                    cur.degradeNote,
+                                )
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    // Phase C P2: `pm list users` returned
+                                    // (Loaded) so readable; only the dual
+                                    // identity is unverifiable here.
+                                    pmReadable = true,
+                                    inventory = cur.inventory.toStaleOrUnknown(
+                                        now = now,
+                                        source = DualRepository.CMD_LIST_USERS,
+                                        targetId = cur.inventory.targetId,
+                                    ),
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.CHANNEL_ERROR,
+                                        techDetail = when {
+                                            idRes is DualIdResolution.Unknown &&
+                                                idRes.detail.isNotBlank() ->
+                                                "verified dual id unknown: " +
+                                                    idRes.detail
+                                            idRes is DualIdResolution.Absent ->
+                                                "profiles snapshot empty " +
+                                                    "despite typed absent"
+                                            else -> "verified dual id unknown"
+                                        },
                                     ),
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
@@ -977,14 +1001,18 @@ class DualViewModel(
                     } else {
                         val groundTruth = onIo { repo.listClonedPackages(dualId) }
                         // listClonedPackages==null 原因鑑別：只在 null 路徑加跑
-                        // 唯讀的 profilesSnapshot + resolveDualUserId (成功路徑
-                        // 零額外開銷)。通道失敗->CHANNEL_ERROR (techDetail 寫明)；
-                        // verified 漂移->VERIFY_MISMATCH (detail 攜新舊 targetId，
-                        // inventory 帶新目標，UI 可見新目標)；其餘維持 VERIFY_UNKNOWN。
+                        // 唯讀的 profilesSnapshot + resolveDualUserIdTyped
+                        // (成功路徑零額外開銷)。通道失敗->CHANNEL_ERROR
+                        // (techDetail 寫明)；只有正值且不同的新 verified ID
+                        // (Confirmed 且 != dualId) 才報 drift
+                        // (VERIFY_MISMATCH，detail 攜新舊 targetId，inventory
+                        // 帶新目標，UI 可見新目標)；複查 Unknown/Absent
+                        // (P2-5：舊 Int -1 走此路) 與 id 一致者一律維持
+                        // VERIFY_UNKNOWN，不誤報 MISMATCH。
                         val nullSnap: ProfilesSnapshot? =
                             if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
-                        val nullVerified: Int? =
-                            if (groundTruth == null) onIo { repo.resolveDualUserId() } else null
+                        val nullVerified: DualIdResolution? =
+                            if (groundTruth == null) onIo { repo.resolveDualUserIdTyped() } else null
                         _state.update { cur ->
                             val now = nowMs()
                             val next = if (groundTruth == null) {
@@ -1023,12 +1051,15 @@ class DualViewModel(
                                         msg = combinedMsg,
                                         msgKind = combinedKind,
                                     )
-                                } else if (nullVerified != null && nullVerified != dualId) {
-                                    val newTarget =
-                                        if (nullVerified > NO_TARGET_ID) nullVerified else dualId
+                                } else if (nullVerified is DualIdResolution.Confirmed &&
+                                    nullVerified.userId != dualId
+                                ) {
+                                    // Confirmed 保證正值（repo 拒收 0/負值），
+                                    // 故此分支即「正值且不同」的新身份。
+                                    val newTarget = nullVerified.userId
                                     val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                         "refresh verification mismatch: " +
-                                            "target $dualId -> $nullVerified",
+                                            "target $dualId -> $newTarget",
                                         MsgKind.VERIFY,
                                         cur.degradeNote,
                                     )
@@ -1046,7 +1077,7 @@ class DualViewModel(
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_MISMATCH,
                                             techDetail = "verified id drifted: " +
-                                                "listed $dualId but now $nullVerified",
+                                                "listed $dualId but now $newTarget",
                                         ),
                                         msg = combinedMsg,
                                         msgKind = combinedKind,
@@ -1206,13 +1237,16 @@ class DualViewModel(
     // SUCCESS/FAILED/UNKNOWN) + diagnose 穩定碼；普通 probe 永不清除。
     fun clone(pkg: String) {
         viewModelScope.launch {
-            // 輸入有界：先 trim 再 take(256)，opKey/detail 不得無界增長。
+            // P2-8 輸入有界：先 trim，空白拒絕；trim 後超過
+            // MAX_PACKAGE_INPUT_CHARS 即 INVALID_INPUT 拒絕執行（取代舊
+            // take(256) 靜默截斷——截斷會把超長輸入變形成另一個包名再執行）。
             // 字元集校驗刻意不在此重做：ShellEscaper 政策由 core 擁有
             // (PmOutputParser builders + DualRepository；
-            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白檢查；
+            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白/長度檢查；
             // 非法字元由 repo 回 InvalidPackage (同碼 INVALID_INPUT)。
-            // 空白拒絕不建 opKey (與 requestRemove 一致)。
-            val trimmed: String = pkg.trim().take(256)
+            // 空白/超長拒絕皆不建 opKey、不碰裝置、不寫 lastOperation，
+            // 只設 diagnose+msg（與 requestRemove 一致）。
+            val trimmed: String = pkg.trim()
             // Validate input early without touching the device.
             if (trimmed.isBlank()) {
                 _state.update {
@@ -1220,6 +1254,20 @@ class DualViewModel(
                         msg = "invalid package",
                         msgKind = MsgKind.INVALID,
                         diagnose = diagnoseEvent(DiagnoseCode.INVALID_INPUT),
+                    )
+                }
+                return@launch
+            }
+            if (trimmed.length > MAX_PACKAGE_INPUT_CHARS) {
+                _state.update {
+                    it.copy(
+                        msg = "輸入過長（超過 $MAX_PACKAGE_INPUT_CHARS 字元），已拒絕",
+                        msgKind = MsgKind.INVALID,
+                        diagnose = diagnoseEvent(
+                            DiagnoseCode.INVALID_INPUT,
+                            techDetail = "package input length ${trimmed.length} " +
+                                "exceeds $MAX_PACKAGE_INPUT_CHARS",
+                        ),
                     )
                 }
                 return@launch
@@ -1567,13 +1615,15 @@ class DualViewModel(
     // closed), so a no-op removal never opens a dialog.
     fun requestRemove(pkg: String) {
         viewModelScope.launch {
-            // 輸入有界：先 trim 再 take(256)，pending pkg 不得無界增長。
+            // P2-8 輸入有界（同 clone）：先 trim，空白/超長 (trim 後超過
+            // MAX_PACKAGE_INPUT_CHARS) 即 INVALID_INPUT 拒絕，不建 opKey、
+            // 不碰裝置、不寫 lastOperation，只設 diagnose+msg。
             // 字元集校驗刻意不在此重做：ShellEscaper 政策由 core 擁有
             // (PmOutputParser builders + DualRepository；
-            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白檢查；
+            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白/長度檢查；
             // 非法字元由後續 repo 流回 InvalidPackage (同碼 INVALID_INPUT)。
-            // 空白拒絕不碰裝置 (與 clone 一致)，diagnose 與 clone 對齊。
-            val trimmed: String = pkg.trim().take(256)
+            // 空白/超長拒絕不碰裝置 (與 clone 一致)，diagnose 與 clone 對齊。
+            val trimmed: String = pkg.trim()
             // Validate input early without touching the device.
             if (trimmed.isBlank()) {
                 _state.update {
@@ -1581,6 +1631,20 @@ class DualViewModel(
                         msg = "invalid package",
                         msgKind = MsgKind.INVALID,
                         diagnose = diagnoseEvent(DiagnoseCode.INVALID_INPUT),
+                    )
+                }
+                return@launch
+            }
+            if (trimmed.length > MAX_PACKAGE_INPUT_CHARS) {
+                _state.update {
+                    it.copy(
+                        msg = "輸入過長（超過 $MAX_PACKAGE_INPUT_CHARS 字元），已拒絕",
+                        msgKind = MsgKind.INVALID,
+                        diagnose = diagnoseEvent(
+                            DiagnoseCode.INVALID_INPUT,
+                            techDetail = "package input length ${trimmed.length} " +
+                                "exceeds $MAX_PACKAGE_INPUT_CHARS",
+                        ),
                     )
                 }
                 return@launch
@@ -3227,13 +3291,27 @@ class DualViewModel(
     // Phase 2 (併發修復)：keepLoadingOnExit=true 時出口保留 loading=true，
     // 供同一次 mutex 持有內的 probe+refresh 鏈式呼叫共用一次 loading
     // (中間不閃斷)；獨立呼叫維持預設 false (語意不變)。
+    // P2-4：resolvedBeforeOp 為呼叫端在前置 swapAutoLocked 之前記錄的
+    // resolved（recheck/onForeground 會先 swap 再 probe；probe 內捕捉不到
+    // 那段變化，故由呼叫端傳入）。null 表無前置 swap，以 probe 入口的
+    // currentChannel 為準（selectChannel/reconnect 皆無前置 swap）。
+    // 最大持鎖估算 (不加 timeout，僅記錄)：probe 約 2×elevator(各 ≤3s settle)
+    // + hook 診斷(cat ≤3s) ≈ ≤9s；後接 refresh 約 ≤4 round-trip(各 ≤3s)
+    // ≈ ≤12s；鏈式合計最差約 ~20s，期間其他 op 在 mutex 排隊，
+    // UI 只顯示 loading，Main 不卡 (IO 已 offload)。
     // P25 Item 3: reusedProbe 攜帶 swapAutoLocked 結果，AUTO recheck/reconnect
     // 每輪最多探測一次 (no double `su -c` cost)。
     private suspend fun probeChannels(
         reusedProbe: ProbeOutcome? = null,
         allowPrivilegedHookDiagnosis: Boolean = false,
         keepLoadingOnExit: Boolean = false,
+        resolvedBeforeOp: ResolvedChannel? = null,
     ) {
+        // P2-4 選定通道失效即失效快照：FRESH 快照聲稱「選定通道可信」，故
+        // probe 後若選定通道不可用（resolved 改變或 ready 變 false），即使
+        // 他通道 probe 成功（anyProbePassed=true），也把 FRESH 降 STALE。舊規則只
+        // 看 anyProbePassed：他通道成功即保 FRESH，即使選定通道已失。
+        val resolvedBefore = resolvedBeforeOp ?: currentChannel
         _state.update { it.copy(loading = true) }
         try {
             // Single probe per call: reuse the swap result when present,
@@ -3472,8 +3550,11 @@ class DualViewModel(
             // work; otherwise ready means silent.
             // PR-6 P2 (#27 後半): 普通 probe 永不清除 lastOperation/diagnose
             // (probe 成功不清 UNKNOWN，需下一次 pinned verify 才覆寫)；FRESH
-            // 且 (通道全失 或 已過 maxAge) 才把 inventory 補標 STALE
-            // (年齡檢查與 markStaleIfAgedLocked 共用 needsRefresh，舊資料不謊稱新鮮)。
+            // 在以下任一成立時補標 STALE（舊資料不謊稱新鮮）：
+            // - 選定通道未就緒 (!ready：P2-4；含舊 !readCap 全失情形——
+            //   readCap 為 false 時 ready 必為 false 的上位條件 (!readCap ⇒ !ready)，故只判 ready)；
+            // - resolved 在本次處理中改變（選定通道已換，舊通道查的資料不可信）；
+            // - 已過 maxAge（與 markStaleIfAgedLocked 共用 needsRefresh）。
             val readyMsg = degradeNoteForState
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
             // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
@@ -3484,11 +3565,13 @@ class DualViewModel(
             // 時保留（同通道仍可讀，快照未失效）。僅 refresh 能寫 true/false。
             // Phase C P2: probeScope follows preference (本次探測範圍); probe
             // never writes pmReadable (refresh owns it) -- copy preserves it.
+            // PR-6 P2 (#27 後半): FRESH 失效條件見上（P2-4：!ready 或 resolved
+            // 改變即降 STALE，不再只看 anyProbePassed——他通道成功不能替選定通道背書）。
             val probeNow = nowMs()
             _state.update { cur ->
                 val staleInventory =
                     if (cur.inventory.freshness == InventoryFreshness.FRESH &&
-                        (!anyProbePassed || cur.inventory.needsRefresh(probeNow))
+                        (!ready || currentChannel != resolvedBefore || cur.inventory.needsRefresh(probeNow))
                     ) {
                         cur.inventory.copy(freshness = InventoryFreshness.STALE)
                     } else {
@@ -3697,30 +3780,43 @@ class DualViewModel(
     }
 
     // PR-6 P2 (#27 後半): 前景入口。MainActivity.onResume 經此進入 (取代直調
-    // recheckPrivilege)：先把過期 FRESH 補標 STALE，再依新鮮度決定輕探或重查 --
-    // inventory/hook 任一為 UNKNOWN/STALE 即走 probe+refresh 全量重查；
-    // 否則只走 probe 輕探 (不動清單與 lastOperation)。
+    // recheckPrivilege)：先把過期 FRESH 補標 STALE，再依新鮮度與通道變化決定
+    // 輕探或重查——inventory 非 FRESH 或通道改變 (resolved/ready 變化) 即走
+    // probe+refresh 全量重查；否則只走 probe 輕探 (不動清單與 lastOperation)。
+    // P2-6：hook UNKNOWN 不再觸發全量 refresh——probeChannels 本就重跑 hook
+    // 診斷，hook 未知只重 probe 即可；反覆前景只探不明顯增加裝置呼叫。
     fun onForeground() {
         viewModelScope.launch {
             opMutex.withLock {
                 markStaleIfAgedLocked()
+                // P2-6：probe 前記錄通道狀態 (resolved/ready)，供 probe 後
+                // 變化偵測（全量 refresh 只在 inventory 非 FRESH 或通道改變時）。
+                val resolvedBefore = currentChannel
+                val readyBefore = _state.value.writeReady
                 // P25 Item 3: one probe per round — swapAutoLocked probes once and
                 // returns the result for probeChannels to reuse.
                 // 全程共用一次 loading：probe 保留 busy，需重查則 refresh 接手
                 // (中間不閃斷)；輕探路徑 (免重查) 在此清除。
                 if (preference == ChannelPreference.AUTO) {
                     val probe = swapAutoLocked()
-                    probeChannels(probe, keepLoadingOnExit = true)
+                    probeChannels(
+                        probe,
+                        keepLoadingOnExit = true,
+                        resolvedBeforeOp = resolvedBefore,
+                    )
                 } else {
-                    probeChannels(keepLoadingOnExit = true)
+                    probeChannels(
+                        keepLoadingOnExit = true,
+                        resolvedBeforeOp = resolvedBefore,
+                    )
                 }
                 // stale-read 修正：probeChannels() 已改寫 state，必須重讀
                 // _state.value 再判斷 refresh (此前沿用 probe 前快照，FRESH
                 // 過期或 hook 轉未知會被漏判)。
                 val after = _state.value
-                val hookUnknownAfter = after.hookStatus == HookStatus.UNKNOWN_UNREADABLE ||
-                    after.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC
-                if (after.inventory.freshness != InventoryFreshness.FRESH || hookUnknownAfter) {
+                val channelChanged =
+                    currentChannel != resolvedBefore || after.writeReady != readyBefore
+                if (after.inventory.freshness != InventoryFreshness.FRESH || channelChanged) {
                     refreshLocked()
                 } else {
                     _state.update { it.copy(loading = false) }
