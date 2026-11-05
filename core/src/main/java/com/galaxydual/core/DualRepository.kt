@@ -2,6 +2,7 @@
 package com.galaxydual.core
 
 import kotlinx.coroutines.CancellationException
+import kotlin.jvm.Volatile
 
 // Profile-list snapshot distinguishing channel failure from an empty parse.
 // Phase C3 (issue #9): listProfiles() collapses both to emptyList by design
@@ -106,6 +107,10 @@ class DualRepository(
     // therefore callers must dispatch repository calls off the Main thread
     // (DualViewModel runs every repo call under Dispatchers.IO). Tests replace
     // it with a no-op/virtual delay to skip the real 1500 ms waits.
+    // TEST-ONLY: production must not overwrite. @Volatile gives visibility
+    // across threads (test thread writes, IO thread reads) but no atomicity;
+    // concurrent overwrite is not safe -- set once before use, never at runtime.
+    @Volatile
     internal var delayFn: suspend (Long) -> Unit = { ms -> Thread.sleep(ms) }
 
     companion object {
@@ -125,6 +130,10 @@ class DualRepository(
         // Part of the retry policy (bounded: at most 2 waits per probe); the
         // wait itself runs through delayFn so tests can go virtual.
         const val VERIFY_RETRY_DELAY_MS = 1500L
+
+        // Total list-probe attempts per verify (PR-3 stage 2, issue #24):
+        // 1 initial + 2 retries, i.e. at most 2 waits.
+        const val VERIFY_MAX_ATTEMPTS = 3
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
@@ -702,16 +711,10 @@ class DualRepository(
             // only an invalid userId could throw here (never a package token).
             return VerifyState.Unknown(e.message ?: "invalid userId")
         }
-        // Gateway defense (PR-2 Phase 3, R5): a gateway that throws mid-probe
-        // (initial call or any retry) maps to Unknown("channel error: ..."),
-        // fail closed; CancellationException is rethrown to stay
-        // coroutine-correct. Settle wait runs through delayFn (PR-3 stage 1,
-        // issue #24) so tests can go virtual; never on Main -- the default
-        // delayFn blocks the calling thread.
         val res = try {
             var r = gateway.run(cmd)
             var attempts = 1
-            while (r.exit != 0 && attempts < 3) {
+            while (r.exit != 0 && attempts < VERIFY_MAX_ATTEMPTS) {
                 delayFn(VERIFY_RETRY_DELAY_MS)
                 r = gateway.run(cmd)
                 attempts++
