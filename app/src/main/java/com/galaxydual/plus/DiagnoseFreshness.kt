@@ -211,6 +211,26 @@ internal fun HookEvidence.timeEvidenceText(): String {
 // DiagnoseCode.OK 保留給映射完整性 (toDiagnoseCode 的 Success 分支)，
 // toDiagnoseEvent 遇 OK 一律回 null，diagnoseEvent(OK) 只供文案表自查，
 // 不得寫入 UiState.diagnose。
+// Stage C C3：E_CHANNEL 桶碼 techDetail 前綴契約 (保持 9 碼不變，不新增碼)：
+// CHANNEL_ERROR 只用以下前綴 (VM 各分支寫死，測試鎖定 startsWith)：
+// - "verified dual id unknown" 系：
+//   "verified dual id unknown" (裸)、"verified dual id unknown: <typed/channel detail>"、
+//   "verified dual id unknown and profiles snapshot empty"、
+//   "verified dual id unknown for expected <id>"、
+//   "verified dual id unknown for listed target <id>"；
+// - "verified dual id <id> absent and profiles snapshot empty"
+//   (空快照不可信，CHANNEL_ERROR，非 NO_DUAL)；
+// - "profiles snapshot empty despite typed absent"
+//   (refresh 首跳 Absent 但快照空)；
+// - "profiles snapshot channel failed: <detail>"
+//   (listCloned null 鑑別重查通道失敗)；
+// - gateway 原始 detail (ProfilesSnapshot.ChannelError / CloneOutcome.ChannelError /
+//   RemoveOutcome.ChannelError 經 toDiagnoseEvent 透傳，無統一前綴)。
+// 非 CHANNEL 桶辨析 (免誤歸)：
+// - "serial unavailable ..." / "serial <a> != <b> ..." 一律 VERIFY_MISMATCH
+//   (身份不可驗證，Stage C C1 與 confirm 一致)，絕非 E_CHANNEL；
+// - "verified id <a> != <b>" / "verified id drifted: ..." 一律 VERIFY_MISMATCH；
+// - "typed resolution absent" 一律 NO_DUAL (Absent+快照可用才報)。
 enum class DiagnoseCode(val stableId: String) {
     OK("OK"),
     CHANNEL_ERROR("E_CHANNEL"),

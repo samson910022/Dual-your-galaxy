@@ -578,9 +578,8 @@ class RemoveConfirmTest {
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
     }
 
-    // The id is confirmed but no serial is available on either verbose
-    // channel (PR-33 R2 P1): request must refuse with no pending and zero
-    // uninstalls (NO_DUAL, fail closed).
+    // Stage C C1：id 已確認但 serial 缺失為身份不可驗證
+    // (VERIFY_MISMATCH + INVALID)，非通道錯誤亦非確認無 dual。
     @Test
     fun request_serialUnavailable_refusesWithoutPending() {
         val gw = FakeRepoGateway(dualId = 95)
@@ -593,7 +592,8 @@ class RemoveConfirmTest {
 
         assertNull(vm.state.value.pendingRemove)
         assertEquals("unverifiable target must not uninstall", 0, gw.uninstallCalls)
-        assertEquals(MsgKind.NO_DUAL, vm.state.value.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, vm.state.value.diagnose?.code)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
     }
 
     // P2 安裝狀態 (PR-33 R3): requesting a package that is not installed
