@@ -94,6 +94,7 @@ sealed interface RefreshOutcome {
 // TODO Follow-up: DualViewModel outer catch swallows CancellationException
 // (its catch (e: Exception) in refreshLocked/clone/remove also catches
 // cancellation; VM change out-of-scope here, recorded for follow-up).
+// TODO: blocking Thread.sleep + Main-dispatcher VM calls owned by PR-3 (retry/sleep unification).
 class DualRepository(
     private val gateway: CmdGateway,
 ) {
@@ -207,7 +208,16 @@ class DualRepository(
     private suspend fun clone(pkg: String, dualId: Int, expected: VerifiedTarget?): CmdResult {
         checkExplicitDualId(dualId, expected)?.let { return it }
         val cmd = PmOutputParser.buildInstallExisting(pkg, dualId)
-        return gateway.run(cmd)
+        // Gateway defense (same R5 discipline as the verified paths): a
+        // throwing gateway maps to a fail-closed CmdResult, never a crash;
+        // CancellationException is rethrown to stay coroutine-correct.
+        try {
+            return gateway.run(cmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return CmdResult(exit = 1, out = "", err = "channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
     }
 
     // Removes the clone from the dual profile via `pm uninstall --user`.
@@ -230,7 +240,16 @@ class DualRepository(
     private suspend fun remove(pkg: String, dualId: Int, expected: VerifiedTarget?): CmdResult {
         checkExplicitDualId(dualId, expected)?.let { return it }
         val cmd = PmOutputParser.buildUninstall(pkg, dualId)
-        return gateway.run(cmd)
+        // Gateway defense (same R5 discipline as the verified paths): a
+        // throwing gateway maps to a fail-closed CmdResult, never a crash;
+        // CancellationException is rethrown to stay coroutine-correct.
+        try {
+            return gateway.run(cmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return CmdResult(exit = 1, out = "", err = "channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
     }
 
     // Validates an explicit dual profile id against the current snapshot AND the
@@ -441,7 +460,17 @@ class DualRepository(
         } catch (e: IllegalArgumentException) {
             return CloneOutcome.InvalidPackage(clean)
         }
-        val res = gateway.run(installCmd)
+        // Write-side gateway defense (R5, same as the probe path): a throwing
+        // gateway (spawn failure, SecurityException, binder death) maps to
+        // ChannelError (fail closed), never a crash; CancellationException
+        // is rethrown to stay coroutine-correct.
+        val res = try {
+            gateway.run(installCmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
@@ -484,7 +513,17 @@ class DualRepository(
         } catch (e: IllegalArgumentException) {
             return RemoveOutcome.InvalidPackage(clean)
         }
-        val res = gateway.run(uninstallCmd)
+        // Write-side gateway defense (R5, same as the probe path): a throwing
+        // gateway (spawn failure, SecurityException, binder death) maps to
+        // ChannelError (fail closed), never a crash; CancellationException
+        // is rethrown to stay coroutine-correct.
+        val res = try {
+            gateway.run(uninstallCmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return RemoveOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
         }
@@ -645,6 +684,12 @@ class DualRepository(
             r
         } catch (e: CancellationException) {
             throw e
+        } catch (e: InterruptedException) {
+            // Settle-sleep interruption: restore the flag, then fail closed
+            // as a channel error. Ordered before Exception (InterruptedException
+            // is an Exception subclass; Exception last keeps it reachable).
+            Thread.currentThread().interrupt()
+            return VerifyState.Unknown("channel error: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             return VerifyState.Unknown("channel error: ${e.message ?: e.javaClass.simpleName}")
         }

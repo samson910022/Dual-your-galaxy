@@ -307,12 +307,16 @@ object PmOutputParser {
 
     // Parses `pm list packages [--user N]` output into package names.
     // Accepts canonical "package:com.foo" lines and skips anything else.
+    // Prefix match is case-insensitive for consistency with the trusted
+    // listing path (TRUSTED_EXEMPT_LINE) and parsePackagesTrusted's M2
+    // payload check; real pm emits all-lowercase, so this only widens
+    // tolerance without changing any lowercase behavior.
     fun parsePackages(output: String): List<String> {
         val out = mutableListOf<String>()
         for (raw in output.lines()) {
             val line = raw.trim()
-            if (!line.startsWith("package:")) continue
-            val pkg = line.removePrefix("package:").trim()
+            if (!line.startsWith("package:", ignoreCase = true)) continue
+            val pkg = line.substring("package:".length).trim()
             if (pkg.isNotEmpty()) out.add(pkg)
         }
         return out
@@ -382,7 +386,7 @@ object PmOutputParser {
         // no ALREADY_EXISTS exception -- any Failure line here is untrusted.
         val errorLine = firstErrorLine(out + "\n" + err, TRUSTED_EXEMPT_LINE)
         if (errorLine != null) {
-            return TrustedList.Unknown("error-semantic output: $errorLine")
+            return TrustedList.Unknown("error-semantic output: ${errorLine.take(200)}")
         }
         // M2: validate each package: payload on the trusted path only.
         // Prefix match is case-insensitive for consistency with
@@ -391,7 +395,7 @@ object PmOutputParser {
         for (raw in out.lines()) {
             val line = raw.trim()
             if (!line.startsWith("package:", ignoreCase = true)) continue
-            val payload = line.removePrefix("package:").trim()
+            val payload = line.substring("package:".length).trim()
             if (!PACKAGE_PAYLOAD.matches(payload)) {
                 return TrustedList.Unknown("malformed package line: ${line.take(200)}")
             }
