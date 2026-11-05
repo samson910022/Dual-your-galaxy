@@ -23,6 +23,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -194,6 +195,76 @@ class ProbeDiagnoseTest {
             vm.state.value.diagnose?.code,
         )
         assertEquals("probe failure must not rewrite lastOperation", baseOp.opId, vm.state.value.lastOperation?.opId)
+        assertEquals(baseOp.timeMs, vm.state.value.lastOperation?.timeMs)
+    }
+
+    // P2-3 通道恢復清過時 E_PROBE：雙通道全失得 PROBE_FAILED 後恢復，
+    // recheck 輕探（ready=false→true，不經 full refresh）須清 diagnose。
+    // 無 sticky UNKNOWN lastOperation 才清；規則見 probeChannels 註解。
+    @Test
+    fun recoveredChannel_clearsStaleProbeFailed() {
+        val gw = FakeRepo(rootOk = false)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.channelReady)
+        assertEquals(
+            "雙通道全失須先得 PROBE_FAILED",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertNull("前置：無操作歷史才測清除", vm.state.value.lastOperation)
+
+        gw.rootOk = true
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && vm.state.value.channelReady }
+
+        assertNull(
+            "通道恢復的輕探須清除過時 PROBE_FAILED，got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose,
+        )
+        val export = buildDiagnosticExport(vm.state.value)
+        assertTrue(
+            "清除後匯出須回 OK（無異常），got: $export",
+            export.contains("OK（無異常）"),
+        )
+    }
+
+    // P2-3 sticky VERIFY_UNKNOWN 下恢復仍保留：操作歷史優先於清除，
+    // 通道恢復（ready=true）的輕探不得洗掉待重新查證的歷史。
+    @Test
+    fun recoveredChannel_retainsStickyVerifyUnknown() {
+        val gw = FakeRepo(failListPackages = true, rootOk = true)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.clone("com.example.chat")
+        await { vm.state.value.lastOperation?.phase == OpPhase.UNKNOWN }
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+        val baseOp = vm.state.value.lastOperation!!
+
+        // 先全失（失敗不洗 sticky），再恢復（成功亦不洗 sticky）。
+        gw.rootOk = false
+        gw.failListPackages = false
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && !vm.state.value.channelReady }
+        assertEquals(
+            "全失不得洗 sticky",
+            DiagnoseCode.VERIFY_UNKNOWN,
+            vm.state.value.diagnose?.code,
+        )
+
+        gw.rootOk = true
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && vm.state.value.channelReady }
+
+        assertEquals(
+            "恢復的輕探須保留 sticky VERIFY_UNKNOWN，不得清為 null",
+            DiagnoseCode.VERIFY_UNKNOWN,
+            vm.state.value.diagnose?.code,
+        )
+        assertEquals("恢復不得改寫 lastOperation", baseOp.opId, vm.state.value.lastOperation?.opId)
         assertEquals(baseOp.timeMs, vm.state.value.lastOperation?.timeMs)
     }
 }

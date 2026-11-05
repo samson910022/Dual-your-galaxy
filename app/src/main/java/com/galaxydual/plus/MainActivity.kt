@@ -371,7 +371,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         exportBtn = Button(this).apply {
-            text = "匯出診斷（已遮蔽）"
+            // P2-4 誠實文案：遮蔽仍非全面保證，不得只寫「已遮蔽」，
+            // 須明示「已遮蔽可辨識資料，分享前請人工確認」。
+            text = "匯出診斷（已遮蔽可辨識資料，分享前請人工確認）"
             setOnClickListener { showDiagnosticExport() }
         }
 
@@ -424,9 +426,11 @@ class MainActivity : ComponentActivity() {
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
-    // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽的本機文字 (buildDiagnosticExport
-    // 經兩道遮蔽：先包名後路徑，大小受限)；只有使用者主動點按才顯示，無自動上傳、
-    // 無網路呼叫、無後台傳送。
+    // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
+    // (buildDiagnosticExport 經兩道遮蔽：先包名後路徑，大小受限)；只有使用者
+    // 主動點按才顯示，無自動上傳、無網路呼叫、無後台傳送。
+    // P2-4 誠實文案：遮蔽仍非全面保證，標題與按鈕須明示「分享前請人工確認」，
+    // 不得只寫「已遮蔽」使人誤信絕對乾淨。
     // P2-7：對話框另附「複製已遮蔽內容」按鈕（見 DIAGNOSTIC_COPY_BUTTON_TEXT）：
     // 使用者主動觸發才經 ClipboardManager 複製已遮蔽文本到本機剪貼簿；複製內容
     // 與預覽同字串 (diagnosticExportCopyText)，不做自動傳輸/share。
@@ -439,7 +443,7 @@ class MainActivity : ComponentActivity() {
             // Best effort: 舊預覽關不掉也不阻塞新預覽。
         }
         exportDialog = AlertDialog.Builder(this)
-            .setTitle("診斷匯出預覽（已遮蔽，無自動上傳）")
+            .setTitle("診斷匯出預覽（已遮蔽可辨識資料，分享前請人工確認，無自動上傳）")
             .setMessage(preview)
             .setCancelable(true)
             .setNeutralButton(DIAGNOSTIC_COPY_BUTTON_TEXT) { _, _ ->
@@ -451,7 +455,7 @@ class MainActivity : ComponentActivity() {
                             diagnosticExportCopyText(state),
                         ),
                     )
-                    msgView.text = "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳）"
+                    msgView.text = "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳，分享前請人工確認）"
                     msgView.setTextColor(colorFor(MsgKind.INFO))
                 } catch (e: Exception) {
                     msgView.text = "複製失敗：${sanitizeForDisplay(e.message ?: "unknown")}"
@@ -833,8 +837,9 @@ internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildSt
 }
 
 // P2-7 匯出複製按鈕文案（頂層 const，JVM 可測；測試鎖定繁中字面）。
+// P2-4 誠實文案：遮蔽仍非全面保證，須附「分享前請人工確認」，不得只寫已遮蔽。
 // 使用者主動觸發才複製，不做自動傳輸/share。
-const val DIAGNOSTIC_COPY_BUTTON_TEXT = "複製已遮蔽內容"
+const val DIAGNOSTIC_COPY_BUTTON_TEXT = "複製已遮蔽內容（分享前請人工確認）"
 
 // 診斷行無障礙描述 (含展開狀態，供 contentDescription + 切換宣告)。
 internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {

@@ -141,6 +141,7 @@ class DualIdResolutionTest {
         )
         val res = runSuspend { repo.resolveDualUserIdTyped() }
         assertTrue("positive property without typed clone must be Unknown, got: $res", res is DualIdResolution.Unknown)
+        assertEquals("canonical must agree (-1)", -1, runSuspend { repo.resolveDualUserId() })
     }
 
     @Test

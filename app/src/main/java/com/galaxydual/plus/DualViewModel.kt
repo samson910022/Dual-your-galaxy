@@ -3734,8 +3734,17 @@ class DualViewModel(
                 // 優先順序規則：已有 sticky 歷史事件（lastOperation UNKNOWN 帶
                 // VERIFY_UNKNOWN，或現有 diagnose 非 null 且非 OK）時保留歷史；
                 // 僅當 diagnose==null（或 OK，即 null）才寫入新的失敗碼，
-                // 避免探測抖動洗掉待查證歷史。成功路徑（ready）不動 diagnose
-                //（沿 PR-6 P2：probe 成功不清 UNKNOWN）。
+                // 避免探測抖動洗掉待查證歷史。
+                // P2-3 通道恢復清過時 E_PROBE（recheck 輕探語意）：
+                // probeChannels 成功（ready=true）走輕探直寫 cur.diagnose，
+                // 不經 full refresh，故舊 PROBE_FAILED 不會被 refresh 清掉，
+                // 須在此清——無 sticky UNKNOWN lastOperation 且現有 diagnose
+                // 為 PROBE_FAILED 時清為 null（通道已恢復，舊失敗碼過時；
+                // 當次 probe 已通過、無新碼可寫，故 null 表就緒）；
+                // 有 sticky UNKNOWN lastOperation 時一律保留 cur.diagnose
+                // （待下一次 pinned verify 重新查證才清）；其他非 PROBE 診斷
+                //（VERIFY_UNKNOWN/VERIFY_MISMATCH/CHANNEL_ERROR 等操作歷史）
+                // 一律保留（sticky，輕探不得洗掉，需 full refresh 才覆寫）。
                 val probeDiagnose =
                     if (!ready) {
                         if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
@@ -3748,7 +3757,13 @@ class DualViewModel(
                             )
                         }
                     } else {
-                        cur.diagnose
+                        if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                            cur.diagnose
+                        } else if (cur.diagnose?.code == DiagnoseCode.PROBE_FAILED) {
+                            null
+                        } else {
+                            cur.diagnose
+                        }
                     }
                 val base = cur.withHookDiagnosis(hook, probeNow).copy(
                     // 鏈式呼叫 (keepLoadingOnExit) 保留 busy，下一段 refreshLocked

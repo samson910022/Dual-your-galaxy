@@ -406,7 +406,8 @@ class Round2PhaseBTest {
             "複製內容不得洩漏原始包名",
             diagnosticExportCopyText(state).contains(rawPkg),
         )
-        assertEquals("複製已遮蔽內容", DIAGNOSTIC_COPY_BUTTON_TEXT)
+        // P2-4 誠實文案：複製按鈕須附「分享前請人工確認」，不得只寫已遮蔽。
+        assertEquals("複製已遮蔽內容（分享前請人工確認）", DIAGNOSTIC_COPY_BUTTON_TEXT)
     }
 
     // ---- P2-8a：超長 clone 拒絕（零 install，歷史不變） ----
