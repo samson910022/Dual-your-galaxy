@@ -32,6 +32,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class SuCancellableTest {
@@ -433,10 +434,15 @@ class SuCancellableTest {
     //       pipe CANNOT until the child dies, so only an upper bound is asserted here.
     //   (c) a normal `echo ok` still returns fast afterwards (new operations stay
     //       usable; truncated=true accepted as degraded fail-closed).
-    // Setup: wrapper `sh -c "sleep 25 & wait"` -- the direct child (sh) dies on
-    // destroyForcibly while the background sleep inherits stdout/stderr pipes and survives
-    // the whole test (25 s >> test elapsed ~5 s, by construction; `25` is unique in this
-    // suite -- other tests use sleep 5/20/30 -- so the finally pkill below only reaps ours).
+    // Setup: wrapper `bash -c "exec -a H2TAG_<uuid> sleep 25 & wait"` -- the
+    // direct child (bash) dies on destroyForcibly while the background sleep
+    // inherits stdout/stderr pipes and survives the whole test (25 s >> test
+    // elapsed ~5 s, by construction). `exec -a` sets the sleep child's argv[0]
+    // to a per-test UUID tag (`wait` keeps wrapper-alive semantics unchanged),
+    // so the finally pkill below (`pkill -9 -f 'H2TAG_<uuid>'`) only reaps
+    // this test's children -- the old `sleep 25` pattern would match foreign
+    // same-name processes (5th-round P3). Host-JVM-only (needs bash/sleep/pkill,
+    // same host assumption as the existing sh/sleep usage in this file).
     // execFn ignores the su argv (same idea as the ChildHoldsPipeProcess fake) and spawns
     // the real wrapper. Android unit-test compile uses android.jar stubs (no Java 9
     // ProcessHandle/pid/toHandle), so child liveness is NOT asserted via pid -- it follows
@@ -448,13 +454,23 @@ class SuCancellableTest {
     // Pollution control: stuck slots would otherwise linger 25 s; finally pkill -9s the
     // sleep 25 survivors so drains EOF and slots release (existing drain-loop pattern).
     @Test fun childHeldPipeRepeatedCancels_staysBoundedAndHandsOver() = runBlocking {
+        // Host-JVM-only premise: bash must exist. assumeTrue aborts (not
+        // vacuously passes) when bash is missing, instead of silently running
+        // with a broken wrapper setup.
+        assumeTrue(
+            "H2 needs bash (host-JVM only)",
+            java.io.File("/bin/bash").exists() || java.io.File("/usr/bin/bash").exists(),
+        )
+        // Per-test UUID tag for the sleep child's argv[0]; the finally pkill
+        // below matches only this tag (never foreign `sleep` processes).
+        val h2Tag = "H2TAG_" + java.util.UUID.randomUUID().toString().replace("-", "")
         delay(500L)
         val baseCount = activeDrainCount.get()
         val baseThreads = aliveCaptureDrains()
         assertTrue("drain count must never exceed cap at start (base=$baseCount)", baseCount <= MAX_ACTIVE_DRAINS)
         val procs = CopyOnWriteArrayList<Process>()
         val gw = SuCmdGateway(
-            execFn = { _ -> ProcessBuilder("sh", "-c", "sleep 25 & wait").start().also { procs += it } },
+            execFn = { _ -> ProcessBuilder("bash", "-c", "exec -a $h2Tag sleep 25 & wait").start().also { procs += it } },
             monoMs = ::defaultMonoMs,
         )
         val iterations = 6
@@ -535,6 +551,15 @@ class SuCancellableTest {
                 maxElapsed < 2_000L,
             )
             assertTrue("drain count must never exceed cap (maxCount=$maxCount)", maxCount <= MAX_ACTIVE_DRAINS)
+            // Fault-injection premise: at least one drain must have stayed stuck
+            // (count rose above base) while the tagged sleep child held the pipes.
+            // If `exec -a` were unsupported the child would exit at once, drains
+            // would EOF immediately and this fails loudly instead of passing
+            // vacuously with no pressure applied.
+            assertTrue(
+                "H2 premise: at least one drain must stay stuck while the tagged child lives (base=$baseCount maxCount=$maxCount)",
+                maxCount > baseCount,
+            )
             // Absolute bound (vs fake `<= 4` convergence): real stuck is expected so
             // non-zero is fine, but it must never diverge past the budget + margin
             // for foreign lingering drains under full-suite load.
@@ -567,17 +592,19 @@ class SuCancellableTest {
                 assertEquals("call after real child-held cancels must succeed", "ok\n", next.out)
             }
         } finally {
-            // Do not pollute the suite: the 25 s sleeps would otherwise pin slots
-            // for the rest of the run. pkill -9s the survivors so drains EOF and
-            // release (pattern is unique to this test; other tests use 5/20/30).
-            // Best-effort only (never masks the main verdict); the next tests
-            // tolerate a non-zero base (drainBudgetExhausted fills remaining).
+            // Do not pollute the suite: the tagged 25 s sleeps would otherwise pin
+            // slots for the rest of the run. pkill -9s only this test's survivors
+            // via the per-test UUID tag (H2TAG_<uuid>), so drains EOF and release
+            // (foreign same-name processes are never matched -- 5th-round P3).
+            // Best-effort only (never masks the main verdict); leftovers expire
+            // naturally with the 25 s sleep and the next tests tolerate a
+            // non-zero base (drainBudgetExhausted fills remaining).
             // Best-effort detail: if pkill is missing or its -f semantics differ,
             // `; true` + the catch swallow it silently; leftovers expire naturally
             // with the 25 s sleep and later tests tolerate a non-zero base.
             // Host-JVM unit-test only (not device/proxybox).
             try {
-                ProcessBuilder("sh", "-c", "pkill -9 -f 'sleep 25'; true").start().waitFor(5, TimeUnit.SECONDS)
+                ProcessBuilder("sh", "-c", "pkill -9 -f '$h2Tag'; true").start().waitFor(5, TimeUnit.SECONDS)
             } catch (_: Exception) {
             }
             for (p in procs) {
