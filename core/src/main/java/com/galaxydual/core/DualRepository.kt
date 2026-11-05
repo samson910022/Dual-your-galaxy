@@ -234,6 +234,30 @@ class DualRepository(
     // plus any id that is not the currently Confirmed dual target (exists but
     // non-Dual: Work/Secondary/Secure Folder, renamed DUAL-label, type
     // conflict, property mismatch, or unknown). Existence alone never suffices.
+    // Phase D + Phase A P1-A continuity helper (issue #21): centralizes the
+    // serial/parent cross-fetch comparison shared by checkExplicitDualId,
+    // verifyOnProfiles, listOnProfiles and checkTargetDrift. userId is NOT
+    // compared here (callers check id drift/vanish separately). Returns null
+    // when every comparable signal agrees; otherwise returns the breach
+    // reason (non-null means breach). Serial known->unknown is continuity
+    // lost; both-present-and-unequal serial/parent each breach. Callers wrap
+    // with "refused: ..." (auto paths) or "identity-changed: ..." (pinned
+    // drift) so existing reason tokens ("reuse"/"continuity"/
+    // "identity-changed") are preserved and external outcomes (refused exit
+    // 1 / Unknown / null / VerifyUnknown) are unchanged.
+    private fun continuityBreach(expected: VerifiedTarget, fresh: VerifiedTarget): String? {
+        if (expected.serial != null && fresh.serial == null) {
+            return "continuity lost: serial known expected=${expected.serial} but fresh missing"
+        }
+        if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
+            return "serial changed expected=${expected.serial} fresh=${fresh.serial}"
+        }
+        if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) {
+            return "parent changed expected=${expected.parentId} fresh=${fresh.parentId}"
+        }
+        return null
+    }
+
     private suspend fun checkExplicitDualId(dualId: Int, expected: VerifiedTarget? = null): CmdResult? {
         if (dualId <= 0) {
             return CmdResult(
@@ -260,28 +284,12 @@ class DualRepository(
             )
         }
         if (expected != null) {
-            if (expected.serial != null && fresh.serial == null) {
+            continuityBreach(expected, fresh)?.let { breach ->
                 return CmdResult(
                     exit = 1,
                     out = "",
                     err = "refused: id $dualId identity reuse suspected" +
-                        " (continuity lost: serial known expected=${expected.serial} but fresh missing)",
-                )
-            }
-            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
-                return CmdResult(
-                    exit = 1,
-                    out = "",
-                    err = "refused: id $dualId identity reuse suspected" +
-                        " (serial changed expected=${expected.serial} fresh=${fresh.serial})",
-                )
-            }
-            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) {
-                return CmdResult(
-                    exit = 1,
-                    out = "",
-                    err = "refused: id $dualId identity reuse suspected" +
-                        " (parent changed expected=${expected.parentId} fresh=${fresh.parentId})",
+                        " ($breach)",
                 )
             }
         }
@@ -481,14 +489,16 @@ class DualRepository(
         if (after.userId != before.userId) {
             return "identity-changed: id drifted before=${before.userId} after=${after.userId}"
         }
-        if (before.serial != null && after.serial == null) {
-            return "identity-changed: serial continuity lost before=${before.serial} after missing (reuse suspected)"
-        }
-        if (before.serial != null && after.serial != null && before.serial != after.serial) {
-            return "identity-changed: serial reuse suspected before=${before.serial} after=${after.serial}"
-        }
-        if (before.parentId != null && after.parentId != null && before.parentId != after.parentId) {
-            return "identity-changed: parent reuse suspected before=${before.parentId} after=${after.parentId}"
+        continuityBreach(before, after)?.let { breach ->
+            val detail = when {
+                breach.startsWith("continuity lost") ->
+                    "identity-changed: serial continuity lost before=${before.serial} after missing (reuse suspected)"
+                breach.startsWith("serial changed") ->
+                    "identity-changed: serial reuse suspected before=${before.serial} after=${after.serial}"
+                else ->
+                    "identity-changed: parent reuse suspected before=${before.parentId} after=${after.parentId}"
+            }
+            return detail
         }
         return null
     }
@@ -551,22 +561,10 @@ class DualRepository(
             )
         }
         if (expected != null) {
-            if (expected.serial != null && fresh.serial == null) {
+            continuityBreach(expected, fresh)?.let { breach ->
                 return VerifyState.Unknown(
                     "refused: id $dualId identity reuse suspected" +
-                        " (continuity lost: serial known expected=${expected.serial} but fresh missing)",
-                )
-            }
-            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
-                return VerifyState.Unknown(
-                    "refused: id $dualId identity reuse suspected" +
-                        " (serial changed expected=${expected.serial} fresh=${fresh.serial})",
-                )
-            }
-            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) {
-                return VerifyState.Unknown(
-                    "refused: id $dualId identity reuse suspected" +
-                        " (parent changed expected=${expected.parentId} fresh=${fresh.parentId})",
+                        " ($breach)",
                 )
             }
         }
@@ -625,11 +623,7 @@ class DualRepository(
         if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
         val fresh = fetchVerifiedTarget()
         if (fresh == null || fresh.userId != dualId) return null
-        if (expected != null) {
-            if (expected.serial != null && fresh.serial == null) return null
-            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) return null
-            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) return null
-        }
+        if (expected != null && continuityBreach(expected, fresh) != null) return null
         return listProbe(dualId)
     }
 
