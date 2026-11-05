@@ -1,6 +1,8 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+import kotlinx.coroutines.CancellationException
+
 // Profile-list snapshot distinguishing channel failure from an empty parse.
 // Phase C3 (issue #9): listProfiles() collapses both to emptyList by design
 // (C2 contract, kept); callers that must tell "channel failed" apart from
@@ -25,7 +27,15 @@ sealed interface VerifyState {
     // The list probe ran cleanly but the package is absent: confirmed absent.
     data object NotInstalled : VerifyState
 
-    // The probe could not run (non-zero exit): no knowledge.
+    // The probe could not run (non-zero exit, guard refusal, or channel
+    // failure): no knowledge.
+    // Display suggestion (PR-2 Phase 3): detail may surface in UI/log, so
+    // the display layer should bound its length (e.g. take(N)); the same
+    // suggestion applies to the VerifyUnknown details on
+    // CloneOutcome/RemoveOutcome. Bounded in practice: the trusted parser
+    // already caps its exit/truncation hints (take(200)); the current
+    // ViewModel interpolates the full detail directly (VM change
+    // out-of-scope here).
     data class Unknown(val detail: String = "") : VerifyState
 }
 
@@ -81,6 +91,9 @@ sealed interface RefreshOutcome {
 
 // Repository for dual-profile app lifecycle; all commands go through PmOutputParser.
 // Pure Kotlin with no Android dependency; execution is delegated to CmdGateway.
+// TODO Follow-up: DualViewModel outer catch swallows CancellationException
+// (its catch (e: Exception) in refreshLocked/clone/remove also catches
+// cancellation; VM change out-of-scope here, recorded for follow-up).
 class DualRepository(
     private val gateway: CmdGateway,
 ) {
@@ -117,8 +130,18 @@ class DualRepository(
     // header-stripped output, so an Error/Failure-labelled UserInfo header is
     // display-only and never fails the channel), Loaded(parse) otherwise.
     // Single gateway call.
+    // Gateway defense (PR-2 Phase 3, R5): a throwing gateway (spawn failure,
+    // SecurityException, binder death surfaced as RuntimeException) maps to
+    // ChannelError (fail closed), never a crash; CancellationException is
+    // rethrown to stay coroutine-correct.
     suspend fun profilesSnapshot(): ProfilesSnapshot {
-        val res = gateway.run(CMD_LIST_USERS)
+        val res = try {
+            gateway.run(CMD_LIST_USERS)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return ProfilesSnapshot.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
         if (!PmOutputParser.isListUsersOutputOk(res.out + "\n" + res.err, res.exit)) {
             return ProfilesSnapshot.ChannelError(res.err.ifEmpty { res.out.ifEmpty { "channel failed" } })
         }
@@ -538,7 +561,14 @@ class DualRepository(
     // a non-zero list probe is retried at most twice with a 1500 ms settle
     // wait before the trusted parse, covering transient binder/timeout blips.
     // gateway.run is a blocking suspend with no dispatcher assumption, hence
-    // Thread.sleep (core has no kotlinx-coroutines dependency for delay).
+    // Thread.sleep is kept (frozen policy; core's coroutines dependency is
+    // only used for the CancellationException rethrow discipline, never for
+    // delay here). Thread.sleep blocks the calling thread itself
+    // (gateway-internal withContext(IO) does not move it), so the caller
+    // must already be off Main. Must NEVER be called on Main: the current
+    // DualViewModel launches repo calls on viewModelScope (Main dispatcher)
+    // without IO dispatch, so the call chain must guarantee non-Main before
+    // this path can rely on it (VM dispatch change out-of-scope here).
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -599,12 +629,24 @@ class DualRepository(
             // only an invalid userId could throw here (never a package token).
             return VerifyState.Unknown(e.message ?: "invalid userId")
         }
-        var res = gateway.run(cmd)
-        var attempts = 1
-        while (res.exit != 0 && attempts < 3) {
-            Thread.sleep(1500)
-            res = gateway.run(cmd)
-            attempts++
+        // Gateway defense (PR-2 Phase 3, R5): a gateway that throws mid-probe
+        // (initial call or any retry) maps to Unknown("channel error: ..."),
+        // fail closed; CancellationException is rethrown to stay
+        // coroutine-correct. Retry/sleep policy frozen (PR-3 owns it; never
+        // on Main -- Thread.sleep blocks the calling thread).
+        val res = try {
+            var r = gateway.run(cmd)
+            var attempts = 1
+            while (r.exit != 0 && attempts < 3) {
+                Thread.sleep(1500)
+                r = gateway.run(cmd)
+                attempts++
+            }
+            r
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return VerifyState.Unknown("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
         // Trusted tri-state (PR-2 stage 2, issue #22): the final probe result
         // is judged by parsePackagesTrusted, not by exit code alone. A clean
@@ -647,13 +689,22 @@ class DualRepository(
     // No retry here by design (frozen, PR-3 owns any change -- same policy
     // as verifyOnProfiles above): refresh maps null to "keep old value", so
     // a transient blip costs one stale frame, not data loss.
+    // Gateway defense (PR-2 Phase 3, R5): a throwing gateway maps to null
+    // (unknown, fail closed), never a crash; CancellationException is
+    // rethrown to stay coroutine-correct.
     private suspend fun listProbe(dualId: Int): List<String>? {
         val cmd = try {
             PmOutputParser.buildListPackages(dualId)
         } catch (e: IllegalArgumentException) {
             return null
         }
-        val res = gateway.run(cmd)
+        val res = try {
+            gateway.run(cmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return null
+        }
         return PmOutputParser.parsePackagesTrusted(res).toPackageList()
     }
 
