@@ -41,7 +41,7 @@ CI / Release:
   [#5 close comment](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/5#issuecomment-6626662388)).
   Push tags `v*` trigger the same workflow; re-verify on first real `v*`
   or after rotation/workflow change. Green non-tag CI does not prove the
-  tag path.
+  tag path (dry-run tag/Release cleaned per #5).
 - Local sign (complete — pass alias and both passwords explicitly):
 
   ```bash
@@ -58,10 +58,13 @@ CI / Release:
   `~/.android-keys/Galaxy-Dual-app-Plus-release.properties`
   (`storeFile/storePassword/keyAlias/keyPassword`) is not read by
   `apksigner` directly; export its values as env vars first.
-- Signature versions: `apksigner` enables v1 (JAR signing) + v2 (APK
+- Signature versions: manual `apksigner sign` enables v1 (JAR signing) + v2 (APK
   Signature Scheme v2) by default. Keep the default for sideload
   installs (widest compatibility). Explicit form:
-  `--v1-signing-enabled true --v2-signing-enabled true`.
+  `--v1-signing-enabled true --v2-signing-enabled true`. CI-built APK
+  differs: run 41800791298 attempt 3 `apksigner verify --verbose`
+  shows v1=false / v2=true as observed in that run (minSdk 29 per
+  gradle/libs.versions.toml; v1/v2 values as measured; cause not yet investigated).
 - `.jks` vs PKCS12: the file keeps the historical `.jks` extension but
   its actual format is PKCS12 (`keytool -list` reports `Type: PKCS12`).
   Java/`apksigner` detect format by content, so the extension does not
