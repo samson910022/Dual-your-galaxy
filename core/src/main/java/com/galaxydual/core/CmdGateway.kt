@@ -53,12 +53,13 @@ data class CmdResult(
     // same consumer rule as timedOut (read-only verifyListProbe, no write
     // resend, reverse observation maps to Unknown). Defaults to false so
     // every existing CmdResult(...) call site keeps compiling and keeps its
-    // old meaning. tri-state rule for write replies:
+    // old meaning. four-signal rule for write replies:
     // explicit pm failure (pm reports Failure[...], both flags false) ->
     // definite failure; pre-dispatch refusal (command never sent: no binder,
     // not authorized, bind failure -- both flags false) -> definite failure;
     // post-dispatch reply loss (timedOut OR transportUnknown OR
-    // isServiceTimeoutText) -> reconcile read-only, never claim failure.
+    // isServiceTimeoutText OR isPostSpawnTransportText) -> reconcile
+    // read-only, never claim failure.
     // Set client-side only (Shizuku transactExec catch path); never crosses
     // the frozen (exit, out, err) parcel -- same wire constraint as timedOut.
     val transportUnknown: Boolean = false,
@@ -86,9 +87,9 @@ data class CmdResult(
 // - "shizuku: bind failed: bind timed out after ..." (bind wrapper: the
 //   command never reached the service -- different knowledge state);
 // - "interrupted: ...", "spawn failed: ...", "service exec failed: ...",
-//   and any mid-line "timeout" word inside pm out/err. The first two are
-//   owned by the post-spawn backstop below (isPostSpawnTransportText),
-//   NOT here: "interrupted:"/"service exec failed:" are post-spawn unknown
+//   and any mid-line "timeout" word inside pm out/err. "interrupted: " and
+//   "service exec failed: " are owned by the post-spawn backstop below
+//   (isPostSpawnTransportText), NOT here: "interrupted:"/"service exec failed:" are post-spawn unknown
 //   (may have executed), while "spawn failed:" is pre-spawn definite
 //   (process never started).
 // Both prefixes contain a space, which a package name can never contain, so
