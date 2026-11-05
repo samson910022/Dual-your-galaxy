@@ -181,19 +181,29 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
 // Service side (GalaxyExecService binder thread, no coroutine scope) keeps
 // calling the blocking captureProcess above; only the SuCmdGateway client
 // path uses this helper.
-internal suspend fun cancellableAwaitExit(proc: Process, timeoutMs: Long): Boolean {
-    val deadlineMs = System.currentTimeMillis() + timeoutMs
+// Monotonic budget (P2-2, PR #40 Re-review): elapsed time on the injectable
+// monoMs clock (default System.nanoTime, monotonic on JVM and Android ART),
+// never a System.currentTimeMillis wall deadline -- a user/NTP backward wall
+// correction must not extend the 10 s / 60 s elapsed bound. Production may
+// inject SystemClock.elapsedRealtime (same family as the remove-consent TTL
+// in DualViewModel); JVM tests inject a fake.
+internal suspend fun cancellableAwaitExit(
+    proc: Process,
+    timeoutMs: Long,
+    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+): Boolean {
+    val startMs = monoMs()
     while (true) {
         // Queue-collapse checkpoint: a cancelled select job surfaces here
         // within one poll slice, releasing opMutex for the winner. This is
         // NOT remote preemption (see captureProcessCancellable header).
         currentCoroutineContext().ensureActive()
-        val remaining = deadlineMs - System.currentTimeMillis()
-        if (remaining <= 0) {
+        val elapsedMs = monoMs() - startMs
+        if (elapsedMs >= timeoutMs) {
             // Final non-blocking check before declaring timeout.
             return proc.waitFor(0, TimeUnit.MILLISECONDS)
         }
-        val poll = minOf(SU_WAIT_POLL_MS, remaining)
+        val poll = minOf(SU_WAIT_POLL_MS, timeoutMs - elapsedMs)
         if (proc.waitFor(poll, TimeUnit.MILLISECONDS)) return true
     }
 }
@@ -203,15 +213,20 @@ internal suspend fun cancellableAwaitExit(proc: Process, timeoutMs: Long): Boole
 // budget expires (caller re-checks isAlive for joinExpired, same as the
 // blocking path). Throws CancellationException on coroutine cancel (caller
 // destroys and rethrows) and InterruptedException on thread interrupt
-// (caller maps to transportUnknown).
-internal suspend fun cancellableJoin(t: Thread, budgetMs: Long) {
-    val deadlineMs = System.currentTimeMillis() + budgetMs
+// (caller maps to transportUnknown). Budget is monoMs elapsed (P2-2, same
+// wall-rollback immunity as cancellableAwaitExit above).
+internal suspend fun cancellableJoin(
+    t: Thread,
+    budgetMs: Long,
+    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+) {
+    val startMs = monoMs()
     while (t.isAlive) {
         currentCoroutineContext().ensureActive()
-        val remaining = deadlineMs - System.currentTimeMillis()
-        if (remaining <= 0) return
+        val elapsedMs = monoMs() - startMs
+        if (elapsedMs >= budgetMs) return
         try {
-            t.join(minOf(SU_DRAIN_POLL_MS, remaining))
+            t.join(minOf(SU_DRAIN_POLL_MS, budgetMs - elapsedMs))
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             throw e
@@ -258,6 +273,13 @@ internal suspend fun cancellableJoin(t: Thread, budgetMs: Long) {
 internal suspend fun captureProcessCancellable(
     argv: Array<String>,
     timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
+    // Monotonic clock seam (P2-2): threaded into every cancellableAwaitExit /
+    // cancellableJoin below so all bounds are mono elapsed. Same default as
+    // the helpers; SuCmdGateway injects its own (production: nanoTime, or
+    // SystemClock.elapsedRealtime for TTL consistency). Kept BEFORE execFn so
+    // the trailing-lambda call style `SuCmdGateway { argv -> ... }` still
+    // binds execFn.
+    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
     execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
 ): CmdResult {
     currentCoroutineContext().ensureActive()
@@ -302,7 +324,7 @@ internal suspend fun captureProcessCancellable(
             errStatus.set(drainCapped(errS, err))
         }.also { openDrainErr = it }
         val exited = try {
-            cancellableAwaitExit(proc, timeoutMs)
+            cancellableAwaitExit(proc, timeoutMs, monoMs)
         } catch (e: CancellationException) {
             // Post-spawn unknown (Phase A): spawned, may have executed, reply
             // lost to cancel. Destroy best effort and propagate CE so the
@@ -328,13 +350,13 @@ internal suspend fun captureProcessCancellable(
             } catch (_: Exception) {
             }
             try {
-                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS)
+                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS, monoMs)
             } catch (_: CancellationException) {
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
             try {
-                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS)
+                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS, monoMs)
             } catch (_: CancellationException) {
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -358,8 +380,8 @@ internal suspend fun captureProcessCancellable(
             } catch (_: Exception) {
             }
             try {
-                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS)
-                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS)
+                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS, monoMs)
+                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS, monoMs)
             } catch (ce: CancellationException) {
                 try {
                     proc.destroyForcibly()
@@ -390,8 +412,8 @@ internal suspend fun captureProcessCancellable(
             } catch (_: Exception) {
             }
             try {
-                cancellableJoin(drainOut, 2_000)
-                cancellableJoin(drainErr, 2_000)
+                cancellableJoin(drainOut, 2_000, monoMs)
+                cancellableJoin(drainErr, 2_000, monoMs)
             } catch (e: CancellationException) {
                 // Timeout already abandoned the wait (timedOut below), but the
                 // cancel must still release the waiter at once for handover.
@@ -404,8 +426,8 @@ internal suspend fun captureProcessCancellable(
             return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
         }
         try {
-            cancellableJoin(drainOut, 5_000)
-            cancellableJoin(drainErr, 5_000)
+            cancellableJoin(drainOut, 5_000, monoMs)
+            cancellableJoin(drainErr, 5_000, monoMs)
         } catch (e: CancellationException) {
             try {
                 proc.destroyForcibly()
@@ -487,13 +509,13 @@ internal suspend fun captureProcessCancellable(
         } catch (_: Exception) {
         }
         try {
-            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS, monoMs) }
         } catch (_: CancellationException) {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
         try {
-            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS, monoMs) }
         } catch (_: CancellationException) {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -558,8 +580,8 @@ internal suspend fun captureProcessCancellable(
         // this caps a stuck child-held pipe without blocking the result.
         // Cancellable: a concurrent cancel aborts the wait and propagates.
         try {
-            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
-            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS, monoMs) }
+            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS, monoMs) }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
@@ -673,6 +695,14 @@ internal fun capped(sink: StringBuilder, truncated: Boolean): String =
 // post-spawn cancel stays unknown-after-send (Phase A transportUnknown
 // semantics); any result-form of that state carries transportUnknown=true.
 class SuCmdGateway(
+    // Monotonic clock seam (P2-2, PR #40 Re-review): elapsed source for every
+    // cancellable wait above. Default System.nanoTime is monotonic on JVM and
+    // Android ART (immune to wall/NTP rollback); production may inject
+    // SystemClock.elapsedRealtime for consistency with the remove-consent TTL
+    // (DualViewModel nowMs, same monotonic family -- interchangeable here
+    // since only intervals are measured). JVM tests inject a fake.
+    // Kept BEFORE execFn so `SuCmdGateway { argv -> ... }` still binds execFn.
+    private val monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
     // Injectable process spawn (P2-1 test seam): production spawns `su -c`
     // via Runtime.exec; JVM tests inject a real blocking `sleep` subprocess
     // (actual Process, non-cooperative waitFor) so latest-wins handover is
@@ -684,7 +714,7 @@ class SuCmdGateway(
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
             try {
-                captureProcessCancellable(suArgv(cmd), suTimeoutFor(cmd), execFn)
+                captureProcessCancellable(suArgv(cmd), suTimeoutFor(cmd), monoMs = monoMs, execFn = execFn)
             } catch (e: InterruptedException) {
                 // Post-spawn unknown (Phase A1): an interrupt escaping
                 // captureProcess means the spawn was attempted and the
