@@ -1035,6 +1035,20 @@ class DualSafetyTest {
 
         assertEquals(-1, runSuspend { repo.resolveDualUserId() })
         assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
         assertTrue(
             "mixed-type must not target user 95, got: ${gateway.commands}",
             gateway.targetCommandsFor(95).isEmpty(),
@@ -1257,6 +1271,435 @@ class DualSafetyTest {
 
         assertTrue(
             "profile.CLONE/evil must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase A P1-R6 trailing-punctuation e2e (fail-closed): both channels
+    // type user 95 as `android.os.usertype.profile.CLONE!evil` (parent 0,
+    // serial 15, prop 95). The `!evil` residual is not allowlisted noise,
+    // so the mention is OTHER on both channels; resolution is -1 and every
+    // entry refuses with zero target commands (notably zero
+    // `pm list packages --user` probes).
+    @Test
+    fun cloneTrailingBangTailBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseBangTail = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE!evil
+        """.trimIndent()
+        val dumpsysBangTail = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE!evil
+        """.trimIndent()
+        // Sanity: both trailing-punct blocks parse as OTHER (single-mention, no mixing).
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseUserListVerbose(verboseBangTail).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysBangTail).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseBangTail,
+            dumpsysOutput = dumpsysBangTail,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE!evil must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase A P1-R6 slash + fake second token e2e (fail-closed): both
+    // channels type user 95 as
+    // `android.os.usertype.profile.CLONE/profile!evil` (parent 0, serial
+    // 15, prop 95). `/profile!evil` opens no legal second token, so the
+    // mention is tainted -> OTHER on both channels (NOT UNKNOWN);
+    // resolution is -1 and every entry refuses with zero target commands.
+    @Test
+    fun cloneSlashFakeSecondTokenBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseFakeSecond = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE/profile!evil
+        """.trimIndent()
+        val dumpsysFakeSecond = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE/profile!evil
+        """.trimIndent()
+        // Sanity: both fake-second-token blocks parse as OTHER, never UNKNOWN.
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseUserListVerbose(verboseFakeSecond).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysFakeSecond).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseFakeSecond,
+            dumpsysOutput = dumpsysFakeSecond,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE/profile!evil must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase A `(default)`-note positive control: both channels type user 95
+    // as `android.os.usertype.profile.CLONE (default)` (parent 0, serial
+    // 15, prop 95). The slash-free `(default)` note is the sole tolerated
+    // suffix, so both claims stay CLONE and resolution confirms 95
+    // (mirrors the `renamedReorderedDual_stillRecognized` positive shape).
+    @Test
+    fun cloneParenthesizedDefaultBothChannels_e2eConfirms() {
+        val verboseDefault = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE (default)
+        """.trimIndent()
+        val dumpsysDefault = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE (default)
+        """.trimIndent()
+        // Sanity: the default-note blocks still parse as CLONE on both channels.
+        assertEquals(
+            ProfileUserType.CLONE,
+            SamsungProfileAdapter.parseUserListVerbose(verboseDefault).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.CLONE,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysDefault).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseDefault,
+            dumpsysOutput = dumpsysDefault,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(95, runSuspend { repo.resolveDualUserId() })
+        assertEquals(95, runSuspend { ShizukuElevator(gateway).probe() }.dualUserId)
+        assertEquals(95, runSuspend { SuElevator(suGateway(gateway)).probe() }.dualUserId)
+
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("cloneVerified must succeed for the (default) note, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(95, (outcome as CloneOutcome.Success).dualId)
+
+        gateway.commands.clear()
+        assertEquals(0, runSuspend { repo.clone("com.example.chat", 95) }.exit)
+        assertEquals(
+            listOf("pm install-existing --user 95 com.example.chat"),
+            gateway.writeCommands(),
+        )
+        gateway.commands.clear()
+        assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Installed)
+        assertEquals(listOf("com.example.chat"), runSuspend { repo.listClonedPackages() })
+    }
+
+    // Phase B fixer (F1 `?evil` gap): trailing-question e2e mirroring
+    // `cloneTrailingBangTailBothChannels_e2eRefusesWithoutTargetCommands`.
+    // Both channels type user 95 as
+    // `android.os.usertype.profile.CLONE?evil` (parent 0, serial 15, prop
+    // 95). The `?evil` residual is not allowlisted noise, so the mention is
+    // OTHER on both channels; resolution is -1 and every entry refuses with
+    // zero target commands (notably zero `pm list packages --user` probes).
+    @Test
+    fun cloneTrailingQuestionTailBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseQuestionTail = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE?evil
+        """.trimIndent()
+        val dumpsysQuestionTail = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE?evil
+        """.trimIndent()
+        // Sanity: both trailing-punct blocks parse as OTHER (single-mention, no mixing).
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseUserListVerbose(verboseQuestionTail).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysQuestionTail).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseQuestionTail,
+            dumpsysOutput = dumpsysQuestionTail,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE?evil must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase B fixer (F1 `/profilegarbage` gap): slash + garbage second
+    // token e2e mirroring
+    // `cloneSlashFakeSecondTokenBothChannels_e2eRefusesWithoutTargetCommands`.
+    // Both channels type user 95 as
+    // `android.os.usertype.profile.CLONE/profilegarbage` (parent 0, serial
+    // 15, prop 95). `/profilegarbage` opens no legal second token (bare
+    // `profile` name with no enumerated separator + name), so the mention
+    // is tainted -> OTHER on both channels (NOT UNKNOWN); resolution is -1
+    // and every entry refuses with zero target commands.
+    @Test
+    fun cloneSlashGarbageSecondTokenBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseGarbageSecond = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE/profilegarbage
+        """.trimIndent()
+        val dumpsysGarbageSecond = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE/profilegarbage
+        """.trimIndent()
+        // Sanity: both garbage-second-token blocks parse as OTHER, never UNKNOWN.
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseUserListVerbose(verboseGarbageSecond).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysGarbageSecond).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseGarbageSecond,
+            dumpsysOutput = dumpsysGarbageSecond,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE/profilegarbage must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase B fixer (F2/T7 dual-token gap): slash with a LEGAL second token
+    // e2e. Both channels type user 95 as
+    // `android.os.usertype.profile.CLONE/profile.MANAGED` (parent 0, serial
+    // 15, prop 95, same value on verbose + dumpsys). The `/` opens another
+    // legal `profile.X` token, so the mention takes the two-token
+    // contradiction rule -> UNKNOWN on both channels (NOT OTHER). UNKNOWN
+    // and OTHER share the same repo-level refuse-to-write semantics, so the
+    // repo assertions mirror the negative e2e shape: resolve -1,
+    // cloneVerified NoDual, explicit clone/remove refused, verifyState
+    // Unknown, list null, targetCommandsFor(95) empty + install/uninstall/
+    // list triple none. Locks: 雙 token 矛盾 → UNKNOWN，仍零目標.
+    @Test
+    fun cloneSlashLegalDualTokenBothChannels_e2eUnknownWithoutTargetCommands() {
+        val verboseDualToken = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE/profile.MANAGED
+        """.trimIndent()
+        val dumpsysDualToken = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE/profile.MANAGED
+        """.trimIndent()
+        // Sanity: both legal-dual-token blocks parse as UNKNOWN (intra-mention contradiction).
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            SamsungProfileAdapter.parseUserListVerbose(verboseDualToken).single { it.userId == 95 }.userType,
+        )
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysDualToken).single { it.userId == 95 }.userType,
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseDualToken,
+            dumpsysOutput = dumpsysDualToken,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE/profile.MANAGED must not target user 95, got: ${gateway.commands}",
             gateway.targetCommandsFor(95).isEmpty(),
         )
         assertTrue(

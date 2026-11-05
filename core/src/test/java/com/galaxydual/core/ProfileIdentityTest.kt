@@ -968,4 +968,165 @@ class ProfileIdentityTest {
             parseSingleVerboseType("profile.CLONE (default)"),
         )
     }
+
+    // ---- Phase A P1-R6: trailing-punctuation tail (fail-closed, R7 T1) ----
+    // A CLONE token followed by trailing punctuation + junk (`!evil`,
+    // backslash, fullwidth slash, ...) leaves a non-allowlisted residual
+    // (strict hasDisallowedResidual check) -> OTHER, never CLONE. Each
+    // value below is the ONLY type mention, so OTHER proves the tail
+    // alone refuses (not an UNKNOWN mixture).
+    @Test
+    fun cloneTrailingPunctTail_isOtherNotClone() {
+        val cases = listOf(
+            "profile.CLONE!evil",
+            "profile.CLONE?evil",
+            "profile.CLONE:evil",
+            "profile.CLONE;evil",
+            "profile.CLONE,evil",
+            "profile.CLONE@evil",
+            "profile.CLONE#evil",
+            "profile.CLONE\$evil",
+            "profile.CLONE%evil",
+            "profile.CLONE^evil",
+            "profile.CLONE&evil",
+            "profile.CLONE*evil",
+            "profile.CLONE=evil",
+            "profile.CLONE|evil",
+            "profile.CLONE+evil",
+            "profile.CLONE(evil)",
+            "profile.CLONE)evil",
+            "profile.CLONE\\evil",
+            "profile.CLONE／evil",
+            "profile_CLONE!evil",
+            "profile CLONE!evil",
+            "profile-CLONE!evil",
+            "profile\tCLONE!evil",
+            "android.os.usertype.profile.CLONE!evil",
+            "android.os.usertype.profile.CLONE?evil",
+            "android.os.usertype.profile.CLONE:evil",
+            "android.os.usertype.profile.CLONE/profile.CLONE/evil",
+            "profile.CLONE (default) evil",
+        )
+        for (value in cases) {
+            assertEquals(
+                "trailing-punct tail must be OTHER, got CLONE/UNKNOWN: $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+        // Locked fail-closed strictness (Phase A): even a repeated,
+        // comma-joined CLONE token is OTHER, never CLONE-by-priority --
+        // `,` is not allowlisted residual noise. Do NOT relax this to
+        // CLONE without a spec change.
+        assertEquals(
+            ProfileUserType.OTHER,
+            parseSingleVerboseType("profile.CLONE, profile.CLONE"),
+        )
+    }
+
+    @Test
+    fun cloneTrailingBangFallback_isOtherNotClone() {
+        // Separator-less fallback path (`usertype <token>`, no `:`/`=`):
+        // the same `!evil` residual fails closed to OTHER there too, as
+        // does a `CLONE/profile!evil` remainder (fake second token taints
+        // the fallback mention just like the explicit-value path).
+        val remainders = listOf(
+            "profile.CLONE!evil",
+            "profile.CLONE/profile!evil",
+        )
+        for (remainder in remainders) {
+            val text = """
+                Users:
+                  UserInfo{95:DualApp:400} running:
+                    Serial: 15
+                    parentId=0
+                    usertype $remainder
+            """.trimIndent()
+            val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+            assertEquals(1, parsed.size)
+            assertEquals(
+                "fallback remainder must be OTHER: $remainder",
+                ProfileUserType.OTHER,
+                parsed[0].userType,
+            )
+        }
+    }
+
+    // ---- Phase A P1-R6: slash + fake second token (fail-closed, R7 T2) ----
+    // A `/` opens a legal second token ONLY for `profile` + enumerated
+    // separator + name (optional `android.os.usertype.` prefix). Anything
+    // else (`/profile!evil`, `/profilegarbage`, bare `/profile`,
+    // `/profiles`, `/profileMANAGED`, ...) taints the mention -> OTHER
+    // for a single-CLONE mention. Note: this is OTHER, NOT UNKNOWN --
+    // UNKNOWN is reserved for genuine two-token contradictions
+    // (`profile.CLONE/profile.MANAGED`, locked below).
+    @Test
+    fun cloneSlashFakeSecondToken_isOtherNotClone() {
+        val cases = listOf(
+            "profile.CLONE/profile!evil",
+            "profile.CLONE/profile?evil",
+            "profile.CLONE/profilegarbage",
+            "profile.CLONE/profile",
+            "profile.CLONE/profiles",
+            "profile.CLONE/profileMANAGED",
+            "profile.CLONE/ profile!evil",
+            "android.os.usertype.profile.CLONE/profile!evil",
+        )
+        for (value in cases) {
+            assertEquals(
+                "fake second token must be OTHER (not UNKNOWN): $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+        // Probe-locked (Phase B fixer): a non-dot dual token is still a
+        // genuine two-token contradiction -> UNKNOWN, not OTHER.
+        // `profile_CLONE` is an allowlisted CLONE token (`_` is an
+        // enumerated separator) and `profile_MANAGED` is an other token,
+        // so the mention takes the contradiction rule (UNKNOWN), same as
+        // the dotted `profile.CLONE/profile.MANAGED` form. Verified by
+        // probe run (verbose + dumpsys both UNKNOWN) before locking.
+        assertEquals(
+            "non-dot dual token must stay UNKNOWN: profile_CLONE/profile_MANAGED",
+            ProfileUserType.UNKNOWN,
+            parseSingleVerboseType("profile_CLONE/profile_MANAGED"),
+        )
+    }
+
+    // NOTE (R7 T3): no new legal-dual-token test added here --
+    // `slashSeparatedManagedAndClone_staysUnknown` already locks both
+    // slash directions (`profile.MANAGED/profile.CLONE` and
+    // `profile.CLONE/profile.MANAGED`) plus the FQ form as UNKNOWN.
+
+    // ---- Phase A `(default)` note: tolerated suffix vs slashed note ----
+    // `(default)` (case-insensitive, optional inner/outer whitespace, slashes
+    // absent) is the sole tolerated suffix -> CLONE. A slash or any other
+    // note content (`(a/b)`, `(evil)`, `[evil]`) fails closed to OTHER.
+    @Test
+    fun cloneParenthesizedDefaultNote_staysClone_andSlashedNote_isOther() {
+        val cloneCases = listOf(
+            "profile.CLONE (default)",
+            "profile.CLONE (DEFAULT)",
+            "profile.CLONE(default)",
+        )
+        for (value in cloneCases) {
+            assertEquals(
+                "default note must stay CLONE: $value",
+                ProfileUserType.CLONE,
+                parseSingleVerboseType(value),
+            )
+        }
+        val otherCases = listOf(
+            "profile.CLONE (a/b)",
+            "profile.CLONE (evil)",
+            "profile.CLONE [evil]",
+        )
+        for (value in otherCases) {
+            assertEquals(
+                "non-default/slashed note must be OTHER: $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
 }
