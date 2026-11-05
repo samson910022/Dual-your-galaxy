@@ -54,6 +54,12 @@ internal const val SU_DRAIN_POLL_MS = 50L
 // cancel cleanup never wedges latest-wins handover (see header policy).
 internal const val SU_CANCEL_DRAIN_MS = 300L
 
+// Single monotonic source for all cancellable waits below (P2-2 G3): default
+// System.nanoTime (CLOCK_MONOTONIC on JVM/ART, immune to wall rollback).
+// Production injects its own clock only if deep-sleep-inclusive (BOOTTIME)
+// semantics are desired; JVM tests inject a fake.
+internal fun defaultMonoMs(): Long = System.nanoTime() / 1_000_000L
+
 // Maps a su command line to its wait budget: probe (`id -u`) uses the short
 // probe timeout, every other command (pm writes, list probes, identity
 // fetches) keeps the full exec timeout. Pure so JVM tests pin it.
@@ -182,15 +188,16 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
 // calling the blocking captureProcess above; only the SuCmdGateway client
 // path uses this helper.
 // Monotonic budget (P2-2, PR #40 Re-review): elapsed time on the injectable
-// monoMs clock (default System.nanoTime, monotonic on JVM and Android ART),
+// monoMs clock (default nanoTime, monotonic on JVM and Android ART),
 // never a System.currentTimeMillis wall deadline -- a user/NTP backward wall
 // correction must not extend the 10 s / 60 s elapsed bound. Production may
-// inject SystemClock.elapsedRealtime (same family as the remove-consent TTL
-// in DualViewModel); JVM tests inject a fake.
+// inject SystemClock.elapsedRealtime only if deep-sleep-inclusive (BOOTTIME)
+// semantics are desired (nanoTime is CLOCK_MONOTONIC and excludes deep
+// sleep, but both are immune to wall rollback); JVM tests inject a fake.
 internal suspend fun cancellableAwaitExit(
     proc: Process,
     timeoutMs: Long,
-    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    monoMs: () -> Long = ::defaultMonoMs,
 ): Boolean {
     val startMs = monoMs()
     while (true) {
@@ -218,7 +225,7 @@ internal suspend fun cancellableAwaitExit(
 internal suspend fun cancellableJoin(
     t: Thread,
     budgetMs: Long,
-    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    monoMs: () -> Long = ::defaultMonoMs,
 ) {
     val startMs = monoMs()
     while (t.isAlive) {
@@ -275,11 +282,12 @@ internal suspend fun captureProcessCancellable(
     timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
     // Monotonic clock seam (P2-2): threaded into every cancellableAwaitExit /
     // cancellableJoin below so all bounds are mono elapsed. Same default as
-    // the helpers; SuCmdGateway injects its own (production: nanoTime, or
-    // SystemClock.elapsedRealtime for TTL consistency). Kept BEFORE execFn so
+    // the helpers; SuCmdGateway injects its own (production: nanoTime by
+    // default, or SystemClock.elapsedRealtime if deep-sleep-inclusive
+    // semantics are desired). Kept BEFORE execFn so
     // the trailing-lambda call style `SuCmdGateway { argv -> ... }` still
     // binds execFn.
-    monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    monoMs: () -> Long = ::defaultMonoMs,
     execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
 ): CmdResult {
     currentCoroutineContext().ensureActive()
@@ -696,13 +704,13 @@ internal fun capped(sink: StringBuilder, truncated: Boolean): String =
 // semantics); any result-form of that state carries transportUnknown=true.
 class SuCmdGateway(
     // Monotonic clock seam (P2-2, PR #40 Re-review): elapsed source for every
-    // cancellable wait above. Default System.nanoTime is monotonic on JVM and
+    // cancellable wait above. Default nanoTime is monotonic on JVM and
     // Android ART (immune to wall/NTP rollback); production may inject
-    // SystemClock.elapsedRealtime for consistency with the remove-consent TTL
-    // (DualViewModel nowMs, same monotonic family -- interchangeable here
-    // since only intervals are measured). JVM tests inject a fake.
+    // SystemClock.elapsedRealtime only if deep-sleep-inclusive (BOOTTIME)
+    // semantics are desired (nanoTime is CLOCK_MONOTONIC and excludes deep
+    // sleep). JVM tests inject a fake.
     // Kept BEFORE execFn so `SuCmdGateway { argv -> ... }` still binds execFn.
-    private val monoMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val monoMs: () -> Long = ::defaultMonoMs,
     // Injectable process spawn (P2-1 test seam): production spawns `su -c`
     // via Runtime.exec; JVM tests inject a real blocking `sleep` subprocess
     // (actual Process, non-cooperative waitFor) so latest-wins handover is

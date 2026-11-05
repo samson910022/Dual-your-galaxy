@@ -371,9 +371,8 @@ class SuCancellableTest {
                 elapsedMs < 2_000L,
             )
         }
-        // Tightened handover bound: reclaim does two bounded drain joins
-        // (2 x SU_CANCEL_DRAIN_MS = 600 ms ceiling), so the worst cancel
-        // return must stay under 1 s even on slow CI.
+        // Cancel-path joins abort at once (already cancelled; 600 ms is the
+        // non-cancel cap), so 1 s is generous margin for scheduling jitter.
         assertTrue(
             "worst cancel return must stay under 1 s with child-held pipes (maxElapsed=${maxElapsed}ms)",
             maxElapsed < 1_000L,
