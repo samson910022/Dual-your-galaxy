@@ -139,9 +139,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
 - daagent 側雙路徑 EACCES：主＋備皆不可寫（daagent SELinux 域限制），
   故 marker 目前僅含 `system_server`；daagent hook 安裝證據以 lspd 日誌
   `found ... static=true`＋clinit 行為準，不以 marker scope 齊全為準。
-- App uid／`run-as` 皆不可讀任一路徑 [S24 已驗證]：直接讀取恆為
-  「未偵測到」（fail-closed 符合設計）；有 SHELL／ROOT 通道就緒時才走
-  gateway `cat` 重試（[待實機驗證]）。
+- App uid／`run-as` 皆不可讀任一路徑 [S24 已驗證]：直接讀取恆不可讀——P1 起不再顯示為「未偵測到」（假陰性），而是「狀態未知（無權限讀取／無可用診斷通道）」（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）；僅當確定可讀但缺失時才顯示「未偵測到」。明選 LSPosed（NoOp 佔位）時診斷仍走獨立路徑：直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）gateway `cat`（[待實機驗證]）；無任何真通道時為「狀態未知（無可用診斷通道）」，需切到 ROOT／Shizuku 真通道後重探才能完整診斷。診斷結果永不進入路由／`channelReady`（沿襲 #19）。
 - daagent 新類路徑（provider 首選）掛載 [S24 已驗證]：
   `using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
   連續命中（daagent 自然重啟後新碼載入，零退回、零 `not present`）。
@@ -174,7 +172,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
    原則不變：兩個用戶都要開、都要含 `system`。
 4. App 內通道選擇（F4b-P1 手動 picker，見 `docs/USAGE.md` §4）：打開 App，
    用四按鈕（自動／ROOT／Shizuku／LSPosed）選擇通道；LSPosed 模式顯示
-   Hook marker 行（`已啟用（system_server, daagent）`／`未偵測到`），
+   Hook marker 行（`已啟用（system_server, daagent）`／`未偵測到`／`狀態未知（…）`，見 §1.4 與 P1 四態），
    該行僅顯示、永不授權——LSPosed 通道為 NoOp 佔位，寫入一律拒絕。
 
 ### 2.3 重啟需求
@@ -186,8 +184,8 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
   `hooked ...#getAllWhitelistedPackages` 等行＋
   `marker wrote scope=...` 行；看不到＝類名／方法名與目前
   One UI 版本對不上，回報時請附上 `service list` 與版本號。
-- 驗證 marker 檔案（需 ROOT／shell 讀權限；App 讀不到即顯示「未偵測到」，
-  屬正常 fail-closed，不代表 hook 沒裝）：
+- 驗證 marker 檔案（需 ROOT／shell 讀權限；App 直接讀不到即顯示「狀態未知」，
+  屬正常 fail-closed，不代表 hook 沒裝；僅確定可讀但缺失才顯示「未偵測到」）：
   ```bash
   adb shell su -c 'cat /data/system/galaxydual_hook.active' 2>/dev/null \
     || adb shell cat /data/local/tmp/galaxydual_hook.active
