@@ -522,8 +522,13 @@ class DualViewModel(
     // degrade reason survives refreshLocked (which previously overwrote msg
     // with "no clones installed" / "" / channel error). NONE (silent) shows
     // the note alone (INFO); INFO (neutral) appends the note ("；" join);
-    // errors (CHANNEL/FAILED/NO_DUAL/VERIFY/INVALID) keep error priority
-    // (pass through, degrade stays in degradeNote + channelView short tag).
+    // errors (CHANNEL/FAILED/NO_DUAL/VERIFY/INVALID) keep error priority:
+    // base error first ("；" join) with the degrade reason appended, kind
+    // stays the original error (never downgraded to INFO). Phase B P2: the
+    // AUTO→NOOP refresh through the NoOp repo always ends as
+    // "channel error: denied", so without the error-branch join the full
+    // dual-failure reason would be hidden behind the refresh error (only in
+    // degradeNote/channelView short tag).
     // Mirrors the pendingRemove preserve rule (NONE/INFO combinable, errors pass).
     private fun combineWithDegradeNote(
         baseMsg: String,
@@ -534,7 +539,7 @@ class DualViewModel(
         return when (baseKind) {
             MsgKind.NONE -> degradeNote to MsgKind.INFO
             MsgKind.INFO -> "$baseMsg；$degradeNote" to MsgKind.INFO
-            else -> baseMsg to baseKind
+            else -> "$baseMsg；$degradeNote" to baseKind
         }
     }
 

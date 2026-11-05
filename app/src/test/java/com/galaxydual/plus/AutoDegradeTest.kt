@@ -743,11 +743,13 @@ class AutoDegradeTest {
         assertTrue("refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
     }
 
-    // P25 Item 1 (error priority): both probes failing degrades to NOOP
-    // read-only; the NoOp repo cannot list profiles so refresh ends as
-    // CHANNEL error. The error must win (pass through, not covered by the
-    // degrade note), while the degrade reason stays in degradeNote +
-    // channelView short tag.
+    // P25 Item 1 (error priority, Phase B P2): both probes failing degrades to
+    // NOOP read-only; the NoOp repo cannot list profiles so refresh ends as
+    // CHANNEL error. The error stays first (kind CHANNEL) with the full
+    // degrade reason appended ("；" join), so the user-visible status line
+    // carries both the refresh failure and the dual-failure recovery note
+    // (previously the error passed through alone and the reason lived only
+    // in degradeNote + channelView short tag).
     @Test
     fun reconnect_noopDegradeRefresh_keepsErrorAndNote() {
         val suFake = FakeSu(rootOk = false)
@@ -777,10 +779,25 @@ class AutoDegradeTest {
         assertEquals(ResolvedChannel.NOOP, s.resolvedGateway)
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertTrue(
-            "error must pass through (not covered by degrade), got: \"${s.msg}\"",
+            "error stays first with kind CHANNEL, got: \"${s.msg}\"",
             s.msg.contains("channel error"),
         )
         assertTrue("degradeNote must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("唯讀"))
+        // Phase B P2 render/state acceptance: the combined status line must
+        // carry the full degrade reason inline (not only in the degradeNote
+        // field), error first with the recovery note appended.
+        assertTrue(
+            "combined msg must carry the full degradeNote inline, got: \"${s.msg}\"",
+            s.degradeNote.isNotEmpty() && s.msg.contains(s.degradeNote),
+        )
+        assertTrue(
+            "combined msg must carry the 唯讀 reason, got: \"${s.msg}\"",
+            s.msg.contains("唯讀"),
+        )
+        assertTrue(
+            "combined msg must carry the recovery entry, got: \"${s.msg}\"",
+            s.msg.contains("重新連線並更新"),
+        )
         assertFalse("NOOP must never be writable", s.writeReady)
         // channelView short-tag condition: degradeNote non-empty under AUTO.
         assertEquals(ChannelPreference.AUTO, s.channel)
