@@ -45,11 +45,35 @@ class VerifyRetryTest {
         // the canned success -- models an install/uninstall whose reply was
         // abandoned (e.g. timedOut=true) while the remote may have executed.
         var writeResult: CmdResult? = null,
+        // Phase E P1-1 (delayed landing): when armed, the write does NOT
+        // immediately change the list view -- the first
+        // [landingAfterListCalls] list probes after the write still see the
+        // pre-land queue/fallback, and only later probes see
+        // [postLandingListResult]. Models "write lands after the immediate
+        // post-timeout probe" deterministically; requires writeCalls > 0 so
+        // pre-write probes are unaffected. Null (default) disables the mode.
+        var landingAfterListCalls: Int? = null,
+        var postLandingListResult: CmdResult? = null,
+        // Phase E P1-1 (wait-window identity change): when non-null, every
+        // verbose/dumpsys identity fetch after the first write returns this
+        // serial instead of 15 -- models a profile recreated (same id, fresh
+        // serial) while the client was waiting on the write reply.
+        var serialAfterWrite: Int? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
         var listCalls = 0
         var writeCalls = 0
+
+        private fun verbosePayload(): String {
+            val s = if (writeCalls > 0) serialAfterWrite ?: 15 else 15
+            return DEFAULT_VERBOSE_95.replace("Serial: 15", "Serial: $s")
+        }
+
+        private fun dumpsysPayload(): String {
+            val s = if (writeCalls > 0) serialAfterWrite ?: 15 else 15
+            return DEFAULT_DUMPSYS_95.replace("serialNo=15", "serialNo=$s")
+        }
 
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
@@ -57,9 +81,9 @@ class VerifyRetryTest {
                 cmd == DualRepository.CMD_LIST_USERS ->
                     CmdResult(exit = 0, out = DEFAULT_USERS, err = "")
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
-                    CmdResult(exit = 0, out = DEFAULT_VERBOSE_95, err = "")
+                    CmdResult(exit = 0, out = verbosePayload(), err = "")
                 cmd == DualRepository.CMD_DUMPSYS_USER ->
-                    CmdResult(exit = 0, out = DEFAULT_DUMPSYS_95, err = "")
+                    CmdResult(exit = 0, out = dumpsysPayload(), err = "")
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
                     CmdResult(exit = 0, out = DEFAULT_PROP_95, err = "")
                 cmd.startsWith("pm install-existing") -> {
@@ -73,7 +97,10 @@ class VerifyRetryTest {
                 cmd.startsWith("pm list packages") -> {
                     listCalls++
                     listThrowable?.let { throw it }
-                    if (listQueue.isNotEmpty()) listQueue.removeFirst() else listFallback
+                    val pre = if (listQueue.isNotEmpty()) listQueue.removeFirst() else listFallback
+                    val arm = landingAfterListCalls
+                    val landed = postLandingListResult
+                    if (arm != null && landed != null && writeCalls > 0 && listCalls > arm) landed else pre
                 }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
@@ -532,33 +559,45 @@ class VerifyRetryTest {
         assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
     }
 
-    // Timeout table, absent side: clone write timed out but the probe
-    // cleanly lacks the package -> VerifyFailed (confirmed not installed),
-    // never InstallFailed.
+    // Timeout table, absent side (Phase E P1-1): clone write timed out but
+    // the immediate probe cleanly lacks the package -> VerifyUnknown (NOT
+    // VerifyFailed -- the probe ran right after the timeout and the remote
+    // install may still land after it; unknown-after-send never claims
+    // "not cloned" while the device may hold the clone). Never InstallFailed.
     @Test
-    fun cloneVerified_writeTimedOut_probeAbsent_isVerifyFailed() {
+    fun cloneVerified_writeTimedOut_probeAbsent_isVerifyUnknown() {
         val gateway = SeqGateway(
             listFallback = CmdResult(exit = 0, out = "", err = ""),
         )
         gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
         val delays = mutableListOf<Long>()
         val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
-        assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
     }
 
-    // Timeout table, present side: remove write timed out but the probe
-    // cleanly still lists the package -> StillInstalled, never RemoveFailed.
+    // Timeout table, present side (Phase E P1-1): remove write timed out but
+    // the immediate probe cleanly still lists the package -> VerifyUnknown
+    // (NOT StillInstalled -- the probe ran right after the timeout and the
+    // remote uninstall may still land after it). Never RemoveFailed.
     @Test
-    fun removeVerified_writeTimedOut_probePresent_isStillInstalled() {
+    fun removeVerified_writeTimedOut_probePresent_isVerifyUnknown() {
         val gateway = SeqGateway(
             listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
         )
         gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
         val delays = mutableListOf<Long>()
         val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
-        assertTrue("expected StillInstalled, got: $outcome", outcome is RemoveOutcome.StillInstalled)
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
     }
@@ -708,19 +747,24 @@ class VerifyRetryTest {
         assertEquals(1, delayCalls)
     }
 
-    // PR-33 final review MINOR-1: removeVerifiedExpected write-timeout branch
-    // (timedOut || isServiceTimeoutText -> verify-first, no resend) was
-    // uncovered. timedOut=true with a clean probe that still lists the
-    // package -> StillInstalled (NOT Success/RemoveFailed), single write.
+    // PR-33 final review MINOR-1 (Phase E P1-1 update): removeVerifiedExpected
+    // write-timeout branch (timedOut || isServiceTimeoutText -> after-pin then
+    // verify-first, no resend). timedOut=true with a clean probe that still
+    // lists the package -> VerifyUnknown (NOT StillInstalled -- the probe ran
+    // right after the timeout and the remote uninstall may still land after
+    // it). Single write.
     @Test
-    fun removeVerifiedExpected_writeTimedOut_probeInstalled_isStillInstalled() {
+    fun removeVerifiedExpected_writeTimedOut_probeInstalled_isVerifyUnknown() {
         val gateway = SeqGateway(
             listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
         )
         gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
         val delays = mutableListOf<Long>()
         val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
-        assertTrue("expected StillInstalled, got: $outcome", outcome is RemoveOutcome.StillInstalled)
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
         assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
@@ -747,5 +791,131 @@ class VerifyRetryTest {
             listOf(DualRepository.VERIFY_RETRY_DELAY_MS, DualRepository.VERIFY_RETRY_DELAY_MS),
             delays,
         )
+    }
+
+    // Phase E P1-1 (delayed landing, clone side): the install reply times out
+    // and the immediate probe still sees absent -- VerifyUnknown (NOT
+    // VerifyFailed), single write. The fake arms delayed landing: the first
+    // post-write list probe sees absent, later probes see present, proving
+    // the immediate absent could not exclude a late landing.
+    @Test
+    fun cloneVerified_writeTimedOut_probeAbsentFirst_landsAfter_isVerifyUnknown() {
+        val absent = CmdResult(exit = 0, out = "", err = "")
+        val present = CmdResult(exit = 0, out = "package:com.example.chat", err = "")
+        val gateway = SeqGateway(
+            listQueue = ArrayDeque(listOf(absent)),
+            listFallback = absent,
+            landingAfterListCalls = 1,
+            postLandingListResult = present,
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        // Prove the landing: the next list probe (what a refresh would see)
+        // now observes the package -- the first absent proved nothing.
+        val landed = runSuspend { gateway.run("pm list packages --user 95") }
+        assertTrue("write must land after the first probe, got: $landed", landed.out.contains("package:com.example.chat"))
+    }
+
+    // Phase E P1-1 (delayed landing, remove side): the uninstall reply times
+    // out and the immediate probe still sees present -- VerifyUnknown (NOT
+    // StillInstalled), single write. Landing is armed symmetrically: first
+    // post-write probe present, later probes absent.
+    @Test
+    fun removeVerified_writeTimedOut_probePresentFirst_landsAfter_isVerifyUnknown() {
+        val present = CmdResult(exit = 0, out = "package:com.example.chat", err = "")
+        val absent = CmdResult(exit = 0, out = "", err = "")
+        val gateway = SeqGateway(
+            listQueue = ArrayDeque(listOf(present)),
+            listFallback = present,
+            landingAfterListCalls = 1,
+            postLandingListResult = absent,
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        // Prove the landing: the next list probe (what a refresh would see)
+        // now observes absent -- the first present proved nothing.
+        val landed = runSuspend { gateway.run("pm list packages --user 95") }
+        assertTrue("write must land after the first probe, got: $landed", !landed.out.contains("package:com.example.chat"))
+    }
+
+    // Phase E P1-1 (wait-window identity change, clone): the serial flips
+    // from 15 to 16 while the client waits on the timed-out install, so the
+    // timeout-branch after-pin (before vs fresh after) drifts ->
+    // VerifyUnknown with identity-changed. Single timed-out write (no
+    // resend), and the list probe never runs (drift short-circuits).
+    @Test
+    fun cloneVerified_writeTimedOut_serialChanged_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+            serialAfterWrite = 16,
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase E P1-1 (wait-window identity change, remove): the serial flips
+    // from 15 to 16 while the client waits on the timed-out uninstall, so
+    // the timeout-branch after-pin drifts -> VerifyUnknown with
+    // identity-changed. Single timed-out write (no resend), zero list
+    // probes.
+    @Test
+    fun removeVerified_writeTimedOut_serialChanged_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+            serialAfterWrite = 16,
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase E P1-1 (wait-window identity change, expected-remove): the serial
+    // flips from 15 to 16 while the client waits on the timed-out uninstall,
+    // so the timeout-branch after-pin (syntheticBefore vs fresh after)
+    // drifts -> VerifyUnknown with identity-changed. Zero uninstalls beyond
+    // the single timed-out write (no resend), and the list probe never runs
+    // (drift short-circuits before it).
+    @Test
+    fun removeVerifiedExpected_writeTimedOut_serialChanged_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+            serialAfterWrite = 16,
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
     }
 }

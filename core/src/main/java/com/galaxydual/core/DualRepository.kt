@@ -619,10 +619,10 @@ class DualRepository(
         // this to InstallFailed (that would claim "not cloned" while the
         // device may hold the clone, and the UI would drop it wrongly).
         // Instead run ONE bounded read-only verifyListProbe (same retry/
-        // delayFn/thrown-defense as the normal path, no write resend) and
-        // reuse the outcome table: Installed -> Success, NotInstalled ->
-        // VerifyFailed, Unknown -> VerifyUnknown (nothing is added; the next
-        // refresh converges from ground truth).
+        // delayFn/thrown-defense as the normal path, no write resend) with
+        // an after-pin first: Installed -> Success, clean-but-absent ->
+        // VerifyUnknown (reverse, write may still land), Unknown ->
+        // VerifyUnknown (nothing is added; the next refresh converges).
         // Trigger (wire frozen): res.timedOut (client abandoned the wait) OR
         // isServiceTimeoutText(res.err) -- the GalaxyExecService 60 s
         // captureProcess timeout arrives over the parcel as exit=1 + its
@@ -632,13 +632,29 @@ class DualRepository(
         // Scope: only these two signals take this path. Other
         // transport-unknown (binder-dead, spawn failure, interrupt) stays on
         // the legacy isSuccess judgement -- follow-up, not inflated here.
-        // No after-pin on this path by design: the probe is already the
-        // report-only evidence (report-only, never redirects a write).
+        // After-pin (Phase E P1-1): the probe below is the report-only
+        // evidence, but the serial may have changed while the client was
+        // waiting -- re-fetch and require the before/after pin to still hold
+        // before trusting a same-direction probe as Success, so a recreated
+        // profile in the wait window is VerifyUnknown instead of Success.
+        // Reverse observation (clean-but-absent here) is VerifyUnknown, NOT
+        // VerifyFailed: the probe ran right after the timeout and the write
+        // may still land after it (unknown-after-send) -- never claim
+        // "not cloned" while the device may hold the clone. The next
+        // refresh converges from ground truth.
         if (res.timedOut || isServiceTimeoutText(res.err)) {
+            val byText = !res.timedOut
+            val after = fetchVerifiedTarget()
+            val drift = checkTargetDrift(before, after)
+            if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
             return when (val state = verifyListProbe(clean, dualId)) {
                 is VerifyState.Installed -> CloneOutcome.Success(dualId)
-                is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
-                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = !res.timedOut))
+                is VerifyState.NotInstalled ->
+                    CloneOutcome.VerifyUnknown(
+                        dualId,
+                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText),
+                    )
+                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText))
             }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
@@ -698,18 +714,33 @@ class DualRepository(
         // above -- a timedOut reply abandons exit/out/err (untrusted either
         // way), so NEVER map it to RemoveFailed (that would claim "still
         // installed" or "remove failed" without knowledge). One bounded
-        // read-only verifyListProbe instead (no write resend):
-        // NotInstalled -> Success, Installed -> StillInstalled, Unknown ->
-        // VerifyUnknown (caller keeps the entry; the next refresh converges).
+        // read-only verifyListProbe instead (no write resend, after-pin
+        // first): NotInstalled -> Success, clean present -> VerifyUnknown
+        // (reverse, write may still land), Unknown -> VerifyUnknown
+        // (caller keeps the entry; the next refresh converges).
         // Trigger (wire frozen): res.timedOut OR isServiceTimeoutText(res.err)
         // (see cloneVerified note -- same parcel flag-loss backstop).
-        // Scope: only these two signals take this path. No after-pin here
-        // by design (report-only probe, same rationale as cloneVerified).
+        // Scope: only these two signals take this path.
+        // After-pin (Phase E P1-1, same as cloneVerified): re-fetch and
+        // require the before/after pin to hold before trusting a
+        // same-direction probe as Success. Reverse observation (clean
+        // present here) is VerifyUnknown, NOT StillInstalled: the probe ran
+        // right after the timeout and the write may still land after it --
+        // never claim "still installed" while the removal may be in flight.
+        // The next refresh converges from ground truth.
         if (res.timedOut || isServiceTimeoutText(res.err)) {
+            val byText = !res.timedOut
+            val after = fetchVerifiedTarget()
+            val drift = checkTargetDrift(before, after)
+            if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
             return when (val state = verifyListProbe(clean, dualId)) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
-                is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
-                is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = !res.timedOut))
+                is VerifyState.Installed ->
+                    RemoveOutcome.VerifyUnknown(
+                        dualId,
+                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText),
+                    )
+                is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText))
             }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
@@ -822,15 +853,29 @@ class DualRepository(
         // Unknown-after-send (PR-32 P1-1, same rule as cloneVerified/
         // removeVerified): a timed-out write reply proves nothing about the
         // remote uninstall -- verify read-only instead of claiming failure.
-        // No after-pin here by design (report-only probe).
+        // After-pin (Phase E P1-1): same synthetic-before pin as the normal
+        // path below -- the serial may have changed while the client was
+        // waiting, so re-fetch and refuse drift as VerifyUnknown before any
+        // probe. Reverse observation (clean present) is VerifyUnknown, NOT
+        // StillInstalled: the probe ran right after the timeout and the
+        // uninstall may still land after it. No write resend on any arm.
         if (res.timedOut || isServiceTimeoutText(res.err)) {
+            val byText = !res.timedOut
+            val syntheticTimeoutBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
+            val timeoutAfter = fetchVerifiedTarget()
+            val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
+            if (timeoutDrift != null) return RemoveOutcome.VerifyUnknown(expectedDualId, timeoutDrift)
             return when (val state = verifyListProbe(clean, expectedDualId)) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
-                is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
+                is VerifyState.Installed ->
+                    RemoveOutcome.VerifyUnknown(
+                        expectedDualId,
+                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText),
+                    )
                 is VerifyState.Unknown ->
                     RemoveOutcome.VerifyUnknown(
                         expectedDualId,
-                        writeTimeoutDetail(state.detail, byText = !res.timedOut),
+                        writeTimeoutDetail(state.detail, byText = byText),
                     )
             }
         }
@@ -1098,5 +1143,20 @@ class DualRepository(
             if (byText) "write reply timed out (service-side timeout recognized by text; wire layout frozen)"
             else "write reply timed out"
         return if (probeDetail.isEmpty()) head else "$head; $probeDetail"
+    }
+
+    // Reverse-observation detail for the unknown-after-send path (Phase E
+    // P1-1): the write reply timed out, so an immediate post-timeout probe
+    // showing the opposite of the intended write (absent right after a
+    // clone, present right after a remove) proves nothing -- the remote
+    // write may still land after the probe completed. Treated as unknown
+    // (never a terminal failure/success); the next refresh converges from
+    // ground truth.
+    private fun writeTimeoutReverseDetail(observed: String, intended: String, byText: Boolean = false): String {
+        val head =
+            if (byText) "write reply timed out (service-side timeout recognized by text; wire layout frozen)"
+            else "write reply timed out"
+        return "$head; immediate post-timeout probe shows $observed opposite the intended $intended -- " +
+            "treated as unknown (write may still land), awaiting refresh convergence"
     }
 }
