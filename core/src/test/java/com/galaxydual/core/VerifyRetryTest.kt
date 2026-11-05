@@ -158,4 +158,30 @@ class VerifyRetryTest {
         assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
         assertEquals(2, gateway.listCalls)
     }
+
+    // PR-3 stage 1 (issue #24): the settle wait runs through the injectable
+    // delayFn, so tests can go virtual -- same 3-probe retry contract as the
+    // persistent-failure test above but without the ~3 s of real sleep stalls.
+    @Test
+    fun removeVerified_persistentFailure_withVirtualDelay_retriesThriceWithoutSleep() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        val repo = DualRepository(gateway)
+        val delays = mutableListOf<Long>()
+        repo.delayFn = { delays.add(it) }
+        val start = System.nanoTime()
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        val elapsedMs = (System.nanoTime() - start) / 1_000_000
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertEquals(3, gateway.listCalls)
+        assertEquals(
+            listOf(DualRepository.VERIFY_RETRY_DELAY_MS, DualRepository.VERIFY_RETRY_DELAY_MS),
+            delays,
+        )
+        assertTrue(
+            "virtual delay must skip the real sleep, took ${elapsedMs}ms",
+            elapsedMs < DualRepository.VERIFY_RETRY_DELAY_MS,
+        )
+    }
 }

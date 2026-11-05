@@ -69,6 +69,15 @@ sealed interface RemoveOutcome {
 class DualRepository(
     private val gateway: CmdGateway,
 ) {
+    // Retry settle wait (PR-3 stage 1, issue #24): the list-probe retry below
+    // waits VERIFY_RETRY_DELAY_MS between attempts. Core has no
+    // kotlinx-coroutines dependency, so this is a suspend function slot rather
+    // than delay(): the default blocks the CALLER thread via Thread.sleep and
+    // therefore callers must dispatch repository calls off the Main thread
+    // (DualViewModel runs every repo call under Dispatchers.IO). Tests replace
+    // it with a no-op/virtual delay to skip the real 1500 ms waits.
+    internal var delayFn: suspend (Long) -> Unit = { ms -> Thread.sleep(ms) }
+
     companion object {
         // Command used to enumerate profiles.
         const val CMD_LIST_USERS = "pm list users"
@@ -81,6 +90,11 @@ class DualRepository(
         const val CMD_USER_LIST_VERBOSE = "cmd user list -v"
         const val CMD_DUMPSYS_USER = "dumpsys user"
         const val CMD_GETPROP_DUAL = "getprop sys.dualapp.profile_id"
+
+        // Settle wait between list-probe retries (PR-3 stage 1, issue #24).
+        // Part of the retry policy (bounded: at most 2 waits per probe); the
+        // wait itself runs through delayFn so tests can go virtual.
+        const val VERIFY_RETRY_DELAY_MS = 1500L
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
@@ -394,10 +408,12 @@ class DualRepository(
     // use the trusted rule.
     //
     // Retry (retained, PR-3 owns it): a non-zero list probe is retried at most
-    // twice with a 1500 ms settle wait before the trusted parse, covering
-    // transient binder/timeout blips. gateway.run is a blocking suspend with
-    // no dispatcher assumption, hence Thread.sleep (core has no
-    // kotlinx-coroutines dependency for delay).
+    // twice with a VERIFY_RETRY_DELAY_MS settle wait before the trusted parse,
+    // covering transient binder/timeout blips. The wait runs through delayFn
+    // (suspend slot: core has no kotlinx-coroutines dependency for delay);
+    // callers must dispatch repository calls off Main (DualViewModel wraps
+    // every repo call in Dispatchers.IO) because the default delayFn blocks
+    // its caller thread.
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -438,7 +454,7 @@ class DualRepository(
         var res = gateway.run(cmd)
         var attempts = 1
         while (res.exit != 0 && attempts < 3) {
-            Thread.sleep(1500)
+            delayFn(VERIFY_RETRY_DELAY_MS)
             res = gateway.run(cmd)
             attempts++
         }
@@ -450,7 +466,8 @@ class DualRepository(
         // non-zero after the retries above, or error-semantic text such as
         // "Unknown package"/SecurityException/Failure with exit 0) is
         // Unknown. Membership stays an exact set lookup (superstrings never
-        // hit). Retry/sleep policy is unchanged (PR-3 owns it).
+        // hit). Retry policy is unchanged (PR-3 owns it: at most 2 retries with
+        // a delayFn settle wait between attempts).
         return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
             is TrustedList.TrustedFull ->
                 if (clean in trusted.packages) VerifyState.Installed else VerifyState.NotInstalled
