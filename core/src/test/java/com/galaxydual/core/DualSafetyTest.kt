@@ -654,4 +654,61 @@ class DualSafetyTest {
             gateway.commands.none { it.contains("--user 95") },
         )
     }
+
+    // Phase A P1-1: CLONE(VERBOSE) + UNKNOWN(DUMPSYS) on the same id is
+    // Unknown (owner repro). Even with an agreeing property, no Confirmed
+    // target exists, so every write/read refuses without target commands.
+    @Test
+    fun clonePlusUnknownSecondChannel_refusesAllWritesAndReads() {
+        val verboseClone = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsysNoType = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+        """.trimIndent()
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseClone,
+            dumpsysOutput = dumpsysNoType,
+            propOutput = "95\n",
+        )
+        val repo = DualRepository(gateway)
+
+        // Sanity: the dumpsys block really parses as UNKNOWN (no type line).
+        val parsedDumpsys = SamsungProfileAdapter.parseDumpsysUser(dumpsysNoType)
+        assertTrue(parsedDumpsys.any { it.userId == 95 && it.userType == ProfileUserType.UNKNOWN })
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val explicit = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, explicit.exit)
+        assertTrue(explicit.err.startsWith("refused:"))
+
+        assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown)
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no write or list-probe command may run, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
 }

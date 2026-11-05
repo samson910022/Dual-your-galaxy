@@ -521,4 +521,40 @@ class ProfileIdentityTest {
         assertEquals(1, parsed.size)
         assertEquals(ProfileUserType.OTHER, parsed[0].userType)
     }
+
+    // ---- Phase A P1-1: dual-CLONE tightening (issue #21 owner finding) ----
+    // Two-channel Confirmed requires the SAME id to be typed CLONE on BOTH
+    // USER_LIST_V and DUMPSYS. CLONE on one channel plus UNKNOWN on the
+    // other is Unknown (insufficient evidence), never Confirmed.
+
+    @Test
+    fun resolveDual_cloneVerboseUnknownDumpsysIsUnknown() {
+        // Owner repro: CLONE(VERBOSE) + UNKNOWN(DUMPSYS) on the same id.
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    @Test
+    fun resolveDual_unknownVerboseCloneDumpsysIsUnknown() {
+        // Reverse direction: UNKNOWN(VERBOSE) + CLONE(DUMPSYS) is Unknown too.
+        val candidates = listOf(
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    @Test
+    fun resolveDual_cloneCloneStillConfirmed() {
+        // Regression guard: CLONE + CLONE on the same id still Confirms
+        // (fixture parentId=0/serial consistent via claim() defaults).
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(candidates))
+    }
 }
