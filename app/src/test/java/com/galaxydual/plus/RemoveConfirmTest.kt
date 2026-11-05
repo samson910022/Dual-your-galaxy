@@ -56,6 +56,13 @@ class RemoveConfirmTest {
         // Null (default) keeps the historic "DualApp" on every channel.
         var labelOverride: String? = null
         private val label: String get() = labelOverride ?: "DualApp"
+        // Agreed platform serial for the dual profile on both verbose
+        // channels (PR-33 R2, P1 serial binding). Flipping it after a request
+        // simulates a delete+recreate that reuses id+label with a fresh
+        // serial; noSerial omits both serial lines to simulate an
+        // unavailable serial (id confirmed, serial missing).
+        var serial: Int = 15
+        var noSerial: Boolean = false
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -67,7 +74,7 @@ class RemoveConfirmTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:$label:400} running:\n" +
-                "    Serial: 15\n" +
+                (if (noSerial) "" else "    Serial: $serial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -75,7 +82,7 @@ class RemoveConfirmTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:$label:400} serialNo=15:\n" +
+                "  UserInfo{$dualId:$label:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
@@ -473,5 +480,48 @@ class RemoveConfirmTest {
         assertNull(vm.state.value.pendingRemove)
         assertEquals("cancel with no pending must not uninstall", 0, gw.uninstallCalls)
         assertEquals("cancel with no pending must leave msg untouched", before, vm.state.value.msg)
+    }
+
+    // Same id, same label, fresh serial (profile deleted and recreated under
+    // the dialog, PR-33 R2 P1): confirm must refuse with zero uninstalls,
+    // clear the pending, and ask for a fresh confirmation (INVALID).
+    @Test
+    fun confirm_serialChange_rejectsWithoutUninstall() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        gw.serial = 41
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+
+        assertEquals("recreated target must not uninstall", 0, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
+        assertTrue(
+            "rejection must ask for re-confirmation, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg.contains("重新確認"),
+        )
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+    }
+
+    // The id is confirmed but no serial is available on either verbose
+    // channel (PR-33 R2 P1): request must refuse with no pending and zero
+    // uninstalls (NO_DUAL, fail closed).
+    @Test
+    fun request_serialUnavailable_refusesWithoutPending() {
+        val gw = FakeRepoGateway(dualId = 95)
+        gw.noSerial = true
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.msg.contains("serial") }
+
+        assertNull(vm.state.value.pendingRemove)
+        assertEquals("unverifiable target must not uninstall", 0, gw.uninstallCalls)
+        assertEquals(MsgKind.NO_DUAL, vm.state.value.msgKind)
     }
 }

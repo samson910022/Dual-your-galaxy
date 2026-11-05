@@ -7,6 +7,7 @@ import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualRepository
+import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
@@ -39,10 +40,14 @@ import kotlinx.coroutines.withContext
 // - pkg: trimmed package the user asked to remove.
 // - dualId: verified cross-source dual target at request time (never the
 //   pm-list label).
+// - dualSerial: agreed platform serial for that target at request time
+//   (PR-33 R2, P1 serial binding). A delete+recreate reuses the user id and
+//   label but mints a fresh serial, so confirmRemove re-verifies (id, serial)
+//   together and refuses a serial mismatch without uninstalling.
 // - profileLabel: display label of that target at request time (second
 //   "selection unchanged" signal besides the id).
 // - requestedAtMs: wall-clock time of the request (diagnostics only; no
-//   expiry is enforced -- a stale dialog is rejected by the id/label
+//   expiry is enforced -- a stale dialog is rejected by the id/label/serial
 //   re-check, not by age).
 //
 // Rotation policy (explicit choice, pinned by RemoveConfirmTest): pending
@@ -53,6 +58,7 @@ import kotlinx.coroutines.withContext
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
+    val dualSerial: Int,
     val profileLabel: String,
     val requestedAtMs: Long,
 )
@@ -149,7 +155,9 @@ data class UiState(
 // clone/request-remove/confirm dedup by operation key (a second identical
 // write while the first is in flight reports "already in progress" instead
 // of queueing). Confirm keys are per generation
-// (`remove:<pkg>@<dualId>#<ts>`) so a stale dialog never blocks a fresh one.
+// (`remove:<pkg>@<dualId>#<serial>#<ts>`, PR-33 R2: the serial joins the
+// generation so a stale dialog never blocks a fresh one, even across a
+// delete+recreate that reuses the id) so a stale dialog never blocks a fresh one.
 // Every repository call runs under Dispatchers.IO (see onIo): the core retry
 // settle wait blocks its caller thread, so running it on Main would stall
 // the Main dispatcher heartbeat for up to ~3 s per probe. Public entry
@@ -173,10 +181,11 @@ data class UiState(
 // effective hook, so it must not grant privilege.
 //
 // PR-4 P1 (issue #23): remove is two-phase. requestRemove(pkg) only records
-// PendingRemove (verified id + label + timestamp); confirmRemove() re-checks
-// (verified id equal, label equal, still writable) and only then runs
-// repo.removeVerified. cancelRemove() drops the pending. Rapid double
-// confirm executes at most once via the shared inFlightWrites dedup.
+// PendingRemove (verified id + serial + label + timestamp); confirmRemove()
+// re-checks (verified id equal, serial equal, label equal, still writable)
+// and only then runs repo.removeVerifiedExpected. cancelRemove() drops the
+// pending. Rapid double confirm executes at most once via the shared
+// inFlightWrites dedup.
 class DualViewModel(
     private var repo: DualRepository,
     // Declared privilege of the gateway backing `repo`. F4a wires the real
@@ -254,7 +263,8 @@ class DualViewModel(
     private var refreshPending = false
 
     // In-flight write dedup keys ("clone:<pkg>" / "request-remove:<pkg>" /
-    // "remove:<pkg>@<id>#<ts>", PR-3 stage 1, issue #24 + PR-4 P23 stage 2).
+    // "remove:<pkg>@<id>#<serial>#<ts>", PR-3 stage 1, issue #24 + PR-4 P23
+    // stage 2, PR-33 R2 adds the serial to the generation).
     // A duplicate op while the first is still running reports
     // "already in progress" instead of queueing behind the mutex. Clone and
     // remove use distinct keys so an intentional clone-then-remove sequence on
@@ -565,13 +575,15 @@ class DualViewModel(
 
     // Two-phase remove, phase 1 (PR-4 P1, issue #23): records what the user
     // asked to remove WITHOUT touching the device uninstall path. Resolves
-    // the verified dual target once (cross-source id + display label) and
-    // stores it in UiState.pendingRemove so MainActivity can render the
-    // confirmation dialog from state (rotation-safe: the dialog is state
-    // driven, never re-sent). No `pm uninstall` runs here by construction.
-    // Refused (no pending) while the channel is not writable or no dual
-    // target exists. A second request overwrites the first (last wins); the
-    // confirm step re-validates, so a stale overwrite cannot execute.
+    // the serial-bound verified target once (cross-source id + agreed serial
+    // + display label, PR-33 R2) and stores it in UiState.pendingRemove so
+    // MainActivity can render the confirmation dialog from state
+    // (rotation-safe: the dialog is state driven, never re-sent). No `pm
+    // uninstall` runs here by construction. Refused (no pending) while the
+    // channel is not writable, when no dual target exists, or when the id is
+    // confirmed but its serial cannot be established. A second request
+    // overwrites the first (last wins); the confirm step re-validates, so a
+    // stale overwrite cannot execute.
     fun requestRemove(pkg: String) {
         viewModelScope.launch {
             // Validate input early without touching the device.
@@ -612,21 +624,8 @@ class DualViewModel(
                                     )
                                 }
                             is ProfilesSnapshot.Loaded -> {
-                                val dualId = onIo { repo.resolveDualUserId() }
-                                if (dualId < 0) {
-                                    _state.update {
-                                        it.copy(
-                                            loading = false,
-                                            profiles = snap.profiles,
-                                            pendingRemove = null,
-                                            msg = "no dual profile",
-                                            msgKind = MsgKind.NO_DUAL,
-                                        )
-                                    }
-                                } else {
-                                    val label =
-                                        snap.profiles.firstOrNull { it.userId == dualId }?.label
-                                    if (label == null) {
+                                when (val target = onIo { repo.fetchDualTarget() }) {
+                                    is DualTargetResult.NoDual ->
                                         _state.update {
                                             it.copy(
                                                 loading = false,
@@ -636,21 +635,47 @@ class DualViewModel(
                                                 msgKind = MsgKind.NO_DUAL,
                                             )
                                         }
-                                    } else {
-                                        val pending = PendingRemove(
-                                            pkg = trimmed,
-                                            dualId = dualId,
-                                            profileLabel = label,
-                                            requestedAtMs = System.currentTimeMillis(),
-                                        )
+                                    is DualTargetResult.SerialUnavailable ->
                                         _state.update {
                                             it.copy(
                                                 loading = false,
                                                 profiles = snap.profiles,
-                                                pendingRemove = pending,
-                                                msg = "等待確認移除：$trimmed（user $dualId）",
-                                                msgKind = MsgKind.INFO,
+                                                pendingRemove = null,
+                                                msg = "無法驗證分身身分（serial 缺失），請重試",
+                                                msgKind = MsgKind.NO_DUAL,
                                             )
+                                        }
+                                    is DualTargetResult.Confirmed -> {
+                                        val dualId = target.target.userId
+                                        val label =
+                                            snap.profiles.firstOrNull { it.userId == dualId }?.label
+                                        if (label == null) {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "no dual profile",
+                                                    msgKind = MsgKind.NO_DUAL,
+                                                )
+                                            }
+                                        } else {
+                                            val pending = PendingRemove(
+                                                pkg = trimmed,
+                                                dualId = dualId,
+                                                dualSerial = target.target.serial,
+                                                profileLabel = label,
+                                                requestedAtMs = System.currentTimeMillis(),
+                                            )
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = pending,
+                                                    msg = "等待確認移除：$trimmed（user $dualId）",
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -701,15 +726,17 @@ class DualViewModel(
 
     // Two-phase remove, phase 2 (PR-4 P1, issue #23): executes the pending
     // uninstall. Re-verifies under opMutex before running anything:
-    // verified id still equals the requested target, the recorded profile
-    // label still matches (selection unchanged), and the channel is still
-    // writable. Any mismatch clears the pending and refuses with a message
-    // that asks for a fresh confirmation -- never executes a moved target.
-    // Rapid double-taps execute at most once via the shared inFlightWrites
-    // dedup (second concurrent confirm reports "already in progress").
-    // Drops the pending entry from cloned ONLY when the pinned re-check
-    // confirms it absent (same fail-closed rule as the old direct remove).
-    // 最終授權者是 repo pinned API，VM pre-check 只是 fail-fast.
+    // verified id still equals the requested target, the agreed serial still
+    // matches (PR-33 R2: a delete+recreate reuses id+label with a fresh
+    // serial, so a serial mismatch refuses without uninstalling), the
+    // recorded profile label still matches (selection unchanged), and the
+    // channel is still writable. Any mismatch clears the pending and refuses
+    // with a message that asks for a fresh confirmation -- never executes a
+    // moved target. Rapid double-taps execute at most once via the shared
+    // inFlightWrites dedup (second concurrent confirm reports "already in
+    // progress"). Drops the pending entry from cloned ONLY when the pinned
+    // re-check confirms it absent (same fail-closed rule as the old direct
+    // remove). 最終授權者是 repo pinned API，VM pre-check 只是 fail-fast.
     fun confirmRemove() {
         viewModelScope.launch {
             val pendingAtCall = _state.value.pendingRemove
@@ -719,11 +746,12 @@ class DualViewModel(
                 }
                 return@launch
             }
-            // Write dedup 按世代 (PR-4 P23 stage 2): key 綁定 pending 世代
-            // (pkg@dualId#requestedAtMs)，避免 v1 卡鎖時 v2 合法確認被誤殺；
-            // a second concurrent confirm of the SAME generation reports
-            // instead of queueing a second uninstall.
-            val key = "remove:${pendingAtCall.pkg}@${pendingAtCall.dualId}#${pendingAtCall.requestedAtMs}"
+            // Write dedup 按世代 (PR-4 P23 stage 2, PR-33 R2 加 serial): key 綁定
+            // pending 世代 (pkg@dualId#serial#requestedAtMs)，避免 v1 卡鎖時 v2
+            // 合法確認被誤殺；a second concurrent confirm of the SAME
+            // generation reports instead of queueing a second uninstall.
+            val key = "remove:${pendingAtCall.pkg}@${pendingAtCall.dualId}" +
+                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}"
             if (!inFlightWrites.add(key)) {
                 _state.update {
                     it.copy(
@@ -784,6 +812,40 @@ class DualViewModel(
                             }
                             return@withLock
                         }
+                        // P1 serial binding (PR-33 R2): re-fetch the
+                        // serial-bound target and compare the agreed serial.
+                        // A delete+recreate under the dialog reuses id+label
+                        // with a fresh serial: mismatch -- or no confirmable
+                        // serial at all -- clears the pending and refuses
+                        // (INVALID + 重新確認), running zero uninstalls.
+                        // VM pre-check 只是 fail-fast，最終授權仍是 repo 的
+                        // removeVerifiedExpected(expectedSerial)。
+                        val freshSerial = (
+                            onIo { repo.fetchDualTarget() } as? DualTargetResult.Confirmed
+                            )?.takeIf { it.target.userId == cur.dualId }?.target?.serial
+                        if (freshSerial == null) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "移除目標無法驗證（serial 缺失），請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (freshSerial != cur.dualSerial) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "移除目標已變更（serial " +
+                                        "$freshSerial ≠ ${cur.dualSerial}），請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
                         when (val snap = onIo { repo.profilesSnapshot() }) {
                             is ProfilesSnapshot.ChannelError ->
                                 _state.update {
@@ -831,7 +893,7 @@ class DualViewModel(
                                         _state.update { it.copy(loading = false) }
                                         return@withLock
                                     }
-                                    when (val res = onIo { repo.removeVerifiedExpected(cur.pkg, cur.dualId) { _state.value.pendingRemove == cur } }) {
+                                    when (val res = onIo { repo.removeVerifiedExpected(cur.pkg, cur.dualId, cur.dualSerial) { _state.value.pendingRemove == cur } }) {
                                         is RemoveOutcome.Success ->
                                             _state.update {
                                                 it.copy(
@@ -914,6 +976,23 @@ class DualViewModel(
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
                                                     msg = "移除目標已變更（verified id ${res.verified} ≠ ${res.expected}），請重新確認",
+                                                    msgKind = MsgKind.INVALID,
+                                                )
+                                            }
+                                        // P1 serial binding (PR-33 R2): the repo
+                                        // refused a serial mismatch (or an
+                                        // unavailable serial) with zero
+                                        // uninstalls -- same INVALID +
+                                        // 重新確認 shape as TargetMoved.
+                                        is RemoveOutcome.SerialMismatch ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "移除目標已變更（serial " +
+                                                        "${res.actual ?: "缺失"} ≠ " +
+                                                        "${res.expected ?: "缺失"}），請重新確認",
                                                     msgKind = MsgKind.INVALID,
                                                 )
                                             }

@@ -65,3 +65,21 @@ data class ProfileIdentity(
     // never read for authorization (see rule above).
     val label: String = "",
 )
+
+/**
+ * Verified dual-profile target with serial binding (PR-33 R2, P1).
+ *
+ * Extends the id-only [DualResolution.Confirmed] with the platform serial
+ * number that both verbose channels ([IdentitySource.USER_LIST_V] and
+ * [IdentitySource.DUMPSYS]) agree on for that id. The serial survives an
+ * id+label-preserving profile recreation (delete + recreate reuses the user
+ * id and label but mints a fresh serial), so the two-phase remove confirm
+ * pins (userId, serial) instead of the id alone: a recreated profile with a
+ * different serial is refused, never uninstalled.
+ */
+data class VerifiedDualTarget(
+    // Confirmed cross-source dual user id (same id resolveDual confirms).
+    val userId: Int,
+    // Agreed platform serial for that id (both verbose channels agree).
+    val serial: Int,
+)

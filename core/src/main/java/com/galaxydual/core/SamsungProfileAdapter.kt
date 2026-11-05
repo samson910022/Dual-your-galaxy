@@ -213,4 +213,39 @@ object SamsungProfileAdapter {
         if (!twoChannel) return DualResolution.Unknown
         return DualResolution.Confirmed(id)
     }
+
+    // Serial-bound dual target (PR-33 R2, P1). First confirms the id through
+    // the existing resolveDual (non-Confirmed maps to null, fail closed),
+    // then requires the USER_LIST_V and DUMPSYS claims for that id to carry
+    // non-null EQUAL serials. PROP-sourced serials are ignored: the property
+    // channel is id-only by contract (a numeric id claim, never identity
+    // evidence). Any missing/mismatched serial maps to null so callers can
+    // refuse the write instead of targeting a possibly-recreated profile.
+    //
+    // @param candidates parsed claims from any sources (same contract as
+    //   resolveDual).
+    // @param propertyId optional property-derived dual id (same contract as
+    //   resolveDual; negative/null = no claim).
+    fun resolveDualTarget(
+        candidates: Collection<ProfileIdentity>,
+        propertyId: Int? = null,
+    ): VerifiedDualTarget? {
+        val id = (resolveDual(candidates, propertyId) as? DualResolution.Confirmed)?.userId
+            ?: return null
+        // Each verbose channel must contribute exactly one agreed serial for
+        // the confirmed id; ambiguous (several distinct) or missing both map
+        // to null (fail closed).
+        val verboseSerial = candidates
+            .filter { it.userId == id && it.source == IdentitySource.USER_LIST_V }
+            .map { it.serial }
+            .distinct()
+            .singleOrNull() ?: return null
+        val dumpsysSerial = candidates
+            .filter { it.userId == id && it.source == IdentitySource.DUMPSYS }
+            .map { it.serial }
+            .distinct()
+            .singleOrNull() ?: return null
+        if (verboseSerial != dumpsysSerial) return null
+        return VerifiedDualTarget(userId = id, serial = verboseSerial)
+    }
 }
