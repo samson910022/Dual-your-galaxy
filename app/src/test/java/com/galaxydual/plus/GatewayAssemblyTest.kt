@@ -10,8 +10,12 @@
 package com.galaxydual.plus
 
 import com.galaxydual.core.Privilege
+import com.galaxydual.core.TRUNCATION_MARKER
+import java.io.ByteArrayInputStream
+import java.io.IOException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -87,5 +91,179 @@ class GatewayAssemblyTest {
     @Test fun gateways_declarePrivilege() {
         assertEquals(Privilege.ROOT, SuCmdGateway().privilege)
         assertEquals(Privilege.SHELL, ShizukuCmdGateway("com.example.test").privilege)
+    }
+
+    // drainCapped: a short stream drains fully and reports clean EOF.
+    @Test fun drainCapped_shortStreamReturnsEof() {
+        val sink = StringBuilder()
+        val status = drainCapped(ByteArrayInputStream("package:com.example.app\n".toByteArray()), sink)
+        assertEquals(DrainStatus.EOF, status)
+        assertEquals("package:com.example.app\n", sink.toString())
+    }
+
+    // drainCapped (P1 BLOCKER #2): an IOException mid-read must surface as
+    // READ_ERROR (never silent EOF) while preserving what was already read.
+    // Fixture delivers exactly 10 bytes, then throws. The available() guard
+    // stops BufferedReader's same-call readahead once the failure point is
+    // reached, so the first reader.read() completes with 10 chars and the
+    // throw surfaces deterministically on the next call (verified: without
+    // the guard, the in-flight chunk is discarded inside the reader and the
+    // sink stays empty -- a BufferedReader artifact, not drainCapped's).
+    @Test fun drainCapped_readErrorPreservesPartial() {
+        val payload = "package:com.example.app\n".toByteArray()
+        val failing = object : ByteArrayInputStream(payload) {
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (pos >= 10) throw IOException("boom-after-10")
+                return super.read(b, off, minOf(len, 10 - pos))
+            }
+            override fun available(): Int = if (pos >= 10) 0 else super.available()
+        }
+        val sink = StringBuilder()
+        val status = drainCapped(failing, sink)
+        assertEquals(DrainStatus.READ_ERROR, status)
+        assertEquals(String(payload, 0, 10), sink.toString())
+    }
+
+    // drainCapped: output past the cap reports CAPPED with the sink held
+    // exactly at MAX_CAPTURE_CHARS.
+    @Test fun drainCapped_overCapReportsCapped() {
+        val big = ByteArray(MAX_CAPTURE_CHARS + 1_000) { 'x'.code.toByte() }
+        val sink = StringBuilder()
+        val status = drainCapped(ByteArrayInputStream(big), sink)
+        assertEquals(DrainStatus.CAPPED, status)
+        assertEquals(MAX_CAPTURE_CHARS, sink.length)
+    }
+
+    // buildResult: clean EOF on both streams without join expiry is not
+    // truncated and carries no marker.
+    @Test fun buildResult_cleanCaptureHasNoMarker() {
+        val res = buildResult(
+            0, StringBuilder("package:com.example.app\n"), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.EOF, false,
+        )
+        assertFalse(res.truncated)
+        assertFalse(res.out.contains(TRUNCATION_MARKER))
+        assertFalse(res.err.contains(TRUNCATION_MARKER))
+    }
+
+    // buildResult: a capped stream forces truncated=true with a marker on the
+    // affected stream only -- the clean stream stays marker-free so the hint
+    // parser can still use its content.
+    @Test fun buildResult_cappedStreamTruncatesWithMarker() {
+        val res = buildResult(
+            0, StringBuilder("partial"), StringBuilder(""),
+            DrainStatus.CAPPED, DrainStatus.EOF, false,
+        )
+        assertTrue(res.truncated)
+        assertTrue(res.out.contains(TRUNCATION_MARKER))
+        assertFalse(res.err.contains(TRUNCATION_MARKER))
+    }
+
+    // buildResult: a read error on either stream forces truncated=true with
+    // a marker on the affected stream only (fail-closed per P1 BLOCKER #2).
+    @Test fun buildResult_readErrorTruncatesWithMarker() {
+        val res = buildResult(
+            0, StringBuilder("partial"), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.READ_ERROR, false,
+        )
+        assertTrue(res.truncated)
+        assertFalse(res.out.contains(TRUNCATION_MARKER))
+        assertTrue(res.err.contains(TRUNCATION_MARKER))
+    }
+
+    // buildResult (P2 #3): join expiry forces truncated=true with a marker
+    // on BOTH streams (it may have cut either side) even when both reached
+    // clean EOF -- previously only hitCap appended a marker, so the Shizuku
+    // client sniffed truncated=false.
+    @Test fun buildResult_joinExpiredTruncatesWithMarker() {
+        val res = buildResult(
+            0, StringBuilder("package:com.example.app\n"), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.EOF, true,
+        )
+        assertTrue(res.truncated)
+        assertTrue(res.out.contains(TRUNCATION_MARKER))
+        assertTrue(res.err.contains(TRUNCATION_MARKER))
+    }
+
+    // Shizuku wire round-trips below exercise ONLY the pure encode/decode
+    // mapping: android.os.Parcel is a framework stub on the JVM and is not
+    // covered here (see the note on encodeExecReply/decodeExecReply).
+
+    // Cap truncation survives the service -> wire -> client mapping.
+    @Test fun execReply_capRoundTripPreservesTruncated() {
+        val svc = buildResult(
+            0, StringBuilder("partial"), StringBuilder(""),
+            DrainStatus.CAPPED, DrainStatus.EOF, false,
+        )
+        assertTrue(svc.truncated)
+        assertTrue(svc.out.contains(TRUNCATION_MARKER))
+        assertFalse(svc.err.contains(TRUNCATION_MARKER))
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(0, cli.exit)
+        assertEquals(svc.out, cli.out)
+        assertEquals(svc.err, cli.err)
+        assertTrue(cli.truncated)
+    }
+
+    // Join-expiry truncation survives the mapping (the P2 #3 regression).
+    // Join expiry marks both streams, so both round-trip verbatim.
+    @Test fun execReply_joinExpiryRoundTripPreservesTruncated() {
+        val svc = buildResult(
+            0, StringBuilder("package:com.example.app\n"), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.EOF, true,
+        )
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(0, cli.exit)
+        assertEquals(svc.out, cli.out)
+        assertEquals(svc.err, cli.err)
+        assertTrue(cli.truncated)
+    }
+
+    // Read-error truncation survives the mapping, symmetric with cap/join:
+    // only the affected stream carries the marker, and decode re-derives
+    // truncated=true from it.
+    @Test fun execReply_readErrorRoundTripPreservesTruncated() {
+        val svc = buildResult(
+            0, StringBuilder("partial"), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.READ_ERROR, false,
+        )
+        assertTrue(svc.truncated)
+        assertFalse(svc.out.contains(TRUNCATION_MARKER))
+        assertTrue(svc.err.contains(TRUNCATION_MARKER))
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(0, cli.exit)
+        assertEquals(svc.out, cli.out)
+        assertEquals(svc.err, cli.err)
+        assertTrue(cli.truncated)
+    }
+
+    // A clean empty capture round-trips as truncated=false with no marker.
+    @Test fun execReply_cleanEmptyRoundTripHasNoTruncated() {
+        val svc = buildResult(
+            0, StringBuilder(""), StringBuilder(""),
+            DrainStatus.EOF, DrainStatus.EOF, false,
+        )
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(0, cli.exit)
+        assertFalse(cli.truncated)
+        assertFalse(cli.out.contains(TRUNCATION_MARKER))
+        assertFalse(cli.err.contains(TRUNCATION_MARKER))
+    }
+
+    // A non-zero exit round-trips its code and stays untruncated.
+    @Test fun execReply_nonZeroExitRoundTrip() {
+        val svc = buildResult(
+            3, StringBuilder(""), StringBuilder("oops"),
+            DrainStatus.EOF, DrainStatus.EOF, false,
+        )
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(3, cli.exit)
+        assertEquals("oops", cli.err)
+        assertFalse(cli.truncated)
     }
 }
