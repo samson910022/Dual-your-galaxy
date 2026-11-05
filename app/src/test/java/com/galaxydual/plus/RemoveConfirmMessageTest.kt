@@ -49,4 +49,23 @@ class RemoveConfirmMessageTest {
         assertTrue("fallback must show profile label, got: $msg", msg.contains(profileLabel))
         assertTrue("raw pkg must not be redacted, got: $msg", !msg.contains("<pkg>"))
     }
+
+    @Test
+    fun newlineInput_doesNotBreakDialogLines() {
+        // m3 行注入：欄位內換行經 sanitizeUserEcho 壓空白，結構換行只剩模板自帶三行。
+        val evilPkg = "com.example.chat\n偽造行"
+        val msg = buildRemoveConfirmMessage(
+            pkg = evilPkg,
+            appLabel = "聊天應用\n偽造行",
+            profileLabel = "DualApp\n偽造行",
+            dualId = dualId,
+            serial = serial,
+        )
+        assertTrue("field newline must be neutralized, got: $msg", !msg.contains(evilPkg))
+        assertTrue("field newline must collapse to space, got: $msg", msg.contains("偽造行"))
+        // 結構換行：模板自帶兩處 \n（三行），欄位內不得再斷行。
+        val lines = msg.split("\n")
+        assertTrue("dialog must stay 3 structural lines, got ${lines.size}: $msg", lines.size == 3)
+        assertTrue("raw pkg must not be redacted, got: $msg", !msg.contains("<pkg>"))
+    }
 }

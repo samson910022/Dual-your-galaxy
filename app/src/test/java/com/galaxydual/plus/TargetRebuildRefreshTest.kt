@@ -141,7 +141,9 @@ class TargetRebuildRefreshTest {
             currentChannel = ResolvedChannel.ROOT,
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
-            nowMs = { clock.now() },
+            // C1 雙時鐘測試同餵：wall/mono 共用同一 fake，沿既有 JumpClock/FakeClock 模式。
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
         )
         vms.add(vm)
         return vm

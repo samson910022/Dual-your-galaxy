@@ -52,8 +52,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 //   together and refuses a serial mismatch without uninstalling.
 // - profileLabel: display label of that target at request time (second
 //   "selection unchanged" signal besides the id).
-// - requestedAtMs: clock reading at request time (consent generation,
-//   same clock source as the TTL check). confirmRemove rejects a stale
+// - requestedAtMs: 單調時鐘讀數 (nowMonoMs，同意生成，與 TTL 同源，
+ //   不受 wall 回撥影響). confirmRemove rejects a stale
 //   consent older than REMOVE_CONFIRM_TTL_MS (fail closed, must request
 //   again); the serial/id/label re-check still guards a moved target
 //   regardless of age.
@@ -491,6 +491,8 @@ class DualViewModel(
     // inventory/hook/lastOperation 時間證據。Defaults to the real wall clock so
     // JVM tests need no Android runtime; tests inject a controllable fake.
     // Constructor stays Android-free; the factory wires elapsedRealtime.
+    // NOTE: p27 dual-clock (C1) 以 nowWallMs/nowMonoMs 接手；nowMs 暫留供
+    // 未遷移呼叫端，最終統一移除。
     private val nowMs: () -> Long = System::currentTimeMillis,
     // Phase N2 (issue #34 re-review): injectable Shizuku teardown observer.
     // Production default null (real ShizukuCmdGateway.abandon() runs inline);
@@ -500,6 +502,15 @@ class DualViewModel(
     // displaced-idle closes in swap paths plus the final cleared snapshot.
     // Never throws (guarded); never drives readiness/diagnosis.
     private val gatewayTeardown: ((CmdGateway) -> Unit)? = null,
+    // 雙時鐘 (C1)：wall-clock 供 inventory/queryTime/hook/lastOp/老化/顯示
+    // (存在性證據，可格式化)；monotonic 供同意時效 (requestedAtMs/TTL，不受
+    // wall 回撥影響)。JVM 預設皆為 currentTimeMillis (免 Android runtime，
+    // 測試注入可控 fake)；生產由 factory 分別接線 (wall 走 currentTimeMillis，
+    // mono 走 elapsedRealtime)。Constructor stays Android-free。
+    private val nowWallMs: () -> Long = System::currentTimeMillis,
+    // 同意時效單調時鐘 (見上)：request 的 requestedAtMs 與 confirm 的 TTL
+    // 差值皆經此取時， wall 回撥不得延長有效期。
+    private val nowMonoMs: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -659,11 +670,11 @@ class DualViewModel(
     }
 
     // PR-6 P4 (#27 架構整理)：clone/confirmRemove 各 pinned 結果分支共用的
-    // LastOperation+diagnose 配對建構。內部統一 nowMs() 取時與 detail 截斷
+    // LastOperation+diagnose 配對建構。內部統一 nowWallMs() 取時與 detail 截斷
     // (capDetail)；diagnose 映射沿用既有 (呼叫端傳入已按原規則算好的事件，
     // 含 Success 分支的 null)，此函數只負責配對、不重解 outcome。
     // 行為等價依據：capDetail(x) 與原 x.take(MAX_DIAG_DETAIL_CHARS) 同輸出；
-    // 每分支仍恰取時一次 (原各分支 val now = nowMs() 改由此函數內取，
+    // 每分支仍恰取時一次 (原各分支 val now = nowWallMs() 改由此函數內取，
     // update 同步執行故 tick 順序不變)；每處 phase/detail/diagnose 與原字面
     // 一字不差 (見各呼叫端傳入值)。
     private fun recordOp(
@@ -679,7 +690,7 @@ class DualViewModel(
             appKey = appKey,
             pinnedTarget = pinnedTarget,
             phase = phase,
-            timeMs = nowMs(),
+            timeMs = nowWallMs(),
             detail = capDetail(detail),
         )
         return op to diagnose
@@ -865,7 +876,7 @@ class DualViewModel(
         try {
             when (val snap = onIo { repo.profilesSnapshot() }) {
                 is ProfilesSnapshot.ChannelError -> {
-                    val now = nowMs()
+                    val now = nowWallMs()
                     _state.update { cur ->
                         val (combinedMsg, combinedKind) = combineWithDegradeNote(
                             "channel error: ${sanitizeForDisplay(snap.detail)}",
@@ -918,7 +929,7 @@ class DualViewModel(
                     val idRes = onIo { repo.resolveDualUserIdTyped() }
                     val dualId = (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
                     if (dualId <= NO_TARGET_ID) {
-                        val now = nowMs()
+                        val now = nowWallMs()
                         // 真正確認無 dual 的唯一條件：typed 稱 Absent 且快照
                         // 可用（列得出戶）。Unknown 全域走 CHANNEL_ERROR；
                         // 空快照（連 owner 都列不出，快照不可信）時即使 typed
@@ -1014,7 +1025,7 @@ class DualViewModel(
                         val nullVerified: DualIdResolution? =
                             if (groundTruth == null) onIo { repo.resolveDualUserIdTyped() } else null
                         _state.update { cur ->
-                            val now = nowMs()
+                            val now = nowWallMs()
                             val next = if (groundTruth == null) {
                                 // 未知：保留舊 cloned，inventory 舊資料標 STALE
                                 // (FRESH->STALE；否則 UNKNOWN，傳入的 targetId
@@ -1190,7 +1201,7 @@ class DualViewModel(
             // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
             // PR-6 P2: 舊資料標 STALE，不謊稱新鮮；lastOperation 不動。
             // UNKNOWN 分支回退保留舊身份：傳入已知 target，UI 仍可見上次目標。
-            val now = nowMs()
+            val now = nowWallMs()
             _state.update { cur ->
                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                     "refresh failed: ${sanitizeForDisplay(e.message ?: "refresh failed")}",
@@ -1378,17 +1389,20 @@ class DualViewModel(
                         is CloneOutcome.NoDual -> {
                             // 寫前拒絕 (install 未執行)：只設 diagnose+msg，
                             // 不覆寫 lastOperation (與空白輸入分支一致)。
-                            // NO_DUAL/CHANNEL_ERROR 鑑別用現有 snapshot API
-                            // (repo 簽名不動)：通道失敗或空快照 (連 owner 都無)
-                            // ->CHANNEL_ERROR 且不清 cloned；快照正常有戶
-                            // ->真正確認無 profile->NO_DUAL。
+                            // M1 typed 鑑別 (沿 refreshLocked)：僅 Absent+快照可用
+                            // 才報 NO_DUAL；Unknown 一律 CHANNEL_ERROR (含 Absent
+                            // 但空快照：快照本身已證通道有問題)。
                             // 理由 (M3 寫前拒絕誠實新鮮度)：FRESH 經 toStaleOrUnknown
                             // 降為 STALE (不清 cloned/lastOperation，只降新鮮度)。
                             val snap = onIo { repo.profilesSnapshot() }
-                            val channelBad = snap is ProfilesSnapshot.ChannelError ||
-                                (snap as? ProfilesSnapshot.Loaded)?.profiles.isNullOrEmpty() == true
+                            val idRes = onIo { repo.resolveDualUserIdTyped() }
+                            val snapshotUsable =
+                                (snap as? ProfilesSnapshot.Loaded)?.profiles?.isNotEmpty() == true
+                            val confirmedAbsent =
+                                idRes is DualIdResolution.Absent && snapshotUsable
                             val channelDetail = (snap as? ProfilesSnapshot.ChannelError)?.detail
-                            val now = nowMs()
+                            val typedDetail = (idRes as? DualIdResolution.Unknown)?.detail
+                            val now = nowWallMs()
                             _state.update { cur ->
                                 val degraded =
                                     if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1400,17 +1414,22 @@ class DualViewModel(
                                     } else {
                                         cur.inventory
                                     }
-                                if (channelBad) {
+                                if (!confirmedAbsent) {
                                     cur.copy(
                                         loading = false,
                                         inventory = degraded,
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.CHANNEL_ERROR,
-                                            techDetail = if (channelDetail != null) {
-                                                "verified dual id unknown: $channelDetail"
-                                            } else {
-                                                "verified dual id unknown " +
-                                                    "and profiles snapshot empty"
+                                            techDetail = when {
+                                                typedDetail?.isNotBlank() == true ->
+                                                    "verified dual id unknown: $typedDetail"
+                                                channelDetail != null ->
+                                                    "verified dual id unknown: $channelDetail"
+                                                !snapshotUsable ->
+                                                    "verified dual id unknown " +
+                                                        "and profiles snapshot empty"
+                                                else ->
+                                                    "verified dual id unknown"
                                             },
                                         ),
                                         msg = if (channelDetail != null) {
@@ -1437,7 +1456,7 @@ class DualViewModel(
                             // 寫前拒絕 (install 未執行)：只設 diagnose+msg，
                             // 不覆寫 lastOperation。
                             // 理由 (M3)：FRESH 經 toStaleOrUnknown 降 STALE (不清 cloned/lastOperation)。
-                            val now = nowMs()
+                            val now = nowWallMs()
                             _state.update { cur ->
                                 val degraded =
                                     if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1464,7 +1483,7 @@ class DualViewModel(
                             // 不覆寫 lastOperation (remove InvalidPackage 同，
                             // 見統一規則：install/uninstall 未執行者不碰歷史)。
                             // 理由 (M3)：FRESH 經 toStaleOrUnknown 降 STALE。
-                            val now = nowMs()
+                            val now = nowWallMs()
                             _state.update { cur ->
                                 val degraded =
                                     if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1614,7 +1633,7 @@ class DualViewModel(
     // confirmed but its serial cannot be established. A second request
     // overwrites the first (last wins); the confirm step re-validates, so a
     // stale overwrite cannot execute.
-    // PR-33 R3 (P2 安裝狀態 + 時效): stores nowMs() as the consent
+    // PR-33 R3 (P2 安裝狀態 + 時效): stores nowMonoMs() as the consent
     // generation and refuses before storing when the package is not
     // installed (NotInstalled -> INFO 無需移除, Unknown -> CHANNEL fail
     // closed), so a no-op removal never opens a dialog.
@@ -1684,7 +1703,7 @@ class DualViewModel(
                             is ProfilesSnapshot.ChannelError -> {
                                 // 理由 (M3 寫前拒絕誠實新鮮度)：寫前拒絕時 FRESH 快照已不可信，
                                 // 經 toStaleOrUnknown 降為 STALE (不清 cloned/lastOperation，只降新鮮度)。
-                                val now = nowMs()
+                                val now = nowWallMs()
                                 _state.update { cur ->
                                     val degraded =
                                         if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1711,12 +1730,19 @@ class DualViewModel(
                             is ProfilesSnapshot.Loaded -> {
                                 when (val target = onIo { repo.fetchDualTarget() }) {
                                     is DualTargetResult.NoDual -> {
-                                        // 理由 (M1 空快照鑑別，repo 簽名不動，照 refreshLocked/clone-NoDual)：
-                                        // Loaded 空快照 (profiles.isEmpty，連 owner 都列不出，快照不可信)
-                                        // ->CHANNEL_ERROR 且不清 cloned；快照正常有戶才為真 NO_DUAL。
+                                        // M1 typed 鑑別 (沿 refreshLocked/clone-NoDual)：
+                                        // 僅 Absent+快照可用才為真 NO_DUAL；Unknown
+                                        // 一律 CHANNEL_ERROR (含 Absent 但空快照)。
+                                        // Loaded 空快照 (連 owner 都列不出，快照不可信)
+                                        // ->CHANNEL_ERROR 且不清 cloned。
                                         // 理由 (M3)：寫前拒絕時 FRESH 降 STALE (不清 cloned/lastOperation)。
                                         val snapshotUsable = snap.profiles.isNotEmpty()
-                                        val now = nowMs()
+                                        val idRes = onIo { repo.resolveDualUserIdTyped() }
+                                        val confirmedAbsent =
+                                            idRes is DualIdResolution.Absent && snapshotUsable
+                                        val typedDetail =
+                                            (idRes as? DualIdResolution.Unknown)?.detail
+                                        val now = nowWallMs()
                                         _state.update { cur ->
                                             val degraded =
                                                 if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1728,7 +1754,7 @@ class DualViewModel(
                                                 } else {
                                                     cur.inventory
                                                 }
-                                            if (!snapshotUsable) {
+                                            if (!confirmedAbsent) {
                                                 cur.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
@@ -1736,8 +1762,15 @@ class DualViewModel(
                                                     inventory = degraded,
                                                     diagnose = diagnoseEvent(
                                                         DiagnoseCode.CHANNEL_ERROR,
-                                                        techDetail = "verified dual id unknown " +
-                                                            "and profiles snapshot empty",
+                                                        techDetail = when {
+                                                            typedDetail?.isNotBlank() == true ->
+                                                                "verified dual id unknown: $typedDetail"
+                                                            !snapshotUsable ->
+                                                                "verified dual id unknown " +
+                                                                    "and profiles snapshot empty"
+                                                            else ->
+                                                                "verified dual id unknown"
+                                                        },
                                                     ),
                                                     msg = "remove result unknown: " +
                                                         "cannot confirm dual profile",
@@ -1751,7 +1784,7 @@ class DualViewModel(
                                                     inventory = degraded,
                                                     diagnose = diagnoseEvent(
                                                         DiagnoseCode.NO_DUAL,
-                                                        techDetail = "verified dual id unknown",
+                                                        techDetail = "typed resolution absent",
                                                     ),
                                                     msg = "no dual profile",
                                                     msgKind = MsgKind.NO_DUAL,
@@ -1761,7 +1794,7 @@ class DualViewModel(
                                     }
                                     is DualTargetResult.SerialUnavailable -> {
                                         // 理由 (M3)：寫前拒絕時 FRESH 降 STALE (不清 cloned/lastOperation)。
-                                        val now = nowMs()
+                                        val now = nowWallMs()
                                         _state.update { cur ->
                                             val degraded =
                                                 if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1798,7 +1831,7 @@ class DualViewModel(
                                             // 快照正常有戶但 verified 目標缺席才為真 NO_DUAL。
                                             // 理由 (M3)：寫前拒絕時 FRESH 降 STALE。
                                             val snapshotUsable = snap.profiles.isNotEmpty()
-                                            val now = nowMs()
+                                            val now = nowWallMs()
                                             _state.update { cur ->
                                                 val degraded =
                                                     if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1858,7 +1891,7 @@ class DualViewModel(
                                                         dualId = dualId,
                                                         dualSerial = target.target.serial,
                                                         profileLabel = label,
-                                                        requestedAtMs = nowMs(),
+                                                        requestedAtMs = nowMonoMs(),
                                                     )
                                                     _state.update {
                                                         it.copy(
@@ -1889,7 +1922,7 @@ class DualViewModel(
                                                     }
                                                 is VerifyState.Unknown -> {
                                                     // 理由 (M3)：寫前拒絕時 FRESH 降 STALE。
-                                                    val now = nowMs()
+                                                    val now = nowWallMs()
                                                     _state.update { cur ->
                                                         val degraded =
                                                             if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -1978,8 +2011,9 @@ class DualViewModel(
             val pending = cur.pendingRemove ?: return@update cur
             cur.copy(
                 pendingRemove = null,
-                // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay。
-                msg = "已取消移除：${sanitizeForDisplay(pending.pkg)}",
+                // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
+                // sanitizeUserEcho (保原文、去換行，不 redact)。
+                msg = "已取消移除：${sanitizeUserEcho(pending.pkg)}",
                 msgKind = MsgKind.INFO,
             )
         }
@@ -1999,7 +2033,7 @@ class DualViewModel(
     // re-check confirms it absent (same fail-closed rule as the old direct
     // remove). 最終授權者是 repo pinned API，VM pre-check 只是 fail-fast.
     // PR-33 R3 (P2 安裝狀態 + 時效): after the serial/label checks, a stale
-    // consent (nowMs() - requestedAtMs > REMOVE_CONFIRM_TTL_MS) is refused
+    // consent (nowMonoMs() - requestedAtMs > REMOVE_CONFIRM_TTL_MS) is refused
     // first (cheap, no IO), then the package is re-verified Installed via
     // repo.verifyState (NotInstalled -> INFO 無需移除 without touching
     // cloned, Unknown -> CHANNEL fail closed) -- only then runs
@@ -2024,9 +2058,10 @@ class DualViewModel(
             if (!inFlightWrites.add(key)) {
                 _state.update {
                     it.copy(
-                        // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay；
+                        // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
+                        // sanitizeUserEcho (保原文、去換行，不 redact)；
                         // 儲存的 key/appKey 保持 raw 不動。
-                        msg = "already in progress: ${sanitizeForDisplay(pendingAtCall.pkg)}",
+                        msg = "already in progress: ${sanitizeUserEcho(pendingAtCall.pkg)}",
                         msgKind = MsgKind.INFO,
                     )
                 }
@@ -2059,24 +2094,59 @@ class DualViewModel(
                     try {
                         // Single-snapshot pinned flow inside the repository.
                         // onIo: the core retry settle wait must never run on Main.
-                        val freshId = onIo { repo.resolveDualUserId() }
+                        // M1 typed 鑑別：僅 Absent+快照可用才報 NO_DUAL；
+                        // Unknown 一律 CHANNEL_ERROR + cannot confirm，
+                        // msg/kind 與 diagnose 對齊 (不再自矛盾)。
+                        val idRes = onIo { repo.resolveDualUserIdTyped() }
+                        val freshId =
+                            (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
                         if (freshId < 0) {
-                            // 理由 (M2 殘留)：freshId<0 為通道失敗語意 (verified 身份不可得)，
-                            // 補 diagnose=CHANNEL_ERROR (原無 diagnose) + sanitize techDetail。
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    pendingRemove = null,
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.CHANNEL_ERROR,
-                                        techDetail = sanitizeForDisplay(
-                                            "verified dual id unknown " +
-                                                "for expected ${cur.dualId}",
-                                        ).take(MAX_DIAG_DETAIL_CHARS),
-                                    ),
-                                    msg = "no dual profile",
-                                    msgKind = MsgKind.NO_DUAL,
-                                )
+                            val snapForId = onIo { repo.profilesSnapshot() }
+                            val snapshotUsable =
+                                (snapForId as? ProfilesSnapshot.Loaded)
+                                    ?.profiles?.isNotEmpty() == true
+                            val confirmedAbsent =
+                                idRes is DualIdResolution.Absent && snapshotUsable
+                            val typedDetail =
+                                (idRes as? DualIdResolution.Unknown)?.detail
+                            if (confirmedAbsent) {
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingRemove = null,
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.NO_DUAL,
+                                            techDetail = "typed resolution absent",
+                                        ),
+                                        msg = "no dual profile",
+                                        msgKind = MsgKind.NO_DUAL,
+                                    )
+                                }
+                            } else {
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingRemove = null,
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.CHANNEL_ERROR,
+                                            techDetail = sanitizeForDisplay(
+                                                when {
+                                                    typedDetail?.isNotBlank() == true ->
+                                                        "verified dual id unknown: $typedDetail"
+                                                    !snapshotUsable ->
+                                                        "verified dual id unknown and profiles " +
+                                                            "snapshot empty"
+                                                    else ->
+                                                        "verified dual id unknown " +
+                                                            "for expected ${cur.dualId}"
+                                                },
+                                            ).take(MAX_DIAG_DETAIL_CHARS),
+                                        ),
+                                        msg = "remove result unknown: " +
+                                            "cannot confirm dual profile",
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
                             }
                             return@withLock
                         }
@@ -2143,10 +2213,17 @@ class DualViewModel(
                             return@withLock
                         }
                         if (freshSerial != cur.dualSerial) {
+                            // M2 補 diagnose：serial 不一致為驗證不一致，
+                            // techDetail 僅數字身份 (不含 raw pkg/label，隱私)。
                             _state.update {
                                 it.copy(
                                     loading = false,
                                     pendingRemove = null,
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.VERIFY_MISMATCH,
+                                        techDetail = "serial $freshSerial != " +
+                                            "${cur.dualSerial} for user ${cur.dualId}",
+                                    ),
                                     msg = "移除目標已變更（serial " +
                                         "$freshSerial ≠ ${cur.dualSerial}），請重新確認",
                                     msgKind = MsgKind.INVALID,
@@ -2170,18 +2247,53 @@ class DualViewModel(
                                 val label =
                                     snap.profiles.firstOrNull { it.userId == cur.dualId }?.label
                                 if (label == null) {
-                                    _state.update {
-                                        it.copy(
-                                            loading = false,
-                                            profiles = snap.profiles,
-                                            pendingRemove = null,
-                                            diagnose = diagnoseEvent(
-                                                DiagnoseCode.NO_DUAL,
-                                                techDetail = "verified dual id ${cur.dualId} absent",
-                                            ),
-                                            msg = "no dual profile",
-                                            msgKind = MsgKind.NO_DUAL,
-                                        )
+                                    // 理由 (M1 空快照鑑別，照 requestRemove 分支)：
+                                    // 空快照 (連 owner 都無，快照不可信) ->CHANNEL_ERROR；
+                                    // 快照正常有戶但 verified 目標缺席才為真 NO_DUAL。
+                                    // 理由 (M3)：寫前拒絕時 FRESH 降 STALE。
+                                    val snapshotUsable = snap.profiles.isNotEmpty()
+                                    val now = nowWallMs()
+                                    _state.update { st ->
+                                        val degraded =
+                                            if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                                st.inventory.toStaleOrUnknown(
+                                                    now = now,
+                                                    source = st.inventory.source,
+                                                    targetId = st.inventory.targetId,
+                                                )
+                                            } else {
+                                                st.inventory
+                                            }
+                                        if (!snapshotUsable) {
+                                            st.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                inventory = degraded,
+                                                diagnose = diagnoseEvent(
+                                                    DiagnoseCode.CHANNEL_ERROR,
+                                                    techDetail = "verified dual id " +
+                                                        "${cur.dualId} absent and profiles " +
+                                                        "snapshot empty",
+                                                ),
+                                                msg = "remove result unknown: " +
+                                                    "cannot confirm dual profile",
+                                                msgKind = MsgKind.CHANNEL,
+                                            )
+                                        } else {
+                                            st.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                inventory = degraded,
+                                                diagnose = diagnoseEvent(
+                                                    DiagnoseCode.NO_DUAL,
+                                                    techDetail = "verified dual id ${cur.dualId} absent",
+                                                ),
+                                                msg = "no dual profile",
+                                                msgKind = MsgKind.NO_DUAL,
+                                            )
+                                        }
                                     }
                                 } else if (label != cur.profileLabel) {
                                     _state.update {
@@ -2211,12 +2323,19 @@ class DualViewModel(
                                     // (TTL 判在既有 IO 之後). A stale consent
                                     // is refused with zero uninstalls
                                     // (INVALID + 重新確認).
-                                    if (nowMs() - cur.requestedAtMs > REMOVE_CONFIRM_TTL_MS) {
+                                    if (nowMonoMs() - cur.requestedAtMs > REMOVE_CONFIRM_TTL_MS) {
+                                        // M3 補 diagnose：同意過期為輸入拒絕，
+                                        // techDetail 僅時效數字 (不含 pkg)。
                                         _state.update {
                                             it.copy(
                                                 loading = false,
                                                 profiles = snap.profiles,
                                                 pendingRemove = null,
+                                                diagnose = diagnoseEvent(
+                                                    DiagnoseCode.INVALID_INPUT,
+                                                    techDetail = "consent expired for user " +
+                                                        "${cur.dualId}",
+                                                ),
                                                 msg = "確認已過期，請重新確認移除",
                                                 msgKind = MsgKind.INVALID,
                                             )
@@ -2246,15 +2365,26 @@ class DualViewModel(
                                             return@withLock
                                         }
                                         is VerifyState.Unknown -> {
+                                            // M3 補 diagnose：寫後無法查證為 VERIFY_UNKNOWN，
+                                            // techDetail 經 sanitizeForDisplay。
                                             _state.update {
                                                 it.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
-                                                    // 理由 (m2)：包名與通道 detail 回音皆消毒。
+                                                    diagnose = diagnoseEvent(
+                                                        DiagnoseCode.VERIFY_UNKNOWN,
+                                                        techDetail = sanitizeForDisplay(
+                                                            "cannot verify ${cur.pkg} " +
+                                                                "for user ${cur.dualId}: " +
+                                                                st.detail,
+                                                        ).take(MAX_DIAG_DETAIL_CHARS),
+                                                    ),
+                                                    // 理由 (m1 本機回音原文)：pkg 回音用
+                                                    // sanitizeUserEcho；st.detail 續消毒。
                                                     msg = "remove result unknown: " +
                                                         "cannot verify " +
-                                                        "${sanitizeForDisplay(cur.pkg)} " +
+                                                        "${sanitizeUserEcho(cur.pkg)} " +
                                                         "for user ${cur.dualId}: " +
                                                         sanitizeForDisplay(st.detail),
                                                     msgKind = MsgKind.CHANNEL,
@@ -2352,10 +2482,14 @@ class DualViewModel(
                                             // profilesSnapshot：仍列有目標 id -> typed 身份
                                             // 通道抖動 -> CHANNEL_ERROR；否則真正無 profile
                                             // -> NO_DUAL。兩者皆不碰 cloned (移除未執行)。
+                                            // M4 空快照守衛 (比照 clone/request)：空快照
+                                            // (連 owner 都無，快照不可信) 即 CHANNEL_ERROR，
+                                            // 不得報 NO_DUAL。
                                             // 理由 (M3)：FRESH 經 toStaleOrUnknown 降 STALE。
                                             val targetListed =
                                                 snap.profiles.any { it.userId == cur.dualId }
-                                            val now = nowMs()
+                                            val snapshotUsable = snap.profiles.isNotEmpty()
+                                            val now = nowWallMs()
                                             _state.update { cur2 ->
                                                 val degraded =
                                                     if (cur2.inventory.freshness == InventoryFreshness.FRESH) {
@@ -2367,7 +2501,7 @@ class DualViewModel(
                                                     } else {
                                                         cur2.inventory
                                                     }
-                                                if (targetListed) {
+                                                if (targetListed || !snapshotUsable) {
                                                     cur2.copy(
                                                         loading = false,
                                                         profiles = snap.profiles,
@@ -2375,8 +2509,13 @@ class DualViewModel(
                                                         inventory = degraded,
                                                         diagnose = diagnoseEvent(
                                                             DiagnoseCode.CHANNEL_ERROR,
-                                                            techDetail = "verified dual id unknown " +
-                                                                "for listed target ${cur.dualId}",
+                                                            techDetail = if (!snapshotUsable) {
+                                                                "verified dual id unknown " +
+                                                                    "and profiles snapshot empty"
+                                                            } else {
+                                                                "verified dual id unknown " +
+                                                                    "for listed target ${cur.dualId}"
+                                                            },
                                                         ),
                                                         msg = "remove result unknown: " +
                                                             "channel error for user ${cur.dualId}",
@@ -2399,7 +2538,7 @@ class DualViewModel(
                                             // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
                                             // 不覆寫 lastOperation。
                                             // 理由 (M3)：FRESH 經 toStaleOrUnknown 降 STALE。
-                                            val now = nowMs()
+                                            val now = nowWallMs()
                                             _state.update { cur2 ->
                                                 val degraded =
                                                     if (cur2.inventory.freshness == InventoryFreshness.FRESH) {
@@ -2428,7 +2567,7 @@ class DualViewModel(
                                             // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
                                             // 不覆寫 lastOperation (msgKind 維持 INVALID)。
                                             // 理由 (M3)：FRESH 經 toStaleOrUnknown 降 STALE。
-                                            val now = nowMs()
+                                            val now = nowWallMs()
                                             _state.update { cur2 ->
                                                 val degraded =
                                                     if (cur2.inventory.freshness == InventoryFreshness.FRESH) {
@@ -2524,7 +2663,7 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.TargetMoved -> {
-                                            val now = nowMs()
+                                            val now = nowWallMs()
                                             _state.update {
                                                 it.copy(
                                                     loading = false,
@@ -2550,7 +2689,7 @@ class DualViewModel(
                                         // uninstalls -- same INVALID +
                                         // 重新確認 shape as TargetMoved.
                                         is RemoveOutcome.SerialMismatch -> {
-                                            val now = nowMs()
+                                            val now = nowWallMs()
                                             _state.update {
                                                 it.copy(
                                                     loading = false,
@@ -3577,7 +3716,9 @@ class DualViewModel(
             // never writes pmReadable (refresh owns it) -- copy preserves it.
             // PR-6 P2 (#27 後半): FRESH 失效條件見上（P2-4：!ready 或 resolved
             // 改變即降 STALE，不再只看 anyProbePassed——他通道成功不能替選定通道背書）。
-            val probeNow = nowMs()
+            // 雙時鐘：探測/清單/hook 取 wall-clock（nowWallMs），同意 TTL 取
+            // 單調時鐘（nowMonoMs），互不混用。
+            val probeNow = nowWallMs()
             _state.update { cur ->
                 val staleInventory =
                     if (cur.inventory.freshness == InventoryFreshness.FRESH &&
@@ -3838,7 +3979,7 @@ class DualViewModel(
     // 過期 FRESH 補標 STALE (保留原 target/queryTime/count 供追溯)。
     // 必須在 opMutex 下呼叫。
     private fun markStaleIfAgedLocked() {
-        val now = nowMs()
+        val now = nowWallMs()
         _state.update { cur ->
             if (cur.inventory.freshness == InventoryFreshness.FRESH &&
                 cur.inventory.needsRefresh(now)
