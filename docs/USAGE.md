@@ -47,8 +47,8 @@ val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, ha
 val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 
-Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
-目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
+Clone／Remove／重新連線並更新／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
+目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。重新連線並更新按鈕（單一入口 `reconnectAndRefresh()`：probe 含 Auto 降級＋refresh，暫態失敗後點此即重探恢復）。Auto probe 降級已實作（su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，見 #25）；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
 
 - 併發邊界（#24；術語：busy 即 `UiState.loading`，merge 即 coalesce）：`refresh()` 快速連點合併為一次 trailing 重跑（coalesce，in-flight 之後最多一次待跑，不堆積 mutex 等待者）；`clone`／`request-remove`／`confirm` 按操作 key 去重，同 key 第二次報 `already in progress` 不排隊，三命名空間全稱 `clone:<pkg>`／`request-remove:<pkg>`／`remove:<pkg>@<id>#<serial>#<ts>`（世代 key，serial 綁定：同包不同世代不互擋，同世代重複才去重；clone 與 request／confirm 互不干擾）；寫回覆 `timedOut‖transportUnknown‖isPostSpawnTransportText‖isServiceTimeoutText` 一律 verify-first（單次有界唯讀 `verifyListProbe` 定奪，不重發寫入；同向成功才認 Success，反向觀測一律 Unknown；before／after pin 漂移→`VerifyUnknown`（identity-changed），不計成功）；執行期間 busy（`UiState.loading=true`，7 鈕＋dialog 按鈕禁用，cancel／pending 保留語義見 ARCH）；所有 repo 呼叫經 `Dispatchers.IO`（`onIo`），settle wait 預設可取消 `delay()`（經 `delayFn`），cancel 在等待間傳播。
 
@@ -64,8 +64,7 @@ Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕�
    - Shizuku 會顯示 6 位數配對碼；在系統跳出的「無線調試配對」對話框輸入配對碼。
    - 配對成功後回到 Shizuku 點「啟動」，看到版本號即表示 binder 已就緒。
 5. 在 Shizuku 的「授權應用」中找到 **Galaxy Dual Plus** 並允許。
-6. 回到本 App 點 `refresh()`；F4a 接線後，已授權 binder 下 Factory 選 `ShizukuCmdGateway` 且 `ShizukuElevator` 探測通過時，標題列預期從 `(NONE)` 變為 `(SHELL)`
-   （選不到／探測未過則維持 `(NONE)` 唯讀 fail-closed；此切換 [待實機驗證] DEVICE-UNVERIFIED，不可視為已可用）。
+6. 回到本 App 點 `重新連線並更新`；F4a 接線後，已授權 binder 下 Factory 選 `ShizukuCmdGateway` 且 `ShizukuElevator` 探測通過時，標題列預期從 `(NONE/NOOP)` 變為 `(SHELL/SHIZUKU)`（標題列顯示實際執行身份＋已解析通道 `execIdentity/resolvedGateway`；選不到／探測未過則維持唯讀 fail-closed；此切換 [待實機驗證] DEVICE-UNVERIFIED，不可視為已可用）。
 
 > 每次重開機後需重複步驟 4（Shizuku 需重新啟動）；配對碼只需配對過一次，
 > 同一 Wi-Fi 下重啟一般直接按「啟動」即可。
@@ -168,7 +167,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
   作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（whitelist 政策分支待實作）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
-- AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
+- AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；Auto probe 降級已實作（P25：首次探測即依 live probes 修正啟動猜測——su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，暫態失敗後點 `重新連線並更新` 即重探恢復）；實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
   絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
 - P1 診斷限制（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）：Hook 狀態為四態——偵測到歷史 Hook 標記（僅存在性證據，未確認本次開機是否生效）／未偵測到／狀態未知（無權限讀取）／狀態未知（無可用診斷通道）。明選 LSPosed（NoOp）時診斷讀取獨立於所選寫入通道：仍嘗試直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）`cat`；若無任何真通道且直接讀取不可讀（App uid 對 `/data/system` 恆 EACCES），顯示「狀態未知」而非「未偵測到」——後者只保留給確定可讀但缺失的情況（fail-closed 誠實顯示，不再假陰性）。要完整診斷需至少一個探測通過的真通道；診斷結果永不進入路由／`channelReady`（hook-neutral，沿襲 #19）。
@@ -177,7 +176,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 | 症狀 | 原因 / 解法 |
 | --- | --- |
-| `(NONE)` 或「通道未就緒」 | 先區分所選 gateway、探測能力與 Shizuku binder／授權。未就緒時會拒寫，但 Refresh 本身不重新探測；重選模式或回到前景才會觸發相應重探，仍不保證 Auto 失敗降級。單一恢復流程由 #25 追蹤，不能以標題權限代替實際通道狀態。 |
+| `(NONE)` 或「通道未就緒」 | 先區分所選 gateway、探測能力與 Shizuku binder／授權。未就緒時會拒寫；點 `重新連線並更新`（probe 含 Auto 降級＋refresh 單一入口）即重探恢復。Auto probe 降級已實作（#25）；不能以標題的裝置路由代替實際通道狀態（標題列顯示的是 `execIdentity/resolvedGateway`）。 |
 | `no dual profile` | 可能是未建立、候選歧義或輸出無法解析，不能一律解讀為尚未建立。先唯讀核對平台身分；不確定即停止寫入，見 #21/#27 |
 | `Failure [INSTALL_FAILED_...]` | 來源 APK 不存在或儲存空間不足；先確認主 profile 已安裝該 App |
 | Play 審查相關警告 | 本專案不發 Play 版，請一律使用 GitHub Release 的 APK |

@@ -76,7 +76,9 @@ enum class MsgKind {
     // Success or neutral status ("cloned: x", "no clones installed").
     INFO,
 
-    // Invalid input or refused write (bad package token, read-only channel).
+    // Invalid input (bad package token). Refused writes use CHANNEL
+    // (selected channel not ready); only the defensive unreachable guard
+    // keeps INVALID.
     INVALID,
 
     // Channel answered but reports no single DUAL profile.
@@ -151,7 +153,9 @@ data class UiState(
     // Packages currently cloned into the dual profile (MVP tracks by name).
     val cloned: List<String> = emptyList(),
     // True while a repository call is in flight; UI should show progress.
-    val loading: Boolean = false,
+    // Starts true so the cold-start frame renders 載入中 rather than 就緒
+    // before the first probe sets loading explicitly.
+    val loading: Boolean = true,
     // Last user-facing status or error message; empty means no message.
     val msg: String = "",
     // Error class of msg; NONE when msg is empty.
@@ -309,8 +313,10 @@ class DualViewModel(
             channel = preference,
             resolvedGateway = currentChannel,
             execIdentity = gatewayPrivilege,
-            msg = "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀",
-            msgKind = MsgKind.CHANNEL,
+            // 初值不預設任何通道訊息（啟動可能是 ROOT/SHIZUKU/NoOp）：
+            // msg/msgKind 保持 NONE，等首次探測（probeChannels）再寫入。
+            msg = "",
+            msgKind = MsgKind.NONE,
         ),
     )
 
@@ -1721,7 +1727,7 @@ class DualViewModel(
                     msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
                         "寫入已拒絕；Hook 狀態：$hookDesc；" +
                         "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
-                    msgKind = MsgKind.INVALID,
+                    msgKind = MsgKind.CHANNEL,
                 )
             }
             return false
@@ -1732,7 +1738,8 @@ class DualViewModel(
             val reason = if (cur.degradeNote.isNotEmpty() && cur.channel == ChannelPreference.AUTO) {
                 cur.degradeNote
             } else if (gatewayPrivilege == Privilege.NONE) {
-                "未選中真通道（NoOp 回退），目前為唯讀；請檢查授權後點「重新連線並更新」"
+                "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀；" +
+                    "請檢查授權後點「重新連線並更新」"
             } else {
                 "所選模式 ${cur.channel}（${gatewayPrivilege} 通道）探測未通過，" +
                     "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
@@ -1747,10 +1754,14 @@ class DualViewModel(
             return false
         }
         if (cur.privilege == Privilege.NONE || gatewayPrivilege == Privilege.NONE) {
+            // Unreachable by construction: channelReady true implies a proven
+            // non-NONE gateway, but kept as a fail-closed guard. 中文化以免
+            // 使用者看到英文原文。
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "read-only: no privilege channel, writes disabled",
+                    msg = "唯讀：無可用權限通道，寫入已禁用；" +
+                        "請檢查授權後點「重新連線並更新」",
                     msgKind = MsgKind.INVALID,
                 )
             }

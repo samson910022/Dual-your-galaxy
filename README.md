@@ -24,7 +24,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 ```
 
 - `core`：定義 `Privilege`（NONE/SHELL/ROOT）、`CmdGateway` 介面、`PmOutputParser` 解析器。
-- `app`：UI 層（`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集＋Shizuku binder／授權生命週期接線；已接入真 gateway＋picker＋marker 顯示［待實機驗證］DEVICE-UNVERIFIED：ROOT→`SuCmdGateway`（`su -c` argv 單參直傳）、SHELL→`ShizukuCmdGateway`（UserService `GalaxyExecService`，`newProcess` 在 13.1.5 已移除故不用）、LSPosed→NoOp 佔位（寫入拒絕，marker 僅顯示）；`ChannelPreference`（AUTO 預設，persist）經 `assembleChannel` 在啟動／`selectChannel` 解析，選不到回 `NoOpGateway` fail-closed；`SuElevator`／`ShizukuElevator` 探測真通道，`channelReady` 僅所選通道探測通過才 `true`（`channelReadyFor` 純函數 [已支援]：hook 訊號永不授權）），目標是透過 `core` 選擇最佳可用提權通道。
+- `app`：UI 層（`MainActivity` 已有 Clone／Remove／重新連線並更新／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集＋Shizuku binder／授權生命週期接線；已接入真 gateway＋picker＋marker 顯示［待實機驗證］DEVICE-UNVERIFIED：ROOT→`SuCmdGateway`（`su -c` argv 單參直傳）、SHELL→`ShizukuCmdGateway`（UserService `GalaxyExecService`，`newProcess` 在 13.1.5 已移除故不用）、LSPosed→NoOp 佔位（寫入拒絕，marker 僅顯示）；`ChannelPreference`（AUTO 預設，persist）經 `assembleChannel` 在啟動／`selectChannel` 解析，選不到回 `NoOpGateway` fail-closed；`SuElevator`／`ShizukuElevator` 探測真通道，`channelReady` 僅所選通道探測通過才 `true`（`channelReadyFor` 純函數 [已支援]：hook 訊號永不授權）），目標是透過 `core` 選擇最佳可用提權通道。
 - `hook`：LSPosed 模組佔位，hook 三星雙開白名單與服務，僅在已授權環境載入；政策集合預設為空，屬 observe-only（會安裝、會記 log，但不改變行為），詳見 [docs/HOOK.md](docs/HOOK.md) 第 1.1 節。
 
 詳見 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
@@ -78,7 +78,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 - 有 LSPosed（模組已勾選並啟用，file marker 存在性證據，僅顯示、永不進入路由）→ App 內切 LSPosed 模式顯示 marker 行（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`）；執行通道為 NoOp 佔位、寫入一律拒絕（[待實機驗證]：LSPosed 寫入、marker gateway-`cat` 顯示未驗；hook 現為 observe-only，不放寬任何包名，見 [docs/HOOK.md](docs/HOOK.md)）。[S24 已驗證]僅限：system hook 雙方法 deoptimize＋hooked、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取）、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效）；現階段 `hasLsposed = false` 保守值使 hook 通道不被選（F4b／後續 [待實機驗證]）。
 - 沒有 LSPosed 但 Shizuku 可用 → 預期降級走 Shizuku 通道（`Privilege.SHELL`），執行 `pm install-existing / uninstall --user / path --user`（Shizuku binder／授權生命週期已接＋真 gateway 已接；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）。[S24 已驗證]僅限已授權 binder 下 App 內切 SHIZUKU→就緒→CLONE（已安裝 verify 單次）；未授權路徑／首次選路／binder 死引導、binder round-trip、授權四情境 [待實機驗證]。
-- 兩者皆無 → `Privilege.NONE` 唯讀模式（[已支援]：路由與 `NoOpGateway` 拒寫＋`channelReady` false fail-closed；所選真通道探測通過即為 `true`；`selectChannel()` 可在 mutex 內重建 gateway 並重探，`recheckPrivilege()` 在 AUTO 環境變化時重選（見 [docs/USAGE.md](docs/USAGE.md) 第 1 節與 `DualViewModel`）；`refresh()` 本身只更新清單不重建 `channelReady`，Auto 降級與單一恢復入口由 [#25](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/25) 追蹤；顯示更新本身 [待實機驗證]）。
+- 兩者皆無 → `Privilege.NONE` 唯讀模式（[已支援]：路由與 `NoOpGateway` 拒寫＋`channelReady` false fail-closed；所選真通道探測通過即為 `true`；`selectChannel()` 可在 mutex 內重建 gateway 並重探，`recheckPrivilege()` 在 AUTO 環境變化時重選（見 [docs/USAGE.md](docs/USAGE.md) 第 1 節與 `DualViewModel`）；Refresh 按鈕已為 `重新連線並更新`（probe 含 Auto 降級＋refresh 單一入口 `reconnectAndRefresh()`，暫態失敗後點此即重探恢復）；Auto probe 降級已實作（su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，見 [#25](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/25)）；標題列顯示實際執行身份＋已解析通道（`execIdentity/resolvedGateway`）；顯示更新本身 [待實機驗證]）。
 
 詳見 [docs/USAGE.md](docs/USAGE.md) 第 1、4 節。
 

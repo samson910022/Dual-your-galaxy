@@ -18,8 +18,9 @@ package com.galaxydual.plus
 // the Activity onRequestPermissionsResult override is kept as a defensive seam
 // (Shizuku delivers via its own listener; the override only reacts when our
 // code matches). onResume re-probes privilege. Every binder/permission event
-// routes into vm.recheckPrivilege() (plus vm.refresh() when the channel may
-// be usable), so the state always tracks the live binder.
+// routes into vm.reconnectAndRefresh() (reread path: probe with Auto degrade +
+// refresh) or vm.recheckPrivilege() (dead-binder path: probe only), so the
+// state always tracks the live binder.
 //
 // Execution seam (F4a): the repository behind the ViewModel is the
 // factory-selected real gateway (su/Shizuku UserService) with NoOp fallback.
@@ -313,8 +314,9 @@ class MainActivity : ComponentActivity() {
 
     // Permission button: no binder -> single reconnect entry (probe keeps the
     // honest NONE state); authorized -> single reconnect entry (probe+refresh);
-    // otherwise ask Shizuku. The button text mirrors the same split in
-    // updateShizukuLine so文案/動作一致.
+    // otherwise ask Shizuku. The button text mirrors the same boolean split in
+    // updateShizukuLine so 文案/動作一致（重連分支為「檢查 Shizuku 並更新」，
+    // 與 Refresh 按鈕「重新連線並更新」區分；未授權分支為「請求 Shizuku 授權」）.
     private fun requestShizukuPermission() {
         try {
             if (!Shizuku.pingBinder()) {
@@ -332,14 +334,24 @@ class MainActivity : ComponentActivity() {
 
     // Shizuku binder/authorization line, read live (never cached): pingBinder
     // guards checkSelfPermission so a dead binder shows 未連線, not a crash.
-    // P25: the permission button text follows the same state so文案/動作一致:
-    // 未連線/已授權 -> "重新連線並更新" (reconnectAndRefresh); 未授權 ->
-    // "請求 Shizuku 授權" (requestPermission).
+    // P25: the permission button text follows the same boolean binder/
+    // permission state (never parsed from the rendered line): 未連線/已授權 ->
+    // "檢查 Shizuku 並更新" (reconnectAndRefresh, 與 Refresh 按鈕的
+    // 「重新連線並更新」區分 TalkBack/視覺）; 未授權 -> "請求 Shizuku 授權"
+    // (requestPermission).
     private fun updateShizukuLine() {
+        // Boolean binder/permission state first (single live read): the
+        // button branch below keys on these, never on state.contains().
+        val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
+        val authorized: Boolean = try {
+            !noBinder && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
         val state: String = try {
-            if (!Shizuku.pingBinder()) {
+            if (noBinder) {
                 "Shizuku：binder 未連線（需安裝並啟動 Shizuku）"
-            } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+            } else if (authorized) {
                 "Shizuku：已連線・已授權"
             } else {
                 "Shizuku：已連線・未授權（請點下方授權）"
@@ -349,7 +361,7 @@ class MainActivity : ComponentActivity() {
         }
         shizukuView.text = state
         try {
-            permBtn.text = if (state.contains("未授權")) "請求 Shizuku 授權" else "重新連線並更新"
+            permBtn.text = if (!noBinder && !authorized) "請求 Shizuku 授權" else "檢查 Shizuku 並更新"
         } catch (_: Exception) {
             // Best effort: updateShizukuLine may run before buildUi in tests.
         }
@@ -362,6 +374,15 @@ class MainActivity : ComponentActivity() {
     // device summary + preference -- so an explicit SHIZUKU pick with ROOT
     // available reports SHELL/SHIZUKU, never "正在使用 ROOT".
     private fun render(s: UiState) {
+        // P25: keep the Shizuku binder line in sync on every state render
+        // (cheap live read inside updateShizukuLine, already try/catch
+        // guarded for the pre-buildUi test path). Double-guarded here so a
+        // Shizuku-less test harness calling render can never crash on it.
+        try {
+            updateShizukuLine()
+        } catch (_: Exception) {
+            // Best effort: the state render must never depend on Shizuku.
+        }
         val readyMark = if (s.writeReady) "已就緒" else "未就緒（唯讀）"
         val readMark = if (s.readCap) "可用" else "不可用"
         privilegeView.text = "權限：${s.execIdentity}（實際通道 ${s.resolvedGateway}" +
@@ -373,10 +394,12 @@ class MainActivity : ComponentActivity() {
         // (restart remembers the preference via SharedPreferences; see
         // factory). Always shown so the user can tell which channel the
         // lists/privilege above were produced with. The Auto degrade note
-        // rides here too so the reason survives even when msg is cleared.
+        // is intentionally persistent here (it survives msg clears), but
+        // only as a short tag: the full note already rides in msg (INFO),
+        // so appending it in full would wash the status line every render.
         channelView.text = buildString {
             append("通道偏好：${s.channel}・實際：${s.resolvedGateway}（選擇已持久化，重啟 App 記住）")
-            if (s.degradeNote.isNotEmpty()) append("；${s.degradeNote}")
+            if (s.degradeNote.isNotEmpty()) append("；已自 Auto 降級，詳見狀態列")
         }
         // Hook signal: LSPosed mode only. ACTIVE shows the recorded scopes as
         // a historical marker (existence evidence only, boot freshness
