@@ -56,7 +56,10 @@ object ShellEscaper {
     // on purpose. All pm command builders (install-existing / uninstall / grant /
     // appops / path) funnel through this function, so no write path can ever be
     // assembled against the owner profile; callers must resolve a real dual id
-    // first (PmOutputParser.resolveDualUserId) or fail closed.
+    // first via the verified boundary (DualRepository.resolveDualUserId() /
+    // CmdGateway.fetchVerifiedDualId(), never the deprecated label-only
+    // PmOutputParser.resolveDualUserId(List)) or fail closed. The owner
+    // profile is never writable through this function by construction.
     fun escapeUserId(userId: Int): String {
         require(userId > 0) { "invalid userId (must be a dual profile id, never 0): $userId" }
         return userId.toString()
