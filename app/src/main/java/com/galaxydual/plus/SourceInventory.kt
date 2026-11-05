@@ -68,11 +68,18 @@ fun sortSourceApps(apps: List<SourceAppEntry>): List<SourceAppEntry> =
 // - markLoaded(appKey):該 key 的圖示已成功載入 (僅成功才記,失敗留待重試)。
 // - isLoaded 只供「是否再嘗試載入」決策;選取/寫入/恢復一律只讀 appKey,永不讀此表。
 // - key 必須是完整 appKey (serial+pkg),不可只用包名 (跨來源覆蓋)。
+// - PR-37 Phase C #5: memo 與 MainActivity 有界圖示快取同進退;淘汰最舊
+//   Drawable 時同步 evict 對應 key,回到該 App 時快取 miss＋未 loaded 即重載
+//   （否則 loaded 殘留會永久擋住重載，列舉再也貼不上圖）。
 class SourceIconState {
     private val loaded = mutableSetOf<String>()
 
     fun markLoaded(appKey: String) {
         loaded.add(appKey)
+    }
+
+    fun evict(appKey: String) {
+        loaded.remove(appKey)
     }
 
     fun isLoaded(appKey: String): Boolean = appKey in loaded
