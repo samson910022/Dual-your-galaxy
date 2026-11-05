@@ -53,12 +53,18 @@ data class VerifiedTarget(val userId: Int, val serial: Int?, val parentId: Int?)
 internal suspend fun CmdGateway.fetchVerifiedTarget(): VerifiedTarget? {
     val verboseRes = try {
         run(DualRepository.CMD_USER_LIST_VERBOSE)
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return null
     } catch (e: Exception) {
         if (e is kotlin.coroutines.cancellation.CancellationException) throw e
         return null
     }
     val dumpsysRes = try {
         run(DualRepository.CMD_DUMPSYS_USER)
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return null
     } catch (e: Exception) {
         if (e is kotlin.coroutines.cancellation.CancellationException) throw e
         return null
@@ -69,6 +75,9 @@ internal suspend fun CmdGateway.fetchVerifiedTarget(): VerifiedTarget? {
     if (!PmOutputParser.isIdentityChannelOk(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return null
     val propRes: CmdResult? = try {
         run(DualRepository.CMD_GETPROP_DUAL)
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return null
     } catch (e: Exception) {
         if (e is kotlin.coroutines.cancellation.CancellationException) throw e
         null
