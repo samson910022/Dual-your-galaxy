@@ -25,6 +25,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
@@ -719,10 +720,11 @@ class SuCancellableTest {
         }
     }
 
-    // H1 drain budget (P2 backpressure): 16 slots = 8 stuck captures. When
-    // exhausted, spawnDrain returns null and the capture still returns
-    // (never wedged) fail-closed with truncated=true via the READ_ERROR
-    // defaults; after release, normal drains recover (echo, truncated=false).
+    // H1 drain budget (P2 backpressure) + I1 pair reservation (5th-round P2):
+    // 16 slots = 8 stuck captures. Reserve→spawn→drain: a capture holds both
+    // slots BEFORE spawn, so when exhausted the command never starts (fast
+    // definite resource-exhausted, never-sent, no timeout wait); after release,
+    // normal drains recover (echo, truncated=false).
     @Test fun drainBudgetExhausted_failClosedWithoutWedging_thenRecovers() = runBlocking {
         // Base may be non-zero: earlier tests can park stuck drains on
         // child-held pipes (close does not unblock a native read held by a
@@ -739,14 +741,27 @@ class SuCancellableTest {
         try {
             assertEquals(MAX_ACTIVE_DRAINS, activeDrainCount.get())
             assertFalse("extra acquire must fail when budget exhausted", tryAcquireDrainSlot())
-            // One capture while exhausted: must still return, fail closed.
+            assertFalse("pair reserve must fail when budget exhausted", tryReserveDrainPair())
+            // One capture while exhausted: must still return fast, fail closed
+            // as definite resource-exhausted (I1: never spawned, no resend).
+            val startNs = System.nanoTime()
             val degraded = withTimeoutOrNull(10_000L) {
                 captureProcessCancellable(arrayOf("sh", "-c", "echo hi"), timeoutMs = 5_000L)
             }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
             assertTrue("exhausted capture must still return (not wedged)", degraded != null)
             val res = degraded!!
             assertTrue("exhausted capture must be truncated (fail closed), got: $res", res.truncated)
-            assertTrue("exhausted capture must keep exit 0 with marker (budget must not pollute exit), got: $res", res.exit == 0 && res.out.contains(TRUNCATION_MARKER))
+            // I1 definite: never-sent (exit 1, no flags, never timeout text).
+            assertEquals("exhausted capture must be definite exit 1, got: $res", 1, res.exit)
+            assertEquals("exhausted capture must carry empty out, got: $res", "", res.out)
+            assertTrue("exhausted err must name the drain budget, got: \"${res.err}\"", res.err.contains("resource exhausted") && res.err.contains("no drain slots"))
+            assertFalse("resource-exhausted must not carry timedOut (definite, never sent), got: $res", res.timedOut)
+            assertFalse("resource-exhausted must not carry transportUnknown (definite, never sent), got: $res", res.transportUnknown)
+            assertTrue(
+                "exhausted capture must be fast (elapsed=${elapsedMs}ms, not the 5 s timeout)",
+                elapsedMs < 2_000L,
+            )
             assertTrue(
                 "drain count must never exceed cap (count=${activeDrainCount.get()})",
                 activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
@@ -764,5 +779,126 @@ class SuCancellableTest {
         assertEquals("hi\n", ok.out)
         assertFalse("recovered capture must not be truncated, got: $ok", ok.truncated)
         assertEquals(base, activeDrainCount.get())
+    }
+
+    // I1-①: 16/16 full + large output (>64 KB pipe buffer) must fail fast
+    // WITHOUT spawning (execFn call count == 0 is the never-sent decisive
+    // proof). Without the pair reservation the child would block in pipe
+    // write() with no drains and drag to the 10 s timeout; with it the reply
+    // is definite resource-exhausted in << timeout with no flags (writes
+    // never resend, lists fail closed via exit != 0).
+    @Test fun drainPairFull_largeOutputFailsFastWithoutSpawn() = runBlocking {
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        val needed = MAX_ACTIVE_DRAINS - base
+        repeat(needed) { idx ->
+            assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+        }
+        try {
+            assertEquals(MAX_ACTIVE_DRAINS, activeDrainCount.get())
+            val execCalls = AtomicInteger(0)
+            val startNs = System.nanoTime()
+            val res = withTimeoutOrNull(15_000L) {
+                captureProcessCancellable(
+                    arrayOf("sh", "-c", "head -c 1048576 /dev/zero"),
+                    timeoutMs = 10_000L,
+                    execFn = { argv ->
+                        execCalls.incrementAndGet()
+                        Runtime.getRuntime().exec(argv)
+                    },
+                )
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("full-budget large-output capture must return (not wedged)", res != null)
+            val r = res!!
+            assertEquals("full-budget must be definite exit 1, got: $r", 1, r.exit)
+            assertEquals("full-budget must carry empty out, got: $r", "", r.out)
+            assertTrue("full-budget err must name the drain budget, got: \"${r.err}\"", r.err.contains("resource exhausted") && r.err.contains("no drain slots"))
+            assertTrue("full-budget must be truncated (fail closed), got: $r", r.truncated)
+            assertFalse("full-budget must not carry timedOut (definite, never sent), got: $r", r.timedOut)
+            assertFalse("full-budget must not carry transportUnknown (definite, never sent), got: $r", r.transportUnknown)
+            // Wire-text backstops must not hit: definite must not look like
+            // unknown-after-send.
+            assertFalse("resource-exhausted must not hit timeout backstop, got: \"${r.err}\"", r.err.startsWith("timeout after ") || r.err.startsWith("shizuku: exec timed out after "))
+            assertFalse("resource-exhausted must not hit post-spawn backstop, got: \"${r.err}\"", r.err.startsWith("interrupted: ") || r.err.startsWith("service exec failed: "))
+            assertEquals("full-budget must never spawn (never-sent), got calls=${execCalls.get()}", 0, execCalls.get())
+            assertTrue(
+                "full-budget large-output must fail fast (elapsed=${elapsedMs}ms, far below 10 s timeout)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+            println("I1 full-budget: elapsed=${elapsedMs}ms execCalls=${execCalls.get()} count=${activeDrainCount.get()}")
+        } finally {
+            repeat(needed) { releaseDrainSlot() }
+        }
+        assertEquals(base, activeDrainCount.get())
+    }
+
+    // I1-②: only 1 slot free (15/16 held) + large output must still fail fast
+    // without spawning -- proves the reservation is atomic-pair (count<=14),
+    // not single-slot.
+    @Test fun drainPairSingleSlot_largeOutputStillFailsFastWithoutSpawn() = runBlocking {
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        // Fill to exactly MAX-1 = 15 held, 1 free. If base already > 15 (stuck
+        // storm residue), no fill is needed -- the pair still cannot fit, so
+        // the same fast-definite verdict applies.
+        val target = MAX_ACTIVE_DRAINS - 1
+        val needed = target - base
+        if (needed > 0) {
+            repeat(needed) { idx ->
+                assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+            }
+        }
+        try {
+            val cur = activeDrainCount.get()
+            assertTrue("single-slot setup must hold >=15 (cur=$cur)", cur >= target)
+            assertTrue("single-slot setup must never exceed cap (cur=$cur)", cur <= MAX_ACTIVE_DRAINS)
+            assertFalse("pair reserve must fail with only 1 slot free (cur=$cur)", tryReserveDrainPair())
+            // tryReserveDrainPair failure must not leak: count unchanged.
+            assertEquals(cur, activeDrainCount.get())
+            val execCalls = AtomicInteger(0)
+            val startNs = System.nanoTime()
+            val res = withTimeoutOrNull(15_000L) {
+                captureProcessCancellable(
+                    arrayOf("sh", "-c", "head -c 1048576 /dev/zero"),
+                    timeoutMs = 10_000L,
+                    execFn = { argv ->
+                        execCalls.incrementAndGet()
+                        Runtime.getRuntime().exec(argv)
+                    },
+                )
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("single-slot large-output capture must return (not wedged)", res != null)
+            val r = res!!
+            assertEquals("single-slot must be definite exit 1, got: $r", 1, r.exit)
+            assertEquals("single-slot must carry empty out, got: $r", "", r.out)
+            assertTrue("single-slot err must name the drain budget, got: \"${r.err}\"", r.err.contains("resource exhausted") && r.err.contains("no drain slots"))
+            assertTrue("single-slot must be truncated (fail closed), got: $r", r.truncated)
+            assertFalse("single-slot must not carry timedOut, got: $r", r.timedOut)
+            assertFalse("single-slot must not carry transportUnknown, got: $r", r.transportUnknown)
+            assertFalse("resource-exhausted must not hit timeout backstop, got: \"${r.err}\"", r.err.startsWith("timeout after ") || r.err.startsWith("shizuku: exec timed out after "))
+            assertFalse("resource-exhausted must not hit post-spawn backstop, got: \"${r.err}\"", r.err.startsWith("interrupted: ") || r.err.startsWith("service exec failed: "))
+            assertEquals("single-slot must never spawn (non-pair never starts), got calls=${execCalls.get()}", 0, execCalls.get())
+            assertTrue(
+                "single-slot large-output must fail fast (elapsed=${elapsedMs}ms, far below 10 s timeout)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+            println("I1 single-slot: elapsed=${elapsedMs}ms execCalls=${execCalls.get()} count=${activeDrainCount.get()} curSetup=$cur")
+        } finally {
+            if (needed > 0) {
+                repeat(needed) { releaseDrainSlot() }
+            }
+        }
     }
 }

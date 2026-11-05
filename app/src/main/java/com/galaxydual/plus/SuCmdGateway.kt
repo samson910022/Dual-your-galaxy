@@ -80,11 +80,8 @@ internal const val MAX_CAPTURE_CHARS = 256_000
 // above. Cap concurrent drains at 16 (= 8 stuck captures): large enough that
 // legitimate bursts (select latest-wins overlap + timeout reclaim) never hit
 // it, small enough that a pathological child-holds-pipe storm cannot exhaust
-// threads/FDs. Exhaustion degrades list/verify fail-closed (spawnDrain
-// returns null, the capture still returns with truncated=true via the
-// READ_ERROR default, forcing a verify re-probe; install writes still report
-// isSuccess and are never claimed fail-closed here), never wedges the caller
-// and never resends pm.
+// threads/FDs. Exhaustion (I1): reserve fails → no spawn, fast definite exit 1
+// resource-exhausted; spawned children always hold both drains, never wedges caller nor resends pm.
 internal const val MAX_ACTIVE_DRAINS = 16
 internal val activeDrainCount = AtomicInteger(0)
 
@@ -105,6 +102,30 @@ internal fun tryAcquireDrainSlot(): Boolean {
 // manually by count, never via a drain thread).
 internal fun releaseDrainSlot() {
     activeDrainCount.updateAndGet { cur -> if (cur > 0) cur - 1 else 0 }
+}
+
+// Atomic pair reservation (I1, 5th-round P2 backpressure): reserve→spawn→drain
+// order. A capture needs 2 drain threads (stdout + stderr); reserving both in
+// ONE CAS before spawn guarantees a spawned child always has its drains.
+// Without this, a slots-full spawn with no drains leaves a large-output child
+// blocked in pipe write() while the client waits out the full 60 s timeout.
+// FD bound: concurrent captures are bounded by MAX_ACTIVE_DRAINS/2 (= 8).
+// Exhaustion degrades fast (definite resource-exhausted, no timeout wait) and
+// never resends: the process never started, so the reply is pre-dispatch
+// definite (same bucket as "spawn failed: ...").
+internal fun tryReserveDrainPair(): Boolean {
+    while (true) {
+        val cur = activeDrainCount.get()
+        if (cur > MAX_ACTIVE_DRAINS - 2) return false
+        if (activeDrainCount.compareAndSet(cur, cur + 2)) return true
+    }
+}
+
+// Release a pair reservation (exec failed before any drain started, or
+// defensive release of the unconsumed remainder when stream/drain setup
+// throws post-spawn). Clamps at zero like releaseDrainSlot above.
+internal fun releaseDrainPair() {
+    activeDrainCount.updateAndGet { cur -> if (cur >= 2) cur - 2 else 0 }
 }
 
 // Single construction point for drain threads: budget first, thread second.
@@ -138,6 +159,27 @@ internal fun spawnDrain(
     }
 }
 
+// Reserved-slot drain start (I1): consumes ONE previously reserved pair slot.
+// No acquire here -- the caller already holds 2 via tryReserveDrainPair, so
+// this never returns null (exhaustion was decided before spawn). The thread
+// still releases its slot in finally. Construction throw (theoretically
+// unreachable, reservation held) propagates WITHOUT an internal release --
+// the caller defensively releases the unconsumed remainder (2 - started).
+internal fun spawnDrainReserved(
+    name: String,
+    status: AtomicReference<DrainStatus>,
+    stream: java.io.InputStream,
+    sink: StringBuilder,
+): Thread {
+    return thread(isDaemon = true, name = name) {
+        try {
+            status.set(drainCapped(stream, sink))
+        } finally {
+            releaseDrainSlot()
+        }
+    }
+}
+
 // Builds the argv for `su -c <cmd>` with cmd verbatim as ONE argument.
 // Pure function (no I/O): covered by JVM unit tests (GatewayAssemblyTest).
 // Uses argv form (not "su -c $cmd" through /bin/sh) so metacharacters in an
@@ -155,12 +197,25 @@ fun suArgv(cmd: String): Array<String> = arrayOf("su", "-c", cmd)
 // run the cancellable suspend variant. The SuCmdGateway client path uses
 // captureProcessCancellable below (same contract, cancellable waits).
 internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEOUT_MS): CmdResult {
+    // I1 reserve→spawn→drain: atomically hold both drain slots BEFORE spawn so
+    // a spawned child can never wait for a drain that will never start (large
+    // output would otherwise block in pipe write() to the 60 s timeout). FD
+    // bound: concurrent captures ≤ MAX_ACTIVE_DRAINS/2. Fast degrade: return
+    // at once without waiting when no pair is available.
+    if (!tryReserveDrainPair()) {
+        return CmdResult(exit = 1, out = "", err = "resource exhausted: no drain slots (active=${activeDrainCount.get()}/$MAX_ACTIVE_DRAINS)", truncated = true)
+    }
     val proc = try {
         Runtime.getRuntime().exec(argv)
     } catch (e: Exception) {
         // Covers missing su ("No such file or directory"), SecurityException,
         // and any other spawn failure: explicit error, exit != 0, no throw.
+        // Reservation was never consumed (process never started) -- release it.
+        releaseDrainPair()
         return CmdResult(exit = 1, out = "", err = "spawn failed: ${(e.message ?: e.javaClass.simpleName)}")
+    } catch (t: Throwable) {
+        releaseDrainPair()
+        throw t
     }
     // Drain both pipes on daemon threads: reading stdout to EOF while stderr
     // sits unfilled can deadlock once the stderr pipe buffer fills.
@@ -179,17 +234,48 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     // Error without setting a status must not look like clean EOF).
     val outStatus = AtomicReference(DrainStatus.READ_ERROR)
     val errStatus = AtomicReference(DrainStatus.READ_ERROR)
-    // H1: budget-gated drains (null = exhausted, list/verify fail closed via
-    // the READ_ERROR defaults above -- truncated forces a verify re-probe;
-    // install writes still report isSuccess, never claimed fail-closed here.
-    // joinExpired below treats null as not-started, and buildResult marks
-    // truncated via the defaults). Blocking form deliberately carries no
-    // best-effort interrupt (binder-thread caller: pipe read() wake-up on
-    // interrupt is not guaranteed and the thread has no coroutine scope, so
-    // interrupt is intentionally left to the cancellable variant below; the
-    // drain budget cap is the guarantee on both paths).
-    val drainOut = spawnDrain("capture-stdout", outStatus, proc.inputStream, out)
-    val drainErr = spawnDrain("capture-stderr", errStatus, proc.errorStream, err)
+    // H1: budget-gated drains (I1: pair already reserved above, so consume the
+    // reservation here -- no re-acquire, never null; the threads still release
+    // in finally). Blocking form deliberately carries no best-effort
+    // interrupt (binder-thread caller: pipe read() wake-up on interrupt is not
+    // guaranteed and the thread has no coroutine scope, so interrupt is
+    // intentionally left to the cancellable variant below; the drain budget
+    // cap is the guarantee on both paths).
+    // Defensive: spawnDrainReserved construction throw is theoretically
+    // unreachable (slots held), but the unconsumed remainder is released and
+    // the already-spawned process maps to post-spawn unknown below -- never
+    // resource-exhausted (already sent cannot be pre-dispatch).
+    val drainOut: Thread
+    val drainErr: Thread
+    var startedReserved = 0
+    try {
+        val inReserved = proc.inputStream
+        val errReserved = proc.errorStream
+        drainOut = spawnDrainReserved("capture-stdout", outStatus, inReserved, out).also { startedReserved++ }
+        drainErr = spawnDrainReserved("capture-stderr", errStatus, errReserved, err).also { startedReserved++ }
+    } catch (t: Throwable) {
+        repeat(2 - startedReserved) { releaseDrainSlot() }
+        if (t is Exception) {
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
+            try {
+                proc.inputStream.close()
+            } catch (_: Exception) {
+            }
+            try {
+                proc.errorStream.close()
+            } catch (_: Exception) {
+            }
+            return CmdResult(exit = 1, out = capped(out, true), err = "su failed post-spawn: ${(t.message ?: t.javaClass.simpleName)}", truncated = true, transportUnknown = true)
+        }
+        try {
+            proc.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        throw t
+    }
     val exited = try {
         proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
     } catch (e: InterruptedException) {
@@ -211,8 +297,8 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     if (!exited) {
         proc.destroyForcibly()
         try {
-            drainOut?.join(2_000)
-            drainErr?.join(2_000)
+            drainOut.join(2_000)
+            drainErr.join(2_000)
         } catch (e: InterruptedException) {
             // Post-spawn unknown (Phase A1): the timeout already abandoned
             // the wait (timedOut=true below covers it), but the drain-join
@@ -230,8 +316,8 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
     }
     try {
-        drainOut?.join(5_000)
-        drainErr?.join(5_000)
+        drainOut.join(5_000)
+        drainErr.join(5_000)
     } catch (e: InterruptedException) {
         // Post-spawn unknown (Phase A1): spawn succeeded and the steady
         // drain was interrupted -- the remote pm may have executed while
@@ -246,10 +332,9 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
     // is the expiry signal. A still-alive drain means the capture may be
     // incomplete even when nothing hit the cap -- fail closed via truncated.
-    // H1: null drain (budget-exhausted, never started) is NOT join expiry,
-    // but its side already carries the READ_ERROR default, so buildResult
-    // still marks truncated via the status OR below.
-    val joinExpired = drainOut?.isAlive == true || drainErr?.isAlive == true
+    // I1: drains always started here (pair reserved pre-spawn), so no null
+    // case remains; READ_ERROR defaults still fail closed via buildResult.
+    val joinExpired = drainOut.isAlive || drainErr.isAlive
     return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
 }
 
@@ -370,11 +455,28 @@ internal suspend fun captureProcessCancellable(
     execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
 ): CmdResult {
     currentCoroutineContext().ensureActive()
+    // I1 reserve→spawn→drain: atomically hold both drain slots BEFORE spawn so
+    // a spawned child can never wait for a drain that will never start (large
+    // output would otherwise block in pipe write() to the full timeout). FD
+    // bound: concurrent captures ≤ MAX_ACTIVE_DRAINS/2. Fast degrade: return
+    // at once without spawning when no pair is available. Definite: process
+    // never started (same bucket as "spawn failed: ..."); the prefix avoids
+    // isServiceTimeoutText/isPostSpawnTransportText so list exit!=0 stays
+    // fail-closed and writes never resend (never-sent).
+    if (!tryReserveDrainPair()) {
+        return CmdResult(exit = 1, out = "", err = "resource exhausted: no drain slots (active=${activeDrainCount.get()}/$MAX_ACTIVE_DRAINS)", truncated = true)
+    }
     val proc = try {
         execFn(argv)
+    } catch (e: CancellationException) {
+        releaseDrainPair()
+        throw e
     } catch (e: Exception) {
-        if (e is CancellationException) throw e
+        releaseDrainPair()
         return CmdResult(exit = 1, out = "", err = "spawn failed: ${(e.message ?: e.javaClass.simpleName)}")
+    } catch (t: Throwable) {
+        releaseDrainPair()
+        throw t
     }
     // Post-spawn section (Phase G1): proc is live from here on. Any
     // non-CE/non-IE exception escaping the waits below (e.g. a rogue
@@ -402,12 +504,31 @@ internal suspend fun captureProcessCancellable(
         // Materializing here routes a getter throw to the outer post-spawn
         // generic below (transportUnknown), which is the correct
         // unknown-after-send bucket.
-        val inS = proc.inputStream.also { openIn = it }
-        val errS = proc.errorStream.also { openErr = it }
-        // H1: budget-gated drains (null = exhausted, fail closed via the
-        // READ_ERROR defaults; stream materialization stays first as before).
-        val drainOut = spawnDrain("capture-stdout", outStatus, inS, out).also { openDrainOut = it }
-        val drainErr = spawnDrain("capture-stderr", errStatus, errS, err).also { openDrainErr = it }
+        // I1: consume the pair reservation (no re-acquire, never null; the
+        // threads still release in finally). Construction throw is
+        // theoretically unreachable (slots held): defensively release the
+        // unconsumed remainder and rethrow so the outer post-spawn guards map
+        // it to transportUnknown -- never resource-exhausted (already sent
+        // cannot be pre-dispatch).
+        var startedReserved = 0
+        val inS: java.io.InputStream
+        val errS: java.io.InputStream
+        val drainOut: Thread
+        val drainErr: Thread
+        try {
+            inS = proc.inputStream.also { openIn = it }
+            errS = proc.errorStream.also { openErr = it }
+            drainOut = spawnDrainReserved("capture-stdout", outStatus, inS, out).also { openDrainOut = it; startedReserved++ }
+            drainErr = spawnDrainReserved("capture-stderr", errStatus, errS, err).also { openDrainErr = it; startedReserved++ }
+        } catch (t: Throwable) {
+            repeat(2 - startedReserved) { releaseDrainSlot() }
+            if (t is Exception) throw t
+            try {
+                proc.destroyForcibly()
+            } catch (_: Throwable) {
+            }
+            throw t
+        }
         val exited = try {
             cancellableAwaitExit(proc, timeoutMs, monoMs)
         } catch (e: CancellationException) {
@@ -437,14 +558,13 @@ internal suspend fun captureProcessCancellable(
             // H1 best-effort interrupt after close, before the bounded join:
             // a plain pipe read() on Linux is NOT guaranteed to wake on
             // interrupt, so this is never relied on -- the drain budget cap
-            // is the guarantee. Harmless when the drain already exited or
-            // never started (null). close() stays synchronous (~ms).
+            // is the guarantee. close() stays synchronous (~ms).
             try {
-                drainOut?.interrupt()
+                drainOut.interrupt()
             } catch (_: Exception) {
             }
             try {
-                drainErr?.interrupt()
+                drainErr.interrupt()
             } catch (_: Exception) {
             }
             try {
@@ -478,13 +598,13 @@ internal suspend fun captureProcessCancellable(
             } catch (_: Exception) {
             }
             // H1 best-effort interrupt (same non-guarantee as above; cap is
-            // the guarantee; null-safe when budget-exhausted).
+            // the guarantee).
             try {
-                drainOut?.interrupt()
+                drainOut.interrupt()
             } catch (_: Exception) {
             }
             try {
-                drainErr?.interrupt()
+                drainErr.interrupt()
             } catch (_: Exception) {
             }
             try {
@@ -521,11 +641,11 @@ internal suspend fun captureProcessCancellable(
             }
             // H1 best-effort interrupt (same non-guarantee; cap is guarantee).
             try {
-                drainOut?.interrupt()
+                drainOut.interrupt()
             } catch (_: Exception) {
             }
             try {
-                drainErr?.interrupt()
+                drainErr.interrupt()
             } catch (_: Exception) {
             }
             try {
@@ -580,7 +700,7 @@ internal suspend fun captureProcessCancellable(
             }
             return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
         }
-        val joinExpired = drainOut?.isAlive == true || drainErr?.isAlive == true
+        val joinExpired = drainOut.isAlive || drainErr.isAlive
         if (joinExpired) {
             // P2-1: steady joins expired but a surviving child may still hold
             // the pipe FDs; close so lingering drains die async via
