@@ -33,7 +33,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 - [已支援] profile 解析安全邊界（`resolveDualUserId`：只認唯一 DUAL、永不選 user 0、多 DUAL／無 DUAL 直接拒絕寫入，見 `DualSafetyTest`）。
 - [已支援] `pm` 命令封裝（`DualRepository.cloneVerified / removeVerified / refresh`：單快照釘選＋`pm path` 二次確認，見 `CloneVerifyRefreshTest`）。
 - [已支援] lint／CI 閘門（`./gradlew` 固定 8.7、fail-fast quality gates、DEX 檢查）。
-- [部分已驗證] App 內一鍵 clone 真通道（S24 已接線＋實機抽驗 DEVICE-PARTIAL：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`；`DualViewModel.selectChannel/clone/refresh`；ROOT 通道 App 內一鍵 [S24 已驗證]：切 ROOT→`cloned: com.openai.chatgpt`＋`Cloned (35)`，走真 `SuCmdGateway`＋verify；`pm uninstall --user 95` 回滾 [S24 已驗證]＋`su -c install-existing` 重裝 [S24 已驗證]；選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；Shizuku 四情境、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]）。
+- [部分已驗證] App 內一鍵 clone 真通道（S24 已接線＋實機抽驗 DEVICE-PARTIAL：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`；`DualViewModel.selectChannel/clone/refresh`；ROOT 通道 App 內一鍵 [S24 已驗證]：切 ROOT→`cloned: com.openai.chatgpt`＋`Cloned (35)`，走真 `SuCmdGateway`＋verify；`pm uninstall --user 95` 回滾 [S24 已驗證]＋`su -c install-existing` 重裝 [S24 已驗證]；選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]）。
 - [待實作] 非空 whitelist policy（`EXTRA_WHITELIST_PACKAGES` 預設為空，hook 為 observe-only；接上政策來源前不放寬任何包名）。
 - [部分已驗證] 雙開實機：`pm install-existing --user 95 com.openai.chatgpt`＋list 二次確認 [S24 已驗證]（shell 通道，兩次獨立成功）；App ROOT 一鍵 `cloned:` [S24 已驗證]；`pm uninstall --user 95` 回滾＋`su -c` 重裝 [S24 已驗證]；`pm path` 主驗證、App 內 Shizuku 通道仍 [待實機驗證]。
 
@@ -87,7 +87,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## 免責聲明 (Disclaimer)
 
 - 本專案不碰 Secure Folder / Knox：不讀寫、不掛載、不繞過 Knox 容器；任何 Knox 熔斷規避皆明確不在範圍內。
-- 寫入設計上需 ROOT 或 Shizuku 環境，且需所選真通道探測通過（`channelReady` true）＋privilege 非 NONE（`isWritable()` fail-closed；LSPosed 模式為 NoOp 佔位、寫入一律拒絕）；ROOT 通道 App 一鍵／裸 pm／`su -c`／uninstall 回滾已在 S24 驗證；Shizuku 通道、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示仍 [待實機驗證]；操作系統服務本來就有風險（請先備份），後果自負。
+- 寫入設計上需 ROOT 或 Shizuku 環境，且需所選真通道探測通過（`channelReady` true）＋privilege 非 NONE（`isWritable()` fail-closed；LSPosed 模式為 NoOp 佔位、寫入一律拒絕）；ROOT 通道 App 一鍵／裸 pm／`su -c`／uninstall 回滾、SHIZUKU 通道 App 一鍵（已授權 binder）已在 S24 驗證；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示仍 [待實機驗證]；操作系統服務本來就有風險（請先備份），後果自負。
 - 僅供學習研究與個人裝置使用；請遵守當地法規與三星服務條款。
 
 ## Credits

@@ -11,7 +11,7 @@
 
 - [已支援] profile 解析安全邊界（只認唯一 DUAL、永不選 user 0）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋F4b-P1 picker＋P2 marker，S24 抽驗：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`；`DualViewModel.selectChannel/clone/refresh`；ROOT 通道 App 內一鍵 [S24 已驗證]：切 ROOT→`cloned: com.openai.chatgpt`；真 gateway `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；`pm uninstall --user 95` 回滾＋`su -c` 重裝 [S24 已驗證]；`path` 主驗證、Shizuku 四情境、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]）。
+- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋F4b-P1 picker＋P2 marker，S24 抽驗：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`；`DualViewModel.selectChannel/clone/refresh`；ROOT 通道 App 內一鍵 [S24 已驗證]：切 ROOT→`cloned: com.openai.chatgpt`；真 gateway `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；`pm uninstall --user 95` 回滾＋`su -c` 重裝 [S24 已驗證]；SHIZUKU 通道 App 一鍵 [S24 已驗證]（已授權 binder 下切 SHIZUKU→就緒→CLONE 成功）；`path` 主驗證、Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
 - [待實機驗證] LSPosed 載入、Shizuku 四情境（有／無 binder × 有／無授權，含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端；其中
@@ -65,6 +65,14 @@ Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕�
 
 > 每次重開機後需重複步驟 4（Shizuku 需重新啟動）；配對碼只需配對過一次，
 > 同一 Wi-Fi 下重啟一般直接按「啟動」即可。
+>
+> 已 root 裝置可用 Shizuku 自帶 so 直接啟動（無需配對流程，S24 已用此法）：
+>
+> ```bash
+> adb shell /data/app/~~-jo681V4qGxj5nbJO4ijNA==/moe.shizuku.privileged.api-MyY9Gq9kawonTnGEcFOYdw==/lib/arm64/libshizuku.so
+> ```
+>
+> 注意 `~~...` 中間路徑每次安裝隨機，實際以 `pm path moe.shizuku.privileged.api` 輸出為準。
 
 舊裝置（Android 10 以下無無線調試）改用 USB：
 
