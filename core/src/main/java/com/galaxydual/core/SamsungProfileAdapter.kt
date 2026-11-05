@@ -43,14 +43,18 @@ object SamsungProfileAdapter {
     // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
     private val CLONE_MARKER = Regex("(?<![A-Za-z0-9])profile[^A-Za-z0-9]{0,3}clone(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
 
-    // Standalone `profile.X` token extractor (dot form, case-insensitive).
+    // Standalone `profile.X` token extractor (separator-tolerant,
+    // case-insensitive). Matches dot form (`profile.CLONE`) or 1-3
+    // non-alphanumeric separators plus a name (`profile_CLONE`,
+    // `profile-CLONE`, `profile CLONE`). Zero-separator glued forms
+    // (`profileCloneable`) yield no token by construction.
     // Used for token-level type uniqueness (P1-1): each type mention's
     // `profile.X` tokens are deduped case-insensitively, then a CLONE-family
     // token (`CLONE_MARKER` matches the token) counts as clone evidence and
     // any other `profile.X` token counts as other evidence. Kept
     // boundary-free by spec; callers ignore matches glued to a preceding
     // ASCII letter/digit (`myprofile.CLONE`) so they fall back to OTHER.
-    private val PROFILE_TOKEN = Regex("profile\\.[A-Za-z0-9_]+", RegexOption.IGNORE_CASE)
+    private val PROFILE_TOKEN = Regex("profile(?:\\.[A-Za-z0-9_]+|[^A-Za-z0-9]{1,3}[A-Za-z0-9_]+)", RegexOption.IGNORE_CASE)
 
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
@@ -176,7 +180,7 @@ object SamsungProfileAdapter {
     //   CLONE_MARKER counts as clone evidence; any other `profile.X` token
     //   counts as other evidence. Non-token text is ignored once tokens
     //   exist. `profile.MANAGED`/`profile.SYSTEM` are other tokens;
-    //   `profileCloneable` (no dot) yields no token and never matches
+    //   `profileCloneable` (no separator) yields no token and never matches
     //   CLONE_MARKER's boundaries.
     // - Same mention holding both clone and other tokens is an intra-mention
     //   contradiction -> UNKNOWN for the block (covers whitespace, `/`,

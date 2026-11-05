@@ -529,6 +529,34 @@ class ProfileIdentityTest {
         assertEquals(ProfileUserType.OTHER, parsed[0].userType)
     }
 
+    @Test
+    fun underscoreSeparatedCloneSingletonYieldsClone() {
+        // Phase A regression: `profile_CLONE` single token must be CLONE
+        // (separator-tolerant PROFILE_TOKEN + CLONE_MARKER).
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: profile_CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+    }
+
+    @Test
+    fun mixedDotAndUnderscoreSeparatorsIsUnknown() {
+        // Cross-separator contradiction: `profile.MANAGED` + `profile_CLONE`
+        // in one mention -> UNKNOWN (never CLONE-by-priority).
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: profile.MANAGED profile_CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+    }
+
     // ---- Phase A P1-1: dual-CLONE tightening (issue #21 owner finding) ----
     // Two-channel Confirmed requires the SAME id to be typed CLONE on BOTH
     // USER_LIST_V and DUMPSYS. CLONE on one channel plus UNKNOWN on the

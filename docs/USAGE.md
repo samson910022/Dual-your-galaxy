@@ -100,7 +100,7 @@ App 內 `DualRepository`／雙 Elevator 探測即執行此契約（命令字串�
 explicit id 即使存在於 `pm list users`，只要不是當下 Confirmed 目標一律
 fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 `verifyState` 回 `Unknown`、`verify` Boolean 回 `false`（已 `@Deprecated`）、
-`listClonedPackages` 回 `null`，不探測不寫入。
+`listClonedPackages` 回 `null`，不探測目標、不寫入（仍做 snapshot＋identity fetch 唯讀）。
 `pm list users` 的名稱僅供顯示，永不進入授權判定；user 0 永遠不可作為寫入目標。
 此次 S24 的 95 為 Dual、150 為 Secure Folder，這不是其他機型的固定對照。
 執行前核對 serial/parent（ID 重用防護，Phase D）：auto 路徑攜帶 resolve 時 identity
@@ -111,7 +111,7 @@ closed，不計成功）；explicit-ID 入口僅做 fresh 自洽檢查（expecte
 TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）。serial 單邊缺失則
 放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒；跨 fetch 已知→未知亦拒
 （continuity lost，與實作一致）。
-pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＝12 命令（probe 最多 2 次 retry 另計）。
+pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＝12 命令（probe 最多 2 次 retry 另計）；寫前 fresh-vs-before 重核僅縮小 before-to-write 重用窗口，仍殘餘 fresh-to-write 微窗口（fail closed，與 DualRepository KDoc 一致）。
 列表刷新（`refreshVerified()`，Phase D P2-D）為單一 target：一次 `pm list users`（1）
 ＋一次 verified-target fetch（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
 ＋一次 `pm list packages --user <dualId>`（1）＝5 命令（舊 resolve-then-reverify
