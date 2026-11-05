@@ -73,6 +73,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
@@ -112,6 +113,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var saveSelBtn: Button
     private lateinit var cancelSaveBtn: Button
     private lateinit var sourceContainer: LinearLayout
+    private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
     private lateinit var batchResultView: TextView
     private lateinit var permBtn: Button
@@ -163,6 +165,15 @@ class MainActivity : ComponentActivity() {
     // (點診斷行切換展開/收合，需重渲染同一狀態)。
     private var diagExpanded: Boolean = false
     private var lastState: UiState? = null
+
+    // PR-37 P3 差量渲染：上次全量重建來源列表的指紋
+    // (catalog 引用+內容 hash+query+includeSystem+selectedKeys hash)。
+    // loading/msg/diagnose/batchReport 變化只更新對應文字區，不重建列表。
+    private var lastSourceListKey: String? = null
+    // catalog 載入失敗的獨立錯誤文案（與「尚未載入」區分；失敗保留舊列表）。
+    private var catalogLoadError: String? = null
+    // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 取消前一個在途任務。
+    private var catalogJob: Job? = null
 
     // Binder attach (sticky: fires immediately when already connected).
     // The channel may be usable now: re-probe privilege, then reload lists.
@@ -248,6 +259,12 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         exportDialog = null
+        try {
+            catalogJob?.cancel()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        catalogJob = null
         try {
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
@@ -416,6 +433,15 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
+            // 旋轉回填：ViewModel retained 保留 sourceQuery，Activity 重建時先回填
+            // 舊 query 再掛 TextWatcher，避免 setText 觸發 afterTextChanged 迴圈。
+            setText(vm.state.value.sourceQuery)
+            // 游標置尾，方便繼續編輯。
+            try {
+                setSelection(text?.length ?: 0)
+            } catch (_: Exception) {
+                // Best effort.
+            }
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
@@ -426,10 +452,15 @@ class MainActivity : ComponentActivity() {
         }
         systemToggleBtn = Button(this).apply {
             text = "系統應用：已隱藏"
+            // TalkBack：只切換顯示範圍，不卸載任何分身。
+            contentDescription = "切換是否顯示系統應用（只切換顯示，不卸載任何分身）"
             setOnClickListener { vm.setIncludeSystemApps(!vm.state.value.includeSystemApps) }
         }
         selectAllBtn = Button(this).apply {
             text = "全選可見"
+            // TalkBack：只勾選目前可見前 N 筆（與渲染同一截斷，見 currentVisibleKeys），
+            // 不寫入分身；超出請用搜尋縮小範圍。
+            contentDescription = "全選目前可見前 $MAX_SOURCE_ROWS 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）"
             setOnClickListener { vm.selectVisible(currentVisibleKeys()) }
         }
         clearSelBtn = Button(this).apply {
@@ -453,8 +484,13 @@ class MainActivity : ComponentActivity() {
         sourceContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
+        catalogErrorView = TextView(this).apply {
+            visibility = View.GONE
+        }
         batchBtn = Button(this).apply {
             text = "建立 0 個分身"
+            // TalkBack：批次對已勾選逐項執行建立；勾選本身≠卸載，取消勾選≠卸載。
+            contentDescription = "批次建立 0 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
             setOnClickListener { vm.cloneSelected() }
         }
         batchResultView = TextView(this)
@@ -514,6 +550,7 @@ class MainActivity : ComponentActivity() {
         root.addView(catalogRow1)
         root.addView(catalogRow2)
         root.addView(sourceContainer)
+        root.addView(catalogErrorView)
         root.addView(batchBtn)
         root.addView(batchResultView)
         root.addView(pkgInput)
@@ -722,6 +759,8 @@ class MainActivity : ComponentActivity() {
         // the read-only placeholder visibly read-only. Channel switches go
         // through the same mutex (selectChannel latest-wins), so the picker
         // is gated too.
+        // PR-37 P3 按鈕狀態：busy 時勾選相關一律禁用（批次執行中不可改勾選）；
+        // batch 需非 busy 且有勾選；保存需已知目標 (targetId > 0)。
         val busy = s.loading
         cloneBtn.isEnabled = !busy
         removeBtn.isEnabled = !busy
@@ -736,9 +775,15 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: render may run before buildUi in tests.
         }
+        systemToggleBtn.isEnabled = !busy
+        selectAllBtn.isEnabled = !busy
+        clearSelBtn.isEnabled = !busy
+        saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
+        cancelSaveBtn.isEnabled = !busy
+        batchBtn.isEnabled = !busy && s.selectedKeys.isNotEmpty()
         // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
+        // PR-37 P3 差量：列表只在指紋變化時全量重建；其餘文字區各自更新。
         renderSourceList(s)
-        batchBtn.isEnabled = !busy
         msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
@@ -844,16 +889,43 @@ class MainActivity : ComponentActivity() {
     // 包到 MainActivity 的生命週期:IO 執行緒讀 PackageManager,回主執行緒注入
     // ViewModel。serial 取自身 user (UserManager,失敗回退 0);AppKey =
     // serial:package (見 SourceInventory)。
+    // PR-37 P3:失敗不清空（保留舊列表，不呼叫 setSourceCatalog），錯誤走獨立
+    // 文案 catalogLoadError（與「尚未載入」區分）；onCreate+onResume 雙觸發以
+    // catalogJob 取消前一個在途任務，避免疊加。
     private fun reloadCatalog() {
-        lifecycleScope.launch {
-            val apps = withContext(Dispatchers.IO) {
+        catalogJob?.cancel()
+        catalogJob = lifecycleScope.launch {
+            val apps: List<SourceAppEntry>? = withContext(Dispatchers.IO) {
                 try {
                     loadSourceApps(packageManager, selfSerial())
                 } catch (_: Exception) {
-                    emptyList()
+                    null
                 }
             }
+            if (apps == null) {
+                catalogLoadError = "來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）"
+                updateCatalogErrorView()
+                return@launch
+            }
+            catalogLoadError = null
+            updateCatalogErrorView()
             vm.setSourceCatalog(apps)
+        }
+    }
+
+    private fun updateCatalogErrorView() {
+        try {
+            if (!::catalogErrorView.isInitialized) return
+            val err = catalogLoadError
+            if (err.isNullOrEmpty()) {
+                catalogErrorView.visibility = View.GONE
+                catalogErrorView.text = ""
+            } else {
+                catalogErrorView.visibility = View.VISIBLE
+                catalogErrorView.text = err
+            }
+        } catch (_: Exception) {
+            // Best effort: view may not be ready in tests.
         }
     }
 
@@ -864,20 +936,42 @@ class MainActivity : ComponentActivity() {
         0
     }
 
-    // 目前可見列的 AppKey (全選可見用);與渲染同一過濾/排序,保證一致。
+    // 目前可見列的 AppKey (全選可見用);與渲染同一過濾/排序/截斷,保證一致。
+    // PR-37 P3:同樣 .take(MAX_SOURCE_ROWS)，「全選可見」只選可見前 N 筆；
+    // 超出請用搜尋縮小範圍（截斷提示見 renderSourceList）。
     private fun currentVisibleKeys(): Set<String> {
         val s = vm.state.value
         return sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
+            .take(MAX_SOURCE_ROWS)
             .map { it.appKey }.toSet()
     }
 
     // PR-7 P2 (#26):catalog 區渲染。清單為唯讀展示 + CheckBox 勾選；
     // 取消勾選 ≠ 卸載 (listener 只調 toggleSelection,零裝置呼叫)。
     // 圖示非同步載入並以 appKey 快取 (顯示用,不參與身分鍵)。
+    // PR-37 P3 差量更新：列表全量重建只在指紋變化時執行
+    // (catalog 引用+內容+query+includeSystem+selectedKeys)；
+    // loading/msg/diagnose/batchReport 變化只更新對應文字區，不重建列表。
+    // 按鈕文字/勾選啟用狀態每輪都更新（busy 時勾選區不可改，見 render）。
     private fun renderSourceList(s: UiState) {
         val visible = sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
+        val busy = s.loading
         systemToggleBtn.text = if (s.includeSystemApps) "系統應用：顯示中" else "系統應用：已隱藏"
         batchBtn.text = "建立 ${s.selectedKeys.size} 個分身"
+        batchBtn.contentDescription =
+            "批次建立 ${s.selectedKeys.size} 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
+        updateCatalogErrorView()
+        batchResultView.text = batchReportText(s.batchReport)
+        val key = buildSourceListKey(s)
+        if (key == lastSourceListKey) {
+            // 指紋未變：不重建列表，只同步勾選區啟用狀態（busy 切換時）。
+            for (i in 0 until sourceContainer.childCount) {
+                val child = sourceContainer.getChildAt(i)
+                if (child is CheckBox) child.isEnabled = !busy
+            }
+            return
+        }
+        lastSourceListKey = key
         sourceContainer.removeAllViews()
         if (s.sourceCatalog.isEmpty()) {
             sourceContainer.addView(TextView(this).apply { text = "應用清單：尚未載入" })
@@ -890,6 +984,8 @@ class MainActivity : ComponentActivity() {
                     text = "${entry.label}\n${entry.packageName}"
                     tag = entry.appKey
                     isChecked = entry.appKey in s.selectedKeys
+                    // 批次執行中不可改勾選。
+                    isEnabled = !busy
                 }
                 requestIcon(entry.packageName, entry.appKey, box)
                 box.setOnCheckedChangeListener { _, checked ->
@@ -900,20 +996,33 @@ class MainActivity : ComponentActivity() {
             if (visible.size > MAX_SOURCE_ROWS) {
                 sourceContainer.addView(
                     TextView(this).apply {
-                        text = "…等共 ${visible.size} 筆，僅顯示前 $MAX_SOURCE_ROWS 筆（請用搜尋縮小範圍）"
+                        // 全選可見同樣只取前 N 筆（見 currentVisibleKeys），此處列明契約。
+                        text = "…等共 ${visible.size} 筆，僅顯示前 $MAX_SOURCE_ROWS 筆，" +
+                            "全選可見只選前 $MAX_SOURCE_ROWS 筆（請用搜尋縮小範圍）"
                     },
                 )
             }
         }
-        batchResultView.text = batchReportText(s.batchReport)
     }
+
+    // 來源列表指紋：catalog 引用+內容 hash、query、系統開關、勾選集合 hash。
+    private fun buildSourceListKey(s: UiState): String =
+        "${System.identityHashCode(s.sourceCatalog)}:${s.sourceCatalog.hashCode()}:" +
+            "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
 
     // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
     // memo 記「已嘗試」避免重打 PackageManager；drawables 有界快取。
+    // PR-37 P3:共用 Drawable 取用時經 constantState 新實例 + mutate()，
+    // 避免多個舊 View 共用同一 Drawable 回呼；memo 快取機制不變。
     private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
         val cached = iconDrawables[appKey]
         if (cached != null) {
-            box.setCompoundDrawablesWithIntrinsicBounds(cached, null, null, null)
+            val fresh = try {
+                cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
+            } catch (_: Exception) {
+                cached
+            }
+            box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
             return
         }
         if (iconMemo.isLoaded(appKey)) return
@@ -932,7 +1041,12 @@ class MainActivity : ComponentActivity() {
             }
             iconDrawables[appKey] = drawable
             if (box.tag == appKey) {
-                box.setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+                val fresh = try {
+                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
+                } catch (_: Exception) {
+                    drawable
+                }
+                box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
             }
         }
     }
