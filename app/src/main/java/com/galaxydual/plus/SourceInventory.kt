@@ -91,13 +91,14 @@ class SourceIconState {
 // - Secure Folder / Knox 容器屬於其他 user,一律不在此列表內。
 // - API 30+ 完整列表需 QUERY_ALL_PACKAGES (見 manifest 註解);若系統過濾,
 //   回傳即為授權可見子集,不偽造、不補全。
-// 穩健性:逐項 try/catch,單項失敗跳過,整體永不拋出 (空列表=未知/無,不謊稱)。
-fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry> {
+// 穩健性:逐項 try/catch,單項失敗跳過;整體載入失敗回傳 null (呼叫方保留舊列表),
+// 空列表=裝置確實無應用 (合法寫入)。除整體失敗回 null 外永不拋出。
+fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry>? {
     val installed: List<ApplicationInfo> = try {
         @Suppress("DEPRECATION")
         pm.getInstalledApplications(0)
     } catch (_: Exception) {
-        return emptyList()
+        return null
     }
     val out = ArrayList<SourceAppEntry>(installed.size)
     for (info in installed) {
