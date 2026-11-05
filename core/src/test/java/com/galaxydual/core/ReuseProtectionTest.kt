@@ -31,6 +31,7 @@ class ReuseProtectionTest {
     private class FlipGateway(
         var listUsersOutput: String = DEFAULT_USERS,
         var propOutput: String = DEFAULT_PROP,
+        var propOutputs: MutableList<String>? = null,
         var listPackagesOutput: String = "package:com.example.chat",
         var listPackagesExit: Int = 0,
         var verboseSerials: MutableList<Int?> = mutableListOf(15),
@@ -40,6 +41,7 @@ class ReuseProtectionTest {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
         private var fetchIndex = 0
+        private var propFetchIndex = 0
         private var drifted = false
 
         private fun serialFor(idx: Int, list: List<Int?>): Int? {
@@ -81,8 +83,17 @@ class ReuseProtectionTest {
                     fetchIndex++
                     CmdResult(exit = 0, out = out, err = "")
                 }
-                cmd == DualRepository.CMD_GETPROP_DUAL ->
-                    CmdResult(exit = 0, out = propOutput, err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL -> {
+                    val outs = propOutputs
+                    val out = if (outs != null) {
+                        val idx = propFetchIndex.coerceAtMost(outs.size - 1)
+                        propFetchIndex++
+                        outs[idx]
+                    } else {
+                        propOutput
+                    }
+                    CmdResult(exit = 0, out = out, err = "")
+                }
                 cmd.startsWith("pm install-existing") || cmd.startsWith("pm uninstall") -> {
                     drifted = true
                     CmdResult(exit = 0, out = "ok", err = "")
@@ -326,6 +337,64 @@ class ReuseProtectionTest {
         assertTrue(
             "continuity-lost must not probe, got: ${gateway.commands}",
             gateway.listProbes().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Serial cross-channel conflict via the auto clone path (Phase B P1-3):
+    // verbose serial 15 vs dumpsys serial 99 (parent 0, CLONE both, prop 95)
+    // is Refused -> fetch null -> resolve -1 and auto clone(pkg) "no dual
+    // profile" with zero target commands. Locks the single-fetch conflict
+    // on the write path (distinct from the cross-fetch reuse guard above).
+    @Test
+    fun autoClone_crossChannelSerialConflict_refusedWithoutWrite() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15),
+            dumpsysSerials = mutableListOf(99),
+        )
+        val repo = DualRepository(gateway)
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        val res = runSuspend { repo.clone("com.example.chat") }
+        assertEquals(1, res.exit)
+        assertEquals("no dual profile", res.err)
+        assertTrue(
+            "conflict must never write, got: ${gateway.commands}",
+            gateway.installWrites().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Cross-fetch property flip (Phase D): fetch1 prop 95 -> target 95,
+    // fetch2 prop 96 -> fresh null (property mismatch Refused). Auto
+    // clone(pkg) carries expected 95 but fresh is null, so the explicit
+    // guard refuses ("not the verified dual target", no stale-95 write).
+    // This is the fresh-null path: a property change never writes stale 95.
+    // Parent-flip (0 -> 10) likewise resolves to fresh null (parent conflict
+    // Refused) and is covered by the same fresh-null refusal, so no extra
+    // fake is added for it.
+    @Test
+    fun autoClone_crossFetchPropertyFlip_refusedWithoutStaleWrite() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, 15),
+            dumpsysSerials = mutableListOf(15, 15),
+            propOutputs = mutableListOf("95\n", "96\n"),
+        )
+        val repo = DualRepository(gateway)
+        val res = runSuspend { repo.clone("com.example.chat") }
+        assertEquals(1, res.exit)
+        assertTrue(
+            "property flip must refuse, got: ${res.err}",
+            res.err.startsWith("refused:"),
+        )
+        assertTrue(
+            "property flip must never write stale 95, got: ${gateway.commands}",
+            gateway.installWrites().isEmpty(),
         )
         assertTrue(
             "no target command for user 95, got: ${gateway.commands}",
