@@ -85,9 +85,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var rootBtn: Button
     private lateinit var shizukuBtn: Button
     private lateinit var lsposedBtn: Button
-    // N1 Phase 1: manual opt-in privileged hook re-diagnosis (retained `cat`).
-    // Auto lifecycle (onResume/binder) never executes privileged `cat`; only
-    // this tap (and the manual reconnect/picker taps) passes userInitiated.
+    // P2-1: narrow-consent privileged hook re-diagnosis (retained `cat`).
+    // Only this tap passes allowPrivilegedHookDiagnosis=true (explicit user
+    // consent for a retained privileged read). Every other entry (picker
+    // taps, reconnect taps, onResume/binder auto paths) passes false: a mode
+    // switch / reconnect is NOT consent for privileged diagnosis.
     private lateinit var hookDiagBtn: Button
     // Row holding the manual hook-diagnosis button: visible only in LSPOSED
     // mode (same condition as hookView) so the opt-in entry never suggests
@@ -154,9 +156,9 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // Re-probe privilege on every foreground return: the user may have
         // granted/revoked Shizuku (or started/stopped its service) while away.
-        // N1 Phase 1: auto path -- never executes privileged `cat` (LSPOSED
+        // P2-1: auto path -- never executes privileged `cat` (LSPOSED
         // stays direct-only, UNKNOWN_* when unreadable).
-        vm.recheckPrivilege(userInitiated = false)
+        vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
         updateShizukuLine()
     }
 
@@ -203,10 +205,10 @@ class MainActivity : ComponentActivity() {
     // degrade + refresh); the dead-binder path only re-probes (a refresh
     // right now could only fail).
     private fun onShizukuChanged(reread: Boolean) {
-        // N1 Phase 1: binder/permission callbacks are auto lifecycle, not user
+        // P2-1: binder/permission callbacks are auto lifecycle, not user
         // taps -- privileged `cat` stays off (false) even on the reread path.
-        // Manual 重新連線並更新 taps call reconnectAndRefresh(true) directly.
-        if (reread) vm.reconnectAndRefresh(userInitiated = false) else vm.recheckPrivilege(userInitiated = false)
+        // Only the dedicated 手動診斷 Hook button consents to privileged reads.
+        if (reread) vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false) else vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
         updateShizukuLine()
     }
 
@@ -250,9 +252,11 @@ class MainActivity : ComponentActivity() {
         }
         refreshBtn = Button(this).apply {
             // P25 single entry: probe (with Auto degrade) + refresh in one tap.
-            // N1 Phase 1: manual tap -- privileged diagnosis allowed.
+            // P2-1: a reconnect tap is NOT consent for privileged diagnosis --
+            // always false (LSPOSED stays direct-only); only the dedicated
+            // 手動診斷 Hook button passes true.
             text = "重新連線並更新"
-            setOnClickListener { vm.reconnectAndRefresh(userInitiated = true) }
+            setOnClickListener { vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false) }
         }
         permBtn = Button(this).apply {
             text = "請求 Shizuku 授權"
@@ -263,24 +267,29 @@ class MainActivity : ComponentActivity() {
         // in the existing style; labels stay short for one horizontal row.
         autoBtn = Button(this).apply {
             text = "Auto"
-            setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, userInitiated = true) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, allowPrivilegedHookDiagnosis = false) }
         }
         rootBtn = Button(this).apply {
             text = "Root"
-            setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, userInitiated = true) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, allowPrivilegedHookDiagnosis = false) }
         }
         shizukuBtn = Button(this).apply {
             text = "Shizuku"
-            setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, userInitiated = true) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, allowPrivilegedHookDiagnosis = false) }
         }
         lsposedBtn = Button(this).apply {
             text = "LSPosed"
-            setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, allowPrivilegedHookDiagnosis = false) }
         }
-        // N1 Phase 1: manual opt-in privileged hook re-diagnosis. Auto
-        // lifecycle never `cat`s; only this tap may use the retained channel.
+        // P2-1: narrow-consent privileged hook re-diagnosis. Only this tap
+        // passes allowPrivilegedHookDiagnosis=true (explicit consent for a
+        // retained privileged `cat`); picker taps, reconnect taps, and auto
+        // lifecycle never `cat`. P3: the copy states the privileged exec
+        // directly (button contentDescription + ViewModel docs).
         hookDiagBtn = Button(this).apply {
             text = "手動診斷 Hook"
+            // P3: 明示此按鈕會執行特權診斷指令（TalkBack 朗讀；點按即明確同意）。
+            contentDescription = "手動診斷 Hook（需要執行 ROOT/Shizuku 診斷指令，僅在此按鈕觸發）"
             setOnClickListener { vm.requestHookRedDiagnosis() }
         }
         // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
@@ -345,15 +354,16 @@ class MainActivity : ComponentActivity() {
     private fun requestShizukuPermission() {
         try {
             if (!Shizuku.pingBinder()) {
-                // User tapped the permission button: manual.
-                vm.reconnectAndRefresh(userInitiated = true)
+                // P2-1: permission-button tap re-probes/refreshes but is NOT
+                // consent for privileged `cat` (always false).
+                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                vm.reconnectAndRefresh(userInitiated = true)
+                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
             } else {
                 Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
             }
         } catch (e: Exception) {
-            vm.recheckPrivilege(userInitiated = true)
+            vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
         }
         updateShizukuLine()
     }
@@ -461,9 +471,9 @@ class MainActivity : ComponentActivity() {
                 HookStatus.INACTIVE ->
                     "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
                 HookStatus.UNKNOWN_UNREADABLE ->
-                    "狀態未知（無權限讀取；需 ROOT／Shizuku 真通道才能完整診斷，見 #27）"
+                    "狀態未知（無權限讀取；需 ROOT／Shizuku 真通道才能完整診斷，見 #27，或點下方「手動診斷 Hook」單次診斷）"
                 HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
-                    "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27）"
+                    "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27，或點下方「手動診斷 Hook」單次診斷）"
             }
             hookView.text = "LSPosed Hook：$status；寫入通道為佔位（NoOp），" +
                 "待 whitelist 政策分支，寫入已禁用"

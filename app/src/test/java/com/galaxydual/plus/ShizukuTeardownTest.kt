@@ -161,7 +161,7 @@ class ShizukuTeardownTest {
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
 
-        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        vm.selectChannel(ChannelPreference.LSPOSED)
         await {
             !vm.state.value.loading &&
                 vm.state.value.channel == ChannelPreference.LSPOSED
@@ -205,11 +205,11 @@ class ShizukuTeardownTest {
         await { !vm.state.value.loading && vm.state.value.writeReady }
 
         repeat(3) {
-            vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+            vm.selectChannel(ChannelPreference.LSPOSED)
             await { !vm.state.value.loading && vm.state.value.channel == ChannelPreference.LSPOSED }
             Thread.sleep(150)
             await { !vm.state.value.loading }
-            vm.selectChannel(ChannelPreference.SHIZUKU, userInitiated = true)
+            vm.selectChannel(ChannelPreference.SHIZUKU)
             await { !vm.state.value.loading && vm.state.value.channel == ChannelPreference.SHIZUKU }
             Thread.sleep(150)
             await { !vm.state.value.loading }
@@ -221,7 +221,7 @@ class ShizukuTeardownTest {
             counter.countFor(shizukuFake),
         )
 
-        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        vm.selectChannel(ChannelPreference.LSPOSED)
         await { !vm.state.value.loading && vm.state.value.channel == ChannelPreference.LSPOSED }
         Thread.sleep(300)
         await { !vm.state.value.loading }
