@@ -152,6 +152,29 @@ data class PendingRemove(
     val requestedAtMs: Long,
 )
 
+// PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
+//
+// 階段 1 仍走既有單筆 cloneVerified (逐包呼叫,見 cloneSelected),不引入
+// 新的批次寫入通道 (留待 #21/#22/#23/#24/#27 完備後的後續階段)。
+// - outcome 直接沿用 CloneOutcome (成功/部分成功/unknown 分流與單筆一致)。
+// - appKey 為勾選時的來源身分鍵 (serial:package);pkg 為實際寫入包名。
+// - 取消勾選/清除選取永不產生 BatchItemResult (見 clearSelectionLocal)。
+data class BatchItemResult(
+    val appKey: String,
+    val pkg: String,
+    val outcome: CloneOutcome,
+)
+
+// 一次「建立 N 個分身」的彙總:逐項結果 + 成功/失敗/未知計數。
+// failed = 非 Success 且非 VerifyUnknown (含 NoDual/ChannelError/Invalid/
+// InstallFailed/VerifyFailed);unknown = VerifyUnknown (需重查,不算失敗)。
+data class BatchReport(
+    val items: List<BatchItemResult> = emptyList(),
+    val successCount: Int = 0,
+    val failedCount: Int = 0,
+    val unknownCount: Int = 0,
+)
+
 // Error class of the user-facing message, so the UI (F3) can render channel
 // failures differently from validation refusals or verify mismatches.
 enum class MsgKind {
@@ -313,6 +336,17 @@ data class UiState(
     // Survives config rotation (ViewModel retained); a recreated ViewModel
     // starts null (fail closed, must request again).
     val pendingRemove: PendingRemove? = null,
+    // PR-7 P2 (issue #26, 階段 1):個人來源 catalog + 多選狀態 (唯讀展示 +
+    // 勾選,執行見 cloneSelected)。sourceCatalog 由 MainActivity 經
+    // loadSourceApps 載入後注入;搜尋/篩選/排序走 SourceInventory 純函數。
+    // selectedKeys 為 AppKey (serial:package) 集合;取消勾選/清除只改此集合,
+    // 永不呼叫 uninstall (見 clearSelectionLocal)。batchReport 為最近一次
+    // 批次執行的逐項結果 (成功/失敗/未知分開,部分成功如實呈現)。
+    val sourceCatalog: List<SourceAppEntry> = emptyList(),
+    val sourceQuery: String = "",
+    val includeSystemApps: Boolean = false,
+    val selectedKeys: Set<String> = emptySet(),
+    val batchReport: BatchReport? = null,
 )
 
 // Android ViewModel owning the dual-app screen state (Phase F2, issue #6).
@@ -511,6 +545,10 @@ class DualViewModel(
     // 同意時效單調時鐘 (見上)：request 的 requestedAtMs 與 confirm 的 TTL
     // 差值皆經此取時， wall 回撥不得延長有效期。
     private val nowMonoMs: () -> Long = System::currentTimeMillis,
+    // PR-7 P2 (issue #26, 階段 1):選取持久化 store。生產由 MainActivity 綁定
+    // SharedPreferences (selectionStore());JVM 測試注入 HashMap 後端;null
+    // 表示無持久化 (既有測試路徑,所有選取操作退化為純記憶體)。
+    private val selectionStore: SelectionStore? = null,
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -611,6 +649,11 @@ class DualViewModel(
     // Single constructor for in-flight write dedup keys; keeps the
     // "clone:<pkg>" / "request-remove:<pkg>" namespaces consistent.
     private fun opKey(op: String, pkg: String) = "$op:$pkg"
+    // PR-7 P2 (issue #26):已對哪個目標自動恢復過持久選取 (in-memory marker)。
+    // SELECTION_RESTORE_NONE = 從未恢復;恢復只在 selectedKeys 為空時執行
+    // 一次 (永不覆蓋使用者當前勾選,永不自動重送寫入)。目標改變 (profile
+    // 變動) 後允許對新目標再恢復一次 (舊目標條目已由 SelectionStore 失效清除)。
+    private var selectionRestoredForTarget: Int = SELECTION_RESTORE_NONE
 
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
     // gateway.run is a blocking suspend with no dispatcher guarantee, and a
@@ -1256,6 +1299,10 @@ class DualViewModel(
                                 next
                             }
                         }
+                        // PR-7 P2 (#26):清單 FRESH 且目標已知時,對該目標自動
+                        // 恢復一次持久選取 (僅打勾,不重送寫入;已有勾選則跳過)。
+                        // 必須在 opMutex 下呼叫 (refreshLocked 已持有)。
+                        restoreSelectionLocked(dualId)
                     }
                 }
             }
@@ -2946,6 +2993,384 @@ class DualViewModel(
     )
     fun remove(pkg: String) = requestRemove(pkg)
 
+    // PR-7 P2 (issue #26, 階段 1):來源 catalog 與選取操作。
+    //
+    // - setSourceCatalog:MainActivity 載入 loadSourceApps 後注入 (全量替換)。
+    // - setSourceQuery/setIncludeSystemApps:搜尋字串與系統 App 開關 (純狀態)。
+    // - toggleSelection/setSelected/selectVisible:勾選變更,只改 selectedKeys,
+    //   永不觸及裝置寫入路徑 (取消勾選 ≠ 卸載,由 InventorySelectionTest 鎖定
+    //   零 gateway 呼叫)。
+    // - clearSelectionLocal:清空記憶體勾選 (≠卸載);要連持久化一起丟用
+    //   cancelSavedSelection。
+    fun setSourceCatalog(entries: List<SourceAppEntry>) {
+        _state.update { it.copy(sourceCatalog = entries.toList()) }
+        // catalog 後載補觸恢復：refresh 可能先跑在空 catalog 上（不置 marker，
+        // 見 restoreSelectionLocked），此處 catalog 就緒後對已知目標補試一次。
+        if (entries.isEmpty()) return
+        if (_state.value.selectedKeys.isNotEmpty()) return
+        val invTarget = _state.value.inventory.targetId
+        val target = if (invTarget > 0) {
+            invTarget
+        } else {
+            try {
+                selectionStore?.loadSnapshot()?.knownTargetId ?: -1
+            } catch (_: Exception) {
+                -1
+            }
+        }
+        if (target <= 0) return
+        if (selectionRestoredForTarget == target) return
+        viewModelScope.launch {
+            opMutex.withLock { restoreSelectionLocked(target) }
+        }
+    }
+
+    fun setSourceQuery(query: String) {
+        _state.update { it.copy(sourceQuery = query) }
+    }
+
+    fun setIncludeSystemApps(include: Boolean) {
+        _state.update { it.copy(includeSystemApps = include) }
+    }
+
+    fun toggleSelection(appKey: String) {
+        _state.update { cur ->
+            val next = cur.selectedKeys.toMutableSet()
+            if (!next.add(appKey)) next.remove(appKey)
+            cur.copy(selectedKeys = next)
+        }
+    }
+
+    fun setSelected(appKey: String, checked: Boolean) {
+        _state.update { cur ->
+            val next = cur.selectedKeys.toMutableSet()
+            if (checked) next.add(appKey) else next.remove(appKey)
+            cur.copy(selectedKeys = next)
+        }
+    }
+
+    fun selectVisible(appKeys: Set<String>) {
+        if (appKeys.isEmpty()) return
+        _state.update { cur -> cur.copy(selectedKeys = cur.selectedKeys + appKeys) }
+    }
+
+    // 清空勾選 (記憶體):只改 selectedKeys,不跑任何 uninstall,不碰持久化。
+    // 語意:「取消勾選」≠「卸載分身」。
+    fun clearSelectionLocal() {
+        _state.update { cur ->
+            if (cur.selectedKeys.isEmpty()) return@update cur
+            cur.copy(
+                selectedKeys = emptySet(),
+                msg = "已清除勾選（未卸載任何分身）",
+                msgKind = MsgKind.INFO,
+            )
+        }
+    }
+
+    // 保存當前勾選到 SelectionStore (需明確已知目標,不自行解析)。
+    // 只保存勾選,不寫入任何分身;targetId <= 0 或無 store 時拒絕並說明。
+    // 保存內容為包名集合 (selected packages,見 SelectionStore):由當前 catalog
+    // 將 AppKey 映射為包名;catalog 已缺失的 key 無法解析，直接捨去 (批次亦
+    // 無法執行,見 cloneSelected 的 InvalidPackage 分流)。
+    fun persistSelection(targetId: Int, source: String = SELECTION_SOURCE_CATALOG) {
+        viewModelScope.launch {
+            opMutex.withLock {
+                val store = selectionStore
+                if (store == null) {
+                    _state.update {
+                        it.copy(msg = "無選取 store,無法保存", msgKind = MsgKind.CHANNEL)
+                    }
+                    return@withLock
+                }
+                if (targetId <= 0) {
+                    _state.update {
+                        it.copy(msg = "no dual profile", msgKind = MsgKind.NO_DUAL)
+                    }
+                    return@withLock
+                }
+                val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
+                val selected = _state.value.selectedKeys
+                    .mapNotNull { catalogByKey[it]?.packageName }
+                    .toSortedSet()
+                val ok = try {
+                    store.save(source, targetId, selected, nowMs())
+                } catch (_: Exception) {
+                    false
+                }
+                _state.update {
+                    if (ok) {
+                        it.copy(
+                            msg = "已保存選取 ${selected.size} 項（user $targetId," +
+                                "重啟可恢復；只保存勾選，不寫入分身）",
+                            msgKind = MsgKind.INFO,
+                        )
+                    } else {
+                        it.copy(msg = "保存選取失敗", msgKind = MsgKind.FAILED)
+                    }
+                }
+            }
+        }
+    }
+
+    // 取消保存:只刪持久化條目,不跑任何 uninstall,不清記憶體勾選
+    // (語意:「取消保存」≠「卸載分身」;記憶體勾選另由 clearSelectionLocal 清)。
+    fun cancelSavedSelection() {
+        viewModelScope.launch {
+            opMutex.withLock {
+                val store = selectionStore
+                if (store == null) {
+                    _state.update {
+                        it.copy(msg = "無選取 store,無法取消保存", msgKind = MsgKind.CHANNEL)
+                    }
+                    return@withLock
+                }
+                val ok = try {
+                    store.clear()
+                } catch (_: Exception) {
+                    false
+                }
+                _state.update {
+                    if (ok) {
+                        it.copy(
+                            msg = "已取消保存選取（不影響已安裝分身與目前勾選）",
+                            msgKind = MsgKind.INFO,
+                        )
+                    } else {
+                        it.copy(msg = "取消保存失敗", msgKind = MsgKind.FAILED)
+                    }
+                }
+            }
+        }
+    }
+
+    // 從 SelectionStore 恢復勾選 (供重啟/Activity 重建後呼叫):
+    // - 僅在 selectedKeys 為空時恢復 (永不覆蓋使用者當前勾選)。
+    // - 保存的是包名集合；只恢復仍在 catalog (availableKeys,預設為當前
+    //   catalog 全量包名) 的包，並映射回其 AppKey (圖示/來源鍵保持當次載入)。
+    // - 恢復只打勾,永不自動執行 clone (恢复不重送寫入)。
+    // - 同一目標只恢復一次 (selectionRestoredForTarget marker)。
+    fun restoreSelection(targetId: Int, availableKeys: Set<String>? = null) {
+        viewModelScope.launch {
+            opMutex.withLock { restoreSelectionLocked(targetId, availableKeys) }
+        }
+    }
+
+    // 恢復本體 (必須在 opMutex 下呼叫):refreshLocked 的 FRESH 分支共用。
+    private fun restoreSelectionLocked(targetId: Int, availableKeys: Set<String>? = null) {
+        val store = selectionStore ?: return
+        if (targetId <= 0) return
+        val cur = _state.value
+        if (cur.selectedKeys.isNotEmpty()) return
+        if (selectionRestoredForTarget == targetId) return
+        // 空 catalog 不置 marker：尚未真正嘗試映射，待 catalog 就緒後
+        // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
+        if (cur.sourceCatalog.isEmpty()) return
+        val byPackage = cur.sourceCatalog.associateBy { it.packageName }
+        val available = availableKeys ?: byPackage.values.map { it.appKey }.toSet()
+        val restored = try {
+            store.loadSelected(targetId)
+        } catch (_: Exception) {
+            emptySet()
+        }
+        selectionRestoredForTarget = targetId
+        if (restored.isEmpty()) return
+        // 保存包名 -> 當次 catalog AppKey；不在 catalog 的包不恢復。
+        val kept = restored.mapNotNull { byPackage[it]?.appKey }
+            .filterTo(mutableSetOf()) { it in available }
+        _state.update { it.copy(selectedKeys = kept) }
+    }
+
+    // PR-7 P2 (issue #26, 階段 1):批次執行已勾選。
+    //
+    // 階段 1 不引入新批次寫入通道:對每個已勾選包名依確定順序 (包名升冪)
+    // 逐一呼叫既有單筆 repo.cloneVerified,逐項記錄 lastOperation/diagnose,
+    // 最後彙總 BatchReport (成功/失敗/未知分開,部分成功如實呈現)。
+    // - 空選取:拒絕,不碰裝置。
+    // - 單一 "batch:clone" inFlight key:併發第二批回報 already in progress。
+    // - 一次 isWritable 前置檢查 (唯讀/佔位通道整批拒絕);逐項失敗不中斷
+    //   其餘項目 (NoDual/ChannelError 亦繼續,結果如實分流)。
+    // - catalog 缺失的 key 以 InvalidPackage 記 unknown 類失敗,不拋出。
+    // - cloned 只加入 Success 確認的包 (與單筆 clone 一致的 fail-closed)。
+    fun cloneSelected() {
+        viewModelScope.launch {
+            val keys = _state.value.selectedKeys.toList()
+            if (keys.isEmpty()) {
+                _state.update {
+                    it.copy(msg = "未勾選任何應用", msgKind = MsgKind.INVALID)
+                }
+                return@launch
+            }
+            val opKey = "batch:clone"
+            if (!inFlightWrites.add(opKey)) {
+                _state.update {
+                    it.copy(msg = "already in progress: batch clone", msgKind = MsgKind.INFO)
+                }
+                return@launch
+            }
+            try {
+                opMutex.withLock {
+                    if (!isWritable()) return@withLock
+                    _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+                    try {
+                        val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
+                        // 確定順序:包名升冪 (catalog 缺失的 key 排最後,按 key 比)。
+                        val ordered = keys.sortedWith(
+                            compareBy(
+                                { catalogByKey[it]?.packageName ?: it },
+                                { it },
+                            ),
+                        )
+                        val items = mutableListOf<BatchItemResult>()
+                        for (appKey in ordered) {
+                            val pkg = catalogByKey[appKey]?.packageName
+                            if (pkg == null) {
+                                items.add(
+                                    BatchItemResult(
+                                        appKey = appKey,
+                                        pkg = appKey,
+                                        outcome = CloneOutcome.InvalidPackage(appKey),
+                                    ),
+                                )
+                                continue
+                            }
+                            // 單筆 pinned 流程 (與 clone(pkg) 相同契約)。
+                            when (val res = onIo { repo.cloneVerified(pkg) }) {
+                                is CloneOutcome.Success -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    _state.update { cur ->
+                                        val current = if (cur.cloned.contains(pkg)) {
+                                            cur.cloned
+                                        } else {
+                                            cur.cloned + pkg
+                                        }
+                                        cur.copy(
+                                            cloned = current,
+                                            lastOperation = LastOperation(
+                                                opId = "clone:$pkg",
+                                                appKey = pkg,
+                                                pinnedTarget = res.dualId,
+                                                phase = OpPhase.SUCCESS,
+                                                timeMs = nowMs(),
+                                                detail = "cloned: $pkg",
+                                            ),
+                                        )
+                                    }
+                                }
+                                is CloneOutcome.NoDual -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                                is CloneOutcome.ChannelError -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                                is CloneOutcome.InvalidPackage -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                                is CloneOutcome.InstallFailed -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                                is CloneOutcome.VerifyFailed -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                                is CloneOutcome.VerifyUnknown -> {
+                                    items.add(BatchItemResult(appKey, pkg, res))
+                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                }
+                            }
+                        }
+                        val success = items.count { it.outcome is CloneOutcome.Success }
+                        val unknown = items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                        val failed = items.size - success - unknown
+                        val report = BatchReport(
+                            items = items.toList(),
+                            successCount = success,
+                            failedCount = failed,
+                            unknownCount = unknown,
+                        )
+                        _state.update { cur ->
+                            val summary = "批次完成：成功 $success / 失敗 $failed / 未知 $unknown" +
+                                "（共 ${items.size} 項）"
+                            val kind = when {
+                                failed > 0 -> MsgKind.FAILED
+                                unknown > 0 -> MsgKind.CHANNEL
+                                else -> MsgKind.INFO
+                            }
+                            cur.copy(
+                                loading = false,
+                                batchReport = report,
+                                msg = summary,
+                                msgKind = kind,
+                            )
+                        }
+                    } catch (e: Exception) {
+                        val now = nowMs()
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.OP_FAILED,
+                                    techDetail = (e.message ?: "batch clone failed")
+                                        .take(MAX_DIAG_DETAIL_CHARS),
+                                ),
+                                msg = "batch clone failed: ${e.message}",
+                                msgKind = MsgKind.FAILED,
+                            )
+                        }
+                    }
+                }
+            } finally {
+                inFlightWrites.remove(opKey)
+            }
+        }
+    }
+
+    // 批次逐項 detail:沿用單筆 clone 的 msg 語意 (InstallFailed 取通道原文)。
+    private fun batchOutcomeDetail(res: CloneOutcome): String = when (res) {
+        is CloneOutcome.Success -> "cloned: ${res.dualId}"
+        is CloneOutcome.NoDual -> "no dual profile"
+        is CloneOutcome.ChannelError -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
+        is CloneOutcome.InvalidPackage -> "invalid package"
+        is CloneOutcome.InstallFailed -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
+        is CloneOutcome.VerifyFailed -> "not installed for user ${res.dualId}"
+        is CloneOutcome.VerifyUnknown -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
+    }
+
+    // 批次逐項非成功結果記帳:lastOperation 逐項覆寫 (pinned verify 語意與
+    // 單筆 clone 一致),diagnose 取該 outcome 穩定碼;cloned 不動 (fail closed)。
+    private fun recordBatchItemUnknownOrFailed(
+        pkg: String,
+        code: DiagnoseCode,
+        res: CloneOutcome,
+    ) {
+        val now = nowMs()
+        val (phase, target) = when (res) {
+            is CloneOutcome.Success -> OpPhase.SUCCESS to res.dualId
+            is CloneOutcome.NoDual -> OpPhase.UNKNOWN to -1
+            is CloneOutcome.ChannelError -> OpPhase.UNKNOWN to -1
+            is CloneOutcome.InvalidPackage -> OpPhase.FAILED to -1
+            is CloneOutcome.InstallFailed -> OpPhase.FAILED to -1
+            is CloneOutcome.VerifyFailed -> OpPhase.FAILED to res.dualId
+            is CloneOutcome.VerifyUnknown -> OpPhase.UNKNOWN to res.dualId
+        }
+        _state.update { cur ->
+            cur.copy(
+                lastOperation = LastOperation(
+                    opId = "clone:$pkg",
+                    appKey = pkg,
+                    pinnedTarget = target,
+                    phase = phase,
+                    timeMs = now,
+                    detail = batchOutcomeDetail(res),
+                ),
+                diagnose = res.toDiagnoseEvent(),
+            )
+        }
+    }
+
     // Re-probes elevation channels after a binder/permission lifecycle event
     // (Phase F3, issue #6): called from MainActivity's Shizuku binder/permission
     // listeners and from onForeground (MainActivity.onResume routes through
@@ -4375,6 +4800,10 @@ class DualViewModel(
 // through this function; HookDiagnosisTest locks the contract.
 fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
     routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
+
+// PR-7 P2 (issue #26):選取自動恢復 marker 初值 (從未恢復)。
+// 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 可作「從未恢復」哨兵。
+private const val SELECTION_RESTORE_NONE = -2
 
 // Pure display mapping: applies a hook diagnosis to the UI state without
 // touching routing or readiness fields (channel/privilege/channelReady are

@@ -2,7 +2,10 @@
 # 使用教學 (USAGE)
 
 > 本專案僅經由 GitHub 發佈 sideload APK，不上架 Play 商店。
-> Manifest 目前宣告全檔案存取等權限，但尚未找到對應 APK staging 實作；依 #26 核對必要性。不上 Play 不是保留過寬權限的充分理由。
+> PR-7 P2 (#26) 權限審計已完成：`REQUEST_INSTALL_PACKAGES` 與 `MANAGE_EXTERNAL_STORAGE`
+> 無呼叫鏈（clone 走 shell `pm install-existing`，不走 PackageInstaller 會話；無共享儲存
+> 暫存）故已移除；僅保留功能必需的 `QUERY_ALL_PACKAGES`（個人來源 catalog 經
+> PackageManager 列舉，見 `SourceInventory.loadSourceApps`）。不上 Play 不是保留過寬權限的充分理由。
 > 全程不碰 Secure Folder（Knox 容器）。
 > 本文件描述包含設計目標與未完成流程；凡 [待實作]／[待實機驗證] 皆不宣稱為可用功能，
 > 驗證須依個別情境判讀，不能由正常成功案例推論所有通道與安全負向邊界。歷史 S24 寫入紀錄與本輪唯讀調查見下方更新。
@@ -195,4 +198,6 @@ adb shell pm uninstall --user <dualId> com.example.chat
   `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked (registration only), daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; callback logs, Shizuku unauthorized flows, first-time selection, binder dead-guidance, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED (`pm path` auxiliary only, see #22); outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
 - Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
   any package yet.
-- GitHub sideload builds only; no Play release. Manifest `MANAGE_EXTERNAL_STORAGE`/`REQUEST_INSTALL_PACKAGES` necessity is still under review per #26 — not shipping on Play does not justify overbroad permissions.
+- GitHub sideload builds only; no Play release. Manifest audit per #26 done:
+  `REQUEST_INSTALL_PACKAGES`/`MANAGE_EXTERNAL_STORAGE` removed (no call chain);
+  only `QUERY_ALL_PACKAGES` kept (source catalog enumeration).
