@@ -856,8 +856,8 @@ class ProfileIdentityTest {
 
     @Test
     fun cloneExactAllowlistVariants_areClone() {
-        // Parameterized allowlist: dot/underscore/hyphen/space separators plus
-        // case-insensitivity all stay CLONE. Consecutive enumerated
+        // Parameterized allowlist: dot/underscore/hyphen/space/Tab separators
+        // plus case-insensitivity all stay CLONE. Consecutive enumerated
         // separators (double space) are documented leniency, still CLONE.
         val cases = listOf(
             "android.os.usertype.profile.CLONE",
@@ -866,6 +866,7 @@ class ProfileIdentityTest {
             "profile_CLONE",
             "profile-CLONE",
             "profile CLONE",
+            "profile\tCLONE",
             "profile  CLONE",
             "android.os.usertype.profile_CLONE",
             "android.os.usertype.profile-CLONE",
@@ -909,10 +910,11 @@ class ProfileIdentityTest {
     }
 
     // ---- Phase A P1-R6: tainted CLONE tail (fail-closed) ----
-    // A CLONE token followed by optional whitespace + `/` (not opening
-    // another `profile` token) is tainted -> OTHER, never CLONE. The
-    // `MANAGED/profile.CLONE` slash dual-token form stays UNKNOWN
-    // (regression locked: slash opens another profile token, untainted).
+    // A CLONE token followed on the same line by any `/` (arbitrary gap
+    // words allowed, not opening another `profile` token) is tainted ->
+    // OTHER, never CLONE. The `MANAGED/profile.CLONE` slash dual-token
+    // form stays UNKNOWN (regression locked: slash opens another profile
+    // token, untainted).
 
     @Test
     fun cloneSlashTail_isOtherNotClone() {
@@ -923,6 +925,9 @@ class ProfileIdentityTest {
             "android.os.usertype.profile.CLONE/",
             "profile.CLONE / evil",
             "android.os.usertype.profile.CLONE / evil",
+            "profile.CLONE - /evil",
+            "profile.CLONE foo/evil",
+            "profile.CLONE (/evil)",
         )
         for (value in cases) {
             assertEquals(
@@ -942,6 +947,7 @@ class ProfileIdentityTest {
         val cases = listOf(
             "android.os.usertype.profile.MANAGED/android.os.usertype.profile.CLONE",
             "profile.MANAGED/profile.CLONE",
+            "profile.CLONE/profile.MANAGED",
         )
         for (value in cases) {
             assertEquals(
@@ -950,5 +956,16 @@ class ProfileIdentityTest {
                 parseSingleVerboseType(value),
             )
         }
+    }
+
+    @Test
+    fun cloneParenthesizedNoteWithoutSlash_staysClone() {
+        // Slash-free parenthesized note keeps the tolerated CLONE verdict
+        // (taint needs a `/` on the same line); slashed notes degrade to
+        // OTHER (locked in cloneSlashTail_isOtherNotClone).
+        assertEquals(
+            ProfileUserType.CLONE,
+            parseSingleVerboseType("profile.CLONE (default)"),
+        )
     }
 }
