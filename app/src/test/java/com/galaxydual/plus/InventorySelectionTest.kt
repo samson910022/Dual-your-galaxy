@@ -6,8 +6,8 @@
 //   永不進入身分鍵)。
 // - 選取持久化：保存後新 client 可重讀；重啟恢復只打勾不重送寫入；profile
 //   變動失效舊選取；損壞恢復；取消勾選/取消保存 ≠ 卸載 (零 gateway 呼叫)。
-// - 批次 (階段 1 仍走單筆 cloneVerified 逐項)：逐項結果/部分成功/unknown
-//   分流；唯讀拒絕；空選取拒絕。
+// - 批次 (cloneVerifiedExpected 原子 pin 逐項)：逐項結果/部分成功/unknown
+//   分流；唯讀拒絕；空選取拒絕；綁定目標不符拒絕；漂移停止＋partial。
 //
 // Harness mirrors DiagnoseFreshnessTest: DualViewModel runs on viewModelScope
 // (Dispatchers.Main replaced with Unconfined), repo I/O on Dispatchers.IO,
