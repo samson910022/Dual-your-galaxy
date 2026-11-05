@@ -107,10 +107,11 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     絕不靜默當成功。
     daagent marker（`scope=daagent`）僅證明至少一個 `WhiteListApps` hook 已安裝
     （此 ROM 實為 `<clinit>` interceptor），不證明政策已生效
-    （預設空政策下直接返回（語義等同 Skipped，未觸及反射）；
-    即使將來政策非空，此 ROM 的 `static final` 欄位仍恆 `ObserveOnly`，
-    見 `DualHook.patchWhitelistField`（空政策直接返回）與
-    `WhitelistPatch.apply`（非空時 `final=>ObserveOnly`），故僅觀察）。
+    （預設空政策下直接返回（語義等同 `Skipped`，未觸及反射）；
+    即使將來政策非空，可讀的 `static-final` 欄位回 `ObserveOnly`，
+    反射失敗（欄位缺失／讀取失敗）則回 `Skipped`，兩者都不寫入，
+    見 `DualHook.patchWhitelistField` 與 `WhitelistPatch.patchFields`／`apply`，
+    故僅觀察）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
 - 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：
@@ -235,5 +236,6 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>no-op,
-  returns early in `DualHook.patchWhitelistField`; static-final=>`ObserveOnly`
-  in `WhitelistPatch.apply` on this ROM).
+  returns early in `DualHook.patchWhitelistField`; readable static-final
+  =>`ObserveOnly`, reflection failure=>`Skipped`, neither writes, see
+  `DualHook.patchWhitelistField` + `WhitelistPatch.patchFields`/`apply`).

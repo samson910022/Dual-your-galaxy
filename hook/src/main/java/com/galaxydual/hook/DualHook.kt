@@ -62,8 +62,11 @@ class DualHook : XposedModule() {
             // Marker semantics: install evidence only (at least one WhiteListApps
             // hook installed, currently the <clinit> interceptor on this ROM),
             // not proof policy took effect. Empty policy => no-op today
-            // (Skipped, returns before reflection); even with non-empty
-            // policy, static-final fields => ObserveOnly (see WhitelistPatch.apply).
+            // (early return, semantically skipped; no Outcome emitted,
+            // returns before reflection); even with non-empty
+            // policy, readable static-final fields => ObserveOnly
+            // (see DualHook.patchWhitelistField + WhitelistPatch.patchFields/apply;
+            // chain patchWhitelistField->patchFields->apply).
             val installed = hookWhiteListApps(param.defaultClassLoader)
             if (installed > 0) {
                 try {
