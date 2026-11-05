@@ -988,10 +988,57 @@ class DualRepository(
         } catch (e: IllegalArgumentException) {
             return CloneOutcome.InvalidPackage(clean)
         }
-        val res = gateway.run(installCmd)
+        // Write-side gateway defense (R5, same as cloneVerified:770-776 and
+        // remove:1122-1127): a throwing gateway (spawn failure,
+        // SecurityException, binder death) maps to ChannelError (fail closed),
+        // never a crash; CancellationException is rethrown to stay
+        // coroutine-correct. Keeps a batch M3 partial from escaping as
+        // OP_FAILED -- per-item ChannelError counts as unknown+1/STALE.
+        val res = try {
+            gateway.run(installCmd)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
+        // Unknown-after-send (same rule as cloneVerified:812-827): an
+        // abandoned or lost reply (timedOut / transportUnknown /
+        // isServiceTimeoutText) leaves exit/out/err untrusted -- NEVER map to
+        // InstallFailed. One bounded read-only verifyListProbe (no write
+        // resend) with an after-pin first: Installed -> Success,
+        // clean-but-absent -> VerifyUnknown (reverse, write may still land),
+        // Unknown -> VerifyUnknown (never InstallFailed/VerifyFailed).
+        if (isUnknownAfterSend(res)) {
+            val byText = !res.timedOut && !res.transportUnknown
+            val transportLost = res.transportUnknown
+            val syntheticTimeoutBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
+            val timeoutAfter = fetchVerifiedTarget()
+            val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
+            if (timeoutDrift != null) return CloneOutcome.VerifyUnknown(expectedDualId, timeoutDrift)
+            return when (val state = verifyListProbe(clean, expectedDualId)) {
+                is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
+                is VerifyState.NotInstalled ->
+                    CloneOutcome.VerifyUnknown(
+                        expectedDualId,
+                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText, transportLost = transportLost),
+                    )
+                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost))
+            }
+        }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
+        // Post-write after-pin drift (same synthetic-before pin as
+        // removeVerifiedExpected:1211-1214 and cloneVerified:837-839): the
+        // write already ran on the pinned id, but the identity may have moved
+        // in the install-to-probe window -- re-fetch and require the pin to
+        // still hold before trusting the list re-check. Drift is
+        // VerifyUnknown/TargetMismatch (never VerifyFailed/Success).
+        // Report-only: zero extra installs.
+        val syntheticBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
+        val after = fetchVerifiedTarget()
+        val drift = checkTargetDrift(syntheticBefore, after)
+        if (drift != null) return CloneOutcome.VerifyUnknown(expectedDualId, drift)
         return when (val state = verifyListProbe(clean, expectedDualId)) {
             is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(expectedDualId)

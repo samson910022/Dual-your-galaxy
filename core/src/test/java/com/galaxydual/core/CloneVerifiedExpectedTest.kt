@@ -40,11 +40,24 @@ class CloneVerifiedExpectedTest {
         var snapshotMissesDual: Boolean = false,
         var installOut: String = "Package com.example.chat installed for user: 95",
         var installExit: Int = 0,
+        var installErr: String = "",
+        var installTimedOut: Boolean = false,
+        var installTransportUnknown: Boolean = false,
+        var throwOnInstall: Boolean = false,
+        var throwInstallMessage: String = "boom install",
+        var serialAfterWrite: Int? = null,
         var listPackagesOut: String = "package:com.example.chat\n",
         var listPackagesExit: Int = 0,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
+
+        private fun effectiveSerial(): Int =
+            if (commands.count { it.startsWith("pm install-existing") } > 0 && serialAfterWrite != null) {
+                serialAfterWrite!!
+            } else {
+                serial
+            }
 
         private fun verboseOut(): String {
             // absent 與 contradictory 的 typed 通道皆無 clone（owner-only）；
@@ -65,7 +78,7 @@ class CloneVerifiedExpectedTest {
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
                 // omitSerial keeps the header + CLONE type but drops the
                 // serial line (id confirms, serial does not).
-                (if (omitSerial) "" else "    Serial: $serial\n") +
+                (if (omitSerial) "" else "    Serial: ${effectiveSerial()}\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n" +
                 (if (verboseNoisy) "Failure [cannot list users]\n" else "")
@@ -80,7 +93,7 @@ class CloneVerifiedExpectedTest {
             // omitSerial keeps the header + CLONE type but drops the serialNo
             // (id confirms, serial does not).
             val header95 = if (omitSerial) "  UserInfo{$dualId:DualApp:400}:\n"
-            else "  UserInfo{$dualId:DualApp:400} serialNo=$serial:\n"
+            else "  UserInfo{$dualId:DualApp:400} serialNo=${effectiveSerial()}:\n"
             return "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
@@ -128,8 +141,16 @@ class CloneVerifiedExpectedTest {
                     // contradictory 刻意仍指向 dualId（property 反證 → Unknown）。
                     if (absentIdentity) CmdResult(exit = 0, out = "", err = "")
                     else CmdResult(exit = 0, out = "$dualId\n", err = "")
-                cmd.startsWith("pm install-existing") ->
-                    CmdResult(exit = installExit, out = installOut, err = "")
+                cmd.startsWith("pm install-existing") -> {
+                    if (throwOnInstall) throw RuntimeException(throwInstallMessage)
+                    CmdResult(
+                        exit = installExit,
+                        out = installOut,
+                        err = installErr,
+                        timedOut = installTimedOut,
+                        transportUnknown = installTransportUnknown,
+                    )
+                }
                 cmd.startsWith("pm list packages") ->
                     CmdResult(exit = listPackagesExit, out = listPackagesOut, err = "")
                 else -> CmdResult(exit = 0, out = "ok", err = "")
@@ -446,6 +467,101 @@ class CloneVerifiedExpectedTest {
         assertTrue(
             "no uninstall may run on snapshot/identity mismatch, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm uninstall") },
+        )
+    }
+
+    // Stage3-1 (R5 write-side defense): install 分支 gateway 拋出 -> ChannelError
+    // (fail closed)，批次側計 unknown+1/STALE，零 crash（永不 InstallFailed）。
+    @Test
+    fun installThrow_returnsChannelErrorWithSingleAttempt() {
+        val gateway = FakeGateway(throwOnInstall = true, throwInstallMessage = "binder died")
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        val detail = (outcome as CloneOutcome.ChannelError).detail
+        assertTrue(
+            "detail must carry the channel error, got: $detail",
+            detail.contains("channel error") && detail.contains("binder died"),
+        )
+        assertEquals("throwing install must be attempted once, got: ${gateway.commands}", 1, gateway.installRuns())
+        assertTrue(
+            "no probe may run after a throwing install, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
+        )
+    }
+
+    // Stage3-2a (unknown-after-send same-direction): install timedOut 但唯讀
+    // probe 確認 Installed -> Success（絕不判 InstallFailed）。
+    @Test
+    fun installTimedOut_probeInstalled_isSuccess() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "shizuku: exec timed out after 60000ms",
+            installTimedOut = true,
+            listPackagesOut = "package:com.example.chat\n",
+            listPackagesExit = 0,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected Success, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(95, (outcome as CloneOutcome.Success).dualId)
+        assertEquals(1, gateway.installRuns())
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // Stage3-2b (unknown-after-send reverse): install timedOut 但唯讀 probe
+    // 乾淨缺席 -> VerifyUnknown（絕不判 InstallFailed/VerifyFailed；寫入仍
+    // 可能落地，下一輪 refresh 收斂）。
+    @Test
+    fun installTimedOut_probeAbsent_isVerifyUnknown() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "shizuku: exec timed out after 60000ms",
+            installTimedOut = true,
+            listPackagesOut = "",
+            listPackagesExit = 0,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain reverse is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.installRuns())
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // Stage3-3 (write 後 after-pin drift):install 與 list-packages 之間翻
+    // serial (15 -> 41，重建同 id 新 incarnation) -> VerifyUnknown
+    // (identity-changed，永不 Success/VerifyFailed），零額外 install。
+    @Test
+    fun installSuccess_serialFlipsAfterWrite_isVerifyUnknownWithSingleInstall() {
+        val gateway = FakeGateway(
+            installOut = "Package com.example.chat installed for user: 95",
+            installExit = 0,
+            // 即使 probe 本會命中，drift 仍優先：VerifyUnknown。
+            listPackagesOut = "package:com.example.chat\n",
+            listPackagesExit = 0,
+            serialAfterWrite = 41,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue(
+            "expected VerifyUnknown (identity drift), never Success/VerifyFailed, got: $outcome",
+            outcome is CloneOutcome.VerifyUnknown,
+        )
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals("drift must not resend the write, got: ${gateway.commands}", 1, gateway.installRuns())
+        assertTrue(
+            "drift short-circuits before any list probe, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
         )
     }
 }
