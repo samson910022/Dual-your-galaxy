@@ -270,6 +270,28 @@ object PmOutputParser {
         }
     }
 
+    // Serial-bound verified dual target (PR-33 R2, P1). Same channels and
+    // fail-closed mapping as resolveDualUserIdVerified, but returns the
+    // (userId, serial) target via SamsungProfileAdapter.resolveDualTarget:
+    // null when the id is not Confirmed or when the two verbose channels do
+    // not agree on one non-null serial for it. The pm-list label is never
+    // read here (display-only by contract).
+    //
+    // @param userListVerbose raw `cmd user list -v` output.
+    // @param dumpsysUser raw `dumpsys user` output.
+    // @param propertyId optional system-property dual id (same contract as
+    //   resolveDualUserIdVerified: null means "no property claim").
+    fun resolveDualTargetVerified(
+        userListVerbose: String,
+        dumpsysUser: String,
+        propertyId: Int? = null,
+    ): VerifiedDualTarget? {
+        val candidates =
+            SamsungProfileAdapter.parseUserListVerbose(userListVerbose) +
+                SamsungProfileAdapter.parseDumpsysUser(dumpsysUser)
+        return SamsungProfileAdapter.resolveDualTarget(candidates, propertyId)
+    }
+
     // Parses `getprop sys.dualapp.profile_id` output into a property claim.
     // Strict single-line full match `^\s*(-?\d+)\s*$`: the whole payload
     // must be one integer token (surrounding whitespace allowed). A payload

@@ -161,5 +161,9 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // PR-32 P2-2: deterministic DualViewModel tests (dispatchers/heartbeat/
     // dedup/channel queue). Test-only, production dependencies unchanged.
+    // PR-4 P1 (issue #23): RemoveConfirmTest drives DualViewModel (viewModelScope
+    // needs Dispatchers.Main). kotlinx-coroutines-test provides setMain/resetMain
+    // so JVM tests can replace Main with Unconfined; same coroutines line as
+    // the app (1.9.0).
     testImplementation(libs.coroutines.test)
 }

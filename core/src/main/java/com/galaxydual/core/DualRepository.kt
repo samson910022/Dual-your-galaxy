@@ -5,6 +5,22 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlin.jvm.Volatile
 
+// Serial-bound dual target fetch result (PR-33 R2, P1): distinguishes a
+// confirmed (id, serial) target from "no dual" and from "id confirmed but
+// the serial cannot be established", so the two-phase remove confirm can
+// refuse a possibly-recreated profile instead of uninstalling it.
+sealed interface DualTargetResult {
+    // Both verbose channels agree on the id AND on one non-null serial.
+    data class Confirmed(val target: VerifiedDualTarget) : DualTargetResult
+
+    // The id itself is not confirmed (Unknown/Refused, or a failed channel).
+    data object NoDual : DualTargetResult
+
+    // The id is confirmed but no single agreed serial exists (no serial on
+    // either verbose channel, or the two serials disagree).
+    data object SerialUnavailable : DualTargetResult
+}
+
 // Profile-list snapshot distinguishing channel failure from an empty parse.
 // Phase C3 (issue #9): listProfiles() collapses both to emptyList by design
 // (C2 contract, kept); callers that must tell "channel failed" apart from
@@ -75,6 +91,24 @@ sealed interface RemoveOutcome {
     // Uninstall reported success but the re-check channel failed: unknown,
     // must NOT be dropped from the UI's cloned list (fail closed).
     data class VerifyUnknown(val dualId: Int, val detail: String = "") : RemoveOutcome
+
+    /**
+     * pinned 期望與當下 verified 不一致，零卸載，呼叫方應視為 INVALID 請重新確認。
+     */
+    data class TargetMoved(val expected: Int, val verified: Int) : RemoveOutcome
+
+    /**
+     * pinned serial 與當下 verified serial 不一致（或當下 serial 不可用），
+     * 零卸載，呼叫方應視為 INVALID 請重新確認（與 TargetMoved 同式）。
+     * null expected 表示呼叫方根本不可驗證（VM 必傳，此分支只應出現在程式化
+     * 誤用）；null actual 表示當下目標無可用 serial。
+     */
+    data class SerialMismatch(val expected: Int?, val actual: Int?) : RemoveOutcome
+
+    /**
+     * confirm 前被取消，零卸載，呼叫方只清 loading 不覆寫 msg。
+     */
+    data object Cancelled : RemoveOutcome
 }
 
 // Outcome of a single-target refresh (Phase D P2-D, issue #21): one
@@ -223,6 +257,65 @@ class DualRepository(
     // serial/parentId continuity signals for ID-reuse protection. Null means
     // Unknown/Refused/channel failure (fail closed).
     private suspend fun fetchVerifiedTarget(): VerifiedTarget? = gateway.fetchVerifiedTarget()
+
+    // Single shared serial-bound identity fetch (PR-33 R2, P1; single-source
+    // policy PR-33 D2): same three gateway runs, CancellationException
+    // rethrow, and fail-closed mapping as fetchVerifiedDualId, but keeps the
+    // agreed serial. A confirmed id maps to Confirmed(target) only when the
+    // verbose channels yield exactly one agreed non-null serial (at least
+    // one side must carry it -- new-ROM verbose has no serial line, so a
+    // dumpsys-only serial confirms; both-missing or disagreeing still
+    // refuses); a confirmed id without an agreed serial maps
+    // to SerialUnavailable; an unconfirmed id (or any failed channel) maps
+    // to NoDual. Never throws except on coroutine cancellation.
+    suspend fun fetchDualTarget(): DualTargetResult {
+        val verboseRes = try {
+            gateway.run(CMD_USER_LIST_VERBOSE)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualTargetResult.NoDual
+        }
+        val dumpsysRes = try {
+            gateway.run(CMD_DUMPSYS_USER)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualTargetResult.NoDual
+        }
+        if (verboseRes.truncated || dumpsysRes.truncated) return DualTargetResult.NoDual
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return DualTargetResult.NoDual
+        // Channel hygiene (Phase F review MAJOR-1): same three gates as
+        // VerifiedIdentity.fetchVerifiedTarget (truncated + isIdentityChannelOk
+        // + property identity gate). isIdentityChannelOk is the strict
+        // identity rule (no install-only exemptions/header-strip), not the
+        // pm-channel isSuccess used for install/uninstall outputs.
+        if (!PmOutputParser.isIdentityChannelOk(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) {
+            return DualTargetResult.NoDual
+        }
+        if (!PmOutputParser.isIdentityChannelOk(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) {
+            return DualTargetResult.NoDual
+        }
+        val propRes = try {
+            gateway.run(CMD_GETPROP_DUAL)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            null
+        }
+        // Truncated property is not "no claim": a cut payload may hide a
+        // mismatch, so fail closed to NoDual (same as fetchVerifiedTarget).
+        if (propRes != null && propRes.truncated) return DualTargetResult.NoDual
+        val propertyId = propRes
+            ?.takeIf { PmOutputParser.isIdentityChannelOk(it.out + "\n" + it.err, it.exit) }
+            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        // Id first (same resolver as fetchVerifiedDualId): unconfirmed means
+        // there is no target at all, regardless of serial lines.
+        val verifiedId =
+            PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
+        if (verifiedId < 0) return DualTargetResult.NoDual
+        val target =
+            PmOutputParser.resolveDualTargetVerified(verboseRes.out, dumpsysRes.out, propertyId)
+                ?: return DualTargetResult.SerialUnavailable
+        return DualTargetResult.Confirmed(target)
+    }
 
     // Clones a package into the dual profile via `pm install-existing`.
     // Auto path carries the resolve-time identity as `expected`: the fresh
@@ -658,6 +751,107 @@ class DualRepository(
             return detail
         }
         return null
+    }
+
+    /**
+     * Pinned remove with an expected id (PR-4 Stage 1, issue #23): pin-style
+     * execution for the two-phase confirm. The VM passes the request-time
+     * dualId; this call snapshots, re-fetches the verified target, and
+     * refuses (fail closed, no uninstall) when the verified target moved.
+     *
+     * PR-33 R2 (P1 serial binding): the VM additionally passes the
+     * request-time serial ([expectedSerial], no default -- callers must pass
+     * it). After the cancel check and before any uninstall, the serial-bound
+     * target is re-fetched: a re-created profile (same id, fresh serial) or
+     * an unavailable serial maps to [RemoveOutcome.SerialMismatch] with zero
+     * uninstalls. A null [expectedSerial] means the caller cannot verify at
+     * all and is refused directly as SerialMismatch(null, actual). An id
+     * mismatch keeps the [RemoveOutcome.TargetMoved] mapping.
+     */
+    suspend fun removeVerifiedExpected(
+        pkg: String,
+        expectedDualId: Int,
+        expectedSerial: Int?,
+        isStillValid: () -> Boolean = { true },
+    ): RemoveOutcome {
+        val snap = profilesSnapshot()
+        if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
+        val profiles = (snap as ProfilesSnapshot.Loaded).profiles
+        val verified = fetchVerifiedDualId()
+        if (verified < 0 || expectedDualId < 0) return RemoveOutcome.NoDual
+        if (verified != expectedDualId) {
+            return RemoveOutcome.TargetMoved(expectedDualId, verified)
+        }
+        if (profiles.none { it.userId == expectedDualId }) return RemoveOutcome.NoDual
+        val clean = pkg.trim()
+        val uninstallCmd = try {
+            PmOutputParser.buildUninstall(clean, expectedDualId)
+        } catch (e: IllegalArgumentException) {
+            return RemoveOutcome.InvalidPackage(clean)
+        }
+        // 縮小 cancel 窗：uninstall 前再檢查一次 pending 是否仍有效，擋住
+        // confirm 與 cancel 交錯的程式化路徑。仍非原子（檢查與執行之間仍有
+        // 間隙），UI 層另用不可取消擋住使用者路徑（back/outside-tap）。
+        if (!isStillValid()) return RemoveOutcome.Cancelled
+        // P1 serial binding (PR-33 R2): re-fetch the serial-bound target
+        // AFTER the cancel check, BEFORE any uninstall. A recreated profile
+        // (same id+label, fresh serial) must never be uninstalled: any id
+        // mismatch keeps TargetMoved, while a serial mismatch -- or no
+        // confirmable serial at all (including a null expectedSerial, which
+        // means the caller cannot verify) -- maps to SerialMismatch.
+        // 零卸載 fail closed。
+        val second = fetchDualTarget()
+        if (second is DualTargetResult.Confirmed && second.target.userId != expectedDualId) {
+            return RemoveOutcome.TargetMoved(expectedDualId, second.target.userId)
+        }
+        val actualSerial = (second as? DualTargetResult.Confirmed)?.target?.serial
+        if (expectedSerial == null || actualSerial != expectedSerial) {
+            return RemoveOutcome.SerialMismatch(expectedSerial, actualSerial)
+        }
+        // 第二道閘：縮小 serial-gate→uninstall 的 check-to-use 窗；仍非原子，UI 不可取消覆蓋使用者路徑。
+        if (!isStillValid()) return RemoveOutcome.Cancelled
+        val res = try {
+            gateway.run(uninstallCmd)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return RemoveOutcome.VerifyUnknown(expectedDualId, e.message ?: e.javaClass.simpleName)
+        }
+        // Unknown-after-send (PR-32 P1-1, same rule as cloneVerified/
+        // removeVerified): a timed-out write reply proves nothing about the
+        // remote uninstall -- verify read-only instead of claiming failure.
+        if (res.timedOut || isServiceTimeoutText(res.err)) {
+            return when (val state = verifyListProbe(clean, expectedDualId)) {
+                is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
+                is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
+                is VerifyState.Unknown ->
+                    RemoveOutcome.VerifyUnknown(
+                        expectedDualId,
+                        writeTimeoutDetail(state.detail, byText = !res.timedOut),
+                    )
+            }
+        }
+        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
+            return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
+        }
+        // Post-write after-pin (Phase F review MAJOR-2): the uninstall already
+        // executed on the pinned id; re-fetch and require the identity pin to
+        // still hold before the list re-check, so a profile recreated in the
+        // write window is reported honestly as VerifyUnknown instead of a
+        // clean Success. Synthetic before: removeVerifiedExpected carries only
+        // (expectedDualId, expectedSerial), not a full resolve-time target, so
+        // the before is reconstructed here with parentId=null; missing-tolerated
+        // semantics (see checkTargetDrift) tolerates the absent parent while
+        // still guarding id/serial reuse. Report-only: the write itself already
+        // ran on the pre-write pinned target.
+        val syntheticBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
+        val after = fetchVerifiedTarget()
+        val drift = checkTargetDrift(syntheticBefore, after)
+        if (drift != null) return RemoveOutcome.VerifyUnknown(expectedDualId, drift)
+        return when (val state = verifyListProbe(clean, expectedDualId)) {
+            is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
+            is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
+            is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(expectedDualId, state.detail)
+        }
     }
 
     // Runs the `pm list packages --user <dualId>` re-check for an
