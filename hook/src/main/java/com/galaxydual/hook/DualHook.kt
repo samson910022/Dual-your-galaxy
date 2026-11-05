@@ -72,6 +72,12 @@ class DualHook : XposedModule() {
     // #isInstalledWhitelistedPackage when present on this Samsung ROM.
     // Returns the number of installed hooks (0 = nothing hooked, so the
     // caller skips the active-marker write and stays honestly undetected).
+    //
+    // Device evidence (S24 OneUI 9, services.jar dexdump-verified):
+    // com.android.server.DualAppManagerService exists with both methods
+    // (getAllWhitelistedPackages x2 refs, isInstalledWhitelistedPackage x4
+    // + Internal variant); lspd logs confirm candidate 1 wins with
+    // deoptimize+hook success on all boots. Candidates 2-3 stay as fallback.
     private fun hookDualAppManagerService(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, SERVICE_CLASS_CANDIDATES)
         if (target == null) {
@@ -94,19 +100,46 @@ class DualHook : XposedModule() {
     // Hooks the daagent-side whitelist holder reflectively. Returns the
     // number of installed hooks (clinit patch hook + query-method hooks);
     // 0 keeps the caller from writing the active marker.
+    //
+    // Device evidence (S24 OneUI 9, DAAgent v3.7.00.0, dexdump-verified):
+    // provider.WhiteListApps is a PUBLIC ABSTRACT constants-only holder
+    // (3 static-final String[] + <clinit> + Base64 helper, zero query
+    // methods), so the <clinit> patch is the effective daagent hook and the
+    // fuzzy *hitelist* sweep correctly installs nothing here. Read queries
+    // live in DualAppDBHelper.getAllInstalledWhitelistedPackages,
+    // DAUtility.getWhiteListPkgs/*
+    // (*InSystemServer), and DualAppManager.*WhitelistPackage* -- future
+    // non-empty-policy work should target those with method-level evidence,
+    // keeping this holder as the patch point.
     private fun hookWhiteListApps(classLoader: ClassLoader): Int {
-        val target = try {
-            classLoader.loadClass(WHITE_LIST_APPS_CLASS)
-        } catch (_: Throwable) {
-            logi("$WHITE_LIST_APPS_CLASS not present, skip daagent hooks")
+        val target = findFirstAvailableClass(classLoader, WHITE_LIST_APPS_CLASS_CANDIDATES)
+        if (target == null) {
+            logi("WhiteListApps not present, skip daagent hooks")
             return 0
         }
+        // Attribution for on-device forensics: the winning candidate disambiguates
+        // provider path vs legacy fallback in lspd logs (field-found lines alone
+        // cannot, both candidates carry the same field names).
+        logi("using ${target.name} for daagent hooks")
         // Best-effort diagnostics: confirm the expected constant exists.
-        try {
-            val field = target.getDeclaredField(WHITELIST_FIELD_NAME)
-            logi("found $WHITELIST_FIELD_NAME : ${field.type.name} static=${Modifier.isStatic(field.modifiers)}")
-        } catch (_: Throwable) {
-            logi("field $WHITELIST_FIELD_NAME not found on $WHITE_LIST_APPS_CLASS")
+        // First candidate present wins; CHINA variant is accepted as fallback.
+        val diagnosticField = WHITELIST_FIELD_CANDIDATES.firstOrNull { name ->
+            try {
+                target.getDeclaredField(name)
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (diagnosticField != null) {
+            try {
+                val field = target.getDeclaredField(diagnosticField)
+                logi("found $diagnosticField : ${field.type.name} static=${Modifier.isStatic(field.modifiers)}")
+            } catch (_: Throwable) {
+                logi("field $diagnosticField not found on ${target.name}")
+            }
+        } else {
+            logi("field $WHITELIST_FIELD_NAME not found on ${target.name}")
         }
         // Patch the static whitelist right after <clinit> finishes.
         var installed = 0
@@ -222,40 +255,53 @@ class DualHook : XposedModule() {
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
         if (extra.isEmpty()) return
+        // First existing field wins: standard name preferred, CHINA variant fallback.
+        val fieldName = WHITELIST_FIELD_CANDIDATES.firstOrNull { name ->
+            try {
+                target.getDeclaredField(name)
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (fieldName == null) {
+            logi("patch skipped on ${target.name}: no whitelist field found")
+            return
+        }
         try {
-            val field = target.getDeclaredField(WHITELIST_FIELD_NAME)
+            val field = target.getDeclaredField(fieldName)
             // Static check BEFORE get(null): an instance field's get(null)
             // throws IllegalArgumentException, which would mask the precise
             // "not static" diagnosis. WhitelistPatch keeps its own isStatic
             // guard as defense-in-depth for direct callers/tests.
             if (!Modifier.isStatic(field.modifiers)) {
-                logi("skip patch $WHITELIST_FIELD_NAME on ${target.name}: field is not static")
+                logi("skip patch $fieldName on ${target.name}: field is not static")
                 return
             }
             field.isAccessible = true
             val current = try {
                 field.get(null)
             } catch (t: Throwable) {
-                logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
+                logi("patch $fieldName on ${target.name} failed: ${t.message}")
                 return
             }
-            when (val outcome = WhitelistPatch.apply(current, true, extra, WHITELIST_FIELD_NAME, target.name)) {
+            when (val outcome = WhitelistPatch.apply(current, true, extra, fieldName, target.name)) {
                 is WhitelistPatch.Outcome.PatchedInPlace ->
-                    logi("patched $WHITELIST_FIELD_NAME on ${target.name} (MutableList): +${outcome.added} entries")
+                    logi("patched $fieldName on ${target.name} (MutableList): +${outcome.added} entries")
                 is WhitelistPatch.Outcome.Replaced -> {
                     try {
                         field.set(null, outcome.value)
                     } catch (t: Throwable) {
-                        logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
+                        logi("patch $fieldName on ${target.name} failed: ${t.message}")
                         return
                     }
-                    logi("patched $WHITELIST_FIELD_NAME on ${target.name} (String[]): +${outcome.added} entries")
+                    logi("patched $fieldName on ${target.name} (String[]): +${outcome.added} entries")
                 }
                 is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason)
             }
         } catch (t: Throwable) {
             // Leave the original whitelist untouched on any reflection mismatch.
-            logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
+            logi("patch $fieldName on ${target.name} failed: ${t.message}")
         }
     }
 
@@ -315,8 +361,15 @@ class DualHook : XposedModule() {
             "isInstalledWhitelistedPackage",
         )
 
-        private const val WHITE_LIST_APPS_CLASS = "com.samsung.android.da.daagent.WhiteListApps"
+        private val WHITE_LIST_APPS_CLASS_CANDIDATES = listOf(
+            "com.samsung.android.da.daagent.provider.WhiteListApps",
+            "com.samsung.android.da.daagent.WhiteListApps",
+        )
         private const val WHITELIST_FIELD_NAME = "DUAL_APP_WHITELIST_PACKAGES"
+        private val WHITELIST_FIELD_CANDIDATES = listOf(
+            "DUAL_APP_WHITELIST_PACKAGES",
+            "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA",
+        )
 
         private const val HOOK_ID_PREFIX = "galaxydual:"
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"

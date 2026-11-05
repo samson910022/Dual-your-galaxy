@@ -11,11 +11,13 @@
 
 - [已支援] profile 解析安全邊界（只認唯一 DUAL、永不選 user 0）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [待實機驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋F4b-P1 picker＋P2 marker DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
-  `DualViewModel.clone/remove/refresh/recheckPrivilege/selectChannel` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating（`channelReadyFor` [已支援] pure gate：ROOT 需 su 探測、hook 訊號永不授權，NONE 永不就緒），選不到仍維持 `NoOp`＋唯讀 fail-closed；hook 訊號為 file marker 存在性證據（`HookStateProvider`，僅顯示，[待實機驗證]）；binder round-trip、授權四情境、su 實機行為、端到端 pm、marker round-trip 皆未驗）。
+- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋F4b-P1 picker＋P2 marker DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
+  `DualViewModel.clone/remove/refresh/recheckPrivilege/selectChannel` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating（`channelReadyFor` [已支援] pure gate：ROOT 需 su 探測、hook 訊號永不授權，NONE 永不就緒），選不到仍維持 `NoOp`＋唯讀 fail-closed；hook 訊號為 file marker 存在性證據（`HookStateProvider`，僅顯示；`path` 主驗證、binder round-trip、授權四情境、su 實機行為、App 內一鍵端到端、marker round-trip 皆未驗；注：裸 `pm install-existing --user 95`＋list 二次確認 [S24 已驗證]，見下條）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
 - [待實機驗證] LSPosed 載入、Shizuku 四情境（有／無 binder × 有／無授權，含重啟後重啟動）、
-  雙開實機（`install-existing / path / uninstall --user` 端到端）。
+  雙開實機（`install-existing / path / uninstall --user` 端到端；其中
+  `install-existing --user 95`＋`pm list packages --user 95` 二次確認
+  [S24 已驗證]：ChatGPT `com.openai.chatgpt`，shell 通道，兩次獨立成功）。
 
 Hook 誠實聲明（`docs/HOOK.md` 第 1.1 節，本文引用不再重述為已生效）：
 hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、會記 log，

@@ -26,7 +26,7 @@
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
 
-### 1.2 system_server：`dual_app` 服務家族
+### 1.2 system_server：`dual_app` 服務家族 [S24 OneUI 9 部分已驗證]
 
 雙開服務跑在 `system_server` 內，對外以 binder 服務 `dual_app` 暴露。
 常見的白名單查詢 transaction 編號落在 **1／2／3／4**（白名單列表、
@@ -39,6 +39,13 @@ adb shell service list | grep -i dual
 # 2. 查實作類別（版本不同類別名不同，模組內已做多候選反射）
 adb shell dumpsys activity services | grep -i -A2 dual
 ```
+
+實機證據（S24 SM-S9210，OneUI 9／Android 17，PDA S9210ZHU6EZIF）：
+`service list` 確認 `dual_app: com.samsung.android.app.ISemDualAppManager`；
+services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
+（含兩方法＋ `isInstalledWhitelistedPackageInternal` 變體）；lspd 模組日誌
+確認候選 1 在三次 system_server 啟動皆 `deoptimized`＋`hooked` 成功、
+無 `method not found`。候選 2／3 在此 ROM 未命中，保留為 fallback。
 
 模組在 `onSystemServerStarting` 以反射依序嘗試（第一個載入成功者勝出，
 其餘 `try/catch` 略過，非三星 ROM 自動無操作）：
@@ -59,13 +66,26 @@ Hook Builder 統一使用
 **`ExceptionMode.PROTECTIVE`**（佔位保護）：hook 自身出錯只記 log 並跳過，
 絕不拖垮 `system_server`。
 
-### 1.3 daagent：`WhiteListApps`
+### 1.3 daagent：`WhiteListApps` [S24 OneUI 9 部分已驗證]
 
 `com.samsung.android.da.daagent` 進程內的
-`WhiteListApps` 持有靜態白名單常量：
+`WhiteListApps`（完整路徑 `com.samsung.android.da.daagent.provider.WhiteListApps`，
+舊短路徑保留為 fallback）持有靜態白名單常量：
 
-- 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`**（僅診斷記 log＋合併用，
-  找不到就略過，不拋錯）。
+實機證據（S24，DAAgent v3.7.00.0，dexdump 反編譯確認）：
+該類為 `PUBLIC ABSTRACT` 純常量持有者（3 個 `static final String[]`：
+`DUAL_APP_WHITELIST_PACKAGES`、`..._FOR_CHINA`、`CHINA_SALES_CODES`，
+僅 `<clinit>`＋Base64 helper，**零查詢方法**）——故 `<clinit>` patch 是
+有效的 daagent hook，模糊 `*hitelist*` 掃描在此類正確掛上零方法；
+讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
+`DAUtility.getWhiteListPkgs`／`*InSystemServer`、`DualAppManager.*WhitelistPackage*`
+（未來非空政策接上時的方法級 hook 目標）。lspd 日誌已確認 daagent 行程載入
+含該欄位的類（`found ... static=true` 跨多代行程）；勝出路徑歸因靠新建的
+`using <class> for daagent hooks` 行，下次 daagent 行程重啟後驗證
+（禁重啟期間以舊行程駐留為準）。
+
+- 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`**（＋`..._FOR_CHINA` 變體；
+  僅診斷記 log＋合併用，找不到就略過，不拋錯）。
 - `hookClassInitializer`：在 `<clinit>` 跑完後把政策集合併入靜態欄位
   （支援 `MutableList`／`String[]` 兩種形態；非 static、型別不合、反射失敗
   一律放棄**並記 log**，方便定位）。
@@ -104,6 +124,17 @@ S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detec
 注入面卻換來更弱的證據。hook 啟用訊號的唯一來源是 file marker，
 App 側經 `HookStateProvider` 讀取、僅顯示、永不進入路由
 （`hasLsposed` 恆 `false`，見 `DualViewModel.probeChannels`）。
+
+Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
+- 主路徑已寫入：`scope=system_server`（system_server 側 hook 安裝後寫入成功）。
+- daagent 側雙路徑 EACCES：主＋備皆不可寫（daagent SELinux 域限制），
+  故 marker 目前僅含 `system_server`；daagent hook 安裝證據以 lspd 日誌
+  `found ... static=true`＋clinit 行為準，不以 marker scope 齊全為準。
+- App uid／`run-as` 皆不可讀任一路徑 [S24 已驗證]：直接讀取恆為
+  「未偵測到」（fail-closed 符合設計）；有 SHELL／ROOT 通道就緒時才走
+  gateway `cat` 重試（[待實機驗證]）。
+- daagent 新類路徑（provider 首選）掛載待 daagent 行程重啟後以
+  `using <class> for daagent hooks` 行驗證 [待重啟驗]（禁重啟期間舊行程駐留）。
 
 ## 2. Scope 勾選教學
 
