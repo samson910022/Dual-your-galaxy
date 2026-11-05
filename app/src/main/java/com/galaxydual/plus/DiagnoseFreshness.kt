@@ -329,16 +329,18 @@ fun RemoveOutcome.toDiagnoseCode(): DiagnoseCode = when (this) {
 // OK 遇碼即回 null (見 DiagnoseCode 契約)；VerifyFailed 的 tech
 // 改用 redactPackage() 後包名+dualId (包名由呼叫端經 pkg 傳入，缺省空字串
 // 時沿用舊泛稱)。
+// 口徑 (P26)：ChannelError/InstallFailed/VerifyUnknown 的 detail 為 shell
+// 原文，入 diagnoseEvent 前先過 redactPii (匯出再過一次冪等)。
 fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
     val code = toDiagnoseCode()
     if (code == DiagnoseCode.OK) return null
     val tech = when (this) {
-        is CloneOutcome.ChannelError -> detail
-        is CloneOutcome.InstallFailed -> detail
+        is CloneOutcome.ChannelError -> redactPii(detail)
+        is CloneOutcome.InstallFailed -> redactPii(detail)
         is CloneOutcome.VerifyFailed ->
             if (pkg.isBlank()) "pkg not installed for user $dualId"
             else "${redactPackage(pkg)} not installed for user $dualId"
-        is CloneOutcome.VerifyUnknown -> detail
+        is CloneOutcome.VerifyUnknown -> redactPii(detail)
         else -> ""
     }
     return diagnoseEvent(code, exit = exit, techDetail = tech)
@@ -347,16 +349,17 @@ fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseE
 // RemoveOutcome -> DiagnoseEvent (契約同上：exit 前向相容佔位，現行尚無
 // 呼叫端填真實 exit；OK 遇碼即回 null；StillInstalled 的 tech 改用
 // redactPackage() 後包名+dualId)。
+// 口徑 (P26)：shell 原文分支先過 redactPii。
 fun RemoveOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
     val code = toDiagnoseCode()
     if (code == DiagnoseCode.OK) return null
     val tech = when (this) {
-        is RemoveOutcome.ChannelError -> detail
-        is RemoveOutcome.RemoveFailed -> detail
+        is RemoveOutcome.ChannelError -> redactPii(detail)
+        is RemoveOutcome.RemoveFailed -> redactPii(detail)
         is RemoveOutcome.StillInstalled ->
             if (pkg.isBlank()) "pkg still installed for user $dualId"
             else "${redactPackage(pkg)} still installed for user $dualId"
-        is RemoveOutcome.VerifyUnknown -> detail
+        is RemoveOutcome.VerifyUnknown -> redactPii(detail)
         is RemoveOutcome.TargetMoved -> "verified id $verified != expected $expected"
         is RemoveOutcome.SerialMismatch -> "serial ${actual ?: "?"} != expected ${expected ?: "?"}"
         else -> ""
@@ -364,10 +367,10 @@ fun RemoveOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): Diagnose
     return diagnoseEvent(code, exit = exit, techDetail = tech)
 }
 
-// profilesSnapshot 失敗 -> DiagnoseEvent (refresh 第一跳)。
+// profilesSnapshot 失敗 -> DiagnoseEvent (refresh 第一跳；shell 原文先遮蔽)。
 fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
     is ProfilesSnapshot.Loaded -> null
-    is ProfilesSnapshot.ChannelError -> diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = detail)
+    is ProfilesSnapshot.ChannelError -> diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = redactPii(detail))
 }
 
 // 個資遮蔽 (純函數)：四道——郵件→包名→IP→路徑 (順序固定)。

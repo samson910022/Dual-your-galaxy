@@ -18,9 +18,12 @@
     <!-- Shizuku shell fallback channel (downgrade path when LSPosed is absent). -->
     <uses-permission android:name="moe.shizuku.manager.permission.APIV2" />
 
+    <!-- allowBackup=false：無備份需求，排除 dual_selection (SharedPreferences) 上雲；
+         選取僅本機持久化，重裝即失效符合 fail-closed。 -->
     <application
         android:label="Galaxy Dual Plus"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true">
