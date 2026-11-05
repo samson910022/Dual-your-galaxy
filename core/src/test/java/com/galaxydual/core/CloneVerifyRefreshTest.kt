@@ -23,6 +23,12 @@ class CloneVerifyRefreshTest {
         var listUsersOut: String = DEFAULT_USERS,
         var listUsersErr: String = "",
         var listUsersExit: Int = 0,
+        var userListVerboseOut: String = DEFAULT_VERBOSE_95,
+        var userListVerboseExit: Int = 0,
+        var dumpsysOut: String = DEFAULT_DUMPSYS_95,
+        var dumpsysExit: Int = 0,
+        var propOut: String = DEFAULT_PROP_95,
+        var propExit: Int = 0,
         var installOut: String = "Package com.example.chat installed for user: 95",
         var installErr: String = "",
         var installExit: Int = 0,
@@ -44,6 +50,12 @@ class CloneVerifyRefreshTest {
             return when {
                 cmd == DualRepository.CMD_LIST_USERS ->
                     CmdResult(exit = listUsersExit, out = listUsersOut, err = listUsersErr)
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = userListVerboseExit, out = userListVerboseOut, err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = dumpsysExit, out = dumpsysOut, err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = propExit, out = propOut, err = "")
                 cmd.startsWith("pm install-existing") ->
                     CmdResult(exit = installExit, out = installOut, err = installErr)
                 cmd.startsWith("pm uninstall") ->
@@ -58,13 +70,59 @@ class CloneVerifyRefreshTest {
 
         fun listUsersCalls(): Int = commands.count { it == DualRepository.CMD_LIST_USERS }
 
-        fun writeCommands(): List<String> = commands.filter { it != DualRepository.CMD_LIST_USERS }
+        // Identity reads are not writes: only install/uninstall/list-packages
+        // count here so pinning assertions keep their meaning.
+        fun writeCommands(): List<String> = commands.filter {
+            it != DualRepository.CMD_LIST_USERS &&
+                it != DualRepository.CMD_USER_LIST_VERBOSE &&
+                it != DualRepository.CMD_DUMPSYS_USER &&
+                it != DualRepository.CMD_GETPROP_DUAL
+        }
 
         companion object {
             const val DEFAULT_USERS =
                 "Users:\n" +
                     "\tUserInfo{0:Owner:13} running\n" +
                     "\tUserInfo{95:DUAL_APP:400} running\n"
+            const val DEFAULT_VERBOSE_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_DUMPSYS_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_PROP_95 = "95\n"
+            // Verified-absent identity: Owner + Work, both non-CLONE (for the
+            // NoDual test below). Serials are distinct from userIds.
+            const val NODUAL_USERS =
+                "Users:\n" +
+                    "\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{10:Work profile:30} running\n"
+            const val NODUAL_VERBOSE =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{10:Work profile:30} running:\n" +
+                    "    Serial: 11\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.MANAGED\n"
+            const val NODUAL_DUMPSYS =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{10:Work profile:30} serialNo=11:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.MANAGED\n"
         }
     }
 
@@ -360,12 +418,14 @@ class CloneVerifyRefreshTest {
     }
 
     // No DUAL profile: NoDual outcomes, no writes, null listing.
+    // Stage 2: verified-absent (Owner SYSTEM + Work MANAGED, no CLONE claim).
     @Test
     fun noDual_runsNoWrite() {
         val gateway = FakeGateway(
-            listUsersOut = "Users:\n" +
-                "\tUserInfo{0:Owner:13} running\n" +
-                "\tUserInfo{10:Work profile:30} running\n",
+            listUsersOut = FakeGateway.NODUAL_USERS,
+            userListVerboseOut = FakeGateway.NODUAL_VERBOSE,
+            dumpsysOut = FakeGateway.NODUAL_DUMPSYS,
+            propOut = "",
         )
         val repo = DualRepository(gateway)
         assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)

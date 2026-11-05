@@ -35,6 +35,12 @@ class VerifyRetryTest {
             return when {
                 cmd == DualRepository.CMD_LIST_USERS ->
                     CmdResult(exit = 0, out = DEFAULT_USERS, err = "")
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = DEFAULT_VERBOSE_95, err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = 0, out = DEFAULT_DUMPSYS_95, err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = DEFAULT_PROP_95, err = "")
                 cmd.startsWith("pm install-existing") ->
                     CmdResult(exit = 0, out = "Package com.example.chat installed for user: 95", err = "")
                 cmd.startsWith("pm uninstall") ->
@@ -52,6 +58,23 @@ class VerifyRetryTest {
                 "Users:\n" +
                     "\tUserInfo{0:Owner:13} running\n" +
                     "\tUserInfo{95:DUAL_APP:400} running\n"
+            const val DEFAULT_VERBOSE_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_DUMPSYS_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_PROP_95 = "95\n"
         }
     }
 
