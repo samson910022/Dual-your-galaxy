@@ -1891,11 +1891,23 @@ class DualViewModel(
                                         val label =
                                             snap.profiles.firstOrNull { it.userId == dualId }?.label
                                         if (label == null) {
-                                            // 理由 (M1 空快照鑑別，repo 簽名不動，照 refreshLocked/clone-NoDual)：
-                                            // 空快照 (連 owner 都無，快照不可信) ->CHANNEL_ERROR 且不清 cloned；
-                                            // 快照正常有戶但 verified 目標缺席才為真 NO_DUAL。
-                                            // 理由 (M3)：寫前拒絕時 FRESH 降 STALE。
+                                            // Stage G P2 (review B)：fresh Confirmed 與 PM 快照衝突
+                                            // (快照可用但缺 target id) 是讀取時間點變動/來源不一致，
+                                            // 不是「確認無 dual」。只有 typed Absent+快照可用才為真
+                                            // NO_DUAL (與 refreshLocked/clone-NoDual 同形)；其餘
+                                            // (typed Confirmed/Unknown，含本分支已見 fresh
+                                            // Confirmed) 一律 VERIFY_MISMATCH + INVALID，要求重查，
+                                            // 零 uninstall。空快照仍為 CHANNEL_ERROR (快照不可信)。
+                                            // 理由 (M3)：寫前拒絕時 FRESH 降 STALE，不清 cloned。
                                             val snapshotUsable = snap.profiles.isNotEmpty()
+                                            val idResForConflict: DualIdResolution? =
+                                                if (snapshotUsable) {
+                                                    onIo { repo.resolveDualUserIdTyped(pmIds = snap.profiles.map { it.userId }.toSet()) }
+                                                } else {
+                                                    null
+                                                }
+                                            val confirmedAbsent =
+                                                idResForConflict is DualIdResolution.Absent && snapshotUsable
                                             val now = nowWallMs()
                                             _state.update { cur ->
                                                 val degraded =
@@ -1924,21 +1936,34 @@ class DualViewModel(
                                                             "cannot confirm dual profile",
                                                         msgKind = MsgKind.CHANNEL,
                                                     )
+                                                } else if (confirmedAbsent) {
+                                                    cur.copy(
+                                                        loading = false,
+                                                        profiles = snap.profiles,
+                                                        pendingRemove = null,
+                                                        inventory = degraded,
+                                                        diagnose = diagnoseEvent(
+                                                            DiagnoseCode.NO_DUAL,
+                                                            techDetail = "typed resolution absent",
+                                                        ),
+                                                        msg = "no dual profile",
+                                                        msgKind = MsgKind.NO_DUAL,
+                                                    )
                                                 } else {
                                                     cur.copy(
                                                         loading = false,
                                                         profiles = snap.profiles,
                                                         pendingRemove = null,
                                                         inventory = degraded,
-                                                        // verified 目標不在快照列中 -> 無可用 dual
-                                                        // (對應 confirmRemove 的 label==null 分支)。
                                                         diagnose = diagnoseEvent(
-                                                            DiagnoseCode.NO_DUAL,
-                                                            techDetail = "verified dual id " +
-                                                                "$dualId absent",
+                                                            DiagnoseCode.VERIFY_MISMATCH,
+                                                            techDetail = "verified id " +
+                                                                "$dualId absent from profiles " +
+                                                                "snapshot",
                                                         ),
-                                                        msg = "no dual profile",
-                                                        msgKind = MsgKind.NO_DUAL,
+                                                        msg = "移除目標已變更（verified id " +
+                                                            "$dualId 與快照不一致），請重新確認",
+                                                        msgKind = MsgKind.INVALID,
                                                     )
                                                 }
                                             }
@@ -2328,10 +2353,17 @@ class DualViewModel(
                                 val label =
                                     snap.profiles.firstOrNull { it.userId == cur.dualId }?.label
                                 if (label == null) {
-                                    // 理由 (M1 空快照鑑別，照 requestRemove 分支)：
-                                    // 空快照 (連 owner 都無，快照不可信) ->CHANNEL_ERROR；
-                                    // 快照正常有戶但 verified 目標缺席才為真 NO_DUAL。
-                                    // 理由 (M3)：寫前拒絕時 FRESH 降 STALE。
+                                    // Stage G P2 (review B)：二次快照 label 缺席但 fresh
+                                    // target 仍 Confirmed (首段 typed 已 Confirmed(cur.dualId)
+                                    // 且第二段 fetchDualTarget 亦 Confirmed 同 id+serial，
+                                    // 見上)——是讀取時間點變動/來源不一致，不是確認無
+                                    // dual。僅 typed Absent+快照可用才為真 NO_DUAL；
+                                    // 此前兩次驗證皆 Confirmed、未觀測到 Absent，故不得
+                                    // 逕報 NO_DUAL (此處省掉第三次 typed 重查：已有兩次
+                                    // Confirmed 背書，省 IO；結論同為保守拒絕)。
+                                    // 一律 VERIFY_MISMATCH + INVALID，要求重查，
+                                    // 零 uninstall。空快照仍為 CHANNEL_ERROR (快照不可信)。
+                                    // 理由 (M3)：寫前拒絕時 FRESH 降 STALE，不清 cloned。
                                     val snapshotUsable = snap.profiles.isNotEmpty()
                                     val now = nowWallMs()
                                     _state.update { st ->
@@ -2368,11 +2400,14 @@ class DualViewModel(
                                                 pendingRemove = null,
                                                 inventory = degraded,
                                                 diagnose = diagnoseEvent(
-                                                    DiagnoseCode.NO_DUAL,
-                                                    techDetail = "verified dual id ${cur.dualId} absent",
+                                                    DiagnoseCode.VERIFY_MISMATCH,
+                                                    techDetail = "verified id " +
+                                                        "${cur.dualId} absent from profiles " +
+                                                        "snapshot",
                                                 ),
-                                                msg = "no dual profile",
-                                                msgKind = MsgKind.NO_DUAL,
+                                                msg = "移除目標已變更（verified id " +
+                                                    "${cur.dualId} 與快照不一致），請重新確認",
+                                                msgKind = MsgKind.INVALID,
                                             )
                                         }
                                     }

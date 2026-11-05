@@ -230,4 +230,158 @@ class RemoveConfirmStageCTest {
             (vm.state.value.diagnose?.techDetail ?: "").startsWith("verified id 96 != 95"),
         )
     }
+
+    // Stage G P2 (review B)：PM 快照漏列已確認 dual (listUsers {0,10} 但
+    // verbose/dumpsys/property 一致 CLONE 95 + serial 15)——讀取時間點變動/
+    // 來源不一致，不是確認無 dual。與 C2 id-drift / C1 serial-missing 區分：
+    // 此處 id 與 serial 皆未漂移，僅快照缺席。
+    private class ConflictGateway(var missing95: Boolean = false) : CmdGateway {
+        override val privilege: Privilege = Privilege.ROOT
+        var uninstallCalls = 0
+        var serial: Int = 15
+        val installedPkgs = mutableSetOf("com.example.chat")
+
+        private fun usersOut(): String =
+            if (!missing95) {
+                "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{10:Work profile:30} running\n" +
+                    "\tUserInfo{95:DualApp:400} running\n"
+            } else {
+                "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{10:Work profile:30} running\n"
+            }
+
+        private fun verboseOut(): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} running:\n" +
+                "    Serial: 11\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.MANAGED\n" +
+                "  UserInfo{95:DualApp:400} running:\n" +
+                "    Serial: $serial\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.CLONE\n"
+
+        private fun dumpsysOut(): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} serialNo=11:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.MANAGED\n" +
+                "  UserInfo{95:DualApp:400} serialNo=$serial:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+
+        override suspend fun run(cmd: String): CmdResult = when {
+            cmd.trim() == "id -u" -> CmdResult(exit = 0, out = "0\n", err = "")
+            cmd == DualRepository.CMD_LIST_USERS ->
+                CmdResult(exit = 0, out = usersOut(), err = "")
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                CmdResult(exit = 0, out = verboseOut(), err = "")
+            cmd == DualRepository.CMD_DUMPSYS_USER ->
+                CmdResult(exit = 0, out = dumpsysOut(), err = "")
+            cmd == DualRepository.CMD_GETPROP_DUAL ->
+                CmdResult(exit = 0, out = "95\n", err = "")
+            cmd.startsWith("pm uninstall") -> {
+                uninstallCalls++
+                val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                installedPkgs.remove(pkg)
+                CmdResult(exit = 0, out = "Success", err = "")
+            }
+            cmd.startsWith("pm list packages") -> {
+                val base = installedPkgs.map { "package:$it" }.joinToString("\n")
+                CmdResult(exit = 0, out = base, err = "")
+            }
+            else -> CmdResult(exit = 0, out = "ok", err = "")
+        }
+    }
+
+    private fun makeConflictVm(gw: ConflictGateway): DualViewModel {
+        val vm = DualViewModel(
+            repo = DualRepository(gw),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(gw), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = SuCmdGateway(),
+            shizukuGateway = ShizukuCmdGateway("com.example.test"),
+            activeGateway = gw,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+        )
+        vms.add(vm)
+        return vm
+    }
+
+    // B1：requestRemove 在 fresh Confirmed(95)+serial 仍成立、僅快照漏列時，
+    // 不得報 NO_DUAL；須 VERIFY_MISMATCH + INVALID、零 uninstall、保 cloned、STALE。
+    @Test
+    fun requestPmMissingWhileTargetConfirmed_mapsMismatch() {
+        val gw = ConflictGateway(missing95 = false)
+        val vm = makeConflictVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        vm.refresh()
+        awaitVm(vm) { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+        assertEquals(95, vm.state.value.inventory.targetId)
+
+        gw.missing95 = true
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.pendingRemove == null }
+
+        assertEquals("conflict must not uninstall", 0, gw.uninstallCalls)
+        assertTrue("conflict must keep the old cloned list", vm.state.value.cloned.contains("com.example.chat"))
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, vm.state.value.diagnose?.code)
+        assertTrue(
+            "conflict must not report NO_DUAL, got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose?.code != DiagnoseCode.NO_DUAL,
+        )
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertEquals("STALE keeps the old target identity", 95, vm.state.value.inventory.targetId)
+        assertTrue(
+            "techDetail must name the absent snapshot, got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").startsWith("verified id 95 absent"),
+        )
+    }
+
+    // B2：confirmRemove 二次快照同形 (首段 typed Confirmed 95 + 第二段 serial
+    // 仍 Confirmed，僅二次快照漏列 95)：同種碼，零 uninstall。
+    @Test
+    fun confirmSecondSnapshotMissingWhileTargetConfirmed_mapsMismatch() {
+        val gw = ConflictGateway(missing95 = false)
+        val vm = makeConflictVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        vm.refresh()
+        awaitVm(vm) { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+        assertEquals(95, vm.state.value.pendingRemove?.dualId)
+
+        gw.missing95 = true
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+
+        assertEquals("second-snapshot conflict must not uninstall", 0, gw.uninstallCalls)
+        assertTrue("conflict must keep the old cloned list", vm.state.value.cloned.contains("com.example.chat"))
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, vm.state.value.diagnose?.code)
+        assertTrue(
+            "conflict must not report NO_DUAL, got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose?.code != DiagnoseCode.NO_DUAL,
+        )
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertTrue(
+            "techDetail must name the absent snapshot, got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").startsWith("verified id 95 absent"),
+        )
+    }
 }
