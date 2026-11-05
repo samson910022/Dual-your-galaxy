@@ -85,3 +85,12 @@ class SuElevator(
         )
     }
 }
+
+// NOTE (H4 reconciliation with #19): an LSPosed Elevator was evaluated (H3:
+// HookElevator over a self-scope prefs flag) and deliberately dropped. The
+// F4b-P2 file marker (HookMarker, scopes system_server/daagent, proven by
+// installed-hook counts) is the single hook-active signal, and by the #19
+// principle it is DISPLAY-ONLY: it never enters privilege routing
+// (hasLsposed stays false) and never satisfies channel readiness. A present
+// marker is existence+scope evidence, not proof of a live, effective hook.
+// Keeping a hook Elevator would risk granting privilege on that weaker claim.

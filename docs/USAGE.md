@@ -13,38 +13,42 @@
 
 - [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [待實機驗證] App 內一鍵 clone 真通道（F4a 已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；
-  `DualViewModel.clone/remove/refresh/recheckPrivilege` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），`channelReady` 改由各通道探測結果 gating，選不到仍維持 `NoOp`＋唯讀 fail-closed；`hasLsposed` 維持保守 `false`（F4b／後續）；指定正常 SHELL clone/remove 與手動通道的歷史證據見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
+- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；寫後主驗證以 listing 為準（`pm path` 僅輔助診斷，見 #22）；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行、callback 可驗日誌、非空政策生效、當前 source 可追溯部署仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
-- [待實機驗證] LSPosed 載入、Shizuku 四情境（有／無 binder × 有／無授權，含重啟後重啟動）、
-  雙開實機（`install-existing / list packages / uninstall --user` 端到端：指定正常 SHELL 情境有歷史實機紀錄，見 [S24 調查](UX_REVIEW_S24.md) §5；當前 source 可追溯部署與完整矩陣仍待驗）。
+- [部分已驗證] LSPosed 載入（system hook 雙方法 deoptimize＋hooked [S24 已驗證]、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取） [S24 已驗證]、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效） [S24 已驗證]，其餘 LSPosed 寫入、非空政策 [待實機驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
+  雙開實機（`install-existing / path / uninstall --user` 端到端；其中
+  `install-existing --user 95`＋`pm list packages --user 95` 二次確認
+  [S24 已驗證]：裸 pm shell 通道兩次獨立成功）。
 
 Hook 誠實聲明（`docs/HOOK.md` 第 1.1 節，本文引用不再重述為已生效）：
 hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、會記 log，
 但不改變任何行為、不放寬任何包名；接上政策來源前，本文凡提及「hook 通道／白名單放寬」
 皆指設計意圖，不是現有效果。
 
-## 1. 提權優先順序（`core` 純函數 [已支援]＋真通道 F4a 已接線 [待實機驗證] DEVICE-UNVERIFIED）
+## 1. 提權優先順序（`core` 純函數 [已支援]＋真通道已接線（ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
-路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`＋Shizuku 生命週期）F4a 已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`、SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；Factory 按探測選擇、選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`；`hasLsposed` 維持保守 `false`，F4b／後續），
-以下順序為接線後預期行為，全部切換 [待實機驗證]（binder round-trip、授權四情境、su 實機行為、LSPosed 啟用偵測皆未驗）：
+路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`／`selectChannel`＋Shizuku 生命週期）已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`；SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；hook 訊號為 file marker 存在性證據，僅顯示、永不進入路由，[待實機驗證]；`ChannelPreference` 手動選擇 AUTO 預設，`selectChannel` 動態換 gateway；選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，`channelReadyFor` [已支援]），
+以下順序為接線後預期行為，App 內 Shizuku 切換（未授權路徑／首次選路／marker gateway-`cat` 顯示 [待實機驗證]；已授權一鍵、ROOT 一鍵／su／uninstall 已驗，見 §0）：
 
-1. **LSPosed 優先（ROOT）**：偵測到本模組在 LSPosed 中已勾選並啟用 → `Privilege.ROOT`
-   - 走 hook 通道（或 `su -c`，F4a 的 `SuCmdGateway` 經 `su -c` 已接線），目標是呼叫三星雙開服務；但現階段 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故 hook 通道永不被選；hook 為
-     observe-only（見上文引用），LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證] DEVICE-UNVERIFIED，不可描述為已能擴展包名。
+1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
+   observe-only（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗），不可描述為已能擴展包名。
 2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
-     binder round-trip、四情境 [待實機驗證] DEVICE-UNVERIFIED。
+     binder round-trip、未授權路徑／首次選路／binder 死引導 [待實機驗證] DEVICE-UNVERIFIED。
 3. **NONE（唯讀）**：選不到通道 → 不執行任何寫入，只顯示狀態（[已支援]：`NoOpGateway` 拒寫＋`channelReady` false fail-closed；不再恆 `false`——所選真通道探測通過即為 `true`）。
 
 ```kotlin
 // Pure routing logic, no side effects (see core/Privilege.kt).
-// App 端現狀：hasLsposed 維持保守 false（跨進程啟用訊號需實機驗證，F4b／後續），hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。
+// App 端現狀（H4／#19）：hook 訊號永不進入路由（hasLsposed 恆 false：file
+// marker 是存在性證據，不是 live hook 證明）；hasRoot/hasShizuku 由
+// Su/ShizukuElevator 真通道探測填入。Hook 狀態走 UiState.hookActive／
+// hookScopes（display-only）供 LSPosed picker 行顯示。
 val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, hasRoot = hasRoot)
+val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 
-Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；F4a 後探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
-目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。
+Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
+目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
@@ -63,6 +67,14 @@ Clone／Remove／Refresh／請求 Shizuku 授權按鈕與 `StateFlow` 收集＋S
 
 > 每次重開機後需重複步驟 4（Shizuku 需重新啟動）；配對碼只需配對過一次，
 > 同一 Wi-Fi 下重啟一般直接按「啟動」即可。
+>
+> 已 root 裝置可用 Shizuku 自帶 so 直接啟動（無需配對流程，S24 已用此法）：
+>
+> ```bash
+> adb shell /data/app/~~-jo681V4qGxj5nbJO4ijNA==/moe.shizuku.privileged.api-MyY9Gq9kawonTnGEcFOYdw==/lib/arm64/libshizuku.so
+> ```
+>
+> 注意 `~~...` 中間路徑每次安裝隨機，實際以 `pm path moe.shizuku.privileged.api` 輸出為準。
 
 舊裝置（Android 10 以下無無線調試）改用 USB：
 
@@ -92,26 +104,27 @@ adb shell pm list users
 # 2. 將已安裝的 App 複製進雙開 profile（不會動到 Secure Folder）
 adb shell pm install-existing --user 95 com.example.chat
 
-# 3. 唯讀診斷輔助：查看套件路徑；不能只靠此命令當所有情境的成功證據。
+# 3. 唯讀診斷輔助：查看套件路徑；僅輔助診斷，不作主驗證（主驗證以 listing 為準，見 #22）。
 adb shell pm path --user 95 com.example.chat
-#   package:/data/app/.../base.apk  -> 表示成功
+#   package:/data/app/.../base.apk  -> 僅表示該包有路徑回應，不能單獨證明雙開成功
 
 # 4. 只移除雙開分身，不動主 profile（user 0）
 adb shell pm uninstall --user 95 com.example.chat
 ```
 
 - `install-existing` 僅對已存在於主 profile 的 package 有效；全新 APK 請先在主 profile 正常安裝一次。
+- 重啟注意（S24 OneUI 9 兩次觀察，假說待對照實驗）：`pm install-existing --user 95` 建立的雙開連結在硬重啟、軟重啟後各消失一次（user 0 主包與完整安裝的雙開包不受影響）；疑為開機時 DualAppManager 對非白名單條目做對帳清理，恰為本 hook 要放寬的對象。重啟後請以 `pm list packages --user <dualId>` 複驗，消失即重裝。
 - 指令失敗時請看 `msg` 欄（`Failure` / `Unknown package` / `not installed` 皆視為失敗）。
-- 上述為手動診斷／命令格式示例；本 App 現行 verified 流程以相同目標的 package listing 作寫後確認，不再只用 `pm path`，錯誤／截斷判定仍待 #22。命令封裝有 `core` 層單元測試；
-  App 真 gateway 與 readiness gating 已接線，指定正常 SHELL 情境有歷史實機證據；App ROOT、完整 binder／授權矩陣及當前 source 的可追溯部署仍待驗證，詳見 [S24 調查](UX_REVIEW_S24.md)。
+- 本 App 的 `DualRepository.clone/remove/verify` 即為上述三指令的程式化封裝（[已支援]：`core` 層＋單元測試＋JVM 組裝測試；App 真 gateway 與 readiness gating 已接線：`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed）。寫後確認以相同目標的 package listing 為準，不再只用 `pm path`（`pm path` 僅輔助診斷，不能當主驗證），錯誤／截斷判定仍待 #22。[S24 已驗證]僅限 App ROOT 一鍵、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、`su -c` 重裝、uninstall 回滾，詳見 §0 與 [S24 調查](UX_REVIEW_S24.md) §5；App ROOT 之外的完整 binder／授權矩陣、App 內 Shizuku 未授權路徑／首次選路、marker gateway-`cat` 顯示及當前 source 可追溯部署仍 [待實機驗證]。
 
-## 4. LSPosed 優先模式（F4a 已接線但 `hasLsposed` 保守 `false`，[待實機驗證] DEVICE-UNVERIFIED）
+## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
-  作用域勾三星雙開相關進程後重啟；F4a 後 su ROOT 通道已接（su 檔存在即選 `SuCmdGateway`，`SuElevator` 以 `id -u`＝0 探測通過才 `channelReady`），但 `hasLsposed` 維持保守 `false`（跨進程啟用訊號需實機驗證，F4b／後續），故勾選模組不會切 hook 通道；LSPosed 載入／啟用偵測＋su 實機行為 [待實機驗證]，無實機證據。
-- 同時有 LSPosed 與 Shizuku 時路由設計為永遠選 LSPosed（`routePrivilege` 純函數 [已支援]）；但 Factory 現階段永不選 hook 通道（同上 `hasLsposed = false`）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
+  作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（whitelist 政策分支待實作）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
+- AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
   絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
+- P1 診斷限制（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）：Hook 狀態為四態——偵測到歷史 Hook 標記（僅存在性證據，未確認本次開機是否生效）／未偵測到／狀態未知（無權限讀取）／狀態未知（無可用診斷通道）。明選 LSPosed（NoOp）時診斷讀取獨立於所選寫入通道：仍嘗試直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）`cat`；若無任何真通道且直接讀取不可讀（App uid 對 `/data/system` 恆 EACCES），顯示「狀態未知」而非「未偵測到」——後者只保留給確定可讀但缺失的情況（fail-closed 誠實顯示，不再假陰性）。要完整診斷需至少一個探測通過的真通道；診斷結果永不進入路由／`channelReady`（hook-neutral，沿襲 #19）。
 
 ## 5. 常見問題
 
@@ -124,12 +137,12 @@ adb shell pm uninstall --user 95 com.example.chat
 
 ## English Summary
 
-- Privilege routing (tested pure function + F4a wired channels [DEVICE-UNVERIFIED]): LSPosed (ROOT) first, su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
-  fallback, else read-only (NONE) with `NoOp` fail-closed. Factory selects by probe; `channelReady` is true only when the selected channel's probe passes; `hasLsposed` stays conservative false (F4b); binder round-trip, all four auth scenarios, su behavior, end-to-end pm, and LSPosed enable detection are unverified.
+- Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
+  fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection, callback logs, and non-empty policy are unverified (`pm path` is auxiliary only, never ground truth, see #22); in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
 - Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (status switches only when the Shizuku probe passes; otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm list packages --user` ground truth (not `pm path` alone);
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).
-  `core` encapsulation plus gateway assembly are unit-tested; in-app one-click true channel is wired with limited historical S24 evidence for specified normal SHELL clone/remove and manual channel (see UX_REVIEW_S24.md §5); App ROOT, full binder/auth matrix and traceable build of current source remain unverified; end-to-end matrix is unverified.
+  `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked (registration only), daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; callback logs, Shizuku unauthorized flows, first-time selection, binder dead-guidance, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED (`pm path` auxiliary only, see #22); outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
 - Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
   any package yet.
 - GitHub sideload builds only; no Play release. Manifest `MANAGE_EXTERNAL_STORAGE`/`REQUEST_INSTALL_PACKAGES` necessity is still under review per #26 — not shipping on Play does not justify overbroad permissions.

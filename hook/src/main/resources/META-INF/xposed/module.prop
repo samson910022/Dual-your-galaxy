@@ -1,6 +1,12 @@
 # LSPosed module configuration (Java properties format).
 # D1 single-APK: id must equal the final APK applicationId (app/build.gradle.kts),
 # version must stay in sync with the app versionName.
+# Phase H1 (F4b foundation): documented fail-safe marker. The real crash
+# isolation is the per-hook setExceptionMode(PROTECTIVE) in
+# DualHook.hookWithDeoptimize (a hooker bug is logged and skipped instead of
+# crashing system_server / daagent); this key only documents the intent for
+# managers that honour it and is ignored when unknown. system_server injection
+# only happens at boot, upgrades require a reboot (see docs/HOOK.md 2.3).
 id=com.galaxydual.plus
 version=0.0.1
 versionCode=1
@@ -8,3 +14,4 @@ author=samson910022
 description=Galaxy Dual Plus hook: Samsung Dual whitelist extension (MIT, no Knox access)
 minApiVersion=102
 targetApiVersion=102
+exceptionMode=protective

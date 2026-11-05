@@ -323,15 +323,29 @@ class MainActivity : ComponentActivity() {
         // SharedPreferences; see factory). Always shown so the user can tell
         // which channel the lists/privilege above were produced with.
         channelView.text = "通道：${s.channel}（選擇已持久化，重啟 App 記住）"
-        // Hook signal: LSPosed mode only. Active shows recorded scopes;
-        // inactive shows 未偵測到 plus the enable hint. The placeholder note
-        // stays visible so the mode is never mistaken for a working channel.
+        // Hook signal: LSPosed mode only. ACTIVE shows the recorded scopes as
+        // a historical marker (existence evidence only, boot freshness
+        // unconfirmed); INACTIVE shows 未偵測到 plus the enable hint; UNKNOWN shows
+        // 狀態未知 (P1: unreadable / no diagnostic path is never reported
+        // as "not detected") plus the true-channel hint. The placeholder
+        // note stays visible so the mode is never mistaken for a working
+        // channel.
         if (s.channel == ChannelPreference.LSPOSED) {
             hookView.visibility = View.VISIBLE
-            val status = if (s.hookActive) {
-                "已啟用（${s.hookScopes.sorted().joinToString(", ")}）"
-            } else {
-                "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
+            // ACTIVE is historical existence+scope evidence only (the marker
+            // survives reboots; S24 evidence shows it predating boot by ~5.5h
+            // with no boot-identity/freshness check): the text names that
+            // limit instead of claiming the current boot is hooked ("已啟用"
+            // would over-claim). Diagnosis stays display-only and hook-neutral.
+            val status = when (s.hookStatus) {
+                HookStatus.ACTIVE ->
+                    "偵測到歷史 Hook 標記（${s.hookScopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
+                HookStatus.INACTIVE ->
+                    "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
+                HookStatus.UNKNOWN_UNREADABLE ->
+                    "狀態未知（無權限讀取；需 ROOT／Shizuku 真通道才能完整診斷，見 #27）"
+                HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
+                    "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27）"
             }
             hookView.text = "LSPosed Hook：$status；寫入通道為佔位（NoOp），" +
                 "待 whitelist 政策分支，寫入已禁用"
@@ -424,6 +438,8 @@ private class DualViewModelFactory(
                 elevators = listOf(SuElevator(asm.suGateway), ShizukuElevator(asm.shizukuGateway)),
                 preference = pref,
                 appPackageName = appPackageName,
+                suGateway = asm.suGateway,
+                shizukuGateway = asm.shizukuGateway,
                 persistPreference = { p ->
                     try {
                         prefs.saveChannelPreference(p)

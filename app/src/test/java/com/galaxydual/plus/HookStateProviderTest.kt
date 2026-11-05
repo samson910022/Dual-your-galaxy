@@ -47,10 +47,11 @@ class HookStateProviderTest {
         assertEquals(setOf("daagent"), state.scopes)
     }
 
-    // Display text: active shows scopes, inactive shows not-detected.
+    // Display text: ACTIVE is a historical marker (existence evidence only,
+    // boot freshness unconfirmed), inactive shows not-detected.
     @Test fun displayText_matchesState() {
         assertEquals(
-            "已啟用（daagent, system_server）",
+            "偵測到歷史 Hook 標記（daagent, system_server，僅存在性證據，未確認本次開機是否生效）",
             HookState(active = true, scopes = setOf("system_server", "daagent")).displayText(),
         )
         assertEquals("未偵測到", HookState(active = false).displayText())

@@ -15,6 +15,7 @@ import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RemoveOutcome
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.routePrivilege
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -77,6 +78,10 @@ data class UiState(
     val hookActive: Boolean = false,
     // Scopes recorded in the marker (subset of system_server/daagent).
     val hookScopes: Set<String> = emptySet(),
+    // P1 diagnostic state (配合 #27): ACTIVE / INACTIVE / UNKNOWN_UNREADABLE
+    // / UNKNOWN_NO_DIAGNOSTIC. Unknown (unreadable / no diagnostic path) is
+    // never displayed as "not detected"; only a positively-read absence is.
+    val hookStatus: HookStatus = HookStatus.UNKNOWN_NO_DIAGNOSTIC,
     // All Android profiles parsed from `pm list users`.
     val profiles: List<DualProfile> = emptyList(),
     // Packages currently cloned into the dual profile (MVP tracks by name).
@@ -143,20 +148,32 @@ class DualViewModel(
     // never touch File/Shizuku statics; the factory passes the real ones.
     private val suPresentCheck: () -> Boolean = { false },
     private val shizukuAuthCheck: () -> Boolean = { false },
+    // Real-channel gateways backing `elevators` and the P1 hook diagnostic
+    // reader. The selected gateway shares its instance with the matching
+    // one here (ROOT -> suGateway, SHIZUKU -> shizukuGateway), so probes and
+    // diagnosis verify the actual channels. Mutable: selectChannel rebuilds
+    // them from the fresh assembly alongside `elevators` (single source).
+    // Constructors stay Android-free so JVM tests can build them.
+    private var suGateway: CmdGateway = SuCmdGateway(),
+    private var shizukuGateway: CmdGateway = ShizukuCmdGateway(appPackageName),
     // Gateway backing `repo`, tracked so a swapped-out Shizuku gateway can
     // release its cached UserService binding instead of leaking it.
     private var activeGateway: CmdGateway = NoOpGateway(),
     // Resolved channel backing `repo` (disambiguates the two NONE-privilege
     // cases: explicit NOOP fallback vs LSPOSED placeholder).
     private var currentChannel: ResolvedChannel = ResolvedChannel.NOOP,
-    // Hook-enable signal source (F4b-P2). Injected so JVM tests never touch
-    // the device marker file; production reads it via readHookState()
-    // (direct File reads of BOTH marker paths, primary then fallback).
-    // Never throws by contract (readHookState maps all failures to
-    // inactive), and probeChannels guards with try/catch regardless. When
-    // the direct read is inactive but the channel proved ready, probeChannels
-    // additionally retries via readHookStateWithGateway(activeGateway).
-    private val hookStateProvider: () -> HookState = { readHookState() },
+    // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
+    // tests never touch the device marker file; production reads via
+    // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
+    // primary then fallback). hookDiagnosticGateways supplies the CURRENT
+    // real-channel gateways INDEPENDENT of the selected write channel, so an
+    // explicit-LSPosed (NoOp) selection still diagnoses through any
+    // probe-verified ROOT/SHIZUKU channel; probeChannels further gates that
+    // list by hasRoot/hasShizuku (an unproven gateway is not a diagnostic
+    // path). Never throws by contract; probeChannels guards with try/catch
+    // regardless.
+    private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
+    private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
 ) : ViewModel() {
     private val _state = MutableStateFlow(
         UiState(
@@ -541,7 +558,9 @@ class DualViewModel(
         activeGateway = asm.gateway
         repo = DualRepository(asm.gateway)
         gatewayPrivilege = asm.gateway.privilege
-        elevators = listOf(SuElevator(asm.suGateway), ShizukuElevator(asm.shizukuGateway))
+        suGateway = asm.suGateway
+        shizukuGateway = asm.shizukuGateway
+        elevators = listOf(SuElevator(suGateway), ShizukuElevator(shizukuGateway))
         preference = pref
         currentChannel = asm.channel
         _state.update { it.copy(channel = pref) }
@@ -580,55 +599,53 @@ class DualViewModel(
         }
         // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
         // the router encodes that priority, probes only feed it.
-        // F4b-P2: hasLsposed stays conservatively false for ROUTING even
-        // though the marker now feeds the UI display below. Rationale: the
-        // marker is existence+scope evidence from a file that survives
-        // reboots (see HookMarker), not proof of a live, effective hook, so
-        // it must never grant privilege. Detecting a truly effective hook
-        // needs a real device to verify.
-        val routed = routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
-        val ready = when (gatewayPrivilege) {
-            Privilege.ROOT -> hasRoot
-            Privilege.SHELL -> hasShizuku
-            Privilege.NONE -> false
-        }
-        // Hook-enable signal for the LSPosed picker row (F4b-P2). Read off
-        // the main thread (file IO); any failure reads as inactive, never
-        // blocking the privilege update. probeChannels runs under opMutex
-        // from recheckPrivilege/selectChannel/init, so every UI entry point
-        // refreshes the hook display with no extra Activity wiring.
-        // Strategy: the injected seam does the direct File reads of both
-        // marker paths first (likely SELinux-denied for the app uid); only
-        // when that reads inactive AND this probe proved the channel (ready)
-        // is the active SHELL/ROOT gateway given one `cat` chance per path
-        // via readHookStateWithGateway. A NoOp/unproven channel never
-        // executes anything, and every failure still maps to inactive.
-        val hook: HookState = try {
+        // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
+        // ROUTING even though the marker now feeds the UI display below
+        // (see hookNeutralRoute). Rationale: the marker is existence+scope
+        // evidence from a file that survives reboots (see HookMarker), not
+        // proof of a live, effective hook, so it must never grant privilege.
+        // Detecting a truly effective hook needs a real device to verify.
+        val routed = hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku)
+        // H2/H4 pure gate (unit-tested by ChannelReadyTest): identical to
+        // the inline when it replaces. Hook signal stays display-only (#19).
+        val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku)
+        // Hook diagnostic signal for the LSPosed picker row (F4b-P2, P1
+        // split). Runs on EVERY probe -- including an explicit-LSPosed
+        // selection with an unproven/NoOp write channel -- and reads through
+        // INDEPENDENT diagnostic paths: direct MarkerReads first, then `cat`
+        // over probe-verified real gateways only (a declared-ROOT/SHELL
+        // gateway whose probe failed is not a usable path). Diagnosis never
+        // feeds `ready`/`routed` above (hook-neutral) and an unproven channel
+        // never executes anything except via a verified diagnostic gateway.
+        // No true channel + unreadable direct reads maps to
+        // UNKNOWN_NO_DIAGNOSTIC, never to inactive.
+        val hook: HookDiagnosis = try {
             withContext(Dispatchers.IO) {
-                val direct = hookStateProvider()
-                if (direct.active) {
-                    direct
-                } else if (!ready || gatewayPrivilege == Privilege.NONE) {
-                    direct
-                } else {
-                    try {
-                        readHookStateWithGateway(activeGateway)
-                    } catch (_: Exception) {
-                        direct
-                    }
+                val direct = try {
+                    hookDirectReads()
+                } catch (_: Exception) {
+                    listOf(MarkerRead.Denied, MarkerRead.Denied)
                 }
+                val candidates = try {
+                    hookDiagnosticGateways()
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                val usable = candidates.filter {
+                    (it.privilege == Privilege.ROOT && hasRoot) ||
+                        (it.privilege == Privilege.SHELL && hasShizuku)
+                }
+                diagnoseHookState(direct, usable)
             }
         } catch (_: Exception) {
-            HookState(active = false)
+            HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
         }
         val hookDesc = hook.displayText()
         _state.update {
-            it.copy(
+            it.withHookDiagnosis(hook).copy(
                 channel = preference,
                 privilege = routed,
                 channelReady = ready,
-                hookActive = hook.active,
-                hookScopes = hook.scopes,
                 msg = if (ready) {
                     ""
                 } else if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
@@ -660,11 +677,9 @@ class DualViewModel(
     private fun isWritable(): Boolean {
         val cur = _state.value
         if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
-            val hookDesc = if (cur.hookActive) {
-                "已啟用（${cur.hookScopes.sorted().joinToString(", ")}）"
-            } else {
-                "未偵測到"
-            }
+            // Status-aware hook text (P1): unknown renders as 狀態未知, never
+            // as 未偵測到 (the latter is reserved for positively-read absence).
+            val hookDesc = HookDiagnosis(cur.hookStatus, cur.hookScopes).displayText()
             _state.update {
                 it.copy(
                     loading = false,
@@ -698,3 +713,21 @@ class DualViewModel(
         return true
     }
 }
+
+// P1 hook-neutral routing (issue #6, 沿襲 #19, 配合 #27): privilege routing
+// always runs with hasLsposed = false, no matter what the hook diagnosis
+// says. A present marker is existence+scope evidence, not proof of a live,
+// effective hook, so it must never grant privilege. probeChannels routes
+// through this function; HookDiagnosisTest locks the contract.
+fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
+    routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
+
+// Pure display mapping: applies a hook diagnosis to the UI state without
+// touching routing or readiness fields (channel/privilege/channelReady are
+// preserved by construction). probeChannels uses this; the hook-neutral lock
+// test pins it for every HookStatus.
+fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis): UiState = copy(
+    hookStatus = diagnosis.status,
+    hookActive = diagnosis.active,
+    hookScopes = diagnosis.scopes,
+)
