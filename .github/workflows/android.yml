@@ -201,11 +201,11 @@ jobs:
             exit 1
           fi
           echo "PASS: GPL containment"
-      # Run :core + :hook unit tests. Failures fail the job.
-      - name: Unit tests (core debug)
+      # Run :app + :core + :hook unit tests. Failures fail the job.
+      - name: Unit tests (app, core, hook debug)
         run: |
           chmod +x ./gradlew
-          ./gradlew :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
+          ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
         if: always()

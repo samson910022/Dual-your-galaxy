@@ -13,7 +13,7 @@
 
 - [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；`pm path` 主驗證、Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
+- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；寫後主驗證以 listing 為準（`pm path` 僅輔助診斷，見 #22）；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行、callback 可驗日誌、非空政策生效、當前 source 可追溯部署仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
 - [部分已驗證] LSPosed 載入（system hook 雙方法 deoptimize＋hooked [S24 已驗證]、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取） [S24 已驗證]、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效） [S24 已驗證]，其餘 LSPosed 寫入、非空政策 [待實機驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端；其中
@@ -104,9 +104,9 @@ adb shell pm list users
 # 2. 將已安裝的 App 複製進雙開 profile（不會動到 Secure Folder）
 adb shell pm install-existing --user 95 com.example.chat
 
-# 3. 唯讀診斷輔助：查看套件路徑；不能只靠此命令當所有情境的成功證據。
+# 3. 唯讀診斷輔助：查看套件路徑；僅輔助診斷，不作主驗證（主驗證以 listing 為準，見 #22）。
 adb shell pm path --user 95 com.example.chat
-#   package:/data/app/.../base.apk  -> 表示成功
+#   package:/data/app/.../base.apk  -> 僅表示該包有路徑回應，不能單獨證明雙開成功
 
 # 4. 只移除雙開分身，不動主 profile（user 0）
 adb shell pm uninstall --user 95 com.example.chat
@@ -138,11 +138,11 @@ adb shell pm uninstall --user 95 com.example.chat
 ## English Summary
 
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
-  fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection, and `pm path` as ground truth are unverified; in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
+  fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection, callback logs, and non-empty policy are unverified (`pm path` is auxiliary only, never ground truth, see #22); in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
 - Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (status switches only when the Shizuku probe passes; otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm list packages --user` ground truth (not `pm path` alone);
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).
-  `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked, daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; Shizuku unauthorized flows, first-time selection, binder dead-guidance, `pm path` as ground truth, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED; outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
+  `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked (registration only), daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; callback logs, Shizuku unauthorized flows, first-time selection, binder dead-guidance, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED (`pm path` auxiliary only, see #22); outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
 - Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
   any package yet.
 - GitHub sideload builds only; no Play release. Manifest `MANAGE_EXTERNAL_STORAGE`/`REQUEST_INSTALL_PACKAGES` necessity is still under review per #26 — not shipping on Play does not justify overbroad permissions.

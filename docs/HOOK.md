@@ -40,12 +40,15 @@ adb shell service list | grep -i dual
 adb shell dumpsys activity services | grep -i -A2 dual
 ```
 
-實機證據（S24 SM-S9210，OneUI 9／Android 17，PDA S9210ZHU6EZIF）：
+實機證據（S24 SM-S9210，OneUI 9／Android 17，PDA S9210ZHU6EZIF，
+五層之第 2 層 hook 註冊）：
 `service list` 確認 `dual_app: com.samsung.android.app.ISemDualAppManager`；
 services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 （含兩方法＋ `isInstalledWhitelistedPackageInternal` 變體）；lspd 模組日誌
 確認候選 1 在三次 system_server 啟動皆 `deoptimized`＋`hooked` 成功、
-無 `method not found`。候選 2／3 在此 ROM 未命中，保留為 fallback。
+無 `method not found`。此為 hook 註冊證據，不等於第 3 層 callback 觸發
+（可驗日誌缺：尚無回調命中／放寬包名 log）與第 4 層政策生效
+（預設空政策，observe-only）。候選 2／3 在此 ROM 未命中，保留為 fallback。
 
 模組在 `onSystemServerStarting` 以反射依序嘗試（第一個載入成功者勝出，
 其餘 `try/catch` 略過，非三星 ROM 自動無操作）：
@@ -72,7 +75,7 @@ Hook Builder 統一使用
 `WhiteListApps`（完整路徑 `com.samsung.android.da.daagent.provider.WhiteListApps`，
 舊短路徑保留為 fallback）持有靜態白名單常量：
 
-實機證據（S24，DAAgent v3.7.00.0，dexdump 反編譯確認）：
+實機證據（S24，DAAgent v3.7.00.0，dexdump 反編譯確認，五層之第 1 層類別選取）：
 該類為 `PUBLIC ABSTRACT` 純常量持有者（3 個 `static final String[]`：
 `DUAL_APP_WHITELIST_PACKAGES`、`..._FOR_CHINA`、`CHINA_SALES_CODES`，
 僅 `<clinit>`＋Base64 helper，**零查詢方法**）——故 `<clinit>` patch 是
@@ -83,6 +86,10 @@ Hook Builder 統一使用
 含該欄位的類（`found ... static=true` 跨多代行程）；
 `using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
 [S24 已驗證]（新路徑連續命中 7 次、零退回，方法零掛載符合抽象類預期）。
+`using`×7 僅證明第 1 層類別選取，不等於第 2 層 `<clinit>` interceptor 執行、
+第 3 層 callback 觸發、第 4 層包名放寬（可驗日誌缺；預設空政策下本就
+observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3，
+歷史通道見 [S24 調查](UX_REVIEW_S24.md) §5。
 
 - 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`** 與 **`..._FOR_CHINA`** 變體：
   兩個候選欄位只要存在**都會**嘗試合併（分別記錄結果），不存在者略過不拋錯。
@@ -134,8 +141,10 @@ S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detec
 App 側經 `HookStateProvider` 讀取、僅顯示、永不進入路由
 （`hasLsposed` 恆 `false`，見 `DualViewModel.probeChannels`）。
 
-Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
-- 主路徑已寫入：`scope=system_server`（system_server 側 hook 安裝後寫入成功）。
+Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷史證據，
+詳 [S24 調查](UX_REVIEW_S24.md) §4.4／§5）：
+- 主路徑已寫入：`scope=system_server`（system_server 側 hook 安裝後寫入成功；
+  早於本次開機約 5.5h，為歷史證據，不能宣稱本次開機有效）。
 - daagent 側雙路徑 EACCES：主＋備皆不可寫（daagent SELinux 域限制），
   故 marker 目前僅含 `system_server`；daagent hook 安裝證據以 lspd 日誌
   `found ... static=true`＋clinit 行為準，不以 marker scope 齊全為準。
