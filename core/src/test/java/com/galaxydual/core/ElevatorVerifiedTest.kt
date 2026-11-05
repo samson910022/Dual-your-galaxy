@@ -13,7 +13,7 @@ import org.junit.Test
 // semantics. Locks that the single fetcher (CmdGateway.fetchVerifiedDualId,
 // shared by DualRepository and both Elevator probes) gates the verbose,
 // dumpsys AND property channels with isIdentityChannelOk (no pm-semantic
-// exemptions), while the pm-list probe gate uses isSuccess (same as
+// exemptions), while the pm-list probe gate uses isListUsersOutputOk (same as
 // profilesSnapshot). Uses a FakeGateway in the DualSafetyTest style.
 class ElevatorVerifiedTest {
     // In-memory CmdGateway: canned identity outputs with stderr/exit control
@@ -179,7 +179,7 @@ class ElevatorVerifiedTest {
         assertEquals(-1, runSuspend { SuElevator(suGateway(gateway)).probe() }.dualUserId)
     }
 
-    // pm-list probe gate shares isSuccess with profilesSnapshot: exit 0 with
+    // pm-list probe gate shares isListUsersOutputOk with profilesSnapshot: exit 0 with
     // a Failure line fails the gate. Shizuku drops to NONE/-1; su keeps ROOT
     // (root proof stands) with dual -1.
     @Test

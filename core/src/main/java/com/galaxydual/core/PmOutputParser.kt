@@ -349,15 +349,19 @@ object PmOutputParser {
     // success on a non-zero exit).
     private val IDENTITY_HEADER_STRIP = Regex("UserInfo\\{\\d+:[^}:\\r\\n]*:[^}\\r\\n]*\\}")
 
-    fun isIdentityChannelOk(output: String, exit: Int): Boolean {
+    private fun checkStrictLines(output: String, exit: Int): Boolean {
         if (exit != 0) return false
-        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
-        for (raw in sanitized.lines()) {
+        for (raw in output.lines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
             if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
         }
         return true
+    }
+
+    fun isIdentityChannelOk(output: String, exit: Int): Boolean {
+        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
+        return checkStrictLines(sanitized, exit)
     }
 
     // `pm list users` strict gate (Phase B P1-2, issue #21; owner re-review R3
@@ -378,14 +382,8 @@ object PmOutputParser {
     // (`cmd user list -v` / `dumpsys user` / `getprop`), while this gate
     // serves only the `pm list users` channel.
     fun isListUsersOutputOk(output: String, exit: Int): Boolean {
-        if (exit != 0) return false
         val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
-        for (raw in sanitized.lines()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
-        }
-        return true
+        return checkStrictLines(sanitized, exit)
     }
 
     // Legacy entry point kept for compatibility: parses key=value token lines.
