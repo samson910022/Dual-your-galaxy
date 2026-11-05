@@ -67,17 +67,17 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out), err = "interrupted: ${(e.message ?: "wait interrupted")}")
+        return CmdResult(exit = 1, out = capped(out), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = isCapped(out))
     }
     if (!exited) {
         proc.destroyForcibly()
         drainOut.join(2_000)
         drainErr.join(2_000)
-        return CmdResult(exit = 1, out = capped(out), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}")
+        return CmdResult(exit = 1, out = capped(out), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = isCapped(out))
     }
     drainOut.join(5_000)
     drainErr.join(5_000)
-    return CmdResult(exit = proc.exitValue(), out = capped(out), err = capped(err))
+    return CmdResult(exit = proc.exitValue(), out = capped(out), err = capped(err), truncated = isCapped(out) || isCapped(err))
 }
 
 // Reads all of input into sink up to MAX_CAPTURE_CHARS; closes the stream.
@@ -101,7 +101,13 @@ private fun drainCapped(input: java.io.InputStream, sink: StringBuilder) {
 }
 
 private fun capped(sink: StringBuilder): String =
-    if (sink.length >= MAX_CAPTURE_CHARS) sink.toString() + "\n[truncated]" else sink.toString()
+    if (isCapped(sink)) sink.toString() + "\n[truncated]" else sink.toString()
+
+// PR-2 stage 1 (issue #22, additive only): mirrors the capped() cap test so
+// captureProcess can set CmdResult.truncated without sniffing text. True iff
+// this stream hit MAX_CAPTURE_CHARS and capped() appended "[truncated]".
+private fun isCapped(sink: StringBuilder): Boolean =
+    sink.length >= MAX_CAPTURE_CHARS
 
 // ROOT gateway: executes core-built pm commands via `su -c`.
 // DEVICE-UNVERIFIED: su presence/behavior varies by ROM; verified only by
