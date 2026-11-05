@@ -21,6 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Check out the repository.
       - uses: actions/checkout@v4
@@ -223,6 +224,7 @@ jobs:
             **/build/reports/tests/
             **/build/test-results/
           if-no-files-found: warn
+          retention-days: 14
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
@@ -241,3 +243,4 @@ jobs:
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
           if-no-files-found: warn
+          retention-days: 14
