@@ -44,6 +44,7 @@ class ReconnectEarlyLoadingTest {
         val listPackagesCalls = AtomicInteger(0)
 
         @Volatile var probeGate: CompletableDeferred<Unit>? = null
+        @Volatile var probeGate2: CompletableDeferred<Unit>? = null
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -70,7 +71,7 @@ class ReconnectEarlyLoadingTest {
         override suspend fun run(cmd: String): CmdResult = when {
             cmd.trim() == "id -u" -> {
                 val n = idUCalls.incrementAndGet()
-                if (n == 1) probeGate?.await()
+                if (n == 1) probeGate?.await() else if (n == 2) probeGate2?.await()
                 CmdResult(exit = 0, out = "0\n", err = "")
             }
             cmd == DualRepository.CMD_LIST_USERS ->
@@ -237,6 +238,76 @@ class ReconnectEarlyLoadingTest {
 
         suFake.probeGate?.complete(Unit)
         suFake.probeGate = null
+
+        await(timeoutMs = 10_000L) { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // Re-review #7 B2 (P2): the coalesced TRAILING recheck round must also
+    // hold loading=true while its own `id -u` is blocked. Before the fix the
+    // trailing loop inlined swapAutoLocked() without the early-busy set (and
+    // the first round's probeChannels tail had already cleared loading), so
+    // during the second probe state.loading read false and MainActivity
+    // render() re-enabled its buttons (busy proxy: clone/remove/refresh +
+    // channel picker all gate on s.loading). This test gates BOTH rounds'
+    // `id -u`: parks round 1, queues round 2 (pending=true), releases round 1,
+    // then asserts loading stays true for the whole second block.
+    @Test
+    fun recheck_trailing_round_holds_busy_while_second_probe_blocked() {
+        val suFake = EarlyProbeSu()
+        val shizukuFake = StableShizuku()
+        val vm = makeVm(suFake, shizukuFake)
+        await { !vm.state.value.loading }
+
+        suFake.idUCalls.set(0)
+        suFake.probeGate = CompletableDeferred()
+        suFake.probeGate2 = CompletableDeferred()
+
+        // Round 1 starts and parks on the first `id -u`.
+        vm.recheckPrivilege()
+        await { suFake.idUCalls.get() >= 1 }
+        await { vm.state.value.loading }
+        assertTrue(
+            "first recheck round must hold loading=true while its id -u is gated",
+            vm.state.value.loading,
+        )
+
+        // Second recheck while round 1 is still in flight: coalesced into a
+        // single trailing re-run (no extra mutex waiter).
+        vm.recheckPrivilege()
+
+        // Release round 1; the trailing round must start and park on the
+        // second `id -u`. The counter increment for round 2 happens-after the
+        // trailing busy re-set (Main sets loading before dispatching the IO),
+        // so observing idUCalls >= 2 implies the fix has already marked busy.
+        suFake.probeGate?.complete(Unit)
+        suFake.probeGate = null
+        await { suFake.idUCalls.get() >= 2 }
+
+        await { vm.state.value.loading }
+        assertTrue(
+            "trailing recheck round must hold loading=true while the second id -u is gated",
+            vm.state.value.loading,
+        )
+        // Sustained-busy sampling: buttons stay disabled for the whole block,
+        // not just at entry (catches a clear-then-re-set flash mid-block).
+        val busyDeadline = System.currentTimeMillis() + 200
+        while (System.currentTimeMillis() < busyDeadline) {
+            assertTrue(
+                "trailing recheck must keep loading=true for the whole second block, " +
+                    "state=${vm.state.value}",
+                vm.state.value.loading,
+            )
+            Thread.sleep(10)
+        }
+        assertEquals(
+            "two coalesced recheck rounds must probe exactly twice (one id -u each)",
+            2,
+            suFake.idUCalls.get(),
+        )
+
+        suFake.probeGate2?.complete(Unit)
+        suFake.probeGate2 = null
 
         await(timeoutMs = 10_000L) { !vm.state.value.loading }
         assertEquals(false, vm.state.value.loading)
