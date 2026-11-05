@@ -236,6 +236,12 @@ class RemoveConfirmTest {
 
     // Rapid double confirm executes at most once (shared inFlightWrites dedup:
     // the second concurrent confirm reports "already in progress").
+    // Flake note: the two confirms race (Unconfined + IO); the terminal msg
+    // depends on who writes last: winner writes "removed: ..." on success,
+    // concurrent loser deduped by inFlightWrites writes "already in progress",
+    // serial loser arriving after pending is cleared writes "沒有待確認的移除".
+    // All three are legal; the strong invariants are uninstallCalls == 1 and
+    // pending cleared.
     @Test
     fun rapidConfirm_executesAtMostOnce() {
         val gw = FakeRepoGateway(dualId = 95)
@@ -250,7 +256,15 @@ class RemoveConfirmTest {
         await(timeoutMs = 5_000L) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
 
         assertEquals("double confirm must run a single uninstall", 1, gw.uninstallCalls)
-        assertEquals("removed: com.example.chat", vm.state.value.msg)
+        assertNull("pending must be cleared", vm.state.value.pendingRemove)
+        assertTrue(
+            "final msg must be a legal terminal state, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg in setOf(
+                "removed: com.example.chat",
+                "already in progress: com.example.chat",
+                "沒有待確認的移除",
+            ),
+        )
     }
 
     // The target moved between request and confirm (verified id 95 -> 96):
