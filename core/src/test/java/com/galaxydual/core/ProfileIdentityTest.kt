@@ -373,8 +373,10 @@ class ProfileIdentityTest {
     }
 
     @Test
-    fun sameBlockDualToken_clonePriorityOverManagedInTypeLine() {
-        // Both tokens in one explicit type line: CLONE wins over MANAGED.
+    fun sameBlockDualToken_contradictionInTypeLineIsUnknown() {
+        // P1-B (issue #21 owner re-review): both tokens in one explicit
+        // type line is an intra-line contradiction -> UNKNOWN, never
+        // CLONE-by-priority. Flipped from the old CLONE-wins expectation.
         val text = """
             Users:
               UserInfo{95:DualApp:400} running:
@@ -382,7 +384,7 @@ class ProfileIdentityTest {
         """.trimIndent()
         val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
         assertEquals(1, parsed.size)
-        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
     }
 
     @Test
