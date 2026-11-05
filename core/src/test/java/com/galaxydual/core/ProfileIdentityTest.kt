@@ -897,6 +897,27 @@ class ProfileIdentityTest {
         val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
         assertEquals(1, parsed.size)
         assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+    }
+
+    @Test
+    fun newFormatCommaFlagsTail_stillClone() {
+        // Comma-form flags tail (raw S24 shape `type=profile.CLONE,
+        // flags=A|B`) must not feed the type mention: the flags tail is
+        // display-only metadata on its own line(s). Guards the
+        // parseNewVerboseLines newline split.
+        val text = """
+            2 users:
+
+            0: id=0, name=Owner, type=full.SYSTEM, flags=ADMIN (running)
+            1: id=95, name=DUAL_APP, type=profile.CLONE, flags=DUALAPP_PROFILE|PROFILE (parentId=0) (running)
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(2, parsed.size)
+        val clone = parsed.first { it.userId == 95 }
+        assertEquals(ProfileUserType.CLONE, clone.userType)
+        assertEquals(0, clone.parentId)
+    }
+
     // End-to-end repository gate (PR-33 S1): V=CLONE/serial15 plus
     // D=UNKNOWN/serial15 resolves to NoDual (id never Confirmed), so
     // removeVerifiedExpected runs zero uninstalls (fail closed). Uses a
