@@ -146,6 +146,22 @@ class DualRepository(
         } catch (e: Exception) {
             return ProfilesSnapshot.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
+        // Review follow-up (cross-PR risk, review lines 49-51): identity
+        // evidence truncation must fail closed. isListUsersOutputOk() (pm-list
+        // label-neutral gate over the shared C2 exit + error-line rule,
+        // Phase C P2-C issue #21) only judges exit + error-semantic lines
+        // and never sees the capture flag, so an exit-0 truncated
+        // `pm list users` would otherwise parse as a partial list and could
+        // hide a conflicting candidate. Any truncated identity capture is
+        // therefore ChannelError without parsing (never an authoritative
+        // Loaded). Relation to gates: #21 owns WHO may be probed (verified
+        // cross-source identity); #22 owns HOW a listing capture is trusted
+        // (truncated capture is untrusted, never absence/presence evidence).
+        // isSuccess() itself is unchanged: install/uninstall outputs are
+        // assumed small and keep the exit + error-line rule.
+        if (res.truncated) {
+            return ProfilesSnapshot.ChannelError("channel error: truncated identity evidence")
+        }
         if (!PmOutputParser.isListUsersOutputOk(res.out + "\n" + res.err, res.exit)) {
             return ProfilesSnapshot.ChannelError(res.err.ifEmpty { res.out.ifEmpty { "channel failed" } })
         }
@@ -343,7 +359,7 @@ class DualRepository(
 
     // Double-checks installation via `pm list packages --user <dualId>`
     // ground truth (exact membership). Returns true only when the probe
-    // exits 0 and the parsed set contains the package. Auto path carries
+    // parses as TrustedFull containing the package. Auto path carries
     // the resolve-time identity as `expected` (Phase D ID-reuse guard);
     // a null resolve maps to false (same as the old -1 behavior).
     suspend fun verify(pkg: String): Boolean {
