@@ -3,9 +3,12 @@ package com.galaxydual.core
 
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.startCoroutine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 // Third-round regression tests: list-based re-check. Real-device proven:
@@ -30,6 +33,9 @@ class VerifyRetryTest {
     private class SeqGateway(
         val listQueue: ArrayDeque<CmdResult> = ArrayDeque(),
         var listFallback: CmdResult = CmdResult(exit = 0, out = "", err = ""),
+        // Phase 3 review (issue #24): when non-null, the `pm list packages`
+        // probe throws instead of returning -- models a rogue gateway.
+        var listThrowable: Throwable? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -52,6 +58,7 @@ class VerifyRetryTest {
                     CmdResult(exit = 0, out = "Success", err = "")
                 cmd.startsWith("pm list packages") -> {
                     listCalls++
+                    listThrowable?.let { throw it }
                     if (listQueue.isNotEmpty()) listQueue.removeFirst() else listFallback
                 }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
@@ -327,5 +334,60 @@ class VerifyRetryTest {
         )
         val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
         assertTrue("detail must carry exit code, got: \"$detail\"", detail.contains("exit=1"))
+    }
+
+    // Phase 3 review (issue #24): a rogue gateway that THROWS (non-cancel)
+    // on the list probe is Unknown, never a guess -- verify path collapses
+    // to VerifyUnknown with zero settle waits (single-shot throw, no retry).
+    @Test
+    fun verifyListProbe_throwingGateway_isUnknownWithoutRetry() {
+        val gateway = SeqGateway(listThrowable = IllegalStateException("boom"))
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("throwing probe must not retry, got: $delays", delays.isEmpty())
+    }
+
+    // Same rogue gateway on the refresh path: listProbe is single-shot
+    // unknown (null), never an authoritative empty list.
+    @Test
+    fun listProbe_throwingGateway_isNull() {
+        val gateway = SeqGateway(listThrowable = IllegalStateException("boom"))
+        val result = runSuspend { virtualRepo(gateway, mutableListOf()).listClonedPackages() }
+        assertNull("throwing list probe must be unknown (null), got: $result", result)
+        assertEquals(1, gateway.listCalls)
+    }
+
+    // Cancellation must propagate: a CancellationException from the list
+    // probe is rethrown, never folded into Unknown. Uses the stdlib
+    // kotlin.coroutines.cancellation.CancellationException (core has no
+    // kotlinx-coroutines dependency).
+    @Test
+    fun verifyListProbe_cancellationException_propagates() {
+        val gateway = SeqGateway(listThrowable = CancellationException("cancel"))
+        val delays = mutableListOf<Long>()
+        try {
+            runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+            fail("expected CancellationException to propagate, not fold into Unknown")
+        } catch (e: CancellationException) {
+            assertEquals("cancel", e.message)
+        }
+        assertEquals(1, gateway.listCalls)
+        assertTrue("cancelled probe must not retry, got: $delays", delays.isEmpty())
+    }
+
+    // Same propagation guarantee on the refresh path: listProbe rethrows
+    // CancellationException instead of returning null.
+    @Test
+    fun listProbe_cancellationException_propagates() {
+        val gateway = SeqGateway(listThrowable = CancellationException("cancel"))
+        try {
+            runSuspend { virtualRepo(gateway, mutableListOf()).listClonedPackages() }
+            fail("expected CancellationException to propagate, not fold into null")
+        } catch (e: CancellationException) {
+            assertEquals("cancel", e.message)
+        }
+        assertEquals(1, gateway.listCalls)
     }
 }

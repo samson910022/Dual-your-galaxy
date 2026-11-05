@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.jvm.Volatile
 
 // Profile-list snapshot distinguishing channel failure from an empty parse.
@@ -155,12 +156,14 @@ class DualRepository(
     private suspend fun fetchVerifiedDualId(): Int {
         val verboseRes = try {
             gateway.run(CMD_USER_LIST_VERBOSE)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         val dumpsysRes = try {
             gateway.run(CMD_DUMPSYS_USER)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
@@ -168,7 +171,8 @@ class DualRepository(
         if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
         val propRes = try {
             gateway.run(CMD_GETPROP_DUAL)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             null
         }
         val propertyId = propRes
@@ -461,11 +465,30 @@ class DualRepository(
         } catch (e: IllegalArgumentException) {
             return VerifyState.Unknown(e.message ?: "invalid package")
         }
-        var res = gateway.run(cmd)
+        var res: CmdResult = try {
+            // Phase 3 (issue #24): fail-closed consistency with
+            // fetchVerifiedDualId -- the gateway contract says it does not
+            // throw, but a rogue implementation still must not escape as an
+            // exception; an un-runnable probe is Unknown, never a guess.
+            // Retry asymmetry is intentional: verify keeps its bounded retry
+            // (post-write confirmation must ride out transient binder/timeout
+            // blips), while listProbe stays single-shot (refresh path is
+            // already coalesced upstream; stacking retries there would pile
+            // waits behind rapid taps).
+            gateway.run(cmd)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return VerifyState.Unknown(e.message ?: e.javaClass.simpleName)
+        }
         var attempts = 1
         while (res.exit != 0 && attempts < VERIFY_MAX_ATTEMPTS) {
             delayFn(VERIFY_RETRY_DELAY_MS)
-            res = gateway.run(cmd)
+            try {
+                res = gateway.run(cmd)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                return VerifyState.Unknown(e.message ?: e.javaClass.simpleName)
+            }
             attempts++
         }
         // Trusted tri-state (PR-2 stage 2, issue #22): the final probe result
@@ -509,7 +532,16 @@ class DualRepository(
         } catch (e: IllegalArgumentException) {
             return null
         }
-        val res = gateway.run(cmd)
+        // Phase 3 (issue #24): same fail-closed rule as verifyListProbe --
+        // a throwing gateway is unknown (null), never an authoritative empty.
+        // Single-shot by design (see verifyListProbe note): refresh callers
+        // coalesce rapid taps upstream instead of retrying here.
+        val res: CmdResult = try {
+            gateway.run(cmd)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return null
+        }
         return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
             is TrustedList.TrustedFull -> trusted.packages
             is TrustedList.TrustedEmpty -> emptyList()

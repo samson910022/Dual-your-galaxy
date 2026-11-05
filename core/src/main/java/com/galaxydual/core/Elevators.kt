@@ -1,6 +1,8 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+import kotlin.coroutines.cancellation.CancellationException
+
 // Elevation channel: probes its privilege level and exposes command strings.
 // Implementations stay API-free placeholders: they only run shell command
 // strings through a CmdGateway and never link against vendor SDKs here.
@@ -58,12 +60,14 @@ class ShizukuElevator(
     private suspend fun resolveVerifiedDualId(): Int {
         val verboseRes = try {
             gateway.run(userListVerboseCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         val dumpsysRes = try {
             gateway.run(dumpsysUserCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
@@ -71,7 +75,8 @@ class ShizukuElevator(
         if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
         val propRes = try {
             gateway.run(getpropDualCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             null
         }
         val propertyId = propRes
@@ -134,12 +139,14 @@ class SuElevator(
     private suspend fun resolveVerifiedDualId(): Int {
         val verboseRes = try {
             gateway.run(userListVerboseCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         val dumpsysRes = try {
             gateway.run(dumpsysUserCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             return -1
         }
         if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
@@ -147,7 +154,8 @@ class SuElevator(
         if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
         val propRes = try {
             gateway.run(getpropDualCmd)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             null
         }
         val propertyId = propRes
