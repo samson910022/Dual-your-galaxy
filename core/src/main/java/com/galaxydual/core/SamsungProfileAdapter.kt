@@ -102,15 +102,24 @@ object SamsungProfileAdapter {
     }
 
     // Parses one user's block body into a single claim. Pure.
+    // Intra-block parent/serial contradiction (P1-B): more than one
+    // distinct parsable parentId (or serial) value inside the SAME block
+    // forces userType UNKNOWN (fail closed). The first parsable value is
+    // retained for diagnosis; confidence follows the final userType.
     private fun parseOneBlock(
         userId: Int,
         label: String,
         body: String,
         source: IdentitySource,
     ): ProfileIdentity {
-        val userType = classifyType(body)
-        val parentId = PARENT_ID.find(body)?.groupValues?.get(1)?.toIntOrNull()
-        val serial = SERIAL.find(body)?.groupValues?.get(1)?.toIntOrNull()
+        var userType = classifyType(body)
+        val parentIds = PARENT_ID.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
+        val serials = SERIAL.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
+        if (parentIds.distinct().size > 1 || serials.distinct().size > 1) {
+            userType = ProfileUserType.UNKNOWN
+        }
+        val parentId = parentIds.firstOrNull()
+        val serial = serials.firstOrNull()
         // Single-source confidence cap: a typed claim is MED (still needs a
         // second source for HIGH); an untyped block is LOW.
         val confidence = when (userType) {
@@ -128,36 +137,70 @@ object SamsungProfileAdapter {
         )
     }
 
-    // Classifies a block body: CLONE only when a TYPE line's value names
-    // profile.CLONE (explicit `user type:`/`userType=` line first, then the
-    // separator-less `usertype <token>` keyword fallback where the same
-    // line carries the CLONE token); OTHER when an explicit non-clone type
-    // statement is present; UNKNOWN when no type statement exists at all.
+    // Classifies a block body with segment-level contradiction detection
+    // (P1-B, issue #21 owner re-review): a block is UNKNOWN whenever its
+    // type evidence contradicts itself, never CLONE-by-priority.
+    // - Explicit `user type :/= value` lines: the value (group 1, trimmed,
+    //   empty skipped) is split on `,`/`;` into trimmed non-empty segments.
+    //   Segments containing CLONE_MARKER vs not containing it inside the SAME
+    //   line value is an intra-line contradiction -> UNKNOWN for the block.
+    // - Bare-keyword lines (TYPE_LINE unmatched, carries TYPE_KEYWORD, no
+    //   explicit `user type :/=` separator): the remainder after the keyword
+    //   (`TYPE_KEYWORD.replaceFirst(line, "").trim()`, empty remainder counts
+    //   as OTHER evidence like the old logic) is split the same way; a
+    //   remainder holding both CLONE and non-CLONE segments -> UNKNOWN.
+    // - Block verdict: any intra-line/remainder contradiction -> UNKNOWN;
+    //   else hasCloneSeg && hasOtherSeg (across lines/values) -> UNKNOWN
+    //   (cross-line contradiction); else CLONE / OTHER / UNKNOWN by presence.
     // Non-type lines (notes, Failure lines, `profileCloneable` tokens) can
     // never yield CLONE. The header label is NOT searched (caller passes
     // the body only), so renaming a profile to contain "DUAL" can never
     // yield CLONE here. Empty type values are skipped (never OTHER).
     private fun classifyType(body: String): ProfileUserType {
-        // Step 1: explicit `user type :/= value` lines only.
-        val typeValues = body.lines().mapNotNull { line ->
-            val m = TYPE_LINE.find(line) ?: return@mapNotNull null
-            m.groupValues[1].trim().takeIf { it.isNotEmpty() }
+        var hasCloneSeg = false
+        var hasOtherSeg = false
+        // Step 1: explicit `user type :/= value` lines, segment-split.
+        for (line in body.lines()) {
+            val m = TYPE_LINE.find(line) ?: continue
+            val value = m.groupValues[1].trim()
+            if (value.isEmpty()) continue
+            val segs = value.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
+            if (segs.isEmpty()) continue
+            val segClone = segs.any { CLONE_MARKER.containsMatchIn(it) }
+            val segOther = segs.any { !CLONE_MARKER.containsMatchIn(it) }
+            if (segClone && segOther) return ProfileUserType.UNKNOWN
+            if (segClone) hasCloneSeg = true
+            if (segOther) hasOtherSeg = true
         }
-        if (typeValues.any { CLONE_MARKER.containsMatchIn(it) }) return ProfileUserType.CLONE
-        if (typeValues.isNotEmpty()) return ProfileUserType.OTHER
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
-        // Any body line NOT matched by TYPE_LINE but carrying the type
-        // keyword counts; CLONE wins there too. Lines with an explicit
-        // `user type :/=` declaration but an empty value (TYPE_LINE matched
-        // nothing) are skipped via explicitSep, so an empty `User type:`
-        // stays UNKNOWN, never OTHER. Trailing `:`/`=` elsewhere in the
-        // line (e.g. `parentId=0`, `flags: 0x400`) no longer excludes it.
+        // Same segment rule applied to the remainder after the keyword.
         val explicitSep = Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]", RegexOption.IGNORE_CASE)
-        val fallback = body.lines().filter { TYPE_LINE.find(it) == null }
-        if (fallback.any { TYPE_KEYWORD.containsMatchIn(it) && CLONE_MARKER.containsMatchIn(it) && !explicitSep.containsMatchIn(it) }) return ProfileUserType.CLONE
-        val bareKeyword = fallback.filter { TYPE_KEYWORD.containsMatchIn(it) && !explicitSep.containsMatchIn(it) }
-        if (bareKeyword.isNotEmpty()) return ProfileUserType.OTHER
-        return ProfileUserType.UNKNOWN
+        for (line in body.lines()) {
+            if (TYPE_LINE.find(line) != null) continue
+            if (!TYPE_KEYWORD.containsMatchIn(line)) continue
+            if (explicitSep.containsMatchIn(line)) continue
+            val remainder = TYPE_KEYWORD.replaceFirst(line, "").trim()
+            if (remainder.isEmpty()) {
+                hasOtherSeg = true
+                continue
+            }
+            val segs = remainder.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
+            if (segs.isEmpty()) {
+                hasOtherSeg = true
+                continue
+            }
+            val segClone = segs.any { CLONE_MARKER.containsMatchIn(it) }
+            val segOther = segs.any { !CLONE_MARKER.containsMatchIn(it) }
+            if (segClone && segOther) return ProfileUserType.UNKNOWN
+            if (segClone) hasCloneSeg = true
+            if (segOther) hasOtherSeg = true
+        }
+        return when {
+            hasCloneSeg && hasOtherSeg -> ProfileUserType.UNKNOWN
+            hasCloneSeg -> ProfileUserType.CLONE
+            hasOtherSeg -> ProfileUserType.OTHER
+            else -> ProfileUserType.UNKNOWN
+        }
     }
 
     // Cross-source resolver (PR-1, issue #21; Phase C P2-2 property required).

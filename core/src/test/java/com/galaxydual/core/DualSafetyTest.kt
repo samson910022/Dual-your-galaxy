@@ -773,4 +773,83 @@ class DualSafetyTest {
             gateway.writeCommands().isEmpty(),
         )
     }
+
+    // Phase B P1-B e2e: dumpsys SAME block carries parentId=0 +
+    // parentId=10 (verbose normal CLONE parent0 serial15, prop 95).
+    // Intra-block parent contradiction forces that claim UNKNOWN, so the
+    // second channel no longer corroborates -> resolve -1, NoDual, zero
+    // target commands.
+    @Test
+    fun intraBlockParentContradiction_e2eRefusesWithoutTargetCommands() {
+        val dumpsysTwoParents = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                parentId=10
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        // Sanity: the contradictory block parses as UNKNOWN (first value
+        // retained for diagnosis).
+        val parsed = SamsungProfileAdapter.parseDumpsysUser(dumpsysTwoParents)
+        val block95 = parsed.single { it.userId == 95 }
+        assertTrue(block95.userType == ProfileUserType.UNKNOWN)
+        assertEquals(0, block95.parentId)
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = dumpsysTwoParents,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "intra-block parent contradiction must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no write command may run on intra-block parent contradiction, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().isEmpty(),
+        )
+    }
+
+    // Phase B P1-B e2e: dumpsys SAME block carries Serial 15 + Serial 99
+    // (verbose normal CLONE parent0 serial15, prop 95) -> same fail-closed
+    // outcome as the parent case.
+    @Test
+    fun intraBlockSerialContradiction_e2eRefusesWithoutTargetCommands() {
+        val dumpsysTwoSerials = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                Serial: 15
+                Serial: 99
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseDumpsysUser(dumpsysTwoSerials)
+        val block95 = parsed.single { it.userId == 95 }
+        assertTrue(block95.userType == ProfileUserType.UNKNOWN)
+        assertEquals(15, block95.serial)
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = dumpsysTwoSerials,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "intra-block serial contradiction must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no write command may run on intra-block serial contradiction, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().isEmpty(),
+        )
+    }
 }
