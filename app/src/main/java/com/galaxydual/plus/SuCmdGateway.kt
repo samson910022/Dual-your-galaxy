@@ -239,9 +239,11 @@ internal suspend fun captureProcessCancellable(
     timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
     execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
 ): CmdResult {
+    currentCoroutineContext().ensureActive()
     val proc = try {
         execFn(argv)
     } catch (e: Exception) {
+        if (e is CancellationException) throw e
         return CmdResult(exit = 1, out = "", err = "spawn failed: ${(e.message ?: e.javaClass.simpleName)}")
     }
     val out = StringBuilder()
