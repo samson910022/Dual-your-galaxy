@@ -18,24 +18,42 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 ## PrivilegeRouter
 
 ```kotlin
-// Pseudocode: selects the best available privilege level.
+// Pseudocode: hook-neutral — hook signal never grants privilege (#19).
+// App side calls routePrivilege(hasLsposed = false, ...); hook state is display-only.
 val privilege: Privilege = when {
-    hookActive() -> Privilege.ROOT   // LSPosed module is enabled
-    shizukuAlive() -> Privilege.SHELL // Shizuku binder reachable
+    hasRoot -> Privilege.ROOT          // su probe passed
+    shizukuAlive() -> Privilege.SHELL // Shizuku binder reachable + authorized
     else -> Privilege.NONE            // read-only mode
 }
 ```
 
-- `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (LSPosed / su).
-- Router is a pure function of two probes: `isHookActive()` and `isShizukuAlive()`.
+> Honesty note (H5 五層證據，見 `docs/HOOK.md` §1.2／§1.3 與
+> [S24 調查](UX_REVIEW_S24.md) §5)：已觀察 —— (1)類別選取：
+> daagent `using provider.WhiteListApps` 連續命中×7（僅類別選取，
+> 不等於 `<clinit>` 執行／回調／放寬）；(2)hook 註冊：system
+> `DualAppManagerService` 雙方法 deoptimize＋hooked（僅註冊，
+> 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
+>（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
+> 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
+> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
+> observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
+> 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
+> 路由 hook-neutral：`routePrivilege` 以 `hasLsposed = false` 呼叫，
+> `channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
+
+- `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (su probe).
+- Router is a pure function of two probes: `hasRoot` (su) and `isShizukuAlive()`; hook signal never enters routing (hook-neutral, LSPosed mode is NoOp placeholder).
 - UI disables write actions when privilege is `NONE`.
 
-## Executor (CmdGateway) — F4a 真通道已接線 [DEVICE-UNVERIFIED]
+## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
 - `CmdGateway` interface exposes `run(cmd: String): CmdResult` as the primary
   entry point (`run(argv: List<String>)` is a convenience overload that joins
   argv with spaces; prefer `run(String)`).
-- Implementations (app side, all DEVICE-UNVERIFIED: no on-device round-trip):
+- Implementations (app side, 五層第 5 層)：已觀察為 ROOT 一鍵 `cloned:`、
+  已授權 SHIZUKU 一鍵（已安裝 verify 單次，見 `docs/USAGE.md` §0 與
+  [S24 調查](UX_REVIEW_S24.md) §5）；未驗為完整 binder／授權矩陣、
+  當前 source 可追溯部署：
   - `ShizukuCmdGateway`: SHELL channel via the Shizuku UserService
     `GalaxyExecService` (`Shizuku#newProcess` was removed in Shizuku API
     13.1.5; the official guide mandates UserService instead -- F4a implements

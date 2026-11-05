@@ -1,3 +1,4 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
 import java.lang.reflect.Executable

@@ -1,3 +1,4 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
 import android.util.Log
@@ -71,6 +72,12 @@ class DualHook : XposedModule() {
     // #isInstalledWhitelistedPackage when present on this Samsung ROM.
     // Returns the number of installed hooks (0 = nothing hooked, so the
     // caller skips the active-marker write and stays honestly undetected).
+    //
+    // Device evidence (S24 OneUI 9, services.jar dexdump-verified):
+    // com.android.server.DualAppManagerService exists with both methods
+    // (getAllWhitelistedPackages x2 refs, isInstalledWhitelistedPackage x4
+    // + Internal variant); lspd logs confirm candidate 1 wins with
+    // deoptimize+hook success on all boots. Candidates 2-3 stay as fallback.
     private fun hookDualAppManagerService(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, SERVICE_CLASS_CANDIDATES)
         if (target == null) {
@@ -93,19 +100,53 @@ class DualHook : XposedModule() {
     // Hooks the daagent-side whitelist holder reflectively. Returns the
     // number of installed hooks (clinit patch hook + query-method hooks);
     // 0 keeps the caller from writing the active marker.
+    //
+    // Device evidence (S24 OneUI 9, DAAgent v3.7.00.0, dexdump-verified):
+    // provider.WhiteListApps is a PUBLIC ABSTRACT constants-only holder
+    // (3 static-final String[] + <clinit> + Base64 helper, zero query
+    // methods), so the <clinit> patch is the effective daagent hook and the
+    // fuzzy *hitelist* sweep correctly installs nothing here. Read queries
+    // live in DualAppDBHelper.getAllInstalledWhitelistedPackages,
+    // DAUtility.getWhiteListPkgs/*
+    // (*InSystemServer), and DualAppManager.*WhitelistPackage* -- future
+    // non-empty-policy work should target those with method-level evidence,
+    // keeping this holder as the patch point.
     private fun hookWhiteListApps(classLoader: ClassLoader): Int {
-        val target = try {
-            classLoader.loadClass(WHITE_LIST_APPS_CLASS)
-        } catch (_: Throwable) {
-            logi("$WHITE_LIST_APPS_CLASS not present, skip daagent hooks")
+        val target = findFirstAvailableClass(classLoader, WHITE_LIST_APPS_CLASS_CANDIDATES)
+        if (target == null) {
+            logi("WhiteListApps not present, skip daagent hooks")
             return 0
         }
-        // Best-effort diagnostics: confirm the expected constant exists.
-        try {
-            val field = target.getDeclaredField(WHITELIST_FIELD_NAME)
-            logi("found $WHITELIST_FIELD_NAME : ${field.type.name} static=${Modifier.isStatic(field.modifiers)}")
-        } catch (_: Throwable) {
-            logi("field $WHITELIST_FIELD_NAME not found on $WHITE_LIST_APPS_CLASS")
+        // Attribution for on-device forensics: the winning candidate disambiguates
+        // provider path vs legacy fallback in lspd logs (field-found lines alone
+        // cannot, both candidates carry the same field names).
+        logi("using ${target.name} for daagent hooks")
+        // Best-effort diagnostics: report every candidate field's presence
+        // (both standard and _FOR_CHINA names are patch targets below, so the
+        // log shows which ones this ROM actually carries).
+        val presentFields = WHITELIST_FIELD_CANDIDATES.filter { name ->
+            try {
+                target.getDeclaredField(name)
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (presentFields.isEmpty()) {
+            logi("field $WHITELIST_FIELD_NAME not found on ${target.name}")
+        } else {
+            for (diagnosticField in presentFields) {
+                try {
+                    val field = target.getDeclaredField(diagnosticField)
+                    logi(
+                        "found $diagnosticField : ${field.type.name} " +
+                            "static=${Modifier.isStatic(field.modifiers)} " +
+                            "final=${Modifier.isFinal(field.modifiers)}",
+                    )
+                } catch (_: Throwable) {
+                    logi("field $diagnosticField not found on ${target.name}")
+                }
+            }
         }
         // Patch the static whitelist right after <clinit> finishes.
         var installed = 0
@@ -180,6 +221,9 @@ class DualHook : XposedModule() {
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown signatures
     // stay observe-only with a log line; nothing is ever narrowed here.
+    // H2: the effective set is PolicySource.effective(seed + remote). No remote
+    // source is wired, so behavior today is identical to the static seed
+    // (observe-only when empty).
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         val desc = try {
@@ -192,48 +236,53 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             emptyList()
         }
-        return WhitelistPolicy.apply(result, args, EXTRA_WHITELIST_PACKAGES, desc, ::logi)
+        return WhitelistPolicy.apply(result, args, effectivePolicy(), desc, ::logi)
     }
 
-    // Merges EXTRA entries into DUAL_APP_WHITELIST_PACKAGES after class init.
-    // Every give-up path logs why (locatable diagnostics); success logs how
-    // many entries were added. The original whitelist is never shrunk.
+    // Effective policy for this process: static seed (+ a RemotePreferences
+    // snapshot if a policy source is ever wired -- none is today, so the
+    // remote snapshot stays empty and behavior is identical to the static
+    // seed). Single seam for any future policy work; IPC-free. NOTE: not
+    // covered by JVM tests (instantiating DualHook needs the framework); the
+    // decision logic inside PolicySource/WhitelistPatch is what tests lock.
+    internal fun effectivePolicy(): Set<String> =
+        PolicySource.effective(EXTRA_WHITELIST_PACKAGES, remotePolicySnapshot())
+
+    // Remote snapshot hook: empty (no policy source wired; a future change
+    // would read LibXposed RemotePreferences here -- hook-side read-only +
+    // change listener into a volatile cache).
+    // Kept as a separate function so that future work touches exactly one seam.
+    internal fun remotePolicySnapshot(): Set<String> = emptySet()
+
+    // Merges policy entries into the WhiteListApps static whitelists after
+    // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
+    // BOTH candidate fields are attempted (the ROM may read the _FOR_CHINA
+    // field per region/sales code, so first-wins would silently miss region
+    // devices); every per-field outcome is logged (locatable diagnostics).
+    // The original whitelist is never shrunk.
+    //
+    // Empty policy today (STATIC_SEED and the remote snapshot are both
+    // empty; no policy source wired): returns before touching reflection,
+    // so current behavior is observe-only and unaffected by the final-field
+    // / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
-        if (EXTRA_WHITELIST_PACKAGES.isEmpty()) return
-        try {
-            val field = target.getDeclaredField(WHITELIST_FIELD_NAME)
-            if (!Modifier.isStatic(field.modifiers)) {
-                logi("skip patch $WHITELIST_FIELD_NAME on ${target.name}: field is not static")
-                return
+        val extra = effectivePolicy()
+        if (extra.isEmpty()) return
+        val results = WhitelistPatch.patchFields(target, WHITELIST_FIELD_CANDIDATES, extra)
+        for ((fieldName, outcome) in results) {
+            when (outcome) {
+                is WhitelistPatch.Outcome.PatchedInPlace ->
+                    logi("patched $fieldName on ${target.name} (MutableList): +${outcome.added} entries")
+                is WhitelistPatch.Outcome.Replaced -> {
+                    if (outcome.added == 0) {
+                        logi("patch $fieldName on ${target.name} already complete, no write")
+                    } else {
+                        logi("patched $fieldName on ${target.name} (String[]): +${outcome.added} entries")
+                    }
+                }
+                is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason)
+                is WhitelistPatch.Outcome.ObserveOnly -> logi(outcome.reason)
             }
-            field.isAccessible = true
-            val current = field.get(null)
-            if (current is MutableList<*>) {
-                @Suppress("UNCHECKED_CAST")
-                val list = current as MutableList<String>
-                val add = EXTRA_WHITELIST_PACKAGES.filter { !list.contains(it) }
-                list.addAll(add)
-                logi("patched $WHITELIST_FIELD_NAME on ${target.name} (MutableList): +${add.size} entries")
-            } else if (current != null && current.javaClass.isArray &&
-                current.javaClass.componentType == String::class.java
-            ) {
-                @Suppress("UNCHECKED_CAST")
-                val arr = current as Array<String>
-                val add = EXTRA_WHITELIST_PACKAGES.filter { !arr.contains(it) }
-                field.set(
-                    null,
-                    (arr.toList() + add).toTypedArray(),
-                )
-                logi("patched $WHITELIST_FIELD_NAME on ${target.name} (String[]): +${add.size} entries")
-            } else {
-                logi(
-                    "skip patch $WHITELIST_FIELD_NAME on ${target.name}: unsupported type " +
-                        (current?.javaClass?.name ?: "null"),
-                )
-            }
-        } catch (t: Throwable) {
-            // Leave the original whitelist untouched on any reflection mismatch.
-            logi("patch $WHITELIST_FIELD_NAME on ${target.name} failed: ${t.message}")
         }
     }
 
@@ -259,24 +308,25 @@ class DualHook : XposedModule() {
     companion object {
         private const val TAG = "GalaxyDualHook"
 
-        // LSPosed scope pseudo-name for system_server (served via
-        // onSystemServerStarting; never arrives as an onPackageLoaded name).
-        const val SYSTEM_SCOPE = "system"
+        // Scope constants are single-sourced in HookScopes (pure JVM, unit-
+        // testable). Kept here as aliases so existing call sites and the CI
+        // scope-parity grep keep working.
+        const val SYSTEM_SCOPE = HookScopes.SYSTEM_SCOPE
 
         // Real framework package name LSPosed delivers for the system_server
         // process via onPackageLoaded. Listed here only so the early-return
         // above stays in sync; it is NOT a hook target and must never detach.
-        const val ANDROID_PACKAGE = "android"
-        const val DA_AGENT_PACKAGE = "com.samsung.android.da.daagent"
+        const val ANDROID_PACKAGE = HookScopes.ANDROID_PACKAGE
+        const val DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE
 
         // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
-        // NOTE: com.android.settings was removed (D2): no settings-side hook
-        // exists, so scoping it only widened the injection surface. SYSTEM_SCOPE
-        // never matches onPackageLoaded; it is kept here for scope.list parity.
-        val SUPPORTED_SCOPES = setOf(
-            SYSTEM_SCOPE,
-            DA_AGENT_PACKAGE,
-        )
+        // H4: self-scope packages (H3) were evaluated and retired; the F4b-P2
+        // file marker is the single hook-active signal (see HOOK.md §1.4).
+        // NOTE: com.android.settings stays out (D2): no settings-side hook
+        // exists, so scoping it would only widen the injection surface.
+        // SYSTEM_SCOPE never matches onPackageLoaded; it is kept here for
+        // scope.list parity.
+        val SUPPORTED_SCOPES: Set<String> = HookScopes.SUPPORTED_SCOPES
 
         // System-service candidates tried in order; first loadable class wins.
         // Class names differ across One UI releases, so all access is reflective.
@@ -292,15 +342,24 @@ class DualHook : XposedModule() {
             "isInstalledWhitelistedPackage",
         )
 
-        private const val WHITE_LIST_APPS_CLASS = "com.samsung.android.da.daagent.WhiteListApps"
+        private val WHITE_LIST_APPS_CLASS_CANDIDATES = listOf(
+            "com.samsung.android.da.daagent.provider.WhiteListApps",
+            "com.samsung.android.da.daagent.WhiteListApps",
+        )
         private const val WHITELIST_FIELD_NAME = "DUAL_APP_WHITELIST_PACKAGES"
+        private val WHITELIST_FIELD_CANDIDATES = listOf(
+            "DUAL_APP_WHITELIST_PACKAGES",
+            "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA",
+        )
 
         private const val HOOK_ID_PREFIX = "galaxydual:"
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"
 
-        // Placeholder policy set: empty = observe-only. Wire to RemotePreferences
-        // (or a managed config) when a real allowlist source is added.
+        // Static policy seed: empty = observe-only. H2 routes it through
+        // PolicySource.effective(seed, remote); no remote source is wired,
+        // so behavior is identical to the static seed. Union-only: entries
+        // are never removed.
         @JvmField
-        val EXTRA_WHITELIST_PACKAGES: Set<String> = emptySet()
+        val EXTRA_WHITELIST_PACKAGES: Set<String> = PolicySource.STATIC_SEED
     }
 }
