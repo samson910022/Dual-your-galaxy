@@ -334,8 +334,13 @@ object SamsungProfileAdapter {
             val typeToken = m.groupValues[3].trim()
             // Normalized to a userType= statement so the shared classifier
             // sees the explicit type; the name=... segment (inside the match
-            // prefix) is excluded by construction.
-            val body = "userType=$typeToken" + raw.substring(m.range.last + 1)
+            // prefix) is excluded by construction. The flags/parent tail goes
+            // on its own line(s): it carries no type keyword so the
+            // classifier ignores it (a flags tail like
+            // "(flags=A|B)" must never contribute profile.X tokens to the
+            // type mention -- display-only metadata), while parentId/serial
+            // extraction still scans the whole body.
+            val body = "userType=$typeToken\n" + raw.substring(m.range.last + 1)
             out.add(parseOneBlock(userId = userId, label = label, body = body, source = IdentitySource.USER_LIST_V))
         }
         return out
