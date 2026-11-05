@@ -26,12 +26,58 @@ data class CmdResult(
     // old meaning. Consumed since stage 2:
     // verify/list judge the flag via PmOutputParser.parsePackagesTrusted.
     val truncated: Boolean = false,
+    // Client-side wait-timeout flag (PR-32 P1-1, unknown-after-send).
+    // Contract: the producer must set timedOut=true when it abandons the
+    // client-side wait for the reply (reply not received -- the remote
+    // command may still have executed). exit/out/err are then untrusted and
+    // must NOT be judged by isSuccess/exit code. Defaults to false so every
+    // existing CmdResult(...) call site keeps compiling and keeps its old
+    // meaning. Consumed by DualRepository.cloneVerified/removeVerified:
+    // a timedOut write NEVER maps to InstallFailed/RemoveFailed; it runs a
+    // bounded read-only verifyListProbe instead (no write resend).
+    // Parsers/callers must never treat timedOut as definite failure.
+    // Note: the flag does not survive the Shizuku binder reply (wire layout
+    // frozen to (exit, out, err), see ShizukuExecProtocol): a service-side
+    // captureProcess timeout arrives as exit=1 + its "timeout after ..."
+    // text with timedOut=false. DualRepository therefore ALSO treats
+    // isServiceTimeoutText(res.err) (anchored producer prefixes, below) as
+    // the same unknown-after-send signal -- text backstop only, no wire
+    // change.
+    val timedOut: Boolean = false,
 ) {
     // Backward-compatible aliases for the older field names.
     val exitCode: Int get() = exit
     val stdout: String get() = out
     val stderr: String get() = err
 }
+
+// Service-side timeout text backstop (PR-32 P1-1 follow-up).
+// Survey of our own timeout producers (exact err text, case-exact):
+// - captureProcess timeout (SuCmdGateway.kt: shared by the su client AND
+//   GalaxyExecService): "timeout after ${timeoutMs}ms: ${argv0}" -- e.g.
+//   "timeout after 60000ms: sh" on the service side (argv "sh -c ...").
+//   The timedOut flag is lost on the wire: onTransact replies only
+//   (exit, out, err) and the client rebuilds truncated from the marker,
+//   so a service-side 60 s timeout arrives as exit=1 + this text +
+//   timedOut=false (without this backstop the repo would misjudge it as
+//   InstallFailed/RemoveFailed).
+// - ShizukuExecErrors.timedOut() (client withTimeoutOrNull expiry):
+//   "shizuku: exec timed out after 60000ms" -- flag survives (same
+//   process); the text match is a backstop only.
+// Deliberately NOT matched (anchored startsWith excludes them):
+// - "shizuku: bind failed: bind timed out after ..." (bind wrapper: the
+//   command never reached the service -- different knowledge state);
+// - "interrupted: ...", "spawn failed: ...", and any mid-line "timeout"
+//   word inside pm out/err.
+// Both prefixes contain a space, which a package name can never contain, so
+// normal install/uninstall output (including package echoes) cannot hit.
+// Wire layout stays frozen: no new parcel field, old payloads compatible.
+// Pure, no I/O -- covered by VerifyRetryTest predicate locks.
+private const val SERVICE_TIMEOUT_PREFIX = "timeout after "
+private const val SHIZUKU_TIMEOUT_PREFIX = "shizuku: exec timed out after "
+
+internal fun isServiceTimeoutText(err: String): Boolean =
+    err.startsWith(SERVICE_TIMEOUT_PREFIX) || err.startsWith(SHIZUKU_TIMEOUT_PREFIX)
 
 // Abstraction over SHELL (Shizuku) and ROOT (su/hook) execution channels.
 // Implementations must never throw for command failure; report via CmdResult.
