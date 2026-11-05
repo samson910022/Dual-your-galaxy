@@ -5,7 +5,14 @@
 # SIGN_STORE_PASSWORD / SIGN_KEY_ALIAS / SIGN_KEY_PASSWORD. No keystore or key
 # material is ever committed (see docs/KEY_MANAGEMENT.md). Any missing secret,
 # unsigned output, or apksigner failure stops the job before publishing.
-# STATUS: SIGN_* secrets not yet configured in GitHub — any v* tag fails by design until then; green non-tag CI does not prove the release signing path; re-verify with one tag dry-run after configuring secrets.
+# STATUS (as of 2026-11-04): SIGN_* secrets configured; tag
+# v0.0.0-dryrun run 41800791298 passed end-to-end: keystore restore +
+# assembleRelease + apksigner verify + single SHA256SUMS.txt (SHA-256,
+# sha256sum -c verified); same-run attempts 1-2 red as observed (base64
+# invalid / password incorrect), attempt 3 green; fail-closed by design;
+# CI green covers build+verify, manual download verified + cert match per #5
+# comment. Push tags v* trigger this same workflow; re-verify on first real v*
+# or after rotation/workflow change. Green non-tag CI does not prove tag path.
 name: Release
 
 on:
