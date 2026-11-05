@@ -13,8 +13,12 @@ class WhitelistPatchTest {
     fun emptyExtraIsSkippedObserveOnly() {
         val list = mutableListOf("a")
         val out = WhitelistPatch.apply(list, true, emptySet(), "F", "C")
-        assertTrue(out is WhitelistPatch.Outcome.Skipped)
-        assertTrue((out as WhitelistPatch.Outcome.Skipped).reason.contains("observe-only"))
+        assertTrue("empty extra should be Skipped", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should carry observe-only marker, was: ${o.reason}",
+            o.reason.contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
         assertEquals(listOf("a"), list)
     }
 
@@ -174,5 +178,19 @@ class WhitelistPatchTest {
         assertTrue(out is WhitelistPatch.Outcome.PatchedInPlace)
         assertEquals(2, (out as WhitelistPatch.Outcome.PatchedInPlace).added)
         assertEquals(listOf("a", "b", "c", "d"), list)
+    }
+
+    @Test
+    fun emptyExtraWithFinalStillSkipped() {
+        val arr = arrayOf("a")
+        val out = WhitelistPatch.apply(arr, true, emptySet(), "F", "C", isFinal = true)
+        assertTrue("empty policy should win over final, was: $out", out is WhitelistPatch.Outcome.Skipped)
+    }
+
+    @Test
+    fun nonStaticFinalIsSkipped() {
+        val arr = arrayOf("a")
+        val out = WhitelistPatch.apply(arr, false, setOf("b"), "F", "C", isFinal = true)
+        assertTrue("non-static should win over final, was: $out", out is WhitelistPatch.Outcome.Skipped)
     }
 }

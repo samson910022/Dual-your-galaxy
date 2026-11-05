@@ -32,6 +32,8 @@ import java.lang.reflect.Modifier
 // ArrayList copy; only the final single addAll touches the live list.
 object WhitelistPatch {
 
+    const val OBSERVE_ONLY_MARKER = "observe-only"
+
     // Outcome of attempting to merge [extra] into a static field value.
     sealed interface Outcome {
         // Mutable list patched in place; [added] entries appended.
@@ -74,7 +76,7 @@ object WhitelistPatch {
         if (extra.isEmpty()) {
             for (name in fieldNames) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: empty policy set (observe-only)",
+                    "skip patch $name on ${target.name}: empty policy set ($OBSERVE_ONLY_MARKER)",
                 )
             }
             return results
@@ -164,7 +166,7 @@ object WhitelistPatch {
     ): Outcome {
         if (extra.isEmpty()) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: empty policy set (observe-only)",
+                "skip patch $fieldName on $className: empty policy set ($OBSERVE_ONLY_MARKER)",
             )
         }
         if (!isStatic) {
@@ -174,7 +176,7 @@ object WhitelistPatch {
         }
         if (isFinal) {
             return Outcome.ObserveOnly(
-                "observe-only $fieldName on $className: static final field, " +
+                "$OBSERVE_ONLY_MARKER $fieldName on $className: static final field, " +
                     "not reassigned via Field.set (no force-write; ART unverified)",
             )
         }

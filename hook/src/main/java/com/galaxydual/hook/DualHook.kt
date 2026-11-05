@@ -276,7 +276,7 @@ class DualHook : XposedModule() {
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
         if (extra.isEmpty()) {
-            logi("skip patch on ${target.name}: empty policy (observe-only)")
+            logi("skip patch on ${target.name}: empty policy (${WhitelistPatch.OBSERVE_ONLY_MARKER})")
             return
         }
         val results = WhitelistPatch.patchFields(target, WHITELIST_FIELD_CANDIDATES, extra)
