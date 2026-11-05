@@ -112,8 +112,9 @@ enum class MsgKind {
 // routed elevation decision, channel the persisted preference, resolvedGateway
 // the actual gateway backing the repo (P25: preference vs actual split, so an
 // explicit SHIZUKU pick with ROOT available never misreports "using ROOT"),
-// execIdentity the declared privilege of that gateway, readCap whether the
-// device proved any channel, writeReady whether the selected channel proved
+// execIdentity the declared privilege of that gateway, anyProbePassed whether
+// the probed subset proved any channel (probe signal only, never proof that
+// `pm list users` is readable -- see field docs), writeReady whether the selected channel proved
 // itself, degradeNote the Auto probe-based degrade explanation (empty when
 // none), profiles/cloned the device ground truth, loading the in-flight flag,
 // and msg (+msgKind) the user-facing status.
@@ -140,10 +141,20 @@ data class UiState(
     // probed subset, never an unprobed unrelated channel).
     val execIdentity: Privilege = Privilege.NONE,
     // Probed subset proved at least one channel (hasRoot || hasShizuku).
+    // P25 Item 4: probe signal only, NOT proof that `pm list users` is
+    // readable. Counter-example A: SuElevator returns hasRoot=true on
+    // `id -u == 0` even when its `pm list users` fails (dualUserId=-1), so
+    // anyProbePassed is true while refresh reports ChannelError. True PM
+    // readability is decided by refresh (profilesSnapshot Loaded vs
+    // ChannelError, listClonedPackages null vs list), not by this flag.
     // AUTO probes all, so this is device-wide; explicit probes only its own
-    // channel (P25 Item 3), so for explicit readCap == writeReady by
+    // channel (P25 Item 3), so for explicit anyProbePassed == writeReady by
     // construction (unrelated channels intentionally unprobed, never reported).
-    val readCap: Boolean = false,
+    // Counter-example B: the environment may hold a capability (e.g. ROOT
+    // proven) while the current repo is a failing/placeholder channel
+    // (denied SHIZUKU, LSPOSED NoOp) -- the flag then reflects only the
+    // selected subset (false), never the unprobed environment.
+    val anyProbePassed: Boolean = false,
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
     // Auto probe-based degrade explanation (P25). Non-empty only for AUTO
@@ -1697,7 +1708,8 @@ class DualViewModel(
     // channel stays read-only: fail closed, never a fake working channel.
     // P25 (issue #25): the result is split five ways -- preference
     // (channel) vs resolvedGateway (currentChannel) vs execIdentity
-    // (gatewayPrivilege) vs readCap (probed subset proved any channel) vs
+    // (gatewayPrivilege) vs anyProbePassed (probed subset proved any channel;
+    // probe signal only, never proof of PM readability -- see UiState docs) vs
     // writeReady (selected channel proved). For AUTO the same probe results
     // drive degradeAutoLocked (su denied + Shizuku proven -> SHIZUKU with a
     // recorded reason; both fail -> NOOP; both succeed -> ROOT), so the
@@ -1707,8 +1719,8 @@ class DualViewModel(
     // for explicit (ROOT -> su only, SHIZUKU -> Shizuku only, LSPOSED -> none;
     // hook diagnosis still runs below via direct reads + verified gateways,
     // so explicit SHIZUKU never runs `su -c id -u` and never triggers a su
-    // auth prompt). For explicit, readCap/routed therefore reflect only the
-    // selected channel (readCap == writeReady by construction: unrelated
+    // auth prompt). For explicit, anyProbePassed/routed therefore reflect only the
+    // selected channel (anyProbePassed == writeReady by construction: unrelated
     // channels are intentionally unprobed, never reported), not device-wide
     // capability. `reusedProbe` carries the swapAutoLocked result so AUTO
     // recheck/reconnect rounds probe at most once (no double `su -c` cost).
@@ -1746,7 +1758,7 @@ class DualViewModel(
             // H2/H4 pure gate (unit-tested by ChannelReadyTest): identical to
             // the inline when it replaces. Hook signal stays display-only (#19).
             val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku)
-            val readCap = hasRoot || hasShizuku
+            val anyProbePassed = hasRoot || hasShizuku
             // Hook diagnostic signal for the LSPosed picker row (F4b-P2, P1
             // split). Runs on EVERY probe -- including an explicit-LSPosed
             // selection with an unproven/NoOp write channel -- and reads through
@@ -1822,7 +1834,7 @@ class DualViewModel(
                     channelReady = ready,
                     resolvedGateway = currentChannel,
                     execIdentity = gatewayPrivilege,
-                    readCap = readCap,
+                    anyProbePassed = anyProbePassed,
                     writeReady = ready,
                     degradeNote = degradeNoteForState,
                     msg = if (ready) readyMsg else notReadyMsg,
