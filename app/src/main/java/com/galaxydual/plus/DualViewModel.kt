@@ -811,7 +811,12 @@ class DualViewModel(
         // loading=true -- during that window state.loading stayed false and
         // MainActivity left its buttons enabled. Idempotent with the
         // probeChannels/refreshLocked sets below.
+        // 取消窗口：early-busy 先於 swap，若取消落在 swap 內 su -c 懸掛，
+        // 永不到 probe/refresh 的清除點 → 同殘 true；外層補取消清 loading
+        // (僅取消路徑，成功/失敗語意不動；生產 job 只隨 scope 清除被取消，
+        // 無手動 cancel，此為保險)。
         _state.update { it.copy(loading = true) }
+        try {
         // P25 Item 3: one probe per round — swapAutoLocked probes once and
         // returns the result for probeChannels to reuse (previously each
         // probed all elevators: double `su -c` cost + double auth-prompt risk).
@@ -832,8 +837,11 @@ class DualViewModel(
                 keepLoadingOnExit = true,
                 resolvedBeforeOp = resolvedBeforeOp,
             )
+            refreshLocked()
+        } catch (e: CancellationException) {
+            _state.update { it.copy(loading = false) }
+            throw e
         }
-        refreshLocked()
     }
 
     // Reload body shared by refresh() and selectChannel(). Must run under
@@ -2023,6 +2031,12 @@ class DualViewModel(
                                 }
                             }
                         }
+                    } catch (e: CancellationException) {
+                        // 協程取消必須透傳：外層 finally 會釋放 inFlightWrites，
+                        // 此處若吞掉會把取消誤記為 UNKNOWN 操作歷史。
+                        // Phase B P0 (B3)：取消路徑補 loading=false，免殘 true (同 clone/confirm)。
+                        _state.update { it.copy(loading = false) }
+                        throw e
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         _state.update {
@@ -2901,15 +2915,23 @@ class DualViewModel(
         // Phase D P2 busy (#24): same early-busy as reconnectLocked --
         // swapAutoLocked() suspends before probeChannels() sets
         // loading, so set it here first (idempotent, msg-preserving).
+        // 取消窗口 (同 reconnectLocked)：取消落在 swap 內 su -c 懸掛
+        // 永不到 probe 的清除點 → 同殘 true；補取消清 loading
+        // (僅取消路徑，成功/失敗語意不動)。
         _state.update { it.copy(loading = true) }
-        // P25 Item 3: one probe per round — see reconnectLocked.
-        // P2-1: allowPrivilegedHookDiagnosis gates privileged diagnostic `cat`
-        // (auto binder/onResume pass false: LSPOSED stays direct-only).
-        if (preference == ChannelPreference.AUTO) {
-            val probe = swapAutoLocked()
-            probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
-        } else {
-            probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+        try {
+            // P25 Item 3: one probe per round — see reconnectLocked.
+            // P2-1: allowPrivilegedHookDiagnosis gates privileged diagnostic `cat`
+            // (auto binder/onResume pass false: LSPOSED stays direct-only).
+            if (preference == ChannelPreference.AUTO) {
+                val probe = swapAutoLocked()
+                probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+            } else {
+                probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+            }
+        } catch (e: CancellationException) {
+            _state.update { it.copy(loading = false) }
+            throw e
         }
     }
 
@@ -4096,6 +4118,11 @@ class DualViewModel(
     // Foreground body: must run under opMutex (callers hold it).
     private suspend fun foregroundLocked() {
         markStaleIfAgedLocked()
+        // 註：此路無 early-busy (loading 由 probeChannels 內首設)，swap 懸掛時
+        // 取消落在 loading=true 之前，舊值多為 false，無殘 true 窗口；生產 job
+        // 只隨 scope 清除被取消，無手動 cancel。外層仍補取消清 loading 作保險
+        // (僅取消路徑，不改成功/失敗語意)。
+        try {
                 // P2-6：probe 前記錄通道狀態 (resolved/ready)，供 probe 後
                 // 變化偵測（全量 refresh 只在 inventory 非 FRESH 或通道改變時）。
                 val resolvedBefore = currentChannel
@@ -4128,6 +4155,10 @@ class DualViewModel(
                 } else {
                     _state.update { it.copy(loading = false) }
                 }
+        } catch (e: CancellationException) {
+            _state.update { it.copy(loading = false) }
+            throw e
+        }
     }
 
     // 過期 FRESH 補標 STALE (保留原 target/queryTime/count 供追溯)。

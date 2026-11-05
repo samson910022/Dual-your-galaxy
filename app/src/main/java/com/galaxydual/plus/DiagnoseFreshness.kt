@@ -375,13 +375,16 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 //   郵件亦須遮 (PATH_TOKEN 不處理無斜線郵件)。
 // - redactPii：dotted 包名 token → <pkg>，數字 uid/serial/exit 不動
 //   (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
-// - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>)；數字 uid/serial/exit
+// - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>) + IPv6
+//   ((?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4} → <ip>，覆蓋含 :: 壓縮形
+//   如 ::1/fe80::1/2001:db8::1 與完整 8 段形；至少需 2 個冒號，時分如 12:34
+//   不誤傷)；數字 uid/serial/exit
 //   (user 95/serial 15/exit=0) 刻意保留可讀性，不動。
 // 匯出/預覽一律先過郵件再過包名+IP (見 redactPii 實作) 最後過 redactPaths；
 // 無自動上傳 (本模組無網路呼叫)。
 private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
 private val EMAIL_TOKEN = Regex("[\\w.+-]+@[\\w.-]+")
-private val IP_TOKEN = Regex("(?:\\d{1,3}\\.){3}\\d{1,3}")
+private val IP_TOKEN = Regex("(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
 
 internal fun redactEmail(text: String): String = EMAIL_TOKEN.replace(text, "<email>")
 
