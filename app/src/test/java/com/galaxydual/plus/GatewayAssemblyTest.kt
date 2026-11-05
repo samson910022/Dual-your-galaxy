@@ -9,6 +9,7 @@
 // of SuCmdGateway / ShizukuCmdGateway).
 package com.galaxydual.plus
 
+import com.galaxydual.core.CmdResult
 import com.galaxydual.core.PmOutputParser
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
@@ -60,10 +61,33 @@ class GatewayAssemblyTest {
     }
 
     // Missing binary maps to an explicit non-zero CmdResult (the su-missing path).
+    // Pre-spawn definite (Phase A1): exec threw, process never started, so no
+    // unknown flags -- DualRepository stays on definite failure.
     @Test fun captureProcess_missingBinaryIsExplicitError() {
         val res = captureProcess(arrayOf("definitely-not-a-real-binary-xyz", "-c", "id"))
         assertNotEquals(0, res.exit)
         assertTrue(res.err.startsWith("spawn failed:"))
+        assertFalse("pre-spawn spawn failure must not carry timedOut, got: $res", res.timedOut)
+        assertFalse("pre-spawn spawn failure must not carry transportUnknown, got: $res", res.transportUnknown)
+    }
+
+    // Phase A1 wire-frozen backstop preservation: the service-side
+    // post-spawn texts ("interrupted: ...", "service exec failed: ...")
+    // survive the (exit, out, err) parcel verbatim so the repository text
+    // backstop can recognize them (flags are dropped by encode).
+    @Test fun execReply_postSpawnTextsRoundTripVerbatim() {
+        for (err in listOf("interrupted: wait interrupted", "service exec failed: boom")) {
+            val (exit, out, replyErr) = encodeExecReply(CmdResult(exit = 1, out = "", err = err))
+            val cli = decodeExecReply(exit, out, replyErr)
+            assertEquals(1, cli.exit)
+            assertEquals(err, cli.err)
+        }
+        // Normal pm Failure lines survive too but must never be confused
+        // with the anchored post-spawn prefixes (anchoring is startsWith).
+        val (_, _, failureErr) = encodeExecReply(CmdResult(exit = 1, out = "Failure [INSTALL_FAILED_INVALID_APK]", err = ""))
+        val failureCli = decodeExecReply(1, "Failure [INSTALL_FAILED_INVALID_APK]", failureErr)
+        assertFalse(failureCli.err.startsWith("interrupted: "))
+        assertFalse(failureCli.err.startsWith("service exec failed: "))
     }
 
     // Every Shizuku error mapping must be non-zero with a greppable message.
@@ -170,10 +194,17 @@ class GatewayAssemblyTest {
     // PR-32 P1-1: Su client-side wait timeout (SU_EXEC_TIMEOUT path) carries
     // timedOut=true so the repository verifies read-only instead of claiming
     // definite failure. Short budget keeps the JVM test fast.
+    // Phase A1衔接: the err text must ALSO match the isServiceTimeoutText
+    // backstop (anchored "timeout after " producer prefix) so the frozen-wire
+    // service-side timeout (flags lost on the parcel) still reconciles
+    // read-only. isServiceTimeoutText itself is internal to :core (not
+    // visible from :app tests); the startsWith below pins the exact prefix
+    // it matches (see core/CmdGateway.kt).
     @Test fun captureProcess_timeoutCarriesTimedOutFlag() {
         val res = captureProcess(arrayOf("sh", "-c", "sleep 5"), timeoutMs = 200L)
         assertNotEquals(0, res.exit)
         assertTrue("timeout reply must carry timedOut, got: $res", res.timedOut)
+        assertTrue("timeout err must hit the isServiceTimeoutText backstop, got: \"${res.err}\"", res.err.startsWith("timeout after "))
     }
 
     // The custom exec code must never collide with the framework-reserved

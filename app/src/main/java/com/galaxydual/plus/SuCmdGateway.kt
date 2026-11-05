@@ -82,25 +82,32 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         proc.destroyForcibly()
-        // Honest flag + marker: the process was killed mid-stream, so the capture is
-        // incomplete by construction even when nothing hit the cap. exit=1,
-        // so parser outcomes are unchanged (Unknown either way).
-        // E2 MINOR note: proc is already destroyForcibly'd above, and the
+        // Post-spawn unknown (Phase A1): the process was spawned, so the
         // remote pm may have executed before the kill -- unknown-after-send
-        // by construction. This branch is almost unreachable in practice:
-        // the wait runs on a Dispatchers.IO worker that is essentially never
-        // thread-interrupted (coroutine cancellation arrives as
-        // CancellationException, not InterruptedException). Full
-        // unknown-after-send coverage for this path stays a follow-up item;
-        // mapping intentionally unchanged here (comment only, no
-        // transportUnknown flag on the su channel -- scope guard against
-        // range creep).
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true)
+        // by construction. transportUnknown=true forces the repository onto
+        // the read-only verify probe instead of claiming definite failure
+        // (exit/out untrusted either way). Pre-spawn spawn failures
+        // ("spawn failed: ...", exec threw, process never started) stay
+        // definite -- only this post-spawn interrupt carries the flag.
+        // The "interrupted: " text prefix is the wire-frozen backstop: the
+        // service-side capture shares this helper and its flag is lost on
+        // the (exit, out, err) parcel, so DualRepository also matches the
+        // anchored text via isPostSpawnTransportText.
+        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
     }
     if (!exited) {
         proc.destroyForcibly()
-        drainOut.join(2_000)
-        drainErr.join(2_000)
+        try {
+            drainOut.join(2_000)
+            drainErr.join(2_000)
+        } catch (e: InterruptedException) {
+            // Post-spawn unknown (Phase A1): the timeout already abandoned
+            // the wait (timedOut=true below covers it), but the drain-join
+            // interrupt itself proves the capture is incomplete after spawn.
+            // Restore the flag and stay unknown-after-send either way.
+            Thread.currentThread().interrupt()
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+        }
         // Same honest-flag reasoning as the interrupt path above: killed
         // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
         // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
@@ -109,8 +116,20 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         // definite failure (exit/out untrusted either way).
         return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
     }
-    drainOut.join(5_000)
-    drainErr.join(5_000)
+    try {
+        drainOut.join(5_000)
+        drainErr.join(5_000)
+    } catch (e: InterruptedException) {
+        // Post-spawn unknown (Phase A1): spawn succeeded and the steady
+        // drain was interrupted -- the remote pm may have executed while
+        // this client holds only a partial capture. Destroy, restore the
+        // flag, and force read-only reconciliation via transportUnknown
+        // (same rule as the wait-interrupt above). The "interrupted: "
+        // prefix is the wire-frozen backstop for the service side.
+        Thread.currentThread().interrupt()
+        proc.destroyForcibly()
+        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+    }
     // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
     // is the expiry signal. A still-alive drain means the capture may be
     // incomplete even when nothing hit the cap -- fail closed via truncated.
@@ -219,6 +238,14 @@ class SuCmdGateway : CmdGateway {
         withContext(Dispatchers.IO) {
             try {
                 captureProcess(suArgv(cmd))
+            } catch (e: InterruptedException) {
+                // Post-spawn unknown (Phase A1): an interrupt escaping
+                // captureProcess means the spawn was attempted and the
+                // remote pm may have executed. Restore the flag and force
+                // read-only reconciliation. The "interrupted: " prefix is
+                // the wire-frozen backstop shared with the service side.
+                Thread.currentThread().interrupt()
+                CmdResult(exit = 1, out = "", err = "interrupted: ${(e.message ?: "su interrupted")}", truncated = true, transportUnknown = true)
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 CmdResult(exit = 1, out = "", err = "su failed: ${(e.message ?: e.javaClass.simpleName)}")

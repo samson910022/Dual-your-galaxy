@@ -243,10 +243,27 @@ class GalaxyExecService : Binder {
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
                 // (binder thread), so call it directly.
+                // Pre-spawn vs post-spawn (Phase A1): spawn failures
+                // ("spawn failed: ...", exec threw, process never started)
+                // are already returned INSIDE captureProcess as definite
+                // failures and never throw here. Any exception ESCAPING
+                // captureProcess therefore happened AFTER spawn started --
+                // the remote pm may have executed -- so this catch is
+                // post-spawn unknown-after-send by construction. The
+                // "service exec failed: " prefix is the wire-frozen backstop:
+                // the (exit, out, err) parcel drops the transportUnknown
+                // flag, so DualRepository.isUnknownAfterSend matches this
+                // anchored text via isPostSpawnTransportText (fail closed:
+                // read-only verify, no resend). Anchoring is exact
+                // (startsWith "service exec failed: ") so normal pm
+                // "Failure [...]" lines (capital F) can never hit.
                 val res = try {
                     captureProcess(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
                 } catch (e: Exception) {
-                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}")
+                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
