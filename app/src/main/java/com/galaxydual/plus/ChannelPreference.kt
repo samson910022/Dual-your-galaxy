@@ -117,11 +117,14 @@ fun buildGatewayForChannel(channel: ResolvedChannel, packageName: String): CmdGa
 // One assembly: the selected gateway plus the fresh su/Shizuku instances
 // backing the probes. The selected gateway SHARES its instance with the
 // matching elevator gateway (ROOT -> suGateway, SHIZUKU -> shizukuGateway)
-// so probes verify the actual channel the repo uses.
+// so probes verify the actual channel the repo uses. Typed as CmdGateway
+// (not the concrete Su/Shizuku types) so JVM tests can inject fake-backed
+// assemblies through DualViewModel's assembleChannelFn seam; production
+// still builds the real gateways below.
 data class ChannelAssembly(
     val gateway: CmdGateway,
-    val suGateway: SuCmdGateway,
-    val shizukuGateway: ShizukuCmdGateway,
+    val suGateway: CmdGateway,
+    val shizukuGateway: CmdGateway,
     val channel: ResolvedChannel,
 )
 

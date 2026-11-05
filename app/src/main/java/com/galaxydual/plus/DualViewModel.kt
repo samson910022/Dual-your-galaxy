@@ -110,18 +110,25 @@ data class UiState(
 //
 // Concurrency (core review finding, PR-3 stage 1 issue #24): refresh/clone/
 // remove/probe are serialized through opMutex so concurrent calls queue
-// instead of racing last-writer-wins on `cloned`/`loading`. Two bounds keep
-// rapid UI taps from piling an unbounded queue on that mutex: refresh()
-// coalesces (at most one pending re-run behind the in-flight one) and
-// clone/remove dedup by operation key (a second identical write while the
-// first is in flight reports "already in progress" instead of queueing).
-// Every repository call runs under Dispatchers.IO (see onIo): the core retry
-// settle wait blocks its caller thread, so running it on Main would stall
-// the Main dispatcher heartbeat for up to ~3 s per probe. Public entry
-// points are plain functions launching in viewModelScope; the Activity just
-// calls them. All op state below (refreshJob/refreshPending/inFlightWrites)
-// is touched only from viewModelScope coroutines (Main-confined) so no extra
-// synchronization is needed.
+// instead of racing last-writer-wins on `cloned`/`loading`. Three bounds keep
+// rapid UI taps from piling an unbounded queue on that mutex: refresh() and
+// recheckPrivilege() each coalesce (at most one pending re-run behind the
+// in-flight one), selectChannel() is latest-wins (a new call cancels the
+// previous select job), and clone/remove dedup by operation key (a second
+// identical write while the first is in flight reports "already in progress"
+// instead of queueing). Every repository call runs under Dispatchers.IO
+// (see onIo): gateway.run is a blocking suspend with no dispatcher
+// guarantee, and a custom blocking delayFn (e.g. Thread.sleep) would still
+// block its caller (the default settle wait is cancellable delay(),
+// PR-32 P2-1), so running repo calls on Main would stall the Main dispatcher
+// heartbeat. Public entry points are plain functions launching in
+// viewModelScope; the Activity just calls them. All op state below
+// (refreshJob/refreshPending/recheckJob/recheckPending/inFlightWrites plus
+// selectJob cleanup) is touched from viewModelScope coroutines
+// (Main-confined) so no extra synchronization is needed, except the
+// selectJob eager store which runs on the caller thread (Main in
+// production, JUnit thread in tests) with the ordering guarantee noted
+// at selectChannel().
 //
 // Phase F4b-P1 (issue #6): selectChannel(pref) swaps the gateway under the
 // same mutex (persist + rebuild via assembleChannel + re-probe + refresh),
@@ -176,6 +183,21 @@ class DualViewModel(
     // Resolved channel backing `repo` (disambiguates the two NONE-privilege
     // cases: explicit NOOP fallback vs LSPOSED placeholder).
     private var currentChannel: ResolvedChannel = ResolvedChannel.NOOP,
+    // Test seam for channel assembly (P2-2 latest-wins tests). Production
+    // uses the shared assembleChannel (real Su/Shizuku gateways, same path
+    // as the startup factory). JVM tests inject fake-backed assemblies so
+    // select probes run on a gatable FakeGateway: real SuCmdGateway blocks
+    // up to SU_EXEC_TIMEOUT on its password prompt with no tty
+    // (environment-dependent, fast-fails in CI) and Shizuku statics throw
+    // ExceptionInInitializerError under unit tests, so select bodies can
+    // never run on the JVM without this seam. Defaults keep production
+    // behavior identical.
+    private val assembleChannelFn: (
+        ChannelPreference,
+        Boolean,
+        Boolean,
+        String,
+    ) -> ChannelAssembly = ::assembleChannel,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -212,6 +234,17 @@ class DualViewModel(
     private var refreshJob: Job? = null
     private var refreshPending = false
 
+    // Recheck single-flight (P2-2): same coalescing gate as refresh(). Binder/
+    // permission/onResume bursts collapse to at most one trailing re-probe.
+    // Main-confined (see class doc).
+    private var recheckJob: Job? = null
+    private var recheckPending = false
+
+    // Select latest-wins (P2-2): the in-flight select job, cancelled by the
+    // next picker tap. Eagerly assigned in selectChannel() (see below).
+    // Main-confined (see class doc).
+    private var selectJob: Job? = null
+
     // In-flight write dedup keys ("clone:<pkg>" / "remove:<pkg>", PR-3 stage 1,
     // issue #24). A duplicate op while the first is still running reports
     // "already in progress" instead of queueing behind the mutex. Clone and
@@ -224,9 +257,11 @@ class DualViewModel(
     private fun opKey(op: String, pkg: String) = "$op:$pkg"
 
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
-    // gateway.run is a blocking suspend with no dispatcher guarantee and the
-    // core retry settle wait blocks its caller, so every repo call site goes
-    // through here to keep the Main dispatcher heartbeat unblocked.
+    // gateway.run is a blocking suspend with no dispatcher guarantee, and a
+    // custom blocking delayFn (e.g. Thread.sleep) still blocks its caller
+    // (the default settle wait is cancellable delay(), PR-32 P2-1), so every
+    // repo call site goes through here to keep the Main dispatcher heartbeat
+    // unblocked.
     private suspend fun <T> onIo(block: suspend () -> T): T =
         withContext(Dispatchers.IO) { block() }
 
@@ -631,10 +666,32 @@ class DualViewModel(
     // start: Shizuku started/granted, su appeared). An explicit non-AUTO
     // choice is never overridden here: only selectChannel() changes it.
     fun recheckPrivilege() {
+        // Single-flight coalesce (P2-2): same gate shape as refresh(). A tap
+        // while a recheck is in flight (including waiting on opMutex behind
+        // init/probe) only records one trailing re-run, so binder/permission/
+        // onResume bursts never pile an unbounded waiter queue on the mutex.
+        // Main-confined check-and-set/clear (same reasoning as refresh()).
         viewModelScope.launch {
-            opMutex.withLock {
-                if (preference == ChannelPreference.AUTO) swapAutoLocked()
-                probeChannels()
+            if (recheckJob?.isActive == true) {
+                recheckPending = true
+                return@launch
+            }
+            val myJob = currentCoroutineContext()[Job] ?: return@launch
+            recheckJob = myJob
+            try {
+                opMutex.withLock {
+                    if (preference == ChannelPreference.AUTO) swapAutoLocked()
+                    probeChannels()
+                }
+                while (recheckPending) {
+                    recheckPending = false
+                    opMutex.withLock {
+                        if (preference == ChannelPreference.AUTO) swapAutoLocked()
+                        probeChannels()
+                    }
+                }
+            } finally {
+                if (recheckJob === myJob) recheckJob = null
             }
         }
     }
@@ -646,18 +703,47 @@ class DualViewModel(
     // assembleChannel), then re-probes privilege and refreshes the lists.
     // Serialized through opMutex like every other op.
     fun selectChannel(pref: ChannelPreference) {
-        viewModelScope.launch {
-            opMutex.withLock {
-                try {
-                    persistPreference?.invoke(pref)
-                } catch (_: Exception) {
-                    // Best effort: a failing store never blocks the swap.
+        // Latest-wins (P2-2): a new picker tap cancels the previous select
+        // job, so rapid AUTO -> ROOT -> SHIZUKU taps collapse to the last
+        // choice instead of queueing a mutex waiter per event. Eager assign:
+        // cancel + launch + store happen synchronously on the caller thread
+        // (Main in production, JUnit thread in tests), so the next tap
+        // always cancels the right job even before either body starts.
+        // Safety: the body is swap (persist + in-memory rebuild) + probe +
+        // refresh -- all read-only/local, no pm install/uninstall write.
+        // Cancellation unwinds via opMutex.withLock (mutex released) and every
+        // catch in the body rethrows CancellationException.
+        //
+        // Cleanup runs in the launch-body finally (Main resumption point,
+        // same shape as refresh()/recheckPrivilege()): no
+        // invokeOnCompletion. No race: production callers are all
+        // Main-serialized (picker callbacks), so the caller-thread store and
+        // the Main finally never run concurrently; tests sequence taps with
+        // scheduler drains for the same ordering. myJob comes from
+        // currentCoroutineContext (not the scope receiver) for the
+        // self-comparison; the eager store above already points selectJob at
+        // the new job, so a cancelled predecessor sees a mismatch and never
+        // clears its successor.
+        selectJob?.cancel()
+        val job = viewModelScope.launch {
+            val myJob = currentCoroutineContext()[Job] ?: return@launch
+            try {
+                opMutex.withLock {
+                    try {
+                        persistPreference?.invoke(pref)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // Best effort: a failing store never blocks the swap.
+                    }
+                    swapToLocked(pref)
+                    probeChannels()
+                    refreshLocked()
                 }
-                swapToLocked(pref)
-                probeChannels()
-                refreshLocked()
+            } finally {
+                if (selectJob === myJob) selectJob = null
             }
         }
+        selectJob = job
     }
 
     // Re-resolves AUTO against the live environment and swaps the gateway
@@ -686,6 +772,8 @@ class DualViewModel(
     // gateway shares its instance with the matching elevator, so the next
     // probe verifies the actual channel the repo uses. Must run under
     // opMutex. A swapped-out Shizuku gateway releases its cached binding.
+    // Builds through assembleChannelFn (production: the shared
+    // assembleChannel; tests: fake-backed assemblies).
     private suspend fun swapToLocked(pref: ChannelPreference) {
         val suPresent = try {
             suPresentCheck()
@@ -697,7 +785,7 @@ class DualViewModel(
         } catch (_: Exception) {
             false
         }
-        val asm = assembleChannel(pref, suPresent, shizukuAuth, appPackageName)
+        val asm = assembleChannelFn(pref, suPresent, shizukuAuth, appPackageName)
         val old = activeGateway
         activeGateway = asm.gateway
         repo = DualRepository(asm.gateway)
