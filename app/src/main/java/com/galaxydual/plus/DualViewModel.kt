@@ -347,7 +347,7 @@ data class UiState(
 // PR-32 P2-1), so running repo calls on Main would stall the Main dispatcher
 // heartbeat. Public entry points are plain functions launching in
 // viewModelScope; the Activity just calls them. All op state below
-// (refreshJob/refreshPending/reconnectPending/recheckJob/recheckPending/inFlightWrites plus
+// (refreshJob/refreshPending/reconnectPending/recheckJob/recheckPending/foregroundJob/foregroundPending/inFlightWrites plus
 // selectJob cleanup) is touched from viewModelScope coroutines
 // (Main-confined) so no extra synchronization is needed, except the
 // selectJob eager store which runs on the caller thread (Main in
@@ -2927,7 +2927,8 @@ class DualViewModel(
 
     // Re-probes elevation channels after a binder/permission lifecycle event
     // (Phase F3, issue #6): called from MainActivity's Shizuku binder/permission
-    // listeners and from onResume. Serialized through opMutex like every other
+    // listeners and from onForeground (MainActivity.onResume routes through
+    // onForeground since StageB). Serialized through opMutex like every other
     // op, so a re-probe never races an in-flight refresh/clone/remove; the
     // probe rewrites privilege/channelReady/msg (+loading while it runs, PR-3
     // stage 1 issue #24) and leaves profiles/cloned to the next refresh.
@@ -2984,7 +2985,7 @@ class DualViewModel(
         // Single-flight coalesce (P2-2): same gate shape as refresh(). A tap
         // while a recheck is in flight (including waiting on opMutex behind
         // init/probe) only records one trailing re-run, so binder/permission/
-        // onResume bursts never pile an unbounded waiter queue on the mutex.
+        // foreground bursts never pile an unbounded waiter queue on the mutex.
         // Main-confined check-and-set/clear (same reasoning as refresh()).
         // F2/P3 leading busy (msg-preserving, same as refresh()): queued
         // behind opMutex still reads busy.

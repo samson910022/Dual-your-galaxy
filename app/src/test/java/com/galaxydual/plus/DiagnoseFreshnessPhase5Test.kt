@@ -1158,14 +1158,16 @@ class DiagnoseFreshnessPhase5Test {
 
     @Test
     fun requestRemove_labelAbsent_mapsNoDual() {
-        // verified 96（typed 走 96）但快照只有 owner → label 缺席 → NO_DUAL。
+        // StageG P2：verified 96（typed 走 96）但快照只有 owner → 跨來源矛盾，
+        // 不再是 NO_DUAL，改為 VERIFY_MISMATCH + INVALID（要求重查，零 uninstall）。
+        // 真 NO_DUAL 只走 typed Absent + 快照可用（見 Round2PhaseB / StageC/G 新測）。
         val gw = FakeRepo(dualId = 96, ownerOnlyUsers = true)
         val vm = makeVm(gw, JumpClock())
         await { vm.state.value.channelReady }
         vm.requestRemove("com.example.chat")
-        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.NO_DUAL }
-        assertNull("absent label sets no pending", vm.state.value.pendingRemove)
-        assertEquals("no dual profile", vm.state.value.msg)
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_MISMATCH }
+        assertNull("conflict sets no pending", vm.state.value.pendingRemove)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
     }
 
     @Test
