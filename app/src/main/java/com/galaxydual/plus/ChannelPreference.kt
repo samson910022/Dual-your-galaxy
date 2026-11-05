@@ -131,7 +131,7 @@ fun resolveAutoProbe(
     hasShizuku -> if (suPresent) {
         AutoProbeDecision(
             ResolvedChannel.SHIZUKU,
-            "Auto 已依實測降級：檢測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；" +
+            "Auto 已依實測降級：偵測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；" +
                 "如需恢復 ROOT 請檢查 su 授權後點「重新連線並更新」",
         )
     } else {
