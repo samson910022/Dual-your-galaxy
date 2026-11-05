@@ -17,8 +17,10 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.routePrivilege
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -217,6 +219,10 @@ class DualViewModel(
     // the same package is never collapsed. Main-confined (see class doc).
     private val inFlightWrites = mutableSetOf<String>()
 
+    // Single constructor for in-flight write dedup keys; keeps the
+    // "clone:<pkg>" / "remove:<pkg>" namespaces consistent.
+    private fun opKey(op: String, pkg: String) = "$op:$pkg"
+
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
     // gateway.run is a blocking suspend with no dispatcher guarantee and the
     // core retry settle wait blocks its caller, so every repo call site goes
@@ -249,15 +255,30 @@ class DualViewModel(
         // in flight (including waiting on opMutex behind init/probe), only
         // record that one trailing re-run is wanted. The trailing run covers
         // every intermediate tap, so the mutex queue never grows past one.
-        if (refreshJob?.isActive == true) {
-            refreshPending = true
-            return
-        }
-        refreshJob = viewModelScope.launch {
-            opMutex.withLock { refreshLocked() }
-            while (refreshPending) {
-                refreshPending = false
+        //
+        // The gate runs INSIDE viewModelScope.launch (Main-serialized with the
+        // drain below): check-and-set (gate) and check-and-clear (drain +
+        // refreshJob = null) each run synchronously on Main with no suspension
+        // in between, so a tap can never slip between the final drain check
+        // and job completion (lost wakeup). Clearing refreshJob in finally also
+        // lets the next tap start a fresh job instead of piling behind a dead
+        // one. currentCoroutineContext (not the scope receiver) identifies the
+        // child job for the self-comparison in finally.
+        viewModelScope.launch {
+            if (refreshJob?.isActive == true) {
+                refreshPending = true
+                return@launch
+            }
+            val myJob = currentCoroutineContext()[Job] ?: return@launch
+            refreshJob = myJob
+            try {
                 opMutex.withLock { refreshLocked() }
+                while (refreshPending) {
+                    refreshPending = false
+                    opMutex.withLock { refreshLocked() }
+                }
+            } finally {
+                if (refreshJob === myJob) refreshJob = null
             }
         }
     }
@@ -341,11 +362,14 @@ class DualViewModel(
                 }
             }
         } catch (e: Exception) {
+            // Never swallow coroutine cancellation: rethrow so cancel stays
+            // cooperative and refresh() coalescing still drains correctly.
+            if (e is CancellationException) throw e
             // Gateways report via CmdResult, but guard against unexpected throws.
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "refresh failed: ${e.message}",
+                    msg = "refresh failed: ${e.message ?: e.javaClass.simpleName}",
                     msgKind = MsgKind.FAILED,
                 )
             }
@@ -370,8 +394,8 @@ class DualViewModel(
             // instead of queueing another mutex waiter + device round-trip.
             // Checked before the mutex hold (Main-confined add); released in
             // finally so a cancelled/failed op never wedges the key.
-            val opKey = "clone:$trimmed"
-            if (!inFlightWrites.add(opKey)) {
+            val key = opKey("clone", trimmed)
+            if (!inFlightWrites.add(key)) {
                 _state.update {
                     it.copy(msg = "already in progress: $trimmed", msgKind = MsgKind.INFO)
                 }
@@ -379,6 +403,7 @@ class DualViewModel(
             }
             try {
                 opMutex.withLock {
+                    try {
                     if (!isWritable()) return@withLock
                     _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
                     try {
@@ -451,17 +476,27 @@ class DualViewModel(
                             }
                     }
                 } catch (e: Exception) {
+                    // Never swallow coroutine cancellation (see refreshLocked).
+                    if (e is CancellationException) throw e
                     _state.update {
                         it.copy(
                             loading = false,
-                            msg = "clone failed: ${e.message}",
+                            msg = "clone failed: ${e.message ?: e.javaClass.simpleName}",
                             msgKind = MsgKind.FAILED,
                         )
                     }
                 }
+                } finally {
+                    // Release the dedup key BEFORE the mutex is released, so a
+                    // next identical op arriving right after this one finishes
+                    // is accepted instead of wrongly refused. The outer finally
+                    // re-removes idempotently to cover cancel-while-queued
+                    // (thrown before entering withLock).
+                    inFlightWrites.remove(key)
+                }
                 }
             } finally {
-                inFlightWrites.remove(opKey)
+                inFlightWrites.remove(key)
             }
         }
     }
@@ -481,8 +516,8 @@ class DualViewModel(
             // Write dedup (PR-3 stage 1, issue #24): same contract as clone()
             // above, keyed "remove:<pkg>" so an intentional clone-then-remove
             // sequence on the same package is never collapsed.
-            val opKey = "remove:$trimmed"
-            if (!inFlightWrites.add(opKey)) {
+            val key = opKey("remove", trimmed)
+            if (!inFlightWrites.add(key)) {
                 _state.update {
                     it.copy(msg = "already in progress: $trimmed", msgKind = MsgKind.INFO)
                 }
@@ -490,6 +525,7 @@ class DualViewModel(
             }
             try {
                 opMutex.withLock {
+                    try {
                     if (!isWritable()) return@withLock
                     _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
                     try {
@@ -559,17 +595,26 @@ class DualViewModel(
                             }
                     }
                 } catch (e: Exception) {
+                    // Never swallow coroutine cancellation (see refreshLocked).
+                    if (e is CancellationException) throw e
                     _state.update {
                         it.copy(
                             loading = false,
-                            msg = "remove failed: ${e.message}",
+                            msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
                             msgKind = MsgKind.FAILED,
                         )
                     }
                 }
+                } finally {
+                    // Release the dedup key BEFORE the mutex is released (see
+                    // clone()): lets the next identical op in immediately. The
+                    // outer finally re-removes idempotently to cover
+                    // cancel-while-queued.
+                    inFlightWrites.remove(key)
+                }
                 }
             } finally {
-                inFlightWrites.remove(opKey)
+                inFlightWrites.remove(key)
             }
         }
     }
@@ -666,7 +711,8 @@ class DualViewModel(
         if (old !== activeGateway && old is ShizukuCmdGateway) {
             try {
                 old.close()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
@@ -699,7 +745,10 @@ class DualViewModel(
                         Privilege.NONE -> Unit
                     }
                 } catch (e: Exception) {
-                    // A throwing probe means no channel from this elevator.
+                    // A throwing probe means no channel from this elevator,
+                    // but cancellation must still propagate (otherwise a
+                    // cancelled scope would be misreported as "no channel").
+                    if (e is CancellationException) throw e
                 }
             }
             // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
@@ -742,7 +791,8 @@ class DualViewModel(
                     }
                     diagnoseHookState(direct, usable)
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
             }
             val hookDesc = hook.displayText()
@@ -771,12 +821,14 @@ class DualViewModel(
                 )
             }
     } catch (e: Exception) {
-        // Probes report via privilege/channelReady, but guard against
+        // Never swallow coroutine cancellation (see refreshLocked); probes
+        // report via privilege/channelReady, but guard against
         // unexpected throws so loading never wedges busy.
+        if (e is CancellationException) throw e
         _state.update {
             it.copy(
                 loading = false,
-                msg = "probe failed: ${e.message}",
+                msg = "probe failed: ${e.message ?: e.javaClass.simpleName}",
                 msgKind = MsgKind.FAILED,
             )
         }
