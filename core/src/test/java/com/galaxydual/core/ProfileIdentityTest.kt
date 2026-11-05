@@ -724,4 +724,61 @@ class ProfileIdentityTest {
         val badVerbose = userList + "\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n"
         assertTrue(!PmOutputParser.isIdentityChannelOk(badVerbose, 0))
     }
+
+    // ---- Phase A P1-1 token-level type uniqueness (issue #21 owner R3) ----
+    // A single mention holding both `profile.MANAGED` and `profile.CLONE`
+    // tokens is an intra-mention contradiction -> UNKNOWN, regardless of
+    // separator (whitespace, `/`, `,`, `;`).
+
+    @Test
+    fun whitespaceSeparatedManagedAndClone_isUnknown() {
+        // Owner counter-example: space-separated mixed tokens must refuse.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: android.os.usertype.profile.MANAGED android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+    }
+
+    @Test
+    fun slashSeparatedManagedAndClone_isUnknown() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: android.os.usertype.profile.MANAGED/android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+    }
+
+    @Test
+    fun repeatedTypeLinesWithCloneAndManaged_isUnknown() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: android.os.usertype.profile.CLONE
+                User type: android.os.usertype.profile.MANAGED
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+    }
+
+    @Test
+    fun repeatedSameCloneToken_isStillClone() {
+        // Same token twice (deduped case-insensitively) is not a
+        // contradiction: clone-only still classifies CLONE.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: profile.CLONE profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+    }
 }

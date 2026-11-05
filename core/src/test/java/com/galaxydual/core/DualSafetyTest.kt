@@ -946,4 +946,63 @@ class DualSafetyTest {
         assertTrue(runSuspend { DualRepository(bad).profilesSnapshot() } is ProfilesSnapshot.ChannelError)
         assertEquals(Privilege.NONE, runSuspend { ShizukuElevator(bad).probe() }.level)
     }
+
+    // Phase A P1-1 e2e (owner R3): both verbose channels carry a
+    // whitespace-separated mixed line (`profile.MANAGED profile.CLONE`,
+    // parent 0 serial 15 consistent, prop 95). Token-level uniqueness forces
+    // both claims UNKNOWN -> resolve -1, cloneVerified NoDual, zero target
+    // commands and zero pm install/uninstall/list probes for user 95.
+    @Test
+    fun whitespaceMixedTypeBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseMixed = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.MANAGED android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsysMixed = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.MANAGED android.os.usertype.profile.CLONE
+        """.trimIndent()
+        // Sanity: both mixed blocks parse as UNKNOWN (intra-mention conflict).
+        assertTrue(
+            SamsungProfileAdapter.parseUserListVerbose(verboseMixed).any {
+                it.userId == 95 && it.userType == ProfileUserType.UNKNOWN
+            },
+        )
+        assertTrue(
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysMixed).any {
+                it.userId == 95 && it.userType == ProfileUserType.UNKNOWN
+            },
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseMixed,
+            dumpsysOutput = dumpsysMixed,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "mixed-type must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing --user") ||
+                    it.startsWith("pm uninstall --user") ||
+                    it.startsWith("pm list packages --user")
+            },
+        )
+    }
 }

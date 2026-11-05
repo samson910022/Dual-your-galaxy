@@ -43,6 +43,15 @@ object SamsungProfileAdapter {
     // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
     private val CLONE_MARKER = Regex("(?<![A-Za-z0-9])profile[^A-Za-z0-9]{0,3}clone(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
 
+    // Standalone `profile.X` token extractor (dot form, case-insensitive).
+    // Used for token-level type uniqueness (P1-1): each type mention's
+    // `profile.X` tokens are deduped case-insensitively, then a CLONE-family
+    // token (`CLONE_MARKER` matches the token) counts as clone evidence and
+    // any other `profile.X` token counts as other evidence. Kept
+    // boundary-free by spec; callers ignore matches glued to a preceding
+    // ASCII letter/digit (`myprofile.CLONE`) so they fall back to OTHER.
+    private val PROFILE_TOKEN = Regex("profile\\.[A-Za-z0-9_]+", RegexOption.IGNORE_CASE)
+
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
     private val TYPE_LINE =
@@ -137,21 +146,44 @@ object SamsungProfileAdapter {
         )
     }
 
-    // Classifies a block body with segment-level contradiction detection
-    // (P1-B, issue #21 owner re-review): a block is UNKNOWN whenever its
-    // type evidence contradicts itself, never CLONE-by-priority.
-    // - Explicit `user type :/= value` lines: the value (group 1, trimmed,
-    //   empty skipped) is split on `,`/`;` into trimmed non-empty segments.
-    //   Segments containing CLONE_MARKER vs not containing it inside the SAME
-    //   line value is an intra-line contradiction -> UNKNOWN for the block.
-    // - Bare-keyword lines (TYPE_LINE unmatched, carries TYPE_KEYWORD, no
-    //   explicit `user type :/=` separator): the remainder after the keyword
-    //   (`TYPE_KEYWORD.replaceFirst(line, "").trim()`, empty remainder counts
-    //   as OTHER evidence like the old logic) is split the same way; a
-    //   remainder holding both CLONE and non-CLONE segments -> UNKNOWN.
-    // - Block verdict: any intra-line/remainder contradiction -> UNKNOWN;
-    //   else hasCloneSeg && hasOtherSeg (across lines/values) -> UNKNOWN
-    //   (cross-line contradiction); else CLONE / OTHER / UNKNOWN by presence.
+    // Extracts standalone `profile.X` tokens from one type mention,
+    // deduped case-insensitively. A match glued to a preceding ASCII
+    // letter/digit (`myprofile.CLONE`) is ignored so it falls back to
+    // OTHER via the no-token path, never CLONE.
+    private fun extractProfileTokens(mention: String): List<String> =
+        PROFILE_TOKEN.findAll(mention)
+            .filter { m ->
+                val s = m.range.first
+                if (s == 0) true else {
+                    val p = mention[s - 1]
+                    !(p in 'A'..'Z' || p in 'a'..'z' || p in '0'..'9')
+                }
+            }
+            .map { it.value }
+            .distinctBy { it.lowercase() }
+            .toList()
+
+    // Classifies a block body with token-level type uniqueness (P1-1,
+    // issue #21 owner re-review R3): a block is UNKNOWN whenever its
+    // `profile.X` type tokens contradict themselves, never CLONE-by-priority.
+    // Each type mention is one explicit `user type :/= value` (group 1,
+    // trimmed, empty skipped) or one bare-keyword remainder
+    // (`TYPE_KEYWORD.replaceFirst(line, "").trim()`).
+    // - 0 `profile.X` tokens in a mention: old fallback (non-empty mention
+    //   counts as OTHER evidence; empty values/remainders are ignored except
+    //   an empty bare remainder which counts as OTHER like the old logic).
+    // - >=1 tokens (deduped case-insensitively): any token matching
+    //   CLONE_MARKER counts as clone evidence; any other `profile.X` token
+    //   counts as other evidence. Non-token text is ignored once tokens
+    //   exist. `profile.MANAGED`/`profile.SYSTEM` are other tokens;
+    //   `profileCloneable` (no dot) yields no token and never matches
+    //   CLONE_MARKER's boundaries.
+    // - Same mention holding both clone and other tokens is an intra-mention
+    //   contradiction -> UNKNOWN for the block (covers whitespace, `/`,
+    //   `,`, `;` or any other separator, since tokens ignore separators).
+    // - Block verdict: any intra-mention contradiction -> UNKNOWN; else
+    //   hasCloneSeg && hasOtherSeg (across mentions) -> UNKNOWN
+    //   (cross-mention contradiction); else CLONE / OTHER / UNKNOWN.
     // Non-type lines (notes, Failure lines, `profileCloneable` tokens) can
     // never yield CLONE. The header label is NOT searched (caller passes
     // the body only), so renaming a profile to contain "DUAL" can never
@@ -159,21 +191,24 @@ object SamsungProfileAdapter {
     private fun classifyType(body: String): ProfileUserType {
         var hasCloneSeg = false
         var hasOtherSeg = false
-        // Step 1: explicit `user type :/= value` lines, segment-split.
+        // Step 1: explicit `user type :/= value` lines, token-level.
         for (line in body.lines()) {
             val m = TYPE_LINE.find(line) ?: continue
             val value = m.groupValues[1].trim()
             if (value.isEmpty()) continue
-            val segs = value.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
-            if (segs.isEmpty()) continue
-            val segClone = segs.any { CLONE_MARKER.containsMatchIn(it) }
-            val segOther = segs.any { !CLONE_MARKER.containsMatchIn(it) }
+            val tokens = extractProfileTokens(value)
+            if (tokens.isEmpty()) {
+                hasOtherSeg = true
+                continue
+            }
+            val segClone = tokens.any { CLONE_MARKER.containsMatchIn(it) }
+            val segOther = tokens.any { !CLONE_MARKER.containsMatchIn(it) }
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
-        // Same segment rule applied to the remainder after the keyword.
+        // Same token rule applied to the remainder after the keyword.
         val explicitSep = Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]", RegexOption.IGNORE_CASE)
         for (line in body.lines()) {
             if (TYPE_LINE.find(line) != null) continue
@@ -184,13 +219,13 @@ object SamsungProfileAdapter {
                 hasOtherSeg = true
                 continue
             }
-            val segs = remainder.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
-            if (segs.isEmpty()) {
+            val tokens = extractProfileTokens(remainder)
+            if (tokens.isEmpty()) {
                 hasOtherSeg = true
                 continue
             }
-            val segClone = segs.any { CLONE_MARKER.containsMatchIn(it) }
-            val segOther = segs.any { !CLONE_MARKER.containsMatchIn(it) }
+            val segClone = tokens.any { CLONE_MARKER.containsMatchIn(it) }
+            val segOther = tokens.any { !CLONE_MARKER.containsMatchIn(it) }
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true
