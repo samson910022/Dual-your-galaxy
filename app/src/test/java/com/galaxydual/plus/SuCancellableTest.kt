@@ -20,6 +20,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import com.galaxydual.core.TRUNCATION_MARKER
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
@@ -522,5 +523,52 @@ class SuCancellableTest {
         } finally {
             sleeper.interrupt()
         }
+    }
+
+    // H1 drain budget (P2 backpressure): 16 slots = 8 stuck captures. When
+    // exhausted, spawnDrain returns null and the capture still returns
+    // (never wedged) fail-closed with truncated=true via the READ_ERROR
+    // defaults; after release, normal drains recover (echo, truncated=false).
+    @Test fun drainBudgetExhausted_failClosedWithoutWedging_thenRecovers() = runBlocking {
+        // Base may be non-zero: earlier tests can park stuck drains on
+        // child-held pipes (close does not unblock a native read held by a
+        // surviving `sleep` child) -- that is exactly why the H1 cap exists.
+        // So fill only the REMAINING slots instead of assuming a zero start.
+        // Brief settle for async releases, then record the base.
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        val needed = MAX_ACTIVE_DRAINS - base
+        repeat(needed) { idx ->
+            assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+        }
+        try {
+            assertEquals(MAX_ACTIVE_DRAINS, activeDrainCount.get())
+            assertFalse("extra acquire must fail when budget exhausted", tryAcquireDrainSlot())
+            // One capture while exhausted: must still return, fail closed.
+            val degraded = withTimeoutOrNull(10_000L) {
+                captureProcessCancellable(arrayOf("sh", "-c", "echo hi"), timeoutMs = 5_000L)
+            }
+            assertTrue("exhausted capture must still return (not wedged)", degraded != null)
+            val res = degraded!!
+            assertTrue("exhausted capture must be truncated (fail closed), got: $res", res.truncated)
+            assertTrue("exhausted capture must keep exit 0 with marker (budget must not pollute exit), got: $res", res.exit == 0 && res.out.contains(TRUNCATION_MARKER))
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+        } finally {
+            repeat(needed) { releaseDrainSlot() }
+        }
+        assertEquals(base, activeDrainCount.get())
+        // Recovered: normal drain succeeds with clean EOF, truncated=false.
+        val ok = withTimeoutOrNull(10_000L) {
+            captureProcessCancellable(arrayOf("sh", "-c", "echo hi"), timeoutMs = 5_000L)
+        }
+        assertTrue("recovered capture must return", ok != null)
+        assertEquals(0, ok!!.exit)
+        assertEquals("hi\n", ok.out)
+        assertFalse("recovered capture must not be truncated, got: $ok", ok.truncated)
+        assertEquals(base, activeDrainCount.get())
     }
 }
