@@ -12,8 +12,10 @@
 // - Hook 時間證據: 沿用 HookStateProvider 的四態 + scope，另加 queriedAtMs
 //   (App 何時查的) 與 markerTimeMs (marker 內 timeMs 行，HookMarker.parseTimeMs)。
 // - DiagnoseEvent: 穩定錯誤碼 + 繁中摘要/下一步 + 可展開 exit/技術 detail
-//   (大小受限，純顯示)。匯出經 redactPii 遮蔽個資 (包名等 dotted token)，
-//   僅使用者預覽/主動匯出，無自動上傳 (本檔案無任何網路呼叫)。
+//   (大小受限，純顯示)。匯出經兩道遮蔽 (契約)：先 redactPii (包名等
+//   dotted token -> <pkg>)，再 redactPaths (含 / 路徑 token -> <path>)；
+//   順序固定 (先包名後路徑)，僅使用者預覽/主動匯出，無自動上傳
+//   (本檔案無任何網路呼叫)。本機展開顯示亦用同一遮蔽 (見 MainActivity)。
 // - 時間一律 wall-clock (System.currentTimeMillis)：有回撥/偽造風險，僅為
 //   存在性證據，絕不作授權依據。needsRefresh 把未來時間戳 (now < queryTime)
 //   視為需重查；marker 時間遠舊於查詢時間者顯示加註舊資料提醒。
@@ -267,12 +269,39 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 
 // 個資遮蔽 (純函數)：把 dotted 包名 token 換成 <pkg>，數字 uid/serial 不動
 // (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
-// 匯出/預覽一律先過此函數；無自動上傳 (本模組無網路呼叫)。
+// 匯出/預覽一律先過此函數再過 redactPaths (先包名後路徑，順序固定)；
+// 無自動上傳 (本模組無網路呼叫)。
 private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
 
 fun redactPii(text: String): String = PKG_TOKEN.replace(text, "<pkg>")
 
-// 包名單筆遮蔽：保留首段供除錯分組，其餘隱藏 (com.example.chat -> com.***）。
+// 路徑遮蔽 (純函數，第二道)：把含 / 的路徑 token 換成 <path>。
+// 只匹配含 / 的 token (Regex "/[\w./-]+"，\w 含 [A-Za-z0-9_])，
+// 故 "exit=0" 這類無斜線內容不受影響；與 redactPii 順序固定為先包名後路徑。
+// 已知取捨 (保留現狀，僅文件化，不改 regex)：
+// - "a/b" 類正常文案會被誤傷為 <path> (fail-closed，可接受：
+//   遮蔽過度只損可讀性，不洩個資；白名單本身即外洩面，刻意不做)。
+// - 反斜線 (C:\...) 與含空格路徑超出 Android 威脅模型，不處理
+//   (裝置路徑皆為正斜線、無空格；桌面風格路徑不進本機顯示/匯出)。
+private val PATH_TOKEN = Regex("/[\\w./-]+")
+
+internal fun redactPaths(text: String): String = PATH_TOKEN.replace(text, "<path>")
+
+// 顯示前淨化 (純函數)：壓 control 字元 (含換行) 為單空白，再走兩道遮蔽
+// (先包名後路徑)，最後 take(500) 有界。所有直接 catch 的 e.message 插值
+// (VM 5 處 + Activity 2 處) 顯示前一律經此函數；經 gateway detail 進 msg
+// 的間接鏈 (snap.detail/res.detail/channelDetail) 亦經此函數覆蓋。
+// techDetail 顯示前同理 (之後再 take MAX_DIAG_DETAIL_CHARS)。
+private val CONTROL_CHARS = Regex("[\r\n\u0000-\u001F\u007F]+")
+
+internal fun sanitizeForDisplay(raw: String): String =
+    redactPaths(redactPii(raw.replace(CONTROL_CHARS, " "))).take(500)
+
+// 包名單筆遮蔽：保留首段供除錯分組，其餘隱藏 (com.example.chat -> com.***)。
+// 已知取捨 (保留現狀)：首段 vendor 辨識殘留 (如 com 可辨識生態系，
+// 但無完整包名已大幅降低個資精度)；另 "android.permission.X" 這類
+// dotted 系統常數亦會被 redactPii 視為包名誤傷 (顯示為 <pkg>，可讀性稍損)。
+// 兩者皆為可讀性/隱私折衷，刻意不做更細白名單 (白名單本身即外洩面)。
 fun redactPackage(pkg: String): String {
     val head = pkg.trim().substringBefore(".").takeIf { it.isNotEmpty() } ?: return "***"
     return if ("." in pkg.trim()) "$head.***" else "***"
@@ -314,6 +343,7 @@ fun buildDiagnosticExport(state: UiState): String {
             "marker時間=${state.hookMarkerTimeMs ?: "未知"} 查詢於=${state.hookQueriedAtMs}",
     )
     sb.appendLine("通道：偏好=${state.channel} 實際=${state.resolvedGateway} 執行身份=${state.execIdentity}")
-    val redacted = redactPii(sb.toString())
+    // 兩道遮蔽 (順序固定：先包名後路徑)，與 sanitizeForDisplay/本機顯示一致。
+    val redacted = redactPaths(redactPii(sb.toString()))
     return if (redacted.length <= MAX_DIAG_EXPORT_CHARS) redacted else redacted.take(MAX_DIAG_EXPORT_CHARS)
 }

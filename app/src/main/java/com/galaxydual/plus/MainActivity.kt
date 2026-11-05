@@ -160,7 +160,8 @@ class MainActivity : ComponentActivity() {
             Shizuku.addBinderDeadListener(binderDeadListener, mainHandler)
             Shizuku.addRequestPermissionResultListener(permissionResultListener, mainHandler)
         } catch (e: Exception) {
-            msgView.text = "Shizuku 監聽註冊失敗：${e.message}"
+            msgView.text = "Shizuku 監聽註冊失敗：" +
+                sanitizeForDisplay(e.message ?: "unknown")
             msgView.setTextColor(colorFor(MsgKind.CHANNEL))
         }
         // Lifecycle-aware collection: renders every state update while STARTED.
@@ -407,7 +408,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽的本機文字 (buildDiagnosticExport
-    // 先經 redactPii，大小受限)；只有使用者主動點按才顯示，無自動上傳、
+    // 經兩道遮蔽：先包名後路徑，大小受限)；只有使用者主動點按才顯示，無自動上傳、
     // 無網路呼叫、無後台傳送。
     private fun showDiagnosticExport() {
         val state = lastState ?: vm.state.value
@@ -475,7 +476,7 @@ class MainActivity : ComponentActivity() {
                 "Shizuku：已連線・未授權（請點下方授權）"
             }
         } catch (e: Exception) {
-            "Shizuku：狀態未知（${e.message}）"
+            "Shizuku：狀態未知（${sanitizeForDisplay(e.message ?: "unknown")}）"
         }
         shizukuView.text = state
         try {
@@ -613,8 +614,12 @@ class MainActivity : ComponentActivity() {
                 append("診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}")
                 if (diagExpanded) {
                     if (diag.exit != null) append("\n  exit=${diag.exit}")
-                    if (diag.techDetail.isNotEmpty()) append("\n  細節：${diag.techDetail}（點此收合）")
-                    else append("（點此收合）")
+                    // 本機顯示經 sanitizeForDisplay (control 壓空白+兩道遮蔽+take500，
+                    // 與其他顯示一致；匯出為兩道遮蔽全量，見 buildDiagnosticExport)。
+                    if (diag.techDetail.isNotEmpty()) {
+                        append("\n  細節（本機顯示遮蔽版，與匯出一致）：")
+                        append("${sanitizeForDisplay(diag.techDetail)}（點此收合）")
+                    } else append("（點此收合）")
                 } else {
                     append("（點此展開技術細節）")
                 }
