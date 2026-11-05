@@ -121,9 +121,10 @@ internal enum class DrainStatus { EOF, CAPPED, READ_ERROR }
 // which re-derives the flag by sniffing text -- still sees truncated whenever
 // any marked stream crosses (P2-#3).
 // Compatibility note: service and client ship in the same APK and update
-// together, so both sides agree on whenever-truncated-append. An OLD service
-// (marker only on cap) paired with a NEW client can still miss a join-expiry
-// flag across versions; known cross-version limitation.
+// together, so both sides agree on whenever-truncated-append. The residual
+// NEW-client + OLD-service (v1 cap-only marker) gap is closed at the
+// deployment layer by ShizukuExecProtocol.SERVICE_VERSION (v2), which forces
+// the daemon to rebuild the resident UserService on upgrade.
 internal fun buildResult(
     exit: Int,
     out: StringBuilder,
