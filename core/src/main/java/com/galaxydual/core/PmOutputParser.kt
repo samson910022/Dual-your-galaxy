@@ -25,15 +25,17 @@ data class DualAppInfo(
 )
 
 // Tri-state result for `pm list packages` ground truth (PR-2 stage 1,
-// issue #22, additive only: no existing verify/list path reads this yet).
+// issue #22; stage 1 was additive-only, stage 2 consumers are
+// verifyListProbe/listProbe via verifyState/listClonedPackages).
 // Distinguishes a genuinely empty profile (TrustedEmpty) from an
 // uncheckable channel (Unknown), so a later stage can stop folding
 // "confirmed absent" and "cannot check" together.
 // - TrustedFull(packages): clean listing containing these exact packages.
 // - TrustedEmpty: clean listing with zero package: lines (confirmed empty).
-// - Unknown(reason): truncated capture, non-zero exit, or error-semantic
-//   text (same line-level C2 rule as isSuccess, minus the install-only
-//   ALREADY_EXISTS exception: any Failure line in a listing is untrusted).
+// - Unknown(reason): truncated capture, non-zero exit, error-semantic
+//   text, or unexpected-format/malformed-payload lines (same line-level
+//   C2 rule as isSuccess, minus the install-only ALREADY_EXISTS
+//   exception: any Failure line in a listing is untrusted).
 sealed interface TrustedList {
     // Clean listing with at least one legal package: line.
     data class TrustedFull(val packages: List<String>) : TrustedList
@@ -91,6 +93,23 @@ object PmOutputParser {
             RegexOption.IGNORE_CASE,
         ),
     )
+
+    // Trusted-listing exempt subset (P22 fix m7): only package: echoes
+    // and Success lines. The install-success "installed for user" echo
+    // (EXEMPT_LINE[2]) is deliberately NOT exempt on the listing path:
+    // only a line carrying an error keyword (or an empty listing with
+    // residual text, see M1 below) yields Unknown; a non-empty listing
+    // with no error keyword still parses to TrustedFull by deliberate
+    // scope. isSuccess() keeps the full EXEMPT_LINE unchanged.
+    private val TRUSTED_EXEMPT_LINE = listOf(
+        Regex("^\\s*package:", RegexOption.IGNORE_CASE),
+        Regex("^\\s*success(?![A-Za-z0-9])", RegexOption.IGNORE_CASE),
+    )
+
+    // Trusted-path package payload allowlist (P22 fix M2): same charset as
+    // ShellEscaper.SAFE_TOKEN. Checked only in parsePackagesTrusted;
+    // parsePackages() itself stays tolerant for compatibility.
+    private val PACKAGE_PAYLOAD = Regex("^[A-Za-z0-9._-]+$")
 
     // True pm error signals (all case-insensitive unless noted). Each must be
     // error-semantic on its own line: Failure [...] lines, Error: lines,
@@ -276,24 +295,30 @@ object PmOutputParser {
     }
 
     // Trusted tri-state parse for `pm list packages` (PR-2 stage 1, issue
-    // #22, additive only: existing parsePackages/isSuccess/verify paths are
-    // untouched and keep their exact behavior).
+    // #22; stage 1 was additive-only, stage 2 now consumes it in
+    // verifyListProbe/listProbe -- parsePackages/isSuccess keep exact behavior).
     // Rules, in order:
     // 1. truncated flag (or a "[truncated]" marker surviving from a caller
     //    that still builds CmdResult without the flag) -> Unknown: the
     //    listing may have been cut off, so "no package: line" proves nothing.
-    // 2. exit != 0 -> Unknown (detail keeps the code; retry/backoff policy
+    // 2. exit != 0 -> Unknown (detail keeps the code plus the first
+    //    stderr (else stdout) line for diagnosis; retry/backoff policy
     //    belongs to the upper layer, never to this pure parser).
     // 3. error-semantic text in out/err -> Unknown. Same line-level C2 rule
-    //    as isSuccess (EXEMPT_LINE skips package: echoes and install-success
-    //    echoes so failure/exception-named packages never misfire, then
-    //    ERROR_LINE matches Failure/Error/exception/SecurityException,
-    //    denied/cannot/abort/invalid, unknown-package/not-installed, stack
-    //    lines). Unlike isSuccess there is NO ALREADY_EXISTS exception here:
-    //    that code is install-only idempotent-success; any Failure line in
-    //    a listing makes the snapshot untrusted.
-    // 4. otherwise parsePackages(out): empty -> TrustedEmpty (confirmed
-    //    empty, format clean), non-empty -> TrustedFull(packages).
+    //    as isSuccess, except the trusted listing scan only exempts package:
+    //    echoes and Success lines -- the install-only "installed for user"
+    //    echo (EXEMPT_LINE[2]) is NOT exempt here, so a stray install echo
+    //    inside a listing is still scrutinized. There is NO ALREADY_EXISTS
+    //    exception here: that code is install-only idempotent-success; any
+    //    Failure line in a listing makes the snapshot untrusted.
+    // 4. malformed package: payload (must match ^[A-Za-z0-9._-]+$, same
+    //    charset as ShellEscaper.SAFE_TOKEN) -> Unknown. Trusted path only;
+    //    parsePackages() itself stays tolerant.
+    // 5. otherwise parsePackages(out): empty -> TrustedEmpty ONLY when both
+    //    streams are otherwise blank (any residual non-blank out line not
+    //    starting with "package:", or any non-blank err line, is an
+    //    unexpected format/dirty channel -> Unknown, fail closed);
+    //    non-empty -> TrustedFull(packages).
     fun parsePackagesTrusted(
         out: String,
         err: String,
@@ -304,18 +329,54 @@ object PmOutputParser {
             return TrustedList.Unknown("truncated: listing may be incomplete")
         }
         if (exit != 0) {
-            return TrustedList.Unknown("verify failed (exit=$exit)")
+            val src = if (err.isBlank()) out else err
+            val hint = src.lineSequence().firstOrNull { it.isNotBlank() }
+                ?.trim()?.take(200)
+            return if (hint != null) {
+                TrustedList.Unknown("verify failed (exit=$exit): $hint")
+            } else {
+                TrustedList.Unknown("verify failed (exit=$exit)")
+            }
         }
         for (raw in (out + "\n" + err).lines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
-            if (EXEMPT_LINE.any { it.containsMatchIn(line) }) continue
+            if (TRUSTED_EXEMPT_LINE.any { it.containsMatchIn(line) }) continue
             if (ERROR_LINE.any { it.containsMatchIn(line) }) {
                 return TrustedList.Unknown("error-semantic output: $line")
             }
         }
+        // M2: validate each package: payload on the trusted path only.
+        // Prefix match is case-insensitive for consistency with
+        // TRUSTED_EXEMPT_LINE (real pm emits all-lowercase; this only
+        // keeps the check self-consistent, still fail-closed).
+        for (raw in out.lines()) {
+            val line = raw.trim()
+            if (!line.startsWith("package:", ignoreCase = true)) continue
+            val payload = line.removePrefix("package:").trim()
+            if (!PACKAGE_PAYLOAD.matches(payload)) {
+                return TrustedList.Unknown("malformed package line: ${line.take(200)}")
+            }
+        }
         val packages = parsePackages(out)
-        return if (packages.isEmpty()) TrustedList.TrustedEmpty else TrustedList.TrustedFull(packages)
+        if (packages.isEmpty()) {
+            // M1 strict empty (fail closed): EXEMPT/ERROR already screened
+            // above, so any remaining non-blank out line is an unknown format
+            // (usage text, help, stray echo) -- never confirmed-absent.
+            val firstOut = out.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+            if (firstOut != null && !firstOut.startsWith("package:", ignoreCase = true)) {
+                return TrustedList.Unknown("unexpected listing format: ${firstOut.take(200)}")
+            }
+            // Conservative err side: a non-blank err stream with zero
+            // packages means a dirty channel (warning/marker the error rule
+            // did not classify) -- do not ignore it as clean-empty.
+            val firstErr = err.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+            if (firstErr != null) {
+                return TrustedList.Unknown("unexpected listing format: ${firstErr.take(200)}")
+            }
+            return TrustedList.TrustedEmpty
+        }
+        return TrustedList.TrustedFull(packages)
     }
 
     // CmdResult convenience overload: forwards the capture flag so callers
