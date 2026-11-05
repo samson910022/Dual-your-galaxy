@@ -78,14 +78,19 @@ fun serializeSelection(s: SavedSelection): String = buildString {
 // 解析 (純函數):null/空白/版本不符/target 缺失或非法 -> null (損壞)。
 // 個別非法 pkg 行跳過 (不連坐整筆);target <= 0 視為損壞 (無目標的選取無意義)。
 // serial 行缺失 -> legacy 快照 (僅 id-only 有效,serial 為 null)；serial 行
-// 存在但無效 (非整數/空字串/超 Int 範圍) 或重複出現 -> 整筆 null (損壞，
+// 存在但無效 (非整數/空字串/超 Int 範圍/<=0) 或重複出現 -> 整筆 null (損壞，
 // 不得降級為 legacy；loadSelected 對此走既有損壞自清)。
+// target 行重複出現亦整筆 null (損壞，與 serial 同級；舊 last-wins 已廢除，
+// 理由：重複行表寫入撕裂/手改，不可猜測以何者為準，fail closed)。
+// Stage5：serial<=0 (0/負值) 與 target 重複皆視損壞 (與 target<=0 同級)。
 fun parseSelection(raw: String?): SavedSelection? {
     if (raw.isNullOrBlank()) return null
     val lines = raw.lines()
     if (lines.firstOrNull()?.trim() != SELECTION_HEADER) return null
     var source = SELECTION_SOURCE_MANUAL
     var target: Int? = null
+    var targetSeen = false
+    var targetBroken = false
     var serial: Int? = null
     var serialSeen = false
     var serialBroken = false
@@ -100,7 +105,13 @@ fun parseSelection(raw: String?): SavedSelection? {
                 if (v.isNotEmpty()) source = v
             }
             t.startsWith("target=") -> {
-                target = t.removePrefix("target=").trim().toIntOrNull()
+                if (targetSeen) {
+                    // 重複 target 行 (值相同亦拒)：整筆損壞，與 serial 同級。
+                    targetBroken = true
+                } else {
+                    targetSeen = true
+                    target = t.removePrefix("target=").trim().toIntOrNull()
+                }
             }
             t.startsWith("serial=") -> {
                 if (serialSeen) {
@@ -109,7 +120,9 @@ fun parseSelection(raw: String?): SavedSelection? {
                 } else {
                     serialSeen = true
                     val v = t.removePrefix("serial=").trim().toIntOrNull()
-                    if (v == null) serialBroken = true else serial = v
+                    // Stage5：serial<=0 (0/負值) 視損壞 (與 target<=0 同級)，
+                    // 不得接受為有效 serial。
+                    if (v == null || v <= 0) serialBroken = true else serial = v
                 }
             }
             t.startsWith("at=") -> {
@@ -123,6 +136,7 @@ fun parseSelection(raw: String?): SavedSelection? {
         }
     }
     if (serialBroken) return null
+    if (targetBroken) return null
     val targetId = target ?: return null
     if (targetId <= 0) return null
     return SavedSelection(
@@ -177,12 +191,23 @@ class SelectionStore(
     // - PR-37 Phase B #2：currentSerial 為當下 verified serial（null=不可驗證）；
     //   v2 快照須相符才有效（同 id 重建的新 serial 永不沿用舊選取），legacy
     //   快照僅比 id（恢復側綁定 id-only，見 ViewModel，不靜默提升）。
-    fun loadSelected(currentTargetId: Int, currentSerial: Int? = null): Set<String> {
-        if (currentTargetId <= 0) return emptySet()
+    // - Stage5 (SerialUnavailable 誤刪修正)：currentSerial==null 對 v2 僅回空、
+    //   不清除 (unverifiable vs verified-mismatch 區分；不可驗證時保留存檔待
+    //   serial 可用後再判定，僅已驗證不符才清除)。
+    fun loadSelected(currentTargetId: Int, currentSerial: Int? = null): Set<String> =
+        loadValidSnapshot(currentTargetId, currentSerial)?.selectedPackages ?: emptySet()
+
+    // 單次讀取有效快照 (Stage5 併發收斂：restore 單次 I/O 用此入口，
+    // selectedPackages＋knownTargetSerial 同快照取得，免雙重 I/O；
+    // loadSelected 亦委派至此，單一真相來源)。
+    // 語義與 loadSelected 完全一致 (含自清)：損壞/已驗證不符清除回空；
+    // 唯 v2＋currentSerial==null (不可驗證) 回 null 且不清除。
+    fun loadValidSnapshot(currentTargetId: Int, currentSerial: Int? = null): SavedSelection? {
+        if (currentTargetId <= 0) return null
         val raw: String? = try {
             loadRaw()
         } catch (_: Exception) {
-            return emptySet()
+            return null
         }
         val saved = try {
             parseSelection(raw)
@@ -197,22 +222,26 @@ class SelectionStore(
                     // Best effort:下次 save 覆寫即恢復。
                 }
             }
-            return emptySet()
+            return null
         }
         if (!isSelectionValidFor(saved, currentTargetId, currentSerial)) {
+            // Stage5：不可驗證 (v2＋當下 serial 未知) 不清除，僅回空。
+            if (saved.knownTargetSerial != null && currentSerial == null) return null
             try {
                 saveRaw(null)
             } catch (_: Exception) {
                 // Best effort:陳舊條目下次 save 覆寫。
             }
-            return emptySet()
+            return null
         }
-        return saved.selectedPackages
+        return saved
     }
 
     // 保存 (原子單鍵 commit)。targetId <= 0 拒絕 (無目標不存)。
     // PR-37 Phase B #2：targetSerial 為保存時刻 verified serial（null=未知，
     // 寫 legacy 形狀，恢復綁定 id-only）；已知才寫 serial 行（v2 內容）。
+    // Stage5 縱深：save 側過濾非法 pkg token (與 parse 同白名單)，VM 層已有
+    // catalog 過濾，生產安全，此為第二道 (非法行直接捨去，不連坐整筆)。
     fun save(
         source: String,
         targetId: Int,
@@ -221,13 +250,17 @@ class SelectionStore(
         targetSerial: Int? = null,
     ): Boolean {
         if (targetId <= 0) return false
+        // Stage5：非正 serial 永不落盤 (與 parse 同級；呼叫端誤傳 0/負值時
+        // 退為 legacy 形狀，不寫出自毀條目)。
+        val safeSerial = if (targetSerial != null && targetSerial <= 0) null else targetSerial
+        val filtered = selected.filterTo(mutableSetOf()) { SELECTION_PKG_TOKEN.matches(it) }
         val payload = serializeSelection(
             SavedSelection(
                 schema = SELECTION_SCHEMA,
                 source = source.ifBlank { SELECTION_SOURCE_MANUAL },
                 knownTargetId = targetId,
-                knownTargetSerial = targetSerial,
-                selectedPackages = selected.toSet(),
+                knownTargetSerial = safeSerial,
+                selectedPackages = filtered.toSet(),
                 savedAtMs = nowMs,
             ),
         )

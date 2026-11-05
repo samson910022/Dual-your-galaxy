@@ -659,7 +659,10 @@ class DualViewModel(
     // 變動/serial 重建) 後允許對新目標再恢復一次 (舊目標條目已由 SelectionStore 失效清除)。
     // PR-37 Phase B #2：marker 為 (id, serial) 配對——同 id 重建（新 serial）
     // 視為新目標，仍可恢復一次；舊 marker 不阻擋新 serial 的恢復。
-    private var selectionRestoredForTarget: SelectionTarget = SELECTION_RESTORE_NONE
+    // Stage5 併發：Main-confinement (見類註解；生產全 Main，同值)；@Volatile
+    // 僅為 Unconfined 測試可見性 (toggle 跑測試執行緒、restore 提交跑 IO 執行緒)，
+    // 與 selectionGen (AtomicLong) 同理，不改變生產串行語義。
+    @Volatile private var selectionRestoredForTarget: SelectionTarget = SELECTION_RESTORE_NONE
     // PR-7 P2 Phase B #1：選取綁定目標（in-memory）。
     // - restore 成功（kept 非空）或使用者在已驗證目標下修改勾選時綁定到當下
     //   inventory 的 (targetId, targetSerial)；清空勾選後回到哨兵。
@@ -671,7 +674,8 @@ class DualViewModel(
     //   殘留風險如實揭露：inventory serial 未知（SerialUnavailable 罕見路徑）
     //   或 legacy 快照恢復時綁定為 id-only (serial null)；id-only 綁定永不
     //   靜默提升為完全體——批次要求完全體 (id,serial) 相符才執行，否則整批拒絕。
-    private var selectionBoundTarget: SelectionTarget = SELECTION_BOUND_NONE
+    // Stage5 併發：同上 Main-confinement＋@Volatile (測試可見性，生產仍串行)。
+    @Volatile private var selectionBoundTarget: SelectionTarget = SELECTION_BOUND_NONE
     // PR-37 Phase B R4 #2：選取變更單調計數（lost-update 競態守衛，ABA 安全）。
     // - toggle/setSelected/selectVisible/clear（含無-opMutex 使用者路徑）實際
     //   改變 selectedKeys 時＋1；mutex 下清空（handle/batch drift）與 restore
@@ -1199,8 +1203,10 @@ class DualViewModel(
                                             targetId = dualId,
                                             // Listing-time 已驗證對偶已知：
                                             // 通道失敗的是清單列舉，不是身份本身，
-                                            // 故身份配對沿用本次 listing-time 值。
-                                        ).copy(targetSerial = dualSerial),
+                                            // 故身份配對沿用本次 listing-time 值
+                                            // (Stage5 原子配對，免兩步 copy)。
+                                            targetSerial = dualSerial,
+                                        ),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.CHANNEL_ERROR,
                                             techDetail = "profiles snapshot " +
@@ -1232,8 +1238,10 @@ class DualViewModel(
                                             source = PmOutputParser.buildListPackages(dualId),
                                             targetId = newTarget,
                                             // 真漂移 (newTarget != dualId 恆成立)：
-                                            // 舊 serial 永不殘留到新 id。
-                                        ).copy(targetSerial = null),
+                                            // 舊 serial 永不殘留到新 id
+                                            // (Stage5 原子配對，免兩步 copy)。
+                                            targetSerial = null,
+                                        ),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_MISMATCH,
                                             techDetail = "verified id drifted: " +
@@ -1259,8 +1267,10 @@ class DualViewModel(
                                             source = PmOutputParser.buildListPackages(dualId),
                                             targetId = dualId,
                                             // 同上：列舉不可查，身份仍為本次
-                                            // listing-time 已驗證配對。
-                                        ).copy(targetSerial = dualSerial),
+                                            // listing-time 已驗證配對
+                                            // (Stage5 原子配對，免兩步 copy)。
+                                            targetSerial = dualSerial,
+                                        ),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_UNKNOWN,
                                             techDetail = "cannot list clones for user $dualId",
@@ -3206,6 +3216,13 @@ class DualViewModel(
     // PR-37 Phase B #2：守衛比對 (id,serial) 配對——呼叫端可另傳 targetSerial
     //（為空即沿用當下 verified serial）；寫入的 serial 一律取自當下已驗證
     // inventory（權威來源，非呼叫端參數），serial 未知時寫 legacy 形狀。
+    // Stage5 新鮮度閘：僅 FRESH 允許保存；STALE 拒絕並提示重查 (舊資料不謊稱
+    // 新鮮，寫入前必須先 refresh 重驗)。UNKNOWN 允許——persist 為顯式使用者
+    // 動作 (使用者主動按保存＋顯式傳入 targetId，非依賴 inventory 自動行為)，
+    // 未驗證時按顯式目標寫 legacy/id-only，不以未知身份冒充已驗證；STALE 則為
+    // 已知過期，必須拒絕 (fail closed)。
+    // Stage5 不降級：known.targetSerial==null (SerialUnavailable/UNKNOWN) 時
+    // 若既有快照為 v2，拒絕以 legacy 覆寫 (防降級丟失 serial 綁定)。
     fun persistSelection(
         targetId: Int,
         source: String = SELECTION_SOURCE_CATALOG,
@@ -3227,6 +3244,16 @@ class DualViewModel(
                     return@withLock
                 }
                 val known = _state.value.inventory
+                // Stage5：STALE 即拒絕 (提示重查)，UNKNOWN 顯式動作放行 (見上)。
+                if (known.freshness == InventoryFreshness.STALE) {
+                    _state.update {
+                        it.copy(
+                            msg = "清單已過期（STALE），請重新查詢後再保存",
+                            msgKind = MsgKind.INVALID,
+                        )
+                    }
+                    return@withLock
+                }
                 if (known.targetId > 0 && known.targetId != targetId) {
                     _state.update {
                         it.copy(
@@ -3249,6 +3276,25 @@ class DualViewModel(
                         )
                     }
                     return@withLock
+                }
+                // Stage5：不可驗證時不降級覆寫既有 v2 (同 mutex 下單次快照讀取)。
+                if (known.targetSerial == null) {
+                    val existing = try {
+                        onIo { store.loadSnapshot() }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        null
+                    }
+                    if (existing != null && existing.knownTargetSerial != null) {
+                        _state.update {
+                            it.copy(
+                                msg = "無法驗證分身身分（serial 缺失），" +
+                                    "為保護既有選取已拒絕覆寫，請重查後再保存",
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
                 }
                 val catalogKeys = _state.value.sourceCatalog.map { it.appKey }.toSet()
                 val selected = _state.value.selectedKeys
@@ -3331,6 +3377,10 @@ class DualViewModel(
     // PR-37 Phase B #2：targetSerial 為當下 verified serial（null=不可驗證）；
     // 綁定 serial 取自存檔快照本身（v2 全、legacy 空），永不靜默提升 id-only
     // 為 (id,serial) 完全體。
+    // Stage5 併發收斂：單次 I/O (loadValidSnapshot) 取得 selectedPackages＋
+    // knownTargetSerial 同一快照，免雙重讀取；同 opMutex 下 persist/clear/
+    // restore 互斥，故快照與提交守衛間無交錯寫入 (外部行程直改 prefs 檔除外，
+    // 該路徑由提交前三比對兜底：身份/選取已變即放棄)。
     // PR-37 Phase B R4 #2 lost-update 競態守衛：提交（寫 selectedKeys／marker／
     // bound）前重讀最新 StateFlow 三比對，任一不符即放棄（不寫選取、不燒 marker、
     // 靜默：不碰 msg，勿擾民）——
@@ -3349,6 +3399,11 @@ class DualViewModel(
         if (targetId <= NO_TARGET_ID) return
         // Phase B #1：inventory 未驗證直接返回，不燒 marker（待驗證後由 refresh 補觸）。
         if (_state.value.inventory.targetId <= NO_TARGET_ID) return
+        // Stage5 外來 id 守衛 (防誤刪為優先)：請求目標 != 已驗證 inventory 即
+        // no-op，不進 store I/O。舊碼以 serial=null 調 loadSelected(外來 id)，
+        // 會把有效條目判不符並自清 (loadSelected 副作用)；VM 層 no-op 最小改動，
+        // 保留有效條目待正確目標恢復。
+        if (_state.value.inventory.targetId != targetId) return
         val cur = _state.value
         if (cur.selectedKeys.isNotEmpty()) return
         val current = SelectionTarget(targetId, targetSerial)
@@ -3362,12 +3417,14 @@ class DualViewModel(
             SelectionTarget(cur.inventory.targetId, cur.inventory.targetSerial)
         val byKey = cur.sourceCatalog.associateBy { it.appKey }
         val available = availableKeys ?: byKey.keys
-        val restored = try {
-            onIo { store.loadSelected(targetId, targetSerial) }
+        // Stage5 單次 I/O：selectedPackages＋knownTargetSerial 同快照取得。
+        val validSnap = try {
+            onIo { store.loadValidSnapshot(targetId, targetSerial) }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            emptySet()
+            null
         }
+        val restored = validSnap?.selectedPackages ?: emptySet()
         if (restored.isEmpty()) return
         // AppKey 交集恢復；舊版包名條目 (無 ":") 向前容忍：按包名 groupBy 取首
         // (同包多來源只取 catalog 首個，消除 associateBy(packageName) 塌陷的
@@ -3379,14 +3436,9 @@ class DualViewModel(
             else byPackageFirst[saved.trim()]?.appKey
         }.filterTo(mutableSetOf()) { it in available }
         if (kept.isEmpty()) return
-        // 綁定 serial 取自存檔快照本身：v2 快照綁完全體，legacy 快照綁 id-only
-        //（已於 loadSelected 驗證有效，此處同 mutex 下重讀必存在）。
-        val savedSerial = try {
-            onIo { store.loadSnapshot() }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            null
-        }?.knownTargetSerial
+        // 綁定 serial 取自同一快照本身：v2 快照綁完全體，legacy 快照綁 id-only
+        //（已於 loadValidSnapshot 驗證有效，無第二重讀）。
+        val savedSerial = validSnap?.knownTargetSerial
         // R4 #2：提交前三比對（最新 StateFlow）。
         val latest = _state.value
         // (a) 選取仍允許自動恢復：為空且期間無任何選取變更（gen 守 ABA）。

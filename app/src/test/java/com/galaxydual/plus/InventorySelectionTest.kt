@@ -1034,6 +1034,9 @@ class InventorySelectionTest {
         // 此時 inventory 仍未驗證（probe 不寫 inventory，需 refresh 才驗證）。
         assertTrue(vm.state.value.inventory.targetId <= 0)
         vm.setSourceCatalog(catalog())
+        // Stage5 註解：sleep 300ms 為非同步 no-op 證明——restore 經 viewModelScope＋
+        // opMutex 非同步執行，sleep 確保若有 stray 恢復早已完成；仍空即真 no-op，
+        // 非「尚未執行」。改 latch 需重構自動補觸路徑，風險大，僅加註解 (最小改動)。
         Thread.sleep(300)
         assertTrue(
             "unverified catalog must not restore via snapshot fallback",
@@ -1106,6 +1109,8 @@ class InventorySelectionTest {
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.inventory.targetId <= 0 }
         // inventory 未驗證時即使傳入已知目標亦不恢復（待驗證後由 refresh 補觸）。
+        // Stage5 註解：同上 sleep 為非同步 no-op 證明 (restore 已在 opMutex 後，
+        // sleep 確保完成；仍空即真 no-op)。
         vm.restoreSelection(95)
         Thread.sleep(200)
         assertTrue(
@@ -1113,6 +1118,7 @@ class InventorySelectionTest {
             vm.state.value.selectedKeys.isEmpty(),
         )
         // 未知目標讀取永不破壞已存資料；顯式未知 target 恢復是 no-op。
+        // Stage5 註解：同上 sleep 為非同步 no-op 證明。
         vm.restoreSelection(-1)
         Thread.sleep(200)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -1412,14 +1418,21 @@ class InventorySelectionTest {
             emptySet<String>(), backend.store().loadSelected(95, 41),
         )
         assertNull("mismatch must clear the stale entry", backend.store().loadSnapshot())
-        // id-only 讀取遇到 v2 行：失效並清除（拒絕靜默降級）。
+        // id-only 讀取遇到 v2 行：失效但不清除（Stage5 unverifiable-no-clear；
+        // 拒絕靜默降級仍回空，僅已驗證不符才自清，見上 41 分支）。
         assertTrue(
             backend.store().save(
                 SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.c"), 3000L, 15,
             ),
         )
         assertEquals(emptySet<String>(), backend.store().loadSelected(95))
-        assertNull(backend.store().loadSnapshot())
+        assertEquals(
+            "unverifiable v2 must be preserved for later verified restore",
+            95, backend.store().loadSnapshot()?.knownTargetId,
+        )
+        assertEquals(15, backend.store().loadSnapshot()?.knownTargetSerial)
+        // serial 可用後仍可恢復。
+        assertEquals(setOf("0:com.example.c"), backend.store().loadSelected(95, 15))
     }
 
     // PR-37 P3 Phase A #4：serial 行存在但無效（非整數/空/超界）或重複出現
@@ -1537,6 +1550,8 @@ class InventorySelectionTest {
         assertTrue(vm.state.value.selectedKeys.isEmpty())
         assertTrue(vm.state.value.msg.contains("目標已變更"))
         // 舊選取不作用到新 profile：顯式恢復亦無效。
+        // Stage5 註解：sleep 為非同步 no-op 證明 (同上)；此處為已驗證不符，
+        // 故自清為預期 (與 unverifiable-no-clear 對照，見 store_unverifiable 測試)。
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -1606,6 +1621,7 @@ class InventorySelectionTest {
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         // refresh 內補觸恢復已因損壞回空；顯式 restore 亦必須無效。
+        // Stage5 註解：sleep 為非同步 no-op 證明 (同上)；損壞自清為預期。
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -1929,5 +1945,249 @@ class InventorySelectionTest {
             "identity-unknown start must not leave inventory FRESH",
             st.inventory.freshness != InventoryFreshness.FRESH,
         )
+    }
+
+    // Stage5 (SerialUnavailable 誤刪修正)：v2＋currentSerial==null 僅回空、
+    // 不清除 (unverifiable vs verified-mismatch 區分)。已驗證不符仍自清
+    // (見 serialRebuild 對照測試)。
+    @Test
+    fun store_unverifiableV2_returnsEmptyWithoutClearing() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1000L, 15,
+            ),
+        )
+        // 不可驗證：回空但保留存檔，待 serial 可用後仍可恢復。
+        assertEquals(emptySet<String>(), backend.store().loadSelected(95, null))
+        assertEquals(95, backend.store().loadSnapshot()?.knownTargetId)
+        assertEquals(15, backend.store().loadSnapshot()?.knownTargetSerial)
+        // serial 可用後仍可恢復 (未被誤刪)。
+        assertEquals(setOf("0:com.example.a"), backend.store().loadSelected(95, 15))
+        // 已驗證不符 (95#15 vs 41)：回空＋自清。
+        assertEquals(emptySet<String>(), backend.store().loadSelected(95, 41))
+        assertNull(backend.store().loadSnapshot())
+    }
+
+    // Stage5：serial<=0 (0/-1/-5) 視損壞 (與 target<=0 同級)，整筆拒絕＋自清。
+    @Test
+    fun store_nonPositiveSerial_rejectsWholeEntry() {
+        val raws = mapOf(
+            "zero" to
+                "v1\nsource=catalog\ntarget=95\nserial=0\nat=1000\npkg=0:com.example.a\n",
+            "negative-one" to
+                "v1\nsource=catalog\ntarget=95\nserial=-1\nat=1000\npkg=0:com.example.a\n",
+            "negative-five" to
+                "v1\nsource=catalog\ntarget=95\nserial=-5\nat=1000\npkg=0:com.example.a\n",
+        )
+        for ((name, raw) in raws) {
+            val backend = MapBackend()
+            backend.map[SELECTION_KEY] = raw
+            val store = backend.store()
+            assertNull("parse must reject $name serial", store.loadSnapshot())
+            assertEquals(
+                "loadSelected must fail closed on $name",
+                emptySet<String>(), store.loadSelected(95, 15),
+            )
+            assertNull("$name damage must self-clear", backend.map[SELECTION_KEY])
+            assertTrue(store.save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1L))
+            assertEquals(setOf("0:com.example.a"), backend.store().loadSelected(95))
+        }
+    }
+
+    // Stage5：重複 target 行視損壞 (與 serial 重複同級，舊 last-wins 已廢除)。
+    @Test
+    fun store_duplicateTargetLine_rejectsWholeEntry() {
+        val raws = mapOf(
+            "duplicate-same" to
+                "v1\nsource=catalog\ntarget=95\ntarget=95\nat=1000\npkg=0:com.example.a\n",
+            "duplicate-different" to
+                "v1\nsource=catalog\ntarget=95\ntarget=96\nat=1000\npkg=0:com.example.a\n",
+        )
+        for ((name, raw) in raws) {
+            val backend = MapBackend()
+            backend.map[SELECTION_KEY] = raw
+            val store = backend.store()
+            assertNull("parse must reject $name target line", store.loadSnapshot())
+            assertEquals(
+                emptySet<String>(), store.loadSelected(95),
+            )
+            assertNull("$name damage must self-clear", backend.map[SELECTION_KEY])
+            assertTrue(store.save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1L))
+            assertEquals(setOf("0:com.example.a"), backend.store().loadSelected(95))
+        }
+    }
+
+    // Stage5 縱深：save 側過濾非法 pkg token (與 parse 同白名單)，不連坐整筆。
+    @Test
+    fun store_save_filtersIllegalPkgToken() {
+        val backend = MapBackend()
+        val store = backend.store()
+        assertTrue(
+            store.save(
+                SELECTION_SOURCE_CATALOG, 95,
+                setOf("0:com.example.good", "bad pkg with spaces", "evil\nline"),
+                1000L, 15,
+            ),
+        )
+        assertEquals(
+            setOf("0:com.example.good"),
+            backend.store().loadSelected(95, 15),
+        )
+    }
+
+    // Stage5 外來 id 誤刪修正：存 96-entry、inventory(96,41)、調
+    // restoreSelection(95) → 選取空＋96-entry 保留 (VM 層 no-op，不進 I/O)。
+    @Test
+    fun restore_foreignId_noOpPreservesEffectiveEntry() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 96, setOf("0:com.example.mail"), 2000L, 41,
+            ),
+        )
+        val gw = FakeRepo()
+        gw.dualId = 96
+        gw.dualSerial = 41
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.targetId == 96 &&
+                vm.state.value.inventory.targetSerial == 41
+        }
+        // refresh 已對 96 自動恢復 (mail 在勾選中)；先清空以構造「選取空」起點，
+        // 再以外來 95 請求驗證 no-op：既不寫入選取，也不刪除 96 有效條目。
+        await { "0:com.example.mail" in vm.state.value.selectedKeys }
+        vm.clearSelectionLocal()
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        // 外來目標請求：no-op (sleep 證明非同步完成後仍空，非尚未執行)。
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertEquals(
+            "foreign-id restore must not delete the effective entry",
+            96, backend.store().loadSnapshot()?.knownTargetId,
+        )
+        assertEquals(
+            41, backend.store().loadSnapshot()?.knownTargetSerial,
+        )
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // Stage5 新鮮度閘：僅 FRESH 允許保存；STALE 拒絕並提示重查。
+    @Test
+    fun persist_staleInventory_refusesWithRequeryHint() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        vm.toggleSelection("0:com.example.good")
+        vm.persistSelection(95)
+        await { vm.state.value.msg.startsWith("已保存選取") }
+        val snapBefore = backend.store().loadSnapshot()
+        assertEquals(setOf("0:com.example.good"), snapBefore?.selectedPackages)
+        // 批次成功 → 庫存 STALE。
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        // STALE 下保存必須拒絕，不覆寫快照。
+        vm.persistSelection(95)
+        await { vm.state.value.msg.contains("已過期") }
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertEquals(
+            "stale persist must not overwrite the snapshot",
+            snapBefore?.selectedPackages, backend.store().loadSnapshot()?.selectedPackages,
+        )
+    }
+
+    // Stage5 不降級：known.serial==null 時拒絕以 legacy 覆寫既有 v2。
+    @Test
+    fun persist_unverifiableDoesNotDowngradeV2() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.chat"), 1000L, 15,
+            ),
+        )
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 15
+        }
+        // 模擬 SerialUnavailable：inventory serial 未知 (FRESH 保留，供追溯)。
+        val f = vm.javaClass.getDeclaredField("_state")
+        f.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val sf = f.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<UiState>
+        sf.update {
+            it.copy(inventory = it.inventory.copy(targetSerial = null))
+        }
+        vm.toggleSelection("0:com.example.mail")
+        vm.persistSelection(95)
+        await { vm.state.value.msg.contains("serial 缺失") }
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertEquals(
+            "unverifiable persist must not downgrade the v2 entry",
+            15, backend.store().loadSnapshot()?.knownTargetSerial,
+        )
+        assertEquals(
+            setOf("0:com.example.chat"),
+            backend.store().loadSnapshot()?.selectedPackages,
+        )
+    }
+
+    // Stage5 (id,serial) 配對參數：新 id 必須原子傳入 serial，不沿用舊值。
+    @Test
+    fun toStaleOrUnknown_pairing_isAtomic() {
+        val fresh = InventorySnapshot(
+            source = "cmd",
+            targetId = 95,
+            targetSerial = 15,
+            queryTimeMs = 1000L,
+            freshness = InventoryFreshness.FRESH,
+            count = 1,
+        )
+        // 同 id 省略 serial：沿用舊 serial。
+        val same = fresh.toStaleOrUnknown(now = 2000L, source = "cmd2", targetId = 95)
+        assertEquals(InventoryFreshness.STALE, same.freshness)
+        assertEquals(95, same.targetId)
+        assertEquals(15, same.targetSerial)
+        // 新 id 原子傳 null：舊 serial 永不殘留。
+        val drift = fresh.toStaleOrUnknown(
+            now = 2000L, source = "cmd2", targetId = 96, targetSerial = null,
+        )
+        assertEquals(96, drift.targetId)
+        assertNull(drift.targetSerial)
+        assertEquals(InventoryFreshness.STALE, drift.freshness)
+        // UNKNOWN 分支同理配對。
+        val unknownBase = InventorySnapshot(
+            source = "cmd",
+            targetId = 95,
+            targetSerial = 15,
+            queryTimeMs = 1000L,
+            freshness = InventoryFreshness.UNKNOWN,
+            count = 2,
+        )
+        val unknownDrift = unknownBase.toStaleOrUnknown(
+            now = 3000L, source = "cmd2", targetId = 96, targetSerial = null,
+        )
+        assertEquals(InventoryFreshness.UNKNOWN, unknownDrift.freshness)
+        assertEquals(96, unknownDrift.targetId)
+        assertNull(unknownDrift.targetSerial)
     }
 }

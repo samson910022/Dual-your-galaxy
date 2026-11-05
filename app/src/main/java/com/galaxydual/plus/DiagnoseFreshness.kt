@@ -107,27 +107,32 @@ fun InventorySnapshot.needsRefresh(now: Long, maxAgeMs: Long = INVENTORY_STALE_A
 // count 一律保留舊筆數，與 FRESH->STALE 一致 (舊資料不謊稱新鮮亦不丟失)。
 // DualViewModel.refreshLocked 各失敗分支共用；寫前拒絕分支 (M3) 亦經此降級。
 // (原名 staleOrUnknownLocked；測試無引用故改名，語意/行為不變。)
+// Stage5 (id,serial) 配對參數：targetId 與 targetSerial 必須配對傳入，
+// 新 id 永不沿用舊 serial (footgun 防呆)。呼叫端改寫目標時須同時顯式傳入
+// serial (新目標配新 serial／未知傳 null)，不得先傳新 id 再 .copy(serial) 兩
+// 步改寫；同 id 保留身份時可省略 (預設沿用 this.targetSerial)。
 fun InventorySnapshot.toStaleOrUnknown(
     now: Long,
     source: String,
     targetId: Int = NO_TARGET_ID,
+    targetSerial: Int? = this.targetSerial,
 ): InventorySnapshot =
     if (freshness == InventoryFreshness.FRESH) {
         // 理由見上：target 有效即覆寫 (drift 不丟)、source 沿用傳入、queryTime 保持舊值。
-        // Serial 保留：此函數只降新鮮度不改身份，呼叫端改寫目標時須另行
-        // 設定 targetSerial（新目標配新 serial，舊 serial 永不殘留到新 id）。
+        // Serial 配對原子寫入：新目標配新 serial，舊 serial 永不殘留到新 id。
         copy(
             source = source,
             targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
+            targetSerial = targetSerial,
             freshness = InventoryFreshness.STALE,
         )
     } else {
         InventorySnapshot(
             source = source,
             targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
-            // UNKNOWN 亦保留舊 serial（舊資料不謊稱新鮮亦不丟失；暫態通道失敗
-            // 不得銷毀已綁定的 serial 身份，否則 v2 持久選取會被誤判失效）。
-            targetSerial = this.targetSerial,
+            // UNKNOWN 亦配對寫入 (暫態通道失敗不得銷毀/殘留錯誤 serial 身份；
+            // 同 id 預設保留，drift 呼叫端須顯式傳 null/新 serial)。
+            targetSerial = targetSerial,
             queryTimeMs = now,
             freshness = InventoryFreshness.UNKNOWN,
             count = this.count,
