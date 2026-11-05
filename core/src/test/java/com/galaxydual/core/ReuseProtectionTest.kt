@@ -8,13 +8,20 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// Phase D ID-reuse protection (issue #21, owner P1-3): an Android user id may
-// be recycled for a different profile incarnation. The id alone is not the
-// identity -- serial/parentId pin the instance. A same-id target whose serial
-// (or parent) positively disagrees between resolve time and use time must be
-// refused (auto paths) or reported VerifyUnknown (pinned post-write re-check),
-// fail closed with zero mis-targeted writes. Either side missing is tolerated
-// (Phase B upgrade path): only both-present-and-unequal refuses.
+// Phase D ID-reuse protection (issue #21, owner P1-3) + Phase A P1-A serial
+// continuity (issue #21, #21 "execute-then-verify serial"): an Android user
+// id may be recycled for a different profile incarnation. The id alone is
+// not the identity -- serial pins the instance. A same-id target whose
+// serial positively disagrees between resolve time and use time must be
+// refused (auto paths) or reported VerifyUnknown (pinned post-write
+// re-check), fail closed with zero mis-targeted writes. A known serial
+// followed by a missing serial across fetches (expected 15 -> fresh null,
+// before 15 -> after null) is continuity lost and likewise refuses (fail
+// closed, before any write/probe). Only an unknown expected.serial stays
+// tolerated (null -> 15 writes); single-fetch single-channel missing stays
+// tolerated (Phase B resolver policy, unchanged). Parent needs no
+// known-to-unknown rule (resolver already requires both channels known and
+// == 0, so a Confirmed fresh target always carries parentId == 0).
 class ReuseProtectionTest {
     // Mutable gateway: per-identity-fetch serials plus an optional post-write
     // drift. Identity fetch index increments per dumpsys call (verbose then
@@ -88,6 +95,10 @@ class ReuseProtectionTest {
 
         fun installWrites(): List<String> = commands.filter { it.startsWith("pm install-existing") }
 
+        fun uninstallWrites(): List<String> = commands.filter { it.startsWith("pm uninstall") }
+
+        fun listProbes(): List<String> = commands.filter { it.startsWith("pm list packages") }
+
         fun targetCommandsFor(userId: Int): List<String> = commands.filter {
             it.contains("--user $userId")
         }
@@ -160,11 +171,14 @@ class ReuseProtectionTest {
         assertEquals(1, gateway.installWrites().size)
     }
 
-    // Serial single-side missing is tolerated (Phase B upgrade path): only
-    // both-present-and-unequal refuses. Both directions must still write.
+    // Serial continuity is asymmetric (Phase A P1-A): unknown -> known is
+    // tolerated (Phase B upgrade path, expected.serial == null writes), but
+    // known -> unknown is continuity lost and refuses (fail closed, before
+    // any write). Parent needs no such rule (see DualRepository KDoc).
     @Test
     fun serialSingleSideMissing_tolerated() {
-        // expected.serial == null (both channels silent at resolve), fresh 15.
+        // expected.serial == null (both channels silent at resolve), fresh 15:
+        // stays tolerated and writes.
         val missingFirst = FlipGateway(
             verboseSerials = mutableListOf(null, 15),
             dumpsysSerials = mutableListOf(null, 15),
@@ -173,14 +187,150 @@ class ReuseProtectionTest {
         assertEquals("missing-expected must be tolerated, got: $first", 0, first.exit)
         assertEquals(1, missingFirst.installWrites().size)
 
-        // fresh.serial == null (channels fall silent after resolve), expected 15.
+        // fresh.serial == null (channels fall silent after resolve), expected
+        // 15: continuity lost -> refused (exit 1, reuse/continuity reason),
+        // zero writes, no target command.
         val missingFresh = FlipGateway(
             verboseSerials = mutableListOf(15, null),
             dumpsysSerials = mutableListOf(15, null),
         )
         val second = runSuspend { DualRepository(missingFresh).clone("com.example.chat") }
-        assertEquals("missing-fresh must be tolerated, got: $second", 0, second.exit)
-        assertEquals(1, missingFresh.installWrites().size)
+        assertEquals("continuity-lost must refuse, got: $second", 1, second.exit)
+        assertTrue(
+            "expected reuse/continuity refusal, got: ${second.err}",
+            second.err.startsWith("refused:") && (second.err.contains("reuse") || second.err.contains("continuity")),
+        )
+        assertTrue(
+            "continuity-lost must never write, got: ${missingFresh.commands}",
+            missingFresh.installWrites().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${missingFresh.commands}",
+            missingFresh.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Auto remove with continuity lost (expected serial 15, fresh serial
+    // missing) is refused with zero uninstall writes and no target command.
+    @Test
+    fun autoRemove_serialContinuityLost_refusedWithoutWrite() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, null),
+            dumpsysSerials = mutableListOf(15, null),
+        )
+        val repo = DualRepository(gateway)
+        val res = runSuspend { repo.remove("com.example.chat") }
+        assertEquals(1, res.exit)
+        assertTrue(
+            "expected reuse/continuity refusal, got: ${res.err}",
+            res.err.startsWith("refused:") && (res.err.contains("reuse") || res.err.contains("continuity")),
+        )
+        assertTrue(
+            "continuity-lost must never write, got: ${gateway.commands}",
+            gateway.uninstallWrites().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Pinned clone whose serial is lost across the write (before 15, fresh
+    // 15, after missing) reports VerifyUnknown (identity-changed +
+    // continuity lost), never Success, even though install and list both
+    // succeed. The write itself ran once (post-write drift); the contract is
+    // fail-closed reporting, never Success.
+    @Test
+    fun pinnedClone_continuityLostAfterWrite_yieldsVerifyUnknown() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, 15, null),
+            dumpsysSerials = mutableListOf(15, 15, null),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("drift must be VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must note identity-changed, got: $detail", detail.contains("identity-changed"))
+        assertTrue("detail must note continuity lost, got: $detail", detail.contains("continuity lost"))
+        assertEquals(1, gateway.installWrites().size)
+    }
+
+    // Pinned clone whose serial is already lost before the write (before 15,
+    // fresh missing) reports VerifyUnknown without emitting any write
+    // command (fail closed pre-write branch).
+    @Test
+    fun pinnedClone_continuityLostBeforeWrite_yieldsVerifyUnknownWithoutWrite() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, null),
+            dumpsysSerials = mutableListOf(15, null),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("pre-write drift must be VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must note identity-changed, got: $detail", detail.contains("identity-changed"))
+        assertTrue("detail must note continuity lost, got: $detail", detail.contains("continuity lost"))
+        assertTrue(
+            "pre-write drift must never write, got: ${gateway.commands}",
+            gateway.installWrites().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // verifyOnProfiles continuity (auto verify path, Phase A P1-A): expected
+    // serial 15 followed by fresh serial missing maps to Unknown (folded to
+    // false by the Boolean auto verify) without emitting the `pm list
+    // packages` probe. The explicit verifyState(pkg, dualId) entry carries
+    // expected=null by construction so it has no cross-fetch pair; the
+    // cross-fetch Unknown is locked here via the auto path that shares the
+    // same verifyOnProfiles guard.
+    @Test
+    fun autoVerify_serialContinuityLost_noProbe() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, null),
+            dumpsysSerials = mutableListOf(15, null),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val verified = runSuspend { DualRepository(gateway).verify("com.example.chat") }
+        assertTrue("continuity-lost verify must be false (Unknown folded), got: $verified", !verified)
+        assertTrue(
+            "continuity-lost must not probe, got: ${gateway.commands}",
+            gateway.listProbes().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // listOnProfiles continuity (auto list path, Phase A P1-A): expected
+    // serial 15 followed by fresh serial missing yields null (unknown)
+    // without emitting the `pm list packages` probe. Same note as above:
+    // the explicit listClonedPackages(dualId) entry carries expected=null,
+    // so the cross-fetch null is locked via the auto path sharing the same
+    // listOnProfiles guard.
+    @Test
+    fun autoList_serialContinuityLost_returnsNullWithoutProbe() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, null),
+            dumpsysSerials = mutableListOf(15, null),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val listed = runSuspend { DualRepository(gateway).listClonedPackages() }
+        assertEquals("continuity-lost list must be null (unknown), got: $listed", null, listed)
+        assertTrue(
+            "continuity-lost must not probe, got: ${gateway.commands}",
+            gateway.listProbes().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
     }
 
     // Direct parser mapping: Confirmed carries the target, Unknown/Refused
