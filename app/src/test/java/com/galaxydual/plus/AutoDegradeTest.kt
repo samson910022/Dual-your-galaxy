@@ -20,6 +20,7 @@ import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import com.galaxydual.hook.HookMarker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
@@ -63,6 +64,11 @@ class AutoDegradeTest {
         // channels (serial binding); noSerial omits both serial lines.
         var serial: Int = 15
         var noSerial: Boolean = false
+        // Phase A P2: marker content served via `cat` for hook-diagnosis tests.
+        // Null (default) preserves the legacy "ok" (no scopes); setting it
+        // makes `cat <marker path>` return parseable marker text so a cached
+        // verified ROOT channel can diagnose ACTIVE without new `id -u` probes.
+        var markerContent: String? = null
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -115,6 +121,14 @@ class AutoDegradeTest {
             }
             cmd.startsWith("pm list packages") ->
                 CmdResult(exit = 0, out = listPackagesOut(), err = "")
+            cmd.startsWith("cat ") -> {
+                // Phase A P2: serve marker content for hook diagnosis; null
+                // keeps the legacy "ok" (no scopes). `cat` never touches
+                // idUCalls/listUsersCalls, so zero-probe assertions stay valid.
+                val content = markerContent
+                if (content != null) CmdResult(exit = 0, out = content, err = "")
+                else CmdResult(exit = 0, out = "ok", err = "")
+            }
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
     }
@@ -220,6 +234,11 @@ class AutoDegradeTest {
         initialChannel: ResolvedChannel,
         initialGateway: CmdGateway,
         preference: ChannelPreference = ChannelPreference.AUTO,
+        hookDirectReads: () -> List<MarkerRead> =
+            { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+        hookDiagnosticGateways: () -> List<CmdGateway> = { emptyList() },
+        lastVerifiedHasRoot: Boolean = false,
+        lastVerifiedHasShizuku: Boolean = false,
     ): DualViewModel {
         val vm = DualViewModel(
             repo = DualRepository(initialGateway),
@@ -234,8 +253,10 @@ class AutoDegradeTest {
             shizukuGateway = shizukuFake,
             activeGateway = initialGateway,
             currentChannel = initialChannel,
-            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
-            hookDiagnosticGateways = { emptyList() },
+            lastVerifiedHasRoot = lastVerifiedHasRoot,
+            lastVerifiedHasShizuku = lastVerifiedHasShizuku,
+            hookDirectReads = hookDirectReads,
+            hookDiagnosticGateways = hookDiagnosticGateways,
         )
         vms.add(vm)
         return vm
@@ -946,5 +967,59 @@ class AutoDegradeTest {
         assertFalse("probe flag stays false for the unprobed subset", s.anyProbePassed)
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertTrue("placeholder repo is unreadable, got: \"${s.msg}\"", s.msg.contains("channel error"))
+    }
+
+    // Phase A P2 regression: LSPOSED diagnosis reuses the AUTO-verified cache
+    // without new probes. Simulates "AUTO全成功後切LSPOSED": direct reads are
+    // denied (app-uid EACCES), but the cache holds proven ROOT (injected here
+    // to stand in for the prior AUTO full success without rebuilding real
+    // gateways via selectChannel), and the cached ROOT channel serves the
+    // marker via `cat`. LSPOSED must then diagnose ACTIVE while write-readiness
+    // stays refused and no new `su -c id -u` probe runs. Cold-start LSPOSED
+    // (empty cache) stays UNKNOWN -- see HookDiagnosisTest direct-denied case.
+    @Test
+    fun explicit_lsposed_usesVerifiedCacheForDiagnosisWithoutNewProbe() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            initialGateway = NoOpGateway(),
+            preference = ChannelPreference.LSPOSED,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { listOf(suFake, shizukuFake) },
+            // Manual cache: stands in for a prior AUTO full success that proved ROOT.
+            lastVerifiedHasRoot = true,
+            lastVerifiedHasShizuku = false,
+        )
+        await { !vm.state.value.loading && vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        val s = vm.state.value
+        assertEquals("cached ROOT must diagnose ACTIVE via `cat`", HookStatus.ACTIVE, s.hookStatus)
+        assertTrue("ACTIVE diagnosis must set hookActive", s.hookActive)
+        assertTrue(
+            "marker history must be visible, got: ${s.hookScopes}",
+            s.hookScopes.contains(HookMarker.SCOPE_SYSTEM_SERVER),
+        )
+        assertFalse("NoOp placeholder is never writable, even with cached diagnosis", s.writeReady)
+        assertFalse("NoOp placeholder is never channelReady", s.channelReady)
+        assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
+        assertFalse("LSPOSED probes none, so no probe passes even with cache", s.anyProbePassed)
+        assertEquals("LSPOSED diagnosis must not run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("LSPOSED diagnosis must not probe Shizuku", 0, shizukuFake.listUsersCalls)
+
+        // A re-probe must not start new `su -c` auth either, and must keep ACTIVE.
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals("LSPOSED recheck must not run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
+        assertFalse(vm.state.value.writeReady)
     }
 }
