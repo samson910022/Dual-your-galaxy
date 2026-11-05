@@ -846,37 +846,50 @@ class DiagnoseFreshnessPhase5Test {
         assertTrue("hook row shows scope, got: $hookRow", hookRow.contains(HookMarker.SCOPE_SYSTEM_SERVER))
     }
 
-    // ---- 11. Phase 1 語意 ----
+    // ---- 11. Phase 1 語意 (p25-rebase 適配)：拋錯 gateway 由新 base
+    // Gateway 防禦在 profilesSnapshot 內收斂為 ChannelError，不再外拋到
+    // refresh 的 OP_FAILED/"refresh(exception)" 分支（該分支僅覆蓋非
+    // gateway 拋錯）。例外文字仍進 techDetail 保可追溯；寫前拒絕不碰裝置。
 
     @Test
-    fun phase1_cloneThrow_mapsUnknownVerifyUnknown() {
+    fun phase1_cloneThrow_mapsChannelErrorUnknown() {
         val gw = FakeRepo()
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
         gw.throwAll = true
         vm.clone("com.example.chat")
-        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
-        val last = vm.state.value.lastOperation!!
-        assertEquals("throwing gateway is post-write-unknown", OpPhase.UNKNOWN, last.phase)
-        assertEquals("clone:com.example.chat", last.opId)
-        assertEquals("com.example.chat", last.appKey)
-        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, vm.state.value.diagnose?.code)
+        assertTrue(
+            "unknown result must say so, got: ${vm.state.value.msg}",
+            vm.state.value.msg.startsWith("clone result unknown"),
+        )
+        assertTrue(
+            "exception text must stay traceable, got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("boom"),
+        )
+        assertFalse("pre-write refusal must not touch the device", gw.sawInstall)
+        assertNull("unverifiable write records no history", vm.state.value.lastOperation)
     }
 
     @Test
-    fun phase1_refreshException_sourceTagged() {
+    fun phase1_refreshException_mapsChannelError() {
         val gw = FakeRepo()
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
         gw.throwAll = true
         vm.refresh()
-        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.OP_FAILED }
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
         assertEquals(
             "exception path source must be distinguishable",
-            "refresh(exception)",
+            "pm list users",
             vm.state.value.inventory.source,
+        )
+        assertTrue(
+            "exception text must stay traceable, got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("boom"),
         )
     }
 
@@ -1011,13 +1024,13 @@ class DiagnoseFreshnessPhase5Test {
     }
 
     @Test
-    fun requestRemove_exception_mapsOpFailed() {
+    fun requestRemove_exception_mapsChannelError() {
         val gw = FakeRepo()
         val vm = makeVm(gw, JumpClock())
         await { vm.state.value.channelReady }
         gw.throwAll = true
         vm.requestRemove("com.example.chat")
-        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.OP_FAILED }
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
         assertNull("exception sets no pending", vm.state.value.pendingRemove)
     }
 }
