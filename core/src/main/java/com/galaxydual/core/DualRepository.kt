@@ -632,6 +632,8 @@ class DualRepository(
         // Scope: only these two signals take this path. Other
         // transport-unknown (binder-dead, spawn failure, interrupt) stays on
         // the legacy isSuccess judgement -- follow-up, not inflated here.
+        // No after-pin on this path by design: the probe is already the
+        // report-only evidence (report-only, never redirects a write).
         if (res.timedOut || isServiceTimeoutText(res.err)) {
             return when (val state = verifyListProbe(clean, dualId)) {
                 is VerifyState.Installed -> CloneOutcome.Success(dualId)
@@ -701,7 +703,8 @@ class DualRepository(
         // VerifyUnknown (caller keeps the entry; the next refresh converges).
         // Trigger (wire frozen): res.timedOut OR isServiceTimeoutText(res.err)
         // (see cloneVerified note -- same parcel flag-loss backstop).
-        // Scope: only these two signals take this path.
+        // Scope: only these two signals take this path. No after-pin here
+        // by design (report-only probe, same rationale as cloneVerified).
         if (res.timedOut || isServiceTimeoutText(res.err)) {
             return when (val state = verifyListProbe(clean, dualId)) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
@@ -819,6 +822,7 @@ class DualRepository(
         // Unknown-after-send (PR-32 P1-1, same rule as cloneVerified/
         // removeVerified): a timed-out write reply proves nothing about the
         // remote uninstall -- verify read-only instead of claiming failure.
+        // No after-pin here by design (report-only probe).
         if (res.timedOut || isServiceTimeoutText(res.err)) {
             return when (val state = verifyListProbe(clean, expectedDualId)) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
