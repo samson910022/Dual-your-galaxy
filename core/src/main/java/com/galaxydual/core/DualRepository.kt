@@ -1,6 +1,8 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+import kotlin.jvm.Volatile
+
 // Profile-list snapshot distinguishing channel failure from an empty parse.
 // Phase C3 (issue #9): listProfiles() collapses both to emptyList by design
 // (C2 contract, kept); callers that must tell "channel failed" apart from
@@ -76,6 +78,10 @@ class DualRepository(
     // therefore callers must dispatch repository calls off the Main thread
     // (DualViewModel runs every repo call under Dispatchers.IO). Tests replace
     // it with a no-op/virtual delay to skip the real 1500 ms waits.
+    // TEST-ONLY: production must not overwrite. @Volatile gives visibility
+    // across threads (test thread writes, IO thread reads) but no atomicity;
+    // concurrent overwrite is not safe -- set once before use, never at runtime.
+    @Volatile
     internal var delayFn: suspend (Long) -> Unit = { ms -> Thread.sleep(ms) }
 
     companion object {
@@ -95,6 +101,10 @@ class DualRepository(
         // Part of the retry policy (bounded: at most 2 waits per probe); the
         // wait itself runs through delayFn so tests can go virtual.
         const val VERIFY_RETRY_DELAY_MS = 1500L
+
+        // Total list-probe attempts per verify (PR-3 stage 2, issue #24):
+        // 1 initial + 2 retries, i.e. at most 2 waits.
+        const val VERIFY_MAX_ATTEMPTS = 3
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
@@ -453,7 +463,7 @@ class DualRepository(
         }
         var res = gateway.run(cmd)
         var attempts = 1
-        while (res.exit != 0 && attempts < 3) {
+        while (res.exit != 0 && attempts < VERIFY_MAX_ATTEMPTS) {
             delayFn(VERIFY_RETRY_DELAY_MS)
             res = gateway.run(cmd)
             attempts++
