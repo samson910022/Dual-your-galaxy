@@ -30,6 +30,11 @@ class CloneVerifiedExpectedTest {
         var verboseNoisy: Boolean = false,
         var throwOnIdentity: Boolean = false,
         var absentIdentity: Boolean = false,
+        // 矛盾證據（負向測試專用）：verbose/dumpsys 無 clone（owner-only，
+        // 同 absent），但 getprop 與 pm 快照仍指向 dualId（舊 absent fake 的
+        // 矛盾狀態）。typed 必須判 Unknown（property/pm 反證），絕不放寬為
+        // Absent；production 判定不動。
+        var contradictoryEvidence: Boolean = false,
         var installOut: String = "Package com.example.chat installed for user: 95",
         var installExit: Int = 0,
         var listPackagesOut: String = "package:com.example.chat\n",
@@ -39,7 +44,9 @@ class CloneVerifiedExpectedTest {
         val commands = mutableListOf<String>()
 
         private fun verboseOut(): String {
-            if (absentIdentity) {
+            // absent 與 contradictory 的 typed 通道皆無 clone（owner-only）；
+            // 差別在 getprop/pm 快照：absent 為乾淨空，contradictory 仍指向 dual。
+            if (absentIdentity || contradictoryEvidence) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} running:\n" +
                     "    Serial number: 0\n" +
@@ -62,7 +69,7 @@ class CloneVerifiedExpectedTest {
         }
 
         private fun dumpsysOut(): String {
-            if (absentIdentity) {
+            if (absentIdentity || contradictoryEvidence) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                     "    userType=android.os.usertype.full.SYSTEM\n"
@@ -79,10 +86,17 @@ class CloneVerifiedExpectedTest {
                 "    userType=android.os.usertype.profile.CLONE\n"
         }
 
-        private fun listUsersOut(): String =
-            "Users:\n" +
+        private fun listUsersOut(): String {
+            // absent 為乾淨無 dual（owner-only，無 95）；contradictory 刻意
+            // 保留 95 以重現 pm 快照反證（typed 必須 Unknown）。
+            if (absentIdentity) {
+                return "Users:\n" +
+                    "\tUserInfo{0:Owner:13} running\n"
+            }
+            return "Users:\n" +
                 "\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{$dualId:DUAL_APP:400} running\n"
+        }
 
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
@@ -105,7 +119,10 @@ class CloneVerifiedExpectedTest {
                         err = if (dumpsysExit != 0) "denied" else "",
                     )
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
-                    CmdResult(exit = 0, out = "$dualId\n", err = "")
+                    // absent 為乾淨無聲明（空字串，identity 閘通過＋解析為 null）；
+                    // contradictory 刻意仍指向 dualId（property 反證 → Unknown）。
+                    if (absentIdentity) CmdResult(exit = 0, out = "", err = "")
+                    else CmdResult(exit = 0, out = "$dualId\n", err = "")
                 cmd.startsWith("pm install-existing") ->
                     CmdResult(exit = installExit, out = installOut, err = "")
                 cmd.startsWith("pm list packages") ->
@@ -316,6 +333,8 @@ class CloneVerifiedExpectedTest {
     // PR-37 Phase C (review R4 #5): genuinely absent dual (clean channels,
     // real user blocks on both sources, no clone claim) stays NoDual --
     // the confirmed-absent basis for the M13 batch short-circuit.
+    // Clean absent requires getprop empty AND pm snapshot owner-only (the
+    // pmIds guard); see contradictoryEvidence below for the fail-closed arm.
     @Test
     fun absentIdentity_returnsNoDualWithZeroInstall() {
         val gateway = FakeGateway(absentIdentity = true)
@@ -325,6 +344,32 @@ class CloneVerifiedExpectedTest {
         assertTrue("expected NoDual, got: $outcome", outcome is CloneOutcome.NoDual)
         assertTrue(
             "no install may run without a dual target, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // PR-37 Stage 1 (gh review #1): contradictory evidence -- typed channels
+    // claim no clone yet pm/property still point at 95 (the old fake's mixed
+    // state) -- must be Unknown/ChannelError with zero installs, never NoDual.
+    // Guards the pmIds + property vetoes against future loosening.
+    @Test
+    fun contradictoryEvidence_returnsChannelErrorWithZeroInstall() {
+        val gateway = FakeGateway(contradictoryEvidence = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        val detail = (outcome as CloneOutcome.ChannelError).detail
+        assertTrue(
+            "detail must name the unknown identity, got: $detail",
+            detail.contains("unknown", ignoreCase = true),
+        )
+        assertTrue(
+            "detail must never claim no dual, got: $detail",
+            !detail.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "no install may run on contradictory identity evidence, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm install-existing") },
         )
     }

@@ -1153,9 +1153,19 @@ class DualViewModel(
                         // 語意仍為未知，不清空。
                         val nullSnap: ProfilesSnapshot? =
                             if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
-                        // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
+// Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
+                        // M2 pm 反證守衛一致性：null 路徑僅 Confirmed-不同-id 觸發
+                        // drift，其餘（Absent/Unknown）同走 VERIFY_UNKNOWN，故傳
+                        // pmIds 無行為差；此處以重查快照（Loaded）為準、回退原快照。
                         val nullVerified: DualIdResolution? =
-                            if (groundTruth == null) onIo { repo.resolveDualUserIdTyped() } else null
+                            if (groundTruth == null) {
+                                val pmIds =
+                                    ((nullSnap as? ProfilesSnapshot.Loaded)?.profiles ?: profiles)
+                                        .map { it.userId }.toSet()
+                                onIo { repo.resolveDualUserIdTyped(pmIds = pmIds) }
+                            } else {
+                                null
+                            }
                         _state.update { cur ->
                             val now = nowWallMs()
                             val next = if (groundTruth == null) {
