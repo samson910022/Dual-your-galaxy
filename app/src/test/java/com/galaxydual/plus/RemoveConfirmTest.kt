@@ -635,7 +635,7 @@ class RemoveConfirmTest {
 
     // P2 安裝重驗 (PR-33 R3): the package vanished between request and
     // confirm (external uninstall) -- confirm clears without uninstalling
-    // (INFO 無需移除, cloned left for refresh to sync).
+    // (INFO 無需移除, cloned left for refresh to sync, never wiped here).
     @Test
     fun confirm_packageGoneBeforeConfirm_clearsPendingWithoutUninstall() {
         val gw = FakeRepoGateway(dualId = 95)
@@ -644,6 +644,7 @@ class RemoveConfirmTest {
 
         vm.requestRemove("com.example.chat")
         awaitVm(vm) { vm.state.value.pendingRemove != null }
+        val before = vm.state.value.cloned
 
         gw.installedPkgs.clear()
         vm.confirmRemove()
@@ -651,6 +652,7 @@ class RemoveConfirmTest {
 
         assertEquals("gone package must not uninstall", 0, gw.uninstallCalls)
         assertNull(vm.state.value.pendingRemove)
+        assertEquals("gone package must leave cloned for refresh to sync", before, vm.state.value.cloned)
         assertTrue(
             "gone package must report no-op, got: \"${vm.state.value.msg}\"",
             vm.state.value.msg.contains("無需移除"),
@@ -742,5 +744,38 @@ class RemoveConfirmTest {
         assertEquals("removed: com.example.chat", vm.state.value.msg)
         assertEquals("late confirm must not run another uninstall", 1, gw.uninstallCalls)
         assertNull(vm.state.value.pendingRemove)
+    }
+
+    // Phase D coverage gap (Unknown branch keeps the display list): seed
+    // cloned via refresh, request a valid pending, then fail the confirm-time
+    // re-verify (persistent exit=1 list probe) -- confirm must report CHANNEL
+    // (remove result unknown), run zero uninstalls, clear the pending, and
+    // leave cloned untouched for the next refresh to converge (fail closed,
+    // never wiped).
+    @Test
+    fun confirm_verifyUnknown_keepsCloned() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.refresh()
+        awaitVm(vm) { vm.state.value.cloned.contains("com.example.chat") }
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+        val before = vm.state.value.cloned
+
+        // Dirty exit-0 listing (error-semantic line): Unknown without the
+        // non-zero retry waits, so the test stays fast.
+        gw.listPackagesOut = "Failure [DELETE_FAILED_INTERNAL_ERROR]"
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+
+        assertEquals("unknown re-verify must not uninstall", 0, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
+        assertEquals("unknown re-verify must keep cloned for refresh to sync", before, vm.state.value.cloned)
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
     }
 }
