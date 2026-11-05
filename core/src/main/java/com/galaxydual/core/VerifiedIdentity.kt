@@ -21,11 +21,19 @@ internal suspend fun CmdGateway.fetchVerifiedDualId(): Int =
 // Verified identity target carrying the cross-source agreed id plus the
 // Phase B identity continuity signals (serial/parentId). The id alone is
 // the write target; serial/parentId pin the *instance* behind a reused id
-// (Phase D, issue #21): an id that reappears with a different serial (or
-// parent) is a different profile incarnation and must be refused, never
-// written. Both are nullable because a passing policy tolerates absence
-// (Phase B: missing serial is tolerated); a null on either side never
-// triggers a reuse refusal, only both-present-and-unequal does.
+// (Phase D, issue #21; Phase A P1-A continuity, issue #21): an id that
+// reappears with a different serial is a different profile incarnation and
+// must be refused, never written; a known serial followed by a missing
+// serial across fetches (expected.serial != null, fresh/after.serial ==
+// null) is continuity lost and likewise refuses (fail closed, before any
+// write/probe). Both are nullable because the single-fetch resolver policy
+// tolerates absence (Phase B: one channel missing serial still Confirms
+// with the deduplicated value or null, unchanged); the strict
+// known-to-unknown rule applies only cross-fetch (expected-vs-fresh,
+// before-vs-after), never intra-fetch. Parent needs no known-to-unknown
+// cross-fetch rule: the resolver already requires both channels to carry a
+// known, equal parentId == 0, so any Confirmed (non-null) target carries
+// parentId non-null and == 0 by construction.
 data class VerifiedTarget(val userId: Int, val serial: Int?, val parentId: Int?)
 
 internal suspend fun CmdGateway.fetchVerifiedTarget(): VerifiedTarget? {

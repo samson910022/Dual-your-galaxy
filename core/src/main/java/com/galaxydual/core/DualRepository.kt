@@ -138,8 +138,10 @@ class DualRepository(
     // Clones a package into the dual profile via `pm install-existing`.
     // Auto path carries the resolve-time identity as `expected`: the fresh
     // re-check inside the write must still agree on serial/parentId
-    // (both-present-and-unequal refuses, suspecting ID reuse); a null
-    // resolve maps to the original "no dual profile" refusal.
+    // (both-present-and-unequal refuses, suspecting ID reuse; a known
+    // expected.serial followed by a missing fresh.serial refuses as
+    // continuity lost); a null resolve maps to the original
+    // "no dual profile" refusal.
     suspend fun clone(pkg: String): CmdResult {
         val expected = fetchVerifiedTarget()
         if (expected == null) return CmdResult(exit = 1, out = "", err = "no dual profile")
@@ -195,9 +197,19 @@ class DualRepository(
     // ID-reuse protection: when `expected` (the resolve-time target carried
     // by auto paths) is non-null and the fresh target still names the same
     // id, both-present-and-unequal serial/parentId refuses (the id was
-    // reused by a different profile incarnation). Either side missing is
-    // tolerated (Phase B upgrade path, same as the resolver): only a
-    // positive disagreement refuses.
+    // reused by a different profile incarnation). Cross-fetch serial
+    // continuity (Phase A P1-A, issue #21): a known expected.serial followed
+    // by a missing fresh.serial also refuses (continuity/reuse suspected,
+    // executed before any write command); expected==null or
+    // expected.serial==null stays tolerated (Phase B upgrade path, same as
+    // the single-fetch resolver tolerance). Only a positive disagreement or
+    // a known-to-unknown serial loss refuses.
+    // Parent needs no known-to-unknown rule: the resolver already requires
+    // both verbose channels to carry a known, equal parentId == 0 before it
+    // Confirms, so any non-null fresh target carries parentId non-null and
+    // == 0 by construction -- a known-to-unknown parent transition is
+    // unrepresentable while the id still Confirms (fresh==null or id drift
+    // already refuses above).
     // Returns a refusal CmdResult, or null when the id is safe to target.
     // Refuses dualId 0 (owner profile, must never be written) and any id not
     // present in this call's `pm list users` snapshot (stale/mistyped id),
@@ -230,6 +242,14 @@ class DualRepository(
             )
         }
         if (expected != null) {
+            if (expected.serial != null && fresh.serial == null) {
+                return CmdResult(
+                    exit = 1,
+                    out = "",
+                    err = "refused: id $dualId identity reuse suspected" +
+                        " (continuity lost: serial known expected=${expected.serial} but fresh missing)",
+                )
+            }
             if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
                 return CmdResult(
                     exit = 1,
@@ -338,8 +358,9 @@ class DualRepository(
 
     // Pinned clone (Phase C3, issue #9; Phase D target pinning): captures the
     // verified target BEFORE the write, then re-fetches AFTER the write and
-    // requires same id plus both-present-equal serial/parentId before the
-    // `pm list packages` re-check. A pre-write fresh-vs-before re-check narrows
+    // requires same id plus serial/parentId continuity (both-present-equal;
+    // a known before.serial followed by a missing after.serial is drift)
+    // before the `pm list packages` re-check. A pre-write fresh-vs-before re-check narrows
     // the before-to-write reuse window (a residual fresh-to-write micro-window
     // remains, fail closed): drift returns VerifyUnknown without
     // emitting any write command (fail closed). A null/drifted after-target maps to
@@ -426,15 +447,24 @@ class DualRepository(
     }
 
     // Phase D drift check for pinned flows: after must be non-null, name the
-    // same id, and agree on serial/parentId whenever both sides carry them.
-    // Either side missing is tolerated (Phase B upgrade path); only a
-    // positive disagreement (or a vanished/renamed target) drifts. Returns
+    // same id, and agree on serial/parentId on positive disagreement plus
+    // serial known-to-unknown continuity. A known before.serial followed by
+    // a missing after.serial drifts (identity-changed ... continuity lost,
+    // fail closed). Either-side-missing is otherwise tolerated only for the
+    // parent channel and for both-null serials (Phase B single-fetch
+    // resolver tolerance, unchanged). Parent needs no known-to-unknown
+    // rule: the resolver already requires both verbose channels to carry a
+    // known, equal parentId == 0 before it Confirms, so any non-null after
+    // target carries parentId non-null and == 0 by construction. Returns
     // the detail string (always containing "identity-changed") or null when
     // the pin holds.
     private fun checkTargetDrift(before: VerifiedTarget, after: VerifiedTarget?): String? {
         if (after == null) return "identity-changed: target vanished after write (before=${before.userId})"
         if (after.userId != before.userId) {
             return "identity-changed: id drifted before=${before.userId} after=${after.userId}"
+        }
+        if (before.serial != null && after.serial == null) {
+            return "identity-changed: serial continuity lost before=${before.serial} after missing (reuse suspected)"
         }
         if (before.serial != null && after.serial != null && before.serial != after.serial) {
             return "identity-changed: serial reuse suspected before=${before.serial} after=${after.serial}"
@@ -488,8 +518,13 @@ class DualRepository(
         // never to a probe of the wrong user.
         // Phase D ID-reuse protection: when `expected` is non-null, a fresh
         // target naming the same id must still agree on serial/parentId
-        // (both-present-and-unequal -> Unknown reuse refusal); either side
-        // missing is tolerated (Phase B upgrade path).
+        // (both-present-and-unequal -> Unknown reuse refusal; a known
+        // expected.serial followed by a missing fresh.serial -> Unknown
+        // continuity-lost refusal, no probe). expected==null or
+        // expected.serial==null stays tolerated (Phase B single-fetch
+        // resolver tolerance). Parent needs no known-to-unknown rule (see
+        // checkExplicitDualId: a Confirmed fresh target always carries
+        // parentId == 0).
         val fresh = fetchVerifiedTarget()
         if (fresh == null || fresh.userId != dualId) {
             return VerifyState.Unknown(
@@ -498,6 +533,12 @@ class DualRepository(
             )
         }
         if (expected != null) {
+            if (expected.serial != null && fresh.serial == null) {
+                return VerifyState.Unknown(
+                    "refused: id $dualId identity reuse suspected" +
+                        " (continuity lost: serial known expected=${expected.serial} but fresh missing)",
+                )
+            }
             if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
                 return VerifyState.Unknown(
                     "refused: id $dualId identity reuse suspected" +
@@ -556,13 +597,18 @@ class DualRepository(
     // Runs `pm list packages --user <dualId>` for an already-pinned snapshot.
     // Guard-refused ids and failed listings yield null (unknown), never throw.
     // Stage 2 adds the verified-dual gate: existence alone never suffices.
-    // Phase D ID-reuse protection: same both-present-and-unequal serial/parent
-    // rule as verifyOnProfiles above; either side missing is tolerated.
+    // Phase D ID-reuse protection: same serial/parent rule as
+    // verifyOnProfiles above (both-present-and-unequal -> null; known
+    // expected.serial followed by missing fresh.serial -> null continuity
+    // loss, no probe). expected==null or expected.serial==null stays
+    // tolerated. Parent needs no known-to-unknown rule (see
+    // checkExplicitDualId).
     private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): List<String>? {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
         val fresh = fetchVerifiedTarget()
         if (fresh == null || fresh.userId != dualId) return null
         if (expected != null) {
+            if (expected.serial != null && fresh.serial == null) return null
             if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) return null
             if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) return null
         }
