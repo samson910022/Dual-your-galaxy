@@ -103,6 +103,24 @@ object SamsungProfileAdapter {
     // to the next header form that user's block. Type/parent/serial are
     // searched in the block BODY only, so the header label can never leak
     // into the authorization-relevant userType.
+    // Section guard (PR-33 D3, S24 實機 blocking): the LAST header has no
+    // next header, so without a cap its body would extend to EOF and swallow
+    // the trailing global catalog. On the S24 `dumpsys user` output the Users
+    // section (UserInfo{0/95/150}, 150 typed profile.PRIVATE) is followed by
+    // `Device properties:`, `User types (12 types):` (which contains an
+    // `android.os.usertype.profile.CLONE:` catalog entry), `Allowlisted ...`
+    // and `Non-compliant ...` sections. That CLONE token leaked into user
+    // 150's body, typing 150 as CLONE -> cloneIds={95,150} -> Refused ->
+    // whole-device NoDual (logcat: verboseOk=true dumpsysOk=true prop=95
+    // but resolved=-1). Fix: a block also ends at the first line starting
+    // with a non-whitespace char after its body start. UserInfo headers
+    // themselves are indented (two spaces) so they never match; top-level
+    // section headers (`Users:`, `Device properties:`, `User types ...:`,
+    // `Allowlisted ...`, `Non-compliant ...`, `Current user:`) start at
+    // column 0 and terminate the block. The new-ROM verbose per-line parser
+    // below is line-oriented and immune; it shares this guard through the
+    // legacy path only. PmOutputParser.parseUsers stays line-oriented and
+    // untouched.
     private fun parseBlocks(text: String, source: IdentitySource): List<ProfileIdentity> {
         val headers = HEADER.findAll(text).toList()
         if (headers.isEmpty()) return emptyList()
@@ -112,11 +130,27 @@ object SamsungProfileAdapter {
             val userId = h.groupValues[1].toIntOrNull() ?: continue
             val label = h.groupValues[2].trim()
             val bodyStart = h.range.last + 1
-            val bodyEnd = if (i + 1 < headers.size) headers[i + 1].range.first else text.length
+            val nextHeader = if (i + 1 < headers.size) headers[i + 1].range.first else text.length
+            val bodyEnd = minOf(nextHeader, sectionEnd(text, bodyStart))
             val body = text.substring(bodyStart, bodyEnd)
             out.add(parseOneBlock(userId = userId, label = label, body = body, source = source))
         }
         return out
+    }
+
+    // First offset >= bodyStart where a new top-level section starts: the
+    // first line (after the header's own line remainder, e.g. ` serialNo=..`)
+    // whose first char is non-whitespace (^\\S). Returns text.length when
+    // there is no such line (block runs to EOF / next header).
+    private fun sectionEnd(text: String, bodyStart: Int): Int {
+        var nl = text.indexOf('\n', bodyStart)
+        while (nl != -1) {
+            val lineStart = nl + 1
+            if (lineStart >= text.length) return text.length
+            if (!text[lineStart].isWhitespace()) return lineStart
+            nl = text.indexOf('\n', lineStart)
+        }
+        return text.length
     }
 
     // New-ROM `cmd user list -v` line parser (PR-33 D2, S24 實機): one claim

@@ -541,6 +541,78 @@ class ProfileIdentityTest {
         )
     }
 
+    // PR-33 D3 (S24 實機 blocking, hermetic 最小復現): dumpsys 尾部全域段
+    // (User types 目錄含 android.os.usertype.profile.CLONE 字樣 +
+    // Allowlisted 行) 不得污染最後一個 user 塊。Users 段 0/95/150 三塊，
+    // 150 塊為 PRIVATE；舊 parseBlocks 讓末塊 body 延到 EOF，把目錄的 CLONE
+    // 字樣算進 150 -> cloneIds={95,150} -> Refused -> 全機 NoDual。
+    @Test
+    fun dumpsysTrailingCatalog_doesNotLeakIntoLastBlock() {
+        val verbose = """
+            3 users:
+
+            0: id=0, name=Owner, type=full.SYSTEM, flags=ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM (running) (current) (visible)
+            1: id=95, name=DUAL_APP, type=profile.CLONE, flags=DUALAPP_PROFILE|INITIALIZED|PROFILE (parentId=0) (running) (visible)
+            2: id=150, name=Secure Folder, type=profile.PRIVATE, flags=INITIALIZED|PROFILE|SDP_NOT_SUPPORTED_SECURE_FOLDER|SECURE_FOLDER (parentId=0) (running) (profile-owner) (visible)
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+              UserInfo{150:Secure Folder:400} serialNo=16:
+                parentId=0
+                userType=android.os.usertype.profile.PRIVATE
+            User types (12 types):
+                android.os.usertype.profile.CLONE:
+                    mName: android.os.usertype.profile.CLONE
+            Allowlisted packages per user type
+                5 -> android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(3, parsed.size)
+        val byId = parsed.associateBy { it.userId }
+        assertEquals(ProfileUserType.CLONE, byId[95]!!.userType)
+        // 150 is PRIVATE; the trailing catalog's CLONE token must not leak in.
+        assertEquals(ProfileUserType.OTHER, byId[150]!!.userType)
+        assertEquals(16, byId[150]!!.serial)
+        assertEquals(
+            95,
+            PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95),
+        )
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15),
+            PmOutputParser.resolveDualTargetVerified(verbose, dumpsys, 95),
+        )
+    }
+
+    // PR-33 D3 段界單元: 末塊在下一個行首非空白段頭 (此處 Device
+    // properties:) 即截斷。經公開解析結果間接斷言 (type 不被尾部 CLONE 字樣
+    // 翻轉、header 同行 serial/parent 照常解析)，不暴露 parseBlocks 內部。
+    @Test
+    fun dumpsysTrailingDeviceProperties_truncatesLastBlock() {
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{150:Secure Folder:400} serialNo=16:
+                parentId=0
+                userType=android.os.usertype.profile.PRIVATE
+            Device properties:
+              Device policy global restrictions:
+                none
+                android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(2, parsed.size)
+        val last = parsed.single { it.userId == 150 }
+        assertEquals(ProfileUserType.OTHER, last.userType)
+        assertEquals(16, last.serial)
+        assertEquals(0, last.parentId)
+    }
+
     @Test
     fun singleSourceSerial_confirmsButMismatchOrBothMissingRefuse() {
         // Verbose missing, dumpsys carrying: single source binds.
