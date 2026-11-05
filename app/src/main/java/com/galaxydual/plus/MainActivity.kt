@@ -160,6 +160,9 @@ class MainActivity : ComponentActivity() {
     // 只供清單列顯示用,永不參與身分鍵/選取/寫入決策 (見 SourceIconState)。
     private val iconMemo = SourceIconState()
     private val iconDrawables = LinkedHashMap<String, Drawable>()
+    // PR-37 Phase C #4 圖示 in-flight 追蹤（與已載入分離）：IO 在途的 appKey，
+    // 避免同一指紋重建/重繪重複打 PackageManager；成功才 markLoaded。
+    private val iconInflight = mutableSetOf<String>()
 
     // PR-6 P2 (#27 後半)：診斷技術細節展開開關 + 最近一次渲染狀態
     // (點診斷行切換展開/收合，需重渲染同一狀態)。
@@ -346,12 +349,17 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
         }
         refreshBtn = Button(this).apply {
-            // P25 single entry: probe (with Auto degrade) + refresh in one tap.
-            // P2-1: a reconnect tap is NOT consent for privileged diagnosis --
+            // P25 單一入口：probe（含 Auto 降級）+ refresh；PR-37 Phase C #5：
+            // catalog 失敗文案指向此按鈕，故同步重試 reloadCatalog（其內部先
+            // cancel 舊 catalogJob，語義為「取消在途、重打一次」，不會疊加）。
+            // P2-1: reconnect tap is NOT consent for privileged diagnosis --
             // always false (LSPOSED stays direct-only); only the dedicated
             // 手動診斷 Hook button passes true.
             text = "重新連線並更新"
-            setOnClickListener { vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false) }
+            setOnClickListener {
+                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
+                reloadCatalog()
+            }
         }
         permBtn = Button(this).apply {
             text = "請求 Shizuku 授權"
@@ -956,7 +964,14 @@ class MainActivity : ComponentActivity() {
     private fun renderSourceList(s: UiState) {
         val visible = sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
         val busy = s.loading
+        // PR-37 Phase C #6 a11y：文字與 contentDescription 每輪隨 state 同步
+        //（按鈕類型不變，最小改動；開關語義靠文案「顯示中/已隱藏＋點兩下切換」傳達）。
         systemToggleBtn.text = if (s.includeSystemApps) "系統應用：顯示中" else "系統應用：已隱藏"
+        systemToggleBtn.contentDescription = if (s.includeSystemApps) {
+            "系統應用目前顯示中，點兩下隱藏（只切換顯示，不卸載任何分身）"
+        } else {
+            "系統應用目前已隱藏，點兩下顯示（只切換顯示，不卸載任何分身）"
+        }
         batchBtn.text = "建立 ${s.selectedKeys.size} 個分身"
         batchBtn.contentDescription =
             "批次建立 ${s.selectedKeys.size} 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
@@ -1011,9 +1026,16 @@ class MainActivity : ComponentActivity() {
             "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
 
     // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
-    // memo 記「已嘗試」避免重打 PackageManager；drawables 有界快取。
+    // memo 記「已成功」避免重打 PackageManager；drawables 有界快取。
     // PR-37 P3:共用 Drawable 取用時經 constantState 新實例 + mutate()，
-    // 避免多個舊 View 共用同一 Drawable 回呼；memo 快取機制不變。
+    // 避免多個舊 View 共用同一 Drawable 回呼；memo 只記成功、inflight 擋併發（見下）。
+    // PR-37 Phase C #4 競態修正：in-flight 與 loaded 分離。發起時先記
+    // iconInflight（同一 key 在途不重打），IO 完成（成功）後才 markLoaded；
+    // 失敗不清 loaded（本來就沒記）、只清 inflight，允許下次列表重建時重試。
+    // 重試節流：重試只發生在 renderSourceList 指紋變化觸發全量重建時（指紋未變
+    // 直接 return，不會每幀重打），加上 inflight 擋併發，故無重試風暴；完成後
+    // 只綁定仍掛在 sourceContainer 下同一 appKey 的可見列（catalog 已換 key
+    // 不在時不貼，避免貼到錯行）。
     private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
         val cached = iconDrawables[appKey]
         if (cached != null) {
@@ -1026,7 +1048,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (iconMemo.isLoaded(appKey)) return
-        iconMemo.markLoaded(appKey)
+        if (appKey in iconInflight) return
+        iconInflight.add(appKey)
         lifecycleScope.launch {
             val drawable = withContext(Dispatchers.IO) {
                 try {
@@ -1034,19 +1057,46 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     null
                 }
-            } ?: return@launch
+            }
+            iconInflight.remove(appKey)
+            if (drawable == null) return@launch
+            iconMemo.markLoaded(appKey)
             if (iconDrawables.size >= MAX_ICON_CACHE) {
                 val eldest = iconDrawables.keys.firstOrNull()
                 if (eldest != null) iconDrawables.remove(eldest)
             }
             iconDrawables[appKey] = drawable
-            if (box.tag == appKey) {
-                val fresh = try {
-                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
-                } catch (_: Exception) {
-                    drawable
+            val fresh = try {
+                drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
+            } catch (_: Exception) {
+                drawable
+            }
+            // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
+            // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
+            //（找不到＝已過濾掉／換 catalog，不貼）。
+            try {
+                if (box.tag == appKey && box.parent === sourceContainer) {
+                    try {
+                        box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
+                        return@launch
+                    } catch (_: Exception) {
+                        // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
+                    }
                 }
-                box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
+                for (i in 0 until sourceContainer.childCount) {
+                    val child = sourceContainer.getChildAt(i)
+                    if (child is CheckBox && child.tag == appKey) {
+                        val perView = try {
+                            drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                        } catch (_: Exception) {
+                            fresh
+                        }
+                        child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                        break
+                    }
+                }
+            } catch (_: Exception) {
+                // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
         }
     }
