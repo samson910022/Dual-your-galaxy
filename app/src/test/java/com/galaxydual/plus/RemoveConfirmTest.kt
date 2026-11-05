@@ -80,14 +80,12 @@ class RemoveConfirmTest {
         var s24Verbose: Boolean = false
 
         private fun usersOut(): String =
-            if (dualId < 0) {
-                // C1/M1：vanished 即乾淨 Absent（僅 Owner，無 CLONE 聲稱），
-                // typed 判 Absent+快照可用才報 NO_DUAL；負值垃圾 id 屬 Unknown。
-                "Users:\n\tUserInfo{0:Owner:13} running\n"
-            } else {
-                "Users:\n\tUserInfo{0:Owner:13} running\n" +
-                    "\tUserInfo{$dualId:$label:400} running\n"
-            }
+            "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                // dualId<0 means the dual profile vanished: emit Owner-only.
+                // (Negative user IDs don't exist on-device; emitting
+                // "UserInfo{-1}" would be incoherent and, under typed
+                // resolution, reads as Unknown instead of Absent.)
+                (if (dualId < 0) "" else "\tUserInfo{$dualId:$label:400} running\n")
 
         private fun verboseOut(): String =
             if (s24Verbose) {
@@ -102,35 +100,24 @@ class RemoveConfirmTest {
                     "2: id=150, name=Secure Folder, type=profile.PRIVATE," +
                     " flags=INITIALIZED|PROFILE|SECURE_FOLDER" +
                     " (parentId=0) (running) (profile-owner) (visible)\n"
-            } else if (dualId < 0) {
-                "Users:\n" +
-                    "  UserInfo{0:Owner:13} running:\n" +
-                    "    Serial number: 0\n" +
-                    "    User type: android.os.usertype.full.SYSTEM\n"
             } else {
                 "Users:\n" +
                     "  UserInfo{0:Owner:13} running:\n" +
                     "    Serial number: 0\n" +
                     "    User type: android.os.usertype.full.SYSTEM\n" +
-                    "  UserInfo{$dualId:$label:400} running:\n" +
+                    (if (dualId < 0) "" else "  UserInfo{$dualId:$label:400} running:\n" +
                     (if (noSerial) "" else "    Serial: $serial\n") +
                     "    parentId=0\n" +
-                    "    User type: android.os.usertype.profile.CLONE\n"
+                    "    User type: android.os.usertype.profile.CLONE\n")
             }
 
         private fun dumpsysOut(): String =
-            if (dualId < 0) {
-                "Users:\n" +
-                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
-                    "    userType=android.os.usertype.full.SYSTEM\n"
-            } else {
-                "Users:\n" +
-                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
-                    "    userType=android.os.usertype.full.SYSTEM\n" +
-                    "  UserInfo{$dualId:$label:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
-                    "    parentId=0\n" +
-                    "    userType=android.os.usertype.profile.CLONE\n"
-            }
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                (if (dualId < 0) "" else "  UserInfo{$dualId:$label:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n")
 
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
@@ -189,8 +176,6 @@ class RemoveConfirmTest {
         Dispatchers.resetMain()
     }
 
-    // C1 雙時鐘測試同餵：單一 now 同餵 wall/mono（沿既有 FakeClock 模式）；
-    // TTL 用 mono，顯示/老化用 wall，測試同餵即兩者同進。
     private fun makeVm(gw: FakeRepoGateway, now: () -> Long = System::currentTimeMillis): DualViewModel {
         val repo = DualRepository(gw)
         // Real SuElevator over the fake gateway: probeChannels only counts
