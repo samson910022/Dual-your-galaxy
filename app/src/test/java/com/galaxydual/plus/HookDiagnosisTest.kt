@@ -102,6 +102,19 @@ class HookDiagnosisTest {
         assertEquals("未偵測到", diagnosis.displayText())
     }
 
+    // P2 (PR #20): ACTIVE is historical existence+scope evidence only (S24
+    // marker predates boot by ~5.5h, no boot-identity/freshness check); the
+    // text must name that limit and never read as proof of a live hook.
+    @Test fun diagnosis_activeTextIsHistoricalExistenceOnly() {
+        val text = HookDiagnosis(
+            HookStatus.ACTIVE,
+            setOf(HookMarker.SCOPE_SYSTEM_SERVER),
+        ).displayText()
+        assertTrue(text.contains(HookMarker.SCOPE_SYSTEM_SERVER))
+        assertTrue("active text must name existence-only evidence: $text", text.contains("僅存在性證據"))
+        assertTrue("active text must disclaim boot freshness: $text", text.contains("未確認本次開機是否生效"))
+    }
+
     // Unknown states never render as "not detected" (reserved for
     // positively-read absence); they name the limitation instead.
     @Test fun diagnosis_unknownDisplayNeverClaimsNotDetected() {
@@ -220,6 +233,52 @@ class HookDiagnosisTest {
         } finally {
             file.delete()
         }
+    }
+
+    // P2 (PR #20): malformed content (readable but unparseable "garbage") is
+    // neither active nor positive absence -- mixed with a truly-missing path
+    // and no gateway it reads UNKNOWN, never INACTIVE.
+    @Test fun diagnosis_garbageDirectWithoutGatewayIsNotInactive() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            listOf(MarkerRead.Readable("garbage"), MarkerRead.Readable(null)),
+            emptyList(),
+        )
+        assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertFalse(diagnosis.active)
+    }
+
+    // All-readable-but-malformed direct paths are likewise not INACTIVE.
+    @Test fun diagnosis_allGarbageDirectWithoutGatewayIsNotInactive() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            listOf(MarkerRead.Readable("garbage"), MarkerRead.Readable("junk\ntimeMs=abc\n")),
+            emptyList(),
+        )
+        assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertFalse(diagnosis.active)
+    }
+
+    // A gateway `cat` exit 0 with unparseable content is not positive
+    // absence either: attempted but nothing positively read, and the
+    // malformed gateway read cannot erase the completed direct check --
+    // UNKNOWN_UNREADABLE, never INACTIVE. (cat failures/null stay unchanged.)
+    @Test fun diagnosis_garbageGatewayIsNotInactive() = runBlocking {
+        val garbage = FakeCatGateway(Privilege.SHELL) { CmdResult(0, "garbage\n", "") }
+        val diagnosis = diagnoseHookState(
+            listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)),
+            listOf(garbage),
+        )
+        assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertFalse(diagnosis.active)
+    }
+
+    // Blank content stays empty evidence (not malformed): positively-read
+    // blank/missing paths still diagnose INACTIVE.
+    @Test fun diagnosis_blankDirectIsStillInactive() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            listOf(MarkerRead.Readable(""), MarkerRead.Readable(null)),
+            emptyList(),
+        )
+        assertEquals(HookStatus.INACTIVE, diagnosis.status)
     }
 
     // (d) Hook-neutral lock: for every probe combination and every hook

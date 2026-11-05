@@ -323,17 +323,23 @@ class MainActivity : ComponentActivity() {
         // SharedPreferences; see factory). Always shown so the user can tell
         // which channel the lists/privilege above were produced with.
         channelView.text = "通道：${s.channel}（選擇已持久化，重啟 App 記住）"
-        // Hook signal: LSPosed mode only. ACTIVE shows recorded scopes;
-        // INACTIVE shows 未偵測到 plus the enable hint; UNKNOWN shows
+        // Hook signal: LSPosed mode only. ACTIVE shows the recorded scopes as
+        // a historical marker (existence evidence only, boot freshness
+        // unconfirmed); INACTIVE shows 未偵測到 plus the enable hint; UNKNOWN shows
         // 狀態未知 (P1: unreadable / no diagnostic path is never reported
         // as "not detected") plus the true-channel hint. The placeholder
         // note stays visible so the mode is never mistaken for a working
         // channel.
         if (s.channel == ChannelPreference.LSPOSED) {
             hookView.visibility = View.VISIBLE
+            // ACTIVE is historical existence+scope evidence only (the marker
+            // survives reboots; S24 evidence shows it predating boot by ~5.5h
+            // with no boot-identity/freshness check): the text names that
+            // limit instead of claiming the current boot is hooked ("已啟用"
+            // would over-claim). Diagnosis stays display-only and hook-neutral.
             val status = when (s.hookStatus) {
                 HookStatus.ACTIVE ->
-                    "已啟用（${s.hookScopes.sorted().joinToString(", ")}）"
+                    "偵測到歷史 Hook 標記（${s.hookScopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
                 HookStatus.INACTIVE ->
                     "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
                 HookStatus.UNKNOWN_UNREADABLE ->

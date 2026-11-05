@@ -181,7 +181,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
    原則不變：兩個用戶都要開、都要含 `system`。
 4. App 內通道選擇（F4b-P1 手動 picker，見 `docs/USAGE.md` §4）：打開 App，
    用四按鈕（自動／ROOT／Shizuku／LSPosed）選擇通道；LSPosed 模式顯示
-   Hook marker 行（`已啟用（system_server, daagent）`／`未偵測到`／`狀態未知（…）`，見 §1.4 與 P1 四態），
+   Hook marker 行（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，見 §1.4 與 P1 四態），
    該行僅顯示、永不授權——LSPosed 通道為 NoOp 佔位，寫入一律拒絕。
 
 ### 2.3 重啟需求
@@ -202,7 +202,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   # scope=daagent,system_server
   # timeMs=1710000000000
   ```
-  App 內 LSPosed 模式的 Hook 行顯示同一內容（`已啟用（…）`／`未偵測到`）。
+  App 內 LSPosed 模式的 Hook 行顯示同一內容（歷史標記文案／`未偵測到`／`狀態未知（…）`）。
 
 ## 3. 免責聲明
 

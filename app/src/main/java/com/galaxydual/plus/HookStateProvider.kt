@@ -29,6 +29,10 @@
 //     with the same parser. Any gateway failure (non-zero exit, blank/
 //     garbage output, throwing gateway, NONE privilege) maps to "not
 //     detected", never to active, never throws.
+//  Both legacy readers are DEPRECATED: they conflate unreadable / absent /
+//  malformed (all inactive), so their INACTIVE must never be used as negative
+//  evidence. Production (DualViewModel.probeChannels) reads via
+//  diagnoseHookState below, which keeps malformed/unreadable as UNKNOWN.
 //
 // P1 diagnostic split (issue #6, 沿襲 #19, 配合 #27): the legacy functions
 // above conflate "unreadable" with "absent" (both inactive), which makes an
@@ -50,10 +54,10 @@
 //   live hook; a boot-time comparison stays future work (see HookMarker).
 // - SELinux: the app uid may be unable to directly read either path on some
 //   ROMs, and the gateway-`cat` round-trip has never run on a device either.
-//   Legacy two-state reads map unreadable/missing/garbage to inactive ("not
-//   detected"), never to active; diagnoseHookState instead reports
-//   unreadable/no-path as UNKNOWN (never "not detected"). The LSPosed
-//   gateway stays the NoOp placeholder either way.
+//   Legacy two-state reads (deprecated, see above) map unreadable/missing/
+//   garbage to inactive ("not detected"), never to active; diagnoseHookState
+//   instead reports unreadable/no-path/malformed as UNKNOWN (never "not
+//   detected"). The LSPosed gateway stays the NoOp placeholder either way.
 package com.galaxydual.plus
 
 import com.galaxydual.core.CmdGateway
@@ -90,6 +94,14 @@ fun parseHookState(raw: String?): HookState {
 // The markerFile/fallbackFile parameters exist so JVM tests can point at temp
 // files; production always uses the defaults. No gateway is consulted here:
 // for the gateway-`cat` fallback see readHookStateWithGateway.
+//
+// DEPRECATED: inactive here conflates unreadable/absent/malformed (all map
+// to "not detected"), so a returned inactive is NOT negative evidence.
+// Production reads via diagnoseHookState; this stays only for legacy callers.
+@Deprecated(
+    message = "Legacy two-state read conflates unreadable/absent/malformed; " +
+        "its inactive is not negative evidence. Use diagnoseHookState.",
+)
 fun readHookState(
     markerFile: File = File(HookMarker.MARKER_PATH),
     fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
@@ -118,6 +130,14 @@ fun readHookState(
 // when channelReady holds, so an unproven/NoOp channel never executes `cat`.
 // Never throws: unreadable output, non-zero exits, a throwing gateway, or a
 // NONE-privilege gateway all map to inactive ("not detected").
+//
+// DEPRECATED: same conflation as readHookState -- inactive is not negative
+// evidence. Production reads via diagnoseHookState; this stays only for
+// legacy callers.
+@Deprecated(
+    message = "Legacy two-state read conflates unreadable/absent/malformed; " +
+        "its inactive is not negative evidence. Use diagnoseHookState.",
+)
 suspend fun readHookStateWithGateway(
     gateway: CmdGateway? = null,
     markerFile: File = File(HookMarker.MARKER_PATH),
@@ -167,10 +187,12 @@ private suspend fun catOrNull(gateway: CmdGateway, absPath: String): String? {
     }
 }
 
-// Pure UI text for the LSPosed picker row.
+// Pure UI text for a HookState (legacy two-state; see deprecation on the
+// readers). ACTIVE keeps the same historical-marker wording as the
+// diagnostic text: existence+scope evidence only, never proof of a live hook.
 fun HookState.displayText(): String =
     if (active) {
-        "已啟用（${scopes.sorted().joinToString(", ")}）"
+        "偵測到歷史 Hook 標記（${scopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
     } else {
         "未偵測到"
     }
@@ -266,6 +288,14 @@ fun defaultDirectMarkerReads(
         readDirectMarker(File(HookMarker.LEGACY_MARKER_PATH), reader),
     )
 
+// Malformed content (readable but unparseable): raw non-null, non-blank, yet
+// parsing to no scopes ("garbage"). Malformed is NEITHER active NOR positive
+// absence: it must not feed directComplete / gatewayFullyEmpty below, so a
+// stale or foreign file never reads as "not detected". Read failures stay
+// null (unchanged logic); blank content stays empty evidence (not malformed).
+internal fun isMalformedMarker(raw: String?): Boolean =
+    raw != null && raw.isNotBlank() && HookMarker.parseScopes(raw).isEmpty()
+
 // IO, suspend: full diagnostic read -- direct reads first, then `cat` over
 // each SHELL/ROOT-privilege diagnostic gateway (NONE gateways are never
 // executed, mirroring the legacy contract). Diagnostic gateways are
@@ -277,10 +307,12 @@ fun defaultDirectMarkerReads(
 //
 // Decision order:
 //  1. direct (or gateway) scopes non-empty -> ACTIVE (direct wins, no exec);
-//  2. a privileged gateway positively read BOTH paths with no scopes, or
-//     every direct path was positively checked with no scopes -> INACTIVE;
+//  2. a privileged gateway positively read BOTH paths with no scopes and no
+//     malformed content anywhere, or every direct path was positively checked
+//     with no scopes and no gateway saw malformed content -> INACTIVE;
 //  3. a gateway was attempted but nothing positively read -> UNKNOWN_UNREADABLE;
-//  4. otherwise (direct denied/missing, no usable gateway) -> UNKNOWN_NO_DIAGNOSTIC.
+//  4. otherwise (direct denied/missing/malformed, no usable gateway) ->
+//     UNKNOWN_NO_DIAGNOSTIC.
 suspend fun diagnoseHookState(
     directReads: List<MarkerRead>,
     diagnosticGateways: List<CmdGateway> = emptyList(),
@@ -292,9 +324,11 @@ suspend fun diagnoseHookState(
         val raw = directReads.filterIsInstance<MarkerRead.Readable>().firstOrNull { HookMarker.parseScopes(it.raw).isNotEmpty() }?.raw
         return HookDiagnosis(HookStatus.ACTIVE, directScopes, raw, viaGateway = false)
     }
-    val directComplete = directReads.isNotEmpty() && directReads.all { it is MarkerRead.Readable }
+    val directMalformed = directReads.any { it is MarkerRead.Readable && isMalformedMarker(it.raw) }
+    val directComplete = directReads.isNotEmpty() && directReads.all { it is MarkerRead.Readable } && !directMalformed
     var attemptedGateway = false
     var gatewayFullyEmpty = false
+    var gatewayMalformed = false
     for (gateway in diagnosticGateways) {
         if (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT) continue
         attemptedGateway = true
@@ -305,17 +339,22 @@ suspend fun diagnoseHookState(
             if (scopes.isNotEmpty()) {
                 return HookDiagnosis(HookStatus.ACTIVE, scopes, primaryRaw ?: fallbackRaw, viaGateway = true)
             }
-            if (primaryRaw != null && fallbackRaw != null) {
+            if (isMalformedMarker(primaryRaw) || isMalformedMarker(fallbackRaw)) {
+                gatewayMalformed = true
+            } else if (primaryRaw != null && fallbackRaw != null) {
                 gatewayFullyEmpty = true
             }
         }
     }
     // A partial gateway read (only one path readable, no scopes) proves
     // nothing about the other path: stay unknown, never claim inactive.
-    if (gatewayFullyEmpty) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
+    // Malformed content anywhere likewise blocks an INACTIVE verdict: a
+    // safely-read but unparseable file is not positive absence.
+    if (gatewayFullyEmpty && !directMalformed) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
     // Positive direct evidence stands even when a gateway attempt failed: a
-    // failed privileged retry cannot erase a completed direct check.
-    if (directComplete) return HookDiagnosis(HookStatus.INACTIVE)
+    // failed privileged retry cannot erase a completed direct check. A
+    // malformed gateway read cannot erase it either.
+    if (directComplete && !gatewayMalformed) return HookDiagnosis(HookStatus.INACTIVE)
     if (attemptedGateway) return HookDiagnosis(HookStatus.UNKNOWN_UNREADABLE, viaGateway = true)
     return HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
 }
@@ -334,8 +373,11 @@ suspend fun diagnoseHookState(
 
 // Pure UI text for a diagnosis. Unknown states NEVER render as "未偵測到"
 // (reserved for positively-read absence); they name the limitation instead.
+// ACTIVE is historical existence+scope evidence only (the marker survives
+// reboots; S24 evidence shows it predating boot by ~5.5h): the text says so
+// and never claims the current boot is hooked.
 fun HookDiagnosis.displayText(): String = when (status) {
-    HookStatus.ACTIVE -> "已啟用（${scopes.sorted().joinToString(", ")}）"
+    HookStatus.ACTIVE -> "偵測到歷史 Hook 標記（${scopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
     HookStatus.INACTIVE -> "未偵測到"
     HookStatus.UNKNOWN_UNREADABLE -> "狀態未知（無權限讀取）"
     HookStatus.UNKNOWN_NO_DIAGNOSTIC -> "狀態未知（無可用診斷通道）"
