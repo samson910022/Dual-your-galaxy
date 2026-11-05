@@ -64,6 +64,21 @@ sealed interface RemoveOutcome {
     data class VerifyUnknown(val dualId: Int, val detail: String = "") : RemoveOutcome
 }
 
+// Outcome of a single-target refresh (Phase D P2-D, issue #21): one
+// `pm list users` snapshot plus one verified-target fetch, then a list
+// probe on that same id (no re-resolution). GroundTruth carries the pinned
+// target so callers display the same id they listed; cloned == null means
+// the list channel failed (unknown, keep the old display list).
+sealed interface RefreshOutcome {
+    data class ChannelError(val detail: String) : RefreshOutcome
+    data class NoDual(val profiles: List<DualProfile>) : RefreshOutcome
+    data class GroundTruth(
+        val profiles: List<DualProfile>,
+        val target: VerifiedTarget,
+        val cloned: List<String>?,
+    ) : RefreshOutcome
+}
+
 // Repository for dual-profile app lifecycle; all commands go through PmOutputParser.
 // Pure Kotlin with no Android dependency; execution is delegated to CmdGateway.
 class DualRepository(
@@ -629,5 +644,25 @@ class DualRepository(
         val res = gateway.run(cmd)
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) return null
         return PmOutputParser.parsePackages(res.out)
+    }
+
+    // Single-target refresh (Phase D P2-D, issue #21): exactly one
+    // profilesSnapshot() (1 cmd) then one fetchVerifiedTarget() (3 cmds:
+    // verbose + dumpsys + property) then one listProbe(target.userId)
+    // (1 cmd, no re-resolution) = 5 commands total (was 9 via the old
+    // resolve-then-reverify listing path). Single target throughout, so
+    // resolve-to-list drift is inexpressible in this API: the listed id is
+    // always the resolved id. ChannelError early-returns; a null target or
+    // a target absent from the snapshot maps to NoDual(profiles) (profiles
+    // still carried for display); otherwise GroundTruth with cloned null
+    // when the list channel fails.
+    suspend fun refreshVerified(): RefreshOutcome {
+        val snap = profilesSnapshot()
+        if (snap is ProfilesSnapshot.ChannelError) return RefreshOutcome.ChannelError(snap.detail)
+        val profiles = (snap as ProfilesSnapshot.Loaded).profiles
+        val target = fetchVerifiedTarget() ?: return RefreshOutcome.NoDual(profiles)
+        if (profiles.none { it.userId == target.userId }) return RefreshOutcome.NoDual(profiles)
+        val cloned = listProbe(target.userId)
+        return RefreshOutcome.GroundTruth(profiles, target, cloned)
     }
 }
