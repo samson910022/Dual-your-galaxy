@@ -97,7 +97,7 @@ sealed interface CloneOutcome {
 
     /**
      * Pinned serial-bound target moved between the batch pin and this item's
-     * own snapshot (PR-37 Phase B, P1 #2 atomic pin): the caller's expected
+     * own snapshot (PR-37 Phase B, P1 #2 per-item pin (non-atomic, per-package verified)): the caller's expected
      * (id, serial) no longer matches the live verified target. Zero installs
      * ran for this item. Callers map this to the existing drift handling
      * (partial + VERIFY_MISMATCH + stop + STALE), never to a per-item
@@ -886,8 +886,8 @@ class DualRepository(
 
     /**
      * Pinned clone with an expected serial-bound target (PR-37 Phase B, P1 #2
-     * atomic pin, issue #26): eliminates the preflight→clone TOCTOU by
-     * pinning inside a single flow. The caller passes the batch-time pinned
+     * per-item pin (non-atomic, per-package verified), issue #26): narrows the preflight window by pinning inside
+     * a single flow (residual write→verify window remains, fail closed). The caller passes the batch-time pinned
      * ([expectedDualId], [expectedSerial]); this call snapshots, re-resolves
      * the verified id AND the serial-bound target, and refuses (fail closed,
      * zero installs) when either no longer matches the expectation:

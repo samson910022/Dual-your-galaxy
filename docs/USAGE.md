@@ -211,8 +211,8 @@ adb shell pm uninstall --user <dualId> com.example.chat
   來源清單載入失敗時保留舊列表（不清空），並顯示獨立錯誤行（與「尚未載入」區分），「重新連線並更新」按鈕會同步重試 catalog 載入；「系統應用」開關的無障礙描述隨顯示中／已隱藏狀態同步更新。
 - 批次按鈕計數與部分成功解讀：按鈕顯示「建立 N 個分身」（N＝目前勾選數，無勾選時禁用；
   批次執行中勾選區與相關按鈕一律禁用，不可中途改勾選）。
-  執行走 `cloneVerifiedExpected(pkg, expectedId, expectedSerial)` 原子 pin 逐項（包名升冪確定順序），結果分成功／失敗／未知三類：
-  成功才加入 `cloned`，失敗（含 catalog 缺失的 `InvalidPackage`）與未知（需重查）分開列出；
+  執行走 `cloneVerifiedExpected(pkg, expectedId, expectedSerial)` 逐項 pin（非原子交易，逐包驗證）（包名升冪確定順序），結果分成功／失敗／未知三類：
+  成功才加入 `cloned`，失敗（含 catalog 缺失的 `InvalidPackage`，以及真 Absent 的 `NoDual`）與未知（`VerifyUnknown` 與 `ChannelError` 皆計未知：身份暫時無法判定、零寫入，需重查，不算失敗、不宣稱無分身；純未知彙總診斷按首個未知項選碼，`ChannelError`→`CHANNEL_ERROR`，否則 `VERIFY_UNKNOWN`）分開列出；
   批次起始先檢查選取綁定目標與裝置當前目標一致（`selectionBoundTarget == expectedTarget`，含未綁定哨兵與 legacy id-only），
   不一致則整批拒絕並清空選取（`INVALID`「選取已綁定舊目標，已清空，請重新勾選確認」，零寫入）；
   逐項 pin 發現目標漂移時立即停止（漂移本身不記為條目，已完成項保留為 partial，診斷為 `VERIFY_MISMATCH`），
