@@ -54,6 +54,10 @@ class Round2PhaseBTest {
     ) : CmdGateway {
         override val privilege: Privilege = priv
         var listUsersCalls: Int = 0
+        // P1-1 VM 整合：允許覆寫 typed 通道原文以重現 False Absent 反例。
+        var verboseOverride: String? = null
+        var dumpsysOverride: String? = null
+        var propOverride: String? = null
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -90,12 +94,12 @@ class Round2PhaseBTest {
             }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                 if (typedFailing()) CmdResult(exit = 1, out = "", err = "typed denied")
-                else CmdResult(exit = 0, out = verboseOut(), err = "")
+                else CmdResult(exit = 0, out = verboseOverride ?: verboseOut(), err = "")
             cmd == DualRepository.CMD_DUMPSYS_USER ->
                 if (typedFailing()) CmdResult(exit = 1, out = "", err = "typed denied")
-                else CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                else CmdResult(exit = 0, out = dumpsysOverride ?: dumpsysOut(), err = "")
             cmd == DualRepository.CMD_GETPROP_DUAL ->
-                CmdResult(exit = 0, out = "$dualId\n", err = "")
+                CmdResult(exit = 0, out = propOverride ?: "$dualId\n", err = "")
             cmd.startsWith("pm install-existing") -> {
                 installCalls++
                 CmdResult(exit = 0, out = "Success", err = "")
@@ -466,5 +470,83 @@ class Round2PhaseBTest {
         await { !vm.state.value.loading && vm.state.value.lastOperation != null }
         assertEquals("exact-limit input must reach the device", 1, suGw.installCalls)
         assertEquals(DiagnoseCode.VERIFY_MISMATCH, vm.state.value.diagnose?.code)
+    }
+
+    // ---- P1-1 VM 整合：False Absent 反例（兩源有戶但型別缺失）不得清空舊單 ----
+
+    @Test
+    fun p11_falseAbsentTypeMissing_keepsOldList() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+
+        // 兩源都有 owner+95 但 95 型別缺失→UNKNOWN；快照仍可用（pm-list 正常）。
+        suGw.verboseOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} running:\n" +
+                "    Serial: 15\n" +
+                "    parentId=0\n"
+        suGw.dumpsysOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                "    parentId=0\n"
+        suGw.propOverride = ""
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertTrue("false-absent must keep the old list", s.cloned.contains("com.example.chat"))
+        assertEquals("FRESH degrades to STALE, not cleared", InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+    }
+
+    // ---- P1-1 VM 整合：property=95 但 typed 無 clone 聲稱不得清空舊單 ----
+
+    @Test
+    fun p11_falseAbsentPropPointsToClone_keepsOldList() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+
+        // 兩源乾淨 OTHER、集合一致，但 property=95 指向仍可能存在的 clone。
+        suGw.verboseOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} running:\n" +
+                "    Serial: 11\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.MANAGED\n"
+        suGw.dumpsysOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} serialNo=11:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.MANAGED\n"
+        suGw.propOverride = "95\n"
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertTrue("prop-pointing-to-clone must keep the old list", s.cloned.contains("com.example.chat"))
+        assertEquals("FRESH degrades to STALE, not cleared", InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
     }
 }
