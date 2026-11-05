@@ -93,9 +93,6 @@ sealed interface RefreshOutcome {
 
 // Repository for dual-profile app lifecycle; all commands go through PmOutputParser.
 // Pure Kotlin with no Android dependency; execution is delegated to CmdGateway.
-// TODO Follow-up: DualViewModel outer catch swallows CancellationException
-// (its catch (e: Exception) in refreshLocked/clone/remove also catches
-// cancellation; VM change out-of-scope here, recorded for follow-up).
 // TODO: blocking Thread.sleep + Main-dispatcher VM calls owned by PR-3 (retry/sleep unification).
 class DualRepository(
     private val gateway: CmdGateway,
@@ -518,6 +515,32 @@ class DualRepository(
         } catch (e: Exception) {
             return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
+        // Unknown-after-send (PR-32 P1-1): a client-side wait timeout means
+        // the reply was abandoned -- the remote pm may still have executed --
+        // so exit/out/err are untrusted regardless of isSuccess. NEVER map
+        // this to InstallFailed (that would claim "not cloned" while the
+        // device may hold the clone, and the UI would drop it wrongly).
+        // Instead run ONE bounded read-only verifyListProbe (same retry/
+        // delayFn/thrown-defense as the normal path, no write resend) and
+        // reuse the outcome table: Installed -> Success, NotInstalled ->
+        // VerifyFailed, Unknown -> VerifyUnknown (nothing is added; the next
+        // refresh converges from ground truth).
+        // Trigger (wire frozen): res.timedOut (client abandoned the wait) OR
+        // isServiceTimeoutText(res.err) -- the GalaxyExecService 60 s
+        // captureProcess timeout arrives over the parcel as exit=1 + its
+        // "timeout after ..." text with timedOut=false (only the marker
+        // survives the (exit, out, err) reply). Anchored prefixes exclude the
+        // bind-failure wrapper and ordinary "timeout" words in pm output.
+        // Scope: only these two signals take this path. Other
+        // transport-unknown (binder-dead, spawn failure, interrupt) stays on
+        // the legacy isSuccess judgement -- follow-up, not inflated here.
+        if (res.timedOut || isServiceTimeoutText(res.err)) {
+            return when (val state = verifyListProbe(clean, dualId)) {
+                is VerifyState.Installed -> CloneOutcome.Success(dualId)
+                is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
+                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = !res.timedOut))
+            }
+        }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
@@ -570,6 +593,23 @@ class DualRepository(
             throw e
         } catch (e: Exception) {
             return RemoveOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
+        }
+        // Unknown-after-send (PR-32 P1-1): same contract as cloneVerified
+        // above -- a timedOut reply abandons exit/out/err (untrusted either
+        // way), so NEVER map it to RemoveFailed (that would claim "still
+        // installed" or "remove failed" without knowledge). One bounded
+        // read-only verifyListProbe instead (no write resend):
+        // NotInstalled -> Success, Installed -> StillInstalled, Unknown ->
+        // VerifyUnknown (caller keeps the entry; the next refresh converges).
+        // Trigger (wire frozen): res.timedOut OR isServiceTimeoutText(res.err)
+        // (see cloneVerified note -- same parcel flag-loss backstop).
+        // Scope: only these two signals take this path.
+        if (res.timedOut || isServiceTimeoutText(res.err)) {
+            return when (val state = verifyListProbe(clean, dualId)) {
+                is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
+                is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
+                is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = !res.timedOut))
+            }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
@@ -835,5 +875,20 @@ class DualRepository(
         if (profiles.none { it.userId == target.userId }) return RefreshOutcome.NoDual(profiles)
         val cloned = listProbe(target.userId)
         return RefreshOutcome.GroundTruth(profiles, target, cloned)
+    }
+
+    // Detail prefix for the unknown-after-send path (PR-32 P1-1): the write
+    // reply timed out, so the VerifyUnknown detail names that first and
+    // keeps the read-only probe detail after it. byText=true marks the
+    // wire-frozen backstop: the flag was lost on the parcel and the timeout
+    // was recognized by anchored producer-prefix text instead. The ViewModel
+    // already renders VerifyUnknown as "result unknown" (MsgKind.CHANNEL)
+    // and keeps the UI list for the next refresh -- no VM/MainActivity
+    // change needed.
+    private fun writeTimeoutDetail(probeDetail: String, byText: Boolean = false): String {
+        val head =
+            if (byText) "write reply timed out (service-side timeout recognized by text; wire layout frozen)"
+            else "write reply timed out"
+        return if (probeDetail.isEmpty()) head else "$head; $probeDetail"
     }
 }

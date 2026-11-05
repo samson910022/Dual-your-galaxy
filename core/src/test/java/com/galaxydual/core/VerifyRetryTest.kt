@@ -36,10 +36,16 @@ class VerifyRetryTest {
         // Phase 3 review (issue #24): when non-null, the `pm list packages`
         // probe throws instead of returning -- models a rogue gateway.
         var listThrowable: Throwable? = null,
+        // PR-32 P1-1 (unknown-after-send): when non-null, the write phase
+        // (`pm install-existing` / `pm uninstall`) returns this instead of
+        // the canned success -- models an install/uninstall whose reply was
+        // abandoned (e.g. timedOut=true) while the remote may have executed.
+        var writeResult: CmdResult? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
         var listCalls = 0
+        var writeCalls = 0
 
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
@@ -52,10 +58,14 @@ class VerifyRetryTest {
                     CmdResult(exit = 0, out = DEFAULT_DUMPSYS_95, err = "")
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
                     CmdResult(exit = 0, out = DEFAULT_PROP_95, err = "")
-                cmd.startsWith("pm install-existing") ->
-                    CmdResult(exit = 0, out = "Package com.example.chat installed for user: 95", err = "")
-                cmd.startsWith("pm uninstall") ->
-                    CmdResult(exit = 0, out = "Success", err = "")
+                cmd.startsWith("pm install-existing") -> {
+                    writeCalls++
+                    writeResult ?: CmdResult(exit = 0, out = "Package com.example.chat installed for user: 95", err = "")
+                }
+                cmd.startsWith("pm uninstall") -> {
+                    writeCalls++
+                    writeResult ?: CmdResult(exit = 0, out = "Success", err = "")
+                }
                 cmd.startsWith("pm list packages") -> {
                     listCalls++
                     listThrowable?.let { throw it }
@@ -441,5 +451,210 @@ class VerifyRetryTest {
             assertEquals("cancel", e.message)
         }
         assertEquals(1, gateway.listCalls)
+    }
+
+    // PR-32 P1-1 (a): install reply timed out (exit/out untrusted) but the
+    // read-only probe confirms the package present -> Success. The failure-
+    // looking exit=1 must NOT become InstallFailed.
+    @Test
+    fun cloneVerified_writeTimedOut_probeInstalled_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-1 (b): uninstall reply timed out but the probe confirms the
+    // package absent -> Success (ground truth backs the removal).
+    @Test
+    fun removeVerified_writeTimedOut_probeAbsent_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-1 (c): write timed out AND the read-only probe is itself
+    // unknown (persistent non-zero) -> VerifyUnknown whose detail names the
+    // write timeout. The UI list is preserved by the caller; the next
+    // refresh converges. Single write (no resend) + bounded probe retries.
+    @Test
+    fun removeVerified_writeTimedOut_probeUnknown_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must keep the probe cause, got: \"$detail\"", detail.contains("exit=1"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
+        assertEquals(
+            listOf(DualRepository.VERIFY_RETRY_DELAY_MS, DualRepository.VERIFY_RETRY_DELAY_MS),
+            delays,
+        )
+    }
+
+    // Same unknown-convergence on the clone path: write timed out, probe
+    // unknown -> VerifyUnknown (never InstallFailed/VerifyFailed).
+    @Test
+    fun cloneVerified_writeTimedOut_probeUnknown_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: su", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
+    }
+
+    // Timeout table, absent side: clone write timed out but the probe
+    // cleanly lacks the package -> VerifyFailed (confirmed not installed),
+    // never InstallFailed.
+    @Test
+    fun cloneVerified_writeTimedOut_probeAbsent_isVerifyFailed() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+    }
+
+    // Timeout table, present side: remove write timed out but the probe
+    // cleanly still lists the package -> StillInstalled, never RemoveFailed.
+    @Test
+    fun removeVerified_writeTimedOut_probePresent_isStillInstalled() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 0, out = "Success", err = "", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected StillInstalled, got: $outcome", outcome is RemoveOutcome.StillInstalled)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+    }
+
+    // PR-32 P1-1 (d): non-timeout write failures stay definite failures
+    // (no regression): install failure -> InstallFailed without probing.
+    @Test
+    fun cloneVerified_writeFailedWithoutTimeout_isInstallFailed() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "Failure [INSTALL_FAILED_INVALID_APK]", err = "")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected InstallFailed, got: $outcome", outcome is CloneOutcome.InstallFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    // Same lock on the remove path: uninstall failure -> RemoveFailed.
+    @Test
+    fun removeVerified_writeFailedWithoutTimeout_isRemoveFailed() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "Failure [DELETE_FAILED_INTERNAL_ERROR]")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected RemoveFailed, got: $outcome", outcome is RemoveOutcome.RemoveFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-1 follow-up (MAJOR): a service-side 60 s captureProcess
+    // timeout arrives over the frozen wire as exit=1 + "timeout after ..."
+    // text with timedOut=false (the flag is lost on the parcel -- only
+    // (exit, out, err) survive). The write must still go verify-first:
+    // probe Installed -> Success, never InstallFailed.
+    @Test
+    fun cloneVerified_serviceSideTimeoutText_probeInstalled_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Same wire-loss shape on the remove path, probe itself unknown ->
+    // VerifyUnknown whose detail names the text-recognized service timeout.
+    @Test
+    fun removeVerified_serviceSideTimeoutText_probeUnknown_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the text-recognized service timeout, got: \"$detail\"", detail.contains("recognized by text"))
+        assertTrue("detail must keep the probe cause, got: \"$detail\"", detail.contains("exit=1"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
+    }
+
+    // Anti-false-positive lock: an ordinary "timeout" word that is NOT one
+    // of our timeout statements must stay a definite failure (no probing).
+    @Test
+    fun cloneVerified_ordinaryTimeoutWord_isInstallFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "Error: timeout waiting for user response")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected InstallFailed, got: $outcome", outcome is CloneOutcome.InstallFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    // Direct predicate locks: only the exact producer prefixes hit. The
+    // bind-failure wrapper, interrupt/spawn texts, mid-line "timeout" words
+    // (either case), and empty err never match.
+    @Test
+    fun isServiceTimeoutText_onlyMatchesProducerPrefixes() {
+        assertTrue(isServiceTimeoutText("timeout after 60000ms: sh"))
+        assertTrue(isServiceTimeoutText("timeout after 200ms: su"))
+        assertTrue(isServiceTimeoutText("shizuku: exec timed out after 60000ms"))
+        assertTrue(!isServiceTimeoutText("shizuku: bind failed: bind timed out after 10000ms"))
+        assertTrue(!isServiceTimeoutText("interrupted: wait interrupted"))
+        assertTrue(!isServiceTimeoutText("spawn failed: No such file or directory"))
+        assertTrue(!isServiceTimeoutText("Error: timeout waiting for user response"))
+        assertTrue(!isServiceTimeoutText("Failure [INSTALL_FAILED_CPU_ABI_INCOMPATIBLE: timeout?]"))
+        assertTrue(!isServiceTimeoutText(""))
     }
 }

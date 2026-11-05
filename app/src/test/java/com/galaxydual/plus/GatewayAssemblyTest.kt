@@ -80,6 +80,27 @@ class GatewayAssemblyTest {
         }
     }
 
+    // PR-32 P1-1: only the client-side wait timeout carries timedOut=true
+    // (unknown-after-send); every other transport-unknown stays false
+    // (follow-up scope, never inflated here).
+    @Test fun shizukuErrors_onlyTimedOutCarriesFlag() {
+        assertTrue(ShizukuExecErrors.timedOut().timedOut)
+        assertTrue(!ShizukuExecErrors.noBinder().timedOut)
+        assertTrue(!ShizukuExecErrors.binderDead().timedOut)
+        assertTrue(!ShizukuExecErrors.notAuthorized().timedOut)
+        assertTrue(!ShizukuExecErrors.bindFailed("boom").timedOut)
+        assertTrue(!ShizukuExecErrors.remoteFailed("boom").timedOut)
+    }
+
+    // PR-32 P1-1: Su client-side wait timeout (SU_EXEC_TIMEOUT path) carries
+    // timedOut=true so the repository verifies read-only instead of claiming
+    // definite failure. Short budget keeps the JVM test fast.
+    @Test fun captureProcess_timeoutCarriesTimedOutFlag() {
+        val res = captureProcess(arrayOf("sh", "-c", "sleep 5"), timeoutMs = 200L)
+        assertNotEquals(0, res.exit)
+        assertTrue("timeout reply must carry timedOut, got: $res", res.timedOut)
+    }
+
     // The custom exec code must never collide with the framework-reserved
     // UserService destroy codes (16777114 aidl spelling / 16777115 on wire).
     @Test fun execCode_avoidsReservedDestroyCodes() {

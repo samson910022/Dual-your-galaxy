@@ -93,7 +93,11 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         drainErr.join(2_000)
         // Same honest-flag reasoning as the interrupt path above: killed
         // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
-        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true)
+        // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
+        // remote pm may still have executed, so timedOut=true forces the
+        // repository onto the read-only verify probe instead of claiming
+        // definite failure (exit/out untrusted either way).
+        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
     }
     drainOut.join(5_000)
     drainErr.join(5_000)

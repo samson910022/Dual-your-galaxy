@@ -94,8 +94,14 @@ object ShizukuExecProtocol {
 // Pure error mapping for every Shizuku-side failure: binder dead, missing
 // authorization, bind failure, remote failure, timeout. All exit != 0 with an
 // explicit message; pure Kotlin so GatewayAssemblyTest covers it on the JVM.
+// Only timedOut() sets CmdResult.timedOut (PR-32 P1-1 unknown-after-send:
+// the client abandoned the wait, the remote pm may still have executed, so
+// the repository must verify read-only instead of claiming failure).
 // No truncated flag needed here: every case is exit != 0, which the trusted
 // parser already maps to Unknown without consulting the flag.
+// Scope: other transport-unknown (binder-dead, bindFailed, remoteFailed,
+// noBinder, notAuthorized) stays timedOut=false -- follow-up, not inflated
+// here (only a client-side wait timeout is known-ambiguous this narrowly).
 object ShizukuExecErrors {
     fun noBinder(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: binder not connected (install/start Shizuku first)")
@@ -113,7 +119,7 @@ object ShizukuExecErrors {
         CmdResult(exit = 1, out = "", err = "shizuku: remote exec failed: $detail")
 
     fun timedOut(): CmdResult =
-        CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms")
+        CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms", timedOut = true)
 }
 
 // Pure wire mapping for the exec reply (JVM-testable): the Binder Parcel
