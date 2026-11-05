@@ -683,6 +683,9 @@ class DualViewModel(
     // 每分支仍恰取時一次 (原各分支 val now = nowWallMs() 改由此函數內取，
     // update 同步執行故 tick 順序不變)；每處 phase/detail/diagnose 與原字面
     // 一字不差 (見各呼叫端傳入值)。
+    // Stage C C4 優先順序：OK 判據為 diagnose==null &&
+    // (lastOperation==null || phase != FAILED)；FRESH 成功清碼時 FAILED 歷史
+    // 由 refreshLocked 同步清除 (見該處)，本函數不自清，僅配對。
     private fun recordOp(
         opId: String,
         appKey: String,
@@ -874,7 +877,10 @@ class DualViewModel(
         // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
         // loading=true（refresh 不應驅散確認對話框的提示）。
         // PR-6 P2 (#27 後半): inventory/lastOperation/diagnose 由各結果分支顯式
-        // 維護，普通 refresh 永不清除 lastOperation。
+        // 維護；Stage C C4 例外：FRESH 成功清碼 (diagnose→null) 時同步清除
+        // FAILED lastOperation (verified 失敗已被新鮮 ground truth 取代，三者
+        // 一致)；UNKNOWN 永不清除 (需下一次 pinned verify 才覆寫)；SUCCESS 保留。
+        // OK 判據：diagnose==null && (lastOperation==null || phase != FAILED)。
         _state.update {
             if (it.pendingRemove != null) it.copy(loading = true)
             else it.copy(loading = true, msg = "", msgKind = MsgKind.NONE)
@@ -1028,8 +1034,13 @@ class DualViewModel(
                         // 帶新目標，UI 可見新目標)；複查 Unknown/Absent
                         // (P2-5：舊 Int -1 走此路) 與 id 一致者一律維持
                         // VERIFY_UNKNOWN，不誤報 MISMATCH。
+                        // Stage C C6：此處複查刻意傳 pmIds=null——本路徑 Unknown/Absent
+                        // 一律 VERIFY_UNKNOWN，不授權 Absent 清單 (Absent 需快照可用
+                        // + typed 乾淨，見 refresh 首跳)；null 僅省一次快照傳參，
+                        // 語意仍為未知，不清空。
                         val nullSnap: ProfilesSnapshot? =
                             if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
+                        // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
                         val nullVerified: DualIdResolution? =
                             if (groundTruth == null) onIo { repo.resolveDualUserIdTyped() } else null
                         _state.update { cur ->
@@ -1127,16 +1138,23 @@ class DualViewModel(
                                     )
                                 }
                             } else if (groundTruth.isEmpty()) {
-                                // 契約：FRESH 成功只在無待查證歷史操作時清
-                                // diagnose；lastOperation.phase==UNKNOWN
-                                // (寫後未查證) 時保留原 diagnose，普通
-                                // refresh 不得清除 (需下一次 pinned verify
-                                // 才覆寫)。
+                                // 契約 (Stage C C4，選 (c))：FRESH 成功清碼時同步
+                                // 歸檔 FAILED 歷史——diagnose 將清 null (phase !=
+                                // UNKNOWN) 且 phase==FAILED 時 lastOperation 同步
+                                // 清為 null，三者一致 (diagnose null + 無 FAILED
+                                // 歷史 + 就緒 msg)；OK 判據為 diagnose==null &&
+                                // lastOperation==null 或 phase != FAILED。
+                                // UNKNOWN 仍保留 (需下一次 pinned verify 才覆寫)；
+                                // SUCCESS 保留 (成功歷史非錯誤，與 OK 共存)。
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "no clones installed",
                                     MsgKind.INFO,
                                     cur.degradeNote,
                                 )
+                                // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
+                                val clearFailed =
+                                    cur.lastOperation?.phase != OpPhase.UNKNOWN &&
+                                        cur.lastOperation?.phase == OpPhase.FAILED
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -1149,6 +1167,11 @@ class DualViewModel(
                                         freshness = InventoryFreshness.FRESH,
                                         count = 0,
                                     ),
+                                    lastOperation = if (clearFailed) {
+                                        null
+                                    } else {
+                                        cur.lastOperation
+                                    },
                                     diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
                                         cur.diagnose
                                     } else {
@@ -1158,13 +1181,18 @@ class DualViewModel(
                                     msgKind = combinedKind,
                                 )
                             } else {
-                                // 契約同上：UNKNOWN 歷史操作未查證前保留原
-                                // diagnose，不因清單新鮮而清除。
+                                // 契約同上 (Stage C C4)：UNKNOWN 保留原 diagnose；
+                                // FAILED 隨 FRESH 成功清碼同步清除 (見空分支註解)；
+                                // SUCCESS 保留。
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "",
                                     MsgKind.NONE,
                                     cur.degradeNote,
                                 )
+                                // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
+                                val clearFailed =
+                                    cur.lastOperation?.phase != OpPhase.UNKNOWN &&
+                                        cur.lastOperation?.phase == OpPhase.FAILED
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -1177,6 +1205,11 @@ class DualViewModel(
                                         freshness = InventoryFreshness.FRESH,
                                         count = groundTruth.size,
                                     ),
+                                    lastOperation = if (clearFailed) {
+                                        null
+                                    } else {
+                                        cur.lastOperation
+                                    },
                                     diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
                                         cur.diagnose
                                     } else {
@@ -1744,6 +1777,11 @@ class DualViewModel(
                             is ProfilesSnapshot.Loaded -> {
                                 when (val target = onIo { repo.fetchDualTarget() }) {
                                     is DualTargetResult.NoDual -> {
+                                        // Stage C C6：DualTargetResult.NoDual 命名誤導——
+                                        // 它僅表「未確認」(含通道失敗/證據不足)，不等於
+                                        // 「確認無 dual」；呼叫端不得據此清空/報 NO_DUAL，
+                                        // 需 Absent 語意一律走 typed 入口
+                                        // resolveDualUserIdTyped()->Absent (見下)。
                                         // M1 typed 鑑別 (沿 refreshLocked/clone-NoDual)：
                                         // 僅 Absent+快照可用才為真 NO_DUAL；Unknown
                                         // 一律 CHANNEL_ERROR (含 Absent 但空快照)。
@@ -1808,7 +1846,11 @@ class DualViewModel(
                                         }
                                     }
                                     is DualTargetResult.SerialUnavailable -> {
-                                        // 理由 (M3)：寫前拒絕時 FRESH 降 STALE (不清 cloned/lastOperation)。
+                                        // Stage C C1：serial 缺失為身份不可驗證 (VERIFY_MISMATCH +
+                                        // INVALID)，與 confirm 內 serial 缺失/不一致一致
+                                        // (:2051-2137)；非通道錯誤 (CHANNEL_ERROR) 亦非
+                                        // 確認無 dual (NO_DUAL)。理由 (M3) 不變：寫前拒絕
+                                        // 時 FRESH 降 STALE (不清 cloned/lastOperation)。
                                         val now = nowWallMs()
                                         _state.update { cur ->
                                             val degraded =
@@ -1827,12 +1869,12 @@ class DualViewModel(
                                                 pendingRemove = null,
                                                 inventory = degraded,
                                                 diagnose = diagnoseEvent(
-                                                    DiagnoseCode.CHANNEL_ERROR,
+                                                    DiagnoseCode.VERIFY_MISMATCH,
                                                     techDetail = "serial unavailable " +
                                                         "for verified target",
                                                 ),
                                                 msg = "無法驗證分身身分（serial 缺失），請重試",
-                                                msgKind = MsgKind.NO_DUAL,
+                                                msgKind = MsgKind.INVALID,
                                             )
                                         }
                                     }
@@ -2198,10 +2240,17 @@ class DualViewModel(
                         // stay INVALID + 重新確認 with zero uninstalls; only the
                         // message differs so the user can tell which pin moved.
                         if (second is DualTargetResult.Confirmed && second.target.userId != cur.dualId) {
+                            // Stage C C2：補 diagnose=VERIFY_MISMATCH (與第一段
+                            // :2051-2066 同形)，否則殘留舊碼；零卸載語意不變。
                             _state.update {
                                 it.copy(
                                     loading = false,
                                     pendingRemove = null,
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.VERIFY_MISMATCH,
+                                        techDetail = "verified id " +
+                                            "${second.target.userId} != ${cur.dualId}",
+                                    ),
                                     msg = "移除目標已變更（verified id " +
                                         "${second.target.userId} ≠ ${cur.dualId}），請重新確認",
                                     msgKind = MsgKind.INVALID,
@@ -2495,6 +2544,36 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.NoDual -> {
+                                            // Stage C C5：先走 typed 入口 (比照 :1997-2001
+                                            // 的 freshId 檢查)，與 refresh drift 語意對齊；
+                                            // Confirmed(otherId) 即目標已變更 → VERIFY_MISMATCH，
+                                            // 不落入下方 targetListed 啟發式 (與 refresh 分叉)。
+                                            // 其餘 (Absent/Unknown/同 id) 才走原啟發式。
+                                            // pmIds 取新鮮快照 (比照 1997-2001 先取快照再鑑別)，
+                                            // 免舊 snap 否決遮蔽真漂移。
+                                            val freshSnapForNoDual = onIo { repo.profilesSnapshot() }
+                                            val pmIds2 = (freshSnapForNoDual as? ProfilesSnapshot.Loaded)?.profiles?.map { it.userId }?.toSet()
+                                                ?: snap.profiles.map { it.userId }.toSet()
+                                            val idRes2 = onIo { repo.resolveDualUserIdTyped(pmIds = pmIds2) }
+                                            val driftedId = (idRes2 as? DualIdResolution.Confirmed)?.userId
+                                                ?.takeIf { it != cur.dualId }
+                                            if (driftedId != null) {
+                                                _state.update {
+                                                    it.copy(
+                                                        loading = false,
+                                                        profiles = snap.profiles,
+                                                        pendingRemove = null,
+                                                        diagnose = diagnoseEvent(
+                                                            DiagnoseCode.VERIFY_MISMATCH,
+                                                            techDetail = "verified id " +
+                                                                "$driftedId != ${cur.dualId}",
+                                                        ),
+                                                        msg = "移除目標已變更（verified id " +
+                                                            "$driftedId ≠ ${cur.dualId}），請重新確認",
+                                                        msgKind = MsgKind.INVALID,
+                                                    )
+                                                }
+                                            } else {
                                             // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
                                             // 不覆寫 lastOperation。鑑別沿用本次已持有的
                                             // profilesSnapshot：仍列有目標 id -> typed 身份
@@ -2550,6 +2629,7 @@ class DualViewModel(
                                                         msgKind = MsgKind.NO_DUAL,
                                                     )
                                                 }
+                                            }
                                             }
                                         }
                                         is RemoveOutcome.ChannelError -> {
