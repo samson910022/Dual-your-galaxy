@@ -16,7 +16,12 @@ import com.galaxydual.core.TRUNCATION_MARKER
 import com.galaxydual.core.TrustedList
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -444,5 +449,68 @@ class GatewayAssemblyTest {
         assertTrue(cli.out.contains(TRUNCATION_MARKER))
         val parsed = PmOutputParser.parsePackagesTrusted(cli)
         assertTrue("new v2 reply with marker must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
+    }
+
+    // P2-1: probe vs exec budget split (pure). `id -u` (SuElevator.whoAmICmd)
+    // is read-only uid check, so the short probe budget bounds a hung su auth
+    // prompt to 10 s; every other command (pm writes, list/identity probes)
+    // keeps the full 60 s exec budget.
+    @Test fun suTimeoutFor_probeUsesShortBudgetOthersUseFull() {
+        assertEquals(SU_PROBE_TIMEOUT_MS, suTimeoutFor("id -u"))
+        assertEquals(SU_PROBE_TIMEOUT_MS, suTimeoutFor("  id -u  "))
+        assertEquals(SU_EXEC_TIMEOUT_MS, suTimeoutFor("pm list users"))
+        assertEquals(SU_EXEC_TIMEOUT_MS, suTimeoutFor("pm install-existing --user 95 com.example.app"))
+        assertEquals(10_000L, SU_PROBE_TIMEOUT_MS)
+        assertEquals(60_000L, SU_EXEC_TIMEOUT_MS)
+    }
+
+    // P2-1: real blocking subprocess wait is cancellable. A `su -c` stuck on
+    // its auth prompt is modelled by an actual `sleep` Process (true waitFor
+    // block, non-cooperative: coroutine cancel cannot interrupt it, only the
+    // poll+ensureActive checkpoint surfaces it). Cancel must stop the waiter
+    // at once with CancellationException (never convert cancel to a result),
+    // destroy the hung child best effort, and leave the gateway usable for an
+    // immediate handover call. The 2 s bound is deliberately loose (poll is
+    // 50 ms); it falsifies the old blocking captureProcess, which held the
+    // caller to the full sleep/timeout.
+    @Test fun suGateway_cancelHungCapture_stopsWaitAtOnceWithCancellation() = runBlocking {
+        val started = CountDownLatch(1)
+        val hungProc = java.util.concurrent.atomic.AtomicReference<Process?>(null)
+        val gw = SuCmdGateway { _ ->
+            started.countDown()
+            ProcessBuilder("sh", "-c", "sleep 20").start().also { hungProc.set(it) }
+        }
+        val job = async(Dispatchers.Default) { gw.run("id -u") }
+        assertTrue("hung capture must be in flight before cancelling", started.await(5, TimeUnit.SECONDS))
+        val startNs = System.nanoTime()
+        job.cancel()
+        try {
+            job.await()
+            fail("cancelled hung su capture must throw CancellationException")
+        } catch (_: CancellationException) {
+            // Expected: caller retreats at once; remote state unknown.
+        }
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertTrue(
+            "cancelled su wait must end at once, not at the deadline (elapsed=${elapsedMs}ms)",
+            elapsedMs < 2_000L,
+        )
+        // Best-effort local kill: the hung child must not linger as a live
+        // process after cancel (unknown-after-send still holds -- the kill is
+        // local only, pm may already have executed, so no definite claim).
+        val deadlineMs = System.currentTimeMillis() + 5_000L
+        while (hungProc.get()?.isAlive == true && System.currentTimeMillis() < deadlineMs) {
+            Thread.sleep(10L)
+        }
+        assertEquals("cancelled capture must destroy its child best effort", false, hungProc.get()?.isAlive)
+        // Handover: a fresh call on the same gateway completes immediately
+        // (no wedge, no resend of the cancelled capture).
+        val fastStartNs = System.nanoTime()
+        val fast = SuCmdGateway { _ ->
+            ProcessBuilder("sh", "-c", "echo 0").start()
+        }.run("id -u")
+        val fastElapsedMs = (System.nanoTime() - fastStartNs) / 1_000_000L
+        assertTrue("handover call must complete immediately (elapsed=${fastElapsedMs}ms)", fastElapsedMs < 5_000L)
+        assertEquals(0, fast.exit)
     }
 }
