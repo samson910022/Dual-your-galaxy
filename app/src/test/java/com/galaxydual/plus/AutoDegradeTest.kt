@@ -41,6 +41,10 @@ class AutoDegradeTest {
     private class FakeSu(var rootOk: Boolean, var dualId: Int = 95) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
 
+        // Counts `id -u` (su auth-risk probe) vs `pm list users` separately so
+        // P25 Item 3 can bound unrelated-channel probes (explicit SHIZUKU must
+        // never run `su -c id -u`).
+        @Volatile var idUCalls = 0
         // Counts `pm list users` calls so tests can prove a re-probe ran.
         @Volatile var listUsersCalls = 0
         @Volatile var uninstallCalls = 0
@@ -81,9 +85,11 @@ class AutoDegradeTest {
             installedPkgs.map { "package:$it" }.joinToString("\n")
 
         override suspend fun run(cmd: String): CmdResult = when {
-            cmd.trim() == "id -u" ->
+            cmd.trim() == "id -u" -> {
+                idUCalls++
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
+            }
             cmd == DualRepository.CMD_LIST_USERS -> {
                 listUsersCalls++
                 if (rootOk) CmdResult(exit = 0, out = usersOut(), err = "")
@@ -342,6 +348,9 @@ class AutoDegradeTest {
     // Explicit SHIZUKU never crosses to ROOT even when ROOT is proven: the
     // resolved gateway stays SHIZUKU with SHELL identity (UI must not claim
     // "正在使用 ROOT").
+    // P25 Item 3: explicit probes only its own channel, so the su elevator is
+    // never probed here (suFake.idUCalls stays 0) and the routed summary
+    // reflects the probed subset (SHELL), never an unprobed unrelated channel.
     @Test
     fun explicit_shizukuNeverCrossesToRoot() {
         val suFake = FakeSu(rootOk = true)
@@ -371,9 +380,11 @@ class AutoDegradeTest {
         assertEquals(Privilege.SHELL, s.execIdentity)
         assertTrue("explicit SHIZUKU with proven SHELL must be writable", s.writeReady)
         assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
-        // The routed device summary may still be ROOT (both channels proven),
-        // but the execution identity must stay SHELL.
-        assertEquals(Privilege.ROOT, s.privilege)
+        // P25 Item 3: routed reflects only the probed (selected) channel --
+        // su was intentionally never probed, so this is SHELL, not ROOT.
+        // Execution identity stays SHELL either way.
+        assertEquals(Privilege.SHELL, s.privilege)
+        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls)
     }
 
     // Phase 2: no su binary + Shizuku proven -> SHIZUKU with NO degrade note
@@ -438,6 +449,8 @@ class AutoDegradeTest {
 
     // Phase 2 (mirror of explicit_shizukuNeverCrossesToRoot): explicit ROOT +
     // only Shizuku proven -> stays ROOT, fail closed, never crosses to SHIZUKU.
+    // P25 Item 3: explicit ROOT probes only su, so the proven-but-unprobed
+    // Shizuku is intentionally invisible (readCap false, routed NONE).
     @Test
     fun explicit_rootNeverCrossesToShizuku() {
         val suFake = FakeSu(rootOk = false)
@@ -461,12 +474,17 @@ class AutoDegradeTest {
         assertFalse("explicit ROOT with denied su must not be channelReady", s.channelReady)
         assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
         assertEquals(MsgKind.CHANNEL, s.msgKind)
-        assertTrue("device proved a channel", s.readCap)
+        // P25 Item 3: Shizuku was intentionally never probed (explicit ROOT
+        // probes su only), so readCap reflects the probed subset only.
+        assertFalse("unprobed Shizuku must not count toward readCap", s.readCap)
+        assertEquals(Privilege.NONE, s.privilege)
+        assertEquals("explicit ROOT must not probe Shizuku", 0, shizukuFake.listUsersCalls)
     }
 
     // Phase 2 (sharpest explicit isolation, missing from Phase 1): explicit
     // SHIZUKU + only ROOT proven -> stays SHIZUKU, fail closed, never crosses
-    // to ROOT. Routed summary may be ROOT but execution stays SHELL.
+    // to ROOT. P25 Item 3: su is intentionally never probed, so routed is NONE
+    // (not ROOT) and su auth is never triggered.
     @Test
     fun explicit_shizukuOnlyRootProven_staysShizuku() {
         val suFake = FakeSu(rootOk = true)
@@ -490,7 +508,9 @@ class AutoDegradeTest {
         assertFalse("explicit SHIZUKU with denied Shizuku must not be channelReady", s.channelReady)
         assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
         assertEquals(MsgKind.CHANNEL, s.msgKind)
-        assertEquals(Privilege.ROOT, s.privilege)
+        assertEquals(Privilege.NONE, s.privilege)
+        assertFalse("unprobed su must not count toward readCap", s.readCap)
+        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls)
     }
 
     // Phase 2: after su-denied + Shizuku-ok degrade, refresh() must see the
@@ -741,5 +761,99 @@ class AutoDegradeTest {
             "channelView must show the degrade short tag (degradeNote non-empty)",
             s.degradeNote.isNotEmpty(),
         )
+    }
+
+    // P25 Item 3: AUTO each round probes at most once -- swap result reused by
+    // probeChannels, no double `su -c id -u`. Stable ROOT: initial probe +
+    // one recheck + one reconnect = exactly one `id -u` per round.
+    @Test
+    fun auto_eachRound_probesOnce() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+
+        suFake.idUCalls = 0
+        val shizukuProbesBefore = shizukuFake.listUsersCalls
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && suFake.idUCalls >= 1 }
+        // Settle: a stray second probe would flip loading busy again; require
+        // quiescence before asserting the upper bound.
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals("AUTO recheck must probe su exactly once, got ${suFake.idUCalls}", 1, suFake.idUCalls)
+        assertTrue("AUTO must still probe Shizuku (full probe)", shizukuFake.listUsersCalls > shizukuProbesBefore)
+
+        suFake.idUCalls = 0
+        vm.reconnectAndRefresh()
+        await { !vm.state.value.loading && suFake.idUCalls >= 1 }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals("AUTO reconnect must probe su exactly once, got ${suFake.idUCalls}", 1, suFake.idUCalls)
+    }
+
+    // P25 Item 3: explicit SHIZUKU never triggers su -- no `id -u`, no
+    // `su -c` auth prompt, even across recheck/reconnect rounds. Shizuku
+    // itself is still probed (writeReady proves it).
+    @Test
+    fun explicit_shizuku_neverRunsSu() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.SHIZUKU,
+            initialGateway = shizukuFake,
+            preference = ChannelPreference.SHIZUKU,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        assertEquals("init probe must not touch su", 0, suFake.idUCalls)
+
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && shizukuFake.listUsersCalls >= 2 }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals("explicit SHIZUKU recheck must never run `su -c id -u`", 0, suFake.idUCalls)
+
+        vm.reconnectAndRefresh()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals("explicit SHIZUKU reconnect must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertTrue("selected Shizuku channel must stay writable", vm.state.value.writeReady)
+    }
+
+    // P25 Item 3: explicit LSPOSED (NoOp placeholder) probes no true channel --
+    // hook diagnosis runs via direct reads only, never `su -c id -u`.
+    @Test
+    fun explicit_lsposed_probesNoTrueChannel() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            initialGateway = NoOpGateway(),
+            preference = ChannelPreference.LSPOSED,
+        )
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertFalse("NoOp placeholder is never writable", vm.state.value.writeReady)
+        assertFalse("NoOp placeholder is never channelReady", vm.state.value.channelReady)
     }
 }

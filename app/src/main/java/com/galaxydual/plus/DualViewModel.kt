@@ -59,6 +59,16 @@ import kotlinx.coroutines.withContext
 // recreate, ViewModel retained) KEEPS the pending and the dialog re-shows
 // from state with no re-send. A ViewModel recreation (process death) starts
 // with pendingRemove == null (fail closed): the user must request again.
+// Single probe result reused by swap + probeChannels (P25 Item 3, issue #25):
+// hasRoot/hasShizuku reflect ONLY the probed subset: AUTO probes all
+// elevators, explicit probes only its own channel (ROOT -> su only,
+// SHIZUKU -> Shizuku only, LSPOSED -> none), so for explicit the fields
+// never claim an unrelated channel.
+data class ProbeOutcome(
+    val hasRoot: Boolean,
+    val hasShizuku: Boolean,
+)
+
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
@@ -124,11 +134,15 @@ data class UiState(
     // (su denied + Shizuku proven -> SHIZUKU, both fail -> NOOP).
     val resolvedGateway: ResolvedChannel = ResolvedChannel.NOOP,
     // Declared privilege of resolvedGateway (ROOT/SHELL/NONE). This is the
-    // actual execution identity, distinct from the routed device summary
-    // above (e.g. explicit SHIZUKU + ROOT available: routed=ROOT but
-    // execIdentity=SHELL).
+    // actual execution identity, distinct from the routed summary above
+    // (e.g. AUTO both-proven: routed=ROOT and execIdentity=ROOT; explicit
+    // SHIZUKU probes only Shizuku per P25 Item 3, so routed reflects the
+    // probed subset, never an unprobed unrelated channel).
     val execIdentity: Privilege = Privilege.NONE,
-    // Device proved at least one channel (hasRoot || hasShizuku).
+    // Probed subset proved at least one channel (hasRoot || hasShizuku).
+    // AUTO probes all, so this is device-wide; explicit probes only its own
+    // channel (P25 Item 3), so for explicit readCap == writeReady by
+    // construction (unrelated channels intentionally unprobed, never reported).
     val readCap: Boolean = false,
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
@@ -454,8 +468,15 @@ class DualViewModel(
     // and the coalesced trailing run. Must run under opMutex: callers hold
     // it, so this never launches or locks itself.
     private suspend fun reconnectLocked() {
-        if (preference == ChannelPreference.AUTO) swapAutoLocked()
-        probeChannels()
+        // P25 Item 3: one probe per round — swapAutoLocked probes once and
+        // returns the result for probeChannels to reuse (previously each
+        // probed all elevators: double `su -c` cost + double auth-prompt risk).
+        if (preference == ChannelPreference.AUTO) {
+            val probe = swapAutoLocked()
+            probeChannels(probe)
+        } else {
+            probeChannels()
+        }
         refreshLocked()
     }
 
@@ -1360,14 +1381,24 @@ class DualViewModel(
             recheckJob = myJob
             try {
                 opMutex.withLock {
-                    if (preference == ChannelPreference.AUTO) swapAutoLocked()
-                    probeChannels()
+                    // P25 Item 3: one probe per round — see reconnectLocked.
+                    if (preference == ChannelPreference.AUTO) {
+                        val probe = swapAutoLocked()
+                        probeChannels(probe)
+                    } else {
+                        probeChannels()
+                    }
                 }
                 while (recheckPending) {
                     recheckPending = false
                     opMutex.withLock {
-                        if (preference == ChannelPreference.AUTO) swapAutoLocked()
-                        probeChannels()
+                        // P25 Item 3: one probe per round — see reconnectLocked.
+                        if (preference == ChannelPreference.AUTO) {
+                            val probe = swapAutoLocked()
+                            probeChannels(probe)
+                        } else {
+                            probeChannels()
+                        }
                     }
                 }
             } finally {
@@ -1455,18 +1486,25 @@ class DualViewModel(
         selectJob = job
     }
 
-    // Re-resolves AUTO against live probes and swaps the gateway only when
-    // the probe-based resolution actually changed (preserves the Shizuku
-    // binder cache on the common no-change path). Must run under opMutex.
-    // P25 probe-based (issue #25): su file presence alone never grants ROOT;
-    // the elevators are probed for actual capability and resolveAutoProbe
-    // decides: su present but probe-denied + Shizuku proven -> SHIZUKU with
-    // autoDegradeNote recording the reason; both fail -> NOOP read-only;
-    // both succeed -> ROOT (F4a order). Explicit choices never reach here.
-    private suspend fun swapAutoLocked() {
+    // Single probe source (P25 Item 3, issue #25): explicit probes only its
+    // own channel so an unrelated channel never triggers an auth prompt.
+    // AUTO probes all elevators; explicit ROOT probes only SuElevator,
+    // explicit SHIZUKU only ShizukuElevator, explicit LSPOSED (NoOp
+    // placeholder) probes none and relies on hook diagnosis only. The su probe
+    // runs `su -c id -u`, which on denial can block up to SU_EXEC_TIMEOUT_MS
+    // (60 s) while `su` waits for user input -- halving the calls halves that
+    // risk (timeout constant unchanged; fewer invocations, not a shorter
+    // budget). Must run under opMutex.
+    private suspend fun probeOnce(): ProbeOutcome {
+        val targets: List<Elevator> = when (preference) {
+            ChannelPreference.AUTO -> elevators
+            ChannelPreference.ROOT -> elevators.filterIsInstance<SuElevator>()
+            ChannelPreference.SHIZUKU -> elevators.filterIsInstance<ShizukuElevator>()
+            ChannelPreference.LSPOSED -> emptyList()
+        }
         var hasRoot = false
         var hasShizuku = false
-        for (elevator in elevators) {
+        for (elevator in targets) {
             try {
                 when (onIo { elevator.probe() }.level) {
                     Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
@@ -1478,7 +1516,27 @@ class DualViewModel(
                 // A throwing probe means no channel from this elevator.
             }
         }
-        degradeAutoLocked(hasRoot, hasShizuku)
+        return ProbeOutcome(hasRoot, hasShizuku)
+    }
+
+    // Re-resolves AUTO against live probes and swaps the gateway only when
+    // the probe-based resolution actually changed (preserves the Shizuku
+    // binder cache on the common no-change path). Must run under opMutex.
+    // P25 probe-based (issue #25): su file presence alone never grants ROOT;
+    // the elevators are probed for actual capability and resolveAutoProbe
+    // decides: su present but probe-denied + Shizuku proven -> SHIZUKU with
+    // autoDegradeNote recording the reason; both fail -> NOOP read-only;
+    // both succeed -> ROOT (F4a order). Explicit choices never reach here.
+    // P25 Item 3: probes once via probeOnce() and returns the result so the
+    // caller (recheck/reconnect) reuses it in probeChannels instead of probing
+    // a second time. Previously swapAutoLocked + probeChannels each probed all
+    // elevators (idempotent degrade, double `su -c` cost and double
+    // auth-prompt risk); now each round probes at most once.
+    private suspend fun swapAutoLocked(): ProbeOutcome {
+        // Callers guarantee preference == AUTO here, so probeOnce() probes all.
+        val probe = probeOnce()
+        degradeAutoLocked(probe.hasRoot, probe.hasShizuku)
+        return probe
     }
 
     // Applies a probe result to the AUTO selection (P25). Records the degrade
@@ -1628,8 +1686,8 @@ class DualViewModel(
         }
     }
 
-    // Probes elevation channels (ROOT first, then SHELL) and routes the
-    // privilege decision via the shared core router. Must run under opMutex.
+    // Probes elevation channels and routes the privilege decision via the
+    // shared core router. Must run under opMutex.
     //
     // Phase F4a (issue #6): the factory injects elevators backed by the real
     // su/Shizuku gateways, so these probes verify the actual channels.
@@ -1639,40 +1697,40 @@ class DualViewModel(
     // channel stays read-only: fail closed, never a fake working channel.
     // P25 (issue #25): the result is split five ways -- preference
     // (channel) vs resolvedGateway (currentChannel) vs execIdentity
-    // (gatewayPrivilege) vs readCap (device proved any channel) vs
+    // (gatewayPrivilege) vs readCap (probed subset proved any channel) vs
     // writeReady (selected channel proved). For AUTO the same probe results
     // drive degradeAutoLocked (su denied + Shizuku proven -> SHIZUKU with a
     // recorded reason; both fail -> NOOP; both succeed -> ROOT), so the
     // startup file heuristic is corrected on the first probe. Explicit
     // choices never cross channels here (only AUTO degrades).
+    // P25 Item 3 (issue #25): probeOnce() probes only the selected channel
+    // for explicit (ROOT -> su only, SHIZUKU -> Shizuku only, LSPOSED -> none;
+    // hook diagnosis still runs below via direct reads + verified gateways,
+    // so explicit SHIZUKU never runs `su -c id -u` and never triggers a su
+    // auth prompt). For explicit, readCap/routed therefore reflect only the
+    // selected channel (readCap == writeReady by construction: unrelated
+    // channels are intentionally unprobed, never reported), not device-wide
+    // capability. `reusedProbe` carries the swapAutoLocked result so AUTO
+    // recheck/reconnect rounds probe at most once (no double `su -c` cost).
     // DEVICE-UNVERIFIED: probe/exec round-trips never ran on a device.
     // PR-3 stage 1 (issue #24): drives loading like every other op (entry sets
     // busy, the single exit update below clears it, the catch path clears it
     // too), and elevator probes run via onIo so a blocking gateway can never
     // stall the Main dispatcher heartbeat.
-    private suspend fun probeChannels() {
+    private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null) {
         _state.update { it.copy(loading = true) }
         try {
-            var hasRoot = false
-            var hasShizuku = false
-            for (elevator in elevators) {
-                try {
-                    when (onIo { elevator.probe() }.level) {
-                        Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
-                        Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
-                        Privilege.NONE -> Unit
-                    }
-                } catch (e: Exception) {
-                    // A throwing probe means no channel from this elevator,
-                    // but cancellation must still propagate (otherwise a
-                    // cancelled scope would be misreported as "no channel").
-                    if (e is CancellationException) throw e
-                }
-            }
+            // Single probe per call: reuse the swap result when present,
+            // otherwise probe once (preference-filtered inside probeOnce).
+            val probe = reusedProbe ?: probeOnce()
+            val hasRoot = probe.hasRoot
+            val hasShizuku = probe.hasShizuku
             // P25: AUTO follows live probes, not the startup file heuristic.
-            // Init and recheck paths reach here without a prior swap, so the
-            // degrade must live here (idempotent with swapAutoLocked above).
-            if (preference == ChannelPreference.AUTO) {
+            // Only the entry without a prior swap (init / selectChannel-AUTO)
+            // degrades here; recheck/reconnect already degraded via
+            // swapAutoLocked(reused) so this skips the second (idempotent but
+            // redundant) degrade.
+            if (preference == ChannelPreference.AUTO && reusedProbe == null) {
                 degradeAutoLocked(hasRoot, hasShizuku)
             }
             val degradeNoteForState = if (preference == ChannelPreference.AUTO) autoDegradeNote else ""

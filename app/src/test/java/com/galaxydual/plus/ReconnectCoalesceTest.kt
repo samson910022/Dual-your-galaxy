@@ -222,10 +222,10 @@ class ReconnectCoalesceTest {
 
         val rounds = suFake.listPackagesCalls.get()
         assertEquals("reconnect burst must collapse to leader + one trailing", 2, rounds)
-        // Each reconnect round probes su twice (swapAuto + probeChannels);
-        // 2 rounds bound the probe side too (no per-tap waiter).
+        // P25 Item 3: each reconnect round probes su once (swap result reused
+        // by probeChannels); 2 rounds bound the probe side too (no per-tap waiter).
         val probes = suFake.idUCalls.get()
-        assertTrue("probe must be bounded too (<=4), got $probes", probes <= 4)
+        assertTrue("probe must be bounded too (<=2, one per round), got $probes", probes <= 2)
     }
 
     // Burst of pure refreshes coalesces without ever probing: refresh
@@ -282,9 +282,10 @@ class ReconnectCoalesceTest {
         await { !vm.state.value.loading }
 
         assertEquals("refresh+reconnect burst must collapse to 2 rounds", 2, suFake.listPackagesCalls.get())
+        // P25 Item 3: the trailing reconnect probes once (swap result reused).
         assertTrue(
             "trailing must have been upgraded to reconnect (probe ran), got ${suFake.idUCalls.get()}",
-            suFake.idUCalls.get() >= 2,
+            suFake.idUCalls.get() >= 1,
         )
     }
 }
