@@ -54,12 +54,15 @@ import rikka.shizuku.Shizuku
 // String stderr. The client must NOT call reply.readException(): a non-zero
 // exit word would be misread as an exception code.
 // The reply does NOT carry CmdResult.truncated explicitly (layout frozen);
-// the client re-derives it from the core TRUNCATION_MARKER.
-// Service-side captureProcess already sets the flag, but only the marker
-// text survives the parcel. Cross-reference: the marker text is produced by
-// capped() in SuCmdGateway.kt from the same core constant -- single import,
-// so the change is atomic; old wire payloads stay compatible (test literals
-// were unified to the constant for style).
+// the client re-derives it from the core TRUNCATION_MARKER via
+// decodeExecReply() below. The service appends the marker whenever the
+// capture is truncated (cap, read error, or join expiry -- see capped() /
+// buildResult() in SuCmdGateway.kt), so every truncated=true result carries
+// detectable text (review Phase B, issue #22 P2-#3).
+// Compatibility note: service and client ship in the same APK and update
+// together, so both sides agree on whenever-truncated-append. An OLD service
+// (marker only on cap) paired with a NEW client can still miss a join-expiry
+// flag across versions; known cross-version limitation.
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
@@ -91,6 +94,25 @@ object ShizukuExecErrors {
     fun timedOut(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms")
 }
+
+// Pure wire mapping for the exec reply (JVM-testable): the Binder Parcel
+// itself (android.os.Parcel) is a framework stub on the JVM and is NOT
+// covered by unit tests -- only this mapping is (GatewayAssemblyTest
+// round-trips encode->decode for cap, join-expiry, clean-empty, and
+// non-zero-exit). The service encodes via encodeExecReply() before writing
+// the Parcel; the client decodes via decodeExecReply() after reading it, so
+// a truncated flag always survives as marker text in one of the streams.
+// Internal so JVM unit tests cover it without a device.
+internal fun encodeExecReply(res: CmdResult): Triple<Int, String, String> =
+    Triple(res.exit, res.out, res.err)
+
+internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
+    CmdResult(
+        exit = exit,
+        out = out,
+        err = err,
+        truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
+    )
 
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
@@ -132,9 +154,10 @@ class GalaxyExecService : Binder {
                 } catch (e: Exception) {
                     CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}")
                 }
-                reply?.writeInt(res.exit)
-                reply?.writeString(res.out)
-                reply?.writeString(res.err)
+                val (replyExit, replyOut, replyErr) = encodeExecReply(res)
+                reply?.writeInt(replyExit)
+                reply?.writeString(replyOut)
+                reply?.writeString(replyErr)
                 return true
             }
             else -> return super.onTransact(code, data, reply, flags)
@@ -246,23 +269,17 @@ class ShizukuCmdGateway(
                         // No readException(): the service writes a raw int exit
                         // first, which readException would misread as an
                         // exception code on any non-zero exit.
-                        // The service side caps via captureProcess and appends the
-                        // "\n[truncated]" marker (core TRUNCATION_MARKER, see
-                        // capped() in SuCmdGateway.kt), but the wire layout
+                        // The service side truncates via buildResult/capped() in
+                        // SuCmdGateway.kt: whenever truncated=true the marker
+                        // text is appended to the streams, and the wire layout
                         // only carries (exit, stdout, stderr). Mirror the
-                        // marker into CmdResult.truncated so parsers can tell
-                        // "clean empty" from "cut off" without changing any
-                        // caller.
+                        // marker into CmdResult.truncated via decodeExecReply()
+                        // so parsers can tell "clean empty" from "cut off"
+                        // without changing any caller.
                         val execExit = reply.readInt()
                         val execOut = reply.readString() ?: ""
                         val execErr = reply.readString() ?: ""
-                        CmdResult(
-                            exit = execExit,
-                            out = execOut,
-                            err = execErr,
-                            truncated = execOut.contains(TRUNCATION_MARKER) ||
-                                execErr.contains(TRUNCATION_MARKER),
-                        )
+                        decodeExecReply(execExit, execOut, execErr)
                     } finally {
                         reply.recycle()
                         data.recycle()
