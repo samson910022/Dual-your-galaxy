@@ -432,6 +432,26 @@ class DualViewModel(
     // Repository calls run via onIo (PR-3 stage 1, issue #24) so the retry
     // settle wait never blocks Main; StateFlow updates stay thread-safe from
     // any dispatcher.
+    // P25 Item 1: combines a refresh result with the Auto degrade note so the
+    // degrade reason survives refreshLocked (which previously overwrote msg
+    // with "no clones installed" / "" / channel error). NONE (silent) shows
+    // the note alone (INFO); INFO (neutral) appends the note ("；" join);
+    // errors (CHANNEL/FAILED/NO_DUAL/VERIFY/INVALID) keep error priority
+    // (pass through, degrade stays in degradeNote + channelView short tag).
+    // Mirrors the pendingRemove preserve rule (NONE/INFO combinable, errors pass).
+    private fun combineWithDegradeNote(
+        baseMsg: String,
+        baseKind: MsgKind,
+        degradeNote: String,
+    ): Pair<String, MsgKind> {
+        if (preference != ChannelPreference.AUTO || degradeNote.isEmpty()) return baseMsg to baseKind
+        return when (baseKind) {
+            MsgKind.NONE -> degradeNote to MsgKind.INFO
+            MsgKind.INFO -> "$baseMsg；$degradeNote" to MsgKind.INFO
+            else -> baseMsg to baseKind
+        }
+    }
+
     private suspend fun refreshLocked() {
         // Mark busy first so the UI can render a spinner. Dialog 開著時狀態列
         // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
@@ -444,11 +464,16 @@ class DualViewModel(
             when (val snap = onIo { repo.profilesSnapshot() }) {
                 is ProfilesSnapshot.ChannelError ->
                     _state.update { cur ->
+                        val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            "channel error: ${snap.detail}",
+                            MsgKind.CHANNEL,
+                            cur.degradeNote,
+                        )
                         val next = cur.copy(
                             loading = false,
                             profiles = emptyList(),
-                            msg = "channel error: ${snap.detail}",
-                            msgKind = MsgKind.CHANNEL,
+                            msg = combinedMsg,
+                            msgKind = combinedKind,
                         )
                         if (cur.pendingRemove != null &&
                             (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
@@ -471,12 +496,17 @@ class DualViewModel(
                     val dualId = onIo { repo.resolveDualUserId() }
                     if (dualId < 0) {
                         _state.update { cur ->
+                            val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                "no dual profile",
+                                MsgKind.NO_DUAL,
+                                cur.degradeNote,
+                            )
                             val next = cur.copy(
                                 loading = false,
                                 profiles = profiles,
                                 cloned = emptyList(),
-                                msg = "no dual profile",
-                                msgKind = MsgKind.NO_DUAL,
+                                msg = combinedMsg,
+                                msgKind = combinedKind,
                             )
                             if (cur.pendingRemove != null &&
                                 (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
@@ -489,29 +519,41 @@ class DualViewModel(
                     } else {
                         val groundTruth = onIo { repo.listClonedPackages(dualId) }
                         _state.update { cur ->
+                            val (baseMsg, baseKind) = if (groundTruth == null) {
+                                "refresh result unknown: " +
+                                    "cannot list clones for user $dualId" to MsgKind.CHANNEL
+                            } else if (groundTruth.isEmpty()) {
+                                "no clones installed" to MsgKind.INFO
+                            } else {
+                                "" to MsgKind.NONE
+                            }
+                            val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                baseMsg,
+                                baseKind,
+                                cur.degradeNote,
+                            )
                             val next = if (groundTruth == null) {
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
-                                    msg = "refresh result unknown: " +
-                                        "cannot list clones for user $dualId",
-                                    msgKind = MsgKind.CHANNEL,
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
                                 )
                             } else if (groundTruth.isEmpty()) {
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
                                     cloned = emptyList(),
-                                    msg = "no clones installed",
-                                    msgKind = MsgKind.INFO,
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
                                 )
                             } else {
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
                                     cloned = groundTruth,
-                                    msg = "",
-                                    msgKind = MsgKind.NONE,
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
                                 )
                             }
                             if (cur.pendingRemove != null &&
@@ -532,10 +574,15 @@ class DualViewModel(
             // Gateways report via CmdResult, but guard against unexpected throws.
             // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
             _state.update { cur ->
+                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                    "refresh failed: ${e.message ?: e.javaClass.simpleName}",
+                    MsgKind.FAILED,
+                    cur.degradeNote,
+                )
                 val next = cur.copy(
                     loading = false,
-                    msg = "refresh failed: ${e.message ?: e.javaClass.simpleName}",
-                    msgKind = MsgKind.FAILED,
+                    msg = combinedMsg,
+                    msgKind = combinedKind,
                 )
                 if (cur.pendingRemove != null &&
                     (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
