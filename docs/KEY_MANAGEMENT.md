@@ -28,7 +28,20 @@ CI / Release:
 - Fail-closed by design: if any secret is missing on a tag build, the
   signing step fails the job and nothing is published. There is no
   `unsigned` fallback asset — do not add one.
-- STATUS: SIGN_* secrets not yet configured in GitHub — any v* tag fails by design until then; green non-tag CI does not prove the release signing path; re-verify with one tag dry-run after configuring secrets.
+- STATUS (as of 2026-11-04): 4 SIGN_* secrets (`SIGN_STORE_BASE64` /
+  `SIGN_STORE_PASSWORD` / `SIGN_KEY_ALIAS` / `SIGN_KEY_PASSWORD`) present
+  and valid for that run; tag v0.0.0-dryrun
+  [run 41800791298](https://github.com/samson910022/Galaxy-Dual-app-Plus/actions/runs/41800791298)
+  passed end-to-end: keystore restore + `./gradlew assembleRelease` +
+  `apksigner verify` + single `SHA256SUMS.txt` (SHA-256, `sha256sum -c`
+  verified); same-run attempts 1-2 red as observed (base64 invalid /
+  password incorrect), attempt 3 green; fail-closed by design; CI green
+  covers build+verify, manual download verified + cert SHA-256 matches the
+  canonical fingerprint at the top of this file (see
+  [#5 close comment](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/5#issuecomment-6626662388)).
+  Push tags `v*` trigger the same workflow; re-verify on first real `v*`
+  or after rotation/workflow change. Green non-tag CI does not prove the
+  tag path (dry-run tag/Release cleaned per #5).
 - Local sign (complete — pass alias and both passwords explicitly):
 
   ```bash
@@ -45,10 +58,15 @@ CI / Release:
   `~/.android-keys/Galaxy-Dual-app-Plus-release.properties`
   (`storeFile/storePassword/keyAlias/keyPassword`) is not read by
   `apksigner` directly; export its values as env vars first.
-- Signature versions: `apksigner` enables v1 (JAR signing) + v2 (APK
-  Signature Scheme v2) by default. Keep the default for sideload
-  installs (widest compatibility). Explicit form:
-  `--v1-signing-enabled true --v2-signing-enabled true`.
+- Signature versions: manual `apksigner sign` schemes depend on the APK
+  min/max SDK and options (`--v1-signing-enabled` / `--v2-signing-enabled`
+  defaults follow the official apksigner documentation, not always both on).
+  To explicitly require v1 (JAR signing) + v2 (APK Signature Scheme v2)
+  for widest sideload compatibility, pass
+  `--v1-signing-enabled true --v2-signing-enabled true`. CI-built APK
+  differs: run 41800791298 attempt 3 `apksigner verify --verbose`
+  shows v1=false / v2=true as observed in that run (minSdk 29 per
+  gradle/libs.versions.toml; v1/v2 values as measured; cause not yet investigated).
 - `.jks` vs PKCS12: the file keeps the historical `.jks` extension but
   its actual format is PKCS12 (`keytool -list` reports `Type: PKCS12`).
   Java/`apksigner` detect format by content, so the extension does not
@@ -65,11 +83,35 @@ Verify (two different things — do not confuse):
   ```
 
 - APK file checksum = integrity of one specific file, changes every
-  build. Check with:
+  build. Two cases — do not mix the filenames:
+  - Locally signed file (local-only): `app-release-signed.apk` plus
+    its sidecar `app-release-signed.apk.sha256` in the same folder.
+    Generate the sidecar first (the sign step above only outputs
+    the `.apk`), then check with:
 
-  ```bash
-  sha256sum -c app-release-signed.apk.sha256
-  ```
+    ```bash
+    sha256sum app-release-signed.apk > app-release-signed.apk.sha256
+    sha256sum -c app-release-signed.apk.sha256
+    ```
+
+    A locally generated checksum is only for later integrity
+    comparison, not an independent trusted-source verification;
+    for official downloads, the Release `SHA256SUMS.txt` and
+    certificate comparison remain authoritative.
+
+  - GitHub Release download: `app-release.apk` plus `SHA256SUMS.txt`
+    in the same folder. Check with:
+
+    ```bash
+    sha256sum -c SHA256SUMS.txt
+    ```
+
+    Optionally confirm the signing key on the downloaded APK:
+
+    ```bash
+    apksigner verify --print-certs app-release.apk
+    # compare the SHA-256 digest of certificate with the canonical value
+    ```
 
   A fingerprint mismatch means a different key; a checksum mismatch
   means a corrupted/modified file. Transcribe fingerprints exactly —
