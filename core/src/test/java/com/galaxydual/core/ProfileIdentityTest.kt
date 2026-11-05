@@ -516,8 +516,8 @@ class ProfileIdentityTest {
 
     @Test
     fun gluedProfileCloneWithoutSeparatorIsNotClone() {
-        // `myprofile.CLONE` has no separator before CLONE: the CLONE_MARKER
-        // left boundary must reject it (line still carries the type keyword,
+        // `myprofile.CLONE` has no separator before CLONE: the isSupportedCloneToken
+        // allowlist must reject it (line still carries the type keyword,
         // so the verdict is OTHER, never CLONE).
         val text = """
             Users:
@@ -532,7 +532,7 @@ class ProfileIdentityTest {
     @Test
     fun underscoreSeparatedCloneSingletonYieldsClone() {
         // Phase A regression: `profile_CLONE` single token must be CLONE
-        // (separator-tolerant PROFILE_TOKEN + CLONE_MARKER).
+        // (separator-tolerant PROFILE_TOKEN + isSupportedCloneToken).
         val text = """
             Users:
               UserInfo{95:DualApp:400} running:
