@@ -277,15 +277,12 @@ class DualRepository(
     // and the same fail-closed channel checks as the shared fetcher above,
     // but keeps the failure reason instead of folding everything to -1:
     // - Confirmed(id): clean channels whose CLONE claims agree on one id.
-    // - Absent: clean channels that parse to real user blocks on BOTH
-    //   sources yet claim no dual profile anywhere (genuinely no target,
-    //   not a broken channel: a single non-empty source alone proves
-    //   nothing, the other channel may just be broken).
-    // - Unknown: a typed channel threw/failed (exit/isSuccess), the outputs
-    //   parse to no user blocks at all (untrustworthy capture), the two
-    //   sources contradict each other (Refused), or a single source alone
-    //   claims a clone (insufficient evidence: the other channel may just be
-    //   broken, so absence must not be claimed).
+    // - Absent: 僅當兩來源對所有相關 user 給出明確且一致的非 CLONE 類型
+    //   （每條 claim 皆為 OTHER、無 UNKNOWN、兩源 user 集合相同、無 CLONE、
+    //   無衝突），且 property 不指向仍可能存在的 clone（有正值 id 但 typed
+    //   無對應 Confirmed 即 Unknown）；其餘一律 Unknown，絕不清空舊單。
+    // - Unknown: 通道截斷/失敗（exit/identity 閘）、輸出不可信、證據矛盾
+    //   （Refused）、單源 clone、型別缺失、集合不一致、property 指向不明。
     // Never throws except on coroutine cancellation. The legacy Int entries
     // above are untouched; this is purely additive.
     // NOTE (p25-rebase adapt): the Int path above stays delegated to the
@@ -305,15 +302,21 @@ class DualRepository(
             if (e is CancellationException) throw e
             return DualIdResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
         }
+        // P1-2（與 canonical fetchVerifiedTarget 同驗證）：截斷一律拒絕，
+        // 身分通道改用 isIdentityChannelOk（不用 isSuccess，避免
+        // INSTALL_FAILED_ALREADY_EXISTS 例外放行身分證據）。
+        if (verboseRes.truncated || dumpsysRes.truncated) {
+            return DualIdResolution.Unknown("typed channel truncated identity evidence")
+        }
         if (verboseRes.exit != 0 || dumpsysRes.exit != 0) {
             return DualIdResolution.Unknown(
                 "typed channel exit (verbose=${verboseRes.exit} dumpsys=${dumpsysRes.exit})",
             )
         }
-        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) {
+        if (!PmOutputParser.isIdentityChannelOk(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) {
             return DualIdResolution.Unknown("typed verbose channel reports failure")
         }
-        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) {
+        if (!PmOutputParser.isIdentityChannelOk(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) {
             return DualIdResolution.Unknown("typed dumpsys channel reports failure")
         }
         val propRes = try {
@@ -322,8 +325,19 @@ class DualRepository(
             if (e is CancellationException) throw e
             null
         }
+        // 截斷 property 非「無聲明」：切掉的 payload 可能藏 mismatch，fail closed。
+        if (propRes != null && propRes.truncated) {
+            return DualIdResolution.Unknown("typed property channel truncated identity evidence")
+        }
+        // property 通道亦走身分閘：髒輸出即 Unknown（canonical 經缺 property
+        // 走向 Unknown，此處直接 Unknown 以擋住後續誤判 Absent；拋出而得 null
+        // 則視為無聲明，沿舊流程）。
+        if (propRes != null &&
+            !PmOutputParser.isIdentityChannelOk(propRes.out + "\n" + propRes.err, propRes.exit)
+        ) {
+            return DualIdResolution.Unknown("typed property channel reports failure")
+        }
         val propertyId = propRes
-            ?.takeIf { it.exit == 0 }
             ?.let { PmOutputParser.parseDualPropertyId(it.out) }
         val verboseClaims = SamsungProfileAdapter.parseUserListVerbose(verboseRes.out)
         val dumpsysClaims = SamsungProfileAdapter.parseDumpsysUser(dumpsysRes.out)
@@ -332,12 +346,31 @@ class DualRepository(
             is DualResolution.Confirmed -> DualIdResolution.Confirmed(resolution.userId)
             is DualResolution.Refused -> DualIdResolution.Unknown(resolution.reason)
             is DualResolution.Unknown -> {
-                val anyCloneClaim = candidates.any { it.userType == ProfileUserType.CLONE }
-                if (!anyCloneClaim && verboseClaims.isNotEmpty() && dumpsysClaims.isNotEmpty()) {
-                    DualIdResolution.Absent
-                } else {
-                    DualIdResolution.Unknown("insufficient identity evidence")
+                // P1-1（False Absent 修正）：Absent 僅當兩源皆有真實區塊、無
+                // 任何 CLONE 聲稱、每條 claim 皆為明確 OTHER（無 UNKNOWN）、兩
+                // 源 user 集合完全一致（無衝突/缺戶），且 property 無具體指向
+                // （有正值 id 但無 Confirmed 即為仍可能存在的 clone）；其餘
+                // （型別缺失、集合不一致、property 指向不明等）一律 Unknown。
+                if (candidates.any { it.userType == ProfileUserType.CLONE }) {
+                    return DualIdResolution.Unknown("insufficient identity evidence")
                 }
+                if (verboseClaims.isEmpty() || dumpsysClaims.isEmpty()) {
+                    return DualIdResolution.Unknown("insufficient identity evidence")
+                }
+                if (verboseClaims.any { it.userType != ProfileUserType.OTHER } ||
+                    dumpsysClaims.any { it.userType != ProfileUserType.OTHER }
+                ) {
+                    return DualIdResolution.Unknown("insufficient identity evidence")
+                }
+                val verboseIds = verboseClaims.map { it.userId }.toSet()
+                val dumpsysIds = dumpsysClaims.map { it.userId }.toSet()
+                if (verboseIds != dumpsysIds) {
+                    return DualIdResolution.Unknown("insufficient identity evidence")
+                }
+                if (propertyId != null) {
+                    return DualIdResolution.Unknown("insufficient identity evidence")
+                }
+                DualIdResolution.Absent
             }
         }
     }
