@@ -918,11 +918,11 @@ class ProfileIdentityTest {
         assertEquals(0, clone.parentId)
     }
 
-    // End-to-end repository gate (PR-33 S1): V=CLONE/serial15 plus
-    // D=UNKNOWN/serial15 resolves to NoDual (id never Confirmed), so
-    // removeVerifiedExpected runs zero uninstalls (fail closed). Uses a
-    // local fake gateway in the DualSafetyTest style (core has no
-    // coroutines dependency, hence the minimal runSuspend helper).
+    // End-to-end repository gate (PR-33 S1, Stage2 身份診斷一致性更新):
+    // V=CLONE/serial15 plus D=UNKNOWN/serial15 resolves to Unknown (id never
+    // Confirmed), so removeVerifiedExpected refuses as ChannelError (never
+    // NoDual) with zero uninstalls (fail closed). Legacy resolveDualUserId/
+    // fetchDualTarget still fold to -1/NoDual (簽名不變)；typed 閘才區分。
     @Test
     fun clonePlusUnknown_repoGateRefusesWithZeroUninstall() {
         val verboseClone = """
@@ -952,7 +952,7 @@ class ProfileIdentityTest {
         val outcome = runSuspend {
             repo.removeVerifiedExpected("com.example.chat", 95, 15)
         }
-        assertTrue("expected NoDual, got: $outcome", outcome is RemoveOutcome.NoDual)
+        assertTrue("expected ChannelError (identity unknown), never NoDual, got: $outcome", outcome is RemoveOutcome.ChannelError)
         assertEquals(0, gateway.uninstallRuns)
         assertTrue(
             "no uninstall may run on CLONE+UNKNOWN, got: ${gateway.commands}",

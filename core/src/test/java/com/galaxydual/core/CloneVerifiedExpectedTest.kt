@@ -35,6 +35,9 @@ class CloneVerifiedExpectedTest {
         // 矛盾狀態）。typed 必須判 Unknown（property/pm 反證），絕不放寬為
         // Absent；production 判定不動。
         var contradictoryEvidence: Boolean = false,
+        // Stage2 身份診斷一致性：typed 確認 dualId，但 pm 快照只剩 owner
+        //（snapshot/identity mismatch）。clone/remove 皆不得報 NoDual。
+        var snapshotMissesDual: Boolean = false,
         var installOut: String = "Package com.example.chat installed for user: 95",
         var installExit: Int = 0,
         var listPackagesOut: String = "package:com.example.chat\n",
@@ -89,7 +92,9 @@ class CloneVerifiedExpectedTest {
         private fun listUsersOut(): String {
             // absent 為乾淨無 dual（owner-only，無 95）；contradictory 刻意
             // 保留 95 以重現 pm 快照反證（typed 必須 Unknown）。
-            if (absentIdentity) {
+            // snapshotMissesDual 反向：typed 確認 dual 但 pm 快照只剩 owner
+            //（snapshot/identity mismatch，絕非 NoDual）。
+            if (absentIdentity || snapshotMissesDual) {
                 return "Users:\n" +
                     "\tUserInfo{0:Owner:13} running\n"
             }
@@ -371,6 +376,76 @@ class CloneVerifiedExpectedTest {
         assertTrue(
             "no install may run on contradictory identity evidence, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // Stage2 身份診斷一致性：typed 已 Confirmed 95，但 pm 快照只剩 owner
+    //（snapshot/identity mismatch）→ 非 NoDual（ChannelError）、零 install、
+    // detail 不含 "no dual"。
+    @Test
+    fun snapshotMissesDual_returnsChannelErrorWithZeroInstall() {
+        val gateway = FakeGateway(snapshotMissesDual = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue(
+            "expected ChannelError (snapshot/identity mismatch), never NoDual, got: $outcome",
+            outcome is CloneOutcome.ChannelError,
+        )
+        val detail = (outcome as CloneOutcome.ChannelError).detail
+        assertTrue(
+            "detail must never claim no dual, got: $detail",
+            !detail.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "no install may run on snapshot/identity mismatch, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // Stage2 身份診斷一致性（remove 側）：identity 通道 exit!=0（不可判定）
+    // → 非 NoDual（ChannelError）、零 uninstall。照 cloneVerifiedExpected＋
+    // requestRemove M1/M2 的 typed 閘，legacy -1 不得折為 NoDual。
+    @Test
+    fun removeIdentityExitFailure_returnsChannelErrorWithZeroUninstall() {
+        val gateway = FakeGateway(verboseExit = 1)
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue(
+            "expected ChannelError (identity unknown), never NoDual, got: $outcome",
+            outcome is RemoveOutcome.ChannelError,
+        )
+        val detail = (outcome as RemoveOutcome.ChannelError).detail
+        assertTrue(
+            "detail must name the unknown identity, got: $detail",
+            detail.contains("unknown", ignoreCase = true),
+        )
+        assertTrue(
+            "detail must never claim no dual, got: $detail",
+            !detail.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "no uninstall may run on an unconfirmable identity, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
+        )
+    }
+
+    // Stage2 身份診斷一致性（remove 側）：typed 已 Confirmed 95，但 pm 快照
+    // 只剩 owner → 非 NoDual（ChannelError）、零 uninstall。
+    @Test
+    fun removeSnapshotMissesDual_returnsChannelErrorWithZeroUninstall() {
+        val gateway = FakeGateway(snapshotMissesDual = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue(
+            "expected ChannelError (snapshot/identity mismatch), never NoDual, got: $outcome",
+            outcome is RemoveOutcome.ChannelError,
+        )
+        assertTrue(
+            "no uninstall may run on snapshot/identity mismatch, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
         )
     }
 }
