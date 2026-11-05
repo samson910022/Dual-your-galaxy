@@ -27,6 +27,8 @@ class DualHook : XposedModule() {
     // Honesty: a stale marker from a previous boot (file survives reboots)
     // can read "active" until rewritten -- the app labels the signal as
     // existence+scope evidence, staleness hardening stays DEVICE-UNVERIFIED.
+    // Marker semantics: install evidence only, not proof policy took effect;
+    // empty policy => observe-only today (see WhitelistPolicy.apply).
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
         val installed = hookDualAppManagerService(param.classLoader)
         if (installed > 0) {

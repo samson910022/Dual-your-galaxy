@@ -48,7 +48,8 @@ services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 確認候選 1 在三次 system_server 啟動皆 `deoptimized`＋`hooked` 成功、
 無 `method not found`。此為 hook 註冊證據，不等於第 3 層 callback 觸發
 （可驗日誌缺：尚無回調命中／放寬包名 log）與第 4 層政策生效
-（預設空政策，observe-only）。候選 2／3 在此 ROM 未命中，保留為 fallback。
+（預設空政策，observe-only；system_server marker 同樣僅證明安裝）。
+候選 2／3 在此 ROM 未命中，保留為 fallback。
 
 模組在 `onSystemServerStarting` 以反射依序嘗試（第一個載入成功者勝出，
 其餘 `try/catch` 略過，非三星 ROM 自動無操作）：
@@ -232,3 +233,5 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   signature guard keeps unknown shapes observe-only); non-scope processes get `detach()`.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
+- The marker proves hook installation only, not policy effect (empty=>no-op,
+  Skipped on daagent clinit path; static-final=>ObserveOnly on this ROM).
