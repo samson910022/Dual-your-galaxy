@@ -838,4 +838,39 @@ class Round2PhaseBTest {
         await { !vm.state.value.loading }
         assertEquals(false, vm.state.value.loading)
     }
+
+    // P27 reconnectLocked 修復回歸：AUTO reconnect 必須 probe 後完成完整
+    // package refresh（refreshLocked 移出 else 共用）。健康 ROOT 下
+    // reconnect 後 package-list IO 必須發生且 inventory queryTime 前進
+    //（非舊快照），cloned 保留。
+    @Test
+    fun autoReconnect_runsFullPackageRefresh() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock(), preference = ChannelPreference.AUTO, shizukuGw = shGw)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val qtBefore = vm.state.value.inventory.queryTimeMs
+
+        suGw.packageListCalls = 0
+        shGw.packageListCalls = 0
+        vm.reconnectAndRefresh()
+        await { !vm.state.value.loading && (suGw.packageListCalls + shGw.packageListCalls) >= 1 }
+        await { !vm.state.value.loading }
+
+        val lists = suGw.packageListCalls + shGw.packageListCalls
+        assertTrue("AUTO reconnect must run package-list refresh, got $lists", lists >= 1)
+        val qtAfter = vm.state.value.inventory.queryTimeMs
+        assertTrue(
+            "AUTO reconnect must refresh inventory (qt $qtBefore -> $qtAfter)",
+            qtAfter > qtBefore,
+        )
+        assertEquals("refresh must converge to FRESH", InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
+        assertEquals("refresh must keep target identity", 95, vm.state.value.inventory.targetId)
+        assertTrue(
+            "refresh must keep cloned entries",
+            vm.state.value.cloned.contains("com.example.chat"),
+        )
+    }
 }

@@ -817,27 +817,28 @@ class DualViewModel(
         // 無手動 cancel，此為保險)。
         _state.update { it.copy(loading = true) }
         try {
-        // P25 Item 3: one probe per round — swapAutoLocked probes once and
-        // returns the result for probeChannels to reuse (previously each
-        // probed all elevators: double `su -c` cost + double auth-prompt risk).
-        // Phase 2: 鏈式共用一次 loading (probe 保留 busy，refresh 結尾才清除)。
-        // P2-4: swap 前記錄 resolved，納入 probe 的 FRESH 失效判斷。
-        val resolvedBeforeOp = currentChannel
-        if (preference == ChannelPreference.AUTO) {
-            val probe = swapAutoLocked()
-            probeChannels(
-                probe,
-                allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
-                keepLoadingOnExit = true,
-                resolvedBeforeOp = resolvedBeforeOp,
-            )
-        } else {
-            probeChannels(
-                allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
-                keepLoadingOnExit = true,
-                resolvedBeforeOp = resolvedBeforeOp,
-            )
-            refreshLocked()
+            // P25 Item 3: one probe per round — swapAutoLocked probes once and
+            // returns the result for probeChannels to reuse (previously each
+            // probed all elevators: double `su -c` cost + double auth-prompt risk).
+            // Phase 2: 鏈式共用一次 loading (probe 保留 busy，refresh 結尾才清除)。
+            // P2-4: swap 前記錄 resolved，納入 probe 的 FRESH 失效判斷。
+            val resolvedBeforeOp = currentChannel
+            if (preference == ChannelPreference.AUTO) {
+                val probe = swapAutoLocked()
+                probeChannels(
+                    probe,
+                    allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                    keepLoadingOnExit = true,
+                    resolvedBeforeOp = resolvedBeforeOp,
+                )
+            } else {
+                probeChannels(
+                    allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                    keepLoadingOnExit = true,
+                    resolvedBeforeOp = resolvedBeforeOp,
+                )
+            }
+            refreshLocked() // BOTH AUTO and explicit, inside try
         } catch (e: CancellationException) {
             _state.update { it.copy(loading = false) }
             throw e
