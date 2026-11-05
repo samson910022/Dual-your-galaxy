@@ -52,6 +52,11 @@ import rikka.shizuku.Shizuku
 // Reply layout (no exception header on purpose): int exit, String stdout,
 // String stderr. The client must NOT call reply.readException(): a non-zero
 // exit word would be misread as an exception code.
+// PR-2 stage 1 (issue #22, additive only): the reply does NOT carry
+// CmdResult.truncated explicitly (layout frozen); the client re-derives it
+// from TRUNCATION_MARKER below. Service-side captureProcess already sets the
+// flag, but only the marker survives the parcel.
+internal const val TRUNCATION_MARKER = "[truncated]"
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
@@ -236,10 +241,21 @@ class ShizukuCmdGateway(
                         // No readException(): the service writes a raw int exit
                         // first, which readException would misread as an
                         // exception code on any non-zero exit.
+                        // PR-2 stage 1 (issue #22, additive only): the service
+                        // side caps via captureProcess and appends the
+                        // "\n[truncated]" marker, but the wire layout only
+                        // carries (exit, stdout, stderr). Mirror the marker
+                        // into CmdResult.truncated so parsers can tell "clean
+                        // empty" from "cut off" without changing any caller.
+                        val execExit = reply.readInt()
+                        val execOut = reply.readString() ?: ""
+                        val execErr = reply.readString() ?: ""
                         CmdResult(
-                            exit = reply.readInt(),
-                            out = reply.readString() ?: "",
-                            err = reply.readString() ?: "",
+                            exit = execExit,
+                            out = execOut,
+                            err = execErr,
+                            truncated = execOut.contains(TRUNCATION_MARKER) ||
+                                execErr.contains(TRUNCATION_MARKER),
                         )
                     } finally {
                         reply.recycle()

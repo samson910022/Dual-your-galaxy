@@ -41,6 +41,7 @@ class CloneVerifyRefreshTest {
         var listPackagesOut: String = "",
         var listPackagesErr: String = "",
         var listPackagesExit: Int = 0,
+        var listPackagesTruncated: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -63,7 +64,12 @@ class CloneVerifyRefreshTest {
                 cmd.startsWith("pm path") ->
                     CmdResult(exit = pathExit, out = pathOut, err = pathErr)
                 cmd.startsWith("pm list packages") ->
-                    CmdResult(exit = listPackagesExit, out = listPackagesOut, err = listPackagesErr)
+                    CmdResult(
+                        exit = listPackagesExit,
+                        out = listPackagesOut,
+                        err = listPackagesErr,
+                        truncated = listPackagesTruncated,
+                    )
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
         }
@@ -267,9 +273,9 @@ class CloneVerifyRefreshTest {
 
     // Remove with an uncheckable re-check channel is unknown (fail closed),
     // and a failed uninstall stays failed even if probed later via refresh.
-    // List-probe channel failure is exit != 0 only: exit-0 output that simply
-    // lacks the package (even error-ish text) is confirmed-absent, not
-    // unknown (exit-only semantics; isSuccess is not applied to the probe).
+    // Untrusted means: truncated capture, non-zero exit (after the retained
+    // retries), or error-semantic text with exit 0 (PR-2 stage 2, issue #22).
+    // Only a format-clean listing that lacks the package is confirmed-absent.
     @Test
     fun removeVerified_unknownRecheck_isNotSuccess() {
         val gateway = FakeGateway(
@@ -283,12 +289,15 @@ class CloneVerifyRefreshTest {
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
     }
 
-    // (a) remove: uninstall ok + list exit 0 whose output lacks the package
-    // (here an absent-package error text, no package: line) is confirmed
-    // absent -> Success, not VerifyUnknown. Proves isSuccess is NOT applied
-    // to the probe: absence text is absence evidence.
+    // (a) remove: uninstall ok + list exit 0 whose output carries an
+    // absent-package error text ("Unknown package: ...", no package: line) is
+    // UNTRUSTED -> VerifyUnknown, never Success. PR-2 stage 2 (issue #22):
+    // only a format-clean listing is absence evidence; error-semantic text
+    // with exit 0 no longer counts as confirmed-absent (stage-1 flip of the
+    // old exit-only rule). The clean-empty twin below still proves the
+    // preserved confirmed-absent path.
     @Test
-    fun removeVerified_absentErrorText_isSuccess() {
+    fun removeVerified_absentErrorText_isVerifyUnknown() {
         val gateway = FakeGateway(
             uninstallOut = "Success",
             listPackagesOut = "Unknown package: com.example.chat",
@@ -296,7 +305,11 @@ class CloneVerifyRefreshTest {
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
-        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertTrue(
+            "detail must name the error-semantic line, got: \"${(outcome as RemoveOutcome.VerifyUnknown).detail}\"",
+            outcome.detail.contains("Unknown package"),
+        )
     }
 
     // (b) remove: uninstall ok + list exit 0 empty is confirmed absent
@@ -315,7 +328,8 @@ class CloneVerifyRefreshTest {
     }
 
     // (c) remove: uninstall ok + list non-zero exit is an uncheckable
-    // channel -> VerifyUnknown (detail kept), never Success.
+    // channel -> VerifyUnknown (detail keeps the exit code for diagnosis),
+    // never Success.
     @Test
     fun removeVerified_nonZeroExit_isVerifyUnknown() {
         val gateway = FakeGateway(
@@ -327,14 +341,18 @@ class CloneVerifyRefreshTest {
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
-        assertEquals("error: closed", (outcome as RemoveOutcome.VerifyUnknown).detail)
+        assertTrue(
+            "detail must carry exit code, got: \"${(outcome as RemoveOutcome.VerifyUnknown).detail}\"",
+            outcome.detail.contains("exit=1"),
+        )
     }
 
-    // (d) clone: install ok + list exit 0 that lacks the package (absent
-    // text, no package: line) is confirmed absent -> VerifyFailed, never
-    // VerifyUnknown.
+    // (d) clone: install ok + list exit 0 that carries an absent-package error
+    // text (no package: line) is UNTRUSTED -> VerifyUnknown, never
+    // VerifyFailed. PR-2 stage 2 (issue #22): an error-semantic listing must
+    // not masquerade as "confirmed not installed".
     @Test
-    fun cloneVerified_absentErrorText_isVerifyFailed() {
+    fun cloneVerified_absentErrorText_isVerifyUnknown() {
         val gateway = FakeGateway(
             installOut = "Package com.example.chat installed for user: 95",
             installExit = 0,
@@ -343,7 +361,7 @@ class CloneVerifyRefreshTest {
         )
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
-        assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
     }
 
     // (e) clone: install ok + list exit 0 that contains the package is
@@ -439,9 +457,11 @@ class CloneVerifyRefreshTest {
     }
 
     // Tri-state verify: installed / confirmed-absent / uncheckable.
-    // Exit-only semantics on the list probe: exit 0 + contains -> Installed,
-    // exit 0 + lacks -> NotInstalled, non-zero (x3, see VerifyRetryTest) ->
-    // Unknown. Guard refusal (owner id) is Unknown, never a probe of user 0.
+    // Trusted tri-state on the list probe (PR-2 stage 2, issue #22): clean
+    // listing + contains -> Installed, clean listing + lacks -> NotInstalled,
+    // untrusted capture (truncated / non-zero (x3, see VerifyRetryTest) /
+    // error-semantic exit-0 text) -> Unknown. Guard refusal (owner id) is
+    // Unknown, never a probe of user 0.
     @Test
     fun verifyState_distinguishesAbsentFromUnknown() {
         val gateway = FakeGateway(listPackagesOut = "package:com.example.chat\n")
@@ -508,5 +528,224 @@ class CloneVerifyRefreshTest {
         val outcome = runSuspend { repo.cloneVerified("bad pkg; rm -rf") }
         assertTrue("expected InvalidPackage, got: $outcome", outcome is CloneOutcome.InvalidPackage)
         assertTrue(gateway.writeCommands().isEmpty())
+    }
+
+    // PR-2 stage 2 (issue #22): filtered-style clean listing WITHOUT the
+    // target (TrustedFull of other packages) is confirmed-absent
+    // (NotInstalled), distinct from Unknown. The pm filter is substring-based
+    // (see UX_REVIEW_S24 §5), so only an exact membership hit counts.
+    @Test
+    fun verifyState_trustedFullWithoutTarget_isNotInstalled() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.other\npackage:com.example.app2\n",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("com.example.app", 95) }
+        assertTrue("clean listing without target must be NotInstalled, got: $state", state is VerifyState.NotInstalled)
+    }
+
+    // PR-2 stage 2 (issue #22): full-listing clean empty (TrustedEmpty) is
+    // confirmed-absent for verify (NotInstalled). Twin of the refresh twin
+    // below, which maps the same TrustedEmpty to authoritative emptyList.
+    @Test
+    fun verifyState_trustedEmptyFullListing_isNotInstalled() {
+        val gateway = FakeGateway(
+            listPackagesOut = "",
+            listPackagesErr = "",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("com.example.chat", 95) }
+        assertTrue("clean empty full listing must be NotInstalled, got: $state", state is VerifyState.NotInstalled)
+    }
+
+    // PR-2 stage 2 (issue #22): exit-0 dirty captures are Unknown across the
+    // whole error-semantic family -- SecurityException / Failure[] / Error: /
+    // stack lines / Caused by: -- even though the exit code is 0. Each keeps
+    // a non-empty diagnostic detail. No retry sleep fires here (exit == 0).
+    @Test
+    fun verifyState_exitZeroDirtyOutputs_areUnknown() {
+        val dirtyCases = listOf(
+            "securityException" to FakeGateway(
+                listPackagesOut = "",
+                listPackagesErr = "java.lang.SecurityException: Neither user 2000 nor current process has permission",
+                listPackagesExit = 0,
+            ),
+            "failureLine" to FakeGateway(
+                listPackagesOut = "Failure [INSTALL_FAILED_INVALID_APK: bad]",
+                listPackagesExit = 0,
+            ),
+            "errorLine" to FakeGateway(
+                listPackagesOut = "",
+                listPackagesErr = "Error: could not list packages",
+                listPackagesExit = 0,
+            ),
+            "stackLine" to FakeGateway(
+                listPackagesOut = "package:com.example.chat\n\tat com.android.server.pm.PackageManagerService.getPackages(Unknown)",
+                listPackagesExit = 0,
+            ),
+            "causedBy" to FakeGateway(
+                listPackagesOut = "Caused by: java.lang.IllegalStateException: binder died",
+                listPackagesExit = 0,
+            ),
+        )
+        for ((name, gateway) in dirtyCases) {
+            val repo = DualRepository(gateway)
+            val state = runSuspend { repo.verifyState("com.example.chat", 95) }
+            assertTrue("[$name] dirty exit-0 listing must be Unknown, got: $state", state is VerifyState.Unknown)
+            assertTrue(
+                "[$name] Unknown detail must be non-empty",
+                (state as VerifyState.Unknown).detail.isNotEmpty(),
+            )
+        }
+    }
+
+    // PR-2 stage 2 (issue #22): a truncated capture proves nothing in either
+    // direction -- truncated + package line present is NOT Installed, and
+    // truncated + empty is NOT NotInstalled. Both are Unknown with a
+    // truncation diagnostic. Covers the explicit flag and the legacy
+    // "[truncated]" marker text.
+    @Test
+    fun verifyState_truncatedListing_isUnknown() {
+        val flaggedPresent = FakeGateway(
+            listPackagesOut = "package:com.example.chat\n",
+            listPackagesExit = 0,
+            listPackagesTruncated = true,
+        )
+        val presentState = runSuspend { DualRepository(flaggedPresent).verifyState("com.example.chat", 95) }
+        assertTrue("truncated listing with package must be Unknown, got: $presentState", presentState is VerifyState.Unknown)
+        assertTrue(
+            "detail must name truncation, got: \"${(presentState as VerifyState.Unknown).detail}\"",
+            presentState.detail.contains("truncat", ignoreCase = true),
+        )
+
+        val flaggedEmpty = FakeGateway(
+            listPackagesOut = "",
+            listPackagesExit = 0,
+            listPackagesTruncated = true,
+        )
+        val emptyState = runSuspend { DualRepository(flaggedEmpty).verifyState("com.example.chat", 95) }
+        assertTrue("truncated empty listing must be Unknown, got: $emptyState", emptyState is VerifyState.Unknown)
+
+        val markerOnly = FakeGateway(
+            listPackagesOut = "package:com.example.chat\n[truncated]",
+            listPackagesExit = 0,
+        )
+        val markerState = runSuspend { DualRepository(markerOnly).verifyState("com.example.chat", 95) }
+        assertTrue("marker-text listing must be Unknown, got: $markerState", markerState is VerifyState.Unknown)
+    }
+
+    // PR-2 stage 2 (issue #22) refresh contract: TrustedFull rebuilds,
+    // TrustedEmpty is authoritative empty (confirmed-empty, not unknown), and
+    // every untrusted capture -- Failure / SecurityException / truncated /
+    // non-zero -- yields null (unknown), never an authoritative empty list.
+    // The ViewModel keeps the previous `cloned` on null (fail closed).
+    @Test
+    fun refresh_untrustedListing_isNull_neverAuthoritativeEmpty() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.chat\npackage:com.example.mail\n",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        assertEquals(
+            listOf("com.example.chat", "com.example.mail"),
+            runSuspend { repo.listClonedPackages() },
+        )
+
+        gateway.listPackagesOut = ""
+        gateway.listPackagesErr = ""
+        gateway.listPackagesExit = 0
+        gateway.listPackagesTruncated = false
+        assertEquals(
+            "clean empty full listing is confirmed-empty",
+            emptyList<String>(),
+            runSuspend { repo.listClonedPackages() },
+        )
+
+        gateway.listPackagesOut = "Failure [INSTALL_FAILED_INVALID_APK: bad]"
+        gateway.listPackagesErr = ""
+        assertNull(
+            "exit-0 Failure text must be unknown (null), not empty",
+            runSuspend { repo.listClonedPackages() },
+        )
+
+        gateway.listPackagesOut = ""
+        gateway.listPackagesErr = "java.lang.SecurityException: Neither user 2000 nor current process has permission"
+        assertNull(
+            "exit-0 SecurityException must be unknown (null), not empty",
+            runSuspend { repo.listClonedPackages() },
+        )
+
+        gateway.listPackagesOut = "package:com.example.chat\n"
+        gateway.listPackagesErr = ""
+        gateway.listPackagesExit = 0
+        gateway.listPackagesTruncated = true
+        assertNull(
+            "truncated listing must be unknown (null), even with a package line",
+            runSuspend { repo.listClonedPackages() },
+        )
+
+        gateway.listPackagesTruncated = false
+        gateway.listPackagesOut = ""
+        gateway.listPackagesErr = "error: closed"
+        gateway.listPackagesExit = 1
+        assertNull(
+            "non-zero listing must be unknown (null), not empty",
+            runSuspend { repo.listClonedPackages() },
+        )
+    }
+
+    // PR-2 stage 2 (issue #22) remove flow: uninstall ok + exit-0 dirty or
+    // truncated re-check is VerifyUnknown (fail closed: the caller must NOT
+    // drop the entry from the UI), never Success.
+    @Test
+    fun removeVerified_exitZeroDirtyRecheck_isVerifyUnknown() {
+        val dirty = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "",
+            listPackagesErr = "java.lang.SecurityException: Neither user 2000 nor current process has permission",
+            listPackagesExit = 0,
+        )
+        val dirtyOutcome = runSuspend { DualRepository(dirty).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $dirtyOutcome", dirtyOutcome is RemoveOutcome.VerifyUnknown)
+
+        val truncated = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "",
+            listPackagesExit = 0,
+            listPackagesTruncated = true,
+        )
+        val truncatedOutcome = runSuspend { DualRepository(truncated).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $truncatedOutcome", truncatedOutcome is RemoveOutcome.VerifyUnknown)
+    }
+
+    // PR-2 stage 2 (issue #22) clone flow: install ok + exit-0 dirty re-check
+    // is VerifyUnknown (must not masquerade as VerifyFailed/not-installed),
+    // and install ok + truncated re-check that even contains the package is
+    // VerifyUnknown (must not masquerade as Success).
+    @Test
+    fun cloneVerified_exitZeroDirtyRecheck_isVerifyUnknown() {
+        val dirty = FakeGateway(
+            installOut = "Package com.example.chat installed for user: 95",
+            installExit = 0,
+            listPackagesOut = "Failure [DELETE_FAILED_INTERNAL_ERROR: System error]",
+            listPackagesExit = 0,
+        )
+        val dirtyOutcome = runSuspend { DualRepository(dirty).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $dirtyOutcome", dirtyOutcome is CloneOutcome.VerifyUnknown)
+
+        val truncatedPresent = FakeGateway(
+            installOut = "Package com.example.chat installed for user: 95",
+            installExit = 0,
+            listPackagesOut = "package:com.example.chat\n",
+            listPackagesExit = 0,
+            listPackagesTruncated = true,
+        )
+        val truncatedOutcome = runSuspend { DualRepository(truncatedPresent).cloneVerified("com.example.chat") }
+        assertTrue(
+            "truncated re-check with package must be VerifyUnknown, got: $truncatedOutcome",
+            truncatedOutcome is CloneOutcome.VerifyUnknown,
+        )
     }
 }

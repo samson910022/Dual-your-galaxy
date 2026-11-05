@@ -24,6 +24,30 @@ data class DualAppInfo(
     val dualEnabled: Boolean,
 )
 
+// Tri-state result for `pm list packages` ground truth (PR-2 stage 1,
+// issue #22, additive only: no existing verify/list path reads this yet).
+// Distinguishes a genuinely empty profile (TrustedEmpty) from an
+// uncheckable channel (Unknown), so a later stage can stop folding
+// "confirmed absent" and "cannot check" together.
+// - TrustedFull(packages): clean listing containing these exact packages.
+// - TrustedEmpty: clean listing with zero package: lines (confirmed empty).
+// - Unknown(reason): truncated capture, non-zero exit, or error-semantic
+//   text (same line-level C2 rule as isSuccess, minus the install-only
+//   ALREADY_EXISTS exception: any Failure line in a listing is untrusted).
+sealed interface TrustedList {
+    // Clean listing with at least one legal package: line.
+    data class TrustedFull(val packages: List<String>) : TrustedList
+
+    // Clean listing with zero package: lines: confirmed empty profile.
+    data object TrustedEmpty : TrustedList
+
+    // Uncheckable: truncated output, non-zero exit, or error-semantic text.
+    // `detail` aliases `reason` for readers used to VerifyState.Unknown.
+    data class Unknown(val reason: String = "") : TrustedList {
+        val detail: String get() = reason
+    }
+}
+
 // Tolerant parser and command builder for pm-style outputs; pure Kotlin, no Android deps.
 object PmOutputParser {
     // Matches lines like "UserInfo{0:Owner:13} running" or "UserInfo{95:DUAL_APP:400}".
@@ -250,6 +274,54 @@ object PmOutputParser {
         }
         return out
     }
+
+    // Trusted tri-state parse for `pm list packages` (PR-2 stage 1, issue
+    // #22, additive only: existing parsePackages/isSuccess/verify paths are
+    // untouched and keep their exact behavior).
+    // Rules, in order:
+    // 1. truncated flag (or a "[truncated]" marker surviving from a caller
+    //    that still builds CmdResult without the flag) -> Unknown: the
+    //    listing may have been cut off, so "no package: line" proves nothing.
+    // 2. exit != 0 -> Unknown (detail keeps the code; retry/backoff policy
+    //    belongs to the upper layer, never to this pure parser).
+    // 3. error-semantic text in out/err -> Unknown. Same line-level C2 rule
+    //    as isSuccess (EXEMPT_LINE skips package: echoes and install-success
+    //    echoes so failure/exception-named packages never misfire, then
+    //    ERROR_LINE matches Failure/Error/exception/SecurityException,
+    //    denied/cannot/abort/invalid, unknown-package/not-installed, stack
+    //    lines). Unlike isSuccess there is NO ALREADY_EXISTS exception here:
+    //    that code is install-only idempotent-success; any Failure line in
+    //    a listing makes the snapshot untrusted.
+    // 4. otherwise parsePackages(out): empty -> TrustedEmpty (confirmed
+    //    empty, format clean), non-empty -> TrustedFull(packages).
+    fun parsePackagesTrusted(
+        out: String,
+        err: String,
+        exit: Int,
+        truncated: Boolean = false,
+    ): TrustedList {
+        if (truncated || out.contains("[truncated]") || err.contains("[truncated]")) {
+            return TrustedList.Unknown("truncated: listing may be incomplete")
+        }
+        if (exit != 0) {
+            return TrustedList.Unknown("verify failed (exit=$exit)")
+        }
+        for (raw in (out + "\n" + err).lines()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (EXEMPT_LINE.any { it.containsMatchIn(line) }) continue
+            if (ERROR_LINE.any { it.containsMatchIn(line) }) {
+                return TrustedList.Unknown("error-semantic output: $line")
+            }
+        }
+        val packages = parsePackages(out)
+        return if (packages.isEmpty()) TrustedList.TrustedEmpty else TrustedList.TrustedFull(packages)
+    }
+
+    // CmdResult convenience overload: forwards the capture flag so callers
+    // cannot forget it. Pure delegation, same rules as above.
+    fun parsePackagesTrusted(res: CmdResult): TrustedList =
+        parsePackagesTrusted(res.out, res.err, res.exit, res.truncated)
 
     // Builds `pm install-existing --user <dualId> <pkg>` to clone into the dual profile.
     fun buildInstallExisting(pkg: String, dualId: Int): String {
