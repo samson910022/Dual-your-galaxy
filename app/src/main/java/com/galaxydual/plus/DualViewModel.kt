@@ -254,8 +254,10 @@ data class UiState(
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
     // Auto probe-based degrade explanation (P25). Non-empty only for AUTO
-    // when the probes overrode the file heuristic (su denied -> Shizuku) or
-    // when both probes failed (read-only). Explicit choices clear it.
+    // when the probes overrode the file heuristic downward (su denied ->
+    // Shizuku) or when both probes failed (read-only); recovery/upgrade back
+    // to ROOT is silent by design (empty note, readyMsg empty -> silent).
+    // Explicit choices clear it.
     val degradeNote: String = "",
     // Hook-enable signal from the cross-process marker file (F4b-P2).
     // Refreshed on every probe (recheckPrivilege/selectChannel cover all UI
@@ -541,6 +543,11 @@ class DualViewModel(
     // "already in progress" instead of queueing behind the mutex. Clone and
     // remove use distinct keys so an intentional clone-then-remove sequence on
     // the same package is never collapsed. Main-confined (see class doc).
+    //
+    // CE convention (F5): a cancelled job never clears loading itself --
+    // every catch rethrows CancellationException before touching state. The
+    // live successor's entry set (leading busy, F2) owns the flag; a terminal
+    // scope-cancel discards state with the ViewModel, so no wedge survives.
     private val inFlightWrites = mutableSetOf<String>()
 
     // Single constructor for in-flight write dedup keys; keeps the
@@ -658,7 +665,14 @@ class DualViewModel(
         // lets the next tap start a fresh job instead of piling behind a dead
         // one. currentCoroutineContext (not the scope receiver) identifies the
         // child job for the self-comparison in finally.
+        // F2/P3 leading busy: mark busy synchronously at launch (msg-preserving)
+        // so a waiter queued behind opMutex never exposes loading=false before
+        // its locked body re-sets it idempotently below. CE convention: a
+        // cancelled job never clears loading itself (see class doc); the live
+        // successor's entry set owns the flag, and a terminal scope-cancel
+        // discards state with the ViewModel.
         viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 refreshPending = true
                 return@launch
@@ -695,6 +709,10 @@ class DualViewModel(
             refreshPending = false
             reconnectPending = false
             reconnectPendingUserInitiated = false
+            // P3 trailing busy (same shape as the recheck loop): hold busy
+            // across the mutex handoff so the trailing round never exposes
+            // loading=false while it waits on opMutex behind another op.
+            _state.update { it.copy(loading = true) }
             if (doReconnect) {
                 opMutex.withLock { reconnectLocked(userInitiated = trailingManual) }
             } else {
@@ -1674,7 +1692,10 @@ class DualViewModel(
         // init/probe) only records one trailing re-run, so binder/permission/
         // onResume bursts never pile an unbounded waiter queue on the mutex.
         // Main-confined check-and-set/clear (same reasoning as refresh()).
+        // F2/P3 leading busy (msg-preserving, same as refresh()): queued
+        // behind opMutex still reads busy.
         viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
             if (recheckJob?.isActive == true) {
                 recheckPending = true
                 // Manual wins across the coalesced burst (see field docs).
@@ -1734,7 +1755,10 @@ class DualViewModel(
     // false (direct reads only under LSPOSED). Existing no-arg callers (tests)
     // default to auto (false) so only explicit manual taps gain privilege.
     fun reconnectAndRefresh(userInitiated: Boolean = false) {
+        // F2/P3 leading busy (msg-preserving, same as refresh()): queued
+        // behind opMutex still reads busy.
         viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 reconnectPending = true
                 reconnectPendingUserInitiated = reconnectPendingUserInitiated || userInitiated
@@ -1785,16 +1809,29 @@ class DualViewModel(
         // clears its successor.
         selectJob?.cancel()
         val job = viewModelScope.launch {
+            // F2/P3 leading busy (msg-preserving): the picker tap reads busy
+            // even while queued behind opMutex; the locked body re-sets it
+            // idempotently below.
+            _state.update { it.copy(loading = true) }
             val myJob = currentCoroutineContext()[Job] ?: return@launch
             try {
                 opMutex.withLock {
+                    // F8 same-pref early-return: no rebuild/repersist churn when
+                    // the preference is unchanged (still re-probe + refresh so
+                    // a revoked-then-reselected same channel recovers).
+                    // F4 persist-after-swap: the stored choice follows a
+                    // successful in-memory swap, so a cancel/failure before or
+                    // during the swap never leaves stored != memory. Same-pref
+                    // has no swap, so its persist stays idempotent here.
+                    if (pref != preference) {
+                        swapToLocked(pref)
+                    }
                     try {
                         persistPreference?.invoke(pref)
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         // Best effort: a failing store never blocks the swap.
                     }
-                    swapToLocked(pref)
                     probeChannels(userInitiated = userInitiated)
                     refreshLocked()
                 }
@@ -1883,10 +1920,18 @@ class DualViewModel(
     // the actual channels and the Shizuku binding is not dropped on a
     // no-op. Must run under opMutex.
     private suspend fun swapToResolvedLocked(desired: ResolvedChannel) {
+        // Fail-closed mapping: the AUTO probe matrix (resolveAutoProbe,
+        // locked by pure_neverLsposed over all 8 combos) never selects the
+        // LSPosed placeholder, but a future matrix change must still land
+        // read-only -- never throw here (IllegalStateException out of a
+        // swap path would violate fail-closed). Both NOOP and
+        // LSPOSED_PLACEHOLDER map to NoOp below.
         val old = activeGateway
         val newGateway: CmdGateway = when (desired) {
             ResolvedChannel.ROOT -> suGateway
             ResolvedChannel.SHIZUKU -> shizukuGateway
+            // Fail-closed: AUTO never selects the placeholder by construction,
+            // but this arm stays live so any future drift still lands read-only.
             ResolvedChannel.NOOP,
             ResolvedChannel.LSPOSED_PLACEHOLDER,
             -> NoOpGateway()
@@ -2209,14 +2254,24 @@ class DualViewModel(
             val hasRoot = probe.hasRoot
             val hasShizuku = probe.hasShizuku
             // Phase A P2: per-channel independent evidence (diagnostic-only,
-            // never feeds routing/readiness). AUTO full probes rewrite BOTH
-            // entries with the CURRENT gateways + generation; explicit
-            // single-channel rounds rewrite ONLY their own entry (the other
-            // stays unknown, never cleared) with the CURRENT gateway; LSPOSED
-            // probes none and writes nothing. Failure writes
-            // hasCapability=false on the same instance (so a Shizuku binder
-            // death, which fails the next `pm list users` probe, immediately
-            // disables that entry until a later passing probe re-enables it).
+            // never feeds routing/readiness). P25: AUTO follows live probes,
+            // so the entry without a prior swap (init / selectChannel-AUTO)
+            // degrades FIRST here; recheck/reconnect already degraded via
+            // swapAutoLocked(reused) so this skips the second (idempotent but
+            // redundant) degrade. Degrade-first keeps the evidence below bound
+            // to the post-degrade generation: writing evidence before the bump
+            // would leave the whole round stale (gen N vs N+1, F1).
+            if (preference == ChannelPreference.AUTO && reusedProbe == null) {
+                degradeAutoLocked(hasRoot, hasShizuku)
+            }
+            // AUTO full probes rewrite BOTH entries with the CURRENT gateways
+            // + generation; explicit single-channel rounds rewrite ONLY their
+            // own entry (the other stays unknown, never cleared) with the
+            // CURRENT gateway; LSPOSED probes none and writes nothing. Failure
+            // writes hasCapability=false on the same instance (so a Shizuku
+            // binder death, which fails the next `pm list users` probe,
+            // immediately disables that entry until a later passing probe
+            // re-enables it).
             when (preference) {
                 ChannelPreference.AUTO -> {
                     suEvidence = DiagnosticEvidence(suGateway, hasRoot, evidenceGeneration)
@@ -2245,14 +2300,9 @@ class DualViewModel(
                     // stale evidence); auto never clears and never execs.
                 }
             }
-            // P25: AUTO follows live probes, not the startup file heuristic.
-            // Only the entry without a prior swap (init / selectChannel-AUTO)
-            // degrades here; recheck/reconnect already degraded via
-            // swapAutoLocked(reused) so this skips the second (idempotent but
-            // redundant) degrade.
-            if (preference == ChannelPreference.AUTO && reusedProbe == null) {
-                degradeAutoLocked(hasRoot, hasShizuku)
-            }
+            // P25: AUTO already follows live probes above (degrade-first); the
+            // reusedProbe path (recheck/reconnect) degraded before this call,
+            // so nothing remains to do here.
             val degradeNoteForState = if (preference == ChannelPreference.AUTO) autoDegradeNote else ""
             // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
             // the router encodes that priority, probes only feed it.
@@ -2345,8 +2395,14 @@ class DualViewModel(
                             )).distinct()
                         }
                         else -> candidates.filter {
-                            (it.privilege == Privilege.ROOT && hasRoot) ||
-                                (it.privilege == Privilege.SHELL && hasShizuku)
+                            // F6 identity gate (same as the LSPOSED branch): a
+                            // candidate must BE the current su/shizukuGateway
+                            // whose probe just passed. Privilege + probe result
+                            // alone would let a stale caller-supplied list
+                            // drive `cat` through a displaced old instance; an
+                            // explicit empty list still means "no diagnosis".
+                            (it === suGateway && it.privilege == Privilege.ROOT && hasRoot) ||
+                                (it === shizukuGateway && it.privilege == Privilege.SHELL && hasShizuku)
                         }
                     }
                     usableGateways = usable
@@ -2387,10 +2443,12 @@ class DualViewModel(
             // Diagnostic isolation lock (N1 contract 4): hook diagnosis must
             // never raise writeReady. ready was computed from probes only;
             // LSPOSED (NoOp placeholder, NONE privilege) is never ready by
-            // construction -- fail loudly if that ever drifts.
-            check(!(preference == ChannelPreference.LSPOSED && ready)) {
-                "diagnostic must never raise writeReady"
-            }
+            // construction -- fail closed (clamp to not-ready) if that ever
+            // drifts, never throw: an IllegalStateException out of a probe
+            // path would violate fail-closed, and the outer catch preserves
+            // stale ready (it never clears channelReady/writeReady).
+            val effectiveReady =
+                if (preference == ChannelPreference.LSPOSED) false else ready
             val hookDesc = hook.displayText()
             // P25 messages: explicit choices never cross channels -- the text
             // states the selected-mode reason plus the optional recovery
@@ -2433,16 +2491,16 @@ class DualViewModel(
                     loading = false,
                     channel = preference,
                     privilege = routed,
-                    channelReady = ready,
+                    channelReady = effectiveReady,
                     resolvedGateway = currentChannel,
                     execIdentity = gatewayPrivilege,
                     anyProbePassed = anyProbePassed,
                     probeScope = preference.probeScope(),
-                    writeReady = ready,
-                    pmReadable = if (!ready) null else cur.pmReadable,
+                    writeReady = effectiveReady,
+                    pmReadable = if (!effectiveReady) null else cur.pmReadable,
                     degradeNote = degradeNoteForState,
-                    msg = if (ready) readyMsg else notReadyMsg,
-                    msgKind = if (ready) {
+                    msg = if (effectiveReady) readyMsg else notReadyMsg,
+                    msgKind = if (effectiveReady) {
                         if (readyMsg.isNotEmpty()) MsgKind.INFO else MsgKind.NONE
                     } else {
                         MsgKind.CHANNEL
@@ -2523,6 +2581,23 @@ class DualViewModel(
                 it.copy(
                     loading = false,
                     msg = reason,
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return false
+        }
+        // F3 fail-closed PM gate (dual-condition readyMark): probe-passed
+        // (channelReady) alone never authorizes a write when `pm list users`
+        // proved unreadable (pmReadable == false). null (unknown, not yet
+        // refreshed or expired by a swap) still allows the write attempt: the
+        // repo re-verifies and fail-closes there; only a proven-false PM
+        // refuses here.
+        if (cur.pmReadable == false) {
+            _state.update {
+                it.copy(
+                    loading = false,
+                    msg = "探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；" +
+                        "請檢查授權後點「重新連線並更新」",
                     msgKind = MsgKind.CHANNEL,
                 )
             }

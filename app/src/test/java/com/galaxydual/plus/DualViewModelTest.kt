@@ -478,9 +478,9 @@ class DualViewModelTest {
         assertEquals(ChannelPreference.SHIZUKU, vm.state.value.channel)
         assertFalse(vm.state.value.loading)
         assertTrue(vm.state.value.channelReady)
-        // Both taps persisted in order (persist precedes the cancellable
-        // probe); convergence is decided by the completed probe + refresh,
-        // not by persist.
+        // Both taps persisted in order (persist follows the swap and precedes
+        // the cancellable probe); convergence is decided by the completed
+        // probe + refresh, not by persist.
         assertEquals(
             listOf(ChannelPreference.ROOT, ChannelPreference.SHIZUKU),
             rig.persisted,
@@ -628,6 +628,12 @@ class DualViewModelTest {
             assembleChannelFn = assemble,
         )
         pumpUntil { vm.state.value.channelReady }
+        // F8 same-pref skips the rebuild, so park on a different channel
+        // first: the blocking ROOT assembly below is only consulted on a
+        // real swap (different pref). This keeps the handover under test a
+        // genuine in-flight `sleep` child.
+        vm.selectChannel(ChannelPreference.SHIZUKU)
+        pumpUntil { !vm.state.value.loading && vm.state.value.channel == ChannelPreference.SHIZUKU }
         // Arm the real block for the next ROOT select only (init stays clean).
         useBlocking.set(true)
         vm.selectChannel(ChannelPreference.ROOT)
@@ -657,7 +663,7 @@ class DualViewModelTest {
         assertFalse(vm.state.value.loading)
         assertTrue(vm.state.value.channelReady)
         assertEquals(
-            listOf(ChannelPreference.ROOT, ChannelPreference.SHIZUKU),
+            listOf(ChannelPreference.SHIZUKU, ChannelPreference.ROOT, ChannelPreference.SHIZUKU),
             persisted,
         )
         // Cancelled capture is never resent as a write on any gateway.

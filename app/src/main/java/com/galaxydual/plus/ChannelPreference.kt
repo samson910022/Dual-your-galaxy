@@ -114,6 +114,9 @@ fun ChannelPreference.resolveChannel(suPresent: Boolean, shizukuAuthorized: Bool
 //   exists but its probe was denied, so this is a degrade and the note
 //   records the reason plus the recovery entry.
 // - else NOOP read-only with a note stating both probes failed plus recovery.
+// F7 semantics (locked by AutoDegradeTest): the note records DOWNWARD
+// overrides only. Recovery/upgrade back to ROOT (hasRoot true) is silent by
+// design (empty note) -- a proven ROOT channel needs no explanation.
 // Explicit preferences never reach here (the ViewModel only calls this for
 // AUTO): explicit choices never cross channels, they fail closed with their
 // own message instead.
