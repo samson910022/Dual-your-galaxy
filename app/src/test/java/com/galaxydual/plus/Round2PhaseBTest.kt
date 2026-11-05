@@ -19,7 +19,9 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -54,6 +56,16 @@ class Round2PhaseBTest {
     ) : CmdGateway {
         override val privilege: Privilege = priv
         var listUsersCalls: Int = 0
+        // Phase B P0 閘控：首個 package-list 阻塞於 gate（leader 持有 mutex），
+        // burst 在此期間觸發只記 pending；trailing 放行（n>1 不阻塞）。
+        // 沿用 ReconnectCoalesceTest 閘控手法（既有 Fake 形狀擴充，非重寫）。
+        @Volatile var packageListGate: CompletableDeferred<Unit>? = null
+        @Volatile var idUGate: CompletableDeferred<Unit>? = null
+        // B3 clone/remove 取消測閘控：install/uninstall 首輪阻塞於 gate，
+        // 取消 in-flight waiter 後斷言 loading==false（沿 b3_cancelledRefresh 手法）。
+        @Volatile var installGate: CompletableDeferred<Unit>? = null
+        @Volatile var uninstallGate: CompletableDeferred<Unit>? = null
+        var idUCalls: Int = 0
         // P1-1 VM 整合：允許覆寫 typed 通道原文以重現 False Absent 反例。
         var verboseOverride: String? = null
         var dumpsysOverride: String? = null
@@ -84,9 +96,12 @@ class Round2PhaseBTest {
         private fun typedFailing(): Boolean = failTyped || listUsersCalls >= typedFailFromListUsers
 
         override suspend fun run(cmd: String): CmdResult = when {
-            cmd.trim() == "id -u" ->
+            cmd.trim() == "id -u" -> {
+                val n = ++idUCalls
+                if (n == 1) idUGate?.await()
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
+            }
             cmd == DualRepository.CMD_LIST_USERS -> {
                 listUsersCalls++
                 if (failListUsers) CmdResult(exit = 1, out = "", err = "denied")
@@ -102,14 +117,19 @@ class Round2PhaseBTest {
                 CmdResult(exit = 0, out = propOverride ?: "$dualId\n", err = "")
             cmd.startsWith("pm install-existing") -> {
                 installCalls++
+                // 僅首輪阻塞：取消測 waiter 持有 mutex，取消後放行收尾。
+                if (installCalls == 1) installGate?.await()
                 CmdResult(exit = 0, out = "Success", err = "")
             }
             cmd.startsWith("pm uninstall") -> {
                 uninstallCalls++
+                if (uninstallCalls == 1) uninstallGate?.await()
                 CmdResult(exit = 0, out = "Success", err = "")
             }
             cmd.startsWith("pm list packages") -> {
-                packageListCalls++
+                val n = ++packageListCalls
+                // 僅首輪阻塞：trailing 放行，drain 才能完成。
+                if (n == 1) packageListGate?.await()
                 if (failListPackages) CmdResult(exit = 0, out = "Failure [list failed]", err = "")
                 else CmdResult(
                     exit = 0,
@@ -594,5 +614,185 @@ class Round2PhaseBTest {
         assertEquals("FRESH degrades to STALE, not cleared", InventoryFreshness.STALE, t.inventory.freshness)
         assertEquals("STALE keeps the old target identity", 95, t.inventory.targetId)
         assertEquals(MsgKind.CHANNEL, t.msgKind)
+    }
+
+    // ---- Phase B P0 (B2)：onForeground 無單飛門 → 連打 5 次各跑 probe+refresh ----
+    // 修後：foregroundJob + foregroundPending 單飛，burst 收斂為 leader + 至多一次
+    // trailing（package-list 增長：leader 1 + trailing 1 = 2；trailing 增長 <=1）。
+    // FRESH 過期（此處以 STALE 常駐模擬：failListPackages 使每次 refresh 皆
+    // VERIFY_UNKNOWN→STALE，inventory 永非 FRESH，故每次前景皆全量 refresh；
+    // 無門則 5 waiter 各跑一次，單飛則 leader + trailing = 2）。
+    @Test
+    fun b2_foregroundBurst_collapsesToSingleTrailing() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo(priv = Privilege.SHELL)
+        val vm = makeVm(suGw, shGw, JumpClock(), shizukuGw = shGw)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val seedLists = suGw.packageListCalls + shGw.packageListCalls
+        assertTrue("seed refresh must have listed once", seedLists > 0)
+
+        // 常駐 STALE：後續每次 refresh 皆 UNKNOWN（不清單、保 STALE），
+        // 使 burst 內每次前景皆符合全量 refresh 條件（inventory != FRESH）。
+        suGw.failListPackages = true
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.STALE }
+
+        suGw.packageListCalls = 0
+        shGw.packageListCalls = 0
+        suGw.packageListGate = CompletableDeferred()
+
+        vm.onForeground()
+        await { suGw.packageListCalls >= 1 }
+        // leader 持有 mutex（首個 package-list 阻塞於 gate）時連打 4 次。
+        repeat(4) { vm.onForeground() }
+        // Main 是 Unconfined：burst 旗標已同步設定，放行即確定覆蓋全部。
+        suGw.packageListGate?.complete(Unit)
+        suGw.packageListGate = null
+
+        await { !vm.state.value.loading && suGw.packageListCalls >= 2 }
+        Thread.sleep(500)
+        await { !vm.state.value.loading }
+
+        val rounds = suGw.packageListCalls + shGw.packageListCalls
+        assertEquals(
+            "foreground burst must collapse to leader + one trailing (2 rounds), got $rounds",
+            2,
+            rounds,
+        )
+        // 任務契約字面：trailing 增長 <=1（leader 1 + trailing 1）。
+        val trailing = rounds - 1
+        assertTrue("foreground trailing growth must be <=1, got $trailing", trailing <= 1)
+    }
+
+    // ---- Phase B P0 (B3)：取消路徑 loading 殘 true ----
+    // refreshLocked 取消即透傳不寫 loading=false，取消後 loading 卡 true。
+    // 修後：取消路徑補 loading=false。閘控首個 package-list，啟動可取消
+    // refresh 後 cancel job，斷言 loading==false。
+    @Test
+    fun b3_cancelledRefresh_clearsLoading() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        // 清零後閘控首個 package-list（refresh tail），leader 持有 mutex。
+        suGw.packageListCalls = 0
+        suGw.packageListGate = CompletableDeferred()
+
+        vm.refresh()
+        await { suGw.packageListCalls >= 1 }
+        await { vm.state.value.loading }
+
+        // 取消 in-flight refresh child（沿 DualViewModelTest 既有手法：
+        // 取 scope children 差集定位 waiter，不殺整個 scope）。
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val waiter = scopeJob.children.firstOrNull { it.isActive }
+        assertTrue("refresh must be in-flight while gated", waiter != null)
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+
+        // 取消路徑須即清 loading（即使 gate 仍阻塞）。
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cancelled refresh must clear loading, got ${vm.state.value.loading}",
+            false,
+            vm.state.value.loading,
+        )
+
+        suGw.packageListGate?.complete(Unit)
+        suGw.packageListGate = null
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- Phase B P0 (B3)：clone 取消路徑 loading 殘 true ----
+    // cloneVerified 取消即透傳不寫 loading=false，取消後 loading 卡 true。
+    // 修後：取消路徑補 loading=false。閘控首個 install（clone 持有 mutex
+    // 阻塞於 gate），啟動可取消 clone 後 cancel job，斷言 loading==false。
+    // 沿 b3_cancelledRefresh 手法（閘控 gateway + cancel job）。
+    @Test
+    fun b3_cancelledClone_clearsLoading() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        // 閘控首個 install（clone 寫入段），leader 持有 mutex。
+        suGw.installCalls = 0
+        suGw.installGate = CompletableDeferred()
+
+        vm.clone("com.example.chat")
+        await { suGw.installCalls >= 1 }
+        await { vm.state.value.loading }
+
+        // 取消 in-flight clone child（沿 b3 手法：取 scope children 定位 waiter）。
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val waiter = scopeJob.children.firstOrNull { it.isActive }
+        assertTrue("clone must be in-flight while gated", waiter != null)
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+
+        // 取消路徑須即清 loading（即使 gate 仍阻塞）。
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cancelled clone must clear loading, got ${vm.state.value.loading}",
+            false,
+            vm.state.value.loading,
+        )
+
+        suGw.installGate?.complete(Unit)
+        suGw.installGate = null
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- Phase B P0 (B3)：confirmRemove 取消路徑 loading 殘 true ----
+    // confirmRemove 取消即透傳不寫 loading=false，取消後 loading 卡 true。
+    // 修後：取消路徑補 loading=false。兩段式：先 request 取得 pending，
+    // 再閘控首個 uninstall（confirm 持有 mutex 阻塞於 gate），啟動可取消
+    // confirm 後 cancel job，斷言 loading==false。沿 b3 手法。
+    @Test
+    fun b3_cancelledConfirmRemove_clearsLoading() {
+        val suGw = FakeRepo(listExtra = listOf("com.example.victim"))
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+
+        // 兩段式前置：request 建立 pending（零 uninstall，不閘控）。
+        vm.requestRemove("com.example.victim")
+        await { vm.state.value.pendingRemove != null }
+
+        // 閘控首個 uninstall（confirm 執行段），leader 持有 mutex。
+        suGw.uninstallCalls = 0
+        suGw.uninstallGate = CompletableDeferred()
+
+        vm.confirmRemove()
+        await { suGw.uninstallCalls >= 1 }
+        await { vm.state.value.loading }
+
+        // 取消 in-flight confirm child（沿 b3 手法）。
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val waiter = scopeJob.children.firstOrNull { it.isActive }
+        assertTrue("confirmRemove must be in-flight while gated", waiter != null)
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+
+        // 取消路徑須即清 loading（即使 gate 仍阻塞）。
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cancelled confirmRemove must clear loading, got ${vm.state.value.loading}",
+            false,
+            vm.state.value.loading,
+        )
+
+        suGw.uninstallGate?.complete(Unit)
+        suGw.uninstallGate = null
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
     }
 }

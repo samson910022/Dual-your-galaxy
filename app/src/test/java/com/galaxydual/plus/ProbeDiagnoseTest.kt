@@ -22,6 +22,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -266,5 +267,188 @@ class ProbeDiagnoseTest {
         )
         assertEquals("恢復不得改寫 lastOperation", baseOp.opId, vm.state.value.lastOperation?.opId)
         assertEquals(baseOp.timeMs, vm.state.value.lastOperation?.timeMs)
+    }
+
+    // Phase B P0 (B1)：LSPOSED 零探測永不誤寫 E_PROBE。
+    // 反例：preference=LSPOSED 冷啟動 → ready=false 恆成立 → 舊碼
+    // cur.diagnose ?: PROBE_FAILED 寫 E_PROBE，但 probeResultMark 顯示
+    // 「未探測」，同畫面「未探測」+「探測未通過」矛盾。
+    // 契約 121-126 / 3534-3538：scope NONE=未探測，絕不報未通過。
+    @Test
+    fun lsposedZeroProbe_neverWritesProbeFailed() {
+        val suFake = FakeRepo(rootOk = true)
+        val clock = JumpClock()
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.LSPOSED,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = NoOpGateway(),
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertEquals("LSPOSED 冷啟動永為未就緒", false, s.channelReady)
+        assertEquals("LSPOSED 零探測 scope 須為 NONE", ProbeScope.NONE, s.probeScope)
+        assertTrue(
+            "LSPOSED 零探測須顯示未探測，got: ${s.probeResultMark()}",
+            s.probeResultMark().contains("未探測"),
+        )
+        assertNotEquals(
+            "LSPOSED 零探測絕不寫 PROBE_FAILED/CHANNEL_ERROR，got: ${s.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            s.diagnose?.code,
+        )
+        assertNotEquals(
+            "LSPOSED 零探測絕不寫 CHANNEL_ERROR，got: ${s.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            s.diagnose?.code,
+        )
+        // isWritable 同理：佔位拒絕寫入亦不得補寫 diagnose。
+        vm.clone("com.example.chat")
+        await { !vm.state.value.loading }
+        assertNotEquals(
+            "LSPOSED 寫入拒絕亦不得寫 PROBE_FAILED，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertNotEquals(
+            "LSPOSED 寫入拒絕亦不得寫 CHANNEL_ERROR，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+        assertTrue(
+            "LSPOSED 仍須顯示未探測，got: ${vm.state.value.probeResultMark()}",
+            vm.state.value.probeResultMark().contains("未探測"),
+        )
+    }
+
+    // 舊 sticky 保留：LSPOSED 冷啟動後以 refresh 預置 CHANNEL_ERROR
+    //（NoOp repo 快照失敗分支），其後 probe（recheck 輕探）須保留舊碼，
+    //不被覆寫為 PROBE_FAILED/CHANNEL_ERROR 新碼。
+    @Test
+    fun lsposedProbe_retainsStickyChannelError() {
+        val suFake = FakeRepo(rootOk = true)
+        val clock = JumpClock()
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.LSPOSED,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = NoOpGateway(),
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading }
+
+        // 預置：NoOp repo 的 refresh 必走 ChannelError，寫入 CHANNEL_ERROR。
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        assertEquals(
+            "前置：refresh 須預置 CHANNEL_ERROR",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+
+        // LSPOSED 輕探不得覆寫舊 sticky。
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+        assertEquals(
+            "LSPOSED probe 須保留舊 CHANNEL_ERROR，不得覆寫，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+        assertNotEquals(
+            "LSPOSED probe 保留舊碼時不得寫 PROBE_FAILED，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertEquals("LSPOSED probe 後 scope 仍為 NONE", ProbeScope.NONE, vm.state.value.probeScope)
+        assertTrue(
+            "LSPOSED probe 後仍須顯示未探測，got: ${vm.state.value.probeResultMark()}",
+            vm.state.value.probeResultMark().contains("未探測"),
+        )
+    }
+
+    // throw 路徑 LSPOSED 測：probe 過程 throw（以外層 catch 覆蓋為準，
+    // 此處以時鐘異常模擬 gateway/IO 拋錯）時 LSPOSED 仍保留舊 diagnose，
+    // 不寫 PROBE_FAILED。
+    @Test
+    fun lsposedThrow_retainsStickyDiagnose() {
+        val suFake = FakeRepo(rootOk = true)
+        val clock = JumpClock()
+        var clockThrows = false
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.LSPOSED,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = NoOpGateway(),
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = {
+                if (clockThrows) throw RuntimeException("boom")
+                clock.now()
+            },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading }
+
+        // 預置舊 sticky：同上以 refresh 寫入 CHANNEL_ERROR。
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        assertEquals(
+            "前置：throw 前須預置 CHANNEL_ERROR",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+
+        // 外層 throw（probeNow 取時拋錯 → probeChannels 外層 catch LSPOSED 分支）。
+        clockThrows = true
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+        clockThrows = false
+
+        assertEquals(
+            "LSPOSED throw 路徑須保留舊 CHANNEL_ERROR，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+        assertNotEquals(
+            "LSPOSED throw 路徑不得寫 PROBE_FAILED，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertEquals(false, vm.state.value.loading)
     }
 }

@@ -569,6 +569,12 @@ class DualViewModel(
     // requestHookRedDiagnosis passes true; auto lifecycle stays false.
     private var recheckPendingPrivileged = false
 
+    // Foreground single-flight (Phase B P0): onForeground bursts collapse to
+    // at most one trailing run, mirroring refresh()/recheckPrivilege().
+    // Main-confined (see class doc).
+    private var foregroundJob: Job? = null
+    private var foregroundPending = false
+
     // Select latest-wins (P2-2): the in-flight select job, cancelled by the
     // next picker tap. Eagerly assigned in selectChannel() (see below).
     // Main-confined (see class doc).
@@ -1194,6 +1200,8 @@ class DualViewModel(
         } catch (e: CancellationException) {
             // 協程取消必須透傳：吞掉會導致 viewModelScope 取消失效、
             // loading 卡住且 refreshPending 尾隨永不執行。
+            // Phase B P0 (B3)：取消路徑補 loading=false，免殘 true。
+            _state.update { it.copy(loading = false) }
             throw e
         } catch (e: Exception) {
             // Never swallow coroutine cancellation: rethrow so cancel stays
@@ -1579,6 +1587,8 @@ class DualViewModel(
                 } catch (e: CancellationException) {
                     // 協程取消必須透傳：外層 finally 會釋放 inFlightWrites，
                     // 此處若吞掉會把取消誤記為 UNKNOWN 操作歷史。
+                    // Phase B P0 (B3)：取消路徑補 loading=false，免殘 true。
+                    _state.update { it.copy(loading = false) }
                     throw e
                 } catch (e: Exception) {
                     // Never swallow coroutine cancellation (see refreshLocked).
@@ -2728,6 +2738,8 @@ class DualViewModel(
                     } catch (e: CancellationException) {
                         // 協程取消必須透傳：外層 finally 會釋放 inFlightWrites，
                         // 此處若吞掉會把取消誤記為 UNKNOWN 操作歷史。
+                        // Phase B P0 (B3)：取消路徑補 loading=false，免殘 true。
+                        _state.update { it.copy(loading = false) }
                         throw e
                     } catch (e: Exception) {
                         // Never swallow coroutine cancellation (see refreshLocked).
@@ -3753,8 +3765,13 @@ class DualViewModel(
                 // （待下一次 pinned verify 重新查證才清）；其他非 PROBE 診斷
                 //（VERIFY_UNKNOWN/VERIFY_MISMATCH/CHANNEL_ERROR 等操作歷史）
                 // 一律保留（sticky，輕探不得洗掉，需 full refresh 才覆寫）。
+                // Phase B P0 (B1)：LSPOSED 零探測 (scope NONE) 永不寫 PROBE_FAILED：
+                // ready=false 恆成立（NoOp 佔位），但 probeResultMark 須為「未探測」
+                // 而非「探測未通過」；此處首判保留 cur.diagnose。
                 val probeDiagnose =
-                    if (!ready) {
+                    if (preference == ChannelPreference.LSPOSED) {
+                        cur.diagnose
+                    } else if (!ready) {
                         if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
                             cur.diagnose
                         } else {
@@ -3818,10 +3835,17 @@ class DualViewModel(
         // m2 與正常路徑同形：sticky UNKNOWN lastOperation 時一律保留
         // cur.diagnose（即使為 null 亦不寫 PROBE_FAILED，待 pinned verify
         // 重查）；其餘才在 diagnose==null 時寫 PROBE_FAILED。
-        if (e is CancellationException) throw e
+        // Phase B P0 (B3)：取消路徑補 loading=false，免殘 true。
+        // Phase B P0 (B1)：LSPOSED 零探測永不寫 PROBE_FAILED，保留原值。
+        if (e is CancellationException) {
+            _state.update { it.copy(loading = false) }
+            throw e
+        }
         _state.update { cur ->
             val probeDiagnose =
-                if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                if (preference == ChannelPreference.LSPOSED) {
+                    cur.diagnose
+                } else if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
                     cur.diagnose
                 } else {
                     cur.diagnose ?: diagnoseEvent(
@@ -3868,19 +3892,13 @@ class DualViewModel(
             // Status-aware hook text (P1): unknown renders as 狀態未知, never
             // as 未偵測到 (the latter is reserved for positively-read absence).
             // PR-6 P4: 時間證據經 hookEvidence()+displayText 統一 (扁平欄位保留)。
+            // Phase B P0 (B1)：LSPOSED 零探測永不寫 diagnose（CHANNEL_ERROR 亦不寫），
+            // 保留 cur.diagnose；scope NONE=未探測，絕不報未通過。
             val hookDesc = cur.hookEvidence().displayText()
             _state.update {
-                val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
                     loading = false,
-                    diagnose = if (sticky) {
-                        it.diagnose
-                    } else {
-                        diagnoseEvent(
-                            DiagnoseCode.CHANNEL_ERROR,
-                            techDetail = "LSPosed placeholder (NoOp) cannot execute writes",
-                        )
-                    },
+                    diagnose = it.diagnose,
                     msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
                         "寫入已拒絕；Hook 狀態：$hookDesc；" +
                         "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
@@ -3970,9 +3988,34 @@ class DualViewModel(
     // P2-6：hook UNKNOWN 不再觸發全量 refresh——probeChannels 本就重跑 hook
     // 診斷，hook 未知只重 probe 即可；反覆前景只探不明顯增加裝置呼叫。
     fun onForeground() {
+        // Single-flight coalesce (Phase B P0 B2): same gate shape as refresh()/
+        // recheckPrivilege(). A burst while a foreground round is in flight
+        // (including waiting on opMutex) only records one trailing re-run, so
+        // 5 rapid taps collapse to leader + at most one trailing instead of
+        // 5 mutex waiters each running probe (+ full refresh when stale).
+        // Main-confined check-and-set/clear (same reasoning as refresh()).
         viewModelScope.launch {
-            opMutex.withLock {
-                markStaleIfAgedLocked()
+            if (foregroundJob?.isActive == true) {
+                foregroundPending = true
+                return@launch
+            }
+            val myJob = currentCoroutineContext()[Job] ?: return@launch
+            foregroundJob = myJob
+            try {
+                opMutex.withLock { foregroundLocked() }
+                while (foregroundPending) {
+                    foregroundPending = false
+                    opMutex.withLock { foregroundLocked() }
+                }
+            } finally {
+                if (foregroundJob === myJob) foregroundJob = null
+            }
+        }
+    }
+
+    // Foreground body: must run under opMutex (callers hold it).
+    private suspend fun foregroundLocked() {
+        markStaleIfAgedLocked()
                 // P2-6：probe 前記錄通道狀態 (resolved/ready)，供 probe 後
                 // 變化偵測（全量 refresh 只在 inventory 非 FRESH 或通道改變時）。
                 val resolvedBefore = currentChannel
@@ -4005,8 +4048,6 @@ class DualViewModel(
                 } else {
                     _state.update { it.copy(loading = false) }
                 }
-            }
-        }
     }
 
     // 過期 FRESH 補標 STALE (保留原 target/queryTime/count 供追溯)。
