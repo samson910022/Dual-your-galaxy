@@ -47,11 +47,14 @@ class VerifyRetryTest {
         var writeResult: CmdResult? = null,
         // Phase E P1-1 (delayed landing): when armed, the write does NOT
         // immediately change the list view -- the first
-        // [landingAfterListCalls] list probes after the write still see the
-        // pre-land queue/fallback, and only later probes see
+        // [landingAfterListCalls] list probes issued AFTER the write still
+        // see the pre-land queue/fallback, and only later probes see
         // [postLandingListResult]. Models "write lands after the immediate
-        // post-timeout probe" deterministically; requires writeCalls > 0 so
-        // pre-write probes are unaffected. Null (default) disables the mode.
+        // post-timeout probe" deterministically. Counted by
+        // [postWriteListCalls] (NIT-2: independent of any pre-write list
+        // probe, so a future pre-write list probe cannot shift the landing;
+        // only probes with writeCalls > 0 advance the count). Null
+        // (default) disables the mode.
         var landingAfterListCalls: Int? = null,
         var postLandingListResult: CmdResult? = null,
         // Phase E P1-1 (wait-window identity change): when non-null, every
@@ -64,6 +67,11 @@ class VerifyRetryTest {
         val commands = mutableListOf<String>()
         var listCalls = 0
         var writeCalls = 0
+        // NIT-2: post-write list-probe count -- advanced only when
+        // writeCalls > 0, so pre-write list probes (none today; the pinned
+        // flows snapshot `pm list users`, not `pm list packages`, before
+        // the write) never shift the delayed-landing arm above.
+        var postWriteListCalls = 0
 
         private fun verbosePayload(): String {
             val s = if (writeCalls > 0) serialAfterWrite ?: 15 else 15
@@ -96,11 +104,12 @@ class VerifyRetryTest {
                 }
                 cmd.startsWith("pm list packages") -> {
                     listCalls++
+                    if (writeCalls > 0) postWriteListCalls++
                     listThrowable?.let { throw it }
                     val pre = if (listQueue.isNotEmpty()) listQueue.removeFirst() else listFallback
                     val arm = landingAfterListCalls
                     val landed = postLandingListResult
-                    if (arm != null && landed != null && writeCalls > 0 && listCalls > arm) landed else pre
+                    if (arm != null && landed != null && postWriteListCalls > arm) landed else pre
                 }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
@@ -670,6 +679,31 @@ class VerifyRetryTest {
         assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
     }
 
+    // Phase E review MINOR-1 (reverse of cloneVerified_serviceSideTimeoutText_
+    // probeInstalled_isSuccess above): the service-side 60 s timeout text
+    // (timedOut=false on the wire) plus a clean REVERSE probe (absent right
+    // after a clone) -> VerifyUnknown whose detail names the text
+    // recognition (never VerifyFailed -- the install may still land after
+    // the probe). Single write, single probe, no settle wait.
+    @Test
+    fun cloneVerified_serviceSideTimeoutText_probeAbsent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must name the text-recognized service timeout, got: \"$detail\"", detail.contains("recognized by text"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
     // Anti-false-positive lock: an ordinary "timeout" word that is NOT one
     // of our timeout statements must stay a definite failure (no probing).
     @Test
@@ -814,6 +848,7 @@ class VerifyRetryTest {
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
         val detail = (outcome as CloneOutcome.VerifyUnknown).detail
         assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
         assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
@@ -843,6 +878,7 @@ class VerifyRetryTest {
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
         val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
         assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
         assertTrue("detail must defer to refresh convergence, got: \"$detail\"", detail.contains("refresh"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
@@ -917,5 +953,208 @@ class VerifyRetryTest {
         assertEquals(1, gateway.writeCalls)
         assertEquals(0, gateway.listCalls)
         assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase E review MINOR-2 (clone, timeout-branch after-pin drift via the
+    // wire-frozen text backstop): the serial flips from 15 to 16 while the
+    // client waits on the install, so the timeout-branch after-pin drifts.
+    // The list view holds the SAME-direction observation (present -- the
+    // probe that would have been Success) but drift wins: VerifyUnknown
+    // with identity-changed, zero list probes, no settle wait.
+    @Test
+    fun cloneVerified_serviceSideTimeoutText_serialChanged_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+            serialAfterWrite = 16,
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase E review MINOR-2 (remove, timeout-branch after-pin drift via the
+    // wire-frozen text backstop): the serial flips from 15 to 16 while the
+    // client waits on the uninstall, so the timeout-branch after-pin drifts.
+    // The list view holds the SAME-direction observation (absent -- the
+    // probe that would have been Success) but drift wins: VerifyUnknown
+    // with identity-changed, zero list probes, no settle wait.
+    @Test
+    fun removeVerified_serviceSideTimeoutText_serialChanged_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+            serialAfterWrite = 16,
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must carry identity-changed, got: \"$detail\"", detail.contains("identity-changed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("drift short-circuits before any settle wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (post-dispatch reply loss, clone same-direction): the server
+    // executed pm but the reply was lost (transact threw / binder died
+    // mid-call / reply decode failed -> transportUnknown, timedOut=false).
+    // exit/out/err are untrusted, so the read-only probe decides: present ->
+    // Success. Single write (no resend), single clean probe.
+    @Test
+    fun cloneVerified_transportUnknown_probeInstalled_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): reply decode failed",
+            transportUnknown = true,
+        )
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (post-dispatch reply loss, clone reverse): the reply was
+    // lost and the immediate probe cleanly lacks the package -> VerifyUnknown
+    // (NOT VerifyFailed -- the remote install may still land after the
+    // probe). Never InstallFailed.
+    @Test
+    fun cloneVerified_transportUnknown_probeAbsent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): binder died mid-call",
+            transportUnknown = true,
+        )
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (post-dispatch reply loss, remove same-direction): reply
+    // lost, probe confirms absent -> Success (ground truth backs the
+    // removal). Single write, single clean probe.
+    @Test
+    fun removeVerified_transportUnknown_probeAbsent_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): transact failed",
+            transportUnknown = true,
+        )
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (post-dispatch reply loss, remove probe unknown): reply lost
+    // AND the read-only probe is itself unknown (persistent non-zero) ->
+    // VerifyUnknown whose detail names the transport loss and keeps the
+    // probe cause. Single write (no resend) + bounded probe retries.
+    @Test
+    fun removeVerified_transportUnknown_probeUnknown_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): reply decode failed",
+            transportUnknown = true,
+        )
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertTrue("detail must keep the probe cause, got: \"$detail\"", detail.contains("exit=1"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
+        assertEquals(
+            listOf(DualRepository.VERIFY_RETRY_DELAY_MS, DualRepository.VERIFY_RETRY_DELAY_MS),
+            delays,
+        )
+    }
+
+    // PR-32 P1-2 (post-dispatch reply loss, expected-remove third path):
+    // reply lost, probe confirms absent -> Success (after-pin holds, ground
+    // truth backs the removal). Single write, single clean probe.
+    @Test
+    fun removeVerifiedExpected_transportUnknown_probeAbsent_isSuccess() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): transact failed",
+            transportUnknown = true,
+        )
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected Success, got: $outcome", outcome is RemoveOutcome.Success)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (pre-dispatch对照, clone): the command never reached the
+    // service (no binder, both flags false) -> definite InstallFailed with
+    // no read-only probe. Guards against inflating every transport error
+    // into Unknown.
+    @Test
+    fun cloneVerified_preDispatchNotSent_isInstallFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: binder not connected (install/start Shizuku first)")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected InstallFailed, got: $outcome", outcome is CloneOutcome.InstallFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    // PR-32 P1-2 (pre-dispatch对照, remove): bind failure before transact
+    // (both flags false) -> definite RemoveFailed with no read-only probe.
+    @Test
+    fun removeVerified_preDispatchBindFailed_isRemoveFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: bind failed: bind timed out after 10000ms")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected RemoveFailed, got: $outcome", outcome is RemoveOutcome.RemoveFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
     }
 }
