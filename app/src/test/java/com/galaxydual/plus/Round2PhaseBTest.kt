@@ -550,4 +550,49 @@ class Round2PhaseBTest {
         assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
         assertEquals(MsgKind.CHANNEL, s.msgKind)
     }
+
+    // ---- P0 fail-closed：malformed prop 不得誤判 Absent 清空舊單 ----
+
+    @Test
+    fun p27_malformedProp_keepsOldList() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+
+        // 第二輪：typed 雙源 OTHER {0,10}＋pm {0,10}（子集、無否決）＋
+        // malformed prop "abc\n"（exit 0、無截斷、無 ERROR_LINE，但 parse 失敗）。
+        // pm 切到 {0,10} 使 pm 否決不觸發，Unknown 只能來自 malformed 閘；
+        // 未修復前會誤收斂 Absent 並報 NO_DUAL 清空舊單。
+        suGw.dualId = 10
+        suGw.verboseOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} running:\n" +
+                "    Serial: 11\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.MANAGED\n"
+        suGw.dumpsysOverride =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} serialNo=11:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.MANAGED\n"
+        suGw.propOverride = "abc\n"
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val t = vm.state.value
+        assertTrue("malformed prop must keep the old list", t.cloned.contains("com.example.chat"))
+        assertEquals("FRESH degrades to STALE, not cleared", InventoryFreshness.STALE, t.inventory.freshness)
+        assertEquals("STALE keeps the old target identity", 95, t.inventory.targetId)
+        assertEquals(MsgKind.CHANNEL, t.msgKind)
+    }
 }
