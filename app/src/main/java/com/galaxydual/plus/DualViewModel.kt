@@ -829,7 +829,7 @@ class DualViewModel(
                     val now = nowMs()
                     _state.update { cur ->
                         val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                            "channel error: ${snap.detail}",
+                            "channel error: ${sanitizeForDisplay(snap.detail)}",
                             MsgKind.CHANNEL,
                             cur.degradeNote,
                         )
@@ -971,7 +971,7 @@ class DualViewModel(
                                 if (snapErr != null) {
                                     val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                         "refresh result unknown: " +
-                                            "channel error: $snapErr",
+                                            "channel error: ${sanitizeForDisplay(snapErr)}",
                                         MsgKind.CHANNEL,
                                         cur.degradeNote,
                                     )
@@ -1132,7 +1132,7 @@ class DualViewModel(
             val now = nowMs()
             _state.update { cur ->
                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                    "refresh failed: ${e.message ?: e.javaClass.simpleName}",
+                    "refresh failed: ${sanitizeForDisplay(e.message ?: "refresh failed")}",
                     MsgKind.FAILED,
                     cur.degradeNote,
                 )
@@ -1148,7 +1148,8 @@ class DualViewModel(
                     ),
                     diagnose = diagnoseEvent(
                         DiagnoseCode.OP_FAILED,
-                        techDetail = (e.message ?: "refresh failed").take(MAX_DIAG_DETAIL_CHARS),
+                        techDetail = sanitizeForDisplay(e.message ?: "refresh failed")
+                            .take(MAX_DIAG_DETAIL_CHARS),
                     ),
                     msg = combinedMsg,
                     msgKind = combinedKind,
@@ -1174,8 +1175,15 @@ class DualViewModel(
     // SUCCESS/FAILED/UNKNOWN) + diagnose 穩定碼；普通 probe 永不清除。
     fun clone(pkg: String) {
         viewModelScope.launch {
+            // 輸入有界：先 trim 再 take(256)，opKey/detail 不得無界增長。
+            // 字元集校驗刻意不在此重做：ShellEscaper 政策由 core 擁有
+            // (PmOutputParser builders + DualRepository；
+            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白檢查；
+            // 非法字元由 repo 回 InvalidPackage (同碼 INVALID_INPUT)。
+            // 空白拒絕不建 opKey (與 requestRemove 一致)。
+            val trimmed: String = pkg.trim().take(256)
             // Validate input early without touching the device.
-            if (pkg.isBlank()) {
+            if (trimmed.isBlank()) {
                 _state.update {
                     it.copy(
                         msg = "invalid package",
@@ -1185,7 +1193,6 @@ class DualViewModel(
                 }
                 return@launch
             }
-            val trimmed: String = pkg.trim()
             // Write dedup (PR-3 stage 1, issue #24): a second identical clone
             // while the first is still in flight reports "already in progress"
             // instead of queueing another mutex waiter + device round-trip.
@@ -1239,7 +1246,8 @@ class DualViewModel(
                                         pinnedTarget = res.dualId,
                                         phase = OpPhase.SUCCESS,
                                         timeMs = now,
-                                        detail = "cloned: $trimmed$rebuiltNote",
+                                        detail = "cloned: $trimmed$rebuiltNote"
+                                            .take(MAX_DIAG_DETAIL_CHARS),
                                     ),
                                     diagnose = null,
                                     msg = "cloned: $trimmed",
@@ -1273,7 +1281,7 @@ class DualViewModel(
                                         ),
                                         msg = if (channelDetail != null) {
                                             "clone result unknown: " +
-                                                "channel error: $channelDetail"
+                                                "channel error: ${sanitizeForDisplay(channelDetail)}"
                                         } else {
                                             "clone result unknown: " +
                                                 "cannot confirm dual profile"
@@ -1298,7 +1306,7 @@ class DualViewModel(
                                     loading = false,
                                     diagnose = res.toDiagnoseEvent(),
                                     msg = "clone result unknown: " +
-                                        "channel error: ${res.detail}",
+                                        "channel error: ${sanitizeForDisplay(res.detail)}",
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }
@@ -1330,7 +1338,7 @@ class DualViewModel(
                                         detail = res.detail.take(MAX_DIAG_DETAIL_CHARS),
                                     ),
                                     diagnose = res.toDiagnoseEvent(),
-                                    msg = res.detail,
+                                    msg = sanitizeForDisplay(res.detail),
                                     msgKind = MsgKind.FAILED,
                                 )
                             }
@@ -1370,7 +1378,8 @@ class DualViewModel(
                                     ),
                                     diagnose = res.toDiagnoseEvent(),
                                     msg = "clone result unknown: " +
-                                        "cannot verify $trimmed for user ${res.dualId}: ${res.detail}",
+                                        "cannot verify $trimmed for user ${res.dualId}: " +
+                                        sanitizeForDisplay(res.detail),
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }
@@ -1398,13 +1407,16 @@ class DualViewModel(
                                 pinnedTarget = knownTarget,
                                 phase = OpPhase.UNKNOWN,
                                 timeMs = now,
-                                detail = (e.message ?: "clone failed").take(MAX_DIAG_DETAIL_CHARS),
+                                detail = sanitizeForDisplay(e.message ?: "clone failed")
+                                    .take(MAX_DIAG_DETAIL_CHARS),
                             ),
                             diagnose = diagnoseEvent(
                                 DiagnoseCode.VERIFY_UNKNOWN,
-                                techDetail = (e.message ?: "clone failed").take(MAX_DIAG_DETAIL_CHARS),
+                                techDetail = sanitizeForDisplay(e.message ?: "clone failed")
+                                    .take(MAX_DIAG_DETAIL_CHARS),
                             ),
-                            msg = "clone failed: ${e.message ?: e.javaClass.simpleName}",
+                            msg = "clone failed: " +
+                                "${sanitizeForDisplay(e.message ?: "clone failed")}",
                             msgKind = MsgKind.FAILED,
                         )
                     }
@@ -1441,9 +1453,22 @@ class DualViewModel(
     // closed), so a no-op removal never opens a dialog.
     fun requestRemove(pkg: String) {
         viewModelScope.launch {
+            // 輸入有界：先 trim 再 take(256)，pending pkg 不得無界增長。
+            // 字元集校驗刻意不在此重做：ShellEscaper 政策由 core 擁有
+            // (PmOutputParser builders + DualRepository；
+            // ViewModel 無既有 ShellEscaper 使用模式)，此處只做空白檢查；
+            // 非法字元由後續 repo 流回 InvalidPackage (同碼 INVALID_INPUT)。
+            // 空白拒絕不碰裝置 (與 clone 一致)，diagnose 與 clone 對齊。
+            val trimmed: String = pkg.trim().take(256)
             // Validate input early without touching the device.
-            if (pkg.isBlank()) {
-                _state.update { it.copy(msg = "invalid package", msgKind = MsgKind.INVALID) }
+            if (trimmed.isBlank()) {
+                _state.update {
+                    it.copy(
+                        msg = "invalid package",
+                        msgKind = MsgKind.INVALID,
+                        diagnose = diagnoseEvent(DiagnoseCode.INVALID_INPUT),
+                    )
+                }
                 return@launch
             }
             val trimmed: String = pkg.trim()
@@ -1473,8 +1498,10 @@ class DualViewModel(
                                     it.copy(
                                         loading = false,
                                         pendingRemove = null,
+                                        // 與 clone 對齊：寫前通道失敗補通道碼。
+                                        diagnose = snap.toDiagnoseEvent(),
                                         msg = "remove result unknown: " +
-                                            "channel error: ${snap.detail}",
+                                            "channel error: ${sanitizeForDisplay(snap.detail)}",
                                         msgKind = MsgKind.CHANNEL,
                                     )
                                 }
@@ -1486,6 +1513,10 @@ class DualViewModel(
                                                 loading = false,
                                                 profiles = snap.profiles,
                                                 pendingRemove = null,
+                                                diagnose = diagnoseEvent(
+                                                    DiagnoseCode.NO_DUAL,
+                                                    techDetail = "verified dual id unknown",
+                                                ),
                                                 msg = "no dual profile",
                                                 msgKind = MsgKind.NO_DUAL,
                                             )
@@ -1496,6 +1527,11 @@ class DualViewModel(
                                                 loading = false,
                                                 profiles = snap.profiles,
                                                 pendingRemove = null,
+                                                diagnose = diagnoseEvent(
+                                                    DiagnoseCode.CHANNEL_ERROR,
+                                                    techDetail = "serial unavailable " +
+                                                        "for verified target",
+                                                ),
                                                 msg = "無法驗證分身身分（serial 缺失），請重試",
                                                 msgKind = MsgKind.NO_DUAL,
                                             )
@@ -1510,6 +1546,13 @@ class DualViewModel(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
+                                                    // verified 目標不在快照列中 -> 無可用 dual
+                                                    // (對應 confirmRemove 的 label==null 分支)。
+                                                    diagnose = diagnoseEvent(
+                                                        DiagnoseCode.NO_DUAL,
+                                                        techDetail = "verified dual id " +
+                                                            "$dualId absent",
+                                                    ),
                                                     msg = "no dual profile",
                                                     msgKind = MsgKind.NO_DUAL,
                                                 )
@@ -1556,8 +1599,18 @@ class DualViewModel(
                                                             loading = false,
                                                             profiles = snap.profiles,
                                                             pendingRemove = null,
+                                                            diagnose = diagnoseEvent(
+                                                                DiagnoseCode.VERIFY_UNKNOWN,
+                                                                techDetail = sanitizeForDisplay(
+                                                                    "cannot verify $trimmed " +
+                                                                        "for user $dualId: " +
+                                                                        st.detail,
+                                                                ).take(MAX_DIAG_DETAIL_CHARS),
+                                                            ),
                                                             msg = "remove result unknown: " +
-                                                                "cannot verify $trimmed for user $dualId: ${st.detail}",
+                                                                "cannot verify $trimmed for user " +
+                                                                "$dualId: " +
+                                                                sanitizeForDisplay(st.detail),
                                                             msgKind = MsgKind.CHANNEL,
                                                         )
                                                     }
@@ -1573,7 +1626,15 @@ class DualViewModel(
                             it.copy(
                                 loading = false,
                                 pendingRemove = null,
-                                msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
+                                // phase 1 只做唯讀查驗 (未執行 uninstall)，
+                                // 例外補 OP_FAILED (與 clone 對齊：只寫 msg 的分支補碼)。
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.OP_FAILED,
+                                    techDetail = sanitizeForDisplay(e.message ?: "remove failed")
+                                        .take(MAX_DIAG_DETAIL_CHARS),
+                                ),
+                                msg = "remove failed: " +
+                                    "${sanitizeForDisplay(e.message ?: "remove failed")}",
                                 msgKind = MsgKind.FAILED,
                             )
                         }
@@ -1767,7 +1828,7 @@ class DualViewModel(
                                         pendingRemove = null,
                                         diagnose = snap.toDiagnoseEvent(),
                                         msg = "remove result unknown: " +
-                                            "channel error: ${snap.detail}",
+                                            "channel error: ${sanitizeForDisplay(snap.detail)}",
                                         msgKind = MsgKind.CHANNEL,
                                     )
                                 }
@@ -1794,9 +1855,16 @@ class DualViewModel(
                                             loading = false,
                                             profiles = snap.profiles,
                                             pendingRemove = null,
+                                            // 隱私：techDetail 不含原始 label 字串
+                                            // (label 為裝置顯示名，匯出可見)，
+                                            // 只留 userId (數字可讀性) 與雙方長度
+                                            // 供除錯；msg 對話框維持原可讀文案。
                                             diagnose = diagnoseEvent(
                                                 DiagnoseCode.VERIFY_MISMATCH,
-                                                techDetail = "label $label != ${cur.profileLabel}",
+                                                techDetail = "profile label mismatch " +
+                                                    "for user ${cur.dualId} " +
+                                                    "(len=${label.length} vs " +
+                                                    "${cur.profileLabel.length})",
                                             ),
                                             msg = "移除目標已變更（$label ≠ " +
                                                 "${cur.profileLabel}），請重新確認",
@@ -1900,7 +1968,8 @@ class DualViewModel(
                                                         pinnedTarget = cur.dualId,
                                                         phase = OpPhase.SUCCESS,
                                                         timeMs = now,
-                                                        detail = "removed: ${cur.pkg}$rebuiltNote",
+                                                        detail = "removed: ${cur.pkg}$rebuiltNote"
+                                                            .take(MAX_DIAG_DETAIL_CHARS),
                                                     ),
                                                     diagnose = null,
                                                     msg = "removed: ${cur.pkg}",
@@ -1953,7 +2022,8 @@ class DualViewModel(
                                                     pendingRemove = null,
                                                     diagnose = res.toDiagnoseEvent(),
                                                     msg = "remove result unknown: " +
-                                                        "channel error: ${res.detail}",
+                                                        "channel error: " +
+                                                        sanitizeForDisplay(res.detail),
                                                     msgKind = MsgKind.CHANNEL,
                                                 )
                                             }
@@ -1988,7 +2058,7 @@ class DualViewModel(
                                                         detail = res.detail.take(MAX_DIAG_DETAIL_CHARS),
                                                     ),
                                                     diagnose = res.toDiagnoseEvent(),
-                                                    msg = res.detail,
+                                                    msg = sanitizeForDisplay(res.detail),
                                                     msgKind = MsgKind.FAILED,
                                                 )
                                             }
@@ -2033,7 +2103,8 @@ class DualViewModel(
                                                     diagnose = res.toDiagnoseEvent(),
                                                     msg = "remove result unknown: " +
                                                         "cannot verify removal of ${cur.pkg} " +
-                                                        "for user ${res.dualId}: ${res.detail}",
+                                                        "for user ${res.dualId}: " +
+                                                        sanitizeForDisplay(res.detail),
                                                     msgKind = MsgKind.CHANNEL,
                                                 )
                                             }
@@ -2114,13 +2185,16 @@ class DualViewModel(
                                     pinnedTarget = pendingAtCall.dualId,
                                     phase = OpPhase.UNKNOWN,
                                     timeMs = now,
-                                    detail = (e.message ?: "remove failed").take(MAX_DIAG_DETAIL_CHARS),
+                                    detail = sanitizeForDisplay(e.message ?: "remove failed")
+                                        .take(MAX_DIAG_DETAIL_CHARS),
                                 ),
                                 diagnose = diagnoseEvent(
                                     DiagnoseCode.VERIFY_UNKNOWN,
-                                    techDetail = (e.message ?: "remove failed").take(MAX_DIAG_DETAIL_CHARS),
+                                    techDetail = sanitizeForDisplay(e.message ?: "remove failed")
+                                        .take(MAX_DIAG_DETAIL_CHARS),
                                 ),
-                                msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
+                                msg = "remove failed: " +
+                                    "${sanitizeForDisplay(e.message ?: "remove failed")}",
                                 msgKind = MsgKind.FAILED,
                             )
                         }
@@ -3129,9 +3203,10 @@ class DualViewModel(
                 pmReadable = null,
                 diagnose = cur.diagnose ?: diagnoseEvent(
                     DiagnoseCode.PROBE_FAILED,
-                    techDetail = (e.message ?: "probe failed").take(MAX_DIAG_DETAIL_CHARS),
+                    techDetail = sanitizeForDisplay(e.message ?: "probe failed")
+                        .take(MAX_DIAG_DETAIL_CHARS),
                 ),
-                msg = "probe failed: ${e.message ?: e.javaClass.simpleName}",
+                msg = "probe failed: ${sanitizeForDisplay(e.message ?: "probe failed")}",
                 msgKind = MsgKind.FAILED,
             )
             if (cur.pendingRemove != null &&
