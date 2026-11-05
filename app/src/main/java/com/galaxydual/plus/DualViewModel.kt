@@ -3014,7 +3014,8 @@ class DualViewModel(
         } else {
             try {
                 selectionStore?.loadSnapshot()?.knownTargetId ?: -1
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 -1
             }
         }
@@ -3094,7 +3095,8 @@ class DualViewModel(
                     .toSortedSet()
                 val ok = try {
                     store.save(source, targetId, selected, nowMs())
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     false
                 }
                 _state.update {
@@ -3126,7 +3128,8 @@ class DualViewModel(
                 }
                 val ok = try {
                     store.clear()
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     false
                 }
                 _state.update {
@@ -3169,7 +3172,8 @@ class DualViewModel(
         val available = availableKeys ?: byPackage.values.map { it.appKey }.toSet()
         val restored = try {
             store.loadSelected(targetId)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             emptySet()
         }
         selectionRestoredForTarget = targetId
@@ -3185,16 +3189,27 @@ class DualViewModel(
     // 階段 1 不引入新批次寫入通道:對每個已勾選包名依確定順序 (包名升冪)
     // 逐一呼叫既有單筆 repo.cloneVerified,逐項記錄 lastOperation/diagnose,
     // 最後彙總 BatchReport (成功/失敗/未知分開,部分成功如實呈現)。
-    // - 空選取:拒絕,不碰裝置。
+    // - 空選取:拒絕,不碰裝置 (鎖外快照僅做早拒,執行以鎖內重讀為準,見 B1)。
     // - 單一 "batch:clone" inFlight key:併發第二批回報 already in progress。
+    // - batch×single 互斥 (B2):執行前按鎖內 catalog 映射逐包認領
+    //   "clone:<pkg>" (catalog 缺失 key 跳過認領,仍按 InvalidPackage 記帳);
+    //   任一已存在則整批拒絕 (INFO,明示該包),不碰裝置,整批結束 finally 釋放。
+    //   已知缺口:remove:<pkg> 未納入本次 batch×single 互斥 (Phase 1 範圍外)。
     // - 一次 isWritable 前置檢查 (唯讀/佔位通道整批拒絕);逐項失敗不中斷
-    //   其餘項目 (NoDual/ChannelError 亦繼續,結果如實分流)。
-    // - catalog 缺失的 key 以 InvalidPackage 記 unknown 類失敗,不拋出。
+    //   其餘項目 (ChannelError 逐項繼續;NoDual 首見後短路,見下)。
+    // - NoDual 短路 (M13):首個 NoDual 後剩餘未執行項直接記同一 NoDual,
+    //   不再打裝置 (verified target 已消失,繼續打裝置必敗)。
+    // - catalog 缺失的 key 以 InvalidPackage 記帳,不拋出。
+    // - 批次中斷 (M3):catch 內以已累積 items 發 partial BatchReport
+    //   (計數口徑與正常彙總一致),loading=false,lastOperation FAILED
+    //   (opId=batch:clone);取消 (CancellationException) 直接重拋,不寫
+    //   partial,僅靠 finally 釋放 inFlight key (B3)。
     // - cloned 只加入 Success 確認的包 (與單筆 clone 一致的 fail-closed)。
     fun cloneSelected() {
         viewModelScope.launch {
-            val keys = _state.value.selectedKeys.toList()
-            if (keys.isEmpty()) {
+            // B1 鎖外快照:僅做早拒 (空選取) 用,不作為執行依據。
+            val outerKeys = _state.value.selectedKeys.toList()
+            if (outerKeys.isEmpty()) {
                 _state.update {
                     it.copy(msg = "未勾選任何應用", msgKind = MsgKind.INVALID)
                 }
@@ -3207,21 +3222,85 @@ class DualViewModel(
                 }
                 return@launch
             }
+            // B2 認領的逐包 key:鎖內填充,外層 finally 釋放 (取消亦不殘留)。
+            val batchPkgKeys = mutableListOf<String>()
             try {
                 opMutex.withLock {
                     if (!isWritable()) return@withLock
+                    // B1 鎖內重讀:以此快照為執行唯一依據 (鎖外僅早拒)。
+                    val lockedKeys = _state.value.selectedKeys.toList()
+                    if (lockedKeys.isEmpty()) {
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                msg = "未勾選任何應用",
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
+                    val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
+                    // 確定順序:包名升冪 (catalog 缺失的 key 排最後,按 key 比)。
+                    val ordered = lockedKeys.sortedWith(
+                        compareBy(
+                            { catalogByKey[it]?.packageName ?: it },
+                            { it },
+                        ),
+                    )
+                    // B2:逐包認領 clone:<pkg> (鎖內 catalog 映射;缺失跳過)。
+                    val distinctPkgs = ordered.mapNotNull { catalogByKey[it]?.packageName }
+                        .distinct()
+                    var conflictingPkg: String? = null
+                    val claimed = mutableListOf<String>()
+                    for (pkg in distinctPkgs) {
+                        val k = "clone:$pkg"
+                        if (!inFlightWrites.add(k)) {
+                            conflictingPkg = pkg
+                            break
+                        }
+                        claimed.add(k)
+                    }
+                    if (conflictingPkg != null) {
+                        for (k in claimed) inFlightWrites.remove(k)
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                msg = "already in progress: $conflictingPkg",
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                        return@withLock
+                    }
+                    batchPkgKeys.addAll(claimed)
                     _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+                    // M3:items 外提,catch 可見已累積進度以發 partial。
+                    val items = mutableListOf<BatchItemResult>()
                     try {
-                        val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
-                        // 確定順序:包名升冪 (catalog 缺失的 key 排最後,按 key 比)。
-                        val ordered = keys.sortedWith(
-                            compareBy(
-                                { catalogByKey[it]?.packageName ?: it },
-                                { it },
-                            ),
-                        )
-                        val items = mutableListOf<BatchItemResult>()
+                        // M13:首個 NoDual 後短路 (verified target 已消失)。
+                        var noDualShort: CloneOutcome.NoDual? = null
                         for (appKey in ordered) {
+                            if (noDualShort != null) {
+                                // M13:短路前先本地校驗 catalog,缺失 key 按正常路徑記 InvalidPackage。
+                                val pkg = catalogByKey[appKey]?.packageName
+                                if (pkg == null) {
+                                    items.add(
+                                        BatchItemResult(
+                                            appKey = appKey,
+                                            pkg = appKey,
+                                            outcome = CloneOutcome.InvalidPackage(appKey),
+                                        ),
+                                    )
+                                    continue
+                                }
+                                val short = noDualShort
+                                items.add(BatchItemResult(appKey, pkg, short))
+                                recordBatchItemUnknownOrFailed(
+                                    pkg,
+                                    short.toDiagnoseCode(),
+                                    short,
+                                )
+                                continue
+                            }
                             val pkg = catalogByKey[appKey]?.packageName
                             if (pkg == null) {
                                 items.add(
@@ -3259,6 +3338,7 @@ class DualViewModel(
                                 is CloneOutcome.NoDual -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
                                     recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    noDualShort = res
                                 }
                                 is CloneOutcome.ChannelError -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
@@ -3307,16 +3387,45 @@ class DualViewModel(
                             )
                         }
                     } catch (e: Exception) {
+                        // B3:取消永不吞沒,重拋前復位 loading (不寫 partial report)。
+                        if (e is CancellationException) {
+                            _state.update { it.copy(loading = false) }
+                            throw e
+                        }
+                        // M3:批次中斷不丟進度,以已累積 items 發 partial。
                         val now = nowMs()
+                        val success = items.count { it.outcome is CloneOutcome.Success }
+                        val unknown = items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                        val failed = items.size - success - unknown
+                        val partial = BatchReport(
+                            items = items.toList(),
+                            successCount = success,
+                            failedCount = failed,
+                            unknownCount = unknown,
+                        )
                         _state.update {
                             it.copy(
                                 loading = false,
+                                batchReport = partial,
+                                lastOperation = LastOperation(
+                                    opId = opKey,
+                                    appKey = "batch",
+                                    pinnedTarget = -1,
+                                    phase = OpPhase.FAILED,
+                                    timeMs = now,
+                                    detail = "批次中斷：已完成 ${items.size} 項 " +
+                                        "(成功 $success / 失敗 $failed / 未知 $unknown)" +
+                                        ": ${(e.message ?: "batch clone failed")
+                                            .take(MAX_DIAG_DETAIL_CHARS)}",
+                                ),
                                 diagnose = diagnoseEvent(
                                     DiagnoseCode.OP_FAILED,
                                     techDetail = (e.message ?: "batch clone failed")
                                         .take(MAX_DIAG_DETAIL_CHARS),
                                 ),
-                                msg = "batch clone failed: ${e.message}",
+                                msg = "批次中斷：已完成 ${items.size} 項 " +
+                                    "(成功 $success / 失敗 $failed / 未知 $unknown)" +
+                                    ": ${e.message}",
                                 msgKind = MsgKind.FAILED,
                             )
                         }
@@ -3324,6 +3433,7 @@ class DualViewModel(
                 }
             } finally {
                 inFlightWrites.remove(opKey)
+                for (k in batchPkgKeys) inFlightWrites.remove(k)
             }
         }
     }
