@@ -69,6 +69,40 @@ data class ProbeOutcome(
     val hasShizuku: Boolean,
 )
 
+// Phase C P2 semantic (issue #25 review): probe scope tracking. The probe
+// result (hasRoot/hasShizuku, routed privilege, anyProbePassed) reflects ONLY
+// the probed subset, never device total capability:
+// - AUTO probes all elevators -> FULL (device-wide for this round).
+// - Explicit ROOT probes only SuElevator -> ROOT_ONLY.
+// - Explicit SHIZUKU probes only ShizukuElevator -> SHIZUKU_ONLY.
+// - Explicit LSPOSED probes none (NoOp placeholder) -> NONE (zero probe).
+// Render must show 本次路由 + 本次探測[scope] + 三態結果 (NONE -> 未探測),
+// never "裝置路由/探測未通過" for a zero-probe round.
+enum class ProbeScope {
+    FULL,
+    ROOT_ONLY,
+    SHIZUKU_ONLY,
+    NONE,
+}
+
+// Pure mapping: preference -> probe scope (single source; probeChannels uses
+// this so state and render can never drift). Covered by JVM unit tests.
+fun ChannelPreference.probeScope(): ProbeScope = when (this) {
+    ChannelPreference.AUTO -> ProbeScope.FULL
+    ChannelPreference.ROOT -> ProbeScope.ROOT_ONLY
+    ChannelPreference.SHIZUKU -> ProbeScope.SHIZUKU_ONLY
+    ChannelPreference.LSPOSED -> ProbeScope.NONE
+}
+
+// Pure display label for the scope (MainActivity uses this; tests assert the
+// state fields, not the rendered string).
+fun ProbeScope.displayLabel(): String = when (this) {
+    ProbeScope.FULL -> "全部通道"
+    ProbeScope.ROOT_ONLY -> "僅ROOT"
+    ProbeScope.SHIZUKU_ONLY -> "僅Shizuku"
+    ProbeScope.NONE -> "未探測"
+}
+
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
@@ -114,12 +148,19 @@ enum class MsgKind {
 // explicit SHIZUKU pick with ROOT available never misreports "using ROOT"),
 // execIdentity the declared privilege of that gateway, anyProbePassed whether
 // the probed subset proved any channel (probe signal only, never proof that
-// `pm list users` is readable -- see field docs), writeReady whether the selected channel proved
-// itself, degradeNote the Auto probe-based degrade explanation (empty when
-// none), profiles/cloned the device ground truth, loading the in-flight flag,
-// and msg (+msgKind) the user-facing status.
+// `pm list users` is readable -- see field docs), probeScope which subset was
+// probed this round (Phase C P2: NONE = zero probe, never "failed"), pmReadable
+// whether `pm list users` proved readable via refresh (probe never writes it;
+// true readability = pmReadable == true plus writeReady -- never collapse
+// probe identity / PM-read / PM-write into one boolean), writeReady whether
+// the selected channel proved itself, degradeNote the Auto probe-based degrade
+// explanation (empty when none), profiles/cloned the device ground truth,
+// loading the in-flight flag, and msg (+msgKind) the user-facing status.
 data class UiState(
     // Routed elevation level from the elevator probes (ROOT/SHELL/NONE).
+    // Phase C P2: 本次路由 only -- reflects the probed subset (see probeScope),
+    // never device total capability. An explicit SHIZUKU success never implies
+    // ROOT absence; an LSPOSED zero-probe NONE never implies failure.
     val privilege: Privilege = Privilege.NONE,
     // Selected channel preference (F4b-P1 model, P2 picker UI in
     // MainActivity). NoOp is never a value here, only the fail-closed
@@ -155,6 +196,19 @@ data class UiState(
     // (denied SHIZUKU, LSPOSED NoOp) -- the flag then reflects only the
     // selected subset (false), never the unprobed environment.
     val anyProbePassed: Boolean = false,
+    // Phase C P2: which subset this round probed (set by probeChannels from
+    // preference; see ChannelPreference.probeScope). NONE = zero probe
+    // (explicit LSPOSED): render shows 未探測, never 未通過. Together with
+    // privilege/anyProbePassed this is 本次探測, not device total capability.
+    val probeScope: ProbeScope = ProbeScope.NONE,
+    // Phase C P2: independent PM readability (`pm list users` via refresh
+    // only; probe never writes this field). null = unknown (not yet refreshed
+    // or refresh threw), true = Loaded (profiles parsed, incl. NoDual which
+    // still read profiles), false = ChannelError (list users failed). Tracks
+    // `pm list users`, not `pm list packages` (a clone-list null still leaves
+    // this true). True readability = (pmReadable == true) plus writeReady;
+    // never collapse probe identity / PM-read / PM-write into one boolean.
+    val pmReadable: Boolean? = null,
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
     // Auto probe-based degrade explanation (P25). Non-empty only for AUTO
@@ -563,6 +617,8 @@ class DualViewModel(
                         val next = cur.copy(
                             loading = false,
                             profiles = emptyList(),
+                            // Phase C P2: `pm list users` proven unreadable.
+                            pmReadable = false,
                             msg = combinedMsg,
                             msgKind = combinedKind,
                         )
@@ -596,6 +652,10 @@ class DualViewModel(
                                 loading = false,
                                 profiles = profiles,
                                 cloned = emptyList(),
+                                // Phase C P2: profiles parsed (readable) but no
+                                // dual target -- still true (`pm list users`
+                                // succeeded).
+                                pmReadable = true,
                                 msg = combinedMsg,
                                 msgKind = combinedKind,
                             )
@@ -627,6 +687,11 @@ class DualViewModel(
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
+                                    // Phase C P2: profilesSnapshot Loaded proves
+                                    // `pm list users` readable even when the
+                                    // clone list itself is unknowable (separate
+                                    // `pm list packages` failure).
+                                    pmReadable = true,
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
                                 )
@@ -635,6 +700,7 @@ class DualViewModel(
                                     loading = false,
                                     profiles = profiles,
                                     cloned = emptyList(),
+                                    pmReadable = true,
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
                                 )
@@ -643,6 +709,7 @@ class DualViewModel(
                                     loading = false,
                                     profiles = profiles,
                                     cloned = groundTruth,
+                                    pmReadable = true,
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
                                 )
@@ -672,6 +739,9 @@ class DualViewModel(
                 )
                 val next = cur.copy(
                     loading = false,
+                    // Phase C P2: unexpected throw -- readability unknown
+                    // (fail closed via null; never claim false proof).
+                    pmReadable = null,
                     msg = combinedMsg,
                     msgKind = combinedKind,
                 )
@@ -1874,6 +1944,8 @@ class DualViewModel(
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
             // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
             // 其他欄位照寫（loading/hook/ready/resolved/exec/caps 照常更新）。
+            // Phase C P2: probeScope follows preference (本次探測範圍); probe
+            // never writes pmReadable (refresh owns it) -- copy preserves it.
             _state.update { cur ->
                 val base = cur.withHookDiagnosis(hook).copy(
                     loading = false,
@@ -1883,6 +1955,7 @@ class DualViewModel(
                     resolvedGateway = currentChannel,
                     execIdentity = gatewayPrivilege,
                     anyProbePassed = anyProbePassed,
+                    probeScope = preference.probeScope(),
                     writeReady = ready,
                     degradeNote = degradeNoteForState,
                     msg = if (ready) readyMsg else notReadyMsg,
@@ -2005,3 +2078,26 @@ fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis): UiState = copy(
     hookActive = diagnosis.active,
     hookScopes = diagnosis.scopes,
 )
+
+// Phase C P2 pure display helpers (MainActivity render uses these; JVM tests
+// assert the state fields plus these keys so the Activity stays untested).
+// Tristate: NONE (zero probe) -> 未探測, never 未通過; otherwise the probed
+// subset decides 通過/未通過. The scope label + 本次路由 wording keep the UI
+// from claiming device total capability.
+fun UiState.probeResultMark(): String = when {
+    probeScope == ProbeScope.NONE -> "未探測"
+    anyProbePassed -> "探測通過"
+    else -> "探測未通過"
+}
+
+// Full 本次探測 status key for state-layer assertions and render.
+fun UiState.probeStatusText(): String =
+    "本次探測[${probeScope.displayLabel()}]${probeResultMark()}"
+
+// Independent PM readability key (refresh only). null = 未知, true = 可讀,
+// false = 不可讀. True readability = (pmReadable == true) plus writeReady.
+fun UiState.pmReadableText(): String = when (pmReadable) {
+    true -> "PM可讀"
+    false -> "PM不可讀"
+    null -> "PM未知"
+}
