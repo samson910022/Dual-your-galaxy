@@ -303,6 +303,9 @@ class CloneVerifyRefreshTest {
             listPackagesExit = 1,
         )
         val repo = DualRepository(gateway)
+        // Virtual settle wait (PR-32 P2-1: default delayFn is now real
+        // delay(), which the synchronous runSuspend runner cannot resume).
+        repo.delayFn = { }
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
     }
@@ -357,6 +360,8 @@ class CloneVerifyRefreshTest {
             listPackagesExit = 1,
         )
         val repo = DualRepository(gateway)
+        // Virtual settle wait (PR-32 P2-1: see unknownRecheck above).
+        repo.delayFn = { }
         val outcome = runSuspend { repo.removeVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
         assertTrue(
@@ -488,6 +493,9 @@ class CloneVerifyRefreshTest {
     fun verifyState_distinguishesAbsentFromUnknown() {
         val gateway = FakeGateway(listPackagesOut = "package:com.example.chat\n")
         val repo = DualRepository(gateway)
+        // Virtual settle wait (PR-32 P2-1: the non-zero leg below retries;
+        // default delay() cannot resume under the synchronous runSuspend).
+        repo.delayFn = { }
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Installed)
 
         gateway.listPackagesOut = ""
