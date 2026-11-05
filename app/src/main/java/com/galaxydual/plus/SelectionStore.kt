@@ -41,14 +41,17 @@ data class SavedSelection(
     val source: String = SELECTION_SOURCE_MANUAL,
     // 保存時刻已知的 verified dualId (寫入目標身分,恢復時必須相符)。
     val knownTargetId: Int = -1,
-    // 已勾選包名集合 (排序後保存,跨重啟位元組穩定)。
+    // 已勾選 AppKey 集合 ("<serial>:<package>",見 sourceAppKey；排序後保存,
+    // 跨重啟位元組穩定。舊版包名格式 (無冒號) 僅恢復側向前容忍,新寫入一律 AppKey)。
     val selectedPackages: Set<String> = emptySet(),
     // 保存時刻 wall-clock (nowMs 注入,測試決定性)。
     val savedAtMs: Long = 0L,
 )
 
-// 包名 token 白名單 (與 core ShellEscaper 同字集:失敗行直接跳過,不污染整筆)。
-private val SELECTION_PKG_TOKEN = Regex("^[a-zA-Z0-9._-]+$")
+// AppKey/包名 token 白名單 (core ShellEscaper 字集 + ":" 供 AppKey 的
+// "serial:package" 前綴；serial 為數字，包名仍為 dotted token。失敗行直接
+// 跳過,不污染整筆)。
+private val SELECTION_PKG_TOKEN = Regex("^[a-zA-Z0-9._\\-:]+$")
 
 // 序列化 (純函數):首行為版本頭,後續 key=value / pkg= 行。
 // 未知行忽略 (向前容忍),但首行版本不符整筆作廢。
@@ -125,10 +128,14 @@ class SelectionStore(
         null
     }
 
-    // 讀已勾選包名:損壞/目標不符皆回傳空集合 (fail closed)。
-    // - 損壞 (有原始字串但解析失敗):主動清除損壞條目,下次 save 即恢復。
+    // 讀已勾選 AppKey:損壞/目標不符皆回傳空集合 (fail closed)。
+    // 副作用 (fail-closed 已文件化,有意為之):
+    // - 損壞 (有原始字串但解析失敗):主動清除損壞條目,下次 save 覆寫即恢復。
     // - 目標不符 (profile 變動):清除陳舊條目,舊選取永不復活。
+    // - currentTargetId <= 0 (無目標):直接回空且不觸碰存檔 (early return 在
+    //   讀取前,絕不刪除；未知目標的讀取永不破壞已存資料)。
     fun loadSelected(currentTargetId: Int): Set<String> {
+        if (currentTargetId <= 0) return emptySet()
         val raw: String? = try {
             loadRaw()
         } catch (_: Exception) {
@@ -191,7 +198,8 @@ class SelectionStore(
 // 生產綁定:app-private SharedPreferences (MODE_PRIVATE),單鍵同步 commit。
 // 寫入後同檔新建 client (新 SelectionStore 實例) 可重讀 (同一 prefs 檔)。
 // 有意用 commit() 而非 apply():需同步落盤語義 (取消保存/損壞自清後立即一致);
-// payload 僅數 KB,呼叫方已在 IO dispatcher,主執行緒阻塞可接受。
+// payload 僅數 KB,且 DualViewModel 經 onIo (Dispatchers.IO) 呼叫 save/clear/
+// loadSelected,故同步落盤不阻塞主執行緒。
 @SuppressLint("ApplySharedPref")
 fun SharedPreferences.selectionStore(): SelectionStore = SelectionStore(
     loadRaw = { getString(SELECTION_KEY, null) },

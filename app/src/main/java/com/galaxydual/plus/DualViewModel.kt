@@ -1315,7 +1315,6 @@ class DualViewModel(
         } catch (e: Exception) {
             // Never swallow coroutine cancellation: rethrow so cancel stays
             // cooperative and refresh() coalescing still drains correctly.
-            if (e is CancellationException) throw e
             // Gateways report via CmdResult, but guard against unexpected throws.
             // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
             // PR-6 P2: 舊資料標 STALE，不謊稱新鮮；lastOperation 不動。
@@ -2944,7 +2943,7 @@ class DualViewModel(
                         // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
                         // pinnedTarget 保留當次已知 dualId (pending 目標)，
                         // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
-                        // 非 OP_FAILED)。
+                        // 非 OP_FAILED).
                         _state.update {
                             val (op, diag) = recordOp(
                                 opId = key,
@@ -3003,6 +3002,8 @@ class DualViewModel(
     // - clearSelectionLocal:清空記憶體勾選 (≠卸載);要連持久化一起丟用
     //   cancelSavedSelection。
     fun setSourceCatalog(entries: List<SourceAppEntry>) {
+        // m3：空 catalog 亦正常寫入 state（UI 顯示「尚未載入」），不吞掉；
+        // 但空時不觸發恢復（守衛，配合 M4 marker 語義）。
         _state.update { it.copy(sourceCatalog = entries.toList()) }
         // catalog 後載補觸恢復：refresh 可能先跑在空 catalog 上（不置 marker，
         // 見 restoreSelectionLocked），此處 catalog 就緒後對已知目標補試一次。
@@ -3070,9 +3071,11 @@ class DualViewModel(
 
     // 保存當前勾選到 SelectionStore (需明確已知目標,不自行解析)。
     // 只保存勾選,不寫入任何分身;targetId <= 0 或無 store 時拒絕並說明。
-    // 保存內容為包名集合 (selected packages,見 SelectionStore):由當前 catalog
-    // 將 AppKey 映射為包名;catalog 已缺失的 key 無法解析，直接捨去 (批次亦
-    // 無法執行,見 cloneSelected 的 InvalidPackage 分流)。
+    // 保存內容為 AppKey 集合 ("serial:package",見 sourceAppKey)：只存仍在
+    // 當前 catalog 的 key；catalog 已缺失的 key 直接捨去 (批次亦無法執行，
+    // 見 cloneSelected 的 InvalidPackage 分流，計入 failed 非 unknown)。
+    // M9 stale-target 守衛：在 opMutex 內重讀 inventory.targetId，已知目標
+    // (>0) 與傳入不一致即拒絕 (MsgKind.INVALID，明示目標已變更)，不寫入 store。
     fun persistSelection(targetId: Int, source: String = SELECTION_SOURCE_CATALOG) {
         viewModelScope.launch {
             opMutex.withLock {
@@ -3089,12 +3092,23 @@ class DualViewModel(
                     }
                     return@withLock
                 }
-                val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
+                val knownTarget = _state.value.inventory.targetId
+                if (knownTarget > 0 && knownTarget != targetId) {
+                    _state.update {
+                        it.copy(
+                            msg = "選取目標已變更（user $knownTarget ≠ $targetId），" +
+                                "請重新確認後再保存",
+                            msgKind = MsgKind.INVALID,
+                        )
+                    }
+                    return@withLock
+                }
+                val catalogKeys = _state.value.sourceCatalog.map { it.appKey }.toSet()
                 val selected = _state.value.selectedKeys
-                    .mapNotNull { catalogByKey[it]?.packageName }
+                    .filterTo(mutableSetOf()) { it in catalogKeys }
                     .toSortedSet()
                 val ok = try {
-                    store.save(source, targetId, selected, nowMs())
+                    onIo { store.save(source, targetId, selected, nowMs()) }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     false
@@ -3127,7 +3141,7 @@ class DualViewModel(
                     return@withLock
                 }
                 val ok = try {
-                    store.clear()
+                    onIo { store.clear() }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     false
@@ -3148,10 +3162,12 @@ class DualViewModel(
 
     // 從 SelectionStore 恢復勾選 (供重啟/Activity 重建後呼叫):
     // - 僅在 selectedKeys 為空時恢復 (永不覆蓋使用者當前勾選)。
-    // - 保存的是包名集合；只恢復仍在 catalog (availableKeys,預設為當前
-    //   catalog 全量包名) 的包，並映射回其 AppKey (圖示/來源鍵保持當次載入)。
+    // - 保存的是 AppKey 集合；只恢復仍在 catalog (availableKeys,預設為當前
+    //   catalog 全量 AppKey) 交集內的 key (舊版包名格式向前容忍：無冒號條目
+    //   按包名 groupBy 取首映射，見內註；新寫入一律 AppKey，無塌陷)。
     // - 恢復只打勾,永不自動執行 clone (恢复不重送寫入)。
-    // - 同一目標只恢復一次 (selectionRestoredForTarget marker)。
+    // - 同一目標只恢復一次 (selectionRestoredForTarget marker)；空結果
+    //   (store 空/損壞/目標不符/交集空) 不置 marker 直接 return (M4)。
     fun restoreSelection(targetId: Int, availableKeys: Set<String>? = null) {
         viewModelScope.launch {
             opMutex.withLock { restoreSelectionLocked(targetId, availableKeys) }
@@ -3159,7 +3175,8 @@ class DualViewModel(
     }
 
     // 恢復本體 (必須在 opMutex 下呼叫):refreshLocked 的 FRESH 分支共用。
-    private fun restoreSelectionLocked(targetId: Int, availableKeys: Set<String>? = null) {
+    // suspend：store I/O 經 onIo 切至 IO dispatcher，不阻塞主執行緒。
+    private suspend fun restoreSelectionLocked(targetId: Int, availableKeys: Set<String>? = null) {
         val store = selectionStore ?: return
         if (targetId <= 0) return
         val cur = _state.value
@@ -3168,19 +3185,26 @@ class DualViewModel(
         // 空 catalog 不置 marker：尚未真正嘗試映射，待 catalog 就緒後
         // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
         if (cur.sourceCatalog.isEmpty()) return
-        val byPackage = cur.sourceCatalog.associateBy { it.packageName }
-        val available = availableKeys ?: byPackage.values.map { it.appKey }.toSet()
+        val byKey = cur.sourceCatalog.associateBy { it.appKey }
+        val available = availableKeys ?: byKey.keys
         val restored = try {
-            store.loadSelected(targetId)
+            onIo { store.loadSelected(targetId) }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             emptySet()
         }
-        selectionRestoredForTarget = targetId
         if (restored.isEmpty()) return
-        // 保存包名 -> 當次 catalog AppKey；不在 catalog 的包不恢復。
-        val kept = restored.mapNotNull { byPackage[it]?.appKey }
-            .filterTo(mutableSetOf()) { it in available }
+        // AppKey 交集恢復；舊版包名條目 (無 ":") 向前容忍：按包名 groupBy 取首
+        // (同包多來源只取 catalog 首個，消除 associateBy(packageName) 塌陷的
+        // 非確定性，舊資料永不硬寫回 AppKey)。
+        val byPackageFirst = cur.sourceCatalog.groupBy { it.packageName }
+            .mapValues { (_, v) -> v.first() }
+        val kept = restored.mapNotNull { saved ->
+            if (":" in saved) byKey[saved]?.appKey
+            else byPackageFirst[saved.trim()]?.appKey
+        }.filterTo(mutableSetOf()) { it in available }
+        if (kept.isEmpty()) return
+        selectionRestoredForTarget = targetId
         _state.update { it.copy(selectedKeys = kept) }
     }
 
@@ -3188,18 +3212,26 @@ class DualViewModel(
     //
     // 階段 1 不引入新批次寫入通道:對每個已勾選包名依確定順序 (包名升冪)
     // 逐一呼叫既有單筆 repo.cloneVerified,逐項記錄 lastOperation/diagnose,
-    // 最後彙總 BatchReport (成功/失敗/未知分開,部分成功如實呈現)。
+    // 最後彙總 BatchReport (成功/失敗/未知分開,部分成功如實呈現；
+    // InvalidPackage 計入 failed，非 unknown)。
     // - 空選取:拒絕,不碰裝置 (鎖外快照僅做早拒,執行以鎖內重讀為準,見 B1)。
     // - 單一 "batch:clone" inFlight key:併發第二批回報 already in progress。
     // - batch×single 互斥 (B2):執行前按鎖內 catalog 映射逐包認領
-    //   "clone:<pkg>" (catalog 缺失 key 跳過認領,仍按 InvalidPackage 記帳);
+    //   "clone:<pkg>" (catalog 缺失 key 跳過認領,仍按 InvalidPackage 記帳，
+    //   計入 failed);
     //   任一已存在則整批拒絕 (INFO,明示該包),不碰裝置,整批結束 finally 釋放。
     //   已知缺口:remove:<pkg> 未納入本次 batch×single 互斥 (Phase 1 範圍外)。
     // - 一次 isWritable 前置檢查 (唯讀/佔位通道整批拒絕);逐項失敗不中斷
     //   其餘項目 (ChannelError 逐項繼續;NoDual 首見後短路,見下)。
     // - NoDual 短路 (M13):首個 NoDual 後剩餘未執行項直接記同一 NoDual,
     //   不再打裝置 (verified target 已消失,繼續打裝置必敗)。
-    // - catalog 缺失的 key 以 InvalidPackage 記帳,不拋出。
+    // - catalog 缺失的 key 以 InvalidPackage 記帳 (計入 failed),顯示用包名
+    //   回退為 appKey 去 serial 前綴 (m1)，不拋出。
+    // - 最終彙總 (M1/M2/M10):覆寫一條批次級 LastOperation (opId="batch:clone",
+    //   phase 按 failed>0→FAILED、unknown>0→UNKNOWN、否則 SUCCESS)，
+    //   diagnose 全成功則 null，否則為彙總對應事件；只要有 ≥1 成功即把
+    //   inventory 標 STALE（保留 targetId 供追溯，不觸發 refresh）。
+    //   逐項 recordBatchItemUnknownOrFailed 僅為中途明細，最終必被覆寫。
     // - 批次中斷 (M3):catch 內以已累積 items 發 partial BatchReport
     //   (計數口徑與正常彙總一致),loading=false,lastOperation FAILED
     //   (opId=batch:clone);取消 (CancellationException) 直接重拋,不寫
@@ -3280,13 +3312,14 @@ class DualViewModel(
                         var noDualShort: CloneOutcome.NoDual? = null
                         for (appKey in ordered) {
                             if (noDualShort != null) {
-                                // M13:短路前先本地校驗 catalog,缺失 key 按正常路徑記 InvalidPackage。
+                                // M13:短路前先本地校驗 catalog,缺失 key 按正常路徑記 InvalidPackage
+                                // (計入 failed；顯示用包名回退 appKey 去 serial 前綴)。
                                 val pkg = catalogByKey[appKey]?.packageName
                                 if (pkg == null) {
                                     items.add(
                                         BatchItemResult(
                                             appKey = appKey,
-                                            pkg = appKey,
+                                            pkg = appKey.substringAfter(":"),
                                             outcome = CloneOutcome.InvalidPackage(appKey),
                                         ),
                                     )
@@ -3294,11 +3327,7 @@ class DualViewModel(
                                 }
                                 val short = noDualShort
                                 items.add(BatchItemResult(appKey, pkg, short))
-                                recordBatchItemUnknownOrFailed(
-                                    pkg,
-                                    short.toDiagnoseCode(),
-                                    short,
-                                )
+                                recordBatchItemUnknownOrFailed(pkg, short)
                                 continue
                             }
                             val pkg = catalogByKey[appKey]?.packageName
@@ -3306,7 +3335,7 @@ class DualViewModel(
                                 items.add(
                                     BatchItemResult(
                                         appKey = appKey,
-                                        pkg = appKey,
+                                        pkg = appKey.substringAfter(":"),
                                         outcome = CloneOutcome.InvalidPackage(appKey),
                                     ),
                                 )
@@ -3337,28 +3366,28 @@ class DualViewModel(
                                 }
                                 is CloneOutcome.NoDual -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                     noDualShort = res
                                 }
                                 is CloneOutcome.ChannelError -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                 }
                                 is CloneOutcome.InvalidPackage -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                 }
                                 is CloneOutcome.InstallFailed -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                 }
                                 is CloneOutcome.VerifyFailed -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                 }
                                 is CloneOutcome.VerifyUnknown -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res.toDiagnoseCode(), res)
+                                    recordBatchItemUnknownOrFailed(pkg, res)
                                 }
                             }
                         }
@@ -3371,6 +3400,27 @@ class DualViewModel(
                             failedCount = failed,
                             unknownCount = unknown,
                         )
+                        // M1/M2/M10：最終彙總覆寫批次級 LastOperation + diagnose 口徑，
+                        // 取代逐項末筆覆寫；≥1 成功即把
+                        // inventory 標 STALE（保留
+                        // targetId 供追溯，不觸發 refresh）。
+                        val batchDetail = "批次 ${items.size} 項：成功 $success/失敗 $failed/未知 $unknown"
+                        val batchPhase = when {
+                            failed > 0 -> OpPhase.FAILED
+                            unknown > 0 -> OpPhase.UNKNOWN
+                            else -> OpPhase.SUCCESS
+                        }
+                        val batchDiagnose: DiagnoseEvent? = when {
+                            failed == 0 && unknown == 0 -> null
+                            failed > 0 -> diagnoseEvent(
+                                DiagnoseCode.OP_FAILED,
+                                techDetail = batchDetail.take(MAX_DIAG_DETAIL_CHARS),
+                            )
+                            else -> diagnoseEvent(
+                                DiagnoseCode.VERIFY_UNKNOWN,
+                                techDetail = batchDetail.take(MAX_DIAG_DETAIL_CHARS),
+                            )
+                        }
                         _state.update { cur ->
                             val summary = "批次完成：成功 $success / 失敗 $failed / 未知 $unknown" +
                                 "（共 ${items.size} 項）"
@@ -3379,9 +3429,30 @@ class DualViewModel(
                                 unknown > 0 -> MsgKind.CHANNEL
                                 else -> MsgKind.INFO
                             }
+                            val pinned = items.firstNotNullOfOrNull {
+                                when (val o = it.outcome) {
+                                    is CloneOutcome.Success -> o.dualId
+                                    is CloneOutcome.VerifyFailed -> o.dualId
+                                    is CloneOutcome.VerifyUnknown -> o.dualId
+                                    else -> null
+                                }
+                            } ?: cur.inventory.targetId.takeIf { it > 0 } ?: -1
+                            val staleInventory =
+                                if (success > 0) cur.inventory.copy(freshness = InventoryFreshness.STALE)
+                                else cur.inventory
                             cur.copy(
                                 loading = false,
                                 batchReport = report,
+                                lastOperation = LastOperation(
+                                    opId = opKey,
+                                    appKey = "batch",
+                                    pinnedTarget = pinned,
+                                    phase = batchPhase,
+                                    timeMs = nowMs(),
+                                    detail = batchDetail,
+                                ),
+                                inventory = staleInventory,
+                                diagnose = batchDiagnose,
                                 msg = summary,
                                 msgKind = kind,
                             )
@@ -3403,8 +3474,11 @@ class DualViewModel(
                             failedCount = failed,
                             unknownCount = unknown,
                         )
-                        _state.update {
-                            it.copy(
+                        _state.update { cur ->
+                            val staleInventory =
+                                if (success > 0) cur.inventory.copy(freshness = InventoryFreshness.STALE)
+                                else cur.inventory
+                            cur.copy(
                                 loading = false,
                                 batchReport = partial,
                                 lastOperation = LastOperation(
@@ -3418,6 +3492,7 @@ class DualViewModel(
                                         ": ${(e.message ?: "batch clone failed")
                                             .take(MAX_DIAG_DETAIL_CHARS)}",
                                 ),
+                                inventory = staleInventory,
                                 diagnose = diagnoseEvent(
                                     DiagnoseCode.OP_FAILED,
                                     techDetail = (e.message ?: "batch clone failed")
@@ -3449,22 +3524,25 @@ class DualViewModel(
         is CloneOutcome.VerifyUnknown -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
     }
 
-    // 批次逐項非成功結果記帳:lastOperation 逐項覆寫 (pinned verify 語意與
-    // 單筆 clone 一致),diagnose 取該 outcome 穩定碼;cloned 不動 (fail closed)。
+    // 批次逐項非成功結果記帳 (中途明細):lastOperation 逐項覆寫
+    // (pinned verify 語意與單筆 clone 一致),diagnose 取該 outcome 穩定碼;
+    // cloned 不動 (fail closed)。最終彙總必覆寫為批次級
+    // LastOperation (opId=batch:clone, 見 cloneSelected 尾段 M1/M2/M10)。
+    // m2: 未使用的 code 參數已刪除；不可達 Success 分支已刪除
+    // (本函數僅用於非成功項)。
     private fun recordBatchItemUnknownOrFailed(
         pkg: String,
-        code: DiagnoseCode,
         res: CloneOutcome,
     ) {
         val now = nowMs()
         val (phase, target) = when (res) {
-            is CloneOutcome.Success -> OpPhase.SUCCESS to res.dualId
             is CloneOutcome.NoDual -> OpPhase.UNKNOWN to -1
             is CloneOutcome.ChannelError -> OpPhase.UNKNOWN to -1
             is CloneOutcome.InvalidPackage -> OpPhase.FAILED to -1
             is CloneOutcome.InstallFailed -> OpPhase.FAILED to -1
             is CloneOutcome.VerifyFailed -> OpPhase.FAILED to res.dualId
             is CloneOutcome.VerifyUnknown -> OpPhase.UNKNOWN to res.dualId
+            else -> error("recordBatchItemUnknownOrFailed: unexpected Success")
         }
         _state.update { cur ->
             cur.copy(

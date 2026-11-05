@@ -268,13 +268,14 @@ class InventorySelectionTest {
     }
 
     // 保存後新 client 可重讀（同一後端新建 SelectionStore）。
+    // M7: 新寫入一律 AppKey ("serial:package")；白名單容納 ":"。
     @Test
     fun selection_persistsAcrossClients() {
         val backend = MapBackend()
         val s1 = backend.store()
-        assertTrue(s1.save(SELECTION_SOURCE_CATALOG, 95, setOf("com.a", "com.b"), 1000L))
+        assertTrue(s1.save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.a", "0:com.b"), 1000L))
         val s2 = backend.store()
-        assertEquals(setOf("com.a", "com.b"), s2.loadSelected(95))
+        assertEquals(setOf("0:com.a", "0:com.b"), s2.loadSelected(95))
         assertEquals(95, s2.loadSnapshot()?.knownTargetId)
         assertEquals(SELECTION_SOURCE_CATALOG, s2.loadSnapshot()?.source)
     }
@@ -324,7 +325,7 @@ class InventorySelectionTest {
             backend.store().save(
                 SELECTION_SOURCE_CATALOG,
                 95,
-                setOf("com.example.chat", "com.example.mail"),
+                setOf("0:com.example.chat", "0:com.example.mail"),
                 1000L,
             ),
         )
@@ -445,6 +446,18 @@ class InventorySelectionTest {
             gw.installCalls.toSet(),
         )
         assertEquals("batch must not uninstall", 0, gw.uninstallCalls.size)
+        // M1/M2/M10: 最終彙總覆寫批次級 LastOperation + diagnose，≥1 成功標 STALE。
+        val last = vm.state.value.lastOperation
+        assertNotNull("batch must leave a batch-level LastOperation", last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.FAILED, last.phase)
+        assertEquals("批次 2 項：成功 1/失敗 1/未知 0", last.detail)
+        assertEquals(DiagnoseCode.OP_FAILED, vm.state.value.diagnose?.code)
+        assertEquals(
+            "any success must mark inventory STALE (no auto refresh)",
+            InventoryFreshness.STALE,
+            vm.state.value.inventory.freshness,
+        )
     }
 
     // 批次 unknown：安裝成功但查證通道失敗 -> unknown，不算失敗，cloned 不收。
@@ -468,6 +481,69 @@ class InventorySelectionTest {
         assertTrue(report.items.single().outcome is CloneOutcome.VerifyUnknown)
         assertFalse(vm.state.value.cloned.contains("com.example.myst"))
         assertTrue(vm.state.value.msg.contains("未知 1"))
+        // M1/M2: unknown-only 批次 phase UNKNOWN + VERIFY_UNKNOWN diagnose，無成功不標 STALE。
+        val lastU = vm.state.value.lastOperation
+        assertNotNull(lastU)
+        assertEquals("batch:clone", lastU!!.opId)
+        assertEquals(OpPhase.UNKNOWN, lastU.phase)
+        assertEquals("批次 1 項：成功 0/失敗 0/未知 1", lastU.detail)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+    }
+
+    // M1 全成功清 diagnose： failed==0 && unknown==0 則 diagnose=null，
+    // 批次級 LastOperation phase SUCCESS，並標 STALE。
+    @Test
+    fun batch_allSuccess_clearsDiagnoseAndMarksStale() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+
+        val report = vm.state.value.batchReport!!
+        assertEquals(1, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertNull("all-success batch must clear diagnose (single-clone parity)", vm.state.value.diagnose)
+        val last = vm.state.value.lastOperation
+        assertNotNull(last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.SUCCESS, last.phase)
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+    }
+
+    // m1 显示回退：catalog 缺失 key 的 BatchItemResult.pkg 不含 "serial:" 前綴。
+    @Test
+    fun batch_missingCatalogKey_usesDisplayFallback() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        vm.toggleSelection("0:com.example.ghost")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+
+        val report = vm.state.value.batchReport!!
+        assertEquals(2, report.items.size)
+        val ghost = report.items.first { it.appKey == "0:com.example.ghost" }
+        assertEquals(
+            "missing-key display pkg must strip the serial prefix",
+            "com.example.ghost",
+            ghost.pkg,
+        )
+        assertTrue(ghost.outcome is CloneOutcome.InvalidPackage)
+        // InvalidPackage 計入 failed（非 unknown）。
+        assertEquals(1, report.successCount)
+        assertEquals(1, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertEquals(0, gw.installCalls.count { it == "0:com.example.ghost" })
     }
 
     // 空選取：拒絕，不碰裝置。
