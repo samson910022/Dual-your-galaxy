@@ -19,9 +19,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -237,6 +241,11 @@ class SuCancellableTest {
     // Fault injection: fake Process whose wait reports wrapper exit after
     // destroy but whose streams never EOF on their own (simulated child-held
     // pipes that only release on local close()).
+    // Scope note: this fake verifies reclaim wiring (cleanup calls close on
+    // both local pipe ends + bounded join), NOT OS-level close wake-up
+    // semantics (a real FileInputStream stuck in native read is not guaranteed
+    // to wake on close; HangingInputStream here is a close-pollable model that
+    // returns EOF once closed).
     private class HangingInputStream : java.io.InputStream() {
         @Volatile private var closed = false
         val isClosed: Boolean get() = closed
@@ -331,7 +340,11 @@ class SuCancellableTest {
         // (deterministic) in addition to the global thread-count convergence
         // below (which tolerates one foreign lingering drain under full-suite
         // load, hence <= 4 rather than <= 2 -- old code leaves ~16 here).
-        val fakes = mutableListOf<ChildHoldsPipeProcess>()
+        // Thread safety: execFn runs on the Dispatchers.Default waiter while
+        // the test body reads after each join; CopyOnWriteArrayList removes the
+        // cross-thread data race a plain mutableListOf would have here.
+        val fakes = CopyOnWriteArrayList<ChildHoldsPipeProcess>()
+        var maxElapsed = 0L
         repeat(8) { idx ->
             val job = async(Dispatchers.Default) {
                 captureProcessCancellable(
@@ -352,11 +365,19 @@ class SuCancellableTest {
                 // effort, remote child untouched (unknown-after-send).
             }
             val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            if (elapsedMs > maxElapsed) maxElapsed = elapsedMs
             assertTrue(
                 "cancel handover must stay fast with child-held pipes (iter $idx elapsed=${elapsedMs}ms)",
                 elapsedMs < 2_000L,
             )
         }
+        // Tightened handover bound: reclaim does two bounded drain joins
+        // (2 x SU_CANCEL_DRAIN_MS = 600 ms ceiling), so the worst cancel
+        // return must stay under 1 s even on slow CI.
+        assertTrue(
+            "worst cancel return must stay under 1 s with child-held pipes (maxElapsed=${maxElapsed}ms)",
+            maxElapsed < 1_000L,
+        )
         // Deterministic: every cancel must have closed both local pipe ends,
         // otherwise a surviving child holding the FDs pins the drains forever.
         assertEquals("every child-holds-pipe fake must be observed", 8, fakes.size)
@@ -367,6 +388,9 @@ class SuCancellableTest {
         // Bounded convergence: close() above lets the blocked reads
         // return/EOF so drains die async instead of accumulating 2 per cancel
         // (old code would leave ~16 alive here).
+        // Primary verdict is the deterministic isClosed check above; the
+        // thread count below stays a weak backstop (tolerates foreign drains
+        // under full-suite load, hence <= 4 rather than <= 2).
         val deadlineMs = System.currentTimeMillis() + 5_000L
         var alive = aliveCaptureDrains()
         while (alive > 4 && System.currentTimeMillis() < deadlineMs) {
@@ -377,5 +401,127 @@ class SuCancellableTest {
             "daemon drain threads must converge after child-holds-pipe cancels (alive=$alive, expected<=4 not 16)",
             alive <= 4,
         )
+        // Post-reclaim health: a fresh call right after the 8 child-held
+        // cancels must still succeed fast (later calls unaffected).
+        val nextStartNs = System.nanoTime()
+        val next = captureProcessCancellable(arrayOf("sh", "-c", "echo ok"), timeoutMs = 5_000L)
+        val nextElapsedMs = (System.nanoTime() - nextStartNs) / 1_000_000L
+        assertEquals("call after child-held cancels must succeed", "ok\n", next.out)
+        assertTrue(
+            "call after child-held cancels must be fast (elapsed=${nextElapsedMs}ms)",
+            nextElapsedMs < 2_000L,
+        )
+    }
+
+    // Phase A3 P2-2 (PR #40 Re-review): fake whose timed waitFor slices block
+    // like a real hung `su` (sleeps the requested slice, reports not-exited)
+    // while the zero-time poll reports the truth without blocking. Lets the
+    // tests below drive the injected monotonic clock while real time only
+    // paces the poll slices.
+    private class NeverExitingProcess : Process() {
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = throw UnsupportedOperationException("no-arg waitFor unused")
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            if (timeout <= 0) return false
+            try {
+                Thread.sleep(minOf(unit.toMillis(timeout), SU_WAIT_POLL_MS))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw e
+            }
+            return false
+        }
+        override fun exitValue(): Int = throw IllegalThreadStateException("not exited")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process = this
+        override fun isAlive(): Boolean = true
+    }
+
+    // Phase A3 P2-2 regression (falsifiable): the helpers measure elapsed
+    // time on the injectable monotonic clock only (mono-only design, never a
+    // System.currentTimeMillis wall deadline). A previous version of these
+    // tests moved a fakeWallMs variable that production never reads (decoy:
+    // helpers only take a monoMs parameter), so a wall-clock implementation
+    // passed vacuously -- the decoy is therefore removed, not moved.
+    // Falsifiability instead comes from freezing mono while REAL time runs
+    // past the budget: a wall-clock implementation (`deadline =
+    // currentTimeMillis + timeout`) would expire after ~300 ms of real time
+    // regardless of the frozen mono, failing the still-waiting assertion
+    // below; the mono implementation stays waiting until mono advances.
+    // Margin is deliberately loose (1 s real vs 300 ms budget, >3x) so CI
+    // jitter cannot flip the verdict; the 5 s withTimeoutOrNull ceiling only
+    // bounds hangs.
+    @Test fun awaitExitFrozenMonoDoesNotExpire_monoAdvanceExpiresImmediately() = runBlocking {
+        val monoMs = AtomicLong(0L) // frozen: never advances until the second phase
+        val proc = NeverExitingProcess()
+        val done = async(Dispatchers.Default) {
+            cancellableAwaitExit(proc, timeoutMs = 300L, monoMs = { monoMs.get() })
+        }
+        // Real time (1 s) runs well past the 300 ms budget while mono stays 0.
+        // A wall-clock implementation would have timed out at ~300 ms real;
+        // the mono implementation must still be waiting.
+        delay(1_000L)
+        assertFalse(
+            "frozen mono must not expire even after 1 s real > 300 ms budget (wall impl would fail here)",
+            done.isCompleted,
+        )
+        // Advance mono past the budget: expiry must now be immediate (one
+        // poll slice, well under the loose 2 s bound / 5 s ceiling).
+        monoMs.set(300L)
+        val startNs = System.nanoTime()
+        val finished = withTimeoutOrNull(5_000L) { done.await(); true } ?: false
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertTrue("mono advance past budget must expire the wait", finished)
+        assertTrue(
+            "mono expiry must be immediate (elapsed=${elapsedMs}ms)",
+            elapsedMs < 2_000L,
+        )
+        assertFalse("hung proc reports timeout (false), not exit", done.await())
+    }
+
+    // Same frozen-mono falsifiability for the drain-join budget: the join
+    // returns once monotonic elapsed reaches the budget, not after real time
+    // passes it. A wall-clock join would return at ~300 ms real despite the
+    // frozen mono and fail the still-waiting assertion; the mono join stays
+    // until mono advances.
+    @Test fun joinFrozenMonoDoesNotExpire_monoAdvanceExpiresImmediately() = runBlocking {
+        val monoMs = AtomicLong(0L) // frozen: never advances until the second phase
+        val sleeper = thread(isDaemon = true, name = "p22-fake-drain") {
+            try {
+                Thread.sleep(30_000L)
+            } catch (_: InterruptedException) {
+                // Expected on cleanup below.
+            }
+        }
+        try {
+            val job = async(Dispatchers.Default) {
+                cancellableJoin(sleeper, budgetMs = 300L, monoMs = { monoMs.get() })
+            }
+            // Real time (1 s) runs well past the 300 ms budget while mono stays 0.
+            delay(1_000L)
+            assertFalse(
+                "frozen mono must not expire the join even after 1 s real > 300 ms budget (wall impl would fail here)",
+                job.isCompleted,
+            )
+            // Advance mono past the budget: the join must return at once
+            // while the thread is still alive (caller re-checks isAlive).
+            monoMs.set(300L)
+            val startNs = System.nanoTime()
+            val finished = withTimeoutOrNull(5_000L) { job.await(); true } ?: false
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("mono advance past budget must expire the join", finished)
+            assertTrue(
+                "mono join expiry must be immediate (elapsed=${elapsedMs}ms)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "budget expiry returns while the thread is alive (caller re-checks isAlive)",
+                sleeper.isAlive,
+            )
+        } finally {
+            sleeper.interrupt()
+        }
     }
 }
