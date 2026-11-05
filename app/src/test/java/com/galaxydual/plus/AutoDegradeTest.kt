@@ -7,6 +7,10 @@
 // - both succeeding -> ROOT (F4a order, no degrade note).
 // - explicit SHIZUKU never crosses to ROOT even when ROOT is proven.
 //
+// Phase 4: 62 tests (was 17 at phase-2, 49 at phase-3 close); this file now also
+// covers factory parity, probeScope, degrade-note error-first, reverse swaps,
+// and command-count/command-delta assertions (see per-test headers).
+//
 // Harness mirrors RemoveConfirmTest: DualViewModel runs on viewModelScope
 // (Dispatchers.Main replaced with Unconfined), repo I/O on Dispatchers.IO,
 // tests poll StateFlow with a timeout.
@@ -55,13 +59,19 @@ class AutoDegradeTest {
         // Counts `id -u` (su auth-risk probe) vs `pm list users` separately so
         // P25 Item 3 can bound unrelated-channel probes (explicit SHIZUKU must
         // never run `su -c id -u`).
-        @Volatile var idUCalls = 0
+        val idUCalls = AtomicInteger(0)
         // Counts `pm list users` calls so tests can prove a re-probe ran.
-        @Volatile var listUsersCalls = 0
+        val listUsersCalls = AtomicInteger(0)
+        // Phase 4 C3: per-command counters so refresh can assert exact
+        // command deltas (verbose/dumpsys/getprop/listPackages).
+        val verboseCalls = AtomicInteger(0)
+        val dumpsysCalls = AtomicInteger(0)
+        val getpropCalls = AtomicInteger(0)
+        val listPackagesCalls = AtomicInteger(0)
         // Counts diagnostic `cat` (hook marker) so tests prove a (non-)use
         // of a gateway for diagnosis without conflating with idU probes.
-        @Volatile var catCalls = 0
-        @Volatile var uninstallCalls = 0
+        val catCalls = AtomicInteger(0)
+        val uninstallCalls = AtomicInteger(0)
         var uninstallOut = "Success"
         var uninstallExit = 0
         // Stateful installed set (mirrors RemoveConfirmTest FakeRepoGateway):
@@ -110,37 +120,45 @@ class AutoDegradeTest {
 
         override suspend fun run(cmd: String): CmdResult = when {
             cmd.trim() == "id -u" -> {
-                idUCalls++
+                idUCalls.incrementAndGet()
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
             }
             cmd == DualRepository.CMD_LIST_USERS -> {
-                listUsersCalls++
+                listUsersCalls.incrementAndGet()
                 val pmOk = pmListOk ?: rootOk
                 if (pmOk) CmdResult(exit = 0, out = usersOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied: su refused")
             }
-            cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                verboseCalls.incrementAndGet()
                 CmdResult(exit = 0, out = verboseOut(), err = "")
-            cmd == DualRepository.CMD_DUMPSYS_USER ->
+            }
+            cmd == DualRepository.CMD_DUMPSYS_USER -> {
+                dumpsysCalls.incrementAndGet()
                 CmdResult(exit = 0, out = dumpsysOut(), err = "")
-            cmd == DualRepository.CMD_GETPROP_DUAL ->
+            }
+            cmd == DualRepository.CMD_GETPROP_DUAL -> {
+                getpropCalls.incrementAndGet()
                 CmdResult(exit = 0, out = "$dualId\n", err = "")
+            }
             cmd.startsWith("pm uninstall") -> {
-                uninstallCalls++
+                uninstallCalls.incrementAndGet()
                 val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
                 if (uninstallExit == 0) installedPkgs.remove(pkg)
                 CmdResult(exit = uninstallExit, out = uninstallOut, err = "")
             }
-            cmd.startsWith("pm list packages") ->
+            cmd.startsWith("pm list packages") -> {
+                listPackagesCalls.incrementAndGet()
                 CmdResult(exit = 0, out = listPackagesOut(), err = "")
+            }
             cmd.startsWith("cat ") -> {
                 // Phase A P2: serve marker content for hook diagnosis; null
                 // keeps the legacy "ok" (no scopes). `cat` never touches
                 // idUCalls/listUsersCalls, so zero-probe assertions stay valid.
                 // N1 Phase 1: `cat` obeys rootOk/catOk -- a revoked su must
                 // fail `cat` (fail closed, maps to UNKNOWN via diagnosis).
-                catCalls++
+                catCalls.incrementAndGet()
                 val catAllowed = catOk ?: rootOk
                 if (!catAllowed) {
                     CmdResult(exit = 1, out = "", err = "denied: su revoked")
@@ -159,13 +177,19 @@ class AutoDegradeTest {
         override val privilege: Privilege = Privilege.SHELL
 
         // Counts `pm list users` calls so tests can prove a re-probe ran.
-        @Volatile var listUsersCalls = 0
+        val listUsersCalls = AtomicInteger(0)
+        // Phase 4 C3: per-command counters so refresh can assert exact
+        // command deltas (verbose/dumpsys/getprop/listPackages).
+        val verboseCalls = AtomicInteger(0)
+        val dumpsysCalls = AtomicInteger(0)
+        val getpropCalls = AtomicInteger(0)
+        val listPackagesCalls = AtomicInteger(0)
         // Counts diagnostic `cat` so tests prove a (non-)use for diagnosis.
         // Mutable shizukuOk models binder dead/rebind (revocation): flipping
         // to false makes the next probe fail, which must rewrite the
         // shizuku evidence entry to false on the same instance.
-        @Volatile var catCalls = 0
-        @Volatile var uninstallCalls = 0
+        val catCalls = AtomicInteger(0)
+        val uninstallCalls = AtomicInteger(0)
         var uninstallOut = "Success"
         var uninstallExit = 0
         // Stateful installed set (mirrors RemoveConfirmTest FakeRepoGateway):
@@ -203,33 +227,41 @@ class AutoDegradeTest {
 
         override suspend fun run(cmd: String): CmdResult = when {
             cmd == DualRepository.CMD_LIST_USERS -> {
-                listUsersCalls++
+                listUsersCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = usersOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied: not authorized")
             }
-            cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                verboseCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = verboseOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
-            cmd == DualRepository.CMD_DUMPSYS_USER ->
+            }
+            cmd == DualRepository.CMD_DUMPSYS_USER -> {
+                dumpsysCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = dumpsysOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
-            cmd == DualRepository.CMD_GETPROP_DUAL ->
+            }
+            cmd == DualRepository.CMD_GETPROP_DUAL -> {
+                getpropCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = "$dualId\n", err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
+            }
             cmd.startsWith("pm uninstall") -> {
                 if (!shizukuOk) CmdResult(exit = 1, out = "", err = "denied")
                 else {
-                    uninstallCalls++
+                    uninstallCalls.incrementAndGet()
                     val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
                     if (uninstallExit == 0) installedPkgs.remove(pkg)
                     CmdResult(exit = uninstallExit, out = uninstallOut, err = "")
                 }
             }
-            cmd.startsWith("pm list packages") ->
+            cmd.startsWith("pm list packages") -> {
+                listPackagesCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = listPackagesOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
+            }
             cmd.startsWith("cat ") -> {
-                catCalls++
+                catCalls.incrementAndGet()
                 if (shizukuOk) CmdResult(exit = 0, out = markerContentForTest(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
             }
@@ -262,6 +294,20 @@ class AutoDegradeTest {
         Dispatchers.resetMain()
     }
 
+    // Phase 4 A4 FactoryParity: default tracks production (null = ViewModel
+    // default { listOf(suGateway, shizukuGateway) } so candidates TRACK
+    // rebuilds, same as DualViewModelFactory/selectChannel production path).
+    // Pass an explicit { emptyList() } ONLY for the intentional
+    // no-diagnostic-channel case (explicit_shizukuNeverCrossesToRoot keeps
+    // it to prove zero gateway diagnosis). All reuseFactory test doubles map
+    // via pref.resolveChannel (same layer as production assembleChannel, see
+    // factoryParity test below) so the two paths can never drift on channel.
+    // Harness note (Phase 4 C1): Dispatchers.Unconfined runs viewModelScope
+    // eagerly on the caller thread, so probe/refresh bodies start synchronously
+    // and tests poll StateFlow with await()+Thread.sleep settle. Unconfined has
+    // no scheduler control: a stray second probe would flip loading busy again,
+    // so exact-once assertions always require quiescence (await loading false +
+    // short settle) before reading counters, never a bare sleep.
     private fun makeAutoVm(
         suFake: FakeSu,
         shizukuFake: FakeShizuku,
@@ -272,10 +318,10 @@ class AutoDegradeTest {
         preference: ChannelPreference = ChannelPreference.AUTO,
         hookDirectReads: () -> List<MarkerRead> =
             { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
-        // Null = use the ViewModel default { listOf(suGateway, shizukuGateway) }
-        // so candidates TRACK rebuilds (production behavior for the new
-        // instance-bound tests). Non-null keeps a fixed list (legacy tests).
-        hookDiagnosticGateways: (() -> List<CmdGateway>)? = { emptyList() },
+        // Null (default, production tracking) = use the ViewModel default so
+        // candidates TRACK rebuilds. Explicit { emptyList() } = intentional
+        // no-diagnostic-channel (only the pinned example below may use it).
+        hookDiagnosticGateways: (() -> List<CmdGateway>)? = null,
         assembleChannelFn: (
             ChannelPreference,
             Boolean,
@@ -440,8 +486,11 @@ class AutoDegradeTest {
     // resolved gateway stays SHIZUKU with SHELL identity (UI must not claim
     // "正在使用 ROOT").
     // P25 Item 3: explicit probes only its own channel, so the su elevator is
-    // never probed here (suFake.idUCalls stays 0) and the routed summary
+    // never probed here (idUCalls stays 0) and the routed summary
     // reflects the probed subset (SHELL), never an unprobed unrelated channel.
+    // Phase 4 A4: this is the single intentional no-diagnostic-channel example
+    // (explicit emptyList): proves an explicit probe succeeds with zero gateway
+    // diagnosis, while makeAutoVm default (null) tracks production elsewhere.
     @Test
     fun explicit_shizukuNeverCrossesToRoot() {
         val suFake = FakeSu(rootOk = true)
@@ -475,7 +524,7 @@ class AutoDegradeTest {
         // su was intentionally never probed, so this is SHELL, not ROOT.
         // Execution identity stays SHELL either way.
         assertEquals(Privilege.SHELL, s.privilege)
-        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls.get())
     }
 
     // Phase 2: no su binary + Shizuku proven -> SHIZUKU with NO degrade note
@@ -569,7 +618,9 @@ class AutoDegradeTest {
         // probes su only), so anyProbePassed reflects the probed subset only.
         assertFalse("unprobed Shizuku must not count toward anyProbePassed", s.anyProbePassed)
         assertEquals(Privilege.NONE, s.privilege)
-        assertEquals("explicit ROOT must not probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertEquals("explicit ROOT must not probe Shizuku", 0, shizukuFake.listUsersCalls.get())
+        // Phase 4 A7: explicit ROOT probes only su -> scope is ROOT_ONLY.
+        assertEquals(ProbeScope.ROOT_ONLY, s.probeScope)
     }
 
     // Phase 2 (sharpest explicit isolation, missing from Phase 1): explicit
@@ -601,7 +652,76 @@ class AutoDegradeTest {
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertEquals(Privilege.NONE, s.privilege)
         assertFalse("unprobed su must not count toward anyProbePassed", s.anyProbePassed)
-        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls.get())
+        // Phase 4 A7: explicit SHIZUKU probes only Shizuku -> SHIZUKU_ONLY.
+        assertEquals(ProbeScope.SHIZUKU_ONLY, s.probeScope)
+    }
+
+    // Phase 4 A7: probeScope() pure mapping -- preference -> probed subset.
+    // Single source used by probeChannels; render must never drift from state.
+    @Test
+    fun probeScope_pureMapping() {
+        assertEquals(ProbeScope.FULL, ChannelPreference.AUTO.probeScope())
+        assertEquals(ProbeScope.ROOT_ONLY, ChannelPreference.ROOT.probeScope())
+        assertEquals(ProbeScope.SHIZUKU_ONLY, ChannelPreference.SHIZUKU.probeScope())
+        assertEquals(ProbeScope.NONE, ChannelPreference.LSPOSED.probeScope())
+    }
+
+    // Phase 4 A4 FactoryParity (channel-parity): test reuseFactory and production
+    // assembleChannel resolve through the same resolveChannel layer, so channel
+    // selection can never drift between tests and production. Exhaustive over
+    // prefs x env. Full-assembly parity: the assembled gateway instance/type
+    // must also match the channel (ROOT -> suGateway instance, SHIZUKU ->
+    // shizukuGateway instance, NOOP/LSPOSED_PLACEHOLDER -> NoOp), so a future
+    // wiring change that picks the right channel but the wrong object turns red.
+    @Test
+    fun factoryParity_resolveChannelMatchesAssemble() {
+        for (pref in ChannelPreference.values()) {
+            for (suPresent in listOf(false, true)) {
+                for (shizukuAuth in listOf(false, true)) {
+                    val expected = pref.resolveChannel(suPresent, shizukuAuth)
+                    val asm = assembleChannel(pref, suPresent, shizukuAuth, "com.example.test")
+                    assertEquals(
+                        "assembleChannel must match resolveChannel for $pref " +
+                            "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                        expected,
+                        asm.channel,
+                    )
+                    assertTrue(
+                        "su slot must be the real su gateway for $pref " +
+                            "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                        asm.suGateway is SuCmdGateway,
+                    )
+                    assertTrue(
+                        "shizuku slot must be the real shizuku gateway for $pref " +
+                            "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                        asm.shizukuGateway is ShizukuCmdGateway,
+                    )
+                    when (expected) {
+                        ResolvedChannel.ROOT ->
+                            assertTrue(
+                                "ROOT must ride the suGateway instance for $pref " +
+                                    "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                                asm.gateway === asm.suGateway,
+                            )
+                        ResolvedChannel.SHIZUKU ->
+                            assertTrue(
+                                "SHIZUKU must ride the shizukuGateway instance for $pref " +
+                                    "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                                asm.gateway === asm.shizukuGateway,
+                            )
+                        ResolvedChannel.NOOP,
+                        ResolvedChannel.LSPOSED_PLACEHOLDER,
+                        ->
+                            assertTrue(
+                                "$expected must ride NoOp (fail-closed) for $pref " +
+                                    "(suPresent=$suPresent, shizukuAuth=$shizukuAuth)",
+                                asm.gateway is NoOpGateway,
+                            )
+                    }
+                }
+            }
+        }
     }
 
     // Phase 2: after su-denied + Shizuku-ok degrade, refresh() must see the
@@ -671,9 +791,9 @@ class AutoDegradeTest {
         assertTrue("confirmation message expected, got: \"$msgBefore\"", msgBefore.contains("等待確認"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
 
-        val probesBefore = shizukuFake.listUsersCalls
+        val probesBefore = shizukuFake.listUsersCalls.get()
         vm.recheckPrivilege()
-        await { !vm.state.value.loading && shizukuFake.listUsersCalls > probesBefore }
+        await { !vm.state.value.loading && shizukuFake.listUsersCalls.get() > probesBefore }
 
         val s = vm.state.value
         assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
@@ -871,6 +991,131 @@ class AutoDegradeTest {
         )
     }
 
+    // Phase 4 A6: error-first degrade stacking -- combineWithDegradeNote keeps
+    // the base kind and appends the degrade reason ("；" join). Error kinds
+    // (CHANNEL/FAILED/NO_DUAL/VERIFY/INVALID) never downgrade to INFO; recovery entry
+    // (重新連線並更新) rides in the degrade note. Tested via reflection so no
+    // production visibility change is needed (private stays private).
+    private fun combineViaReflection(
+        vm: DualViewModel,
+        baseMsg: String,
+        baseKind: MsgKind,
+        degradeNote: String,
+    ): Pair<String, MsgKind> {
+        val m = DualViewModel::class.java.getDeclaredMethod(
+            "combineWithDegradeNote",
+            String::class.java,
+            MsgKind::class.java,
+            String::class.java,
+        )
+        m.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        return m.invoke(vm, baseMsg, baseKind, degradeNote) as Pair<String, MsgKind>
+    }
+
+    @Test
+    fun combine_channel_keepsKindAndStacksNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading }
+        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val (msg, kind) = combineViaReflection(vm, "channel error: denied", MsgKind.CHANNEL, degrade)
+        assertEquals(MsgKind.CHANNEL, kind)
+        assertTrue("base first, got: \"$msg\"", msg.startsWith("channel error: denied"))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
+    }
+
+    @Test
+    fun combine_noDual_keepsKindAndStacksNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading }
+        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val (msg, kind) = combineViaReflection(vm, "no dual profile", MsgKind.NO_DUAL, degrade)
+        assertEquals(MsgKind.NO_DUAL, kind)
+        assertTrue("base first, got: \"$msg\"", msg.startsWith("no dual profile"))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
+    }
+
+    @Test
+    fun combine_failed_keepsKindAndStacksNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading }
+        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val (msg, kind) = combineViaReflection(vm, "clone failed: boom", MsgKind.FAILED, degrade)
+        assertEquals(MsgKind.FAILED, kind)
+        assertTrue("base first, got: \"$msg\"", msg.startsWith("clone failed: boom"))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+    }
+
+    @Test
+    fun combine_verify_keepsKindAndStacksNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading }
+        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val (msg, kind) = combineViaReflection(vm, "clone verification failed: x not installed", MsgKind.VERIFY, degrade)
+        assertEquals(MsgKind.VERIFY, kind)
+        assertTrue("base first, got: \"$msg\"", msg.startsWith("clone verification failed"))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+    }
+
+    @Test
+    fun combine_invalid_keepsKindAndStacksNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading }
+        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val (msg, kind) = combineViaReflection(vm, "invalid package", MsgKind.INVALID, degrade)
+        assertEquals(MsgKind.INVALID, kind)
+        assertTrue("base first, got: \"$msg\"", msg.startsWith("invalid package"))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
+    }
+
     // P25 Item 3: AUTO each round probes at most once -- swap result reused by
     // probeChannels, no double `su -c id -u`. Stable ROOT: initial probe +
     // one recheck + one reconnect = exactly one `id -u` per round.
@@ -888,23 +1133,28 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
 
-        suFake.idUCalls = 0
-        val shizukuProbesBefore = shizukuFake.listUsersCalls
+        suFake.idUCalls.set(0)
+        val shizukuProbesBefore = shizukuFake.listUsersCalls.get()
         vm.recheckPrivilege()
-        await { !vm.state.value.loading && suFake.idUCalls >= 1 }
+        await { !vm.state.value.loading && suFake.idUCalls.get() >= 1 }
         // Settle: a stray second probe would flip loading busy again; require
         // quiescence before asserting the upper bound.
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        assertEquals("AUTO recheck must probe su exactly once, got ${suFake.idUCalls}", 1, suFake.idUCalls)
-        assertTrue("AUTO must still probe Shizuku (full probe)", shizukuFake.listUsersCalls > shizukuProbesBefore)
+        assertEquals("AUTO recheck must probe su exactly once, got ${suFake.idUCalls.get()}", 1, suFake.idUCalls.get())
+        // Phase 4 C3/B1: precise +1 delta (not just >) proves no hidden extra probe.
+        assertEquals(
+            "AUTO must still probe Shizuku exactly once, got ${shizukuFake.listUsersCalls.get()} vs $shizukuProbesBefore",
+            shizukuProbesBefore + 1,
+            shizukuFake.listUsersCalls.get(),
+        )
 
-        suFake.idUCalls = 0
+        suFake.idUCalls.set(0)
         vm.reconnectAndRefresh()
-        await { !vm.state.value.loading && suFake.idUCalls >= 1 }
+        await { !vm.state.value.loading && suFake.idUCalls.get() >= 1 }
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        assertEquals("AUTO reconnect must probe su exactly once, got ${suFake.idUCalls}", 1, suFake.idUCalls)
+        assertEquals("AUTO reconnect must probe su exactly once, got ${suFake.idUCalls.get()}", 1, suFake.idUCalls.get())
     }
 
     // P25 Item 3: explicit SHIZUKU never triggers su -- no `id -u`, no
@@ -924,19 +1174,19 @@ class AutoDegradeTest {
             preference = ChannelPreference.SHIZUKU,
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
-        assertEquals("init probe must not touch su", 0, suFake.idUCalls)
+        assertEquals("init probe must not touch su", 0, suFake.idUCalls.get())
 
         vm.recheckPrivilege()
-        await { !vm.state.value.loading && shizukuFake.listUsersCalls >= 2 }
+        await { !vm.state.value.loading && shizukuFake.listUsersCalls.get() >= 2 }
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        assertEquals("explicit SHIZUKU recheck must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit SHIZUKU recheck must never run `su -c id -u`", 0, suFake.idUCalls.get())
 
         vm.reconnectAndRefresh()
         await { !vm.state.value.loading }
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        assertEquals("explicit SHIZUKU reconnect must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit SHIZUKU reconnect must never run `su -c id -u`", 0, suFake.idUCalls.get())
         assertTrue("selected Shizuku channel must stay writable", vm.state.value.writeReady)
     }
 
@@ -959,8 +1209,8 @@ class AutoDegradeTest {
         Thread.sleep(300)
         await { !vm.state.value.loading }
 
-        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
-        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls.get())
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls.get())
         assertFalse("NoOp placeholder is never writable", vm.state.value.writeReady)
         assertFalse("NoOp placeholder is never channelReady", vm.state.value.channelReady)
         assertFalse("LSPOSED probes none, so no probe passes", vm.state.value.anyProbePassed)
@@ -1034,8 +1284,8 @@ class AutoDegradeTest {
         assertFalse("LSPOSED probes none, so no probe passes despite env capability", probed.anyProbePassed)
         assertFalse("NoOp placeholder is never writable", probed.writeReady)
         assertEquals(Privilege.NONE, probed.privilege)
-        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
-        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls.get())
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls.get())
 
         vm.refresh()
         await {
@@ -1095,9 +1345,9 @@ class AutoDegradeTest {
         // Initial AUTO proves the OLD instance (writable + ACTIVE via its cat).
         await { !vm.state.value.loading && vm.state.value.writeReady }
         await { vm.state.value.hookStatus == HookStatus.ACTIVE }
-        val oldCatBefore = suOld.catCalls
+        val oldCatBefore = suOld.catCalls.get()
         assertTrue("precondition: old instance must have served `cat`", oldCatBefore > 0)
-        val oldIdUBefore = suOld.idUCalls
+        val oldIdUBefore = suOld.idUCalls.get()
 
         vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
@@ -1124,21 +1374,21 @@ class AutoDegradeTest {
         assertFalse("NoOp placeholder is never channelReady", s.channelReady)
         assertFalse("LSPOSED probes none", s.anyProbePassed)
         val newSu = createdSu.first()
-        assertEquals("new instance must never run `su -c id -u` before verification", 0, newSu.idUCalls)
-        assertEquals("new instance must never be `cat`ed before verification", 0, newSu.catCalls)
+        assertEquals("new instance must never run `su -c id -u` before verification", 0, newSu.idUCalls.get())
+        assertEquals("new instance must never be `cat`ed before verification", 0, newSu.catCalls.get())
         assertTrue(
-            "diagnosis must ride the retained old instance, got ${suOld.catCalls} vs $oldCatBefore",
-            suOld.catCalls > oldCatBefore,
+            "diagnosis must ride the retained old instance, got ${suOld.catCalls.get()} vs $oldCatBefore",
+            suOld.catCalls.get() > oldCatBefore,
         )
-        assertEquals("switch must not run new `su -c id -u` probes", oldIdUBefore, suOld.idUCalls)
+        assertEquals("switch must not run new `su -c id -u` probes", oldIdUBefore, suOld.idUCalls.get())
 
         // N1 Phase 1: LSPOSED AUTO recheck stays direct-only -- no retained
         // `cat`, no `id -u` anywhere, no `cat` on the fresh instance. The
         // retained instance diagnosed ACTIVE on the manual select above, but
         // the auto recheck must not re-exec it (fresh `su -c` process, auth
         // risk): hook falls back to UNKNOWN with writeReady false.
-        val totalIdUBefore = suOld.idUCalls + newSu.idUCalls
-        val retainedCatBeforeAuto = suOld.catCalls
+        val totalIdUBefore = suOld.idUCalls.get() + newSu.idUCalls.get()
+        val retainedCatBeforeAuto = suOld.catCalls.get()
         vm.recheckPrivilege()
         await { !vm.state.value.loading }
         Thread.sleep(300)
@@ -1150,14 +1400,14 @@ class AutoDegradeTest {
         )
         assertFalse(vm.state.value.writeReady)
         assertFalse(vm.state.value.channelReady)
-        assertEquals("LSPOSED auto recheck must run zero probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
+        assertEquals("LSPOSED auto recheck must run zero probes", totalIdUBefore, suOld.idUCalls.get() + newSu.idUCalls.get())
         assertEquals(
             "LSPOSED auto recheck must not `cat` the retained instance",
             retainedCatBeforeAuto,
-            suOld.catCalls,
+            suOld.catCalls.get(),
         )
-        assertEquals("fresh instance stays untouched across auto recheck", 0, newSu.idUCalls)
-        assertEquals("fresh instance stays un-`cat`ed across auto recheck", 0, newSu.catCalls)
+        assertEquals("fresh instance stays untouched across auto recheck", 0, newSu.idUCalls.get())
+        assertEquals("fresh instance stays un-`cat`ed across auto recheck", 0, newSu.catCalls.get())
         // Manual opt-in restores ACTIVE through the retained instance (one
         // `cat`, still zero probes on the fresh instance, writeReady stays
         // false: diagnosis never raises readiness).
@@ -1172,11 +1422,11 @@ class AutoDegradeTest {
         assertFalse(vm.state.value.writeReady)
         assertTrue(
             "manual diagnosis must ride the retained old instance",
-            suOld.catCalls > retainedCatBeforeAuto,
+            suOld.catCalls.get() > retainedCatBeforeAuto,
         )
-        assertEquals("manual diagnosis still runs zero `id -u` probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
-        assertEquals("fresh instance stays untouched across manual diagnosis", 0, newSu.idUCalls)
-        assertEquals("fresh instance stays un-`cat`ed across manual diagnosis", 0, newSu.catCalls)
+        assertEquals("manual diagnosis still runs zero `id -u` probes", totalIdUBefore, suOld.idUCalls.get() + newSu.idUCalls.get())
+        assertEquals("fresh instance stays untouched across manual diagnosis", 0, newSu.idUCalls.get())
+        assertEquals("fresh instance stays un-`cat`ed across manual diagnosis", 0, newSu.catCalls.get())
     }
 
     // Phase A P2 (match branch) + B1 (retained slot): explicit ROOT writes
@@ -1216,7 +1466,7 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
         await { vm.state.value.hookStatus == HookStatus.ACTIVE }
-        val idUBefore = suFake.idUCalls
+        val idUBefore = suFake.idUCalls.get()
 
         vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
@@ -1238,10 +1488,10 @@ class AutoDegradeTest {
         assertFalse(s.channelReady)
         assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
         assertFalse("LSPOSED probes none", s.anyProbePassed)
-        assertEquals("LSPOSED must not run `su -c id -u`", idUBefore, suFake.idUCalls)
+        assertEquals("LSPOSED must not run `su -c id -u`", idUBefore, suFake.idUCalls.get())
         // N1 Phase 1: auto recheck stays direct-only (UNKNOWN, no `cat`);
         // manual opt-in restores ACTIVE. Diagnosis never raises writeReady.
-        val catAfterSelect = suFake.catCalls
+        val catAfterSelect = suFake.catCalls.get()
         vm.recheckPrivilege()
         await { !vm.state.value.loading }
         Thread.sleep(300)
@@ -1256,9 +1506,9 @@ class AutoDegradeTest {
         assertEquals(
             "LSPOSED auto recheck must not `cat` the retained instance",
             catAfterSelect,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
-        assertEquals("LSPOSED auto recheck must not run `su -c id -u`", idUBefore, suFake.idUCalls)
+        assertEquals("LSPOSED auto recheck must not run `su -c id -u`", idUBefore, suFake.idUCalls.get())
         vm.requestHookRedDiagnosis()
         await {
             !vm.state.value.loading &&
@@ -1269,8 +1519,8 @@ class AutoDegradeTest {
         assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
         assertFalse(vm.state.value.writeReady)
         assertFalse(vm.state.value.channelReady)
-        assertTrue("manual diagnosis must `cat` once", suFake.catCalls > catAfterSelect)
-        assertEquals("manual diagnosis still runs zero `id -u` probes", idUBefore, suFake.idUCalls)
+        assertTrue("manual diagnosis must `cat` once", suFake.catCalls.get() > catAfterSelect)
+        assertEquals("manual diagnosis still runs zero `id -u` probes", idUBefore, suFake.idUCalls.get())
     }
 
     // Phase A P2 (revocation): ROOT proven then auth revoked (rootOk true ->
@@ -1307,7 +1557,7 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
         await { vm.state.value.hookStatus == HookStatus.ACTIVE }
-        val catBeforeRevoke = suFake.catCalls
+        val catBeforeRevoke = suFake.catCalls.get()
         assertTrue(catBeforeRevoke > 0)
 
         // Revoke: next probe on the SAME instance fails and clears evidence.
@@ -1337,7 +1587,7 @@ class AutoDegradeTest {
         assertEquals(
             "revoked instance must not serve new `cat` for LSPOSED",
             catBeforeRevoke,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
     }
 
@@ -1377,8 +1627,8 @@ class AutoDegradeTest {
         )
         assertFalse(probed.anyProbePassed)
         assertEquals(Privilege.NONE, probed.privilege)
-        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
-        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls.get())
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls.get())
         assertNull("probe must never write pmReadable (still unknown)", probed.pmReadable)
         assertEquals("PM unknown before refresh", "PM未知", probed.pmReadableText())
 
@@ -1652,6 +1902,309 @@ class AutoDegradeTest {
         )
     }
 
+    // Phase 4 A8 (reverse swap, reuseFactory): SHIZUKU -> NOOP expires
+    // pmReadable to null. AUTO degraded to SHIZUKU with refresh-proven true;
+    // revoking Shizuku degrades to NOOP, and the stale true must not survive
+    // (probe-only recheck leaves unknown, never the old true).
+    @Test
+    fun phase4_shizukuToNoop_expiresPmReadable() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == true }
+        assertEquals(ResolvedChannel.SHIZUKU, vm.state.value.resolvedGateway)
+
+        shizukuFake.shizukuOk = false
+        vm.recheckPrivilege()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.NOOP
+        }
+        val s = vm.state.value
+        assertNull("SHIZUKU->NOOP must expire pmReadable, got ${s.pmReadable}", s.pmReadable)
+        assertEquals("PM未知", s.pmReadableText())
+        assertFalse(s.writeReady)
+        assertFalse(s.anyProbePassed)
+    }
+
+    // Phase 4 A8 (reverse, reuseFactory): NOOP -> ROOT keeps pending null.
+    // While NOOP a remove request is refused (fail closed, no dialog); after
+    // recovery the pending is still null so the user must request again.
+    @Test
+    fun phase4_noopToRoot_pendingStaysNull() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
+        assertNull(vm.state.value.pendingRemove)
+
+        vm.requestRemove("com.example.chat")
+        await { !vm.state.value.loading && vm.state.value.msgKind == MsgKind.CHANNEL }
+        assertNull("NOOP must never open a pending (fail closed)", vm.state.value.pendingRemove)
+
+        suFake.rootOk = true
+        vm.reconnectAndRefresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.ROOT &&
+                vm.state.value.pmReadable == true
+        }
+        val s = vm.state.value
+        assertTrue(s.writeReady)
+        assertNull("NOOP->ROOT must keep pending null (must re-request)", s.pendingRemove)
+    }
+
+    // Phase 4 A8 (reuseFactory): single-channel revoke retains pmReadable.
+    // AUTO stays ROOT (su still proven) while only Shizuku dies; readiness
+    // holds so the last refresh readability (true) is retained, not nulled.
+    @Test
+    fun phase4_singleChannelRevoke_retainsPmReadable() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == true }
+
+        shizukuFake.shizukuOk = false
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.ROOT }
+        // Settle: a stray second probe would flip busy again; require
+        // quiescence before reading the retained field.
+        Thread.sleep(200)
+        await { !vm.state.value.loading }
+        val s = vm.state.value
+        assertEquals(ResolvedChannel.ROOT, s.resolvedGateway)
+        assertTrue(s.writeReady)
+        assertEquals("single-channel revoke with readiness held must retain true", true, s.pmReadable)
+        assertEquals("已就緒", s.readyMark())
+    }
+
+    // Phase 4 A8 (reuseFactory): LSPOSED <-> AUTO expires pmReadable both ways.
+    // Any gateway swap nulls the last refresh snapshot; only a fresh refresh
+    // rebuilds true/false.
+    @Test
+    fun phase4_lsposedAutoSwap_expiresPmReadable() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == true }
+
+        vm.selectChannel(ChannelPreference.LSPOSED)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.pmReadable == false
+        }
+        // Swap nulls then refresh proves false (NoOp ChannelError): stale true
+        // must be gone (null transient is already covered by the swap; final
+        // false proves the old snapshot did not survive).
+        assertEquals(false, vm.state.value.pmReadable)
+        assertEquals("PM不可讀", vm.state.value.pmReadableText())
+        assertFalse(vm.state.value.writeReady)
+
+        vm.selectChannel(ChannelPreference.AUTO)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.AUTO &&
+                vm.state.value.pmReadable == true
+        }
+        assertEquals("已就緒", vm.state.value.readyMark())
+    }
+
+    // Phase 4 C3: refresh runs the old 9-command resolve-then-reverify path
+    // (DualViewModel.refreshLocked, not refreshVerified 5): snapshot(1) +
+    // target(3) + snapshot(1) + target(3) + list(1). Assert exact per-command
+    // deltas on the SHIZUKU fake (repo lives there after degrade).
+    @Test
+    fun phase4_refresh_commandCounts() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        shizukuFake.installedPkgs.clear()
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+
+        shizukuFake.listUsersCalls.set(0)
+        shizukuFake.verboseCalls.set(0)
+        shizukuFake.dumpsysCalls.set(0)
+        shizukuFake.getpropCalls.set(0)
+        shizukuFake.listPackagesCalls.set(0)
+        val suIdUBefore = suFake.idUCalls.get()
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("no clones installed")
+        }
+        // Settle before reading exact counts (Unconfined trailing run would
+        // otherwise race the assertion).
+        Thread.sleep(200)
+        await { !vm.state.value.loading }
+
+        assertEquals("refresh snapshot+reverify listUsers x2", 2, shizukuFake.listUsersCalls.get())
+        assertEquals("refresh target fetches verbose x2", 2, shizukuFake.verboseCalls.get())
+        assertEquals("refresh target fetches dumpsys x2", 2, shizukuFake.dumpsysCalls.get())
+        assertEquals("refresh target fetches getprop x2", 2, shizukuFake.getpropCalls.get())
+        assertEquals("refresh list probe x1", 1, shizukuFake.listPackagesCalls.get())
+        assertEquals("pure refresh must never probe su", suIdUBefore, suFake.idUCalls.get())
+    }
+
+    // Phase 4 B4 glossary: 禁用 = not-ready fail-closed (generic NoOp +
+    // explicit fail); 拒絕 = LSPOSED policy placeholder. Each of the three
+    // notReadyMsg branches must carry its keyword.
+    @Test
+    fun phase4_notReadyMsg_glossary() {
+        // 1) LSPOSED placeholder -> 佔位 + 拒絕 (init probe only, no refresh
+        // overwrite: selectChannel would append refresh ChannelError, so pin
+        // the probe message via a fresh LSPOSED init).
+        run {
+            val suFake = FakeSu(rootOk = true)
+            val shizukuFake = FakeShizuku(shizukuOk = true)
+            val vm = makeAutoVm(
+                suFake = suFake,
+                shizukuFake = shizukuFake,
+                suPresent = true,
+                shizukuAuth = true,
+                initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+                initialGateway = NoOpGateway(),
+                preference = ChannelPreference.LSPOSED,
+            )
+            await { !vm.state.value.loading }
+            Thread.sleep(200)
+            await { !vm.state.value.loading }
+            val msg = vm.state.value.msg
+            assertTrue("LSPOSED must name 佔位, got: \"$msg\"", msg.contains("佔位"))
+            assertTrue("LSPOSED policy uses 拒絕, got: \"$msg\"", msg.contains("拒絕"))
+        }
+        // 2) Explicit fail (ROOT denied) -> 明選不跨通道 + 禁用.
+        run {
+            val suFake = FakeSu(rootOk = false)
+            val shizukuFake = FakeShizuku(shizukuOk = true)
+            val vm = makeAutoVm(
+                suFake = suFake,
+                shizukuFake = shizukuFake,
+                suPresent = false,
+                shizukuAuth = true,
+                initialChannel = ResolvedChannel.ROOT,
+                initialGateway = suFake,
+                preference = ChannelPreference.ROOT,
+            )
+            await { !vm.state.value.loading && vm.state.value.msg.contains("明選不跨通道") }
+            val msg = vm.state.value.msg
+            assertTrue("explicit fail must name 明選不跨通道, got: \"$msg\"", msg.contains("明選不跨通道"))
+            assertTrue("not-ready uses 禁用 (fail-closed), got: \"$msg\"", msg.contains("禁用"))
+        }
+        // 3) Generic NoOp fallback (explicit with NONE gateway, no degrade note)
+        // -> 通道未就緒 + 禁用 (fail-closed, distinct from LSPOSED 拒絕).
+        run {
+            val suFake = FakeSu(rootOk = false)
+            val shizukuFake = FakeShizuku(shizukuOk = false)
+            val vm = DualViewModel(
+                repo = DualRepository(NoOpGateway()),
+                gatewayPrivilege = Privilege.NONE,
+                elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+                preference = ChannelPreference.ROOT,
+                appPackageName = "com.example.test",
+                persistPreference = null,
+                suPresentCheck = { false },
+                shizukuAuthCheck = { false },
+                suGateway = suFake,
+                shizukuGateway = shizukuFake,
+                activeGateway = NoOpGateway(),
+                currentChannel = ResolvedChannel.NOOP,
+                hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+                hookDiagnosticGateways = { emptyList() },
+            )
+            vms.add(vm)
+            await { !vm.state.value.loading && vm.state.value.msgKind == MsgKind.CHANNEL }
+            Thread.sleep(200)
+            await { !vm.state.value.loading }
+            val msg = vm.state.value.msg
+            assertTrue("NoOp fallback must name 通道未就緒, got: \"$msg\"", msg.contains("通道未就緒"))
+            assertTrue("not-ready uses 禁用 (fail-closed), got: \"$msg\"", msg.contains("禁用"))
+            assertFalse("generic fallback must not use 拒絕 (LSPOSED-only), got: \"$msg\"", msg.contains("拒絕"))
+        }
+    }
+
     // N1 Phase 1: AUTO -> LSPOSED (ACTIVE via manual select) -> revoke while
     // parked on LSPOSED (rootOk=false) -> auto recheckPrivilege() must not
     // execute any retained su `cat` (fresh `su -c` process, no session
@@ -1716,11 +2269,11 @@ class AutoDegradeTest {
         // Revoke while parked (no probing channel selected): the retained
         // `cat` would now fail -- auto must not discover this by executing.
         suFake.rootOk = false
-        val catBefore = suFake.catCalls
-        val idUBefore = suFake.idUCalls
-        val listBefore = suFake.listUsersCalls
-        val shizukuListBefore = shizukuFake.listUsersCalls
-        val shizukuCatBefore = shizukuFake.catCalls
+        val catBefore = suFake.catCalls.get()
+        val idUBefore = suFake.idUCalls.get()
+        val listBefore = suFake.listUsersCalls.get()
+        val shizukuListBefore = shizukuFake.listUsersCalls.get()
+        val shizukuCatBefore = shizukuFake.catCalls.get()
 
         vm.recheckPrivilege()
         await {
@@ -1743,37 +2296,37 @@ class AutoDegradeTest {
         assertEquals(
             "auto recheck must not execute retained su `cat`",
             catBefore,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
         assertEquals(
             "auto recheck must not run `su -c id -u` (LSPOSED probes none)",
             idUBefore,
-            suFake.idUCalls,
+            suFake.idUCalls.get(),
         )
         assertEquals(
             "auto recheck must not run `pm list users` via su",
             listBefore,
-            suFake.listUsersCalls,
+            suFake.listUsersCalls.get(),
         )
         assertEquals(
             "auto recheck must not probe Shizuku",
             shizukuListBefore,
-            shizukuFake.listUsersCalls,
+            shizukuFake.listUsersCalls.get(),
         )
         assertEquals(
             "auto recheck must not `cat` via Shizuku",
             shizukuCatBefore,
-            shizukuFake.catCalls,
+            shizukuFake.catCalls.get(),
         )
         // Fresh post-swap instances are never verified under LSPOSED (no
         // probes), so they must stay fully untouched -- diagnosis rode only
         // the retained old instance (or nothing, when auto).
         val newSu = createdSu.single()
         val newShizuku = createdShizuku.single()
-        assertEquals("fresh instance must never run `su -c id -u`", 0, newSu.idUCalls)
-        assertEquals("fresh instance must never be `cat`ed", 0, newSu.catCalls)
-        assertEquals("fresh Shizuku must never be probed", 0, newShizuku.listUsersCalls)
-        assertEquals("fresh Shizuku must never be `cat`ed", 0, newShizuku.catCalls)
+        assertEquals("fresh instance must never run `su -c id -u`", 0, newSu.idUCalls.get())
+        assertEquals("fresh instance must never be `cat`ed", 0, newSu.catCalls.get())
+        assertEquals("fresh Shizuku must never be probed", 0, newShizuku.listUsersCalls.get())
+        assertEquals("fresh Shizuku must never be `cat`ed", 0, newShizuku.catCalls.get())
     }
 
     // N1 Phase 1: manual opt-in still reads (manual entry triggers `cat` and
@@ -1835,7 +2388,7 @@ class AutoDegradeTest {
         }
         Thread.sleep(200)
         await { !vm.state.value.loading }
-        val catAfterAuto = suFake.catCalls
+        val catAfterAuto = suFake.catCalls.get()
         assertFalse(vm.state.value.writeReady)
 
         // ...but the manual entry re-reads the marker through the retained
@@ -1858,12 +2411,12 @@ class AutoDegradeTest {
         assertFalse(s.channelReady)
         assertTrue(
             "manual diagnosis must execute retained `cat`",
-            suFake.catCalls > catAfterAuto,
+            suFake.catCalls.get() > catAfterAuto,
         )
         assertEquals(
             "fresh instance stays un-`cat`ed: diagnosis rode the retained old one",
             0,
-            createdSu.single().catCalls,
+            createdSu.single().catCalls.get(),
         )
     }
 
@@ -1925,7 +2478,7 @@ class AutoDegradeTest {
 
         // Revoke while parked, then prove death via ONE manual exec.
         suFake.rootOk = false
-        val catBeforeManual = suFake.catCalls
+        val catBeforeManual = suFake.catCalls.get()
         vm.requestHookRedDiagnosis()
         await {
             !vm.state.value.loading &&
@@ -1936,11 +2489,11 @@ class AutoDegradeTest {
         await { !vm.state.value.loading }
         assertTrue(
             "manual diagnosis must attempt exactly the proving `cat`",
-            suFake.catCalls > catBeforeManual,
+            suFake.catCalls.get() > catBeforeManual,
         )
         assertFalse(vm.state.value.writeReady)
-        val catAfterProving = suFake.catCalls
-        val idUAfterProving = suFake.idUCalls
+        val catAfterProving = suFake.catCalls.get()
+        val idUAfterProving = suFake.idUCalls.get()
 
         // After the clear, further auto AND manual rounds must not exec.
         vm.recheckPrivilege()
@@ -1950,9 +2503,9 @@ class AutoDegradeTest {
         assertEquals(
             "cleared slot: auto must not re-exec root",
             catAfterProving,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
-        assertEquals(idUAfterProving, suFake.idUCalls)
+        assertEquals(idUAfterProving, suFake.idUCalls.get())
 
         vm.requestHookRedDiagnosis()
         await { !vm.state.value.loading }
@@ -1966,9 +2519,9 @@ class AutoDegradeTest {
         assertEquals(
             "cleared slot: second manual must not re-exec root",
             catAfterProving,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
-        assertEquals(idUAfterProving, suFake.idUCalls)
+        assertEquals(idUAfterProving, suFake.idUCalls.get())
         assertFalse(vm.state.value.writeReady)
         assertFalse(vm.state.value.channelReady)
     }
@@ -2033,7 +2586,7 @@ class AutoDegradeTest {
         await { !vm.state.value.loading }
         gating.set(true)
         val roundsBase = entered.get()
-        val catBase = suFake.catCalls
+        val catBase = suFake.catCalls.get()
 
         // Leading auto round, held inside direct reads.
         vm.reconnectAndRefresh(userInitiated = false)
@@ -2048,7 +2601,7 @@ class AutoDegradeTest {
         // Trailing round 1 (manual) runs: retained `cat`, back to ACTIVE.
         gate.release()
         await { entered.get() >= roundsBase + 3 }
-        val catAfterManual = suFake.catCalls
+        val catAfterManual = suFake.catCalls.get()
         assertTrue(
             "manual trailing round must `cat` the retained instance",
             catAfterManual > catBase,
@@ -2061,7 +2614,7 @@ class AutoDegradeTest {
         assertEquals(
             "second trailing round must not inherit manual (no new `cat`)",
             catAfterManual,
-            suFake.catCalls,
+            suFake.catCalls.get(),
         )
         assertTrue(
             "auto trailing round stays UNKNOWN_*, got: ${vm.state.value.hookStatus}",
@@ -2101,7 +2654,7 @@ class AutoDegradeTest {
         // path existed), never a fake ACTIVE/INACTIVE.
         assertEquals(HookStatus.UNKNOWN_UNREADABLE, s.hookStatus)
         assertFalse(s.hookActive)
-        assertTrue("denied `cat` must still have been attempted", suFake.catCalls > 0)
+        assertTrue("denied `cat` must still have been attempted", suFake.catCalls.get() > 0)
     }
 
     // N1 Phase 1 (re-verify recovery): after a manual proving `cat` clears
@@ -2157,7 +2710,7 @@ class AutoDegradeTest {
         }
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        val catAfterClear = suFake.catCalls
+        val catAfterClear = suFake.catCalls.get()
         assertTrue(
             "proving round stays UNKNOWN_*, got: ${vm.state.value.hookStatus}",
             vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
@@ -2180,7 +2733,7 @@ class AutoDegradeTest {
 
         // Park on LSPOSED again: manual diagnosis rides the RESTORED
         // retained instance back to ACTIVE (zero new probes, not writable).
-        val idUBefore = suFake.idUCalls
+        val idUBefore = suFake.idUCalls.get()
         vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
             !vm.state.value.loading &&
@@ -2195,9 +2748,9 @@ class AutoDegradeTest {
         assertFalse(s.channelReady)
         assertTrue(
             "restored retained instance must serve `cat` again",
-            suFake.catCalls > catAfterClear,
+            suFake.catCalls.get() > catAfterClear,
         )
-        assertEquals("re-park still runs zero `id -u` probes", idUBefore, suFake.idUCalls)
+        assertEquals("re-park still runs zero `id -u` probes", idUBefore, suFake.idUCalls.get())
     }
 
     // Phase 2 P3: dual-condition matrix for readyMark.
@@ -2367,19 +2920,28 @@ class AutoDegradeTest {
         await { !vm.state.value.loading && vm.state.value.pmReadable == false }
         assertTrue("probe gate stays true on `id -u == 0`", vm.state.value.writeReady)
 
-        val idUBefore = suFake.idUCalls
+        val idUBefore = suFake.idUCalls.get()
         vm.clone("com.example.chat")
         await { !vm.state.value.loading && vm.state.value.msg.contains("PM 不可讀") }
         val s = vm.state.value
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertTrue("refusal must name PM unreadability, got: \"${s.msg}\"", s.msg.contains("PM 不可讀"))
         assertTrue("probe gate unchanged by the refusal", s.writeReady)
-        assertEquals("refused clone must not run new probes", idUBefore, suFake.idUCalls)
+        assertEquals("refused clone must not run new probes", idUBefore, suFake.idUCalls.get())
         assertFalse("refused clone must not claim success", s.msg.contains("cloned:"))
     }
 
     // Phase 3 F4: a swap that never completes (cancelled/failed assembly)
     // must never persist: stored stays != memory is forbidden.
+    // Phase 4 C1: gated start, tolerance window for the absence -- await
+    // loading==true to prove the select body ran its leading busy (Unconfined
+    // runs it synchronously on the caller thread), then poll a short 200 ms
+    // tolerance window for any stray persist. No quiescence (loading==false)
+    // gate here by design: the cancelled select never clears loading itself
+    // (CE convention, successor owns it, and there is no successor), so
+    // awaiting loading==false would time out. The stuck-busy assertion below
+    // locks that convention (a future change that clears loading on cancel
+    // must update this test + the convention note in selectChannel).
     @Test
     fun phase3_failedSwap_neverPersists() {
         val suFake = FakeSu(rootOk = true)
@@ -2408,9 +2970,21 @@ class AutoDegradeTest {
         vms.add(vm)
         await { !vm.state.value.loading }
         vm.selectChannel(ChannelPreference.SHIZUKU)
-        Thread.sleep(500)
+        // Start gate: the leading busy is set synchronously on the caller
+        // thread (Unconfined), so this proves the select body ran before the
+        // tolerance window below. No quiescence (loading==false) gate here by
+        // design: the cancelled select never clears loading itself (CE
+        // convention, successor owns it, and there is no successor), so
+        // awaiting loading==false would time out. Poll a short tolerance
+        // window for any stray persist instead.
+        await { vm.state.value.loading }
+        Thread.sleep(200)
         assertTrue("failed swap must never persist, got: $persisted", persisted.isEmpty())
         assertEquals("in-memory preference unchanged", ChannelPreference.AUTO, vm.state.value.channel)
+        assertTrue(
+            "cancelled select holds busy (successor owns loading, no successor here)",
+            vm.state.value.loading,
+        )
     }
 
     // Phase 3 F5 (CE successor convention): a select cancelled mid-probe by
@@ -2541,7 +3115,7 @@ class AutoDegradeTest {
         assertEquals(
             "stale instance must never serve `cat`",
             0,
-            staleSu.catCalls,
+            staleSu.catCalls.get(),
         )
         assertTrue(
             "stale-only candidates must yield UNKNOWN_*, got: ${s.hookStatus}",
@@ -2578,9 +3152,9 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
         factoryCalls.set(0)
-        val idUBefore = suFake.idUCalls
+        val idUBefore = suFake.idUCalls.get()
         vm.selectChannel(ChannelPreference.AUTO)
-        await { !vm.state.value.loading && suFake.idUCalls > idUBefore }
+        await { !vm.state.value.loading && suFake.idUCalls.get() > idUBefore }
         Thread.sleep(200)
         await { !vm.state.value.loading }
         assertEquals("same-pref select must not rebuild", 0, factoryCalls.get())
