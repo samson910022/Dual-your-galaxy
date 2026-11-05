@@ -707,4 +707,45 @@ class VerifyRetryTest {
         assertEquals(1, gateway.listCalls)
         assertEquals(1, delayCalls)
     }
+
+    // PR-33 final review MINOR-1: removeVerifiedExpected write-timeout branch
+    // (timedOut || isServiceTimeoutText -> verify-first, no resend) was
+    // uncovered. timedOut=true with a clean probe that still lists the
+    // package -> StillInstalled (NOT Success/RemoveFailed), single write.
+    @Test
+    fun removeVerifiedExpected_writeTimedOut_probeInstalled_isStillInstalled() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", timedOut = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected StillInstalled, got: $outcome", outcome is RemoveOutcome.StillInstalled)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Same branch via the wire-frozen text backstop (timedOut=false lost on
+    // the parcel, isServiceTimeoutText hit): probe Unknown -> VerifyUnknown
+    // whose detail names the text recognition plus the probe cause.
+    @Test
+    fun removeVerifiedExpected_serviceSideTimeoutText_probeUnknown_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 1, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the text-recognized service timeout, got: \"$detail\"", detail.contains("recognized by text"))
+        assertTrue("detail must keep the probe cause, got: \"$detail\"", detail.contains("exit=1"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.listCalls)
+        assertEquals(
+            listOf(DualRepository.VERIFY_RETRY_DELAY_MS, DualRepository.VERIFY_RETRY_DELAY_MS),
+            delays,
+        )
+    }
 }
