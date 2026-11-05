@@ -110,6 +110,12 @@ fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 closed，不計成功）；explicit-ID 入口僅做 fresh 自洽檢查（expected=null），殘餘
 TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）。serial 單邊缺失則
 放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒。
+列表刷新（`refreshVerified()`，Phase D P2-D）為單一 target：一次 `pm list users`（1）
+＋一次 verified-target fetch（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
+＋一次 `pm list packages --user <dualId>`（1）＝5 命令（舊 resolve-then-reverify
+列表路徑為 9）；同一 target 全程，resolve→list 漂移在本 API 內消除（explicit
+舊入口殘餘除外）。Auto 降級與單一恢復入口仍由 #25 擁有，本 API 只保證列表
+一致性，不改變政策門。
 
 ```bash
 # 1. 雙源驗證（缺一不可；任一失敗即停手，不寫入不探測目標）：

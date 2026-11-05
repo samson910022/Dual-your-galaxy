@@ -10,7 +10,7 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
-import com.galaxydual.core.ProfilesSnapshot
+import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
@@ -198,12 +198,17 @@ class DualViewModel(
     }
 
     // Reloads profiles AND rebuilds `cloned` from the dual user's actual
-    // packages. Three states are told apart explicitly (issue #9):
+    // packages via the single-target refresh (Phase D P2-D): one
+    // profilesSnapshot (1 cmd) + one verified-target fetch (3 cmds) + one
+    // list probe on that same id (1 cmd) = 5 commands. Three states are told
+    // apart explicitly (issue #9):
     // - ChannelError: `pm list users` itself failed -> "channel error: ...".
     // - NoDual: channel ok but no single DUAL profile -> "no dual profile".
     // - Empty: dual exists but owns no clones -> "no clones installed".
-    // A failed clone-listing keeps the previous `cloned` and reports
-    // "result unknown" rather than claiming the list is empty.
+    // A failed clone-listing (GroundTruth cloned == null) keeps the previous
+    // `cloned` and reports "result unknown" rather than claiming the list is
+    // empty. Drift is eliminated inside this API (single target throughout);
+    // the explicit-id residual remains only in the old entries.
     fun refresh() {
         viewModelScope.launch {
             opMutex.withLock { refreshLocked() }
@@ -212,69 +217,65 @@ class DualViewModel(
 
     // Reload body shared by refresh() and selectChannel(). Must run under
     // opMutex: callers hold it, so this never launches or locks itself.
+    //
+    // Phase D P2-D (single target fetch: snapshot 1 + target 3 cmds + list 1
+    // = 5): one repo.refreshVerified() pins snapshot, target, and listing to
+    // the same id, so resolve-to-list drift is inexpressible here (the old
+    // resolve-then-reverify path needed 9 commands and could drift between
+    // two fetches). Read-only throughout, fail closed; the explicit-id
+    // residual (same id recreated between check and write) remains only in
+    // the old explicit entries, never in this API.
     private suspend fun refreshLocked() {
         // Mark busy first so the UI can render a spinner.
         _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
         try {
-            when (val snap = repo.profilesSnapshot()) {
-                is ProfilesSnapshot.ChannelError ->
+            when (val res = repo.refreshVerified()) {
+                is RefreshOutcome.ChannelError ->
                     _state.update {
                         it.copy(
                             loading = false,
                             profiles = emptyList(),
-                            msg = "channel error: ${snap.detail}",
+                            msg = "channel error: ${res.detail}",
                             msgKind = MsgKind.CHANNEL,
                         )
                     }
-                is ProfilesSnapshot.Loaded -> {
-                    val profiles = snap.profiles
-                    // Verified identity only: the id comes from the repo's
-                    // cross-source resolver, never from the pm-list label
-                    // (display-only by contract), so the display layer makes
-                    // no label judgment. Two separate fetches under the hood
-                    // (resolve here plus re-verification inside
-                    // listClonedPackages(dualId)); drift between them returns
-                    // unknown (fail closed), never a write to the wrong user
-                    // (refresh itself is read-only).
-                    val dualId = repo.resolveDualUserId()
-                    if (dualId < 0) {
-                        _state.update {
-                            it.copy(
+                is RefreshOutcome.NoDual ->
+                    _state.update {
+                        it.copy(
+                            loading = false,
+                            profiles = res.profiles,
+                            cloned = emptyList(),
+                            msg = "no dual profile",
+                            msgKind = MsgKind.NO_DUAL,
+                        )
+                    }
+                is RefreshOutcome.GroundTruth -> {
+                    val cloned = res.cloned
+                    _state.update { cur ->
+                        if (cloned == null) {
+                            cur.copy(
                                 loading = false,
-                                profiles = profiles,
-                                cloned = emptyList(),
-                                msg = "no dual profile",
-                                msgKind = MsgKind.NO_DUAL,
+                                profiles = res.profiles,
+                                msg = "refresh result unknown: " +
+                                    "cannot list clones for user ${res.target.userId}",
+                                msgKind = MsgKind.CHANNEL,
                             )
-                        }
-                    } else {
-                        val groundTruth = repo.listClonedPackages(dualId)
-                        _state.update { cur ->
-                            if (groundTruth == null) {
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    msg = "refresh result unknown: " +
-                                        "cannot list clones for user $dualId",
-                                    msgKind = MsgKind.CHANNEL,
-                                )
-                            } else if (groundTruth.isEmpty()) {
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    cloned = emptyList(),
-                                    msg = "no clones installed",
-                                    msgKind = MsgKind.INFO,
-                                )
-                            } else {
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    cloned = groundTruth,
-                                    msg = "",
-                                    msgKind = MsgKind.NONE,
-                                )
-                            }
+                        } else if (cloned.isEmpty()) {
+                            cur.copy(
+                                loading = false,
+                                profiles = res.profiles,
+                                cloned = emptyList(),
+                                msg = "no clones installed",
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            cur.copy(
+                                loading = false,
+                                profiles = res.profiles,
+                                cloned = cloned,
+                                msg = "",
+                                msgKind = MsgKind.NONE,
+                            )
                         }
                     }
                 }
