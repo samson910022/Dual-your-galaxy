@@ -57,9 +57,11 @@ class DualHook : XposedModule() {
             // Phase F4b-P2: same marker contract as system_server above,
             // scope "daagent". Both processes read-merge-write the same file,
             // so each installed scope survives the other's write.
-            // Marker semantics: install evidence only (observe-only: empty
-            // policy + static-final field => no policy effect), not proof
-            // that the policy took effect.
+            // Marker semantics: install evidence only (at least one WhiteListApps
+            // hook installed, currently the <clinit> interceptor on this ROM),
+            // not proof policy took effect. Empty policy => no-op today
+            // (Skipped, returns before reflection); even with non-empty
+            // policy, static-final fields => ObserveOnly (see WhitelistPatch.apply).
             val installed = hookWhiteListApps(param.defaultClassLoader)
             if (installed > 0) {
                 try {
@@ -163,10 +165,9 @@ class DualHook : XposedModule() {
                     null
                 }
             installed++
-            // Install evidence only (observe-only: empty policy + static-final
-            // field => no behavior change); policy effect is decided in
-            // patchWhitelistField/WhitelistPatch, not by this install.
-            logi("hooked ${target.name}#<clinit> (observe-only: empty policy + static-final field, no behavior change)")
+            // Install evidence only (see patchWhitelistField below for effect);
+            // deferred/observe-only reasoning lives in comments, not in the log.
+            logi("hooked ${target.name}#<clinit> (install evidence only)")
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }
@@ -274,7 +275,10 @@ class DualHook : XposedModule() {
     // / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
-        if (extra.isEmpty()) return
+        if (extra.isEmpty()) {
+            logi("skip patch on ${target.name}: empty policy (observe-only)")
+            return
+        }
         val results = WhitelistPatch.patchFields(target, WHITELIST_FIELD_CANDIDATES, extra)
         for ((fieldName, outcome) in results) {
             when (outcome) {
