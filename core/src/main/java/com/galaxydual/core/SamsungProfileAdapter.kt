@@ -39,17 +39,23 @@ object SamsungProfileAdapter {
     // A user-type token meaning Samsung/clone profile. Matches
     // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space/Tab) so
     // `android.os.usertype.profile.CLONE`, `profile_CLONE` and case
-    // variants all count. Case-insensitive by design. Right boundary
-    // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
+    // variants all count. Case-insensitive by design.
     // Historical note (P22-follow-up, fixed): old substring-marker right
     // boundary did not block '_', so `profile.CLONE_extra` once matched
     // via containsMatchIn; fixed by routing authorization through
     // isSupportedCloneToken (full token exact match), now the sole
     // authorization entry (no substring/regex fallback remains).
+    // PR #30 Phase A (R7): the extractor intentionally stays boundary-free
+    // and truncation-tolerant (`/` still terminates the name class); it only
+    // SPLITS candidate spans. Whether a mention may be CLONE is decided by
+    // isSupportedCloneToken (full-token allowlist) PLUS strict residual
+    // validation (hasDisallowedResidual): any non-allowlisted leftover
+    // (`!evil`, `/evil`, backslash, fullwidth slash, zero-width/control
+    // chars, ...) fails the mention closed to OTHER, never CLONE.
 
     // Standalone `profile.X` token extractor (separator-enumerated,
     // case-insensitive). Matches dot form (`profile.CLONE`) or 1-3
-    // enumerated separators (space/`_`/`-`/Tab) plus a name
+    // enumerated separators (space/`_`/`-`/Tab, shared ENUM_SEP) plus a name
     // (`profile_CLONE`, `profile-CLONE`, `profile CLONE`). Only `.`/`_`/`-`/
     // whitespace (space/Tab) 1-3 chars count as separators; `!`/`?`/`:`/`/`
     // and any other punctuation are NOT separators and yield no token
@@ -58,18 +64,23 @@ object SamsungProfileAdapter {
     // separators (e.g. double space) are still tolerated as documented
     // leniency. The name class is `[A-Za-z0-9_.-]+` so suffixes are never
     // truncated (`profile.CLONE-EXTRA` stays one token instead of being cut
-    // to `profile.CLONE`); `/` remains a terminator (residual tolerance:
-    // `a/b` splits tokens; a trailing `/...` after CLONE is handled by
-    // TAINTED_CLONE_TAIL, not by the extractor).
+    // to `profile.CLONE`); `/` remains a terminator (a trailing `/...`
+    // after CLONE is caught by the tainted-slash guard and the residual
+    // check, not by the extractor).
     // Zero-separator glued forms (`profileCloneable`) yield no token by
     // construction.
     // Used for token-level type uniqueness (P1-1): each type mention's
-    // `profile.X` tokens are deduped case-insensitively, then a CLONE-family
-    // token (`isSupportedCloneToken` matches the token) counts as clone evidence and
-    // any other `profile.X` token counts as other evidence. Kept
-    // boundary-free by spec; callers ignore matches glued to a preceding
-    // ASCII letter/digit (`myprofile.CLONE`) so they fall back to OTHER.
-    private val PROFILE_TOKEN = Regex("profile(?:\\.[A-Za-z0-9_.-]+|[ _\\-\\t]{1,3}[A-Za-z0-9_.-]+)", RegexOption.IGNORE_CASE)
+    // `profile.X` tokens are deduped case-insensitively (Locale.ROOT), then
+    // a CLONE-family token (`isSupportedCloneToken` matches the token)
+    // counts as clone evidence and any other `profile.X` token counts as
+    // other evidence. Kept boundary-free by spec; callers ignore matches
+    // glued to a preceding letter/digit/`_`/`-` (`myprofile.CLONE`,
+    // `_profile.CLONE`) so they fall back to OTHER. `.` still passes the
+    // glue check so FQ `android.os.usertype.profile.X` keeps matching
+    // (Unicode-aware: Kotlin `isLetterOrDigit` is stricter than ASCII).
+    // Enumerated separators shared by PROFILE_TOKEN and the allowlist below.
+    private const val ENUM_SEP = "[ _\\-\\t]{1,3}"
+    private val PROFILE_TOKEN = Regex("profile(?:\\.[A-Za-z0-9_.-]+|${ENUM_SEP}[A-Za-z0-9_.-]+)", RegexOption.IGNORE_CASE)
 
     // Full-token CLONE allowlist (P1 full-token boundary, P1-R6 enumerated):
     // `profile` + single `.` OR 1-3 enumerated separators (space/`_`/`-`/
@@ -80,17 +91,18 @@ object SamsungProfileAdapter {
     // `profileCloneable` -> false; `profile!CLONE`/`profile?CLONE`/
     // `profile:CLONE`/`profile:::CLONE`/`profile/CLONE` -> false (arbitrary
     // punctuation is never a separator).
-    private fun isSupportedCloneToken(token: String): Boolean =
-        Regex("^profile(?:\\.clone|[ _\\-\\t]{1,3}clone)$", RegexOption.IGNORE_CASE).matches(token)
+    private val SUPPORTED_CLONE_TOKEN =
+        Regex("^profile(?:\\.clone|${ENUM_SEP}clone)$", RegexOption.IGNORE_CASE)
+    private fun isSupportedCloneToken(token: String): Boolean = SUPPORTED_CLONE_TOKEN.matches(token)
 
-    // Tainted CLONE tail (P1-R6 fail-closed): a CLONE token (dot form or
-    // enumerated separators) followed on the same line by any `/` (with
-    // arbitrary gap words between CLONE and the slash), where the `/`
-    // does NOT open another `profile` token. `profile.CLONE/evil`,
+    // Tainted-slash guard (P1-R6 fail-closed, PR #30 Phase A tightened): any
+    // `/` in a type mention that does NOT open another `profile.X` token
+    // taints the mention (segClone forced false, segOther forced true ->
+    // OTHER for a single-CLONE mention). `profile.CLONE/evil`,
     // `profile.CLONE/`, `profile.CLONE / evil`, `profile.CLONE - /evil`,
-    // `profile.CLONE foo/evil` and `profile.CLONE (/evil)` match
-    // (tainted -> OTHER); `profile.MANAGED/profile.CLONE` and
-    // `profile.CLONE/profile.MANAGED` do not match (the `/` opens another
+    // `profile.CLONE foo/evil` and `profile.CLONE (/evil)` are tainted ->
+    // OTHER; `profile.MANAGED/profile.CLONE` and
+    // `profile.CLONE/profile.MANAGED` are untainted (the `/` opens another
     // `profile` token, so the mention still goes through the normal
     // two-token UNKNOWN rule). `profile.CLONE (default)` (no slash) stays
     // CLONE. Note: a slash inside a parenthesized note (e.g.
@@ -102,20 +114,99 @@ object SamsungProfileAdapter {
     // the trailing-slash signal so such mentions fail closed to OTHER
     // (single tainted CLONE) instead of CLONE. A mixed `CLONE, CLONE/evil`
     // mention is likewise OTHER (fail closed, never CLONE-by-priority).
-    private val TAINTED_CLONE_TAIL =
-        Regex("profile(?:\\.|[ _\\-\\t]{1,3})clone[^\\n/]*?/(?![ \\t]*profile)", RegexOption.IGNORE_CASE)
+    // Phase A tightening vs the old `/(?![ \t]*profile)` exemption: the old
+    // prefix-only check exempted `/profilegarbage`, `/profile` (bare),
+    // `/profileX` and any `/` before a second token (so a multi-slash
+    // `profile.CLONE / profile /evil` mention slipped through: the first
+    // `/` was exempt and the single containsMatchIn never re-scanned for
+    // the second `/evil`). Now EVERY `/` is examined (hasTaintedSlash):
+    // a slash is exempt only when it opens a legal second `profile.X`
+    // token (optional `[ \t]*` gap, optional `android.os.usertype.` prefix,
+    // `profile` + enumerated separator + name); any other slash taints.
+    // The residual check (hasDisallowedResidual) independently forces the
+    // same OTHER verdict for these shapes (double insurance), and additionally
+    // covers non-`/` residuals (`!evil`, backslash, fullwidth slash,
+    // zero-width/control chars) that no slash guard can see.
+    private fun opensProfileToken(afterSlash: String): Boolean {
+        val s = afterSlash.dropWhile { it == ' ' || it == '\t' }
+        val t = if (s.startsWith(FQ_PREFIX_DOT, ignoreCase = true)) s.substring(FQ_PREFIX_DOT.length) else s
+        val m = PROFILE_TOKEN.find(t)
+        return m != null && m.range.first == 0
+    }
 
+    private fun hasTaintedSlash(mention: String): Boolean {
+        var idx = mention.indexOf('/')
+        while (idx >= 0) {
+            if (!opensProfileToken(mention.substring(idx + 1))) return true
+            idx = mention.indexOf('/', idx + 1)
+        }
+        return false
+    }
+
+    // Strict residual validation (PR #30 Phase A, R7 one-shot syntax check,
+    // not a per-character blacklist): after removing every extracted
+    // `profile.X` token span from the mention, the leftover must consist
+    // solely of allowlisted noise, otherwise the mention cannot be CLONE
+    // (caller forces segClone=false, segOther=true -> OTHER). Allowlisted:
+    // ASCII space/Tab, `android.os.usertype.` prefix remnants (FQ form),
+    // co-located `parentId=`/`serial=` field text (parsed independently and
+    // valid on the same single-line fallback remainder, e.g.
+    // `usertype profile.CLONE parentId=0`), and at most one `(default)`
+    // note (case-insensitive, optional surrounding whitespace — the sole
+    // tolerated suffix). In particular `CLONE!evil` leaves `!evil`, and
+    // `CLONE/profile!evil` leaves `/` + `!evil`, both disallowed -> OTHER.
+    // Only consulted for would-be CLONE mentions (all extracted tokens are
+    // clone tokens); mixed clone+other mentions stay on the contradiction
+    // rule (UNKNOWN) so genuine `MANAGED, CLONE` / `MANAGED/CLONE`
+    // separators are never laundered into OTHER.
+    private val FQ_PREFIX_TAIL = Regex("android\\.os\\.usertype\\.?", RegexOption.IGNORE_CASE)
+    private val DEFAULT_NOTE = Regex("\\(\\s*default\\s*\\)", RegexOption.IGNORE_CASE)
+    private fun hasDisallowedResidual(mention: String, matches: List<MatchResult>): Boolean {
+        // 1. Remove every extracted token span.
+        val sb = StringBuilder()
+        var cursor = 0
+        for (m in matches.sortedBy { it.range.first }) {
+            sb.append(mention, cursor, m.range.first)
+            cursor = m.range.last + 1
+        }
+        sb.append(mention, cursor, mention.length)
+        var residual = sb.toString()
+        // 2. Strip co-located structured fields (authorized separately).
+        residual = PARENT_ID.replace(residual, "")
+        residual = SERIAL.replace(residual, "")
+        // 3. Strip FQ prefix remnants.
+        residual = FQ_PREFIX_TAIL.replace(residual, "")
+        // 4. The `(default)` note is the sole tolerated suffix: at most one.
+        val notes = DEFAULT_NOTE.findAll(residual).toList()
+        if (notes.size > 1) return true
+        if (notes.size == 1) residual = DEFAULT_NOTE.replace(residual, "")
+        // 5. Only ASCII space/Tab may remain (fullwidth/zero-width/control
+        // chars and every punctuation residual fail closed to OTHER).
+        return residual.any { it != ' ' && it != '\t' }
+    }
+
+    // FQ `android.os.usertype.` prefix (dot form) shared by the tainted-slash
+    // exemption (opensProfileToken) and the residual check above.
+    private const val FQ_PREFIX_DOT = "android.os.usertype."
+
+    // `user type` keyword core shared by TYPE_LINE/TYPE_KEYWORD/EXPLICIT_SEP.
+    private const val USER_TYPE_PREFIX = "user[\\s_\\-]*type"
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
     private val TYPE_LINE =
-        Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
 
     // Fallback keyword for separator-less ROM forms such as
     // `usertype profile.MANAGED` (no `:`/`=`). Any body line carrying the
     // keyword counts as an explicit type statement. Left boundary guards
     // against mid-token hits (PmOutputParser convention).
     private val TYPE_KEYWORD =
-        Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9])$USER_TYPE_PREFIX", RegexOption.IGNORE_CASE)
+
+    // Explicit `:`/`=` separator after the keyword: lines matching this take
+    // the explicit-value path, never the separator-less fallback path.
+    private val EXPLICIT_SEP =
+        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
 
     // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
     // Left boundary so `transparentId`/`grandparentId` never match.
@@ -199,22 +290,48 @@ object SamsungProfileAdapter {
         )
     }
 
-    // Extracts standalone `profile.X` tokens from one type mention,
-    // deduped case-insensitively. A match glued to a preceding ASCII
-    // letter/digit (`myprofile.CLONE`) is ignored so it falls back to
-    // OTHER via the no-token path, never CLONE.
-    private fun extractProfileTokens(mention: String): List<String> =
+    // Extracts standalone `profile.X` token matches from one type mention.
+    // A match glued to a preceding letter/digit/`_`/`-`
+    // (`myprofile.CLONE`) is ignored so it falls back to OTHER via the
+    // no-token path, never CLONE. `.` passes so FQ forms keep matching.
+    private fun profileTokenMatches(mention: String): List<MatchResult> =
         PROFILE_TOKEN.findAll(mention)
             .filter { m ->
                 val s = m.range.first
                 if (s == 0) true else {
                     val p = mention[s - 1]
-                    !(p in 'A'..'Z' || p in 'a'..'z' || p in '0'..'9')
+                    !(p.isLetterOrDigit() || p == '_' || p == '-')
                 }
             }
-            .map { it.value }
-            .distinctBy { it.lowercase() }
             .toList()
+
+    // Classifies one type mention (explicit `user type :/= value` or bare
+    // keyword remainder) into (segClone, segOther). Empty token list with a
+    // non-empty mention is (false, true) (OTHER via the no-token path);
+    // callers skip empty explicit values and count empty bare remainders as
+    // OTHER per the legacy rule. Intra-mention clone+other contradiction
+    // surfaces as (true, true) -> caller maps to UNKNOWN for the block.
+    private fun classifyMention(mention: String): Pair<Boolean, Boolean> {
+        val matches = profileTokenMatches(mention)
+        val tokens = matches.map { it.value }.distinctBy { it.lowercase(java.util.Locale.ROOT) }.toList()
+        if (tokens.isEmpty()) return Pair(false, true)
+        val anyClone = tokens.any { isSupportedCloneToken(it) }
+        val anyOtherToken = tokens.any { !isSupportedCloneToken(it) }
+        // Slash taint (every `/` must open another legal token) plus strict
+        // residual validation (would-be CLONE mentions only): either fails
+        // the mention closed to OTHER. Mixed mentions skip the residual
+        // check and stay on the contradiction rule.
+        val tainted = hasTaintedSlash(mention)
+        val residualTainted = anyClone && !anyOtherToken && !tainted && hasDisallowedResidual(mention, matches)
+        val failClosed = tainted || residualTainted
+        return Pair(anyClone && !failClosed, anyOtherToken || failClosed)
+    }
+
+    // Unicode line terminators that Kotlin lines() does NOT split on but
+    // Java regex `.` treats as line ends (truncating the TYPE_LINE value
+    // capture). Without normalization a `profile.CLONE<U+2028>evil` mention
+    // would have its tail silently cut and misclassify as CLONE.
+    private val UNICODE_LINE_END = Regex("[\\u0085\\u2028\\u2029]")
 
     // Classifies a block body with token-level type uniqueness (P1-1,
     // issue #21 owner re-review R3): a block is UNKNOWN whenever its
@@ -222,31 +339,38 @@ object SamsungProfileAdapter {
     // Each type mention is one explicit `user type :/= value` (group 1,
     // trimmed, empty skipped) or one bare-keyword remainder
     // (`TYPE_KEYWORD.replaceFirst(line, "").trim()`).
-    // - 0 `profile.X` tokens in a mention: old fallback (non-empty mention
-    //   counts as OTHER evidence; empty values/remainders are ignored except
-    //   an empty bare remainder which counts as OTHER like the old logic).
-    // - >=1 tokens (deduped case-insensitively): any token matching
-    //   isSupportedCloneToken counts as clone evidence; any other `profile.X` token
-    //   counts as other evidence. Non-token text is ignored once tokens
-    //   exist. `profile.MANAGED`/`profile.SYSTEM` are other tokens;
-    //   `profileCloneable` (no separator) yields no token and never matches
-    //   the allowlist; `profile.CLONE_extra`/`profile.CLONE-EXTRA`/
-    //   `profile.CLONE.X`/`profile.CLONEable` are full-token non-matches and
-    //   count as other evidence.
+    // - 0 `profile.X` tokens in a non-empty mention: old fallback (non-empty
+    //   mention counts as OTHER evidence; empty values are skipped except an
+    //   empty bare remainder which counts as OTHER like the old logic).
+    // - >=1 tokens (deduped case-insensitively with Locale.ROOT): any token
+    //   matching isSupportedCloneToken counts as clone evidence; any other
+    //   `profile.X` token counts as other evidence. Non-token text is gated
+    //   by the strict residual check (PR #30 Phase A): a would-be CLONE
+    //   mention (all tokens clone tokens) with any non-allowlisted leftover
+    //   (`!evil`, `/evil`, backslash, fullwidth slash, zero-width/control
+    //   chars, second-token garbage like `CLONE/profile!evil`, ...) fails
+    //   closed to OTHER via hasDisallowedResidual — non-token text is no
+    //   longer ignored once tokens exist. `profile.MANAGED`/`profile.SYSTEM`
+    //   are other tokens; `profileCloneable` (no separator) yields no token
+    //   and never matches the allowlist; `profile.CLONE_extra`/
+    //   `profile.CLONE-EXTRA`/`profile.CLONE.X`/`profile.CLONEable` are
+    //   full-token non-matches and count as other evidence.
     // - Same mention holding both clone and other tokens is an intra-mention
     //   contradiction -> UNKNOWN for the block (covers whitespace, `/`,
-    //   `,`, `;` or any other separator, since tokens ignore separators).
-    // - Tainted CLONE tail (P1-R6 fail-closed): within one mention, a CLONE
-    //   token followed on the same line by any `/` (arbitrary gap words
-    //   allowed between CLONE and the slash, not opening another
-    //   `profile` token, see TAINTED_CLONE_TAIL) taints the mention: a
-    //   single `profile.CLONE/evil` (or trailing-slash, or gap-word forms
+    //   `,`, `;` or any other separator, since token spans are removed
+    //   before residual validation and mixed mentions skip that check).
+    // - Tainted-slash guard (P1-R6 fail-closed, Phase A tightened): within
+    //   one mention, EVERY `/` must open another legal `profile.X` token
+    //   (optional spaces, optional `android.os.usertype.` prefix,
+    //   `profile` + enumerated separator + name; see hasTaintedSlash).
+    //   A single `profile.CLONE/evil` (or trailing-slash, or gap-word forms
     //   like `profile.CLONE - /evil` / `profile.CLONE foo/evil` /
-    //   `profile.CLONE (/evil)`) mention has
-    //   segClone forced false and segOther forced true -> OTHER for the
-    //   block; `profile.MANAGED/profile.CLONE` and
+    //   `profile.CLONE (/evil)`, or multi-slash
+    //   `profile.CLONE / profile /evil` where the second `/` opens no
+    //   token) has segClone forced false and segOther forced true -> OTHER
+    //   for the block; `profile.MANAGED/profile.CLONE` and
     //   `profile.CLONE/profile.MANAGED` are untainted (slash opens
-    //   another `profile` token) and stay on the two-token UNKNOWN rule;
+    //   another legal token) and stay on the two-token UNKNOWN rule;
     //   a mixed `CLONE, CLONE/evil` mention is OTHER (fail closed).
     // - Block verdict: any intra-mention contradiction -> UNKNOWN; else
     //   hasCloneSeg && hasOtherSeg (across mentions) -> UNKNOWN
@@ -255,49 +379,39 @@ object SamsungProfileAdapter {
     // never yield CLONE. The header label is NOT searched (caller passes
     // the body only), so renaming a profile to contain "DUAL" can never
     // yield CLONE here. Empty type values are skipped (never OTHER).
+    // Sole authorization entry: isSupportedCloneToken full-token match PLUS
+    // hasDisallowedResidual; the extractor only splits spans, and
+    // `(default)` is the sole tolerated suffix.
     private fun classifyType(body: String): ProfileUserType {
         var hasCloneSeg = false
         var hasOtherSeg = false
+        // Normalize Unicode line ends first (see UNICODE_LINE_END): map them
+        // to `?` (never allowlisted, never a separator) so a smuggled tail
+        // fails closed to OTHER via the residual check instead of being cut.
+        val text = UNICODE_LINE_END.replace(body, "?")
         // Step 1: explicit `user type :/= value` lines, token-level.
-        for (line in body.lines()) {
+        for (line in text.lines()) {
             val m = TYPE_LINE.find(line) ?: continue
             val value = m.groupValues[1].trim()
             if (value.isEmpty()) continue
-            val tokens = extractProfileTokens(value)
-            if (tokens.isEmpty()) {
-                hasOtherSeg = true
-                continue
-            }
-            // Tainted CLONE tail fails the mention closed: a `/...` tail
-            // (not opening another profile token) can never be CLONE.
-            val tainted = TAINTED_CLONE_TAIL.containsMatchIn(value)
-            val segClone = tokens.any { isSupportedCloneToken(it) } && !tainted
-            val segOther = tokens.any { !isSupportedCloneToken(it) } || tainted
+            val (segClone, segOther) = classifyMention(value)
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
         // Same token rule applied to the remainder after the keyword.
-        val explicitSep = Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]", RegexOption.IGNORE_CASE)
-        for (line in body.lines()) {
+        for (line in text.lines()) {
             if (TYPE_LINE.find(line) != null) continue
             if (!TYPE_KEYWORD.containsMatchIn(line)) continue
-            if (explicitSep.containsMatchIn(line)) continue
+            if (EXPLICIT_SEP.containsMatchIn(line)) continue
             val remainder = TYPE_KEYWORD.replaceFirst(line, "").trim()
             if (remainder.isEmpty()) {
                 hasOtherSeg = true
                 continue
             }
-            val tokens = extractProfileTokens(remainder)
-            if (tokens.isEmpty()) {
-                hasOtherSeg = true
-                continue
-            }
-            // Same taint rule as the explicit-value path above.
-            val tainted = TAINTED_CLONE_TAIL.containsMatchIn(remainder)
-            val segClone = tokens.any { isSupportedCloneToken(it) } && !tainted
-            val segOther = tokens.any { !isSupportedCloneToken(it) } || tainted
+            // Same slash-taint + residual rule as the explicit-value path.
+            val (segClone, segOther) = classifyMention(remainder)
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true
