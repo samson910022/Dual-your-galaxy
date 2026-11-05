@@ -57,6 +57,9 @@ class DualHook : XposedModule() {
             // Phase F4b-P2: same marker contract as system_server above,
             // scope "daagent". Both processes read-merge-write the same file,
             // so each installed scope survives the other's write.
+            // Marker semantics: install evidence only (observe-only: empty
+            // policy + static-final field => no policy effect), not proof
+            // that the policy took effect.
             val installed = hookWhiteListApps(param.defaultClassLoader)
             if (installed > 0) {
                 try {
@@ -160,6 +163,10 @@ class DualHook : XposedModule() {
                     null
                 }
             installed++
+            // Install evidence only (observe-only: empty policy + static-final
+            // field => no behavior change); policy effect is decided in
+            // patchWhitelistField/WhitelistPatch, not by this install.
+            logi("hooked ${target.name}#<clinit> (observe-only: empty policy + static-final field, no behavior change)")
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }

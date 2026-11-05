@@ -104,6 +104,8 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     見 `WhitelistPatchReflectTest` 行為鎖定測試）；不做 `setAccessible` 強寫，
     ART 行為未驗證、不宣稱可覆寫。結果以 `Outcome.ObserveOnly` 明確記錄，
     絕不靜默當成功。
+    daagent marker（`scope=daagent`）僅證明 `<clinit>` hook 已安裝，不證明政策已生效
+    （預設空政策＋`static final String[]` 恆 `ObserveOnly`，故僅觀察）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
 - 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：

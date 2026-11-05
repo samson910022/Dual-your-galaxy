@@ -85,6 +85,7 @@ class WhitelistPatchReflectTest {
         val out = WhitelistPatch.apply(arr, true, setOf("b"), "F", "C", isFinal = true)
         assertTrue(out is WhitelistPatch.Outcome.ObserveOnly)
         assertTrue((out as WhitelistPatch.Outcome.ObserveOnly).reason.contains("F"))
+        assertTrue(out.reason.contains("observe-only"))
         assertEquals(listOf("a"), arr.toList())
     }
 
@@ -97,6 +98,7 @@ class WhitelistPatchReflectTest {
         val single = out.getValue("FINAL_ARR")
         assertTrue(single is WhitelistPatch.Outcome.ObserveOnly)
         assertTrue((single as WhitelistPatch.Outcome.ObserveOnly).reason.contains("FINAL_ARR"))
+        assertTrue(single.reason.contains("observe-only"))
         assertEquals(listOf("a"), FinalHolder.FINAL_ARR.toList())
     }
 
