@@ -37,9 +37,13 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -276,24 +280,117 @@ class GalaxyExecService : Binder {
     }
 }
 
+// Injectable bind seam (Phase B P2-2, issue #34 re-review #10): the Shizuku
+// statics plus the Android ComponentName/UserServiceArgs construction cannot
+// run on the JVM (android.jar stubs throw "Stub!"), so the bind-await-unbind
+// lifecycle is driven through this driver. Production uses
+// RealShizukuBindDriver below (identical behavior to the old inline code);
+// JVM tests inject a fake that controls callback timing (never-complete for
+// contention, manual complete for late-arrival) and counts releases.
+// Contract: send() starts exactly one bind request and returns its handle;
+// onResult fires at most once (binder or failure); a throwing send() means
+// NO request was sent (nothing to release); Request.release() unbinds the
+// sent request (production impl idempotent, fakes count every call so tests
+// pin the gateway to at most one release per request).
+interface ShizukuBindDriver {
+    interface Request {
+        fun release()
+    }
+
+    fun send(onResult: (Result<IBinder>) -> Unit): Request
+}
+
+// Production driver: identical bind/unbind behavior to the pre-seam inline
+// code (same args chain, same unbindUserService(args, conn, true)).
+private class RealShizukuBindDriver(
+    private val packageName: String,
+    private val serviceClassName: String,
+) : ShizukuBindDriver {
+    override fun send(onResult: (Result<IBinder>) -> Unit): ShizukuBindDriver.Request {
+        val args = Shizuku.UserServiceArgs(
+            ComponentName(packageName, serviceClassName),
+            // Tag stays the stable service identity; SERVICE_VERSION (v2) is the
+            // invalidation signal that forces Shizuku/Sui to rebuild the
+            // resident UserService on upgrade (see ShizukuExecProtocol).
+        ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                if (service != null) onResult(Result.success(service))
+                else onResult(Result.failure(IllegalStateException("null service binder")))
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                // Server process died; next run() rebinds via isBinderAlive.
+            }
+        }
+        // Throws IllegalStateException when the binder just died: caller
+        // maps it to a CmdResult, never crashing the app. A throw here means
+        // no request was sent, so the gateway releases nothing.
+        Shizuku.bindUserService(args, conn)
+        val released = AtomicBoolean(false)
+        return object : ShizukuBindDriver.Request {
+            override fun release() {
+                if (released.compareAndSet(false, true)) {
+                    try {
+                        Shizuku.unbindUserService(args, conn, true)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Independent cleanup scope (Phase B P2-2): deferred abandon() cleanup must
+// not depend on viewModelScope (already cancelled in onCleared). One shared
+// daemon scope for all gateways; Dispatchers.IO threads never block process
+// exit. Never cancelled.
+private val shizukuCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+// Bounded wait for the deferred abandon() cleanup: an in-flight bind holds
+// bindMutex at most bindTimeoutMs, so bindTimeoutMs + margin always lets a
+// cancelled in-flight attempt finish first (its own try/finally then
+// releases, the deferred drop is a no-op). Derived from the instance timeout
+// so a custom bindTimeoutMs > 15 s keeps the guarantee. If the wait still
+// expires, the next lock holder drains via the closed check -- never a
+// silent leak.
+private const val SHIZUKU_CLEANUP_MARGIN_MS = 5_000L
+
 // SHELL gateway: executes core-built pm commands inside GalaxyExecService via
 // Shizuku.bindUserService. Constructor takes plain strings only (no Android
 // objects) so it stays JVM-constructible for unit tests; the ComponentName is
-// built lazily inside run(), never on a test thread.
+// built lazily inside the production driver, never on a test thread.
 // DEVICE-UNVERIFIED: no binder round-trip has ever run; every failure mode
 // below returns CmdResult(exit != 0) instead of throwing.
 class ShizukuCmdGateway(
     private val packageName: String,
     private val serviceClassName: String = GalaxyExecService::class.java.name,
+    // Phase B P2-2 seams: bind timeout (default = wire budget) and the bind
+    // driver (default = real Shizuku). Trailing params with defaults so every
+    // existing call site (factory, ViewModel default, tests) keeps working.
+    private val bindTimeoutMs: Long = ShizukuExecProtocol.BIND_TIMEOUT_MS,
+    private val bindDriver: ShizukuBindDriver? = null,
+    private val cleanupScope: CoroutineScope? = null,
 ) : CmdGateway {
     override val privilege: Privilege = Privilege.SHELL
 
-    // Cached privileged binder + its connection, guarded by bindMutex. Bound
-    // lazily on first run(); process-lifetime cache (close() unbinds).
+    private val resolvedDriver: ShizukuBindDriver by lazy {
+        bindDriver ?: RealShizukuBindDriver(packageName, serviceClassName)
+    }
+    private val resolvedCleanupScope: CoroutineScope by lazy {
+        cleanupScope ?: shizukuCleanupScope
+    }
+
+    // Cached privileged binder + its owning request, guarded by bindMutex.
+    // Bound lazily on first run(); process-lifetime cache (close() unbinds).
+    // Once closed=true the gateway never caches again (fail closed).
     private val bindMutex = Mutex()
     private var cachedBinder: IBinder? = null
-    private var cachedArgs: Shizuku.UserServiceArgs? = null
-    private var cachedConn: ServiceConnection? = null
+    private var cachedRequest: ShizukuBindDriver.Request? = null
+    // Phase B P2-2: set by close()/abandon(), read by every lock holder.
+    // A contended abandon() records a deferred cleanup instead of giving up.
+    private val closed = AtomicBoolean(false)
+    private val deferredCleanupScheduled = AtomicBoolean(false)
 
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
@@ -326,42 +423,59 @@ class ShizukuCmdGateway(
     // Returns the live service binder, binding on first use (mutex-guarded
     // single-flight, bounded wait). Must be called off the main thread
     // (blocking latch await); run() already dispatches to Dispatchers.IO.
-    private suspend fun boundBinder(): IBinder? =
+    // Internal (not private) so JVM tests drive the bind lifecycle directly
+    // through a fake driver (run()/transactExec need real Parcels and stay
+    // device-only).
+    //
+    // Phase B P2-2 release guarantee: EVERY sent request is owned by a
+    // try/finally. Only the success path promotes the request into the cache
+    // (promoted=true); timeout, Job cancellation (CE out of latch.await),
+    // callback failure, a send throw (no request sent -- nothing to release),
+    // or an abandon()-during-bind (closed observed after the wait) all fall
+    // through finally without promoting and release the request exactly
+    // once. A late callback arriving after the release completes a discarded
+    // latch and never triggers a second unbind. A promoted (cached) request
+    // is released exactly once by the later close()/abandon()/drop path, so
+    // success and failure releases never overlap (no double-unbind).
+    internal suspend fun boundBinder(): IBinder? =
         bindMutex.withLock {
+            if (closed.get()) {
+                dropBindingLocked()
+                throw IllegalStateException("shizuku gateway closed")
+            }
             cachedBinder?.let { if (it.isBinderAlive) return@withLock it else dropBindingLocked() }
             val latch = CompletableDeferred<IBinder>()
-            val args = Shizuku.UserServiceArgs(
-                ComponentName(packageName, serviceClassName),
-            // Tag stays the stable service identity; SERVICE_VERSION (v2) is the
-            // invalidation signal that forces Shizuku/Sui to rebuild the
-            // resident UserService on upgrade (see ShizukuExecProtocol).
-            ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")
-            val conn = object : ServiceConnection {
-                override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                    if (service != null) latch.complete(service)
-                    else latch.completeExceptionally(IllegalStateException("null service binder"))
+            val request: ShizukuBindDriver.Request = try {
+                resolvedDriver.send { result ->
+                    val binder = result.getOrNull()
+                    if (binder != null) latch.complete(binder)
+                    else latch.completeExceptionally(
+                        result.exceptionOrNull() ?: IllegalStateException("bind failed"),
+                    )
                 }
-
-                override fun onServiceDisconnected(name: ComponentName?) {
-                    // Server process died; next run() rebinds via isBinderAlive.
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                throw e
+            }
+            var promoted = false
+            try {
+                val binder = withTimeoutOrNull(bindTimeoutMs) {
+                    latch.await()
+                } ?: throw IllegalStateException("bind timed out after ${bindTimeoutMs}ms")
+                if (closed.get()) throw IllegalStateException("shizuku gateway closed during bind")
+                cachedRequest = request
+                cachedBinder = binder
+                promoted = true
+                binder
+            } finally {
+                if (!promoted) {
+                    try {
+                        request.release()
+                    } catch (e: RuntimeException) {
+                        if (e is CancellationException) throw e
+                    }
                 }
             }
-            // Throws IllegalStateException when the binder just died: caller
-            // maps it to a CmdResult, never crashing the app.
-            Shizuku.bindUserService(args, conn)
-            val binder = withTimeoutOrNull(ShizukuExecProtocol.BIND_TIMEOUT_MS) {
-                latch.await()
-            } ?: run {
-                try {
-                    Shizuku.unbindUserService(args, conn, true)
-                } catch (_: Exception) {
-                }
-                throw IllegalStateException("bind timed out after ${ShizukuExecProtocol.BIND_TIMEOUT_MS}ms")
-            }
-            cachedArgs = args
-            cachedConn = conn
-            cachedBinder = binder
-            binder
         }
 
     // One exec round-trip with a bounded client wait. Pre-dispatch refusals
@@ -471,38 +585,85 @@ class ShizukuCmdGateway(
 
     // Drops the cached binding; caller must hold bindMutex, except close()
     // which takes it. Unbind is best-effort: the server side may be gone.
+    // Idempotent: nulls the cache first, so a second drop releases nothing.
     private fun dropBindingLocked() {
-        val args = cachedArgs
-        val conn = cachedConn
+        val request = cachedRequest
         cachedBinder = null
-        cachedArgs = null
-        cachedConn = null
-        try {
-            if (args != null && conn != null) Shizuku.unbindUserService(args, conn, true)
-        } catch (_: Exception) {
+        cachedRequest = null
+        if (request != null) {
+            try {
+                request.release()
+            } catch (_: Exception) {
+            }
         }
     }
 
+    // Test seam: reports whether a binding is currently cached (acquires the
+    // mutex, so call only when quiescent -- never from inside a bind).
+    internal suspend fun hasCachedBindingForTest(): Boolean =
+        bindMutex.withLock { cachedBinder != null }
+
     // Releases the cached binding (e.g. from process teardown). The gateways
     // are otherwise process-lifetime objects owned by the ViewModel factory;
-    // not calling close() before process death is fine.
+    // not calling close() before process death is fine. Marks the gateway
+    // closed first so no later bind reuses or repopulates the cache; every
+    // lock holder observes closed and drops instead of promoting.
     suspend fun close() {
+        closed.set(true)
         bindMutex.withLock { dropBindingLocked() }
     }
 
-    // Non-suspend best-effort release for ViewModel.onCleared (Phase N2):
-    // onCleared cannot suspend and viewModelScope is already cancelled, so a
-    // suspend close() (bindMutex.withLock) is unusable there. tryLock takes
-    // the binding only when uncontended; a contended mutex (in-flight run()
-    // holding it) is放弃 by design -- the stale binding dies with the
-    // process (process-death 兜底). Idempotent: dropBindingLocked nulls the
-    // cache, so a second abandon() finds null args and unbinds nothing.
+    // Non-suspend best-effort release for ViewModel.onCleared (Phase N2, hardened
+    // by Phase B P2-2): onCleared cannot suspend and viewModelScope is already
+    // cancelled, so a suspend close() (bindMutex.withLock) is unusable there.
+    // This marks the gateway closed and guarantees eventual cleanup instead
+    // of giving up after one contended tryLock:
+    // - uncontended: takes the binding inline (same as before);
+    // - contended (an in-flight boundBinder holds the mutex): records a
+    //   deferred cleanup on the independent shizukuCleanupScope (never the
+    //   ViewModel scope) which drops the cache under a bounded wait once the
+    //   lock is free. The in-flight attempt itself also observes closed after
+    //   its wait and releases its own request instead of caching it, so the
+    //   contended window cannot leak even if the deferred wait expires -- the
+    //   next boundBinder/close holder would drain via the same closed check.
+    // Idempotent: closed CAS runs once; dropBindingLocked nulls the cache, so
+    // a second abandon()/close() finds null and unbinds nothing (no
+    // double-unbind).
     fun abandon() {
-        if (!bindMutex.tryLock()) return
+        if (!closed.compareAndSet(false, true)) return
+        if (bindMutex.tryLock()) {
+            try {
+                dropBindingLocked()
+            } finally {
+                bindMutex.unlock()
+            }
+        } else {
+            scheduleDeferredCleanup()
+        }
+    }
+
+    private fun scheduleDeferredCleanup() {
+        if (!deferredCleanupScheduled.compareAndSet(false, true)) return
+        val scope = try {
+            resolvedCleanupScope
+        } catch (_: Exception) {
+            return
+        }
         try {
-            dropBindingLocked()
-        } finally {
-            bindMutex.unlock()
+            scope.launch {
+                try {
+                    withTimeoutOrNull(bindTimeoutMs + SHIZUKU_CLEANUP_MARGIN_MS) {
+                        bindMutex.withLock { dropBindingLocked() }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Best effort: the stale binding dies with the process
+                    // anyway, and every later lock holder drains via closed.
+                }
+            }
+        } catch (_: Exception) {
+            deferredCleanupScheduled.set(false)
         }
     }
 }
