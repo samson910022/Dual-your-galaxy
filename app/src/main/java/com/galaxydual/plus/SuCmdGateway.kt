@@ -90,13 +90,19 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     }
     drainOut.join(5_000)
     drainErr.join(5_000)
-    return result(proc.exitValue(), out, err)
+    // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
+    // is the expiry signal. A still-alive drain means the capture may be
+    // incomplete even when nothing hit the cap -- fail closed via truncated.
+    val joinExpired = drainOut.isAlive || drainErr.isAlive
+    return result(proc.exitValue(), out, err, joinExpired)
 }
 
 // Single construction point for the steady-state path: truncated is derived
-// from the same cap test as capped() so flag and marker can never disagree.
-private fun result(exit: Int, out: StringBuilder, err: StringBuilder): CmdResult =
-    CmdResult(exit = exit, out = capped(out), err = capped(err), truncated = isCapped(out) || isCapped(err))
+// from the same cap test as capped() so flag and marker can never disagree,
+// plus join-expiry (a drain still alive after its join window) which likewise
+// means the capture may be incomplete.
+private fun result(exit: Int, out: StringBuilder, err: StringBuilder, joinExpired: Boolean = false): CmdResult =
+    CmdResult(exit = exit, out = capped(out), err = capped(err), truncated = isCapped(out) || isCapped(err) || joinExpired)
 
 // Reads all of input into sink up to MAX_CAPTURE_CHARS; closes the stream.
 // Truncation marker included so callers can tell capped output apart.

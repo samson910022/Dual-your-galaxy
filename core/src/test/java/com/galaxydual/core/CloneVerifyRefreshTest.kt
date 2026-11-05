@@ -49,6 +49,8 @@ class CloneVerifyRefreshTest {
         // hand-rolled runSuspend above cannot model it.
         var throwOnListUsers: Boolean = false,
         var throwOnListPackages: Boolean = false,
+        var throwOnInstall: Boolean = false,
+        var throwOnUninstall: Boolean = false,
         var throwMessage: String = "binder died",
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
@@ -67,10 +69,14 @@ class CloneVerifyRefreshTest {
                     CmdResult(exit = dumpsysExit, out = dumpsysOut, err = "")
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
                     CmdResult(exit = propExit, out = propOut, err = "")
-                cmd.startsWith("pm install-existing") ->
+                cmd.startsWith("pm install-existing") -> {
+                    if (throwOnInstall) throw RuntimeException(throwMessage)
                     CmdResult(exit = installExit, out = installOut, err = installErr)
-                cmd.startsWith("pm uninstall") ->
+                }
+                cmd.startsWith("pm uninstall") -> {
+                    if (throwOnUninstall) throw RuntimeException(throwMessage)
                     CmdResult(exit = uninstallExit, out = uninstallOut, err = uninstallErr)
+                }
                 cmd.startsWith("pm path") ->
                     CmdResult(exit = pathExit, out = pathOut, err = pathErr)
                 cmd.startsWith("pm list packages") -> {
@@ -880,6 +886,41 @@ class CloneVerifyRefreshTest {
             "listProfiles collapses channel failure to empty by design",
             emptyList<DualProfile>(),
             runSuspend { repo.listProfiles() },
+        )
+    }
+
+    // M1 write-path defense: a throwing install maps cloneVerified to
+    // ChannelError (fail closed), never a crash. Identity channels stay
+    // healthy so the throw is proven to come from the write itself.
+    @Test
+    fun cloneVerified_throwingInstall_isChannelError() {
+        val gateway = FakeGateway(
+            throwOnInstall = true,
+            throwMessage = "binder died",
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("throwing install must be ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        assertTrue(
+            "detail must carry the channel error, got: \"${(outcome as CloneOutcome.ChannelError).detail}\"",
+            outcome.detail.contains("channel error") && outcome.detail.contains("binder died"),
+        )
+    }
+
+    // M1 write-path defense: a throwing uninstall maps removeVerified to
+    // ChannelError (fail closed), never a crash.
+    @Test
+    fun removeVerified_throwingUninstall_isChannelError() {
+        val gateway = FakeGateway(
+            throwOnUninstall = true,
+            throwMessage = "binder died",
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        assertTrue("throwing uninstall must be ChannelError, got: $outcome", outcome is RemoveOutcome.ChannelError)
+        assertTrue(
+            "detail must carry the channel error, got: \"${(outcome as RemoveOutcome.ChannelError).detail}\"",
+            outcome.detail.contains("channel error") && outcome.detail.contains("binder died"),
         )
     }
 }

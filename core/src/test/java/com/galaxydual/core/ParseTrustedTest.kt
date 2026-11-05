@@ -335,4 +335,41 @@ class ParseTrustedTest {
             res.reason.contains("unexpected listing format"),
         )
     }
+
+    // L2 pin: uppercase "PACKAGE:" prefix with a legal payload is handled
+    // like the lowercase form (prefix match is case-insensitive, same as
+    // TRUSTED_EXEMPT_LINE; payload extraction uses length-based substring so
+    // the case of the prefix cannot leak into the payload). Must never be
+    // TrustedEmpty (fail closed): a legal payload is TrustedFull.
+    @Test
+    fun uppercasePackagePrefix_isTrustedFull() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "PACKAGE:com.foo",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertEquals(
+            TrustedList.TrustedFull(listOf("com.foo")),
+            res,
+        )
+    }
+
+    // Scope pin: a non-empty clean listing ignores residual err text (dirty
+    // err side only fails closed when zero packages are present). The err
+    // channel here carries a non-error-semantic warning, so the listing
+    // stays authoritative TrustedFull by deliberate scope.
+    @Test
+    fun nonEmptyListing_ignoresResidualErrWarning() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.foo",
+            err = "some warning",
+            exit = 0,
+            truncated = false,
+        )
+        assertEquals(
+            TrustedList.TrustedFull(listOf("com.foo")),
+            res,
+        )
+    }
 }
