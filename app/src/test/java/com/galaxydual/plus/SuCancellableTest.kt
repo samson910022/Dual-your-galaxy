@@ -413,6 +413,200 @@ class SuCancellableTest {
         )
     }
 
+    // H2 (P2 verification core): real ProcessBuilder + inherited-pipe live-child fault injection.
+    // Background: the HangingInputStream fake above is close-pollable (close lets the blocked
+    // read return EOF), but the reviewer proved real OS semantics differ: close() does NOT
+    // guarantee waking a native read blocked on a child-held pipe (Java 21 probe:
+    // ProcessPipeInputStream drains stay stuck 3-10 s after close, only exiting when the
+    // sleep child is killed). This test therefore uses TRUE OS semantics and must NOT expect
+    // convergence -- stuck threads/slots while the child lives are EXPECTED (this is exactly
+    // why the H1 drain budget exists). What it verifies instead is bound + handover +
+    // subsequent availability:
+    //   (a) every cancel handover stays < 2 s (this also covers the reviewer side-note:
+    //       close() itself runs synchronously on the cancel caller with no deadline, so a
+    //       blocking close would fail this bound);
+    //   (b) activeDrainCount stays <= MAX_ACTIVE_DRAINS throughout and reader threads stay
+    //       bounded (<= MAX + small margin) -- non-zero is allowed (real stuck is expected),
+    //       divergence is not. Contrast with the fake test's `<= 4` convergence assertion:
+    //       the fake CAN converge because its reads are close-pollable; the real child-held
+    //       pipe CANNOT until the child dies, so only an upper bound is asserted here.
+    //   (c) a normal `echo ok` still returns fast afterwards (new operations stay
+    //       usable; truncated=true accepted as degraded fail-closed).
+    // Setup: wrapper `sh -c "sleep 25 & wait"` -- the direct child (sh) dies on
+    // destroyForcibly while the background sleep inherits stdout/stderr pipes and survives
+    // the whole test (25 s >> test elapsed ~5 s, by construction; `25` is unique in this
+    // suite -- other tests use sleep 5/20/30 -- so the finally pkill below only reaps ours).
+    // execFn ignores the su argv (same idea as the ChildHoldsPipeProcess fake) and spawns
+    // the real wrapper. Android unit-test compile uses android.jar stubs (no Java 9
+    // ProcessHandle/pid/toHandle), so child liveness is NOT asserted via pid -- it follows
+    // from the 25 s duration plus the stuck-drain/count observation below (wrapper dead
+    // yet drains/count still held => a survivor holds the pipes; close-wakeup is racy so
+    // no lower-bound is asserted -- either stuck or early-EOF is real OS semantics).
+    // Iterations: 6 x 2 = 12 slots < 16, so the normal path is verified without triggering
+    // degrade (the exhausted-degrade path is already covered by drainBudgetExhausted).
+    // Pollution control: stuck slots would otherwise linger 25 s; finally pkill -9s the
+    // sleep 25 survivors so drains EOF and slots release (existing drain-loop pattern).
+    @Test fun childHeldPipeRepeatedCancels_staysBoundedAndHandsOver() = runBlocking {
+        delay(500L)
+        val baseCount = activeDrainCount.get()
+        val baseThreads = aliveCaptureDrains()
+        assertTrue("drain count must never exceed cap at start (base=$baseCount)", baseCount <= MAX_ACTIVE_DRAINS)
+        val procs = CopyOnWriteArrayList<Process>()
+        val gw = SuCmdGateway(
+            execFn = { _ -> ProcessBuilder("sh", "-c", "sleep 25 & wait").start().also { procs += it } },
+            monoMs = ::defaultMonoMs,
+        )
+        val iterations = 6
+        val elapsedList = mutableListOf<Long>()
+        var maxElapsed = 0L
+        var maxCount = baseCount
+        try {
+            repeat(iterations) { idx ->
+                val job = async(Dispatchers.Default) { gw.run("pm list users") }
+                // Let spawn + drains start and the wait go in flight. Poll for the proc
+                // to appear (exec runs on Dispatchers.IO inside the gateway).
+                var spins = 0
+                while (procs.size <= idx && spins < 50) {
+                    delay(100L)
+                    spins++
+                }
+                assertTrue("wrapper proc must spawn (iter $idx)", procs.size > idx)
+                val proc = procs[idx]
+                // Give `sleep 25 &` a moment to start and inherit the pipes (probe:
+                // child present after ~300 ms; wrapper must still be alive here
+                // or the setup itself is broken).
+                delay(300L)
+                assertTrue("wrapper must be alive before cancel (iter $idx)", proc.isAlive)
+                val startNs = System.nanoTime()
+                job.cancel()
+                try {
+                    job.await()
+                    fail("cancelled capture must throw CE (iter $idx)")
+                } catch (_: CancellationException) {
+                    // Expected: caller released at once, wrapper destroyed best
+                    // effort, remote child untouched (unknown-after-send).
+                }
+                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                elapsedList += elapsedMs
+                if (elapsedMs > maxElapsed) maxElapsed = elapsedMs
+                assertTrue(
+                    "cancel handover must stay fast with real child-held pipe (iter $idx elapsed=${elapsedMs}ms)",
+                    elapsedMs < 2_000L,
+                )
+                val cur = activeDrainCount.get()
+                if (cur > maxCount) maxCount = cur
+                assertTrue(
+                    "drain count must never exceed cap (iter $idx count=$cur)",
+                    cur <= MAX_ACTIVE_DRAINS,
+                )
+                // Wrapper must die quickly (destroyForcibly SIGKILLs sh).
+                var wspins = 0
+                while (proc.isAlive && wspins < 50) {
+                    delay(100L)
+                    wspins++
+                }
+                assertFalse("wrapper must die after cancel (iter $idx)", proc.isAlive)
+                // No available()/read-based stream-closed assert here (android.jar
+                // has no ProcessHandle, and JDK 21 probe showed
+                // ProcessPipeInputStream.available() blocks ~24 s behind a stuck
+                // concurrent read -- asserting via it would wedge the test for the
+                // full sleep duration instead of verifying production). Close
+                // determinism is covered by the fake above (isClosed); here the
+                // < 2 s handover bound IS the close-blocking verification: close()
+                // itself runs synchronously on the cancel path with no deadline,
+                // so a blocking close would fail the elapsed bound (reviewer note).
+                // No direct child-pid assert either: child survival follows from
+                // `sleep 25` duration (whole test ~5 s when fast) plus
+                // wrapper-dead-yet-count-held -- a survivor must still hold the
+                // write ends whenever drains stay stuck (early-EOF via a racy
+                // close-wakeup is also real semantics, so no lower bound).
+                // Thread bound per iteration: at most 2 new stuck drains per cancel
+                // plus base plus small scheduling margin (drains start synchronously
+                // before the wait, so no startup race beyond 4).
+                val alive = aliveCaptureDrains()
+                assertTrue(
+                    "reader threads must stay bounded (iter $idx alive=$alive base=$baseThreads)",
+                    alive <= baseThreads + (idx + 1) * 2 + 4,
+                )
+            }
+            assertTrue(
+                "worst cancel handover must stay under 2 s with real child-held pipes (maxElapsed=${maxElapsed}ms per-iter=$elapsedList)",
+                maxElapsed < 2_000L,
+            )
+            assertTrue("drain count must never exceed cap (maxCount=$maxCount)", maxCount <= MAX_ACTIVE_DRAINS)
+            // Absolute bound (vs fake `<= 4` convergence): real stuck is expected so
+            // non-zero is fine, but it must never diverge past the budget + margin
+            // for foreign lingering drains under full-suite load.
+            val finalAlive = aliveCaptureDrains()
+            assertTrue(
+                "reader threads must stay bounded with real child-held pipes (alive=$finalAlive base=$baseThreads, expected<=${MAX_ACTIVE_DRAINS + 4} not unbounded)",
+                finalAlive <= MAX_ACTIVE_DRAINS + 4,
+            )
+            println("H2 handover elapsed ms per iter=$elapsedList max=${maxElapsed}ms maxCount=$maxCount finalCount=${activeDrainCount.get()} finalThreads=$finalAlive baseCount=$baseCount baseThreads=$baseThreads")
+            // Post-pressure health while stuck slots are still held (12 < 16 leaves
+            // room): a fresh call must still return fast (later calls unaffected).
+            val nextStartNs = System.nanoTime()
+            val next = withTimeoutOrNull(10_000L) {
+                captureProcessCancellable(arrayOf("sh", "-c", "echo ok"), timeoutMs = 5_000L)
+            }
+            assertTrue("call after real child-held cancels must still return (not wedged)", next != null)
+            val nextElapsedMs = (System.nanoTime() - nextStartNs) / 1_000_000L
+            // Fast return is asserted unconditionally (mid-storm new operations
+            // stay usable); the truncated/out state is degrade-tolerant below.
+            assertTrue(
+                "call after real child-held cancels must be fast (elapsed=${nextElapsedMs}ms)",
+                nextElapsedMs < 2_000L,
+            )
+            if (next!!.truncated) {
+                // Accepted as degraded fail-closed: under full-suite load foreign
+                // lingering drains may already fill the slots, so fail-closed
+                // (truncated=true, no wait) is the expected slots-full behavior,
+                // not a regression -- availability (fast return) is what matters.
+            } else {
+                assertEquals("call after real child-held cancels must succeed", "ok\n", next.out)
+            }
+        } finally {
+            // Do not pollute the suite: the 25 s sleeps would otherwise pin slots
+            // for the rest of the run. pkill -9s the survivors so drains EOF and
+            // release (pattern is unique to this test; other tests use 5/20/30).
+            // Best-effort only (never masks the main verdict); the next tests
+            // tolerate a non-zero base (drainBudgetExhausted fills remaining).
+            // Best-effort detail: if pkill is missing or its -f semantics differ,
+            // `; true` + the catch swallow it silently; leftovers expire naturally
+            // with the 25 s sleep and later tests tolerate a non-zero base.
+            // Host-JVM unit-test only (not device/proxybox).
+            try {
+                ProcessBuilder("sh", "-c", "pkill -9 -f 'sleep 25'; true").start().waitFor(5, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+            }
+            for (p in procs) {
+                try {
+                    p.destroyForcibly()
+                } catch (_: Exception) {
+                }
+            }
+            for (p in procs) {
+                try {
+                    p.waitFor(2, TimeUnit.SECONDS)
+                } catch (_: Exception) {
+                }
+                try {
+                    p.inputStream.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    p.errorStream.close()
+                } catch (_: Exception) {
+                }
+            }
+            var spins = 0
+            while (activeDrainCount.get() > baseCount && spins < 100) {
+                delay(100L)
+                spins++
+            }
+        }
+    }
+
     // Phase A3 P2-2 (PR #40 Re-review): fake whose timed waitFor slices block
     // like a real hung `su` (sleeps the requested slice, reports not-exited)
     // while the zero-time poll reports the truth without blocking. Lets the
