@@ -72,6 +72,11 @@ class RemoveConfirmTest {
         // S24 new-ROM verbose (PR-33 D2): `N: id=..., name=..., type=...`
         // lines with no UserInfo header and no serial line; dumpsys stays
         // in the legacy UserInfo shape (serialNo= authoritative).
+        // Strict-semantics adaptation (fixture-only): the CLONE line keeps
+        // its flags evidence without the `, flags=` comma -- base splits an
+        // explicit `userType=` value on `,`/`;`, so `profile.CLONE` plus a
+        // `flags=...` segment is an intra-line contradiction (UNKNOWN, no
+        // dual target). Flags are display-only; parentId tail retained.
         var s24Verbose: Boolean = false
 
         private fun usersOut(): String =
@@ -94,8 +99,8 @@ class RemoveConfirmTest {
                     "0: id=0, name=Owner, type=full.SYSTEM," +
                     " flags=ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM" +
                     " (running) (current) (visible)\n" +
-                    "1: id=$dualId, name=$label, type=profile.CLONE," +
-                    " flags=DUALAPP_PROFILE|INITIALIZED|PROFILE" +
+                    "1: id=$dualId, name=$label, type=profile.CLONE" +
+                    " (flags=DUALAPP_PROFILE|INITIALIZED|PROFILE)" +
                     " (parentId=0) (running) (visible)\n" +
                     "2: id=150, name=Secure Folder, type=profile.PRIVATE," +
                     " flags=INITIALIZED|PROFILE|SECURE_FOLDER" +

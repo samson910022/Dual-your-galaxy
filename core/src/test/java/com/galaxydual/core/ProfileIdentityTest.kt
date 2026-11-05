@@ -942,26 +942,38 @@ class ProfileIdentityTest {
     // PR-33 D2 (S24 實機格式): new-ROM `cmd user list -v` has no UserInfo
     // header and no serial line. Fixture embeds the S24 evidence verbatim
     // (3-user verbose block) plus the matching dumpsys 0/95/150 blocks.
+    // Strict-semantics adaptation (base p21-review, fixture-only): the CLONE
+    // line keeps its flags evidence but without the `, flags=` comma -- base
+    // splits an explicit `userType=` value on `,`/`;`, so `profile.CLONE`
+    // plus a second `flags=...` segment is an intra-line contradiction
+    // (UNKNOWN, never CLONE). Flags are display-only; the parentId tail is
+    // retained so the parent gate still sees parentId=0.
     private val S24_VERBOSE = """
         3 users:
 
         0: id=0, name=陳孝宣, type=full.SYSTEM, flags=ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM (running) (current) (visible)
-        1: id=95, name=DUAL_APP, type=profile.CLONE, flags=DUALAPP_PROFILE|INITIALIZED|PROFILE (parentId=0) (running) (visible)
+        1: id=95, name=DUAL_APP, type=profile.CLONE (flags=DUALAPP_PROFILE|INITIALIZED|PROFILE) (parentId=0) (running) (visible)
         2: id=150, name=Secure Folder, type=profile.PRIVATE, flags=INITIALIZED|PROFILE|SDP_NOT_SUPPORTED_SECURE_FOLDER|SECURE_FOLDER (parentId=0) (running) (profile-owner) (visible)
     """.trimIndent()
 
+    // Strict-semantics adaptation (base p21-review, fixture-only): base
+    // classifies a block only on a `user`-prefixed type keyword (`User type:`
+    // / `userType=`); a bare `Type:` line carries no type evidence
+    // (non-type lines never yield CLONE), so the S24 dumpsys blocks use the
+    // base-recognized `User type:` keyword. Serial/parent stay on the header
+    // remainder (`serialNo=` authoritative) exactly as on device.
     private val S24_DUMPSYS = """
         Users:
           UserInfo{0:xxx:4c13} serialNo=0 isPrimary=true
-            Type: android.os.usertype.full.SYSTEM
+            User type: android.os.usertype.full.SYSTEM
             Flags: 19475 (ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM)
             State: RUNNING_UNLOCKED
           UserInfo{95:xxx:20001010} serialNo=95 isPrimary=false parentId=0
-            Type: android.os.usertype.profile.CLONE
+            User type: android.os.usertype.profile.CLONE
             Flags: 536875024 (DUALAPP_PROFILE|INITIALIZED|PROFILE)
             State: RUNNING_UNLOCKED
           UserInfo{150:xxx:61010} serialNo=150 isPrimary=false parentId=0
-            Type: android.os.usertype.profile.PRIVATE
+            User type: android.os.usertype.profile.PRIVATE
             Flags: 397328 (INITIALIZED|PROFILE|SDP_NOT_SUPPORTED_SECURE_FOLDER|SECURE_FOLDER)
             State: RUNNING_UNLOCKED
     """.trimIndent()
@@ -1017,13 +1029,16 @@ class ProfileIdentityTest {
     // Allowlisted 行) 不得污染最後一個 user 塊。Users 段 0/95/150 三塊，
     // 150 塊為 PRIVATE；舊 parseBlocks 讓末塊 body 延到 EOF，把目錄的 CLONE
     // 字樣算進 150 -> cloneIds={95,150} -> Refused -> 全機 NoDual。
+    // Strict-semantics adaptation (fixture-only): verbose CLONE 行的 flags
+    // 證據改用無逗號形式，否則 base 的行內段規則（`userType=` 值按 `,`/`;`
+    // 分段，CLONE+他段=矛盾）會把 95 判 UNKNOWN，雙通道合議不足而 -1。
     @Test
     fun dumpsysTrailingCatalog_doesNotLeakIntoLastBlock() {
         val verbose = """
             3 users:
 
             0: id=0, name=Owner, type=full.SYSTEM, flags=ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM (running) (current) (visible)
-            1: id=95, name=DUAL_APP, type=profile.CLONE, flags=DUALAPP_PROFILE|INITIALIZED|PROFILE (parentId=0) (running) (visible)
+            1: id=95, name=DUAL_APP, type=profile.CLONE (flags=DUALAPP_PROFILE|INITIALIZED|PROFILE) (parentId=0) (running) (visible)
             2: id=150, name=Secure Folder, type=profile.PRIVATE, flags=INITIALIZED|PROFILE|SDP_NOT_SUPPORTED_SECURE_FOLDER|SECURE_FOLDER (parentId=0) (running) (profile-owner) (visible)
         """.trimIndent()
         val dumpsys = """
