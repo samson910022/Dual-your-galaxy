@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 # Phase A1: least-privilege top-level permissions (checkout + cache only need read).
