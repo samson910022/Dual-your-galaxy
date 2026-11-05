@@ -117,6 +117,10 @@ class MainActivity : ComponentActivity() {
     private var removeConfirmDialog: AlertDialog? = null
     private var shownPending: PendingRemove? = null
 
+    // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
+    // dismiss，否則舊 Activity 的 window 洩漏。
+    private var exportDialog: AlertDialog? = null
+
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
     // the shizuku status line update on the UI thread.
@@ -146,6 +150,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
+        diagExpanded = savedInstanceState?.getBoolean(KEY_DIAG_EXPANDED) ?: false
         buildUi()
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
         // manager (or an unexpected API failure) never crashes the UI.
@@ -164,8 +170,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         updateShizukuLine()
-        // Initial load; queued behind the ViewModel's channel probe.
-        vm.refresh()
+        // 冷啟動單一入口：初查由 onResume.onForeground() (probe+按需 refresh)
+        // 覆蓋，此處不再直調 vm.refresh()，避免與 init probe/onForeground/
+        // binder sticky reconnect 在 mutex 上三重排隊。
+        // 覆蓋論證：冷啟動 ViewModel 為全新實例，inventory=UNKNOWN，
+        // onForeground 判 UNKNOWN 必走 refreshLocked；binder 已連線時 sticky
+        // 監聽另觸發一次 reconnectAndRefresh (probe+refresh)，初查只多不少。
     }
 
     override fun onResume() {
@@ -179,6 +189,12 @@ class MainActivity : ComponentActivity() {
         updateShizukuLine()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // 旋轉保留診斷展開開關 (純 UI 狀態，不經 ViewModel)。
+        outState.putBoolean(KEY_DIAG_EXPANDED, diagExpanded)
+    }
+
     override fun onDestroy() {
         try {
             removeConfirmDialog?.dismiss()
@@ -187,6 +203,12 @@ class MainActivity : ComponentActivity() {
         }
         removeConfirmDialog = null
         shownPending = null
+        try {
+            exportDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        exportDialog = null
         try {
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
@@ -390,7 +412,12 @@ class MainActivity : ComponentActivity() {
     private fun showDiagnosticExport() {
         val state = lastState ?: vm.state.value
         val preview = buildDiagnosticExport(state)
-        AlertDialog.Builder(this)
+        try {
+            exportDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: 舊預覽關不掉也不阻塞新預覽。
+        }
+        exportDialog = AlertDialog.Builder(this)
             .setTitle("診斷匯出預覽（已遮蔽，無自動上傳）")
             .setMessage(preview)
             .setCancelable(true)
@@ -709,6 +736,9 @@ class MainActivity : ComponentActivity() {
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
         private const val SHIZUKU_REQUEST_CODE = 1001
+
+        // 旋轉保留鍵：診斷技術細節展開開關。
+        private const val KEY_DIAG_EXPANDED = "diagExpanded"
 
         // Status-line color per message class; NONE falls back to default.
         private fun colorFor(kind: MsgKind): Int = when (kind) {

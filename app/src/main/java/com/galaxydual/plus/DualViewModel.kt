@@ -767,11 +767,12 @@ class DualViewModel(
         // P25 Item 3: one probe per round — swapAutoLocked probes once and
         // returns the result for probeChannels to reuse (previously each
         // probed all elevators: double `su -c` cost + double auth-prompt risk).
+        // Phase 2: 鏈式共用一次 loading (probe 保留 busy，refresh 結尾才清除)。
         if (preference == ChannelPreference.AUTO) {
             val probe = swapAutoLocked()
-            probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+            probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
         } else {
-            probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+            probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
         }
         refreshLocked()
     }
@@ -1116,6 +1117,10 @@ class DualViewModel(
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            // 協程取消必須透傳：吞掉會導致 viewModelScope 取消失效、
+            // loading 卡住且 refreshPending 尾隨永不執行。
+            throw e
         } catch (e: Exception) {
             // Never swallow coroutine cancellation: rethrow so cancel stays
             // cooperative and refresh() coalescing still drains correctly.
@@ -1371,6 +1376,10 @@ class DualViewModel(
                             }
                         }
                     }
+                } catch (e: CancellationException) {
+                    // 協程取消必須透傳：外層 finally 會釋放 inFlightWrites，
+                    // 此處若吞掉會把取消誤記為 UNKNOWN 操作歷史。
+                    throw e
                 } catch (e: Exception) {
                     // Never swallow coroutine cancellation (see refreshLocked).
                     if (e is CancellationException) throw e
@@ -2083,6 +2092,10 @@ class DualViewModel(
                                 }
                             }
                         }
+                    } catch (e: CancellationException) {
+                        // 協程取消必須透傳：外層 finally 會釋放 inFlightWrites，
+                        // 此處若吞掉會把取消誤記為 UNKNOWN 操作歷史。
+                        throw e
                     } catch (e: Exception) {
                         // Never swallow coroutine cancellation (see refreshLocked).
                         if (e is CancellationException) throw e
@@ -2336,12 +2349,12 @@ class DualViewModel(
                         if (e is CancellationException) throw e
                         // Best effort: a failing store never blocks the swap.
                     }
-                    probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+                    // 鏈式共用一次 loading：probe 保留 busy，refresh 結尾才清除。
+                    probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
                     refreshLocked()
                 }
             } finally {
                 if (selectJob === myJob) selectJob = null
-            }
         }
         selectJob = job
     }
@@ -2798,11 +2811,21 @@ class DualViewModel(
     // diagnosis.
     // Diagnosis never feeds ready/routed (hook-neutral, #19): ready is
     // computed from probes before diagnosis and asserted independent below.
-    private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null, allowPrivilegedHookDiagnosis: Boolean = false) {
+    // Phase 2 (併發修復)：keepLoadingOnExit=true 時出口保留 loading=true，
+    // 供同一次 mutex 持有內的 probe+refresh 鏈式呼叫共用一次 loading
+    // (中間不閃斷)；獨立呼叫維持預設 false (語意不變)。
+    // P25 Item 3: reusedProbe 攜帶 swapAutoLocked 結果，AUTO recheck/reconnect
+    // 每輪最多探測一次 (no double `su -c` cost)。
+    private suspend fun probeChannels(
+        reusedProbe: ProbeOutcome? = null,
+        allowPrivilegedHookDiagnosis: Boolean = false,
+        keepLoadingOnExit: Boolean = false,
+    ) {
         _state.update { it.copy(loading = true) }
         try {
             // Single probe per call: reuse the swap result when present,
-            // otherwise probe once (preference-filtered inside probeOnce).
+            // otherwise probe once (preference-filtered inside probeOnce,
+            // cancellation propagates via probeOnce's rethrow).
             val probe = reusedProbe ?: probeOnce()
             val hasRoot = probe.hasRoot
             val hasShizuku = probe.hasShizuku
@@ -3059,7 +3082,9 @@ class DualViewModel(
                         cur.inventory
                     }
                 val base = cur.withHookDiagnosis(hook, probeNow).copy(
-                    loading = false,
+                    // 鏈式呼叫 (keepLoadingOnExit) 保留 busy，下一段 refreshLocked
+                    // 會接手；獨立呼叫則在此清除。
+                    loading = keepLoadingOnExit,
                     channel = preference,
                     privilege = routed,
                     channelReady = effectiveReady,
@@ -3096,10 +3121,11 @@ class DualViewModel(
         // 只記錄本次探測失敗的診斷事件。
         // phase1: 探測異常只在無 sticky 事件時才設 PROBE_FAILED (既有 diagnose
         // 如 VERIFY_UNKNOWN 等待重新查證者優先保留，避免探測抖動洗掉歷史)。
+        // phase2: 鏈式呼叫保留 busy 交給 refreshLocked；獨立呼叫在此清除。
         if (e is CancellationException) throw e
         _state.update { cur ->
             val next = cur.copy(
-                loading = false,
+                loading = keepLoadingOnExit,
                 pmReadable = null,
                 diagnose = cur.diagnose ?: diagnoseEvent(
                     DiagnoseCode.PROBE_FAILED,
@@ -3217,11 +3243,13 @@ class DualViewModel(
                 markStaleIfAgedLocked()
                 // P25 Item 3: one probe per round — swapAutoLocked probes once and
                 // returns the result for probeChannels to reuse.
+                // 全程共用一次 loading：probe 保留 busy，需重查則 refresh 接手
+                // (中間不閃斷)；輕探路徑 (免重查) 在此清除。
                 if (preference == ChannelPreference.AUTO) {
                     val probe = swapAutoLocked()
-                    probeChannels(probe)
+                    probeChannels(probe, keepLoadingOnExit = true)
                 } else {
-                    probeChannels()
+                    probeChannels(keepLoadingOnExit = true)
                 }
                 // stale-read 修正：probeChannels() 已改寫 state，必須重讀
                 // _state.value 再判斷 refresh (此前沿用 probe 前快照，FRESH
@@ -3231,6 +3259,8 @@ class DualViewModel(
                     after.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC
                 if (after.inventory.freshness != InventoryFreshness.FRESH || hookUnknownAfter) {
                     refreshLocked()
+                } else {
+                    _state.update { it.copy(loading = false) }
                 }
             }
         }
