@@ -14,6 +14,7 @@ class WhitelistPatchTest {
         val list = mutableListOf("a")
         val out = WhitelistPatch.apply(list, true, emptySet(), "F", "C")
         assertTrue(out is WhitelistPatch.Outcome.Skipped)
+        assertTrue((out as WhitelistPatch.Outcome.Skipped).reason.contains("observe-only"))
         assertEquals(listOf("a"), list)
     }
 
