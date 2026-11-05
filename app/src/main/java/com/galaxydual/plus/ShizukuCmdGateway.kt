@@ -489,4 +489,20 @@ class ShizukuCmdGateway(
     suspend fun close() {
         bindMutex.withLock { dropBindingLocked() }
     }
+
+    // Non-suspend best-effort release for ViewModel.onCleared (Phase N2):
+    // onCleared cannot suspend and viewModelScope is already cancelled, so a
+    // suspend close() (bindMutex.withLock) is unusable there. tryLock takes
+    // the binding only when uncontended; a contended mutex (in-flight run()
+    // holding it) is放弃 by design -- the stale binding dies with the
+    // process (process-death 兜底). Idempotent: dropBindingLocked nulls the
+    // cache, so a second abandon() finds null args and unbinds nothing.
+    fun abandon() {
+        if (!bindMutex.tryLock()) return
+        try {
+            dropBindingLocked()
+        } finally {
+            bindMutex.unlock()
+        }
+    }
 }
