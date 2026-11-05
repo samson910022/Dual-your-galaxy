@@ -809,4 +809,69 @@ class ProfileIdentityTest {
         assertEquals(1, parsed.size)
         assertEquals(ProfileUserType.CLONE, parsed[0].userType)
     }
+
+    // ---- Phase A P1 full-token CLONE allowlist (issue #21 owner BLOCKER) ----
+    // `profile.CLONE_extra` / `profile.CLONE-EXTRA` / `profile.CLONE.X` /
+    // `profile.CLONEable` must never authorize: suffix-bearing profile tokens
+    // are OTHER (single-mention, no mixing). Exact allowlist members
+    // (`profile.CLONE`, `profile_CLONE`, `profile-CLONE`, `profile CLONE`)
+    // stay CLONE.
+
+    private fun parseSingleVerboseType(value: String): ProfileUserType {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: $value
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        return parsed[0].userType
+    }
+
+    @Test
+    fun cloneSuffixVariants_areOtherNotClone() {
+        // Parameterized over the BLOCKER suffix family: each value appears as
+        // the ONLY type mention, so OTHER proves the suffix alone refuses
+        // (not an UNKNOWN mixture).
+        val cases = listOf(
+            "android.os.usertype.profile.CLONE_extra",
+            "android.os.usertype.profile.CLONE-EXTRA",
+            "android.os.usertype.profile.CLONE.X",
+            "android.os.usertype.profile.CLONEable",
+            "profile.CLONE_extra",
+            "profile.CLONE-EXTRA",
+            "profile.CLONE.X",
+            "profile.CLONEable",
+        )
+        for (value in cases) {
+            assertEquals(
+                "value must be OTHER, got CLONE/UNKNOWN: $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
+
+    @Test
+    fun cloneExactAllowlistVariants_areClone() {
+        // Parameterized allowlist: dot/underscore/hyphen/space separators plus
+        // case-insensitivity all stay CLONE.
+        val cases = listOf(
+            "android.os.usertype.profile.CLONE",
+            "android.os.usertype.profile.clone",
+            "profile.CLONE",
+            "profile_CLONE",
+            "profile-CLONE",
+            "profile CLONE",
+        )
+        for (value in cases) {
+            assertEquals(
+                "value must be CLONE: $value",
+                ProfileUserType.CLONE,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
 }
