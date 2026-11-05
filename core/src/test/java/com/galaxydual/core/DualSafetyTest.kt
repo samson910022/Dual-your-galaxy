@@ -947,6 +947,49 @@ class DualSafetyTest {
         assertEquals(Privilege.NONE, runSuspend { ShizukuElevator(bad).probe() }.level)
     }
 
+    // Phase B P1-2 e2e (owner re-review R3 blocking): `pm list users` with
+    // `exit=1` + ALREADY_EXISTS marker on stdout must fail the strict gate.
+    // profilesSnapshot() is ChannelError, cloneVerified() is ChannelError
+    // (neither NoDual nor Success) with zero writes, and the Shizuku probe
+    // drops to NONE (not SHELL). Contrast (R3, covered above): exit 0 +
+    // Error-labelled header stays SHELL/Success.
+    @Test
+    fun pmListAlreadyExistsMarkerExitOne_isChannelErrorWithZeroWrites() {
+        val markerUsers =
+            "Users:\n" +
+                "\tUserInfo{0:Owner:13} running\n" +
+                "\tUserInfo{95:DUAL_APP:400} running\n" +
+                "Failure [INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install " +
+                "com.example.chat without first uninstalling.]"
+        val gateway = FakeGateway(
+            listUsersOutput = markerUsers,
+            listUsersExit = 1,
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        val snap = runSuspend { repo.profilesSnapshot() }
+        assertTrue("marker exit=1 must be ChannelError, got: $snap", snap is ProfilesSnapshot.ChannelError)
+
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("marker exit=1 must be ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+
+        assertTrue(
+            "marker exit=1 must run zero writes, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().isEmpty(),
+        )
+        assertTrue(
+            "marker exit=1 must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+
+        val shizuku = runSuspend { ShizukuElevator(gateway).probe() }
+        assertEquals(Privilege.NONE, shizuku.level)
+        assertEquals(-1, shizuku.dualUserId)
+    }
+
     // Phase A P1-1 e2e (owner R3): both verbose channels carry a
     // whitespace-separated mixed line (`profile.MANAGED profile.CLONE`,
     // parent 0 serial 15 consistent, prop 95). Token-level uniqueness forces

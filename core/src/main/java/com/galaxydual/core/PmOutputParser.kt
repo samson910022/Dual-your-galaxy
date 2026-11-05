@@ -328,8 +328,9 @@ object PmOutputParser {
     // Identity-channel gate (Phase 2, issue #21; P2-1 header strip, issue #21).
     // Strict variant of isSuccess for the verified-identity channels
     // (`cmd user list -v`, `dumpsys user`, `getprop sys.dualapp.profile_id`).
-    // Differences from isSuccess (which stays the pm-channel rule used by
-    // profilesSnapshot and the pm-list probe gate):
+    // Differences from isSuccess (which stays the install/uninstall/
+    // list-packages pm-channel rule; profilesSnapshot and the Elevator
+    // pm-list gates now use the dedicated isListUsersOutputOk below):
     // - No INSTALL_FAILED_ALREADY_EXISTS exemption: idempotent-success is a
     //   pm install semantic; an identity dump carrying an install code (or
     //   any Failure line) is still error-semantic output and must fail the
@@ -359,19 +360,33 @@ object PmOutputParser {
         return true
     }
 
-    // `pm list users` gate (Phase C P2-C, issue #21): label-neutrality for the
-    // pm-list channel. Strips all strict single-line `UserInfo{...}` header
-    // substrings (same IDENTITY_HEADER_STRIP shape as isIdentityChannelOk)
-    // before delegating to isSuccess unchanged, so a renamed label carrying
-    // error keywords (`UserInfo{95:Error:400}`, `{95:Failure:400}`,
-    // `{10:not found:30}`) can never fail the pm-list gate: the label is
-    // display-only by contract (renames do not change authorization). Only
-    // non-header body lines carry error semantics, so a genuine body
-    // `Failure [...]` line (stdout or stderr) still fails. This is a
-    // `pm list users` command-specific structural distinction; the isSuccess
-    // body (install-channel protection) itself is untouched.
-    fun isListUsersOutputOk(output: String, exit: Int): Boolean =
-        isSuccess(IDENTITY_HEADER_STRIP.replace(output, ""), exit)
+    // `pm list users` strict gate (Phase B P1-2, issue #21; owner re-review R3
+    // blocking). Independent strict判定, no longer delegating to isSuccess:
+    // exit-first (any non-zero exit fails), header-strip (same
+    // IDENTITY_HEADER_STRIP shape as isIdentityChannelOk, so a renamed label
+    // carrying error keywords stays display-only), then every non-blank body
+    // line tested against ERROR_LINE with NO INSTALL_FAILED_ALREADY_EXISTS
+    // exemption and NO EXEMPT_LINE filtering. A genuine body `Failure [...]`
+    // line (stdout or stderr) fails even at exit 0, and
+    // `exit=1 + Failure [INSTALL_FAILED_ALREADY_EXISTS]` can no longer pass
+    // as Loaded (it previously inherited the isSuccess exemption and passed
+    // before the exit check, letting a guard be bypassed via snapshot fake
+    // Loaded). Relation: isSuccess keeps the install-channel
+    // idempotent-success semantics (ALREADY_EXISTS + EXEMPT_LINE) unchanged;
+    // isIdentityChannelOk shares this same判定 shape (exit-first,
+    // header-strip, no exemptions) for the verified-identity channels
+    // (`cmd user list -v` / `dumpsys user` / `getprop`), while this gate
+    // serves only the `pm list users` channel.
+    fun isListUsersOutputOk(output: String, exit: Int): Boolean {
+        if (exit != 0) return false
+        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
+        for (raw in sanitized.lines()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
+        }
+        return true
+    }
 
     // Legacy entry point kept for compatibility: parses key=value token lines.
     // Example: "package:/data/app/xxx basePackage=com.foo userId=150 enabled=true".
