@@ -2,6 +2,7 @@
 package com.galaxydual.core
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlin.jvm.Volatile
 
 // Profile-list snapshot distinguishing channel failure from an empty parse.
@@ -93,22 +94,26 @@ sealed interface RefreshOutcome {
 
 // Repository for dual-profile app lifecycle; all commands go through PmOutputParser.
 // Pure Kotlin with no Android dependency; execution is delegated to CmdGateway.
-// TODO: blocking Thread.sleep + Main-dispatcher VM calls owned by PR-3 (retry/sleep unification).
+// NOTE (PR-32 P2-1): the settle-wait default is cancellable (delay); a custom
+// blocking delayFn (e.g. Thread.sleep) still needs off-Main dispatch -- the VM
+// already wraps every repo call in Dispatchers.IO, so that path stays covered.
 class DualRepository(
     private val gateway: CmdGateway,
 ) {
-    // Retry settle wait (PR-3 stage 1, issue #24): the list-probe retry below
-    // waits VERIFY_RETRY_DELAY_MS between attempts. Core has no
-    // kotlinx-coroutines dependency, so this is a suspend function slot rather
-    // than delay(): the default blocks the CALLER thread via Thread.sleep and
-    // therefore callers must dispatch repository calls off the Main thread
-    // (DualViewModel runs every repo call under Dispatchers.IO). Tests replace
-    // it with a no-op/virtual delay to skip the real 1500 ms waits.
+    // Retry settle wait (PR-3 stage 1, issue #24; PR-32 P2-1 cancellable):
+    // the list-probe retry below waits VERIFY_RETRY_DELAY_MS between
+    // attempts. Core depends on kotlinx-coroutines-core (CancellationException
+    // discipline, PR-2 Phase 3), so the default is cancellable delay() -- a
+    // Job cancel while waiting ends the wait immediately instead of sleeping
+    // through it. The slot stays injectable so tests can go virtual
+    // (no-op/record) or gate on entry; callers keep repo calls off Main
+    // (DualViewModel runs every repo call under Dispatchers.IO), which also
+    // covers a custom blocking delayFn.
     // TEST-ONLY: production must not overwrite. @Volatile gives visibility
     // across threads (test thread writes, IO thread reads) but no atomicity;
     // concurrent overwrite is not safe -- set once before use, never at runtime.
     @Volatile
-    internal var delayFn: suspend (Long) -> Unit = { ms -> Thread.sleep(ms) }
+    internal var delayFn: suspend (Long) -> Unit = { delay(it) }
 
     companion object {
         // Command used to enumerate profiles.
@@ -688,9 +693,11 @@ class DualRepository(
     // a non-zero list probe is retried at most twice with a
     // VERIFY_RETRY_DELAY_MS settle wait before the trusted parse, covering
     // transient binder/timeout blips. The wait runs through delayFn
-    // (suspend slot: callers must dispatch repository calls off Main because
-    // the default delayFn blocks its caller thread; DualViewModel wraps every
-    // repo call in Dispatchers.IO).
+    // (cancellable suspend slot, default delay(); PR-32 P2-1): a Job cancel
+    // during the wait propagates as CancellationException instead of
+    // sleeping through it. Callers keep repository calls off Main
+    // (DualViewModel wraps every repo call in Dispatchers.IO), which also
+    // covers a custom blocking delayFn.
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -763,8 +770,11 @@ class DualRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: InterruptedException) {
-            // Settle-sleep interruption: restore the flag, then fail closed
-            // as a channel error. Ordered before Exception (InterruptedException
+            // Kept (PR-32 P2-1 decision: retain): the default delay() throws
+            // CancellationException (rethrown above), so this arm can only
+            // fire from a custom blocking delayFn (e.g. Thread.sleep under
+            // thread interrupt). Restore the flag, then fail closed as a
+            // channel error. Ordered before Exception (InterruptedException
             // is an Exception subclass; Exception last keeps it reachable).
             Thread.currentThread().interrupt()
             return VerifyState.Unknown("channel error: ${e.message ?: e.javaClass.simpleName}")

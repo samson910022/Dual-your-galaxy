@@ -5,6 +5,10 @@ import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.startCoroutine
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -221,7 +225,7 @@ class VerifyRetryTest {
                 ),
             ),
         )
-        val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
+        val outcome = runSuspend { virtualRepo(gateway, mutableListOf()).removeVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
         assertEquals(2, gateway.listCalls)
         val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
@@ -423,8 +427,9 @@ class VerifyRetryTest {
 
     // Cancellation must propagate: a CancellationException from the list
     // probe is rethrown, never folded into Unknown. Uses the stdlib
-    // kotlin.coroutines.cancellation.CancellationException (core has no
-    // kotlinx-coroutines dependency).
+    // kotlin.coroutines.cancellation.CancellationException (same JVM class
+    // as kotlinx.coroutines.CancellationException: both are typealiases of
+    // java.util.concurrent.CancellationException).
     @Test
     fun verifyListProbe_cancellationException_propagates() {
         val gateway = SeqGateway(listThrowable = CancellationException("cancel"))
@@ -656,5 +661,50 @@ class VerifyRetryTest {
         assertTrue(!isServiceTimeoutText("Error: timeout waiting for user response"))
         assertTrue(!isServiceTimeoutText("Failure [INSTALL_FAILED_CPU_ABI_INCOMPATIBLE: timeout?]"))
         assertTrue(!isServiceTimeoutText(""))
+    }
+
+    // PR-32 P2-1 (cancel-between-probes): a Job cancelled while sitting in
+    // the settle wait between probe 1 (exit != 0) and probe 2 must propagate
+    // CancellationException (never fold into Unknown) and must NOT run the
+    // extra probe (listCalls stays 1). The wait is the production-equivalent
+    // cancellable suspend (real delay(), gated to Long.MAX_VALUE so the
+    // test -- not the wall clock -- decides when the wait ends): a blocking
+    // Thread.sleep wait could not answer cancel promptly. delayCalls counts
+    // production-shape delay invocations (exactly 1: the cancelled wait).
+    // Core owns no in-flight key (the serial key lives in the VM); core only
+    // guarantees it never swallows cancellation, and VM key release is
+    // already finally-guaranteed (Phase 1). No VM test here by design (P2-2
+    // builds VM test infra).
+    @Test
+    fun verifyListProbe_cancelBetweenProbes_propagatesWithoutExtraProbe() {
+        val gateway = SeqGateway(
+            listQueue = ArrayDeque(
+                listOf(CmdResult(exit = 1, out = "", err = "")),
+            ),
+            // Present-listing fallback: proves no second probe ran (a second
+            // probe would return Installed and flip the assertions below).
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        val repo = DualRepository(gateway)
+        val entered = CompletableDeferred<Unit>()
+        var delayCalls = 0
+        repo.delayFn = { _ ->
+            delayCalls++
+            entered.complete(Unit)
+            delay(Long.MAX_VALUE)
+        }
+        runBlocking {
+            val deferred = async { repo.removeVerified("com.example.chat") }
+            entered.await()
+            deferred.cancel()
+            try {
+                deferred.await()
+                fail("expected CancellationException, not an outcome (never fold cancel into Unknown)")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Expected: cooperative cancel out of the settle wait.
+            }
+        }
+        assertEquals(1, gateway.listCalls)
+        assertEquals(1, delayCalls)
     }
 }
