@@ -237,7 +237,8 @@ class DualRepository(
     // package (exact match); NotInstalled when the probe exits 0 but the
     // set lacks it (confirmed absent); Unknown when the id is
     // guard-refused, the package token is invalid, or the probe exits
-    // non-zero (channel failure). C1 guard is unchanged; the shared C2
+    // non-zero (channel failure). Same verified-dual guard (stage 2) as the
+    // explicit paths; the shared C2
     // isSuccess rule is intentionally NOT applied to the list probe here
     // (see verifyOnProfiles): only the result granularity is new.
     suspend fun verifyState(pkg: String, dualId: Int): VerifyState {
@@ -266,7 +267,7 @@ class DualRepository(
         return listProbe(dualId)
     }
 
-    // Explicit-id variant with the same C1 guard as clone(pkg, dualId):
+    // Explicit-id variant with the same verified-dual guard (stage 2) as clone(pkg, dualId):
     // dualId 0 and ids absent from this call's snapshot yield null (unknown)
     // without probing; an invalid builder token also yields null.
     suspend fun listClonedPackages(dualId: Int): List<String>? {
