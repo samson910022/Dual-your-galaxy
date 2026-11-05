@@ -33,18 +33,30 @@ class WhitelistPolicyTest {
     fun booleanFalseWithNoArgsIsObserveOnly() {
         assertEquals(false, WhitelistPolicy.apply(false, emptyList(), setOf("a"), "m", log))
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
     fun booleanFalseWithNonStringArgIsObserveOnly() {
         assertEquals(false, WhitelistPolicy.apply(false, listOf(42), setOf("a"), "m", log))
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
     fun booleanFalseWithTwoArgsIsObserveOnly() {
         assertEquals(false, WhitelistPolicy.apply(false, listOf("a", "b"), setOf("a"), "m", log))
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
@@ -67,6 +79,10 @@ class WhitelistPolicyTest {
         val out = WhitelistPolicy.apply(queue, emptyList(), setOf("b"), "m", log)
         assertSame(queue, out)
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
@@ -81,6 +97,10 @@ class WhitelistPolicyTest {
         val out = WhitelistPolicy.apply(42, emptyList(), setOf("a"), "m", log)
         assertEquals(42, out)
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
@@ -88,6 +108,10 @@ class WhitelistPolicyTest {
         val out = WhitelistPolicy.apply(null, emptyList(), setOf("a"), "m", log)
         assertEquals(null, out)
         assertEquals(1, logs.size)
+        assertTrue(
+            "log should carry observe-only marker, was: ${logs.single()}",
+            logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
     }
 
     @Test
