@@ -41,15 +41,21 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.app.AlertDialog
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.os.Process
+import android.os.UserManager
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -61,11 +67,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
 // Observes DualViewModel.state, drives Shizuku binder/permission lifecycle,
@@ -92,6 +101,19 @@ class MainActivity : ComponentActivity() {
     private lateinit var cloneBtn: Button
     private lateinit var removeBtn: Button
     private lateinit var refreshBtn: Button
+    // PR-7 P2 (#26, 階段 1):個人來源唯讀 catalog + 勾選。
+    // searchInput/系統開關只改 UiState 搜尋狀態；清單列為 CheckBox (唯讀展示
+    // + 勾選,取消勾選 ≠ 卸載)；batchBtn 顯示「建立 N 個分身」,走
+    // vm.cloneSelected (既有單筆 cloneVerified 逐項,見 DualViewModel)。
+    private lateinit var searchInput: EditText
+    private lateinit var systemToggleBtn: Button
+    private lateinit var selectAllBtn: Button
+    private lateinit var clearSelBtn: Button
+    private lateinit var saveSelBtn: Button
+    private lateinit var cancelSaveBtn: Button
+    private lateinit var sourceContainer: LinearLayout
+    private lateinit var batchBtn: Button
+    private lateinit var batchResultView: TextView
     private lateinit var permBtn: Button
     private lateinit var autoBtn: Button
     private lateinit var rootBtn: Button
@@ -131,6 +153,11 @@ class MainActivity : ComponentActivity() {
     // entry points are thread-safe anyway (viewModelScope), this only keeps
     // the shizuku status line update on the UI thread.
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // PR-7 P2 (#26):圖示快取 (appKey -> Drawable,有界)。
+    // 只供清單列顯示用,永不參與身分鍵/選取/寫入決策 (見 SourceIconState)。
+    private val iconMemo = SourceIconState()
+    private val iconDrawables = LinkedHashMap<String, Drawable>()
 
     // PR-6 P2 (#27 後半)：診斷技術細節展開開關 + 最近一次渲染狀態
     // (點診斷行切換展開/收合，需重渲染同一狀態)。
@@ -183,6 +210,8 @@ class MainActivity : ComponentActivity() {
         // 覆蓋論證：冷啟動 ViewModel 為全新實例，inventory=UNKNOWN，
         // onForeground 判 UNKNOWN 必走 refreshLocked；binder 已連線時 sticky
         // 監聽另觸發一次 reconnectAndRefresh (probe+refresh)，初查只多不少。
+        // PR-7 P2 (#26):載入個人來源 catalog (授權範圍唯讀,不跨 user)。
+        reloadCatalog()
     }
 
     override fun onResume() {
@@ -195,6 +224,8 @@ class MainActivity : ComponentActivity() {
         // 不執行特權 cat，與直接調 recheckPrivilege(false) 同契約。
         vm.onForeground()
         updateShizukuLine()
+        // PR-7 P2 (#26):前景重載來源 catalog (安裝/卸載後保持新鮮)。
+        reloadCatalog()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -376,6 +407,57 @@ class MainActivity : ComponentActivity() {
             text = "匯出診斷（已遮蔽可辨識資料，分享前請人工確認）"
             setOnClickListener { showDiagnosticExport() }
         }
+        // PR-7 P2 (#26, 階段 1):個人來源 catalog 搜尋/勾選區。
+        // 唯讀展示 + 勾選；batchBtn 顯示「建立 N 個分身」,走既有單筆
+        // cloneVerified 逐項 (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
+        searchInput = EditText(this).apply {
+            hint = "搜尋應用名稱 / 包名"
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    vm.setSourceQuery(s?.toString().orEmpty())
+                }
+            })
+        }
+        systemToggleBtn = Button(this).apply {
+            text = "系統應用：已隱藏"
+            setOnClickListener { vm.setIncludeSystemApps(!vm.state.value.includeSystemApps) }
+        }
+        selectAllBtn = Button(this).apply {
+            text = "全選可見"
+            setOnClickListener { vm.selectVisible(currentVisibleKeys()) }
+        }
+        clearSelBtn = Button(this).apply {
+            text = "清除勾選"
+            // TalkBack:只清勾選,永不卸載；描述寫明契約。
+            contentDescription = "清除勾選（不卸載任何分身）"
+            setOnClickListener { vm.clearSelectionLocal() }
+        }
+        saveSelBtn = Button(this).apply {
+            text = "保存選取"
+            // 只保存勾選,不寫入分身；重啟可恢復。
+            contentDescription = "保存目前勾選（只保存勾選，不寫入分身）"
+            setOnClickListener { vm.persistSelection(vm.state.value.inventory.targetId) }
+        }
+        cancelSaveBtn = Button(this).apply {
+            text = "取消保存"
+            // 只刪持久化條目,不卸載、不清目前勾選。
+            contentDescription = "取消保存選取（不卸載分身，不清除目前勾選）"
+            setOnClickListener { vm.cancelSavedSelection() }
+        }
+        sourceContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        batchBtn = Button(this).apply {
+            text = "建立 0 個分身"
+            setOnClickListener { vm.cloneSelected() }
+        }
+        batchResultView = TextView(this)
 
         // Clone/remove share one row; 重新連線並更新 + permission share the next.
         val writeRow = LinearLayout(this).apply {
@@ -391,6 +473,19 @@ class MainActivity : ComponentActivity() {
         hookRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(hookDiagBtn, rowParams())
+        }
+        // Catalog rows: search full width, then toggle/select/clear,
+        // then save/cancel-save, then the list, batch button and results.
+        val catalogRow1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(systemToggleBtn, rowParams())
+            addView(selectAllBtn, rowParams())
+            addView(clearSelBtn, rowParams())
+        }
+        val catalogRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(saveSelBtn, rowParams())
+            addView(cancelSaveBtn, rowParams())
         }
         // Picker row 1: Auto + Root; row 2: Shizuku + LSPosed (two rows keep
         // labels legible on narrow screens, same weight style as above).
@@ -415,6 +510,12 @@ class MainActivity : ComponentActivity() {
         root.addView(clonedView)
         root.addView(inventoryView)
         root.addView(lastOpView)
+        root.addView(searchInput)
+        root.addView(catalogRow1)
+        root.addView(catalogRow2)
+        root.addView(sourceContainer)
+        root.addView(batchBtn)
+        root.addView(batchResultView)
         root.addView(pkgInput)
         root.addView(writeRow)
         root.addView(readRow)
@@ -635,6 +736,9 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: render may run before buildUi in tests.
         }
+        // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
+        renderSourceList(s)
+        batchBtn.isEnabled = !busy
         msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
@@ -736,6 +840,122 @@ class MainActivity : ComponentActivity() {
             pkg
         }
 
+    // PR-7 P2 (#26):來源 catalog 載入 (授權範圍唯讀)。
+    // 包到 MainActivity 的生命週期:IO 執行緒讀 PackageManager,回主執行緒注入
+    // ViewModel。serial 取自身 user (UserManager,失敗回退 0);AppKey =
+    // serial:package (見 SourceInventory)。
+    private fun reloadCatalog() {
+        lifecycleScope.launch {
+            val apps = withContext(Dispatchers.IO) {
+                try {
+                    loadSourceApps(packageManager, selfSerial())
+                } catch (_: Exception) {
+                    emptyList()
+                }
+            }
+            vm.setSourceCatalog(apps)
+        }
+    }
+
+    private fun selfSerial(): Int = try {
+        val um = getSystemService(UserManager::class.java)
+        um?.getSerialNumberForUser(Process.myUserHandle())?.toInt() ?: 0
+    } catch (_: Exception) {
+        0
+    }
+
+    // 目前可見列的 AppKey (全選可見用);與渲染同一過濾/排序,保證一致。
+    private fun currentVisibleKeys(): Set<String> {
+        val s = vm.state.value
+        return sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
+            .map { it.appKey }.toSet()
+    }
+
+    // PR-7 P2 (#26):catalog 區渲染。清單為唯讀展示 + CheckBox 勾選；
+    // 取消勾選 ≠ 卸載 (listener 只調 toggleSelection,零裝置呼叫)。
+    // 圖示非同步載入並以 appKey 快取 (顯示用,不參與身分鍵)。
+    private fun renderSourceList(s: UiState) {
+        val visible = sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
+        systemToggleBtn.text = if (s.includeSystemApps) "系統應用：顯示中" else "系統應用：已隱藏"
+        batchBtn.text = "建立 ${s.selectedKeys.size} 個分身"
+        sourceContainer.removeAllViews()
+        if (s.sourceCatalog.isEmpty()) {
+            sourceContainer.addView(TextView(this).apply { text = "應用清單：尚未載入" })
+        } else if (visible.isEmpty()) {
+            sourceContainer.addView(TextView(this).apply { text = "應用清單：無符合項目" })
+        } else {
+            for (entry in visible.take(MAX_SOURCE_ROWS)) {
+                val box = CheckBox(this).apply {
+                    // 可辨識列:名稱 + 包名；TalkBack 讀同一文字。
+                    text = "${entry.label}\n${entry.packageName}"
+                    tag = entry.appKey
+                    isChecked = entry.appKey in s.selectedKeys
+                }
+                requestIcon(entry.packageName, entry.appKey, box)
+                box.setOnCheckedChangeListener { _, checked ->
+                    vm.setSelected(entry.appKey, checked)
+                }
+                sourceContainer.addView(box)
+            }
+            if (visible.size > MAX_SOURCE_ROWS) {
+                sourceContainer.addView(
+                    TextView(this).apply {
+                        text = "…等共 ${visible.size} 筆，僅顯示前 $MAX_SOURCE_ROWS 筆（請用搜尋縮小範圍）"
+                    },
+                )
+            }
+        }
+        batchResultView.text = batchReportText(s.batchReport)
+    }
+
+    // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
+    // memo 記「已嘗試」避免重打 PackageManager；drawables 有界快取。
+    private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
+        val cached = iconDrawables[appKey]
+        if (cached != null) {
+            box.setCompoundDrawablesWithIntrinsicBounds(cached, null, null, null)
+            return
+        }
+        if (iconMemo.isLoaded(appKey)) return
+        iconMemo.markLoaded(appKey)
+        lifecycleScope.launch {
+            val drawable = withContext(Dispatchers.IO) {
+                try {
+                    packageManager.getApplicationIcon(pkg)
+                } catch (_: Exception) {
+                    null
+                }
+            } ?: return@launch
+            if (iconDrawables.size >= MAX_ICON_CACHE) {
+                val eldest = iconDrawables.keys.firstOrNull()
+                if (eldest != null) iconDrawables.remove(eldest)
+            }
+            iconDrawables[appKey] = drawable
+            if (box.tag == appKey) {
+                box.setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+            }
+        }
+    }
+
+    // 批次逐項結果文字:成功/失敗/未知分開列,部分成功如實呈現。
+    private fun batchReportText(report: BatchReport?): String {
+        if (report == null || report.items.isEmpty()) return ""
+        return buildString {
+            appendLine(
+                "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
+                    "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）",
+            )
+            for (item in report.items) {
+                val mark = when (item.outcome) {
+                    is CloneOutcome.Success -> "成功"
+                    is CloneOutcome.VerifyUnknown -> "未知（需重查）"
+                    else -> "失敗"
+                }
+                appendLine("  ${item.pkg}：$mark")
+            }
+        }.trimEnd()
+    }
+
     companion object {
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
@@ -743,6 +963,11 @@ class MainActivity : ComponentActivity() {
 
         // 旋轉保留鍵：診斷技術細節展開開關。
         private const val KEY_DIAG_EXPANDED = "diagExpanded"
+        // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
+        private const val MAX_SOURCE_ROWS = 200
+
+        // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
+        private const val MAX_ICON_CACHE = 200
 
         // Status-line color per message class; NONE falls back to default.
         private fun colorFor(kind: MsgKind): Int = when (kind) {
@@ -918,6 +1143,12 @@ private class DualViewModelFactory(
             )
             val pref = loadChannelPreference(prefs)
             val asm = assembleChannel(pref, suBinaryPresent(), shizukuAuthorizedNow(), appPackageName)
+            // PR-7 P2 (#26):選取持久化綁定 app-private SharedPreferences
+            // (SELECTION_PREFS_NAME,MODE_PRIVATE);與通道偏好不同檔,互不干擾。
+            val selPrefs = appContext.applicationContext.getSharedPreferences(
+                SELECTION_PREFS_NAME,
+                Context.MODE_PRIVATE,
+            )
             return DualViewModel(
                 repo = DualRepository(asm.gateway),
                 gatewayPrivilege = asm.gateway.privilege,
@@ -943,6 +1174,7 @@ private class DualViewModelFactory(
                 // JVM 預設皆 currentTimeMillis，測試注入可控 fake。
                 nowWallMs = { System.currentTimeMillis() },
                 nowMonoMs = { SystemClock.elapsedRealtime() },
+                selectionStore = selPrefs.selectionStore(),
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
