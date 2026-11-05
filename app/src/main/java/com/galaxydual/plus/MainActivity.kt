@@ -158,6 +158,9 @@ class MainActivity : ComponentActivity() {
 
     // PR-7 P2 (#26):圖示快取 (appKey -> Drawable,有界)。
     // 只供清單列顯示用,永不參與身分鍵/選取/寫入決策 (見 SourceIconState)。
+    // PR-37 Phase C #5: drawables 與 iconMemo 同進退——淘汰最舊 Drawable 時
+    // 必須同步 evict memo 對應 key（見 evictIcon），否則殘留 loaded 會永久
+    // 擋住該 App 的重載（快取 miss＋已 loaded → 直接 return，白列無圖）。
     private val iconMemo = SourceIconState()
     private val iconDrawables = LinkedHashMap<String, Drawable>()
     // PR-37 Phase C #4 圖示 in-flight 追蹤（與已載入分離）：IO 在途的 appKey，
@@ -1036,6 +1039,10 @@ class MainActivity : ComponentActivity() {
     // 直接 return，不會每幀重打），加上 inflight 擋併發，故無重試風暴；完成後
     // 只綁定仍掛在 sourceContainer 下同一 appKey 的可見列（catalog 已換 key
     // 不在時不貼，避免貼到錯行）。
+    // PR-37 Phase C #5 淘汰同步：drawables 滿時淘汰最舊項必須同步 evict memo
+    // 對應 key（見 evictIcon／pickIconEvictionKey）。之後回到該 App：快取 miss
+    // ＋未 loaded → 重新請求圖示。淘汰永不碰 iconInflight（在途 key 本就不在
+    // 快取內，被害者不可能是自己）；完成寫入時即使快取已滿也正常寫入＋淘汰最舊。
     private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
         val cached = iconDrawables[appKey]
         if (cached != null) {
@@ -1060,11 +1067,9 @@ class MainActivity : ComponentActivity() {
             }
             iconInflight.remove(appKey)
             if (drawable == null) return@launch
+            val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
+            if (victim != null) evictIcon(victim)
             iconMemo.markLoaded(appKey)
-            if (iconDrawables.size >= MAX_ICON_CACHE) {
-                val eldest = iconDrawables.keys.firstOrNull()
-                if (eldest != null) iconDrawables.remove(eldest)
-            }
             iconDrawables[appKey] = drawable
             val fresh = try {
                 drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
@@ -1101,6 +1106,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // PR-37 Phase C #5 淘汰同步點：同時清除 drawables 與 memo 兩處。
+    // JVM 可測性說明：Activity 私有函數無法被既有 JVM 測試覆蓋，故淘汰邏輯
+    // 拆成兩步——純決策 pickIconEvictionKey（伴隨對象，只用 stdlib 集合，無
+    // Android 依賴）＋本函數做同步清除（底層 SourceIconState.evict 為純狀態
+    // 操作，JVM 可直接測）。在途集合 iconInflight 永不經手此處，完成回填不
+    // 受淘汰干擾；若 victim 恰為本次 appKey（理論上不會發生，見上），先清後
+    // 寫的順序仍保證最終快取＋memo 一致。
+    private fun evictIcon(appKey: String) {
+        iconDrawables.remove(appKey)
+        iconMemo.evict(appKey)
+    }
+
     // 批次逐項結果文字:成功/失敗/未知分開列,部分成功如實呈現。
     private fun batchReportText(report: BatchReport?): String {
         if (report == null || report.items.isEmpty()) return ""
@@ -1132,6 +1149,13 @@ class MainActivity : ComponentActivity() {
 
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
+
+        // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
+        // (orderedKeys.size >= maxSize) 時回傳最舊 key（插入順序第一個），
+        // 未滿回傳 null。只用 stdlib 集合、無 Android 依賴；呼叫方拿到 victim
+        // 後經 evictIcon 同步清除 drawables＋memo 兩處。
+        internal fun pickIconEvictionKey(orderedKeys: List<String>, maxSize: Int): String? =
+            if (orderedKeys.size >= maxSize) orderedKeys.firstOrNull() else null
 
         // Status-line color per message class; NONE falls back to default.
         private fun colorFor(kind: MsgKind): Int = when (kind) {
