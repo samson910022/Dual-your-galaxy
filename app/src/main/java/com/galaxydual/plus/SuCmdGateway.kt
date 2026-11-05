@@ -48,6 +48,12 @@ internal const val SU_PROBE_TIMEOUT_MS = 10_000L
 internal const val SU_WAIT_POLL_MS = 50L
 internal const val SU_DRAIN_POLL_MS = 50L
 
+// Short reclaim window for post-cancel drain cleanup (P2-1, PR #40): after
+// close() unblocks a pipe-held read, drains usually exit within milliseconds;
+// the bound only caps a stuck child-held pipe. Kept << handover budget so
+// cancel cleanup never wedges latest-wins handover (see header policy).
+internal const val SU_CANCEL_DRAIN_MS = 300L
+
 // Maps a su command line to its wait budget: probe (`id -u`) uses the short
 // probe timeout, every other command (pm writes, list probes, identity
 // fetches) keeps the full exec timeout. Pure so JVM tests pin it.
@@ -234,6 +240,21 @@ internal suspend fun cancellableJoin(t: Thread, budgetMs: Long) {
 //   transportUnknown=true (Phase A), never a definite failure. The Shizuku
 //   transact path (BoundedAwait) documents the same split: caller wait is
 //   bounded + cancellable, remote work is never force-stopped.
+//
+// Post-spawn cleanup policy (P2-1 fix, PR #40 Re-review):
+// - destroyForcibly only kills the local `su` wrapper best effort; a child
+//   spawned via `su -c` (e.g. pm) may inherit the stdout/stderr pipe FDs and
+//   outlive the wrapper, so a drain blocked in read() would wait for EOF
+//   forever (2 leaked daemon threads per cancel without cleanup).
+// - Every post-spawn exit therefore closes the local pipe ends first (促使
+//   read 返回/EOF or IOException -> drain thread exits), then does a BOUNDED
+//   + CANCELLABLE drain wait (cancellableJoin: SU_CANCEL_DRAIN_MS on cancel
+//   paths, existing 2 s / 5 s windows on timeout / steady paths). The
+//   cancel-path wait aborts at once when the job is already cancelled (close
+//   still lets drains die async), so handover stays fast.
+// - Cleanup only promotes reclaim; it does NOT guarantee killing an
+//   already-sent pm child, and unknown-after-send semantics are unchanged
+//   (cancel rethrows CE, result paths carry transportUnknown / timedOut).
 internal suspend fun captureProcessCancellable(
     argv: Array<String>,
     timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
@@ -258,6 +279,13 @@ internal suspend fun captureProcessCancellable(
     val err = StringBuilder()
     val outStatus = AtomicReference(DrainStatus.READ_ERROR)
     val errStatus = AtomicReference(DrainStatus.READ_ERROR)
+    // Outer-visible handles for post-spawn cleanup (P2-1): inner paths use
+    // the local vals below; outer guards use these (assigned as soon as each
+    // resource materializes) so CE/IE/generic after spawn can still close.
+    var openIn: java.io.InputStream? = null
+    var openErr: java.io.InputStream? = null
+    var openDrainOut: Thread? = null
+    var openDrainErr: Thread? = null
     try {
         // Materialize streams on the caller thread: proc.inputStream /
         // errorStream getters may throw, and an access inside thread{...}
@@ -265,14 +293,14 @@ internal suspend fun captureProcessCancellable(
         // Materializing here routes a getter throw to the outer post-spawn
         // generic below (transportUnknown), which is the correct
         // unknown-after-send bucket.
-        val inS = proc.inputStream
-        val errS = proc.errorStream
+        val inS = proc.inputStream.also { openIn = it }
+        val errS = proc.errorStream.also { openErr = it }
         val drainOut = thread(isDaemon = true, name = "capture-stdout") {
             outStatus.set(drainCapped(inS, out))
-        }
+        }.also { openDrainOut = it }
         val drainErr = thread(isDaemon = true, name = "capture-stderr") {
             errStatus.set(drainCapped(errS, err))
-        }
+        }.also { openDrainErr = it }
         val exited = try {
             cancellableAwaitExit(proc, timeoutMs)
         } catch (e: CancellationException) {
@@ -285,12 +313,61 @@ internal suspend fun captureProcessCancellable(
                 proc.destroyForcibly()
             } catch (_: Exception) {
             }
+            // P2-1 reclaim: close local pipe ends so a surviving child holding
+            // the same FDs cannot pin drains in read() forever (2 leaked
+            // daemon threads per cancel). Bounded + cancellable wait aborts
+            // at once here (already cancelled) while drains die async via
+            // close; handover stays fast. Swallow the reclaim CE to preserve
+            // the original cancel below.
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS)
+            } catch (_: CancellationException) {
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            try {
+                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS)
+            } catch (_: CancellationException) {
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
             throw e
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             try {
                 proc.destroyForcibly()
             } catch (_: Exception) {
+            }
+            // P2-1: same pipe close so drains cannot linger on a child-held
+            // FD; bounded reclaim before returning the interrupt result
+            // (cancellable, so a concurrent cancel still hands over at once).
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                cancellableJoin(drainOut, SU_CANCEL_DRAIN_MS)
+                cancellableJoin(drainErr, SU_CANCEL_DRAIN_MS)
+            } catch (ce: CancellationException) {
+                try {
+                    proc.destroyForcibly()
+                } catch (_: Exception) {
+                }
+                throw ce
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
             return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
         }
@@ -301,12 +378,24 @@ internal suspend fun captureProcessCancellable(
                 proc.destroyForcibly()
             } catch (_: Exception) {
             }
+            // P2-1: close pipes BEFORE joining so a child-held FD cannot pin
+            // drains to the full 2 s windows; drains observing close exit
+            // early and the joins return at once.
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
             try {
                 cancellableJoin(drainOut, 2_000)
                 cancellableJoin(drainErr, 2_000)
             } catch (e: CancellationException) {
                 // Timeout already abandoned the wait (timedOut below), but the
                 // cancel must still release the waiter at once for handover.
+                // Pipes already closed above; propagate without extra wait.
                 throw e
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -322,6 +411,17 @@ internal suspend fun captureProcessCancellable(
                 proc.destroyForcibly()
             } catch (_: Exception) {
             }
+            // P2-1: close so a child-held FD cannot pin the drains; already
+            // cancelled so the reclaim below (if any) must not delay
+            // handover -- propagate at once, drains die async via close.
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
             throw e
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -329,9 +429,34 @@ internal suspend fun captureProcessCancellable(
                 proc.destroyForcibly()
             } catch (_: Exception) {
             }
+            // P2-1: close before returning; the interrupted join already
+            // bounded the wait, drains die async via close.
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
             return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
         }
         val joinExpired = drainOut.isAlive || drainErr.isAlive
+        if (joinExpired) {
+            // P2-1: steady joins expired but a surviving child may still hold
+            // the pipe FDs; close so lingering drains die async via
+            // close instead of waiting for an EOF that never comes. No extra
+            // wait here (already spent 5 s per drain); unknown-ness is
+            // carried by buildResult's truncated flag, exit stays as read.
+            try {
+                inS.close()
+            } catch (_: Exception) {
+            }
+            try {
+                errS.close()
+            } catch (_: Exception) {
+            }
+        }
         return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
     } catch (e: CancellationException) {
         // Outer post-spawn guard: CE from any point after spawn (including a
@@ -341,11 +466,54 @@ internal suspend fun captureProcessCancellable(
             proc.destroyForcibly()
         } catch (_: Exception) {
         }
+        // P2-1 reclaim: close cached pipes (fallback to proc getters if setup
+        // threw before caching); bounded wait aborts at once here (already
+        // cancelled) while drains die async via close. Swallow reclaim CE to
+        // preserve the original cancel.
+        try {
+            openIn?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            openErr?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Exception) {
+        }
+        try {
+            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+        } catch (_: CancellationException) {
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        try {
+            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+        } catch (_: CancellationException) {
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         throw e
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         try {
             proc.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        // P2-1: close cached pipes first (proc getters as fallback); the
+        // thread is interrupted so a join here would abort at once -- close
+        // alone lets drains die async without delaying the result.
+        try {
+            openIn?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            openErr?.close()
         } catch (_: Exception) {
         }
         try {
@@ -361,11 +529,21 @@ internal suspend fun captureProcessCancellable(
         // Outer post-spawn guard (Phase G1 P1): any other exception after
         // spawn (waitFor/exitValue/drain-setup throwing) is
         // unknown-after-send -- the remote pm may have executed. Destroy
-        // best effort (+ close opened streams; full P2-1 drain cleanup stays
-        // with G2) and return transportUnknown, never definite. CE is
-        // excluded above so cancellation is never swallowed here.
+        // best effort, close pipes (P2-1: cached handles + proc fallback so
+        // a child-held FD cannot pin drains), then bounded + cancellable
+        // reclaim before returning transportUnknown (cancel during reclaim
+        // still propagates). CE is excluded above so cancellation is never
+        // swallowed here.
         try {
             proc.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        try {
+            openIn?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            openErr?.close()
         } catch (_: Exception) {
         }
         try {
@@ -375,6 +553,15 @@ internal suspend fun captureProcessCancellable(
         try {
             proc.errorStream.close()
         } catch (_: Exception) {
+        }
+        // Bounded reclaim: close above usually lets drains exit at once, so
+        // this caps a stuck child-held pipe without blocking the result.
+        // Cancellable: a concurrent cancel aborts the wait and propagates.
+        try {
+            openDrainOut?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+            openDrainErr?.let { cancellableJoin(it, SU_CANCEL_DRAIN_MS) }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         }
         return CmdResult(exit = 1, out = capped(out, true), err = "su failed post-spawn: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
     }

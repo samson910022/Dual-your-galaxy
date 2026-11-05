@@ -225,4 +225,157 @@ class SuCancellableTest {
             assertEquals("cancel-seam", e.message)
         }
     }
+
+    // Phase A2 P2-1 (PR #40 Re-review): child holds stdout/stderr FDs while
+    // the wrapper is already dead. destroyForcibly only kills the local `su`
+    // wrapper; a `su -c`-spawned child (e.g. pm) inheriting the pipe FDs keeps
+    // the pipes open, so without explicit close() the two daemon drains block
+    // in read() forever waiting for an EOF that never comes (2 leaked threads
+    // per cancel). Cleanup must close the local pipe ends (促使 read 返回/EOF)
+    // and bound the drain wait (SU_CANCEL_DRAIN_MS, cancellable, never wedging
+    // handover), so repeated cancels converge instead of accumulating.
+    // Fault injection: fake Process whose wait reports wrapper exit after
+    // destroy but whose streams never EOF on their own (simulated child-held
+    // pipes that only release on local close()).
+    private class HangingInputStream : java.io.InputStream() {
+        @Volatile private var closed = false
+        val isClosed: Boolean get() = closed
+        override fun read(): Int {
+            while (!closed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw java.io.InterruptedIOException("interrupted")
+                }
+            }
+            return -1
+        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (closed) return -1
+            while (!closed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw java.io.InterruptedIOException("interrupted")
+                }
+            }
+            return -1
+        }
+        override fun close() {
+            closed = true
+        }
+    }
+
+    private class ChildHoldsPipeProcess : Process() {
+        val stdout = HangingInputStream()
+        val stderr = HangingInputStream()
+        @Volatile var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream(): java.io.InputStream = stdout
+        override fun getErrorStream(): java.io.InputStream = stderr
+        override fun waitFor(): Int {
+            while (!destroyed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+            return 0
+        }
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            val deadlineMs = System.currentTimeMillis() + unit.toMillis(timeout)
+            while (System.currentTimeMillis() < deadlineMs) {
+                if (destroyed) return true
+                try {
+                    Thread.sleep(5)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+            return destroyed
+        }
+        override fun exitValue(): Int {
+            if (!destroyed) throw IllegalThreadStateException("not exited")
+            return 1
+        }
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            // Only the wrapper dies; the simulated child keeps the pipe FDs
+            // open (streams stay hanging until cleanup closes them).
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = !destroyed
+    }
+
+    private fun aliveCaptureDrains(): Int =
+        Thread.getAllStackTraces().keys.count { t ->
+            t.isAlive && t.isDaemon && (t.name == "capture-stdout" || t.name == "capture-stderr")
+        }
+
+    @Test fun cancelWithChildHoldingPipe_doesNotAccumulateDrainThreads() = runBlocking {
+        // Settle leftovers from earlier tests so the final count belongs to
+        // this fault injection, not to prior real-process drains.
+        var spins = 0
+        while (aliveCaptureDrains() > 0 && spins < 50) {
+            delay(100L)
+            spins++
+        }
+        // Repeated cancels: each spawns 2 drains blocked on child-held pipes.
+        // Keep every fake so we can prove cleanup closed its pipes directly
+        // (deterministic) in addition to the global thread-count convergence
+        // below (which tolerates one foreign lingering drain under full-suite
+        // load, hence <= 4 rather than <= 2 -- old code leaves ~16 here).
+        val fakes = mutableListOf<ChildHoldsPipeProcess>()
+        repeat(8) { idx ->
+            val job = async(Dispatchers.Default) {
+                captureProcessCancellable(
+                    arrayOf("su", "-c", "pm install-existing --user 95 com.example.app"),
+                    timeoutMs = 30_000L,
+                    execFn = { _ -> ChildHoldsPipeProcess().also { fakes += it } },
+                )
+            }
+            // Let spawn + drains start and the wait go in flight.
+            delay(200L)
+            val startNs = System.nanoTime()
+            job.cancel()
+            try {
+                job.await()
+                fail("cancelled capture must throw CE (iter $idx)")
+            } catch (_: CancellationException) {
+                // Expected: caller released at once, wrapper destroyed best
+                // effort, remote child untouched (unknown-after-send).
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue(
+                "cancel handover must stay fast with child-held pipes (iter $idx elapsed=${elapsedMs}ms)",
+                elapsedMs < 2_000L,
+            )
+        }
+        // Deterministic: every cancel must have closed both local pipe ends,
+        // otherwise a surviving child holding the FDs pins the drains forever.
+        assertEquals("every child-holds-pipe fake must be observed", 8, fakes.size)
+        fakes.forEachIndexed { idx, fake ->
+            assertTrue("cancel must close stdout pipe (iter $idx)", fake.stdout.isClosed)
+            assertTrue("cancel must close stderr pipe (iter $idx)", fake.stderr.isClosed)
+        }
+        // Bounded convergence: close() above lets the blocked reads
+        // return/EOF so drains die async instead of accumulating 2 per cancel
+        // (old code would leave ~16 alive here).
+        val deadlineMs = System.currentTimeMillis() + 5_000L
+        var alive = aliveCaptureDrains()
+        while (alive > 4 && System.currentTimeMillis() < deadlineMs) {
+            delay(100L)
+            alive = aliveCaptureDrains()
+        }
+        assertTrue(
+            "daemon drain threads must converge after child-holds-pipe cancels (alive=$alive, expected<=4 not 16)",
+            alive <= 4,
+        )
+    }
 }
