@@ -365,11 +365,17 @@ class MainActivity : ComponentActivity() {
                 s.cloned.joinToString("\n") { "  $it" }
         }
         // Writes queue in the ViewModel anyway; disabling while busy keeps
-        // the read-only placeholder visibly read-only.
+        // the read-only placeholder visibly read-only. Channel switches go
+        // through the same mutex (selectChannel latest-wins), so the picker
+        // is gated too.
         val busy = s.loading
         cloneBtn.isEnabled = !busy
         removeBtn.isEnabled = !busy
         refreshBtn.isEnabled = !busy
+        autoBtn.isEnabled = !busy
+        rootBtn.isEnabled = !busy
+        shizukuBtn.isEnabled = !busy
+        lsposedBtn.isEnabled = !busy
         msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
     }

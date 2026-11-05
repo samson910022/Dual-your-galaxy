@@ -159,4 +159,7 @@ dependencies {
     // true channels (su argv assembly, Shizuku error mapping, capture helper).
     // Same pinned junit:junit:4.13.2 the core module already uses (cached).
     testImplementation("junit:junit:4.13.2")
+    // PR-32 P2-2: deterministic DualViewModel tests (dispatchers/heartbeat/
+    // dedup/channel queue). Test-only, production dependencies unchanged.
+    testImplementation(libs.coroutines.test)
 }
