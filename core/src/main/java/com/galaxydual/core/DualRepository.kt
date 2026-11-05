@@ -468,12 +468,14 @@ class DualRepository(
             gateway.run(CMD_USER_LIST_VERBOSE)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            if (e is InterruptedException) Thread.currentThread().interrupt()
             return DualTargetResult.NoDual
         }
         val dumpsysRes = try {
             gateway.run(CMD_DUMPSYS_USER)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            if (e is InterruptedException) Thread.currentThread().interrupt()
             return DualTargetResult.NoDual
         }
         if (verboseRes.truncated || dumpsysRes.truncated) return DualTargetResult.NoDual
@@ -493,6 +495,10 @@ class DualRepository(
             gateway.run(CMD_GETPROP_DUAL)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            // 寬嚴分裂註記：此 pin 入口 property 拋出視為無聲明（null，沿用
+            // canonical 行為），而 typed 入口同拋出判 Unknown（嚴格）；本階段
+            // 僅修中斷旗標，不改 pin 嚴格度（避免行為大改）。
             null
         }
         // Truncated property is not "no claim": a cut payload may hide a
@@ -945,7 +951,16 @@ class DualRepository(
                 }
             }
         }
-        if (profiles.none { it.userId == expectedDualId }) return CloneOutcome.NoDual
+        if (profiles.none { it.userId == expectedDualId }) {
+            // Stage2 身份診斷一致性：typed 已 Confirmed expected，卻不在 pm
+            // 快照——快照與身分矛盾（stale/partial 快照或重建空窗），絕非「無
+            // dual」。計 ChannelError（unknown，不短路、不宣稱 no dual），
+            // 與 after-pin Unknown 口徑一致；零 install。
+            return CloneOutcome.ChannelError(
+                "snapshot/identity mismatch: verified id $expectedDualId " +
+                    "absent from profiles snapshot",
+            )
+        }
         // Serial gate AFTER the id gate, BEFORE any install (mirrors
         // removeVerifiedExpected): a recreated profile (same id, fresh
         // serial) must never receive the install.
@@ -1135,12 +1150,32 @@ class DualRepository(
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val verified = fetchVerifiedDualId()
-        if (verified < 0 || expectedDualId < 0) return RemoveOutcome.NoDual
-        if (verified != expectedDualId) {
-            return RemoveOutcome.TargetMoved(expectedDualId, verified)
+        // Stage2 身份診斷一致性（照 cloneVerifiedExpected＋requestRemove
+        // M1/M2）：legacy Int 把 Absent＋Unknown 折成 -1→NoDual，誤報無 dual。
+        // 此處改走 typed 鑑別——Absent＋快照可用才 NoDual；Unknown 一律
+        // ChannelError（fail closed，零 uninstall）；Confirmed 才比對 id。
+        if (expectedDualId < 0) return RemoveOutcome.NoDual
+        when (val idRes = resolveDualUserIdTyped(pmIds = profiles.map { it.userId }.toSet())) {
+            is DualIdResolution.Absent -> return RemoveOutcome.NoDual
+            is DualIdResolution.Unknown ->
+                return RemoveOutcome.ChannelError(
+                    "verified dual id unknown" +
+                        (idRes.detail.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""),
+                )
+            is DualIdResolution.Confirmed -> {
+                if (idRes.userId != expectedDualId) {
+                    return RemoveOutcome.TargetMoved(expectedDualId, idRes.userId)
+                }
+            }
         }
-        if (profiles.none { it.userId == expectedDualId }) return RemoveOutcome.NoDual
+        if (profiles.none { it.userId == expectedDualId }) {
+            // typed 已 Confirmed 卻不在 pm 快照——快照與身分矛盾，絕非無 dual。
+            // 計 ChannelError（unknown，零 uninstall），與 clone 側一致。
+            return RemoveOutcome.ChannelError(
+                "snapshot/identity mismatch: verified id $expectedDualId " +
+                    "absent from profiles snapshot",
+            )
+        }
         val clean = pkg.trim()
         val uninstallCmd = try {
             PmOutputParser.buildUninstall(clean, expectedDualId)

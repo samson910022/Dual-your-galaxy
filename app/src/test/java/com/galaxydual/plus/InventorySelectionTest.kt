@@ -1883,4 +1883,41 @@ class InventorySelectionTest {
         await { mailB in vm.state.value.selectedKeys }
         assertEquals(setOf(mailB), vm.state.value.selectedKeys)
     }
+
+    // Stage2 身份診斷一致性（批次起始 null target 分支）：verbose 通道
+    // exit!=0（不可判定）但 pm 快照正常有戶 → 必須報 CHANNEL unknown、
+    // 零 install、msg 不含 "no dual"（typed Absent＋快照可用才可 NO_DUAL）。
+    // 舊碼僅看快照有戶即 NO_DUAL，此測試鎖定新鑑別。
+    @Test
+    fun batch_startIdentityUnknown_reportsChannelWithoutInstall() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        // 起始即身分通道失敗（verbose/dumpsys exit!=0），pm 快照仍正常。
+        gw.failIdentityAfterInstalls = 0
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        vm.cloneSelected()
+        await { !vm.state.value.loading && vm.state.value.msg.isNotEmpty() }
+        val st = vm.state.value
+        assertEquals(MsgKind.CHANNEL, st.msgKind)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, st.diagnose?.code)
+        assertTrue(
+            "channel-unknown must never claim no dual, got msg=${st.msg} detail=${st.diagnose?.techDetail}",
+            !st.msg.contains("no dual", ignoreCase = true) &&
+                !(st.diagnose?.techDetail ?: "").contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "unconfirmable identity must never reach install, got: ${gw.installCalls}",
+            gw.installCalls.isEmpty(),
+        )
+        assertNull("start failure must not produce a batch report", st.batchReport)
+        // STALE 語意：FRESH 不得殘留（UNKNOWN 起點保持非 FRESH）。
+        assertTrue(
+            "identity-unknown start must not leave inventory FRESH",
+            st.inventory.freshness != InventoryFreshness.FRESH,
+        )
+    }
 }

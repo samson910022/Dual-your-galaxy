@@ -3693,8 +3693,51 @@ class DualViewModel(
                             }
                             return@withLock
                         }
-                        val channelBadStart = snapStart is ProfilesSnapshot.ChannelError ||
-                            (snapStart as? ProfilesSnapshot.Loaded)?.profiles.isNullOrEmpty() == true
+                        // Stage2 身份診斷一致性（照單筆 clone M1/M2）：僅 typed
+                        // Absent＋快照可用才報 NO_DUAL；Unknown 一律 CHANNEL_ERROR
+                        //（含 Absent 但空快照：快照本身已證通道有問題）。零
+                        // install、FRESH 降 STALE、CHANNEL msg 不含 "no dual"。
+                        val pmIdsStart = (snapStart as? ProfilesSnapshot.Loaded)
+                            ?.profiles?.map { it.userId }?.toSet()
+                        val idResStart: DualIdResolution
+                        try {
+                            idResStart = onIo { repo.resolveDualUserIdTyped(pmIds = pmIdsStart) }
+                        } catch (e: CancellationException) {
+                            _state.update { it.copy(loading = false) }
+                            throw e
+                        } catch (e: Exception) {
+                            val nowTypedEx = nowWallMs()
+                            _state.update { cur ->
+                                val degraded =
+                                    if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                                        cur.inventory.toStaleOrUnknown(
+                                            now = nowTypedEx,
+                                            source = cur.inventory.source,
+                                            targetId = cur.inventory.targetId,
+                                        )
+                                    } else {
+                                        cur.inventory
+                                    }
+                                cur.copy(
+                                    loading = false,
+                                    inventory = degraded,
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.CHANNEL_ERROR,
+                                        techDetail = sanitizeForDisplay(e.message ?: "batch start failed"),
+                                    ),
+                                    msg = "批次無法開始：channel error: " +
+                                        sanitizeForDisplay(e.message ?: "batch start failed"),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
+                        }
+                        val snapshotUsableStart =
+                            (snapStart as? ProfilesSnapshot.Loaded)?.profiles?.isNotEmpty() == true
+                        val confirmedAbsentStart =
+                            idResStart is DualIdResolution.Absent && snapshotUsableStart
+                        val typedDetailStart =
+                            (idResStart as? DualIdResolution.Unknown)?.detail
                         val channelDetailStart =
                             (snapStart as? ProfilesSnapshot.ChannelError)?.detail
                         val nowStart = nowWallMs()
@@ -3709,13 +3752,21 @@ class DualViewModel(
                                 } else {
                                     cur.inventory
                                 }
-                            if (channelBadStart) {
+                            if (!confirmedAbsentStart) {
                                 cur.copy(
                                     loading = false,
                                     inventory = degraded,
                                     diagnose = diagnoseEvent(
                                         DiagnoseCode.CHANNEL_ERROR,
-                                        techDetail = channelDetailStart ?: "no verified target",
+                                        techDetail = when {
+                                            typedDetailStart?.isNotBlank() == true ->
+                                                "verified dual id unknown: $typedDetailStart"
+                                            channelDetailStart != null -> channelDetailStart
+                                            !snapshotUsableStart ->
+                                                "verified dual id unknown " +
+                                                    "and profiles snapshot empty"
+                                            else -> "verified dual id unknown"
+                                        },
                                     ),
                                     msg = if (channelDetailStart != null) {
                                         "refresh result unknown: " +
@@ -3731,7 +3782,7 @@ class DualViewModel(
                                     inventory = degraded,
                                     diagnose = diagnoseEvent(
                                         DiagnoseCode.NO_DUAL,
-                                        techDetail = "verified dual id unknown",
+                                        techDetail = "confirmed absent dual profile",
                                     ),
                                     msg = "no dual profile",
                                     msgKind = MsgKind.NO_DUAL,
