@@ -636,14 +636,23 @@ class RemoveConfirmTest {
     }
 
     // Cancel-during-confirm (B2): cancelRemove() interleaved while
-    // confirmRemove() is suspended on its first onIo must abort the confirm
-    // with zero uninstalls.
+    // confirmRemove() is suspended on IO must abort the confirm with zero
+    // uninstalls and must preserve the cancel message.
     //
-    // 確定性原理：Unconfined 下 vm.confirmRemove() 同步執行到首個 onIo 即掛起
-    // （此時 confirm 已持 opMutex 停在 IO）；cancelRemove() 是同步的
-    // _state.update，不拿 mutex，故可在 confirm 的 IO 區間確定性交錯、清掉
-    // pending；confirm 的 post-IO 重驗（pendingRemove != cur）abort，只清
-    // loading（保留 cancel 訊息 / 新 request 的 pending）。
+    // 機制（DualViewModel.kt:844-848, 1000-1003）：Unconfined 下
+    // vm.confirmRemove() 的前綴同步執行——讀 pending、加 dedup key、拿未競爭
+    // 的 opMutex、isWritable 純狀態檢查、置 loading=true——直到首個 onIo
+    //（withContext(IO)，切 dispatcher 必掛起）才交出控制；cancelRemove()
+    // 是同步 _state.update 且不拿 mutex，故必在 confirm 掛起後、post-IO
+    // 重驗前到達並清掉 pending。confirm 的 IO 序列（resolveDualUserId +
+    // fetchDualTarget + profilesSnapshot + verifyState→fetchVerifiedDualId，
+    // 共 3 次 verbose）結束後的 post-IO 重驗（pendingRemove != cur）abort，
+    // 連 repo.removeVerifiedExpected 都沒進（其兩道 isStillValid 閘與
+    // uninstall 皆未到達）；abort 只清 loading，保留 cancel 訊息與 kind。
+    // 誠實註記：掛起後的交錯是執行緒競速而非硬屏障（fake gateway 純記憶體、
+    // IO 極快），計數 verbose 設閘反而脆弱（次數隨 verifyState/repo 內部
+    // 實現漂移），故不設 gate；此測試以 msg 保留斷言鎖定 preserve 語義，
+    // 若未來競速落敗（出現 uninstall 或訊息被覆寫）會直接轉紅而非靜默通過。
     @Test
     fun confirm_cancelDuringConfirm_abortsWithoutUninstall() {
         val gw = FakeRepoGateway(dualId = 95)
@@ -660,6 +669,11 @@ class RemoveConfirmTest {
         assertEquals("cancel-during-confirm must not uninstall", 0, gw.uninstallCalls)
         assertNull(vm.state.value.pendingRemove)
         assertFalse(vm.state.value.loading)
+        assertTrue(
+            "abort must preserve the cancel message, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg.contains("已取消移除"),
+        )
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
     }
 
     // PR-33 S2 (P2 終態結果釘住): a serial second confirm after success must
