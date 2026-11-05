@@ -279,12 +279,19 @@ class DualRepository(
     // - Confirmed(id): clean channels whose CLONE claims agree on one id.
     // - Absent: 僅當兩來源對所有相關 user 給出明確且一致的非 CLONE 類型
     //   （每條 claim 皆為 OTHER、無 UNKNOWN、兩源 user 集合相同、無 CLONE、
-    //   無衝突），且 property 無具體指向（任何非 null 含 0 但 typed
-    //   無對應 Confirmed 即 Unknown）；其餘一律 Unknown，絕不清空舊單。
-    //   另收 pmIds 否決（見參數）：pm 快照多出的戶即 typed 漏戶，不得 Absent。
+    //   無衝突），且 property 為乾淨無聲明（白名單制三態，見下方 property 閘：
+    //   Blank（out+err 皆 blank）或負值 sentinel（trim 後 toIntOrNull() 為負值，
+    //   為 null，維持「負值=no claim」意圖）才算無聲明；Value（含 0）若無對應
+    //   Confirmed 即 Unknown；Malformed（out 非空非 sentinel 但 parse 失敗，含溢
+    //   位，或 stderr 殘留）直接 Unknown，絕不進入 Absent）。其餘一律 Unknown，
+    //   絕不清空舊單。另收 pmIds 否決（見參數）：pm 快照多出的戶即 typed 漏戶，
+    //   不得 Absent。與 canonical VerifiedIdentity.kt 一致：null 只通往 Unknown
+    //  （canonical 要求 property corroboration，null 永不 Confirm）；typed 的
+    //   Absent 是額外收斂，僅乾淨無聲明＋乾淨 OTHER 集合才可達，髒通道永不收斂。
     // - Unknown: 通道截斷/失敗（exit/identity 閘）、輸出不可信、證據矛盾
     //   （Refused）、單源 clone、型別缺失、集合不一致、property 指向不明
-    //   （含拋出而無回應的 property 通道）、pm 快照否決。
+    //   （含拋出而無回應的 property 通道、非空但 parse 失敗的 malformed payload
+    //   含溢位、stderr 殘留髒通道）、pm 快照否決。
     // Never throws except on coroutine cancellation. The legacy Int entries
     // above are untouched; this is purely additive.
     // NOTE (p25-rebase adapt): the Int path above stays delegated to the
@@ -353,9 +360,36 @@ class DualRepository(
         if (!PmOutputParser.isIdentityChannelOk(propRes.out + "\n" + propRes.err, propRes.exit)) {
             return DualIdResolution.Unknown("typed property channel reports failure")
         }
-        // 無聲明僅指「identity 閘通過＋解析為 null 的非 null propRes」
-        // （乾淨空輸出，如空字串）；拋出/截斷/髒輸出已在上方 Unknown。
+        // 白名單制三態（P0 fail-closed）：property 解析後顯式區分 Blank /
+        // Sentinel（無聲明，可往 Absent 收斂）vs Malformed（Unknown，擋 Absent）
+        // vs Value（非 null，後續無 Confirmed 即 Unknown）。
+        // - 乾淨無聲明僅指 out.isBlank() && err.isBlank()（乾淨空輸出），或明確
+        //   sentinel（out.trim().toIntOrNull() 為負值，如 "-1"/"-5"/
+        //   "-2147483648"，parser 本就歸一為 null，維持「負值=no claim」意圖，
+        //   且須 err 全空，stderr 殘留即髒通道，對照 parsePackagesTrusted 的
+        //   stderr 白名單；Int 溢位如 "-9999999999"/"-2147483649"（toIntOrNull
+        //   為 null）不算 sentinel，落到下方 malformed → Unknown）。
+        // - 其餘 propertyId==null（out 非空、非負值 sentinel、但 parse 失敗，含溢
+        //   位如 "9999999999"/"2147483648"、多行/尾隨 token 如 "95\ntrailing" /
+        //   "95\n96\n"、非數值如 "unknown"/"unsupported_value"/"+95"/"95.0"）
+        //   直接 Unknown("typed property channel malformed...")，detail 截斷 200
+        //   字（沿用 parsePackagesTrusted 的 take(200) 慣例），不得進入 Absent。
+        // 與 canonical VerifiedIdentity.kt 一致：null 永遠只通往 Unknown（絕不
+        // Confirm）；typed 的 Absent 僅乾淨無聲明才可達，髒通道永不收斂為 Absent。
         val propertyId = PmOutputParser.parseDualPropertyId(propRes.out)
+        if (propertyId == null) {
+            val propOutBlank = propRes.out.isBlank()
+            val propErrBlank = propRes.err.isBlank()
+            // 值域檢查（非每-call Regex 語法匹配）：僅 Int 範圍內負值為 sentinel；
+            // 溢位（toIntOrNull null）不算 sentinel；"-0" parse 得 0 非 null，
+            // 不進此分支，後續擋 Unknown。
+            val isNegativeSentinel = propRes.out.trim().toIntOrNull()?.let { it < 0 } == true
+            val cleanNoClaim = (propOutBlank && propErrBlank) || (isNegativeSentinel && propErrBlank)
+            if (!cleanNoClaim) {
+                val raw = if (!propOutBlank) propRes.out.trim() else propRes.err.trim()
+                return DualIdResolution.Unknown("typed property channel malformed: ${raw.take(200)}")
+            }
+        }
         val verboseClaims = SamsungProfileAdapter.parseUserListVerbose(verboseRes.out)
         val dumpsysClaims = SamsungProfileAdapter.parseDumpsysUser(dumpsysRes.out)
         val candidates = verboseClaims + dumpsysClaims

@@ -245,6 +245,102 @@ class DualIdResolutionTest {
         )
     }
 
+    @Test
+    fun malformedPropChannels_unknownNotAbsent() {
+        // P0 fail-closed：非空但格式不合法的 getprop 成功輸出（exit=0、無截斷、
+        // 無 ERROR_LINE）經 parseDualPropertyId 得 null 後，不得誤當「乾淨無聲明」
+        // 放行 Absent，一律 Unknown（白名單制；canonical 回 -1）。
+        // verbose/dumpsys 用既有 NODUAL 乾淨 fixtures（Absent 正向同形）。
+        val malformedProps = listOf(
+            "95\ntrailing",
+            "unsupported_value",
+            "95 unexpected-suffix",
+            "unknown",
+            "95\n96\n",
+            "+95",
+            "9999999999",
+            "2147483648",
+            "-9999999999",
+            "-2147483649",
+        )
+        for (prop in malformedProps) {
+            val repo = DualRepository(
+                FakeGateway(
+                    verboseOut = NODUAL_VERBOSE,
+                    dumpsysOut = NODUAL_DUMPSYS,
+                    propOut = prop,
+                ),
+            )
+            val res = runSuspend { repo.resolveDualUserIdTyped() }
+            assertTrue(
+                "malformed prop ${prop.replace("\n", "\\n")} must be Unknown, got: $res",
+                res is DualIdResolution.Unknown,
+            )
+            assertEquals(
+                "canonical must agree (-1) for malformed prop ${prop.replace("\n", "\\n")}",
+                -1,
+                runSuspend { repo.resolveDualUserId() },
+            )
+        }
+    }
+
+    @Test
+    fun negativeSentinelProps_stillAbsent() {
+        // 明確 sentinel：trim 後 toIntOrNull 為負值（如 "-1"/"-5"/
+        // "-2147483648"，parser 本就歸一為 null）視為無聲明，維持既有
+        // 「負值=no claim」意圖，仍可收斂 Absent；Int 溢位負值
+        // （如 "-9999999999"/"-2147483649"）不算 sentinel，見
+        // malformedPropChannels_unknownNotAbsent → Unknown。
+        for (prop in listOf("-1\n", "-5\n", "-2147483648\n")) {
+            val repo = DualRepository(
+                FakeGateway(
+                    verboseOut = NODUAL_VERBOSE,
+                    dumpsysOut = NODUAL_DUMPSYS,
+                    propOut = prop,
+                ),
+            )
+            assertEquals(
+                "negative sentinel $prop must stay Absent",
+                DualIdResolution.Absent,
+                runSuspend { repo.resolveDualUserIdTyped() },
+            )
+        }
+    }
+
+    @Test
+    fun blankWhitespaceProp_treatedAsEmpty_absent() {
+        // Blank 對照："" 已由 cleanChannelsWithoutClone_absent 鎖 Absent；
+        // 此處釘死 "   \n"（isBlank 視同空）同樣收斂 Absent。
+        val repo = DualRepository(
+            FakeGateway(
+                verboseOut = NODUAL_VERBOSE,
+                dumpsysOut = NODUAL_DUMPSYS,
+                propOut = "   \n",
+            ),
+        )
+        assertEquals(
+            DualIdResolution.Absent,
+            runSuspend { repo.resolveDualUserIdTyped() },
+        )
+    }
+
+    @Test
+    fun propErrResidue_unknownNotAbsent() {
+        // stderr 殘留即髒通道（對照 parsePackagesTrusted stderr 白名單）：
+        // out="" + err="some warning" 不得視為乾淨無聲明，一律 Unknown。
+        val repo = DualRepository(
+            FakeGateway(
+                verboseOut = NODUAL_VERBOSE,
+                dumpsysOut = NODUAL_DUMPSYS,
+                propOut = "",
+                propErr = "some warning",
+            ),
+        )
+        val res = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("prop stderr residue must be Unknown, got: $res", res is DualIdResolution.Unknown)
+        assertEquals("canonical must agree (-1)", -1, runSuspend { repo.resolveDualUserId() })
+    }
+
     companion object {
         const val VERBOSE_95 =
             "Users:\n" +
