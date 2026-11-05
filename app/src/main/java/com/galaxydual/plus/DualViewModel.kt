@@ -3294,7 +3294,7 @@ class DualViewModel(
                     var conflictingPkg: String? = null
                     val claimed = mutableListOf<String>()
                     for (pkg in distinctPkgs) {
-                        val k = "clone:$pkg"
+                        val k = opKey("clone", pkg)
                         if (!inFlightWrites.add(k)) {
                             conflictingPkg = pkg
                             break
@@ -3306,7 +3306,7 @@ class DualViewModel(
                         _state.update {
                             it.copy(
                                 loading = false,
-                                msg = "already in progress: $conflictingPkg",
+                                msg = "already in progress: ${sanitizeForDisplay(conflictingPkg)}",
                                 msgKind = MsgKind.INFO,
                             )
                         }
