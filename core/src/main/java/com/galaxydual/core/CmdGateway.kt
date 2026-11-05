@@ -1,12 +1,14 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
-// Capture-truncation marker appended by capture helpers when the per-stream
-// cap bites (PR-2, issue #22). Single source of truth: gateways append
-// "\n$TRUNCATION_MARKER" via capped() and parsers sniff it via
+// Capture-truncation marker appended by capture helpers whenever the capture
+// is truncated (cap, read error, or join expiry -- PR-2 Phase B, issue #22).
+// Single source of truth: gateways append "\n$TRUNCATION_MARKER" via
+// capped(sink, truncated) and parsers sniff it via
 // PmOutputParser.parsePackagesTrusted (legacy text fallback for callers that
-// still build CmdResult without the flag). Changing this string requires both
-// sides to change together.
+// still build CmdResult without the flag, and for the Shizuku Binder client
+// which re-derives the flag from text via decodeExecReply). Changing this
+// string requires both sides to change together.
 const val TRUNCATION_MARKER = "[truncated]"
 
 // Result of a single command execution via a gateway.
@@ -16,12 +18,12 @@ data class CmdResult(
     val out: String,
     val err: String,
     // Capture-truncation flag (PR-2, issue #22).
-    // Contract: capture helpers cap each stream at MAX_CAPTURE_CHARS and
-    // capped() appends newline + TRUNCATION_MARKER when the cap bites; whenever the marker
-    // is appended the producer must also set truncated=true so parsers can
-    // tell "clean empty" apart from "output was cut off" without sniffing
-    // text. Defaults to false so every existing CmdResult(...) call site
-    // keeps compiling and keeps its old meaning. Consumed since stage 2:
+    // Contract: capture helpers append newline + TRUNCATION_MARKER whenever
+    // the capture is truncated (cap, read error, or join expiry); flag and
+    // marker are always set together so parsers can tell "clean empty" apart
+    // from "output was cut off" without sniffing text. Defaults to false so
+    // every existing CmdResult(...) call site keeps compiling and keeps its
+    // old meaning. Consumed since stage 2:
     // verify/list judge the flag via PmOutputParser.parsePackagesTrusted.
     val truncated: Boolean = false,
 ) {
