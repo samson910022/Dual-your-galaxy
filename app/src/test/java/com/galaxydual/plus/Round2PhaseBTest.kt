@@ -208,7 +208,10 @@ class Round2PhaseBTest {
         await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.STALE }
 
         val s = vm.state.value
-        assertTrue("other channel passed, so device still proved a channel", s.readCap)
+        // P25 Item 3 新語意：明選只探自己通道 (ROOT→su only)，他通道
+        // (Shizuku) 故意不探，故 anyProbePassed == writeReady == false；
+        // 不再是舊 readCap 的 device-wide 含義。
+        assertFalse("explicit probes only the selected channel", s.anyProbePassed)
         assertFalse("selected ROOT channel lost readiness", s.writeReady)
         assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
         assertTrue("old cloned entries are kept", s.cloned.contains("com.example.chat"))

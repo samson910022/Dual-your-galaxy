@@ -486,7 +486,7 @@ class DualViewModel(
     // Never throws by contract; probeChannels guards with try/catch.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
-<    // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
+    // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
     // monotonic clock in production) and the PR-6 P2 #27 後半
     // inventory/hook/lastOperation 時間證據。Defaults to the real wall clock so
     // JVM tests need no Android runtime; tests inject a controllable fake.
@@ -1280,9 +1280,11 @@ class DualViewModel(
             val key = opKey("clone", trimmed)
             if (!inFlightWrites.add(key)) {
                 _state.update {
-                    // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay。
+                    // 理由 (本機回音原文)：使用者自輸包名在自己螢幕回顯用
+                    // sanitizeUserEcho (只壓 control+有界，不遮蔽)；遮蔽只在
+                    // 診斷 techDetail/匯出。儲存的 opKey 保持 raw。
                     it.copy(
-                        msg = "already in progress: ${sanitizeForDisplay(trimmed)}",
+                        msg = "already in progress: ${sanitizeUserEcho(trimmed)}",
                         msgKind = MsgKind.INFO,
                     )
                 }
@@ -1363,8 +1365,9 @@ class DualViewModel(
                                     inventory = degradedInventory,
                                     lastOperation = op,
                                     diagnose = diag,
-                                    // 理由 (m2)：顯示用 msg 回音消毒。
-                                    msg = "cloned: ${sanitizeForDisplay(trimmed)}",
+                                    // 理由 (本機回音原文)：msg 顯示真包名，
+                                    // 遮蔽只在 detail/techDetail/匯出。
+                                    msg = "cloned: ${sanitizeUserEcho(trimmed)}",
                                     msgKind = MsgKind.INFO,
                                 )
                             }
@@ -1515,10 +1518,11 @@ class DualViewModel(
                                     loading = false,
                                     lastOperation = op,
                                     diagnose = diag,
-                                    // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay；
-                                    // 儲存的 opId/appKey 保持 raw，diagnose techDetail 已截斷不動。
+                                    // 理由 (本機回音原文)：msg 的包名回音用
+                                    // sanitizeUserEcho 顯示原文；儲存的 opId/appKey
+                                    // 保持 raw，diagnose techDetail 已截斷不動。
                                     msg = "clone verification failed: " +
-                                        "${sanitizeForDisplay(trimmed)} not installed " +
+                                        "${sanitizeUserEcho(trimmed)} not installed " +
                                         "for user ${res.dualId}",
                                     msgKind = MsgKind.VERIFY,
                                 )
@@ -1538,9 +1542,10 @@ class DualViewModel(
                                     loading = false,
                                     lastOperation = op,
                                     diagnose = diag,
-                                    // 理由 (m2)：顯示用 msg 的包名回音消毒；res.detail 已消毒。
+                                    // 理由 (本機回音原文)：msg 的包名回音顯示原文；
+                                    // res.detail 仍經 sanitizeForDisplay (不可信)。
                                     msg = "clone result unknown: " +
-                                        "cannot verify ${sanitizeForDisplay(trimmed)} " +
+                                        "cannot verify ${sanitizeUserEcho(trimmed)} " +
                                         "for user ${res.dualId}: " +
                                         sanitizeForDisplay(res.detail),
                                     msgKind = MsgKind.CHANNEL,
@@ -1659,9 +1664,11 @@ class DualViewModel(
             val key = opKey("request-remove", trimmed)
             if (!inFlightWrites.add(key)) {
                 _state.update {
-                    // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay。
+                    // 理由 (本機回音原文)：使用者自輸包名在自己螢幕回顯用
+                    // sanitizeUserEcho (只壓 control+有界，不遮蔽)；遮蔽只在
+                    // 診斷 techDetail/匯出。儲存的 opKey 保持 raw。
                     it.copy(
-                        msg = "already in progress: ${sanitizeForDisplay(trimmed)}",
+                        msg = "already in progress: ${sanitizeUserEcho(trimmed)}",
                         msgKind = MsgKind.INFO,
                     )
                 }
@@ -1858,10 +1865,10 @@ class DualViewModel(
                                                             loading = false,
                                                             profiles = snap.profiles,
                                                             pendingRemove = pending,
-                                                            // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay，
+                                                            // 理由 (本機回音原文)：msg 顯示真包名，
                                                             // 儲存的 pending.pkg 保持 raw 不動。
                                                             msg = "等待確認移除：" +
-                                                                "${sanitizeForDisplay(trimmed)}" +
+                                                                "${sanitizeUserEcho(trimmed)}" +
                                                                 "（user $dualId）",
                                                             msgKind = MsgKind.INFO,
                                                         )
@@ -1873,9 +1880,10 @@ class DualViewModel(
                                                             loading = false,
                                                             profiles = snap.profiles,
                                                             pendingRemove = null,
-                                                            // 理由 (m2)：顯示回音消毒，儲存不動 (此分支無儲存)。
+                                                            // 理由 (本機回音原文)：msg 顯示真包名
+                                                            // (此分支無儲存)。
                                                             msg = "未安裝，無需移除：" +
-                                                                sanitizeForDisplay(trimmed),
+                                                                sanitizeUserEcho(trimmed),
                                                             msgKind = MsgKind.INFO,
                                                         )
                                                     }
@@ -1906,11 +1914,12 @@ class DualViewModel(
                                                                         st.detail,
                                                                 ).take(MAX_DIAG_DETAIL_CHARS),
                                                             ),
-                                                            // 理由 (m2)：$trimmed 回音消毒；
+                                                            // 理由 (本機回音原文)：msg 的 $trimmed
+                                                            // 回音顯示原文；
                                                             // st.detail 已經 sanitizeForDisplay。
                                                             msg = "remove result unknown: " +
                                                                 "cannot verify " +
-                                                                "${sanitizeForDisplay(trimmed)} " +
+                                                                "${sanitizeUserEcho(trimmed)} " +
                                                                 "for user " +
                                                                 "$dualId: " +
                                                                 sanitizeForDisplay(st.detail),
@@ -2228,9 +2237,9 @@ class DualViewModel(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
-                                                    // 理由 (m2)：顯示用包名回音消毒。
+                                                    // 理由 (本機回音原文)：msg 顯示真包名。
                                                     msg = "未安裝，無需移除：" +
-                                                        sanitizeForDisplay(cur.pkg),
+                                                        sanitizeUserEcho(cur.pkg),
                                                     msgKind = MsgKind.INFO,
                                                 )
                                             }
@@ -2302,8 +2311,8 @@ class DualViewModel(
                                                     appKey = cur.pkg,
                                                     pinnedTarget = cur.dualId,
                                                     phase = OpPhase.SUCCESS,
-                                                    // 理由 (m2)：顯示用 detail 回音消毒；
-                                                    // 儲存的 opId/appKey 保持 raw。
+                                                    // 理由 (本機回音原文)：msg 顯示真包名；
+                                                    // 儲存的 opId/appKey 保持 raw，detail 仍遮蔽。
                                                     detail = "removed: " +
                                                         sanitizeForDisplay(cur.pkg) +
                                                         rebuiltNote,
@@ -2328,8 +2337,8 @@ class DualViewModel(
                                                     pendingRemove = null,
                                                     lastOperation = op,
                                                     diagnose = diag,
-                                                    // 理由 (m2)：顯示用 msg 回音消毒。
-                                                    msg = "removed: ${sanitizeForDisplay(cur.pkg)}",
+                                                    // 理由 (本機回音原文)：msg 顯示真包名。
+                                                    msg = "removed: ${sanitizeUserEcho(cur.pkg)}",
                                                     msgKind = MsgKind.INFO,
                                                 )
                                             }
@@ -2479,9 +2488,9 @@ class DualViewModel(
                                                     pendingRemove = null,
                                                     lastOperation = op,
                                                     diagnose = diag,
-                                                    // 理由 (m2)：顯示用 msg 的包名回音消毒。
+                                                    // 理由 (本機回音原文)：msg 的包名回音顯示原文。
                                                     msg = "remove failed: " +
-                                                        "${sanitizeForDisplay(cur.pkg)} " +
+                                                        "${sanitizeUserEcho(cur.pkg)} " +
                                                         "still installed for user ${res.dualId}",
                                                     msgKind = MsgKind.VERIFY,
                                                 )
@@ -2503,10 +2512,11 @@ class DualViewModel(
                                                     pendingRemove = null,
                                                     lastOperation = op,
                                                     diagnose = diag,
-                                                    // 理由 (m2)：顯示用 msg 的包名回音消毒；res.detail 已消毒。
+                                                    // 理由 (本機回音原文)：msg 的包名回音顯示原文；
+                                                    // res.detail 仍消毒 (不可信)。
                                                     msg = "remove result unknown: " +
                                                         "cannot verify removal of " +
-                                                        "${sanitizeForDisplay(cur.pkg)} " +
+                                                        "${sanitizeUserEcho(cur.pkg)} " +
                                                         "for user ${res.dualId}: " +
                                                         sanitizeForDisplay(res.detail),
                                                     msgKind = MsgKind.CHANNEL,
@@ -3856,7 +3866,7 @@ fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
 // PR-6 P2 (#27 後半): 同步寫入時間證據 (queriedAtMs/markerTimeMs/viaGateway)；
 // 呼叫端傳入本次探測的 wall-clock，沿用 HookStateProvider 的 scope 解析。
 // P4：queriedAtMs 無預設 (強制顯式，免 0L 預設誤讀為真實時間)。
-fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long): UiState = copy(
+fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long = 0L): UiState = copy(
     hookStatus = diagnosis.status,
     hookActive = diagnosis.active,
     hookScopes = diagnosis.scopes,

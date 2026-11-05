@@ -376,6 +376,15 @@ private val CONTROL_CHARS = Regex("[\r\n\u0000-\u001F\u007F]+")
 internal fun sanitizeForDisplay(raw: String): String =
     redactPaths(redactPii(raw.replace(CONTROL_CHARS, " "))).take(500)
 
+// 使用者自輸包名的本機回音淨化 (純函數)：只壓 control 字元並有界，
+// 不做包名遮蔽。理由：這是使用者剛親手輸入的字串，在自己螢幕上回顯
+// (msg/確認對話框) 必須是原文——新 base RemoveConfirmTest 鎖定
+// "removed: <真包名>"，Round2 的 dialog-raw 測試亦同；遮蔽只發生在
+// 診斷 techDetail/匯出 (redactPii/redactPaths)，那些會離開當下畫面
+// (預覽/複製/匯出) 才需遮。儲存的 opId/appKey/pending.pkg 本就保持 raw。
+internal fun sanitizeUserEcho(raw: String): String =
+    raw.replace(CONTROL_CHARS, " ").take(500)
+
 // 包名單筆遮蔽：保留首段供除錯分組，其餘隱藏 (com.example.chat -> com.***)。
 // 已知取捨 (保留現狀)：首段 vendor 辨識殘留 (如 com 可辨識生態系，
 // 但無完整包名已大幅降低個資精度)；另 "android.permission.X" 這類
