@@ -63,6 +63,43 @@ class DiagnoseFreshnessStageDTest {
         assertEquals("exit=0", sanitizeForDisplay("exit=0"))
     }
 
+    // D3 IPv6 壓縮形 + 完整形遮蔽，數字可讀性保留。
+    @Test
+    fun d3_ipv6_compressedAndFull_masked_numbersKept() {
+        val loop = redactIp("loop ::1 end")
+        assertFalse("ipv6 ::1 must not leak, got: $loop", loop.contains("::1"))
+        assertTrue("ip marker must appear, got: $loop", loop.contains("<ip>"))
+
+        val comp1 = redactIp("addr fe80::1 end")
+        assertFalse("ipv6 fe80::1 must not leak, got: $comp1", comp1.contains("fe80::1"))
+        assertTrue("ip marker must appear, got: $comp1", comp1.contains("<ip>"))
+
+        val comp2 = redactIp("addr 2001:db8::1 end")
+        assertFalse("ipv6 2001:db8::1 must not leak, got: $comp2", comp2.contains("2001:db8::1"))
+        assertTrue("ip marker must appear, got: $comp2", comp2.contains("<ip>"))
+
+        val full = redactIp("addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 end")
+        assertFalse(
+            "ipv6 full form must not leak, got: $full",
+            full.contains("2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+        )
+        assertTrue("ip marker must appear, got: $full", full.contains("<ip>"))
+
+        val joint = sanitizeForDisplay("ping fe80::1 user 95 serial 15 exit=0")
+        assertFalse("joint pipeline must not leak ipv6, got: $joint", joint.contains("fe80::1"))
+        assertTrue("joint pipeline must carry ip marker, got: $joint", joint.contains("<ip>"))
+        assertTrue("user id must stay readable, got: $joint", joint.contains("95"))
+        assertTrue("serial must stay readable, got: $joint", joint.contains("15"))
+        assertTrue("exit must stay readable, got: $joint", joint.contains("exit=0"))
+
+        assertEquals("user 95", redactPii("user 95"))
+        assertEquals("serial 15", redactPii("serial 15"))
+        assertEquals("exit=0", redactPii("exit=0"))
+
+        assertEquals("time 12:34 stays readable", "time 12:34", redactIp("time 12:34"))
+        assertEquals("version stays readable", "v1.2.3", redactIp("v1.2.3"))
+    }
+
     // D3 匯出 IPv4 不洩 raw。
     @Test
     fun d3_export_ipTech_noRawLeak() {

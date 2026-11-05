@@ -795,4 +795,47 @@ class Round2PhaseBTest {
         await { !vm.state.value.loading }
         assertEquals(false, vm.state.value.loading)
     }
+
+    // ---- Phase B P0 (B3)：requestRemove 取消路徑 loading 殘 true ----
+    // requestRemove 取消即透傳不寫 loading=false，取消後 loading 卡 true
+    // (clone/confirm/refresh/probe 皆已補取消清 loading，僅此路遺漏)。
+    // 修後：取消路徑補 loading=false。閘控首個 package-list
+    // (request verifyState 終探，leader 持有 mutex 阻塞於 gate)，啟動可取消
+    // request 後 cancel job，斷言 loading==false。沿 b3 手法。
+    @Test
+    fun b3_cancelledRequestRemove_clearsLoading() {
+        val suGw = FakeRepo(listExtra = listOf("com.example.victim"))
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+
+        // 閘控首個 package-list (request verifyState 終探)，leader 持有 mutex。
+        suGw.packageListCalls = 0
+        suGw.packageListGate = CompletableDeferred()
+
+        vm.requestRemove("com.example.victim")
+        await { suGw.packageListCalls >= 1 }
+        await { vm.state.value.loading }
+
+        // 取消 in-flight request child（沿 b3 手法）。
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val waiter = scopeJob.children.firstOrNull { it.isActive }
+        assertTrue("requestRemove must be in-flight while gated", waiter != null)
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+
+        // 取消路徑須即清 loading（即使 gate 仍阻塞）。
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cancelled requestRemove must clear loading, got ${vm.state.value.loading}",
+            false,
+            vm.state.value.loading,
+        )
+
+        suGw.packageListGate?.complete(Unit)
+        suGw.packageListGate = null
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
+    }
 }
