@@ -287,7 +287,7 @@ class ShizukuCmdGateway(
     // keeps the previous `cloned` instead of wiping it, and the bounded probe
     // retry (at most 2 settle waits, core delayFn) is the ONLY resend -- this
     // gateway itself never retries internally, so a timeout never triggers a
-    // blind immediate resend that would pile onto a still-running service call.
+    // single delayed resend that may overlap a still-running service call.
     // The orphaned transact, if the binder thread is still blocked in it after
     // cancellation, owns its Parcel pair (recycled in finally below); its late
     // reply is discarded, never applied to state. dropBindingLocked() on the
