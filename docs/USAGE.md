@@ -50,7 +50,7 @@ val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
 目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
 
-- 併發邊界（#24；術語：busy 即 `UiState.loading`，merge 即 coalesce）：`refresh()` 快速連點合併為一次 trailing 重跑（coalesce，in-flight 之後最多一次待跑，不堆積 mutex 等待者）；`clone`／`remove` 按操作 key 去重，同 key 第二次報 `already in progress` 不排隊，且 clone 與 remove 分屬不同命名空間（`clone:<pkg>`／`remove:<pkg>`）不互斥；所有 repo 呼叫經 `Dispatchers.IO`（`onIo`），執行期間 busy（`UiState.loading=true`）。
+- 併發邊界（#24；術語：busy 即 `UiState.loading`，merge 即 coalesce）：`refresh()` 快速連點合併為一次 trailing 重跑（coalesce，in-flight 之後最多一次待跑，不堆積 mutex 等待者）；`clone`／`request-remove`／`confirm` 按操作 key 去重，同 key 第二次報 `already in progress` 不排隊，三命名空間全稱 `clone:<pkg>`／`request-remove:<pkg>`／`remove:<pkg>@<id>#<serial>#<ts>`（世代 key，serial 綁定：同包不同世代不互擋，同世代重複才去重；clone 與 request／confirm 互不干擾）；寫回覆 `timedOut‖transportUnknown‖isPostSpawnTransportText‖isServiceTimeoutText` 一律 verify-first（單次有界唯讀 `verifyListProbe` 定奪，不重發寫入；同向成功才認 Success，反向觀測一律 Unknown；before／after pin 漂移→`VerifyUnknown`（identity-changed），不計成功）；執行期間 busy（`UiState.loading=true`，7 鈕＋dialog 按鈕禁用，cancel／pending 保留語義見 ARCH）；所有 repo 呼叫經 `Dispatchers.IO`（`onIo`），settle wait 預設可取消 `delay()`（經 `delayFn`），cancel 在等待間傳播。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
@@ -160,7 +160,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - 本 App 的 `DualRepository.clone/remove/verifyState/list` 即為上述指令的程式化封裝（[已支援]：`core` 層＋單元測試＋JVM 組裝測試；App 真 gateway 與 readiness gating 已接線：`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed；目標解析為 PR-1 階段2雙源驗證＋失敗拒寫，label-only 舊路徑已 `@Deprecated`，`verify(pkg,dualId)` Boolean 已 `@Deprecated` 請改用 `verifyState`）。寫後確認（`cloneVerified`／`removeVerified`）以相同已驗證目標的 package listing 為準，不再只用 `pm path`（`pm path` 僅輔助診斷，不能當主驗證；plain `clone()`／`remove()` 無內建 re-check），listing 判定為 P22 已合併之 trusted 三態＋白名單＋截斷契約＋throw defense＋detail caps＋retry 凍結（見 §3 P22 段）。[S24 已驗證]僅限 App ROOT 一鍵、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、`su -c` 重裝、uninstall 回滾，詳見 §0 與 [S24 調查](UX_REVIEW_S24.md) §5；App ROOT 之外的完整 binder／授權矩陣、App 內 Shizuku 未授權路徑／首次選路、marker gateway-`cat` 顯示及當前 source 可追溯部署仍 [待實機驗證]。
 - 移除確認已知限制（PR-33）：
   - (a) 確認 TTL 5 分鐘走 monotonic 時鐘（`SystemClock.elapsedRealtime()`，免 wall-clock 回撥延長有效期；pending 不跨重啟，reboot 重置無影響；JVM 預設 `currentTimeMillis` 僅供測試注入）。
-  - (b) 同名重裝限制：membership 僅保證確認時可見同名 package，不綁定安裝世代。
+  - (b) 同名重裝限制：membership 僅保證確認時可見同名 package，不綁定安裝世代（profile 世代由 serial 綁定；package 安裝世代不綁定：同名重裝視為同一 membership）。
   - (c) shell 檢查→uninstall 非原子（裝置限制，repo 雙閘僅縮小窗口）。
   - (d) S24 實機 destructive／negative acceptance [S24 已驗證]（2026-11-05，SM-S9210，ROOT 通道）：身分雙 CLONE＋serial 95＋prop 95 確認、`Cloned (35)` 真實列表；可拋棄 overlay（`com.android.settings.supervision.overlay`，owner 有／95 無，先 `install-existing` 進 95）經 App 兩階段確認移除→`removed:`＋95 內消失＋owner 副本完好＋總數回 35（淨零）；negative（取消鍵、back 鍵）皆零卸載並保留正確訊息，截圖存檔；未安裝拒絕以 JVM 測試為準（實機訊息僅截圖存檔）。殘留：旋轉重建、TalkBack 朗讀僅 JVM／靜態證據。
 
