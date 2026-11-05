@@ -103,6 +103,13 @@ fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 `listClonedPackages` 回 `null`，不探測不寫入。
 `pm list users` 的名稱僅供顯示，永不進入授權判定；user 0 永遠不可作為寫入目標。
 此次 S24 的 95 為 Dual、150 為 Secure Folder，這不是其他機型的固定對照。
+執行前核對 serial/parent（ID 重用防護，Phase D）：auto 路徑攜帶 resolve 時 identity
+作 `expected`，guard 以 fresh 比對——同 id 但 serial／parent 雙邊皆有且不等即拒
+（reason 註明 reuse，疑為同 id 被不同 profile 轉世重用）；pinned 寫前取 `before`、
+寫後重核 `after`，不一致即 `VerifyUnknown`（detail 註明 identity-changed，fail
+closed，不計成功）；explicit-ID 入口僅做 fresh 自洽檢查（expected=null），殘餘
+TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）。serial 單邊缺失則
+放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒。
 
 ```bash
 # 1. 雙源驗證（缺一不可；任一失敗即停手，不寫入不探測目標）：
