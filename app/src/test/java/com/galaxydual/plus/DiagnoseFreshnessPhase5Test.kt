@@ -815,8 +815,12 @@ class DiagnoseFreshnessPhase5Test {
                 ),
             ),
         )
-        assertTrue("op line shows opId, got: $opText", opText.contains("clone:com.example.chat"))
+        // 理由 (security-low)：不再顯示 raw opId，改顯示 redactPackage(appKey)+phase
+        // (+targetId 若有效)；儲存的 opId 保持 raw (另斷言)。
+        assertFalse("op line must not leak raw pkg, got: $opText", opText.contains("com.example.chat"))
+        assertTrue("op line shows redacted pkg, got: $opText", opText.contains("com.***"))
         assertTrue("op line shows phase, got: $opText", opText.contains("SUCCESS"))
+        assertTrue("op line shows target when valid, got: $opText", opText.contains("95"))
 
         assertEquals("診斷：就緒", renderDiagnoseText(UiState(), false))
         val diagState = UiState(diagnose = diagnoseEvent(DiagnoseCode.VERIFY_UNKNOWN, techDetail = "d"))

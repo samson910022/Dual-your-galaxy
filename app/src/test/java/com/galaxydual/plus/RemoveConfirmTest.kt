@@ -281,11 +281,12 @@ class RemoveConfirmTest {
 
         assertEquals("double confirm must run a single uninstall", 1, gw.uninstallCalls)
         assertNull("pending must be cleared", vm.state.value.pendingRemove)
+        // 理由 (m2 包名回音消毒)：顯示用 msg 經 sanitizeForDisplay，完整包名遮為 <pkg>。
         assertTrue(
             "final msg must be a legal terminal state, got: \"${vm.state.value.msg}\"",
             vm.state.value.msg in setOf(
-                "removed: com.example.chat",
-                "already in progress: com.example.chat",
+                "removed: <pkg>",
+                "already in progress: <pkg>",
                 "沒有待確認的移除",
             ),
         )

@@ -206,7 +206,9 @@ class DiagnoseFreshnessTest {
     }
 
     // target 重建舊資料標上次結果：dualId 95 FRESH 後 target 換成 96 且
-    // listing 未知 -> inventory STALE (保留舊 target/筆數)，cloned 保留舊資料。
+    // listing 未知 -> inventory STALE (M4 後攜新目標 96，不再保留舊 95；
+    // 理由：drift 新目標不再丟，UI 可見新目標；queryTime/count 照舊保留)，
+    // cloned 保留舊資料。
     @Test
     fun targetRebuild_marksOldInventoryStale() {
         val gw = FakeRepo(dualId = 95, failListPackages = false)
@@ -233,8 +235,8 @@ class DiagnoseFreshnessTest {
 
         val stale = vm.state.value.inventory
         assertEquals(
-            "stale inventory keeps the old target identity",
-            95,
+            "stale inventory carries the new target after M4 (drift 不再丟)",
+            96,
             stale.targetId,
         )
         assertTrue(
