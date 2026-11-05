@@ -69,20 +69,38 @@ class RemoveConfirmTest {
         // unavailable serial (id confirmed, serial missing).
         var serial: Int = 15
         var noSerial: Boolean = false
+        // S24 new-ROM verbose (PR-33 D2): `N: id=..., name=..., type=...`
+        // lines with no UserInfo header and no serial line; dumpsys stays
+        // in the legacy UserInfo shape (serialNo= authoritative).
+        var s24Verbose: Boolean = false
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{$dualId:$label:400} running\n"
 
         private fun verboseOut(): String =
-            "Users:\n" +
-                "  UserInfo{0:Owner:13} running:\n" +
-                "    Serial number: 0\n" +
-                "    User type: android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:$label:400} running:\n" +
-                (if (noSerial) "" else "    Serial: $serial\n") +
-                "    parentId=0\n" +
-                "    User type: android.os.usertype.profile.CLONE\n"
+            if (!s24Verbose) {
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{$dualId:$label:400} running:\n" +
+                    (if (noSerial) "" else "    Serial: $serial\n") +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            } else {
+                "3 users:\n" +
+                    "\n" +
+                    "0: id=0, name=Owner, type=full.SYSTEM," +
+                    " flags=ADMIN|FULL|INITIALIZED|MAIN|PRIMARY|SYSTEM" +
+                    " (running) (current) (visible)\n" +
+                    "1: id=$dualId, name=$label, type=profile.CLONE," +
+                    " flags=DUALAPP_PROFILE|INITIALIZED|PROFILE" +
+                    " (parentId=0) (running) (visible)\n" +
+                    "2: id=150, name=Secure Folder, type=profile.PRIVATE," +
+                    " flags=INITIALIZED|PROFILE|SECURE_FOLDER" +
+                    " (parentId=0) (running) (profile-owner) (visible)\n"
+            }
 
         private fun dumpsysOut(): String =
             "Users:\n" +
@@ -674,6 +692,28 @@ class RemoveConfirmTest {
             vm.state.value.msg.contains("已取消移除"),
         )
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+    }
+
+    // PR-33 D2 (S24 實機格式相容): new-format verbose carries no serial
+    // line, so the dumpsys serialNo= alone must bind end to end: request
+    // builds a pending with dualSerial from the single source and runs
+    // zero uninstalls (Secure Folder line present but never selected).
+    @Test
+    fun request_s24VerboseWithoutSerial_succeedsWithDumpsysSerial() {
+        val gw = FakeRepoGateway(dualId = 95)
+        gw.s24Verbose = true
+        gw.serial = 95
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        val pending = vm.state.value.pendingRemove
+        assertNotNull("S24 verbose must still build a pending", pending)
+        assertEquals(95, pending!!.dualId)
+        assertEquals("single-source dumpsys serial must bind", 95, pending.dualSerial)
+        assertEquals("no uninstall may run on request", 0, gw.uninstallCalls)
     }
 
     // PR-33 S2 (P2 終態結果釘住): a serial second confirm after success must

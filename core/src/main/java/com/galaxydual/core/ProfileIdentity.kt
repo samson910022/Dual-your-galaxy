@@ -70,8 +70,11 @@ data class ProfileIdentity(
  * Verified dual-profile target with serial binding (PR-33 R2, P1).
  *
  * Extends the id-only [DualResolution.Confirmed] with the platform serial
- * number that both verbose channels ([IdentitySource.USER_LIST_V] and
- * [IdentitySource.DUMPSYS]) agree on for that id. The serial survives an
+ * number agreed for that id: the distinct non-null serial pooled from the
+ * verbose channels ([IdentitySource.USER_LIST_V] and
+ * [IdentitySource.DUMPSYS]), nulls ignored, so a single carrying side
+ * suffices (new-ROM verbose has no serial line; dumpsys serialNo= is then
+ * authoritative) while both-missing or disagreement refuses. The serial survives an
  * id+label-preserving profile recreation (delete + recreate reuses the user
  * id and label but mints a fresh serial), so the two-phase remove confirm
  * pins (userId, serial) instead of the id alone: a recreated profile with a
@@ -80,6 +83,7 @@ data class ProfileIdentity(
 data class VerifiedDualTarget(
     // Confirmed cross-source dual user id (same id resolveDual confirms).
     val userId: Int,
-    // Agreed platform serial for that id (both verbose channels agree).
+    // Agreed platform serial for that id (exactly one distinct non-null
+    // serial across the verbose channels; see KDoc above).
     val serial: Int,
 )

@@ -15,8 +15,8 @@ sealed interface DualTargetResult {
     // The id itself is not confirmed (Unknown/Refused, or a failed channel).
     data object NoDual : DualTargetResult
 
-    // The id is confirmed but no single agreed serial exists (a channel
-    // carries no serial line, or the two serials disagree).
+    // The id is confirmed but no single agreed serial exists (no serial on
+    // either verbose channel, or the two serials disagree).
     data object SerialUnavailable : DualTargetResult
 }
 
@@ -215,11 +215,14 @@ class DualRepository(
         return PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
     }
 
-    // Single shared serial-bound identity fetch (PR-33 R2, P1): same three
-    // gateway runs, CancellationException rethrow, and fail-closed mapping
-    // as fetchVerifiedDualId, but keeps the agreed serial. A confirmed id
-    // maps to Confirmed(target) only when both verbose channels agree on one
-    // non-null serial for it; a confirmed id without an agreed serial maps
+    // Single shared serial-bound identity fetch (PR-33 R2, P1; single-source
+    // policy PR-33 D2): same three gateway runs, CancellationException
+    // rethrow, and fail-closed mapping as fetchVerifiedDualId, but keeps the
+    // agreed serial. A confirmed id maps to Confirmed(target) only when the
+    // verbose channels yield exactly one agreed non-null serial (at least
+    // one side must carry it -- new-ROM verbose has no serial line, so a
+    // dumpsys-only serial confirms; both-missing or disagreeing still
+    // refuses); a confirmed id without an agreed serial maps
     // to SerialUnavailable; an unconfirmed id (or any failed channel) maps
     // to NoDual. Never throws except on coroutine cancellation.
     suspend fun fetchDualTarget(): DualTargetResult {
