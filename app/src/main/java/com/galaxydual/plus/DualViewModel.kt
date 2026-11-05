@@ -2959,11 +2959,22 @@ class DualViewModel(
             // P25 Item 3: one probe per round — see reconnectLocked.
             // P2-1: allowPrivilegedHookDiagnosis gates privileged diagnostic `cat`
             // (auto binder/onResume pass false: LSPOSED stays direct-only).
+            // P2-4 (同 reconnectLocked/foregroundLocked)：swap 前記錄 resolved，
+            // 納入 probe 的 FRESH 失效判斷 (resolved 改變即降 STALE；此處若沿用
+            // swap 後的 currentChannel，degrade 會被誤判為無變化而續留 FRESH)。
+            val resolvedBeforeOp = currentChannel
             if (preference == ChannelPreference.AUTO) {
                 val probe = swapAutoLocked()
-                probeChannels(probe, allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+                probeChannels(
+                    probe,
+                    allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                    resolvedBeforeOp = resolvedBeforeOp,
+                )
             } else {
-                probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis)
+                probeChannels(
+                    allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis,
+                    resolvedBeforeOp = resolvedBeforeOp,
+                )
             }
         } catch (e: CancellationException) {
             _state.update { it.copy(loading = false) }
