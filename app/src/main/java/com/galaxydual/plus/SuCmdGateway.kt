@@ -246,57 +246,138 @@ internal suspend fun captureProcessCancellable(
         if (e is CancellationException) throw e
         return CmdResult(exit = 1, out = "", err = "spawn failed: ${(e.message ?: e.javaClass.simpleName)}")
     }
+    // Post-spawn section (Phase G1): proc is live from here on. Any
+    // non-CE/non-IE exception escaping the waits below (e.g. a rogue
+    // Process.waitFor/exitValue throwing IllegalStateException) must NOT
+    // reach SuCmdGateway.run's generic catch as definite -- the remote pm
+    // may have executed after spawn, so fail closed to transportUnknown.
+    // CE rethrows (queue-collapse handover); IE keeps the existing
+    // "interrupted: " path. The inner awaits already map their own CE/IE;
+    // the outer catches below cover every other post-spawn throw site.
     val out = StringBuilder()
     val err = StringBuilder()
     val outStatus = AtomicReference(DrainStatus.READ_ERROR)
     val errStatus = AtomicReference(DrainStatus.READ_ERROR)
-    val drainOut = thread(isDaemon = true, name = "capture-stdout") {
-        outStatus.set(drainCapped(proc.inputStream, out))
-    }
-    val drainErr = thread(isDaemon = true, name = "capture-stderr") {
-        errStatus.set(drainCapped(proc.errorStream, err))
-    }
-    val exited = try {
-        cancellableAwaitExit(proc, timeoutMs)
-    } catch (e: CancellationException) {
-        // Post-spawn unknown (Phase A): spawned, may have executed, reply
-        // lost to cancel. Destroy best effort and propagate CE so the
-        // winner takes over at once; never claim definite.
-        proc.destroyForcibly()
-        throw e
-    } catch (e: InterruptedException) {
-        Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
-    }
-    if (!exited) {
-        proc.destroyForcibly()
-        try {
-            cancellableJoin(drainOut, 2_000)
-            cancellableJoin(drainErr, 2_000)
+    try {
+        // Materialize streams on the caller thread: proc.inputStream /
+        // errorStream getters may throw, and an access inside thread{...}
+        // would run on the child thread (uncaught there, invisible here).
+        // Materializing here routes a getter throw to the outer post-spawn
+        // generic below (transportUnknown), which is the correct
+        // unknown-after-send bucket.
+        val inS = proc.inputStream
+        val errS = proc.errorStream
+        val drainOut = thread(isDaemon = true, name = "capture-stdout") {
+            outStatus.set(drainCapped(inS, out))
+        }
+        val drainErr = thread(isDaemon = true, name = "capture-stderr") {
+            errStatus.set(drainCapped(errS, err))
+        }
+        val exited = try {
+            cancellableAwaitExit(proc, timeoutMs)
         } catch (e: CancellationException) {
-            // Timeout already abandoned the wait (timedOut below), but the
-            // cancel must still release the waiter at once for handover.
+            // Post-spawn unknown (Phase A): spawned, may have executed, reply
+            // lost to cancel. Destroy best effort and propagate CE so the
+            // winner takes over at once; never claim definite. The destroy
+            // itself is best-effort: a rogue destroyForcibly throw must not
+            // mask the CE (outer generic would convert it to a result).
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
             throw e
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
-            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
         }
-        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
-    }
-    try {
-        cancellableJoin(drainOut, 5_000)
-        cancellableJoin(drainErr, 5_000)
+        if (!exited) {
+            // Best-effort kill: a rogue destroyForcibly throw must not mask
+            // the timeout result (outer generic would convert it).
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
+            try {
+                cancellableJoin(drainOut, 2_000)
+                cancellableJoin(drainErr, 2_000)
+            } catch (e: CancellationException) {
+                // Timeout already abandoned the wait (timedOut below), but the
+                // cancel must still release the waiter at once for handover.
+                throw e
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+            }
+            return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
+        }
+        try {
+            cancellableJoin(drainOut, 5_000)
+            cancellableJoin(drainErr, 5_000)
+        } catch (e: CancellationException) {
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
+            throw e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            try {
+                proc.destroyForcibly()
+            } catch (_: Exception) {
+            }
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        }
+        val joinExpired = drainOut.isAlive || drainErr.isAlive
+        return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
     } catch (e: CancellationException) {
-        proc.destroyForcibly()
+        // Outer post-spawn guard: CE from any point after spawn (including a
+        // rethrown inner CE) still destroys best effort and propagates --
+        // never synthesized into a definite result (queue-collapse).
+        try {
+            proc.destroyForcibly()
+        } catch (_: Exception) {
+        }
         throw e
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        try {
+            proc.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Exception) {
+        }
+        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "post-spawn interrupted")}", truncated = true, transportUnknown = true)
+    } catch (e: Exception) {
+        // Outer post-spawn guard (Phase G1 P1): any other exception after
+        // spawn (waitFor/exitValue/drain-setup throwing) is
+        // unknown-after-send -- the remote pm may have executed. Destroy
+        // best effort (+ close opened streams; full P2-1 drain cleanup stays
+        // with G2) and return transportUnknown, never definite. CE is
+        // excluded above so cancellation is never swallowed here.
+        try {
+            proc.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Exception) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Exception) {
+        }
+        return CmdResult(exit = 1, out = capped(out, true), err = "su failed post-spawn: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
     }
-    val joinExpired = drainOut.isAlive || drainErr.isAlive
-    return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
 }
 
 // Per-stream drain outcome (review Phase B, issues #22 P1-#2/P2-#3): the old
@@ -427,7 +508,17 @@ class SuCmdGateway(
                 CmdResult(exit = 1, out = "", err = "interrupted: ${(e.message ?: "su interrupted")}", truncated = true, transportUnknown = true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                CmdResult(exit = 1, out = "", err = "su failed: ${(e.message ?: e.javaClass.simpleName)}")
+                // Conservative unknown (Phase G1): this catch cannot prove
+                // pre-spawn -- captureProcessCancellable already maps every
+                // known pre-spawn throw to "spawn failed: ..." (definite)
+                // and every known post-spawn throw to transportUnknown, so
+                // anything reaching here is an unclassified escape (e.g. a
+                // rogue Process API throw). Fail closed to Unknown via the
+                // in-process flag; the "su failed: " text prefix is kept
+                // verbatim (isPostSpawnTransportText("su failed: boom") stays
+                // false -- discrimination walks the flag, not the text).
+                // True pre-spawn definite stays with the "spawn failed" path.
+                CmdResult(exit = 1, out = "", err = "su failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
             }
         }
 }
