@@ -191,7 +191,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 ## 6. 來源選取與批次建立（PR-7 P2 #26 階段 1）
 
 個人來源 catalog 為唯讀展示＋勾選：`MainActivity` 經 `PackageManager.getInstalledApplications(0)`
-列舉呼叫者所屬 user 可見的已安裝 App（絕不跨 user 枚舉，不碰 Secure Folder／Knox 容器），
+僅列舉呼叫者自身 user 可見的已安裝 App（政策：不跨 user 枚舉，不讀取其他 user 的套件、檔案與私有內容，包括其他 user 下的容器資料），
 以 `SourceAppEntry` 唯讀列出；寫入目標仍以 `DualRepository` 跨來源 verified dualId 為準（見 §3），
 本表只決定「要對哪個包名打勾」。
 
