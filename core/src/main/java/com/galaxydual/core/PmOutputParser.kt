@@ -95,12 +95,13 @@ object PmOutputParser {
     )
 
     // Trusted-listing exempt subset (P22 fix m7): only package: echoes
-    // and Success lines. The install-success "installed for user" echo
-    // (EXEMPT_LINE[2]) is deliberately NOT exempt on the listing path:
-    // only a line carrying an error keyword (or an empty listing with
-    // residual text, see M1 below) yields Unknown; a non-empty listing
-    // with no error keyword still parses to TrustedFull by deliberate
-    // scope. isSuccess() keeps the full EXEMPT_LINE unchanged.
+    // and Success lines skip the error-keyword scan. The install-success
+    // "installed for user" echo (EXEMPT_LINE[2]) is deliberately NOT exempt
+    // on the listing path. Exemption is NOT trust: after the scan, the
+    // step-4 structural whitelist still requires every non-blank stdout
+    // line to be a legal package: line and stderr to be fully blank;
+    // anything else is Unknown. isSuccess() keeps the full EXEMPT_LINE
+    // unchanged.
     private val TRUSTED_EXEMPT_LINE = listOf(
         Regex("^\\s*package:", RegexOption.IGNORE_CASE),
         Regex("^\\s*success(?![A-Za-z0-9])", RegexOption.IGNORE_CASE),
@@ -343,14 +344,23 @@ object PmOutputParser {
     //    inside a listing is still scrutinized. There is NO ALREADY_EXISTS
     //    exception here: that code is install-only idempotent-success; any
     //    Failure line in a listing makes the snapshot untrusted.
-    // 4. malformed package: payload (must match ^[A-Za-z0-9._-]+$, same
-    //    charset as ShellEscaper.SAFE_TOKEN) -> Unknown. Trusted path only;
-    //    parsePackages() itself stays tolerant.
-    // 5. otherwise parsePackages(out): empty -> TrustedEmpty ONLY when both
-    //    streams are otherwise blank (any residual non-blank out line not
-    //    starting with "package:", or any non-blank err line, is an
-    //    unexpected format/dirty channel -> Unknown, fail closed);
-    //    non-empty -> TrustedFull(packages).
+    // 4. structural whitelist (P1 BLOCKER #1, issue #22 review): an
+    //    authoritative full listing contains NOTHING but legal package:
+    //    lines -- every non-blank stdout line must start with "package:"
+    //    (case-insensitive, same as TRUSTED_EXEMPT_LINE) with a payload
+    //    matching ^[A-Za-z0-9._-]+$ (same charset as
+    //    ShellEscaper.SAFE_TOKEN), and stderr must be fully blank. Any
+    //    other stdout line (usage text, non-English error, stray echo) ->
+    //    Unknown("unexpected listing format: <first line>"); any non-blank
+    //    stderr line -> Unknown("unexpected stderr: <first line>").
+    //    Strict policy: only a whitelisted clean listing is
+    //    absence/presence evidence. ROM-specific extra lines are NOT
+    //    tolerated by default -- each must be proven and added here as an
+    //    explicit allowlist entry (there is no other escape hatch).
+    //    Trusted path only; parsePackages() itself stays tolerant.
+    // 5. otherwise parsePackages(out): empty -> TrustedEmpty (confirmed
+    //    empty); non-empty -> TrustedFull(packages). Reached only when the
+    //    whitelist above passed, so both cases are authoritative.
     fun parsePackagesTrusted(
         out: String,
         err: String,
@@ -388,34 +398,39 @@ object PmOutputParser {
         if (errorLine != null) {
             return TrustedList.Unknown("error-semantic output: ${errorLine.take(200)}")
         }
-        // M2: validate each package: payload on the trusted path only.
-        // Prefix match is case-insensitive for consistency with
+        // P1 structural whitelist (fail closed, issue #22 review): an
+        // authoritative listing carries nothing but legal package: lines.
+        // TRUSTED_EXEMPT stays unchanged above (package:/Success lines never
+        // reach the error scan, so failure-named packages keep their
+        // regression); this is an independent subsequent gate, not a second
+        // error scan. Prefix match is case-insensitive for consistency with
         // TRUSTED_EXEMPT_LINE (real pm emits all-lowercase; this only
         // keeps the check self-consistent, still fail-closed).
         for (raw in out.lines()) {
             val line = raw.trim()
-            if (!line.startsWith("package:", ignoreCase = true)) continue
+            if (line.isEmpty()) continue
+            if (!line.startsWith("package:", ignoreCase = true)) {
+                return TrustedList.Unknown("unexpected listing format: ${line.take(200)}")
+            }
+            // M2 payload check (trusted path only; parsePackages() itself
+            // stays tolerant): must match ^[A-Za-z0-9._-]+$, same charset
+            // as ShellEscaper.SAFE_TOKEN.
             val payload = line.substring("package:".length).trim()
             if (!PACKAGE_PAYLOAD.matches(payload)) {
                 return TrustedList.Unknown("malformed package line: ${line.take(200)}")
             }
         }
+        // Unexplained stderr residue: the truncation marker/flag and
+        // error-semantic lines already returned above, so any remaining
+        // non-blank stderr line (warning, notice, partial-result marker the
+        // error rule did not classify) is a dirty channel, never ignored --
+        // with or without packages.
+        val firstErr = err.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+        if (firstErr != null) {
+            return TrustedList.Unknown("unexpected stderr: ${firstErr.take(200)}")
+        }
         val packages = parsePackages(out)
         if (packages.isEmpty()) {
-            // M1 strict empty (fail closed): EXEMPT/ERROR already screened
-            // above, so any remaining non-blank out line is an unknown format
-            // (usage text, help, stray echo) -- never confirmed-absent.
-            val firstOut = out.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
-            if (firstOut != null && !firstOut.startsWith("package:", ignoreCase = true)) {
-                return TrustedList.Unknown("unexpected listing format: ${firstOut.take(200)}")
-            }
-            // Conservative err side: a non-blank err stream with zero
-            // packages means a dirty channel (warning/marker the error rule
-            // did not classify) -- do not ignore it as clean-empty.
-            val firstErr = err.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
-            if (firstErr != null) {
-                return TrustedList.Unknown("unexpected listing format: ${firstErr.take(200)}")
-            }
             return TrustedList.TrustedEmpty
         }
         return TrustedList.TrustedFull(packages)

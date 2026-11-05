@@ -923,4 +923,55 @@ class CloneVerifyRefreshTest {
             outcome.detail.contains("channel error") && outcome.detail.contains("binder died"),
         )
     }
+
+    // P1 BLOCKER #1 (issue #22 review) verify path: target absent from the
+    // listing but a garbage stdout line rides along -> the listing is not
+    // whitelist-clean, so Unknown (never NotInstalled).
+    @Test
+    fun verifyState_packagePlusGarbage_isUnknown() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.other\nusage: pm list packages",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("com.example.chat", 95) }
+        assertTrue("garbage listing without target must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertTrue(
+            "detail must name the format, got: \"${(state as VerifyState.Unknown).detail}\"",
+            state.detail.contains("unexpected listing format"),
+        )
+    }
+
+    // P1 BLOCKER #1 remove path: uninstall ok + garbage listing re-check ->
+    // VerifyUnknown (caller keeps the entry: fail closed), never Success.
+    @Test
+    fun removeVerified_garbageListing_isVerifyUnknown() {
+        val gateway = FakeGateway(
+            uninstallOut = "Success",
+            listPackagesOut = "package:com.example.other\nusage: pm list packages",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertTrue(
+            "detail must name the format, got: \"${(outcome as RemoveOutcome.VerifyUnknown).detail}\"",
+            outcome.detail.contains("unexpected listing format"),
+        )
+    }
+
+    // P1 BLOCKER #1 refresh path: garbage listing -> null (unknown), never
+    // an authoritative list, so the ViewModel keeps the previous `cloned`.
+    @Test
+    fun refresh_garbageListing_isNull() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.chat\nusage: pm list packages",
+            listPackagesExit = 0,
+        )
+        val repo = DualRepository(gateway)
+        assertNull(
+            "garbage listing must be unknown (null), not an authoritative list",
+            runSuspend { repo.listClonedPackages() },
+        )
+    }
 }
