@@ -42,6 +42,14 @@ class CloneVerifyRefreshTest {
         var listPackagesErr: String = "",
         var listPackagesExit: Int = 0,
         var listPackagesTruncated: Boolean = false,
+        // Throw switches (PR-2 Phase 3, R5): when set, run() throws a
+        // RuntimeException for that command family instead of returning a
+        // result. CancellationException is deliberately NOT covered here:
+        // testing the rethrow needs runTest cancellation semantics, the
+        // hand-rolled runSuspend above cannot model it.
+        var throwOnListUsers: Boolean = false,
+        var throwOnListPackages: Boolean = false,
+        var throwMessage: String = "binder died",
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -49,8 +57,10 @@ class CloneVerifyRefreshTest {
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
             return when {
-                cmd == DualRepository.CMD_LIST_USERS ->
+                cmd == DualRepository.CMD_LIST_USERS -> {
+                    if (throwOnListUsers) throw RuntimeException(throwMessage)
                     CmdResult(exit = listUsersExit, out = listUsersOut, err = listUsersErr)
+                }
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                     CmdResult(exit = userListVerboseExit, out = userListVerboseOut, err = "")
                 cmd == DualRepository.CMD_DUMPSYS_USER ->
@@ -63,13 +73,15 @@ class CloneVerifyRefreshTest {
                     CmdResult(exit = uninstallExit, out = uninstallOut, err = uninstallErr)
                 cmd.startsWith("pm path") ->
                     CmdResult(exit = pathExit, out = pathOut, err = pathErr)
-                cmd.startsWith("pm list packages") ->
+                cmd.startsWith("pm list packages") -> {
+                    if (throwOnListPackages) throw RuntimeException(throwMessage)
                     CmdResult(
                         exit = listPackagesExit,
                         out = listPackagesOut,
                         err = listPackagesErr,
                         truncated = listPackagesTruncated,
                     )
+                }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
         }
@@ -362,6 +374,10 @@ class CloneVerifyRefreshTest {
         val repo = DualRepository(gateway)
         val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        assertTrue(
+            "detail must name the error-semantic line, got: \"${(outcome as CloneOutcome.VerifyUnknown).detail}\"",
+            outcome.detail.contains("Unknown package"),
+        )
     }
 
     // (e) clone: install ok + list exit 0 that contains the package is
@@ -746,6 +762,124 @@ class CloneVerifyRefreshTest {
         assertTrue(
             "truncated re-check with package must be VerifyUnknown, got: $truncatedOutcome",
             truncatedOutcome is CloneOutcome.VerifyUnknown,
+        )
+    }
+
+    // PR-2 Phase 3 (T1): a channel error on the profiles snapshot maps verify
+    // to Unknown (fail closed), and no list probe may run.
+    @Test
+    fun verifyState_channelError_isUnknown() {
+        val gateway = FakeGateway(listUsersExit = 1, listUsersErr = "denied: no privilege")
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("com.example.chat", 95) }
+        assertTrue("channel error must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertTrue(
+            "no probe may run on channel error, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
+        )
+    }
+
+    // PR-2 Phase 3 (T3): an invalid package token maps verify to Unknown
+    // (fail closed) without ever emitting a probe command.
+    @Test
+    fun verifyState_invalidPackage_isUnknown() {
+        val gateway = FakeGateway()
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("bad pkg; rm -rf", 95) }
+        assertTrue("invalid package must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertTrue(
+            "no probe may run for an invalid package, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
+        )
+    }
+
+    // PR-2 Phase 3 (T4): explicit-id listing with a refused id (owner 0, or
+    // an id absent from the snapshot) yields null (unknown) without probing.
+    @Test
+    fun listClonedPackages_invalidId_isNull() {
+        val gateway = FakeGateway()
+        val repo = DualRepository(gateway)
+        assertNull(runSuspend { repo.listClonedPackages(0) })
+        assertNull(runSuspend { repo.listClonedPackages(999) })
+        assertTrue(
+            "no probe may run for refused ids, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
+        )
+    }
+
+    // PR-2 Phase 3 (T-extra): the refresh listing path never retries -- a
+    // non-zero probe yields null (unknown) after exactly one gateway call,
+    // so the ViewModel keeps the previous `cloned` on one stale frame.
+    @Test
+    fun refresh_nonZeroExit_probesOnce_isNull() {
+        val gateway = FakeGateway(
+            listPackagesOut = "",
+            listPackagesErr = "error: closed",
+            listPackagesExit = 1,
+        )
+        val repo = DualRepository(gateway)
+        assertNull(runSuspend { repo.listClonedPackages() })
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // PR-2 Phase 3 (R5): a gateway that throws mid-probe (spawn failure,
+    // SecurityException, binder death surfaced as RuntimeException) maps to
+    // Unknown("channel error: ..."), fail closed, never a crash. Identity
+    // channels stay healthy here so the throw is proven to come from the
+    // list probe itself (no sleep fires: throws bypass the retry loop).
+    @Test
+    fun verifyState_throwingListProbe_isUnknownChannelError() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.chat\n",
+            throwOnListPackages = true,
+            throwMessage = "binder died",
+        )
+        val repo = DualRepository(gateway)
+        val state = runSuspend { repo.verifyState("com.example.chat", 95) }
+        assertTrue("throwing probe must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertTrue(
+            "detail must carry the channel error, got: \"${(state as VerifyState.Unknown).detail}\"",
+            state.detail.contains("channel error") && state.detail.contains("binder died"),
+        )
+    }
+
+    // PR-2 Phase 3 (R5): a throwing refresh listing maps to null (unknown),
+    // never a crash and never an authoritative empty list.
+    @Test
+    fun listClonedPackages_throwingProbe_isNull() {
+        val gateway = FakeGateway(
+            listPackagesOut = "package:com.example.chat\n",
+            throwOnListPackages = true,
+            throwMessage = "binder died",
+        )
+        val repo = DualRepository(gateway)
+        assertNull(runSuspend { repo.listClonedPackages() })
+    }
+
+    // PR-2 Phase 3 (R5): a throwing `pm list users` maps profilesSnapshot to
+    // ChannelError (fail closed); listProfiles collapses it to emptyList by
+    // design (C2 contract, kept). Simplest directly-observable collapse
+    // path, no clone/remove flow needed.
+    // CancellationException rethrow is NOT covered here: it needs runTest
+    // cancellation semantics, which the hand-rolled runSuspend above cannot
+    // model.
+    @Test
+    fun profilesSnapshot_throwingGateway_isChannelError_listProfilesEmpty() {
+        val gateway = FakeGateway(
+            throwOnListUsers = true,
+            throwMessage = "spawn failed: su",
+        )
+        val repo = DualRepository(gateway)
+        val snap = runSuspend { repo.profilesSnapshot() }
+        assertTrue("throwing snapshot must be ChannelError, got: $snap", snap is ProfilesSnapshot.ChannelError)
+        assertTrue(
+            "detail must carry the channel error, got: \"${(snap as ProfilesSnapshot.ChannelError).detail}\"",
+            snap.detail.contains("channel error"),
+        )
+        assertEquals(
+            "listProfiles collapses channel failure to empty by design",
+            emptyList<DualProfile>(),
+            runSuspend { repo.listProfiles() },
         )
     }
 }

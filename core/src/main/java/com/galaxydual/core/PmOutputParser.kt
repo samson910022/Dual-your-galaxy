@@ -133,6 +133,12 @@ object PmOutputParser {
     // error-semantic on its own line: Failure [...] lines, Error: lines,
     // Exception headers/stack lines, unknown-package/not-installed statements,
     // and denied/cannot/abort/invalid operation failures.
+    //
+    // Locale assumption (PR-2 Phase 3, R4): these patterns only match ENGLISH
+    // pm output. On a non-English ROM an exit-0 dirty line in another language
+    // can slip through as Trusted (known trade-off; the fail-closed direction
+    // -- truncated / non-zero / malformed payload rules -- is unchanged, but
+    // a foreign-language error sentence is not recognized as error-semantic).
     private val ERROR_LINE = listOf(
         // "Failure [INSTALL_FAILED_...]" / "Failure: ..." / "FAILURE ...".
         Regex("(?<![A-Za-z0-9])failures?(?![A-Za-z0-9])", RegexOption.IGNORE_CASE),

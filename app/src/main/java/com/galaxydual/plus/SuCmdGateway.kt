@@ -55,6 +55,13 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     }
     // Drain both pipes on daemon threads: reading stdout to EOF while stderr
     // sits unfilled can deadlock once the stderr pipe buffer fills.
+    // Known limitation (PR-2 Phase 3, R8): each StringBuilder has exactly one
+    // writer thread and the steady path joins both drains before reading, but
+    // StringBuilder itself is unsynchronized, and on the timeout path
+    // join(2_000) can expire while a drain thread is still appending, racing
+    // with the capped(out) read below. Accepted as extremely low risk (2 s
+    // grace on kilobyte-scale pm output; worst case is a torn tail that the
+    // trusted parse already treats as untrusted), never silently trusted.
     val out = StringBuilder()
     val err = StringBuilder()
     val drainOut = thread(isDaemon = true, name = "capture-stdout") {

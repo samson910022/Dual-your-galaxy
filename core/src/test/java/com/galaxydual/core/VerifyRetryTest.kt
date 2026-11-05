@@ -158,4 +158,56 @@ class VerifyRetryTest {
         assertTrue("expected VerifyFailed, got: $outcome", outcome is CloneOutcome.VerifyFailed)
         assertEquals(2, gateway.listCalls)
     }
+
+    // PR-2 Phase 3 (T6): retry exhausted into a dirty final -- [exit 1,
+    // exit-0 error-semantic] -- is Unknown whose detail names the error line
+    // (not the exit code), after exactly 2 probes. Costs one 1500 ms settle
+    // sleep (single retry on the exit-1 head; the exit-0 dirty tail never
+    // retries -- see T7 below).
+    @Test
+    fun removeVerified_retryThenDirtyFinal_isUnknownWithErrorDetail() {
+        val gateway = SeqGateway(
+            listQueue = ArrayDeque(
+                listOf(
+                    CmdResult(exit = 1, out = "", err = "timeout"),
+                    CmdResult(
+                        exit = 0,
+                        out = "Failure [DELETE_FAILED_INTERNAL_ERROR: System error]",
+                        err = "",
+                    ),
+                ),
+            ),
+        )
+        val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        assertEquals(2, gateway.listCalls)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the error-semantic line, got: \"$detail\"", detail.contains("Failure"))
+    }
+
+    // PR-2 Phase 3 (T7): exit-0 captures never retry -- truncated and dirty
+    // finals each cost exactly 1 probe. Retry fires only on exit != 0.
+    @Test
+    fun verifyState_truncatedExitZero_doesNotRetry() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat\n", err = "", truncated = true),
+        )
+        val state = runSuspend { DualRepository(gateway).verifyState("com.example.chat", 95) }
+        assertTrue("truncated exit-0 listing must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertEquals(1, gateway.listCalls)
+    }
+
+    @Test
+    fun verifyState_dirtyExitZero_doesNotRetry() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(
+                exit = 0,
+                out = "",
+                err = "java.lang.SecurityException: Neither user 2000 nor current process has permission",
+            ),
+        )
+        val state = runSuspend { DualRepository(gateway).verifyState("com.example.chat", 95) }
+        assertTrue("dirty exit-0 listing must be Unknown, got: $state", state is VerifyState.Unknown)
+        assertEquals(1, gateway.listCalls)
+    }
 }
