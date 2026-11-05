@@ -50,24 +50,45 @@ import rikka.shizuku.Shizuku
 // TRANSACTION_EXEC is a custom code on our own Binder subclass; it must never
 // collide with the framework-reserved UserService destroy codes (16777114 in
 // aidl spelling, 16777115 on the wire) -- enforced by unit test.
-// Reply layout (no exception header on purpose): int exit, String stdout,
-// String stderr. The client must NOT call reply.readException(): a non-zero
-// exit word would be misread as an exception code.
-// The reply does NOT carry CmdResult.truncated explicitly (layout frozen);
-// the client re-derives it from the core TRUNCATION_MARKER via
-// decodeExecReply() below. The service appends the marker whenever the
-// capture is truncated (cap, read error, or join expiry -- see capped() /
-// buildResult() in SuCmdGateway.kt), so every truncated=true result carries
-// detectable text (review Phase B, issue #22 P2-#3).
-// Compatibility note: service and client ship in the same APK and update
-// together, so both sides agree on whenever-truncated-append. An OLD service
-// (marker only on cap) paired with a NEW client can still miss a join-expiry
-// flag across versions; known cross-version limitation.
+// Reply layout (FROZEN: int exit, String stdout, String stderr -- three fields
+// only, no independent completeness bit; adding one is a wire break, so the
+// truncated flag travels as marker text inside the streams).
+// The client re-derives truncated from the core TRUNCATION_MARKER via
+// decodeExecReply() below. Marker semantics v2 (SERVICE_VERSION = 2): the
+// service appends the marker whenever the capture is truncated (cap, read
+// error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
+// so every truncated=true result carries detectable text (review Phase B,
+// issue #22 P2-#3). v1 = cap-only marker (old semantics): an old service on
+// a read-error / join-expiry path returned exit=0 partial package lines (or
+// clean empty) with NO marker, which a new client decodes as truncated=false.
+// Upgrade gap closed at the deployment layer: UserServiceArgs
+// .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
+// UserService on upgrade (official UserServiceArgs.version(int) contract:
+// use a different version code whenever the service code is updated; daemon
+// defaults to true), so the next bind with the new args rebuilds the
+// resident UserService instead of reusing the old one. The
+// tag stays "GalaxyDualExec-v1" for stable service identity; the version bump
+// is the invalidation signal.
+// Device upgrade verification (S24 real-device item, NOT JVM-testable: the
+// android.os.Parcel / Binder round-trip is a framework stub on the JVM):
+//   1. install the old APK and start the resident UserService (v1);
+//   2. upgrade the APK WITHOUT restarting Shizuku;
+//   3. confirm the bound service runs the new capture/marker contract (an
+//      exit=0 partial read-error / join-expired reply arrives WITH marker and
+//      parses as Unknown on the new client).
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
     const val BIND_TIMEOUT_MS = 10_000L
     const val EXEC_TIMEOUT_MS = 60_000L
+    // UserService implementation version. v1 = cap-only marker (old service
+    // semantics); v2 = whenever-truncated marker (current capture contract).
+    // Bump whenever the service-side capture/encode code changes: Shizuku
+    // requires a different version code on service-code updates so the daemon
+    // (default true) rebuilds the UserService instead of reusing the resident
+    // old one. Tag is intentionally NOT bumped ("GalaxyDualExec-v1" stays the
+    // stable service identity below).
+    const val SERVICE_VERSION = 2
 }
 
 // Pure error mapping for every Shizuku-side failure: binder dead, missing
@@ -221,7 +242,10 @@ class ShizukuCmdGateway(
             val latch = CompletableDeferred<IBinder>()
             val args = Shizuku.UserServiceArgs(
                 ComponentName(packageName, serviceClassName),
-            ).processNameSuffix("dualexec").version(1).tag("GalaxyDualExec-v1")
+            // Tag stays the stable service identity; SERVICE_VERSION (v2) is the
+            // invalidation signal that forces Shizuku/Sui to rebuild the
+            // resident UserService on upgrade (see ShizukuExecProtocol).
+            ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")
             val conn = object : ServiceConnection {
                 override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                     if (service != null) latch.complete(service)
