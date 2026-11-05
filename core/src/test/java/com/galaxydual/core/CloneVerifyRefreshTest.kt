@@ -203,10 +203,12 @@ class CloneVerifyRefreshTest {
         )
     }
 
-    // Pinning (issue #9 req 1): one `pm list users` snapshot serves both the
-    // install and the re-check, and both target the same user.
+    // Pinning (issue #9 req 1; Phase D before/fresh/after target pin): one
+    // `pm list users` snapshot serves the flow plus verified-target checks
+    // around the write, and install and re-check target the same user.
+    // legacy name: cloneVerified_pinsSingleSnapshotForInstallAndVerify
     @Test
-    fun cloneVerified_pinsSingleSnapshotForInstallAndVerify() {
+    fun cloneVerified_pinsSnapshotAndBeforeAfterTargetForInstallAndVerify() {
         val gateway = FakeGateway(
             installOut = "Package com.example.chat installed for user: 95",
             listPackagesOut = "package:com.example.chat\n",
@@ -226,9 +228,11 @@ class CloneVerifyRefreshTest {
         )
     }
 
-    // Same pinning for remove: uninstall and re-check share the snapshot id.
+    // Same pinning for remove: uninstall and re-check share one snapshot id
+    // plus before/fresh/after verified-target pin.
+    // legacy name: removeVerified_pinsSingleSnapshotForUninstallAndRecheck
     @Test
-    fun removeVerified_pinsSingleSnapshotForUninstallAndRecheck() {
+    fun removeVerified_pinsSnapshotAndBeforeAfterTargetForUninstallAndRecheck() {
         val gateway = FakeGateway(
             uninstallOut = "Success",
             // Absent after removal: clean empty listing.

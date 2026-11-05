@@ -97,7 +97,8 @@ data class UiState(
 // All shell work is delegated to DualRepository; this class only owns state.
 //
 // Phase C3 (issue #9): clone/remove go through the repository's pinned flows
-// (cloneVerified/removeVerified: one snapshot, install/uninstall and re-check
+// (cloneVerified/removeVerified: one `pm list users` snapshot plus
+// before/fresh/after verified-target pinning; install/uninstall and re-check
 // on the same dual id), and refresh rebuilds `cloned` from the device ground
 // truth (`pm list packages --user <dualId>`) instead of trusting local state.
 // Only a verify-confirmed install is added to `cloned`; only a
@@ -230,8 +231,11 @@ class DualViewModel(
                     // Verified identity only: the id comes from the repo's
                     // cross-source resolver, never from the pm-list label
                     // (display-only by contract), so the display layer makes
-                    // no label judgment and shares one verified target with
-                    // the listing below.
+                    // no label judgment. Two separate fetches under the hood
+                    // (resolve here plus re-verification inside
+                    // listClonedPackages(dualId)); drift between them returns
+                    // unknown (fail closed), never a write to the wrong user
+                    // (refresh itself is read-only).
                     val dualId = repo.resolveDualUserId()
                     if (dualId < 0) {
                         _state.update {
