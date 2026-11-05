@@ -1133,8 +1133,11 @@ class InventorySelectionTest {
         vm.toggleSelection("0:com.example.a1")
         vm.toggleSelection("0:com.example.a2")
         assertEquals(2, vm.state.value.selectedKeys.size)
-        // live 切到 96，不經 refresh（模擬 95 勾選殘留到 96 前的空窗）。
+        val queryBefore = vm.state.value.inventory.queryTimeMs
+        assertTrue("refresh must stamp queryTime", queryBefore > 0)
+        // live 已切到 96＋新 serial，不經 refresh（模擬 95 勾選殘留到 96 前的空窗）。
         gw.dualId = 96
+        gw.dualSerial = 41
         vm.cloneSelected()
         await {
             !vm.state.value.loading &&
@@ -1146,6 +1149,20 @@ class InventorySelectionTest {
         assertNull("stale batch must clear batchReport", vm.state.value.batchReport)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
         assertFalse(vm.state.value.loading)
+        // PR-37 P3 Phase A #3：bound 拒絕亦 STALE——inventory 無條件 STALE
+        //（FRESH 不得殘留）＋更新為 live 目標（pin 的 expectedTarget），
+        // queryTime 保留供追溯。
+        assertTrue(
+            "bound rejection must not keep inventory FRESH",
+            vm.state.value.inventory.freshness != InventoryFreshness.FRESH,
+        )
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertEquals(96, vm.state.value.inventory.targetId)
+        assertEquals(41, vm.state.value.inventory.targetSerial)
+        assertEquals(
+            "bound rejection must keep queryTime for traceability",
+            queryBefore, vm.state.value.inventory.queryTimeMs,
+        )
     }
 
     // PR-37 P3 Phase A #1：從未綁定（bound==NONE 哨兵）的勾選亦整批拒絕。
@@ -1303,6 +1320,44 @@ class InventorySelectionTest {
         assertNull(backend.store().loadSnapshot())
     }
 
+    // PR-37 P3 Phase A #4：serial 行存在但無效（非整數/空/超界）或重複出現
+    // ——整筆拒絕（損壞自清），不得降級為 legacy（id-only 有效）。
+    // 直接測 SelectionStore parse/load 層：五種形狀皆 parse null、
+    // loadSelected 回空、損壞條目自清、之後可正常保存。
+    @Test
+    fun store_invalidOrDuplicateSerialLine_rejectsWholeEntry() {
+        val raws = mapOf(
+            "malformed" to
+                "v1\nsource=catalog\ntarget=95\nserial=garbage\nat=1000\npkg=0:com.example.a\n",
+            "empty" to
+                "v1\nsource=catalog\ntarget=95\nserial=\nat=1000\npkg=0:com.example.a\n",
+            "overflow" to
+                "v1\nsource=catalog\ntarget=95\nserial=9999999999\nat=1000\npkg=0:com.example.a\n",
+            "duplicate-same" to
+                "v1\nsource=catalog\ntarget=95\nserial=15\nserial=15\nat=1000\npkg=0:com.example.a\n",
+            "duplicate-different" to
+                "v1\nsource=catalog\ntarget=95\nserial=15\nserial=41\nat=1000\npkg=0:com.example.a\n",
+        )
+        for ((name, raw) in raws) {
+            val backend = MapBackend()
+            backend.map[SELECTION_KEY] = raw
+            val store = backend.store()
+            assertNull("parse must reject $name serial line", store.loadSnapshot())
+            assertEquals(
+                "loadSelected must fail closed on $name",
+                emptySet<String>(), store.loadSelected(95, 15),
+            )
+            assertNull("$name damage must self-clear", backend.map[SELECTION_KEY])
+            // legacy id-only 讀取亦不得復活已損壞條目。
+            assertEquals(
+                emptySet<String>(), backend.store().loadSelected(95),
+            )
+            // 自清後可正常保存，store 恢復可用。
+            assertTrue(store.save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1L))
+            assertEquals(setOf("0:com.example.a"), backend.store().loadSelected(95))
+        }
+    }
+
     // PR-37 Phase B #1 原子 pin：批次 pin（fetchDualTarget，不經
     // CMD_LIST_USERS）見 95，首項 snapshot 即見 96——core 在同一流程內
     // snapshot＋resolve＋比對並拒絕（TargetMismatch），零 `--user 96`
@@ -1431,5 +1486,32 @@ class InventorySelectionTest {
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         assertEquals(1, vm.state.value.batchReport!!.successCount)
         assertEquals(listOf("com.example.chat"), gw.installCalls)
+    }
+
+    // PR-37 P3 Phase A #4（VM 層）：損壞 v2 存檔（serial 行無效）restore
+    // 不恢復——parse 整筆拒絕走損壞自清（刪檔回空），舊勾選不復活，
+    // 零裝置寫入。
+    @Test
+    fun restore_corruptSerialLine_restoresNothingAndSelfClears() {
+        val backend = MapBackend()
+        backend.map[SELECTION_KEY] =
+            "v1\nsource=catalog\ntarget=95\nserial=garbage\nat=1000\npkg=0:com.example.chat\n"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        // refresh 內補觸恢復已因損壞回空；顯式 restore 亦必須無效。
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertNull(
+            "corrupt v2 entry must self-clear on restore",
+            backend.store().loadSnapshot(),
+        )
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
     }
 }

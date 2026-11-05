@@ -3,9 +3,10 @@
 // PR-7 P2 (issue #26, 階段 1):個人來源 App 唯讀 catalog。
 //
 // 範圍 (S24 證據界線,見 docs/UX_REVIEW_S24.md §2):
-// - 只列舉「呼叫者所屬 user 可見」的已安裝 App (PackageManager 授權範圍):
-//   loader 用無參數 getInstalledApplications(0),絕不跨 user 枚舉,絕不碰
-//   Secure Folder / Knox 容器 (150 等其他 user 的套件/檔案/私有內容一律不讀)。
+// - 只列舉「呼叫者自身 user 可見」的已安裝 App (PackageManager 授權範圍):
+//   loader 用無參數 getInstalledApplications(0),僅列舉呼叫者自身 user,
+//   不跨 user 枚舉;其他 user 的套件/檔案/私有內容一律不讀 (完整政策見
+//   docs/USAGE.md §6)。
 // - AppKey = sourceUserSerial + packageName ("<serial>:<pkg>"),同一包名在
 //   不同來源 user 下永遠是不同 key;圖示載入狀態永不參與身分鍵 (見
 //   SourceIconState),避免快取狀態污染選取/寫入目標。
@@ -92,10 +93,10 @@ class SourceIconState {
 // 載入呼叫者 user 可見的已安裝 App (DEVICE-UNVERIFIED:需實機驗證列表完整性)。
 //
 // 授權範圍保證:
-// - 只用 pm.getInstalledApplications(0):回傳呼叫者所屬 user 授權可見的
+// - 只用 pm.getInstalledApplications(0):回傳呼叫者自身 user 授權可見的
 //   列表,不帶跨 user 枚舉 (不用 getInstalledApplicationsAsUser 等隱藏
 //   API,不讀其他 user 的套件/檔案)。
-// - Secure Folder / Knox 容器屬於其他 user,一律不在此列表內。
+// - 其他 user 的內容一律不在此列表內 (完整政策見 docs/USAGE.md §6)。
 // - API 30+ 完整列表需 QUERY_ALL_PACKAGES (見 manifest 註解);若系統過濾,
 //   回傳即為授權可見子集,不偽造、不補全。
 // 穩健性:逐項 try/catch,單項失敗跳過;整體載入失敗回傳 null (呼叫方保留舊列表),

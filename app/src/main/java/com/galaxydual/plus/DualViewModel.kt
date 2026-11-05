@@ -3551,15 +3551,32 @@ class DualViewModel(
                         return@withLock
                     }
                     if (pinned is DualTargetResult.SerialUnavailable) {
-                        _state.update {
-                            it.copy(
+                        // PR-37 P3 Phase A #3：serial 不可用即無完全體 pin，
+                        // 整批拒絕、零裝置寫入（fail closed）；舊資料不得殘留
+                        // FRESH（FRESH 即降 STALE 待重查，保留原 target/
+                        // queryTime 供追溯）；diagnose/msgKind 皆走 CHANNEL
+                        //（身份未完全驗證，非 NO_DUAL 語意）。
+                        val nowSerialBad = nowWallMs()
+                        _state.update { cur ->
+                            val degraded =
+                                if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                                    cur.inventory.toStaleOrUnknown(
+                                        now = nowSerialBad,
+                                        source = cur.inventory.source,
+                                        targetId = cur.inventory.targetId,
+                                    )
+                                } else {
+                                    cur.inventory
+                                }
+                            cur.copy(
                                 loading = false,
+                                inventory = degraded,
                                 diagnose = diagnoseEvent(
                                     DiagnoseCode.CHANNEL_ERROR,
                                     techDetail = "serial unavailable for verified target",
                                 ),
                                 msg = "無法驗證分身身分（serial 缺失），請重試",
-                                msgKind = MsgKind.NO_DUAL,
+                                msgKind = MsgKind.CHANNEL,
                             )
                         }
                         return@withLock
@@ -3663,15 +3680,24 @@ class DualViewModel(
                     // 下一次 refresh 對新目標仍可恢復一次）。
                     // 口徑與 M9 persist 守衛、handleSelectionTargetChangeLocked 一致
                     //（fail closed on target mismatch）。
+                    // PR-37 P3 Phase A #3：bound 拒絕亦視為一次目標變更——
+                    // inventory 無條件 STALE＋更新為 live 目標（id/serial 皆取
+                    // pin 的 expectedTarget；queryTime 保留供追溯，不觸發
+                    // refresh）。
                     if (lockedKeys.isNotEmpty() && selectionBoundTarget != expectedTarget) {
                         val oldBound = selectionBoundTarget
                         selectionBoundTarget = SELECTION_BOUND_NONE
                         selectionRestoredForTarget = SELECTION_RESTORE_NONE
-                        _state.update {
-                            it.copy(
+                        _state.update { cur ->
+                            cur.copy(
                                 loading = false,
                                 selectedKeys = emptySet(),
                                 batchReport = null,
+                                inventory = cur.inventory.copy(
+                                    freshness = InventoryFreshness.STALE,
+                                    targetId = expectedTarget.id,
+                                    targetSerial = expectedTarget.serial,
+                                ),
                                 msg = "選取已綁定舊目標，已清空，請重新勾選確認" +
                                     "（user ${oldBound.display()} → ${expectedTarget.display()}）",
                                 msgKind = MsgKind.INVALID,

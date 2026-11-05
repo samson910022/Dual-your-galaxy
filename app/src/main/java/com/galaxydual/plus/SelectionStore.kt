@@ -30,6 +30,7 @@ const val SELECTION_KEY = "saved_selection"
 // PR-37 Phase B #2 serial 綁定：serial 以可選 `serial=` 行攜帶（header 維持
 // v1，不升級）：舊快照無此行即 legacy（id-only，恢復綁定 id-only，見下）；
 // 新寫入在 serial 已知時帶 serial（v2 內容），未知時省略（legacy 形狀）。
+// serial 行一旦出現必須唯一且為有效整數，否則整筆視為損壞（見 parseSelection）。
 const val SELECTION_SCHEMA = 1
 private const val SELECTION_HEADER = "v1"
 
@@ -76,7 +77,9 @@ fun serializeSelection(s: SavedSelection): String = buildString {
 
 // 解析 (純函數):null/空白/版本不符/target 缺失或非法 -> null (損壞)。
 // 個別非法 pkg 行跳過 (不連坐整筆);target <= 0 視為損壞 (無目標的選取無意義)。
-// serial 行缺失/非法 -> null (legacy 快照，僅 id-only 有效)。
+// serial 行缺失 -> legacy 快照 (僅 id-only 有效,serial 為 null)；serial 行
+// 存在但無效 (非整數/空字串/超 Int 範圍) 或重複出現 -> 整筆 null (損壞，
+// 不得降級為 legacy；loadSelected 對此走既有損壞自清)。
 fun parseSelection(raw: String?): SavedSelection? {
     if (raw.isNullOrBlank()) return null
     val lines = raw.lines()
@@ -84,6 +87,8 @@ fun parseSelection(raw: String?): SavedSelection? {
     var source = SELECTION_SOURCE_MANUAL
     var target: Int? = null
     var serial: Int? = null
+    var serialSeen = false
+    var serialBroken = false
     var at = 0L
     val pkgs = mutableSetOf<String>()
     for (line in lines.drop(1)) {
@@ -98,7 +103,14 @@ fun parseSelection(raw: String?): SavedSelection? {
                 target = t.removePrefix("target=").trim().toIntOrNull()
             }
             t.startsWith("serial=") -> {
-                serial = t.removePrefix("serial=").trim().toIntOrNull()
+                if (serialSeen) {
+                    // 重複 serial 行 (值相同亦拒)：整筆損壞。
+                    serialBroken = true
+                } else {
+                    serialSeen = true
+                    val v = t.removePrefix("serial=").trim().toIntOrNull()
+                    if (v == null) serialBroken = true else serial = v
+                }
             }
             t.startsWith("at=") -> {
                 at = t.removePrefix("at=").trim().toLongOrNull() ?: 0L
@@ -110,6 +122,7 @@ fun parseSelection(raw: String?): SavedSelection? {
             // 未知行:向前容忍,忽略。
         }
     }
+    if (serialBroken) return null
     val targetId = target ?: return null
     if (targetId <= 0) return null
     return SavedSelection(
@@ -127,6 +140,8 @@ fun parseSelection(raw: String?): SavedSelection? {
 // PR-37 Phase B #2 serial 綁定：v2 快照（knownTargetSerial 非 null）另須
 // 當下 serial 相符（null 當下視為不可驗證，直接無效）；legacy 快照
 // （serial null）僅比 id（恢復側綁定 id-only，批次拒絕靜默提升為完全體）。
+// 無效/重複 serial 行不產生 SavedSelection（parse 側整筆拒絕），故此處
+// null 分支嚴格等於「無 serial 行」的 legacy，不含任何損壞降級。
 fun isSelectionValidFor(
     saved: SavedSelection,
     currentTargetId: Int,
