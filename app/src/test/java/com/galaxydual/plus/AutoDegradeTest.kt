@@ -27,6 +27,8 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -34,9 +36,13 @@ import org.junit.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class AutoDegradeTest {
     // Fake su gateway: rootOk=true proves ROOT via `id -u -> 0`; false denies
-    // (exit 0 / non-zero uid, i.e. "su exists but refused").
-    private class FakeSu(val rootOk: Boolean, var dualId: Int = 95) : CmdGateway {
+    // (exit 0 / non-zero uid, i.e. "su exists but refused"). Mutable so a
+    // test can flip the probe outcome mid-flight (degrade path).
+    private class FakeSu(var rootOk: Boolean, var dualId: Int = 95) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
+
+        // Counts `pm list users` calls so tests can prove a re-probe ran.
+        @Volatile var listUsersCalls = 0
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -64,9 +70,11 @@ class AutoDegradeTest {
             cmd.trim() == "id -u" ->
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
-            cmd == DualRepository.CMD_LIST_USERS ->
+            cmd == DualRepository.CMD_LIST_USERS -> {
+                listUsersCalls++
                 if (rootOk) CmdResult(exit = 0, out = usersOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied: su refused")
+            }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                 CmdResult(exit = 0, out = verboseOut(), err = "")
             cmd == DualRepository.CMD_DUMPSYS_USER ->
@@ -82,6 +90,9 @@ class AutoDegradeTest {
     // Fake Shizuku gateway: shizukuOk=true proves SHELL via `pm list users`.
     private class FakeShizuku(val shizukuOk: Boolean, var dualId: Int = 95) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
+
+        // Counts `pm list users` calls so tests can prove a re-probe ran.
+        @Volatile var listUsersCalls = 0
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -106,9 +117,11 @@ class AutoDegradeTest {
                 "    userType=android.os.usertype.profile.CLONE\n"
 
         override suspend fun run(cmd: String): CmdResult = when {
-            cmd == DualRepository.CMD_LIST_USERS ->
+            cmd == DualRepository.CMD_LIST_USERS -> {
+                listUsersCalls++
                 if (shizukuOk) CmdResult(exit = 0, out = usersOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied: not authorized")
+            }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                 if (shizukuOk) CmdResult(exit = 0, out = verboseOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
@@ -152,12 +165,13 @@ class AutoDegradeTest {
         shizukuAuth: Boolean,
         initialChannel: ResolvedChannel,
         initialGateway: CmdGateway,
+        preference: ChannelPreference = ChannelPreference.AUTO,
     ): DualViewModel {
         val vm = DualViewModel(
             repo = DualRepository(initialGateway),
             gatewayPrivilege = initialGateway.privilege,
             elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
-            preference = ChannelPreference.AUTO,
+            preference = preference,
             appPackageName = "com.example.test",
             persistPreference = null,
             suPresentCheck = { suPresent },
@@ -318,5 +332,268 @@ class AutoDegradeTest {
         // The routed device summary may still be ROOT (both channels proven),
         // but the execution identity must stay SHELL.
         assertEquals(Privilege.ROOT, s.privilege)
+    }
+
+    // Phase 2: no su binary + Shizuku proven -> SHIZUKU with NO degrade note
+    // (Shizuku is the natural pick, not a fallback).
+    @Test
+    fun pure_noSuNoShizukuOk_noDegradeNote() {
+        val d = resolveAutoProbe(suPresent = false, hasRoot = false, hasShizuku = true)
+        assertEquals(ResolvedChannel.SHIZUKU, d.channel)
+        assertTrue(
+            "no su present so SHIZUKU is the natural pick, note must be empty, " +
+                "got: \"${d.degradeNote}\"",
+            d.degradeNote.isEmpty(),
+        )
+    }
+
+    // Phase 2: no su binary + both probes failing -> NOOP read-only with the
+    // second (no-su) copy, distinct from the su-denied copy.
+    @Test
+    fun pure_noSuBothFail_secondCopy() {
+        val d = resolveAutoProbe(suPresent = false, hasRoot = false, hasShizuku = false)
+        assertEquals(ResolvedChannel.NOOP, d.channel)
+        assertTrue("read-only note expected, got: \"${d.degradeNote}\"", d.degradeNote.contains("唯讀"))
+        assertTrue(
+            "must be the no-su copy, got: \"${d.degradeNote}\"",
+            d.degradeNote.contains("su 不存在"),
+        )
+    }
+
+    // Phase 2: ROOT proven alone (su present, Shizuku denied) -> ROOT, no note.
+    @Test
+    fun pure_rootOnly_staysRoot() {
+        val d = resolveAutoProbe(suPresent = true, hasRoot = true, hasShizuku = false)
+        assertEquals(ResolvedChannel.ROOT, d.channel)
+        assertTrue(
+            "no degrade note when ROOT is proven, got: \"${d.degradeNote}\"",
+            d.degradeNote.isEmpty(),
+        )
+    }
+
+    // Phase 2: the Auto probe matrix must never select the LSPosed placeholder
+    // (hook channel is never auto-selected); exhaustive over all 8 combos.
+    @Test
+    fun pure_neverLsposed() {
+        for (suPresent in listOf(false, true)) {
+            for (hasRoot in listOf(false, true)) {
+                for (hasShizuku in listOf(false, true)) {
+                    val d = resolveAutoProbe(
+                        suPresent = suPresent,
+                        hasRoot = hasRoot,
+                        hasShizuku = hasShizuku,
+                    )
+                    assertTrue(
+                        "auto probe must never select the LSPosed placeholder " +
+                            "(suPresent=$suPresent, hasRoot=$hasRoot, " +
+                            "hasShizuku=$hasShizuku), got ${d.channel}",
+                        d.channel != ResolvedChannel.LSPOSED_PLACEHOLDER,
+                    )
+                }
+            }
+        }
+    }
+
+    // Phase 2 (mirror of explicit_shizukuNeverCrossesToRoot): explicit ROOT +
+    // only Shizuku proven -> stays ROOT, fail closed, never crosses to SHIZUKU.
+    @Test
+    fun explicit_rootNeverCrossesToShizuku() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = false,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.ROOT,
+        )
+        await { !vm.state.value.loading && vm.state.value.msg.contains("明選不跨通道") }
+
+        val s = vm.state.value
+        assertEquals(ChannelPreference.ROOT, s.channel)
+        assertEquals(ResolvedChannel.ROOT, s.resolvedGateway)
+        assertEquals(Privilege.ROOT, s.execIdentity)
+        assertFalse("explicit ROOT with denied su must not be writable", s.writeReady)
+        assertFalse("explicit ROOT with denied su must not be channelReady", s.channelReady)
+        assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue("device proved a channel", s.readCap)
+    }
+
+    // Phase 2 (sharpest explicit isolation, missing from Phase 1): explicit
+    // SHIZUKU + only ROOT proven -> stays SHIZUKU, fail closed, never crosses
+    // to ROOT. Routed summary may be ROOT but execution stays SHELL.
+    @Test
+    fun explicit_shizukuOnlyRootProven_staysShizuku() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.SHIZUKU,
+            initialGateway = shizukuFake,
+            preference = ChannelPreference.SHIZUKU,
+        )
+        await { !vm.state.value.loading && vm.state.value.msg.contains("明選不跨通道") }
+
+        val s = vm.state.value
+        assertEquals(ChannelPreference.SHIZUKU, s.channel)
+        assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
+        assertEquals(Privilege.SHELL, s.execIdentity)
+        assertFalse("explicit SHIZUKU with denied Shizuku must not be writable", s.writeReady)
+        assertFalse("explicit SHIZUKU with denied Shizuku must not be channelReady", s.channelReady)
+        assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(Privilege.ROOT, s.privilege)
+    }
+
+    // Phase 2: after su-denied + Shizuku-ok degrade, refresh() must see the
+    // switched repo (profiles load, "no clones installed"), proving the repo
+    // really moved to the Shizuku fake. Counter-example: an unswitched repo
+    // would report ChannelError ("denied: su refused").
+    @Test
+    fun auto_repoFollowsDegrade() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.msg == "no clones installed" }
+
+        val s = vm.state.value
+        assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
+        assertEquals(Privilege.SHELL, s.execIdentity)
+        assertEquals(MsgKind.INFO, s.msgKind)
+        assertTrue("degraded SHIZUKU refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
+        assertTrue("degraded SHIZUKU must stay writable", s.writeReady)
+        assertTrue("degrade note must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+    }
+
+    // Phase 2: a re-probe that does NOT swap (already SHIZUKU, still SHIZUKU)
+    // keeps pendingRemove and its confirmation message (NONE/INFO preserved).
+    // listUsersCalls proves the second probe actually ran (state is otherwise
+    // identical, so awaiting on state alone could pass trivially).
+    @Test
+    fun probe_pendingPreservedOnDegradeInfo() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.SHIZUKU,
+            initialGateway = shizukuFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+
+        vm.requestRemove("com.example.chat")
+        await { vm.state.value.pendingRemove != null && !vm.state.value.loading }
+        val pending = vm.state.value.pendingRemove
+        assertNotNull("request must set pending", pending)
+        val msgBefore = vm.state.value.msg
+        assertTrue("confirmation message expected, got: \"$msgBefore\"", msgBefore.contains("等待確認"))
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+
+        val probesBefore = shizukuFake.listUsersCalls
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && shizukuFake.listUsersCalls > probesBefore }
+
+        val s = vm.state.value
+        assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
+        assertEquals("no swap means the pending survives", pending, s.pendingRemove)
+        assertEquals("NONE/INFO probe must not wash the confirm message", msgBefore, s.msg)
+        assertEquals(MsgKind.INFO, s.msgKind)
+    }
+
+    // Phase 2: an AUTO degrade swap (ROOT -> SHIZUKU) fail-closes the stale
+    // pending: the verified id/label snapshot belongs to the old channel, so
+    // the user must request again after the swap.
+    @Test
+    fun auto_degradeSwap_clearsPending() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+
+        vm.requestRemove("com.example.chat")
+        await { vm.state.value.pendingRemove != null && !vm.state.value.loading }
+
+        // Deny su now: the next probe degrades ROOT -> SHIZUKU.
+        suFake.rootOk = false
+        vm.recheckPrivilege()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU &&
+                vm.state.value.pendingRemove == null
+        }
+
+        val s = vm.state.value
+        assertNull("degrade swap must drop the stale pending (fail closed)", s.pendingRemove)
+        assertTrue("degrade note must record the reason, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertTrue("degraded SHIZUKU must be writable", s.writeReady)
+    }
+
+    // Phase 2: after an AUTO degrade, switching to an explicit channel clears
+    // both the degrade note and any pending (repo/gateway rebuilt, old
+    // snapshot invalid).
+    //
+    // Harness note: selectChannel() rebuilds REAL gateways, so the trailing
+    // probe/refresh runs host `su -c`. Under a Gradle worker (stdin is an
+    // open pipe, no tty) `su` blocks reading a password up to
+    // SU_EXEC_TIMEOUT_MS instead of failing fast, so awaiting full probe
+    // completion here is environment-hostage. The object under test does not
+    // need it: swapToLocked() applies channel + cleared degradeNote/pending
+    // in ONE synchronous _state.update before the first probe suspension
+    // (Unconfined runs it on the caller thread), so awaiting only the
+    // channel flip is deterministic; probe/refresh outcomes on real
+    // gateways are deliberately not asserted.
+    @Test
+    fun selectChannel_clearsDegradeNoteAndPending() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+        assertTrue(
+            "precondition: AUTO must have degraded, got: \"${vm.state.value.degradeNote}\"",
+            vm.state.value.degradeNote.contains("降級"),
+        )
+
+        vm.requestRemove("com.example.chat")
+        await { vm.state.value.pendingRemove != null && !vm.state.value.loading }
+
+        vm.selectChannel(ChannelPreference.ROOT)
+        await { vm.state.value.channel == ChannelPreference.ROOT }
+
+        val s = vm.state.value
+        assertEquals(ChannelPreference.ROOT, s.channel)
+        assertTrue("explicit choice clears the Auto degrade note, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
+        assertNull("channel switch must drop the stale pending (fail closed)", s.pendingRemove)
     }
 }
