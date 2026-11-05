@@ -102,6 +102,7 @@ class DualViewModelTest {
     private class FakeGateway(
         override val privilege: Privilege = Privilege.ROOT,
         var listPackagesOut: String = "",
+        var listPackagesExit: Int = 0,
         var idUOut: String = "0",
         var failListUsers: Boolean = false,
     ) : CmdGateway {
@@ -139,7 +140,7 @@ class DualViewModelTest {
                     l.entered.complete(Unit)
                     l.release.await()
                 }
-                CmdResult(0, listPackagesOut, "")
+                CmdResult(listPackagesExit, listPackagesOut, "")
             }
             cmd.startsWith("pm install-existing") || cmd.startsWith("pm uninstall") -> {
                 writeCalls.incrementAndGet()
@@ -520,6 +521,28 @@ class DualViewModelTest {
             listOf(ChannelPreference.ROOT, ChannelPreference.SHIZUKU, ChannelPreference.ROOT),
             rig.persisted,
         )
+    }
+
+    // (j) Unknown list probe preserves the display list: seed cloned=[a]
+    // with a clean refresh, then fail every list probe (persistent exit=1) --
+    // refresh must report CHANNEL ("refresh result unknown"), keep cloned
+    // untouched (fail closed, never wipe to empty), and clear loading.
+    @Test
+    fun refresh_unknownList_preservesCloned() {
+        val fake = FakeGateway(listPackagesOut = "package:com.example.a")
+        val vm = writableVm(fake, DualRepository(fake))
+        pumpUntil { vm.state.value.channelReady }
+        vm.refresh()
+        pumpUntil { vm.state.value.cloned.contains("com.example.a") }
+        val seeded = vm.state.value.cloned
+        fake.listPackagesOut = ""
+        fake.listPackagesExit = 1
+        vm.refresh()
+        pumpUntil { !vm.state.value.loading && vm.state.value.msgKind == MsgKind.CHANNEL }
+        assertEquals(seeded, vm.state.value.cloned)
+        assertTrue(vm.state.value.cloned.contains("com.example.a"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
     }
 
     // (i) P2-1 real blocking subprocess handover: the old ROOT select stuck in

@@ -1348,4 +1348,21 @@ class VerifyRetryTest {
         assertEquals(0, gateway.listCalls)
         assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
     }
+
+    // Phase D coverage gap: an ordinary write failure (plain Failure[...] with
+    // no timeout signal) on the expected-remove path stays a definite
+    // RemoveFailed -- single write, zero list probes, zero settle waits.
+    @Test
+    fun removeVerifiedExpected_writeFailedWithoutTimeout_isRemoveFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "Failure [DELETE_FAILED_INTERNAL_ERROR]", err = "")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected RemoveFailed, got: $outcome", outcome is RemoveOutcome.RemoveFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
 }

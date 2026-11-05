@@ -21,6 +21,10 @@ class RemoveVerifiedPinnedTest {
         var uninstallExit: Int = 0,
         var listPackagesOut: String = "",
         var listPackagesExit: Int = 0,
+        // Serial-unavailable simulation (PR-33 R2 P1): omits the serial line
+        // on both verbose channels (dumpsys loses serialNo=, verbose loses
+        // Serial:) so fetchDualTarget maps to SerialUnavailable.
+        var noSerial: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -40,7 +44,7 @@ class RemoveVerifiedPinnedTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: $serial\n" +
+                (if (noSerial) "" else "    Serial: $serial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -48,7 +52,7 @@ class RemoveVerifiedPinnedTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=$serial:\n" +
+                "  UserInfo{$dualId:DualApp:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
@@ -214,6 +218,42 @@ class RemoveVerifiedPinnedTest {
         assertEquals(
             "pm uninstall --user 95 com.example.chat",
             gateway.commands.single { it.startsWith("pm uninstall") },
+        )
+    }
+
+    // Null expected serial means the caller cannot verify at all: refused
+    // directly as SerialMismatch(null, actual) with zero uninstalls.
+    @Test
+    fun nullExpectedSerial_refusesWithoutUninstall() {
+        val gateway = FakeGateway()
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, null)
+        }
+        assertTrue("expected SerialMismatch, got: $outcome", outcome is RemoveOutcome.SerialMismatch)
+        assertEquals(null, (outcome as RemoveOutcome.SerialMismatch).expected)
+        assertEquals(15, outcome.actual)
+        assertEquals(0, gateway.uninstallRuns)
+        assertTrue(
+            "no uninstall may run on serial mismatch, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
+        )
+    }
+
+    // Both verbose channels carry no serial (id confirmed, serial missing):
+    // SerialMismatch(expected, null) with zero uninstalls.
+    @Test
+    fun bothSerialMissing_returnsSerialMismatchWithZeroUninstall() {
+        val gateway = FakeGateway(noSerial = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected SerialMismatch, got: $outcome", outcome is RemoveOutcome.SerialMismatch)
+        assertEquals(15, (outcome as RemoveOutcome.SerialMismatch).expected)
+        assertEquals(null, outcome.actual)
+        assertEquals(0, gateway.uninstallRuns)
+        assertTrue(
+            "no uninstall may run on serial mismatch, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
         )
     }
 }
