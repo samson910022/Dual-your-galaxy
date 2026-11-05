@@ -155,7 +155,8 @@ data class PendingRemove(
 
 // PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
 //
-// 批次走 `cloneVerifiedExpected` 原子 pin 逐項 (見 cloneSelected)，不引入
+// 批次走 `cloneVerifiedExpected` 逐項 pin：非原子交易、逐包驗證
+// (見 cloneSelected)，不引入
 // 新的批次寫入通道 (留待 #21/#22/#23/#24/#27 完備後的後續階段)。
 // - outcome 直接沿用 CloneOutcome (成功/部分成功/unknown 分流與單筆一致)。
 // - appKey 為勾選時的來源身分鍵 (serial:package);pkg 為實際寫入包名。
@@ -168,7 +169,8 @@ data class BatchItemResult(
 
 // 一次「建立 N 個分身」的彙總:逐項結果 + 成功/失敗/未知計數。
 // failed = 非 Success 且非 unknown (含 NoDual/Invalid/InstallFailed/
-// VerifyFailed/TargetMismatch);unknown = VerifyUnknown/ChannelError
+// VerifyFailed/TargetMismatch；真 Absent 的 NoDual 走 failed 口徑＋M13 短路，
+// 與逐項中途明細一致)；unknown = VerifyUnknown/ChannelError
 // (寫後未查證或身份暫時無法判定，需重查，不算失敗)。
 data class BatchReport(
     val items: List<BatchItemResult> = emptyList(),
@@ -3501,7 +3503,7 @@ class DualViewModel(
     //   install），VM 側不再另做 preflight resolve（TOCTOU 已消除）。
     //   TargetMismatch 沿用 drift 收斂（partial＋VERIFY_MISMATCH＋停＋STALE，
     //   新目標 serial 一併寫入 inventory）；vanish 沿用 M13 NoDual 短路。
-    //   逐項 recordBatchItemUnknownOrFailed 僅為中途明細，最終必被覆寫。
+    //   逐項 recordBatchItemFailedOrUnknown 僅為中途明細，最終必被覆寫。
     // - 批次中斷 (M3):catch 內以已累積 items 發 partial BatchReport
     //   (計數口徑與正常彙總一致),loading=false,lastOperation FAILED
     //   (opId=batch:clone);取消 (CancellationException) 直接重拋,不寫
@@ -3851,7 +3853,7 @@ class DualViewModel(
                                 }
                                 val short = noDualShort
                                 items.add(BatchItemResult(appKey, pkg, short))
-                                recordBatchItemUnknownOrFailed(pkg, short)
+                                recordBatchItemFailedOrUnknown(pkg, short)
                                 continue
                             }
                             val pkg = catalogByKey[appKey]?.packageName
@@ -3900,28 +3902,28 @@ class DualViewModel(
                                     // 區分 Absent／Unknown，此分支僅真 Absent 到達
                                     // (Unknown 走 ChannelError，分進 unknown 口徑)。
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                     noDualShort = res
                                 }
                                 is CloneOutcome.ChannelError -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                 }
                                 is CloneOutcome.InvalidPackage -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                 }
                                 is CloneOutcome.InstallFailed -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                 }
                                 is CloneOutcome.VerifyFailed -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                 }
                                 is CloneOutcome.VerifyUnknown -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
-                                    recordBatchItemUnknownOrFailed(pkg, res)
+                                    recordBatchItemFailedOrUnknown(pkg, res)
                                 }
                                 is CloneOutcome.TargetMismatch -> {
                                     // 批次中原子漂移：core pin 與批次 pin 不一致
@@ -4030,10 +4032,23 @@ class DualViewModel(
                                 DiagnoseCode.OP_FAILED,
                                 techDetail = batchDetail.take(MAX_DIAG_DETAIL_CHARS),
                             )
-                            else -> diagnoseEvent(
-                                DiagnoseCode.VERIFY_UNKNOWN,
-                                techDetail = batchDetail.take(MAX_DIAG_DETAIL_CHARS),
-                            )
+                            // Stage4：純未知批次按首個未知項選碼——ChannelError
+                            //（通道無法查證）走 CHANNEL_ERROR，VerifyUnknown 才走
+                            // VERIFY_UNKNOWN；與明細文案同口徑，防彙總/明細漂移。
+                            else -> {
+                                val firstUnknown =
+                                    items.firstOrNull { isBatchUnknownOutcome(it.outcome) }?.outcome
+                                val code =
+                                    if (firstUnknown is CloneOutcome.ChannelError) {
+                                        DiagnoseCode.CHANNEL_ERROR
+                                    } else {
+                                        DiagnoseCode.VERIFY_UNKNOWN
+                                    }
+                                diagnoseEvent(
+                                    code,
+                                    techDetail = batchDetail.take(MAX_DIAG_DETAIL_CHARS),
+                                )
+                            }
                         }
                         _state.update { cur ->
                             val summary = "批次完成：成功 $success / 失敗 $failed / 未知 $unknown" +
@@ -4132,7 +4147,7 @@ class DualViewModel(
     // unknown；ChannelError 亦計入 unknown——core cloneVerifiedExpected 把暫時
     // 無法判定的身分 (exit!=0／noisy 輸出／throw) 以 ChannelError 回報 (fail
     // closed，零寫入)，通道什麼都沒證明，故為未知、永不計入 failed、永不宣稱
-    // "no dual"。此與逐項中途明細一致 (recordBatchItemUnknownOrFailed 已把
+    // "no dual"。此與逐項中途明細一致 (recordBatchItemFailedOrUnknown 已把
     // ChannelError 記為 OpPhase.UNKNOWN) 及單筆 "result unknown" 語義一致。
     // STALE 無需改動：(success>0 || unknown>0) 已涵蓋。真 Absent 仍為 NoDual
     // (failed 口徑＋M13 短路，不變)。
@@ -4159,15 +4174,17 @@ class DualViewModel(
     // (pinned verify 語意與單筆 clone 一致),diagnose 取該 outcome 穩定碼;
     // cloned 不動 (fail closed)。最終彙總必覆寫為批次級
     // LastOperation (opId=batch:clone, 見 cloneSelected 尾段 M1/M2/M10)。
-    // m2: 未使用的 code 參數已刪除；不可達 Success 分支已刪除
-    // (本函數僅用於非成功項)。
-    private fun recordBatchItemUnknownOrFailed(
+    // 口徑 (與 BatchReport 聚合一致)：NoDual 計 failed（真 Absent，M13 短路同記；
+    // 逐項 phase 亦為 FAILED，不再是 UNKNOWN）；ChannelError/VerifyUnknown 計
+    // unknown (phase UNKNOWN)。m2: 未使用的 code 參數已刪除；不可達 Success
+    // 分支已刪除 (本函數僅用於非成功項)。
+    private fun recordBatchItemFailedOrUnknown(
         pkg: String,
         res: CloneOutcome,
     ) {
         val now = nowWallMs()
         val (phase, target) = when (res) {
-            is CloneOutcome.NoDual -> OpPhase.UNKNOWN to -1
+            is CloneOutcome.NoDual -> OpPhase.FAILED to -1
             is CloneOutcome.ChannelError -> OpPhase.UNKNOWN to -1
             is CloneOutcome.InvalidPackage -> OpPhase.FAILED to -1
             is CloneOutcome.InstallFailed -> OpPhase.FAILED to -1
@@ -4176,7 +4193,7 @@ class DualViewModel(
             // 到達不能（批次內 drift 直接走停止分支，不經此函數）；
             // 穩健起見記 FAILED（目標漂移、寫入未執行，需重查）。
             is CloneOutcome.TargetMismatch -> OpPhase.FAILED to res.expectedId
-            else -> error("recordBatchItemUnknownOrFailed: unexpected Success")
+            else -> error("recordBatchItemFailedOrUnknown: unexpected Success")
         }
         _state.update { cur ->
             cur.copy(

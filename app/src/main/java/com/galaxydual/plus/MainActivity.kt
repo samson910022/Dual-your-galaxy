@@ -105,7 +105,8 @@ class MainActivity : ComponentActivity() {
     // PR-7 P2 (#26, 階段 1):個人來源唯讀 catalog + 勾選。
     // searchInput/系統開關只改 UiState 搜尋狀態；清單列為 CheckBox (唯讀展示
     // + 勾選,取消勾選 ≠ 卸載)；batchBtn 顯示「建立 N 個分身」,走
-    // vm.cloneSelected (cloneVerifiedExpected 原子 pin 逐項,見 DualViewModel)。
+    // vm.cloneSelected (cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證，
+    // 見 DualViewModel)。
     private lateinit var searchInput: EditText
     private lateinit var systemToggleBtn: Button
     private lateinit var selectAllBtn: Button
@@ -437,7 +438,8 @@ class MainActivity : ComponentActivity() {
         }
         // PR-7 P2 (#26, 階段 1):個人來源 catalog 搜尋/勾選區。
         // 唯讀展示 + 勾選；batchBtn 顯示「建立 N 個分身」,走
-        // cloneVerifiedExpected 原子 pin 逐項 (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
+        // cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證
+        // (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
         searchInput = EditText(this).apply {
             hint = "搜尋應用名稱 / 包名"
             layoutParams = LinearLayout.LayoutParams(
@@ -497,6 +499,8 @@ class MainActivity : ComponentActivity() {
         }
         catalogErrorView = TextView(this).apply {
             visibility = View.GONE
+            // Stage4 a11y：錯誤行異動靠 liveRegion 播報（TalkBack polite）。
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         batchBtn = Button(this).apply {
             text = "建立 0 個分身"
@@ -504,7 +508,10 @@ class MainActivity : ComponentActivity() {
             contentDescription = "批次建立 0 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
             setOnClickListener { vm.cloneSelected() }
         }
-        batchResultView = TextView(this)
+        batchResultView = TextView(this).apply {
+            // Stage4 a11y：批次逐項結果異動靠 liveRegion 播報（TalkBack polite）。
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
 
         // Clone/remove share one row; 重新連線並更新 + permission share the next.
         val writeRow = LinearLayout(this).apply {
@@ -792,6 +799,8 @@ class MainActivity : ComponentActivity() {
         saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
         cancelSaveBtn.isEnabled = !busy
         batchBtn.isEnabled = !busy && s.selectedKeys.isNotEmpty()
+        // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
+        searchInput.isEnabled = !busy
         // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
         // PR-37 P3 差量：列表只在指紋變化時全量重建；其餘文字區各自更新。
         renderSourceList(s)
@@ -1119,23 +1128,8 @@ class MainActivity : ComponentActivity() {
     }
 
     // 批次逐項結果文字:成功/失敗/未知分開列,部分成功如實呈現。
-    private fun batchReportText(report: BatchReport?): String {
-        if (report == null || report.items.isEmpty()) return ""
-        return buildString {
-            appendLine(
-                "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
-                    "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）",
-            )
-            for (item in report.items) {
-                val mark = when (item.outcome) {
-                    is CloneOutcome.Success -> "成功"
-                    is CloneOutcome.VerifyUnknown -> "未知（需重查）"
-                    else -> "失敗"
-                }
-                appendLine("  ${item.pkg}：$mark")
-            }
-        }.trimEnd()
-    }
+    // Stage4：純渲染走頂層 formatBatchReportText（JVM 可測），此處僅委派。
+    private fun batchReportText(report: BatchReport?): String = formatBatchReportText(report)
 
     companion object {
         // Shizuku permission request code; matched in both the Shizuku result
@@ -1193,6 +1187,8 @@ internal fun renderInventoryText(s: UiState): String = buildString {
 // 理由 (security-low)：不再顯示 raw opId (含完整包名與世代序號)，改顯示
 // redactPackage(appKey)+phase (+targetId 若有效)，避免個資回音；儲存的
 // opId/appKey 保持 raw (VM 狀態/測試仍直讀)。
+// 口徑註記：批次明細 (formatBatchReportText) 顯示 raw pkg 是 by-design 例外——
+// 該處列的是使用者剛勾選的包名，需可核對；此處 lastOp 顯示遮蔽版。
 internal fun renderLastOpText(s: UiState): String {
     val last = s.lastOperation
     return if (last != null) {
@@ -1265,6 +1261,42 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
     if (diag == null) return "診斷：就緒"
     val state = if (expanded) "已展開，點兩下收合" else "點兩下展開技術細節"
     return "診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}（$state）"
+}
+
+// 批次逐項結果文字上限（Stage4 效能護欄）：明細最多顯示前 N 項，超出以
+// 「…等 M 項」收尾（與來源清單 MAX_SOURCE_ROWS 同式截斷提示）。
+const val BATCH_REPORT_MAX_ROWS = 50
+
+// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派)。
+// - 未知口徑與 DualViewModel.isBatchUnknownOutcome 一致：VerifyUnknown 與
+//   ChannelError（身份暫時無法判定、零寫入，需重查）皆計未知；NoDual 計失敗
+//   （真 Absent＋M13 短路語意），其餘非 Success 皆計失敗。彙總計數由呼叫端
+//   BatchReport 攜帶，此處只渲染不重算；formatter 測試鎖定此口徑，防彙總/明細漂移。
+// - 明細包名顯示 raw pkg 是 by-design（與 renderLastOpText 的 redactPackage
+//   差異是故意的）：此處列的是使用者剛勾選、即將/已經逐項執行的包名，需可核對；
+//   診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
+internal fun formatBatchReportText(report: BatchReport?): String {
+    if (report == null || report.items.isEmpty()) return ""
+    return buildString {
+        appendLine(
+            "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
+                "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）",
+        )
+        val shown = report.items.take(BATCH_REPORT_MAX_ROWS)
+        for (item in shown) {
+            val mark = when (item.outcome) {
+                is CloneOutcome.Success -> "成功"
+                is CloneOutcome.VerifyUnknown -> "未知（需重查）"
+                is CloneOutcome.ChannelError -> "未知（通道無法查證，請重試）"
+                else -> "失敗"
+            }
+            appendLine("  ${item.pkg}：$mark")
+        }
+        val rest = report.items.size - shown.size
+        if (rest > 0) {
+            appendLine("  …等 $rest 項（共 ${report.items.size} 項，僅顯示前 $BATCH_REPORT_MAX_ROWS 項）")
+        }
+    }.trimEnd()
 }
 
 // 移除確認文案純函數（MainActivity 頂層 internal，JVM 可測）。

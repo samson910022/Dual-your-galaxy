@@ -830,7 +830,9 @@ class InventorySelectionTest {
         assertTrue(gw.installCalls.isEmpty())
     }
 
-    // (c/M13) 首個 NoDual 後短路：首項成功，剩餘項同記 NoDual，不再打裝置。
+    // (c/M13) 首個 NoDual 後短路：首項寫後目標消失記 VerifyUnknown（Stage3
+    // unknown-after-send 語義，2c24078；非 Success），剩餘項首見 NoDual 即短路，
+    // 同記 NoDual，不再打裝置。
     // PR-37 P3 Phase A #1：先 refresh 綁定（vanish 在首個 install 後才生效，
     // refresh 時仍見 95，可正常綁定）。
     @Test
@@ -858,20 +860,21 @@ class InventorySelectionTest {
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         val report = vm.state.value.batchReport!!
         assertEquals(3, report.items.size)
-        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(report.items[0].outcome is CloneOutcome.VerifyUnknown)
         assertTrue(report.items[1].outcome is CloneOutcome.NoDual)
         assertTrue(report.items[2].outcome is CloneOutcome.NoDual)
         assertEquals("short-circuit must stop device calls after the first NoDual",
             1, gw.installCalls.size)
-        assertEquals(1, report.successCount)
+        assertEquals(0, report.successCount)
         assertEquals(2, report.failedCount)
-        assertEquals(0, report.unknownCount)
+        assertEquals(1, report.unknownCount)
     }
 
     // PR-37 Stage 1 (gh review #3)：部分消失——僅翻 verbose/dumpsys
-    //（owner-only），getprop/pm 仍指向 95（矛盾證據）→ 第二項為
-    // ChannelError（unknown、不短路、不宣稱 NoDual）。首項成功後每項仍打
-    // 裝置（無 M13 短路），最終 1 成功＋2 未知。
+    //（owner-only），getprop/pm 仍指向 95（矛盾證據）。Stage3 unknown-after-send
+    // 語義下首項寫後身份矛盾 → VerifyUnknown（非 Success）；次項起 typed
+    // Unknown → ChannelError（unknown、不短路、不宣稱 NoDual）。每項仍嘗試
+    // 裝置（無 M13 短路），最終 0 成功＋3 未知。
     @Test
     fun batch_partialVanish_reportsChannelErrorWithoutShortCircuit() {
         val backend = MapBackend()
@@ -897,7 +900,7 @@ class InventorySelectionTest {
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         val report = vm.state.value.batchReport!!
         assertEquals(3, report.items.size)
-        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(report.items[0].outcome is CloneOutcome.VerifyUnknown)
         assertTrue(
             "partial vanish must be ChannelError (unknown), never NoDual, got: " +
                 report.items[1].outcome,
@@ -908,9 +911,12 @@ class InventorySelectionTest {
                 report.items[2].outcome,
             report.items[2].outcome is CloneOutcome.ChannelError,
         )
-        assertEquals(1, report.successCount)
+        assertEquals(0, report.successCount)
         assertEquals(0, report.failedCount)
-        assertEquals(2, report.unknownCount)
+        assertEquals(3, report.unknownCount)
+        // Stage4 首個未知項選碼：首個未知為 VerifyUnknown → VERIFY_UNKNOWN。
+        assertEquals(OpPhase.UNKNOWN, vm.state.value.lastOperation?.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
     }
 
     // (d/B2) 併發第二批：慢批次持有 batch:clone 期間，第二批整批拒絕。
@@ -1132,7 +1138,8 @@ class InventorySelectionTest {
         assertEquals(setOf("0:com.example.chat"), backend.store().loadSelected(95, 15))
     }
 
-    // Phase B #2：批次中途 95→96，首項成功後漂移即停，第二項零裝置寫入。
+    // Phase B #2：批次中途 95→96，首項寫後漂移記 VerifyUnknown（Stage3
+    // unknown-after-send 語義；非 Success）即停，第二項零裝置寫入。
     // PR-37 P3 Phase A #4：drift 無條件 STALE＋視為目標變更（inventory 更新為新目標
     // STALE，清空選取＋重置 marker，與 handle 一致；partial 保留，msgKind 維持 FAILED）。
     @Test
@@ -1161,8 +1168,9 @@ class InventorySelectionTest {
             "drift must stop before the second item: no fake outcome",
             1, report.items.size,
         )
-        assertTrue(report.items.single().outcome is CloneOutcome.Success)
-        assertEquals(1, report.successCount)
+        assertTrue(report.items.single().outcome is CloneOutcome.VerifyUnknown)
+        assertEquals(0, report.successCount)
+        assertEquals(1, report.unknownCount)
         assertEquals(
             "second item must never reach the device",
             listOf("com.example.a1"), gw.installCalls,
@@ -1609,9 +1617,11 @@ class InventorySelectionTest {
         assertEquals(0, gw.uninstallCalls.size)
     }
 
-    // PR-37 Phase C (review R4 #5)：批次中途身分通道暫時無法判定（首項成功後
-    // verbose/dumpsys exit!=0）→ 該項 ChannelError（非 NoDual），零寫入、
-    // 不觸發 M13 短路；彙總計入 unknown（非 failed），STALE＋VERIFY_UNKNOWN，
+    // PR-37 Phase C (review R4 #5)：批次中途身分通道暫時無法判定（首項寫入後
+    // verbose/dumpsys exit!=0）→ 首項 VerifyUnknown（Stage3 unknown-after-send
+    // 語義；非 Success），次項 typed Unknown → ChannelError（非 NoDual），零寫入、
+    // 不觸發 M13 短路；彙總計入 unknown（非 failed），STALE＋VERIFY_UNKNOWN
+    //（Stage4：純未知批次按首個未知項選碼，首個未知為 VerifyUnknown），
     // msg/diagnose 永不宣稱 no dual。
     @Test
     fun batch_identityUnknown_countsUnknownWithoutShortCircuit() {
@@ -1636,7 +1646,7 @@ class InventorySelectionTest {
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         val report = vm.state.value.batchReport!!
         assertEquals(2, report.items.size)
-        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(report.items[0].outcome is CloneOutcome.VerifyUnknown)
         assertTrue(
             "identity Unknown must surface as ChannelError, got: ${report.items[1].outcome}",
             report.items[1].outcome is CloneOutcome.ChannelError,
@@ -1649,10 +1659,10 @@ class InventorySelectionTest {
             "unknown item must never reach the device",
             listOf("com.example.a1"), gw.installCalls,
         )
-        assertEquals(1, report.successCount)
+        assertEquals(0, report.successCount)
         assertEquals(0, report.failedCount)
-        assertEquals(1, report.unknownCount)
-        assertTrue(vm.state.value.cloned.contains("com.example.a1"))
+        assertEquals(2, report.unknownCount)
+        assertFalse(vm.state.value.cloned.contains("com.example.a1"))
         assertFalse(vm.state.value.cloned.contains("com.example.a2"))
         val last = vm.state.value.lastOperation
         assertNotNull(last)
@@ -1663,7 +1673,7 @@ class InventorySelectionTest {
             "msg must never claim no dual: ${vm.state.value.msg}",
             !vm.state.value.msg.contains("no dual", ignoreCase = true),
         )
-        assertTrue(vm.state.value.msg.contains("成功 1 / 失敗 0 / 未知 1"))
+        assertTrue(vm.state.value.msg.contains("成功 0 / 失敗 0 / 未知 2"))
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
     }

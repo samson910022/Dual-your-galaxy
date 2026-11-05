@@ -8,7 +8,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// PR-37 Phase B (P1 #2) regression tests: cloneVerifiedExpected atomic pin.
+// PR-37 Phase B (P1 #2) regression tests: cloneVerifiedExpected per-item pin (non-atomic).
 // The expected (id, serial) is pinned inside a single flow (snapshot +
 // resolve + serial-bound compare); any mismatch refuses with TargetMismatch
 // and zero installs. Uses a FakeGateway with mutable dualId/serial (no device).
