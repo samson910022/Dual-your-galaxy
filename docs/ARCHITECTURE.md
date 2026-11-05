@@ -87,6 +87,11 @@ val privilege: Privilege = when {
 3. Gateway runs `pm` / `dumpsys` commands.
 4. Raw stdout goes through `PmOutputParser` into UI state.
 5. Hook path (ROOT) may bypass shell by calling the dual-app service directly.
+6. Concurrency boundary (#24; busy = `UiState.loading`, merge = coalesce):
+   `opMutex` serializes probe/refresh/clone/remove; rapid refresh taps coalesce
+   into one trailing run, clone/remove dedup by op key (`already in progress`,
+   separate clone/remove namespaces); every repo call runs via `onIo` on
+   `Dispatchers.IO`.
 
 ## Non-Goals
 
