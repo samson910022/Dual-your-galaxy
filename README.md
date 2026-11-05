@@ -33,11 +33,9 @@ hook -> XposedModule (DualHook, apiVersion 102)
 - [已支援] profile 解析安全邊界（`resolveDualUserId`：只認唯一 DUAL、永不選 user 0、多 DUAL／無 DUAL 直接拒絕寫入，見 `DualSafetyTest`）。
 - [已支援] `pm` 命令封裝（`DualRepository.cloneVerified / removeVerified / refresh`：單快照釘選＋`pm path` 二次確認，見 `CloneVerifyRefreshTest`）。
 - [已支援] lint／CI 閘門（`./gradlew` 固定 8.7、fail-fast quality gates、DEX 檢查）。
-- [待實機驗證] App 內一鍵 clone 真通道（已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；`DualViewModel.clone/remove/refresh/recheckPrivilege/selectChannel` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` 改由各通道探測結果 gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；marker round-trip、binder round-trip、授權四情境、su 實機行為、端到端 pm 皆未驗）。
+- [待實機驗證] App 內一鍵 clone 真通道（已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；`DualViewModel.clone/remove/refresh/recheckPrivilege/selectChannel` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` 改由各通道探測結果 gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；marker round-trip、binder round-trip、授權四情境、su 實機行為、App 內一鍵端到端皆未驗（注：裸 `pm install-existing --user 95`＋list 二次確認 [S24 已驗證]，見下條）。
 - [待實作] 非空 whitelist policy（`EXTRA_WHITELIST_PACKAGES` 預設為空，hook 為 observe-only；接上政策來源前不放寬任何包名）。
-- [待實機驗證] LSPosed 載入（system／daagent scope 注入、重啟後 log 確認，無實機）。
-- [待實機驗證] Shizuku 四情境（有／無 binder × 有／無授權，以及重啟後重啟動流程，無實機）。
-- [待實機驗證] 雙開實機（`pm install-existing / path / uninstall --user <dualId>` 端到端，無實機）。
+- [部分已驗證] LSPosed 載入（system scope 注入＋hook 安裝 [S24 已驗證]：lspd 日誌確認 `DualAppManagerService` 雙方法 deoptimize＋hooked；daagent 類路徑已修正待重啟驗）／Shizuku 四情境（無實機）／雙開實機：`pm install-existing --user 95 com.openai.chatgpt`＋list 二次確認 [S24 已驗證]（shell 通道，兩次獨立成功）；`uninstall` 回滾、App 內一鍵全流程仍 [待實機驗證]。
 
 凡標 [待實作]／[待實機驗證] 者，皆不可描述為「可用功能」；下文路由／自動模式描述的是設計意圖與 `core` 純函數行為，不是已接通的 App 流程。
 
@@ -73,7 +71,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ## 自動模式 (Auto Mode) — 真通道已接線，全部 [待實機驗證] DEVICE-UNVERIFIED
 
-已接線（picker＋真通道＋marker 顯示，[待實機驗證] DEVICE-UNVERIFIED）：AUTO 按 su→Shizuku→NoOp 解析；ROOT→`SuCmdGateway`（`su -c`）、SHELL→`ShizukuCmdGateway`（UserService，`newProcess` 在 13.1.5 已移除）、LSPosed→NoOp 佔位（寫入拒絕，marker 僅顯示）；`channelReady` 為各通道探測通過才 `true`（未通過／選不到時仍 `false` 拒寫，按鈕寫入被 `isWritable()` 攔下）。以下為接線後預期行為，無實機切換證據（marker round-trip、binder round-trip、授權四情境、su 實機行為、端到端 pm 皆未驗）：
+已接線（picker＋真通道＋marker 顯示，[待實機驗證] DEVICE-UNVERIFIED）：AUTO 按 su→Shizuku→NoOp 解析；ROOT→`SuCmdGateway`（`su -c`）、SHELL→`ShizukuCmdGateway`（UserService，`newProcess` 在 13.1.5 已移除）、LSPosed→NoOp 佔位（寫入拒絕，marker 僅顯示）；`channelReady` 為各通道探測通過才 `true`（未通過／選不到時仍 `false` 拒寫，按鈕寫入被 `isWritable()` 攔下）。以下為接線後預期行為，App 內一鍵切換無實機證據（marker round-trip、binder round-trip、授權四情境、su 實機行為、App 內一鍵端到端皆未驗；裸 pm clone＋list 已在 S24 驗證兩次，見「實作狀態」）。
 
 - 有 LSPosed（模組已勾選並啟用，file marker 存在性證據 [待實機驗證]）→ App 內切 LSPosed 模式顯示 marker 行（`已啟用（…）`／`未偵測到`），執行通道為 NoOp 佔位；su ROOT 通道需 su 檔存在被解析且 `SuElevator`（`id -u`＝0）探測通過才 `channelReady`（[待實機驗證]：marker round-trip、su 實機行為未驗；hook 現為 observe-only，不放寬任何包名，見 [docs/HOOK.md](docs/HOOK.md)）。
 - 沒有 LSPosed 但 Shizuku 可用 → 預期降級走 Shizuku 通道（`Privilege.SHELL`），執行 `pm install-existing / uninstall --user / path --user`（Shizuku binder／授權生命週期已接＋F4a 真 gateway 已接［待實機驗證］；Factory 在無 su 且 binder alive＋已授權時選 `ShizukuCmdGateway`，`ShizukuElevator` 探測通過才 `channelReady`；[待實機驗證]：binder round-trip、授權四情境無實機）。
@@ -89,7 +87,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## 免責聲明 (Disclaimer)
 
 - 本專案不碰 Secure Folder / Knox：不讀寫、不掛載、不繞過 Knox 容器；任何 Knox 熔斷規避皆明確不在範圍內。
-- 寫入設計上需 ROOT 或 Shizuku 環境，且需所選真通道探測通過（`channelReady` true）＋privilege 非 NONE（`isWritable()` fail-closed；LSPosed 模式為 NoOp 佔位、寫入一律拒絕）；在 ROOT／Shizuku 裝置上有可能寫入（選不到／探測未過時仍拒寫），但全部分支 DEVICE-UNVERIFIED（marker round-trip、binder round-trip、授權四情境、su 實機行為、端到端 pm 皆未驗）；操作系統服務本來就有風險（請先備份），後果自負。
+- 寫入設計上需 ROOT 或 Shizuku 環境，且需所選真通道探測通過（`channelReady` true）＋privilege 非 NONE（`isWritable()` fail-closed；LSPosed 模式為 NoOp 佔位、寫入一律拒絕）；在 ROOT／Shizuku 裝置上有可能寫入（選不到／探測未過時仍拒寫），但 App 內一鍵全流程 DEVICE-UNVERIFIED（marker round-trip、binder round-trip、授權四情境、su 實機行為、App 內一鍵端到端皆未驗；裸 pm clone＋list 已在 S24 驗證兩次）；操作系統服務本來就有風險（請先備份），後果自負。
 - 僅供學習研究與個人裝置使用；請遵守當地法規與三星服務條款。
 
 ## Credits
