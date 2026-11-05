@@ -10,7 +10,8 @@ sealed interface ProfilesSnapshot {
     data class Loaded(val profiles: List<DualProfile>) : ProfilesSnapshot
 
     // The listing command itself failed (exit != 0 or error-semantic output
-    // per the shared C2 isSuccess rule); detail is the stderr/out reason.
+    // per the pm-list dedicated isListUsersOutputOk gate); detail is the
+    // stderr/out reason.
     data class ChannelError(val detail: String) : ProfilesSnapshot
 }
 
@@ -99,11 +100,13 @@ class DualRepository(
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
-    // Phase C2 (issue #8): shares the isSuccess semantics with verify()/clone/
-    // remove, so a `pm list users` that exits 0 but reports "Failure [...]"
-    // on stderr is treated as failed (empty) instead of parsed as profiles.
-    // UserInfo{...} lines never match the error patterns, so normal listings
-    // are unaffected. Delegates to profilesSnapshot(); use that directly when
+    // Phase C2 (issue #8) + P2-C: the pm-list dedicated gate
+    // (isListUsersOutputOk: exit-first, header-stripped, no install-command
+    // exemptions), so a `pm list users` that exits 0 but reports "Failure [...]"
+    // on stderr is treated as failed (empty) instead of parsed as profiles,
+    // while an Error/Failure-labelled UserInfo header stays display-only.
+    // UserInfo{...} headers never participate in error matching, so normal
+    // listings are unaffected. Delegates to profilesSnapshot(); use that directly when
     // ChannelError must be told apart from a genuinely empty parse (C3).
     suspend fun listProfiles(): List<DualProfile> =
         when (val snap = profilesSnapshot()) {
@@ -113,10 +116,10 @@ class DualRepository(
 
     // Same listing as listProfiles() but keeps the channel-failure signal:
     // ChannelError when the `pm list users` command itself fails the pm-list
-    // dedicated gate (isListUsersOutputOk: shared C2 isSuccess rule over
-    // header-stripped output, so an Error/Failure-labelled UserInfo header is
-    // display-only and never fails the channel), Loaded(parse) otherwise.
-    // Single gateway call.
+    // dedicated gate (isListUsersOutputOk: exit-first, header-stripped,
+    // no install-command exemptions, so an Error/Failure-labelled UserInfo
+    // header is display-only and never fails the channel), Loaded(parse)
+    // otherwise. Single gateway call.
     suspend fun profilesSnapshot(): ProfilesSnapshot {
         val res = gateway.run(CMD_LIST_USERS)
         if (!PmOutputParser.isListUsersOutputOk(res.out + "\n" + res.err, res.exit)) {

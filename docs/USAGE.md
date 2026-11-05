@@ -117,7 +117,7 @@ pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3
 ＋一次 `pm list packages --user <dualId>`（1）＝5 命令（舊 resolve-then-reverify
 列表路徑為 9）；同一 target 全程，resolve→list 漂移在本 API 內消除；fetch→probe 殘唯讀窗口（只誤報 presence/absence，不重定向寫入）（explicit
 舊入口殘餘除外）。Auto 降級與單一恢復入口仍由 #25 擁有，本 API 只保證列表
-一致性，不改變政策門。
+一致性，不改變政策門。初次 fetch 雙通道皆無 serial 即容忍放行，屬能力限制而非全防護（見 #22 後續）；非阻塞操作生命週期由 #24 追蹤。
 
 ```bash
 # 1. 雙源驗證（缺一不可；任一失敗即停手，不寫入不探測目標）：
