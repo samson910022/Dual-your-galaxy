@@ -315,7 +315,8 @@ class HookDiagnosisTest {
                         channelReady = channelReadyFor(Privilege.SHELL, hasRoot, hasShizuku),
                         privilege = hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku),
                     )
-                    val mapped = base.withHookDiagnosis(diagnosis)
+                    // P4：queriedAtMs 改強制顯式，此處傳 0L 沿用原預設行為。
+                    val mapped = base.withHookDiagnosis(diagnosis, 0L)
                     assertEquals(base.channelReady, mapped.channelReady)
                     assertEquals(base.privilege, mapped.privilege)
                     assertEquals(base.channel, mapped.channel)

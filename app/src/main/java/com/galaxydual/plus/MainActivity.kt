@@ -77,7 +77,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var channelView: TextView
     private lateinit var hookView: TextView
     // PR-6 P2 (#27 後半)：清單新鮮度行 + 診斷事件行 (穩定碼/摘要/下一步，可點開展開技術細節)。
+    // P4：上次操作相位拆成獨立 lastOpView 行 (原附於清單行尾)。
     private lateinit var inventoryView: TextView
+    private lateinit var lastOpView: TextView
     private lateinit var diagView: TextView
     private lateinit var exportBtn: Button
     private lateinit var profilesView: TextView
@@ -347,11 +349,20 @@ class MainActivity : ComponentActivity() {
         // PR-6 P2 (#27 後半)：清單新鮮度行 + 診斷事件行 + 匯出按鈕。
         // diagView 點一下展開/收合技術細節；匯出只顯示已遮蔽的本機預覽，
         // 無自動上傳 (buildDiagnosticExport 為純字串，無網路呼叫)。
+        // P4 a11y：可聚焦 + 狀態 contentDescription，切換時 announce。
         inventoryView = TextView(this)
+        lastOpView = TextView(this)
         diagView = TextView(this).apply {
+            isFocusable = true
+            contentDescription = "診斷：載入中"
             setOnClickListener {
                 diagExpanded = !diagExpanded
                 lastState?.let { render(it) }
+                try {
+                    announceForAccessibility(contentDescription)
+                } catch (_: Exception) {
+                    // Best effort: 無障礙宣告失敗不影響顯示。
+                }
             }
         }
         exportBtn = Button(this).apply {
@@ -396,6 +407,7 @@ class MainActivity : ComponentActivity() {
         root.addView(profilesView)
         root.addView(clonedView)
         root.addView(inventoryView)
+        root.addView(lastOpView)
         root.addView(pkgInput)
         root.addView(writeRow)
         root.addView(readRow)
@@ -540,37 +552,12 @@ class MainActivity : ComponentActivity() {
         // 狀態未知 (P1: unreadable / no diagnostic path is never reported
         // as "not detected") plus the true-channel hint. The placeholder
         // note stays visible so the mode is never mistaken for a working
-        // channel.
-        if (s.channel == ChannelPreference.LSPOSED) {
+        // channel. P4: 時間證據經 hookEvidence()+timeEvidenceText 統一
+        // (狀態文案維持本頁提示，不動)。
+        val hookText = renderHookText(s)
+        if (hookText != null) {
             hookView.visibility = View.VISIBLE
-            try {
-                hookRow.visibility = View.VISIBLE
-                hookDiagHint.visibility = View.VISIBLE
-            } catch (_: Exception) {
-                // Best effort: render may run before buildUi in tests.
-            }
-            // ACTIVE is historical existence+scope evidence only (the marker
-            // survives reboots; S24 evidence shows it predating boot by ~5.5h
-            // with no boot-identity/freshness check): the text names that
-            // limit instead of claiming the current boot is hooked ("已啟用"
-            // would over-claim). Diagnosis stays display-only and hook-neutral.
-            val status = when (s.hookStatus) {
-                HookStatus.ACTIVE ->
-                    "偵測到歷史 Hook 標記（${s.hookScopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
-                HookStatus.INACTIVE ->
-                    "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
-                HookStatus.UNKNOWN_UNREADABLE ->
-                    "狀態未知（無權限讀取；需 ROOT／Shizuku 真通道才能完整診斷，見 #27，或點下方「手動診斷 Hook」單次診斷）"
-                HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
-                    "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27，或點下方「手動診斷 Hook」單次診斷）"
-            }
-            val timeEvidence = buildString {
-                if (s.hookMarkerTimeMs != null) append("；marker timeMs=${s.hookMarkerTimeMs}") else append("；marker 時間未知")
-                if (s.hookQueriedAtMs > 0L) append("；查詢於 ${s.hookQueriedAtMs}")
-                if (s.hookViaGateway) append("（經真通道讀取）")
-            }
-            hookView.text = "LSPosed Hook：$status$timeEvidence；寫入通道為佔位（NoOp），" +
-                "待 whitelist 政策分支，寫入已禁用"
+            hookView.text = hookText
         } else {
             hookView.visibility = View.GONE
             try {
@@ -592,39 +579,16 @@ class MainActivity : ComponentActivity() {
             "Cloned (${s.cloned.size})：\n" +
                 s.cloned.joinToString("\n") { "  $it" }
         }
-        // PR-6 P2 (#27 後半)：清單新鮮度行。STALE/UNKNOWN 明確標示，
-        // FRESH 顯示目標/筆數/查詢時間；上次操作相位一併顯示 (成功/失敗/未知)。
-        inventoryView.text = buildString {
-            append("清單：${s.inventory.freshness}")
-            if (s.inventory.targetId >= 0) append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
-            if (s.inventory.queryTimeMs > 0L) append("・查詢於 ${s.inventory.queryTimeMs}")
-            if (s.inventory.freshness != InventoryFreshness.FRESH) append("（資料可能過期，已自動重查或請點「重新連線並更新」）")
-            val last = s.lastOperation
-            if (last != null) {
-                append("；上次操作 ${last.opId} 相位 ${last.phase}")
-            }
-        }
+        // PR-6 P2 (#27 後半)：清單新鮮度行 (STALE/UNKNOWN 明確標示，
+        // FRESH 顯示目標/筆數/查詢時間)。P4：上次操作相位拆至獨立 lastOpView
+        // 行 (renderLastOpText)，此處只剩清單；查詢時間經 formatTimeMs。
+        inventoryView.text = renderInventoryText(s)
+        lastOpView.text = renderLastOpText(s)
         // PR-6 P2 (#27 後半)：診斷事件行。穩定碼 + 繁中摘要/下一步常顯；
         // 點一下展開 exit/技術 detail (大小受限)。無事件時顯示就緒。
-        diagView.text = buildString {
-            val diag = s.diagnose
-            if (diag == null) {
-                append("診斷：就緒")
-            } else {
-                append("診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}")
-                if (diagExpanded) {
-                    if (diag.exit != null) append("\n  exit=${diag.exit}")
-                    // 本機顯示經 sanitizeForDisplay (control 壓空白+兩道遮蔽+take500，
-                    // 與其他顯示一致；匯出為兩道遮蔽全量，見 buildDiagnosticExport)。
-                    if (diag.techDetail.isNotEmpty()) {
-                        append("\n  細節（本機顯示遮蔽版，與匯出一致）：")
-                        append("${sanitizeForDisplay(diag.techDetail)}（點此收合）")
-                    } else append("（點此收合）")
-                } else {
-                    append("（點此展開技術細節）")
-                }
-            }
-        }
+        // P4 a11y：同步更新 contentDescription (含展開狀態)。
+        diagView.text = renderDiagnoseText(s, diagExpanded)
+        diagView.contentDescription = renderDiagnoseDescription(s, diagExpanded)
         // Writes queue in the ViewModel anyway; disabling while busy keeps
         // the read-only placeholder visibly read-only. Channel switches go
         // through the same mutex (selectChannel latest-wins), so the picker
@@ -756,6 +720,88 @@ class MainActivity : ComponentActivity() {
             MsgKind.FAILED -> Color.rgb(0xB0, 0x00, 0x20)
         }
     }
+}
+
+// PR-6 P4 (#27 架構整理)：render() 的純字串拆分 (頂層 internal，JVM 可測)。
+// 有意變更 (非等價重構)，共四處，各有理由：
+// - 0/無效 epoch 改經 formatTimeMs 顯示「從未查詢」(理由：空態明確化，原 raw 0/不顯示易誤讀為有效時間)；
+// - marker 時間文案由 raw epoch 改為格式化時間 (理由：可讀性/可追溯性，與 HookEvidence.displayText 統一)；
+// - 上次操作相位由清單行尾移至 renderLastOpText 獨立行 (理由：行職責單一/可讀性，無操作顯示「無」與匯出同詞)；
+// - hook 時間證據經 hookEvidence()+timeEvidenceText 統一 (狀態文案維持本頁提示，不動；理由：單一來源免分叉)。
+
+// 清單新鮮度行：STALE/UNKNOWN 明確標示，FRESH 顯示目標/筆數/查詢時間。
+internal fun renderInventoryText(s: UiState): String = buildString {
+    append("清單：${s.inventory.freshness}")
+    if (s.inventory.targetId > NO_TARGET_ID) {
+        append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
+    }
+    append("・查詢於 ${formatTimeMs(s.inventory.queryTimeMs)}")
+    if (s.inventory.freshness != InventoryFreshness.FRESH) {
+        append("（資料可能過期，已自動重查或請點「重新連線並更新」）")
+    }
+}
+
+// 上次操作獨立行 (原附於清單行尾)；無操作顯示「無」(與匯出同詞)。
+internal fun renderLastOpText(s: UiState): String {
+    val last = s.lastOperation
+    return if (last != null) {
+        "上次操作：${last.opId} 相位 ${last.phase}"
+    } else {
+        "上次操作：無"
+    }
+}
+
+// Hook 行：非 LSPosed 模式回 null (呼叫端 Gone)；狀態文案維持本頁提示
+// (ACTIVE 歷史證據措辭/INACTIVE 啟用提示/UNKNOWN 真通道提示，不動)，
+// 時間證據經 hookEvidence()+timeEvidenceText 統一。
+internal fun renderHookText(s: UiState): String? {
+    if (s.channel != ChannelPreference.LSPOSED) return null
+    // ACTIVE is historical existence+scope evidence only (the marker
+    // survives reboots; S24 evidence shows it predating boot by ~5.5h
+    // with no boot-identity/freshness check): the text names that
+    // limit instead of claiming the current boot is hooked ("已啟用"
+    // would over-claim). Diagnosis stays display-only and hook-neutral.
+    val status = when (s.hookStatus) {
+        HookStatus.ACTIVE ->
+            "偵測到歷史 Hook 標記（${s.hookScopes.sorted().joinToString(", ")}，僅存在性證據，未確認本次開機是否生效）"
+        HookStatus.INACTIVE ->
+            "未偵測到（需在 LSPosed 管理器啟用模組並重啟）"
+        HookStatus.UNKNOWN_UNREADABLE ->
+            "狀態未知（無權限讀取；需 ROOT／Shizuku 真通道才能完整診斷，見 #27）"
+        HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
+            "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27）"
+    }
+    return "LSPosed Hook：$status${s.hookEvidence().timeEvidenceText()}；寫入通道為佔位（NoOp），" +
+        "待 whitelist 政策分支，寫入已禁用"
+}
+
+// 診斷事件行：穩定碼 + 繁中摘要/下一步常顯；展開時加 exit/技術 detail。
+internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildString {
+    val diag = s.diagnose
+    if (diag == null) {
+        append("診斷：就緒")
+    } else {
+        append("診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}")
+        if (expanded) {
+            if (diag.exit != null) append("\n  exit=${diag.exit}")
+            // 本機顯示經 sanitizeForDisplay (control 壓空白+兩道遮蔽+take500，
+            // 與其他顯示一致；匯出為兩道遮蔽全量，見 buildDiagnosticExport)。
+            if (diag.techDetail.isNotEmpty()) {
+                append("\n  細節（本機顯示遮蔽版，與匯出一致）：")
+                append("${sanitizeForDisplay(diag.techDetail)}（點此收合）")
+            } else append("（點此收合）")
+        } else {
+            append("（點此展開技術細節）")
+        }
+    }
+}
+
+// 診斷行無障礙描述 (含展開狀態，供 contentDescription + 切換宣告)。
+internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
+    val diag = s.diagnose
+    if (diag == null) return "診斷：就緒"
+    val state = if (expanded) "已展開，點兩下收合" else "點兩下展開技術細節"
+    return "診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}（$state）"
 }
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
