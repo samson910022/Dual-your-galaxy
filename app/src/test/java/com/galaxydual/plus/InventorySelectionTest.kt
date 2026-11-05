@@ -64,17 +64,30 @@ class InventorySelectionTest {
         // B2 測試鉤子：install 分支在 IO 執行緒上停留此毫秒數，讓首批慢批次
         // 在持有 inFlight key 時可被併發第二批/單筆觀測到。預設 0（無行為變化）。
         var installDelayMs: Long = 0L,
+        // PR-37 P3 Phase A #6 測試鉤子：profilesSnapshot 起始 I/O 拋出
+        //（模擬 snapshot 通道異常；true 即 CMD_LIST_USERS 直接拋）。
+        var profilesSnapshotThrows: Boolean = false,
+        // PR-37 P3 Phase A #4 0/2 drift 測試鉤子：當 verbose 呼叫次數超過此閾值後，
+        // 身份通道整體切到 switchDualIdTo（-1 停用）。與 install-based 切換共用
+        // switchDualIdTo，四通道同步切。測試在 refresh＋綁定後將閾值設為
+        // verboseCalls+1，使批次 pin 仍見舊目標、首項 preflight 即見新目標
+        //（0 項完成即 drift，零 install）。
+        var resolveSwitchAfterVerbose: Int = -1,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         val installCalls = mutableListOf<String>()
         val uninstallCalls = mutableListOf<String>()
+        var verboseCalls: Int = 0
 
-        private fun effectiveDualId(): Int =
+        private fun effectiveDualId(): Int {
             if (switchDualIdAfterInstalls >= 0 && installCalls.size >= switchDualIdAfterInstalls) {
-                switchDualIdTo
-            } else {
-                dualId
+                return switchDualIdTo
             }
+            if (resolveSwitchAfterVerbose >= 0 && verboseCalls > resolveSwitchAfterVerbose) {
+                return switchDualIdTo
+            }
+            return dualId
+        }
 
         private fun usersOut(): String {
             val id = effectiveDualId()
@@ -119,10 +132,14 @@ class InventorySelectionTest {
             cmd.trim() == "id -u" ->
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
-            cmd == DualRepository.CMD_LIST_USERS ->
+            cmd == DualRepository.CMD_LIST_USERS -> {
+                if (profilesSnapshotThrows) throw RuntimeException("boom snapshot")
                 CmdResult(exit = 0, out = usersOut(), err = "")
-            cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+            }
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                verboseCalls += 1
                 CmdResult(exit = 0, out = verboseOut(), err = "")
+            }
             cmd == DualRepository.CMD_DUMPSYS_USER ->
                 CmdResult(exit = 0, out = dumpsysOut(), err = "")
             cmd == DualRepository.CMD_GETPROP_DUAL ->
@@ -498,6 +515,7 @@ class InventorySelectionTest {
     }
 
     // 批次部分成功：成功/失敗/未知分流，cloned 只收成功，逐項列出。
+    // PR-37 P3 Phase A #1：批次要求已綁定選取，故先 refresh 驗證 95 再勾選綁定。
     @Test
     fun batch_partialSuccess_reportsPerItem() {
         val backend = MapBackend()
@@ -512,6 +530,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.bad", "Bad", 0, false),
             ),
         )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.good")
         vm.toggleSelection("0:com.example.bad")
         vm.cloneSelected()
@@ -545,6 +565,8 @@ class InventorySelectionTest {
     }
 
     // 批次 unknown：安裝成功但查證通道失敗 -> unknown，不算失敗，cloned 不收。
+    // PR-37 P3 Phase A #1：先 refresh 綁定（failList 下 refresh 得 UNKNOWN target 95，
+    // 仍可綁定；綁定只看 targetId>0，不看新鮮度）。
     @Test
     fun batch_verifyUnknown_reportsUnknown() {
         val backend = MapBackend()
@@ -553,6 +575,8 @@ class InventorySelectionTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.myst", "Myst", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.myst")
         vm.cloneSelected()
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
@@ -567,8 +591,8 @@ class InventorySelectionTest {
         assertTrue(vm.state.value.msg.contains("未知 1"))
         // M1/M2: unknown-only 批次 phase UNKNOWN + VERIFY_UNKNOWN diagnose。
         // Phase B #3：VerifyUnknown 可能=已寫入未驗證（install 成功但重查通道
-        // 失敗），故 unknown 亦標 STALE（此前僅 success>0 才標）。此例起點為
-        // UNKNOWN（未 refresh），STALE 規則下 UNKNOWN→STALE（舊資料不謊稱新鮮）。
+        // 失敗），故 unknown 亦標 STALE。此例先 refresh 綁定（failList 下 refresh 得
+        // UNKNOWN target 95），批次後 UNKNOWN→STALE（舊資料不謊稱新鮮）。
         val lastU = vm.state.value.lastOperation
         assertNotNull(lastU)
         assertEquals("batch:clone", lastU!!.opId)
@@ -584,6 +608,7 @@ class InventorySelectionTest {
 
     // M1 全成功清 diagnose： failed==0 && unknown==0 則 diagnose=null，
     // 批次級 LastOperation phase SUCCESS，並標 STALE。
+    // PR-37 P3 Phase A #1：先 refresh 驗證再勾選綁定。
     @Test
     fun batch_allSuccess_clearsDiagnoseAndMarksStale() {
         val backend = MapBackend()
@@ -592,6 +617,8 @@ class InventorySelectionTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.good")
         vm.cloneSelected()
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
@@ -609,6 +636,7 @@ class InventorySelectionTest {
     }
 
     // m1 显示回退：catalog 缺失 key 的 BatchItemResult.pkg 不含 "serial:" 前綴。
+    // PR-37 P3 Phase A #1：先 refresh 綁定再勾選。
     @Test
     fun batch_missingCatalogKey_usesDisplayFallback() {
         val backend = MapBackend()
@@ -617,6 +645,8 @@ class InventorySelectionTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.good")
         vm.toggleSelection("0:com.example.ghost")
         vm.cloneSelected()
@@ -687,6 +717,7 @@ class InventorySelectionTest {
     }
 
     // (a) 批次執行順序：包名升冪，與勾選順序無關；裝置呼叫順序一致。
+    // PR-37 P3 Phase A #1：先 refresh 綁定再勾選。
     @Test
     fun batch_executesInPackageNameAscendingOrder() {
         val backend = MapBackend()
@@ -701,6 +732,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.mid", "Mid", 0, false),
             ),
         )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.zeta")
         vm.toggleSelection("0:com.example.mid")
         vm.toggleSelection("0:com.example.alpha")
@@ -712,6 +745,7 @@ class InventorySelectionTest {
     }
 
     // (b) 單一 catalog 缺失 key：InvalidPackage、計 failed（非 unknown）、零裝置呼叫。
+    // PR-37 P3 Phase A #1：先 refresh 綁定再勾選（缺失 key 仍可綁定執行，記帳 failed）。
     @Test
     fun batch_missingKey_recordsInvalidPackageWithoutDeviceCall() {
         val backend = MapBackend()
@@ -720,6 +754,8 @@ class InventorySelectionTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.ghost")
         vm.cloneSelected()
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
@@ -733,6 +769,8 @@ class InventorySelectionTest {
     }
 
     // (c/M13) 首個 NoDual 後短路：首項成功，剩餘項同記 NoDual，不再打裝置。
+    // PR-37 P3 Phase A #1：先 refresh 綁定（vanish 在首個 install 後才生效，
+    // refresh 時仍見 95，可正常綁定）。
     @Test
     fun batch_noDualShortCircuit_skipsRemainingDeviceCalls() {
         val backend = MapBackend()
@@ -749,6 +787,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.a3", "A3", 0, false),
             ),
         )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.a3")
         vm.toggleSelection("0:com.example.a2")
         vm.toggleSelection("0:com.example.a1")
@@ -767,6 +807,7 @@ class InventorySelectionTest {
     }
 
     // (d/B2) 併發第二批：慢批次持有 batch:clone 期間，第二批整批拒絕。
+    // PR-37 P3 Phase A #1：先 refresh 綁定再勾選。
     @Test
     fun batch_concurrentSecondBatch_reportsAlreadyInProgress() {
         val backend = MapBackend()
@@ -781,6 +822,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.other", "Other", 0, false),
             ),
         )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.good")
         vm.toggleSelection("0:com.example.other")
         vm.cloneSelected()
@@ -794,6 +837,7 @@ class InventorySelectionTest {
     }
 
     // (d/B2) 批次認領方向：慢批次持有 clone:<pkg> 期間，遲到單筆報 already in progress 且零裝置呼叫。
+    // PR-37 P3 Phase A #1：先 refresh 綁定再勾選。
     @Test
     fun batch_claimsRejectLateSingleClone() {
         val backend = MapBackend()
@@ -808,6 +852,8 @@ class InventorySelectionTest {
                 SourceAppEntry("com.example.other", "Other", 0, false),
             ),
         )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
         vm.toggleSelection("0:com.example.good")
         vm.toggleSelection("0:com.example.other")
         vm.cloneSelected()
@@ -978,6 +1024,8 @@ class InventorySelectionTest {
     }
 
     // Phase B #2：批次中途 95→96，首項成功後漂移即停，第二項零裝置寫入。
+    // PR-37 P3 Phase A #4：drift 無條件 STALE＋視為目標變更（inventory 更新為新目標
+    // STALE，清空選取＋重置 marker，與 handle 一致；partial 保留，msgKind 維持 FAILED）。
     @Test
     fun batch_targetDrift_stopsWithPartial() {
         val backend = MapBackend()
@@ -1018,6 +1066,11 @@ class InventorySelectionTest {
         assertTrue("msg must name the target change: ${vm.state.value.msg}", vm.state.value.msg.contains("目標已變更"))
         assertTrue("msg must show progress X/Y: ${vm.state.value.msg}", vm.state.value.msg.contains("已完成 1/共 2"))
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+        // #4：無條件 STALE＋新目標＋已清空選取（與 handle 同口徑）。
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertEquals(96, vm.state.value.inventory.targetId)
+        assertTrue("drift must clear selection", vm.state.value.selectedKeys.isEmpty())
+        assertTrue(vm.state.value.msg.contains("已清空舊勾選"))
     }
 
     // Phase B #3：FRESH→unknown，全 unknown 批次後 freshness 非 FRESH。
@@ -1042,5 +1095,148 @@ class InventorySelectionTest {
             vm.state.value.inventory.freshness != InventoryFreshness.FRESH,
         )
         assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+    }
+
+    // PR-37 P3 Phase A #1：已綁定 95 的勾選，live 已切 96，批次整批拒絕。
+    // 鎖內 pin 96 ≠ bound 95 → 清空選取＋batchReport、重置 marker、INVALID 明示、
+    // loading=false、零裝置寫入。禁止自動重新領養舊選取。
+    @Test
+    fun batch_staleBound_rejectsWholeBatch() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a1")
+        vm.toggleSelection("0:com.example.a2")
+        assertEquals(2, vm.state.value.selectedKeys.size)
+        // live 切到 96，不經 refresh（模擬 95 勾選殘留到 96 前的空窗）。
+        gw.dualId = 96
+        vm.cloneSelected()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("選取已綁定舊目標，已清空，請重新勾選確認")
+        }
+        assertEquals("stale bound must block all device writes", 0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertTrue("stale selection must be cleared", vm.state.value.selectedKeys.isEmpty())
+        assertNull("stale batch must clear batchReport", vm.state.value.batchReport)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
+    }
+
+    // PR-37 P3 Phase A #1：從未綁定（bound==NONE 哨兵）的勾選亦整批拒絕。
+    // 未經 refresh 驗證即批次（inventory UNKNOWN、bound NONE）→ 同上拒絕口徑。
+    // 此測試鎖定「未綁定不可批次」新契約；舊批次測試已全數改為先 refresh 綁定。
+    @Test
+    fun batch_unboundSelection_rejectsWholeBatch() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        assertTrue(vm.state.value.inventory.targetId <= 0)
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        assertEquals(1, vm.state.value.selectedKeys.size)
+        vm.cloneSelected()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("選取已綁定舊目標，已清空，請重新勾選確認")
+        }
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertNull(vm.state.value.batchReport)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
+    }
+
+    // PR-37 P3 Phase A #4：0/2 項完成即 drift（起始 pin 95、首項 preflight 即見 96）。
+    // 零 install、inventory 無條件 STALE（新目標 96＋已清空選取），partial 0 項、
+    // FAILED 口徑正確。
+    @Test
+    fun batch_targetDrift_zeroCompleted_marksStaleWithNoInstall() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a1")
+        vm.toggleSelection("0:com.example.a2")
+        // pin 仍見 95、首項 preflight 即見 96（resolve 次數閾值，見 FakeRepo 註記）。
+        gw.resolveSwitchAfterVerbose = gw.verboseCalls + 1
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals("0 completed drift must keep empty partial", 0, report.items.size)
+        assertEquals(0, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertTrue("zero-completed drift must never reach the device", gw.installCalls.isEmpty())
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertEquals(96, vm.state.value.inventory.targetId)
+        assertTrue("drift must clear selection", vm.state.value.selectedKeys.isEmpty())
+        val last = vm.state.value.lastOperation
+        assertNotNull(last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.FAILED, last.phase)
+        assertTrue(last.detail.contains("目標已變更"))
+        assertTrue(last.detail.contains("已完成 0/共 2"))
+        assertTrue(vm.state.value.msg.contains("目標已變更"))
+        assertTrue(vm.state.value.msg.contains("已完成 0/共 2"))
+        assertTrue(vm.state.value.msg.contains("已清空舊勾選"))
+        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
+    }
+
+    // PR-37 P3 Phase A #6：起始 snapshot 拋出 → loading=false＋錯誤 msg＋釋放已認領 keys。
+    // 無殘留 inFlight（下一批可正常執行）、msg 非空、零 install。
+    @Test
+    fun batch_startSnapshotThrows_recoversCleanly() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        gw.vanishDualAfterInstalls = 0
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        // 起始 I/O 拋出只針對批次階段：probe 完成後才打開，避免探測期同步被炸
+        //（Fake 與探測共用同一 CMD_LIST_USERS 通道）。
+        gw.profilesSnapshotThrows = true
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        vm.cloneSelected()
+        await { !vm.state.value.loading && vm.state.value.msg.isNotEmpty() }
+        assertFalse(vm.state.value.loading)
+        assertTrue(vm.state.value.msg.isNotEmpty())
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue("snapshot throw must never reach install", gw.installCalls.isEmpty())
+        assertNull("start failure must not produce a batch report", vm.state.value.batchReport)
+        // 選取保留（起始失敗不清勾選），已認領 keys 必須釋放：下一批可正常執行。
+        assertEquals(setOf("0:com.example.good"), vm.state.value.selectedKeys)
+        gw.vanishDualAfterInstalls = -1
+        gw.profilesSnapshotThrows = false
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(1, vm.state.value.batchReport!!.successCount)
+        assertEquals(listOf("com.example.good"), gw.installCalls)
     }
 }

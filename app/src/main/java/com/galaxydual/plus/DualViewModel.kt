@@ -3407,11 +3407,80 @@ class DualViewModel(
                     // Phase B #2：鎖內起始 pin 單一 verified target。經 onIo resolve
                     //（VM 側守衛，每項另有一次 resolve，多一次裝置呼叫可接受；
                     // core 尚無 cloneVerifiedExpected，不動 core API）。
-                    val expectedTarget = onIo { repo.resolveDualUserId() }
+                    // PR-37 P3 Phase A #6：起始 I/O（pin＋snapshot）納入 catch/finally
+                    // 保護：一般 Exception → loading=false＋錯誤 msg＋釋放已認領 keys
+                    //（外層 finally 釋放 batchPkgKeys，此處 return 即可）；取消透傳
+                    //（僅復位 loading，如 Phase 1 模式）。
+                    val expectedTarget: Int
+                    try {
+                        expectedTarget = onIo { repo.resolveDualUserId() }
+                    } catch (e: CancellationException) {
+                        _state.update { it.copy(loading = false) }
+                        throw e
+                    } catch (e: Exception) {
+                        val nowPinEx = nowMs()
+                        _state.update { cur ->
+                            val degraded =
+                                if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                                    cur.inventory.toStaleOrUnknown(
+                                        now = nowPinEx,
+                                        source = cur.inventory.source,
+                                        targetId = cur.inventory.targetId,
+                                    )
+                                } else {
+                                    cur.inventory
+                                }
+                            cur.copy(
+                                loading = false,
+                                inventory = degraded,
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.CHANNEL_ERROR,
+                                    techDetail = sanitizeForDisplay(e.message ?: "batch start failed"),
+                                ),
+                                msg = "批次無法開始：channel error: " +
+                                    sanitizeForDisplay(e.message ?: "batch start failed"),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return@withLock
+                    }
                     if (expectedTarget <= NO_TARGET_ID) {
                         // 起始即無 verified target：整批拒絕，不碰裝置（除上行
                         // resolve＋此處鑑別用 snapshot，無 install）。
-                        val snapStart = onIo { repo.profilesSnapshot() }
+                        // #6：snapshot 亦納入保護（Cancellation 透傳僅復位 loading）。
+                        val snapStart: ProfilesSnapshot
+                        try {
+                            snapStart = onIo { repo.profilesSnapshot() }
+                        } catch (e: CancellationException) {
+                            _state.update { it.copy(loading = false) }
+                            throw e
+                        } catch (e: Exception) {
+                            val nowSnapEx = nowMs()
+                            _state.update { cur ->
+                                val degraded =
+                                    if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                                        cur.inventory.toStaleOrUnknown(
+                                            now = nowSnapEx,
+                                            source = cur.inventory.source,
+                                            targetId = cur.inventory.targetId,
+                                        )
+                                    } else {
+                                        cur.inventory
+                                    }
+                                cur.copy(
+                                    loading = false,
+                                    inventory = degraded,
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.CHANNEL_ERROR,
+                                        techDetail = sanitizeForDisplay(e.message ?: "batch start failed"),
+                                    ),
+                                    msg = "批次無法開始：channel error: " +
+                                        sanitizeForDisplay(e.message ?: "batch start failed"),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
+                        }
                         val channelBadStart = snapStart is ProfilesSnapshot.ChannelError ||
                             (snapStart as? ProfilesSnapshot.Loaded)?.profiles.isNullOrEmpty() == true
                         val channelDetailStart =
@@ -3459,6 +3528,31 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // PR-37 P3 Phase A #1：批次起始檢查選取綁定（防 95 勾選寫到 96）。
+                    // 鎖內、pin expectedTarget 之後、任何 install 之前：若 selectedKeys
+                    // 非空且 selectionBoundTarget != expectedTarget（含 bound==NONE
+                    // 哨兵）→ 整批拒絕：清空 selectedKeys＋batchReport、重置恢復 marker
+                    //（允許新目標後續恢復自己的存檔）、msg 明示 INVALID、loading=false，
+                    // 零裝置寫入。禁止自動重新領養舊選取（此處不清 store、不觸 restore，
+                    // 下一次 refresh 對新目標仍可恢復一次）。
+                    // 口徑與 M9 persist 守衛、handleSelectionTargetChangeLocked 一致
+                    //（fail closed on target mismatch）。
+                    if (lockedKeys.isNotEmpty() && selectionBoundTarget != expectedTarget) {
+                        val oldBound = selectionBoundTarget
+                        selectionBoundTarget = SELECTION_BOUND_NONE
+                        selectionRestoredForTarget = SELECTION_RESTORE_NONE
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                selectedKeys = emptySet(),
+                                batchReport = null,
+                                msg = "選取已綁定舊目標，已清空，請重新勾選確認" +
+                                    "（user $oldBound → $expectedTarget）",
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
                     // M3:items 外提,catch 可見已累積進度以發 partial。
                     val items = mutableListOf<BatchItemResult>()
                     try {
@@ -3491,19 +3585,21 @@ class DualViewModel(
                                 val driftDetail = "目標已變更（user $expectedTarget " +
                                     "→ $currentTarget），批次停止：已完成 $completed/共 $total 項" +
                                     "（成功 $successD/失敗 $failedD/未知 $unknownD）"
+                                // PR-37 P3 Phase A #4：drift 無條件 STALE（即使 0 項完成，
+                                // 含 UNKNOWN 起點亦升為 STALE，舊資料不謊稱新鮮）。
+                                // 採「更新為 live target＋視為一次目標變更」口徑，與
+                                // handleSelectionTargetChangeLocked 一致：inventory 更新為
+                                // 新目標 STALE（UI 可見新目標供追溯），清空選取＋重置恢復
+                                // marker（新目標後續仍可恢復自己的存檔，禁止自動重新領養舊
+                                // 選取）。與 handle 差異：partial 必須保留（審計已完成項），
+                                // 故 batchReport 保留 partial 不置 null；msgKind 維持 FAILED
+                                //（批次中斷優先，handle 的 INVALID 為純選取變更無批次失敗）。
+                                selectionBoundTarget = SELECTION_BOUND_NONE
+                                selectionRestoredForTarget = SELECTION_RESTORE_NONE
                                 _state.update { cur ->
-                                    // Phase B #3：unknown 亦標 STALE（VerifyUnknown
-                                    // 可能=已寫入未驗證）。
-                                    val staleInventory =
-                                        if (successD > 0 || unknownD > 0) {
-                                            cur.inventory.copy(
-                                                freshness = InventoryFreshness.STALE,
-                                            )
-                                        } else {
-                                            cur.inventory
-                                        }
                                     cur.copy(
                                         loading = false,
+                                        selectedKeys = emptySet(),
                                         batchReport = partialDrift,
                                         lastOperation = LastOperation(
                                             opId = opKey,
@@ -3513,14 +3609,18 @@ class DualViewModel(
                                             timeMs = nowMs(),
                                             detail = driftDetail,
                                         ),
-                                        inventory = staleInventory,
+                                        inventory = cur.inventory.copy(
+                                            freshness = InventoryFreshness.STALE,
+                                            targetId = currentTarget,
+                                        ),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_MISMATCH,
                                             techDetail = driftDetail.take(MAX_DIAG_DETAIL_CHARS),
                                         ),
                                         msg = "批次中斷：目標已變更（user $expectedTarget " +
                                             "→ $currentTarget），已完成 $completed/共 $total 項" +
-                                            "（成功 $successD/失敗 $failedD/未知 $unknownD）",
+                                            "（成功 $successD/失敗 $failedD/未知 $unknownD）" +
+                                            "；已清空舊勾選，請重新確認",
                                         msgKind = MsgKind.FAILED,
                                     )
                                 }
