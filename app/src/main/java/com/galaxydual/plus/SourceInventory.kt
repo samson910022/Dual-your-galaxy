@@ -65,7 +65,7 @@ fun sortSourceApps(apps: List<SourceAppEntry>): List<SourceAppEntry> =
     )
 
 // 圖示載入記憶 (純記憶體狀態,非身分鍵):
-// - markLoaded(appKey):該 key 的圖示已嘗試載入過 (成功或失敗皆記,避免重打 PackageManager)。
+// - markLoaded(appKey):該 key 的圖示已成功載入 (僅成功才記,失敗留待重試)。
 // - isLoaded 只供「是否再嘗試載入」決策;選取/寫入/恢復一律只讀 appKey,永不讀此表。
 // - key 必須是完整 appKey (serial+pkg),不可只用包名 (跨來源覆蓋)。
 class SourceIconState {
