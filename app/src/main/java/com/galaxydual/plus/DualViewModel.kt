@@ -3039,7 +3039,9 @@ class DualViewModel(
         _state.update { cur ->
             val next = cur.selectedKeys.toMutableSet()
             if (!next.add(appKey)) next.remove(appKey)
-            cur.copy(selectedKeys = next)
+            // 勾選變更即清 stale 批次報告（報告只描述上次執行的勾選集合）。
+            if (next == cur.selectedKeys) cur
+            else cur.copy(selectedKeys = next, batchReport = null)
         }
     }
 
@@ -3047,13 +3049,19 @@ class DualViewModel(
         _state.update { cur ->
             val next = cur.selectedKeys.toMutableSet()
             if (checked) next.add(appKey) else next.remove(appKey)
-            cur.copy(selectedKeys = next)
+            // 同上：無實際變更不碰報告，避免重渲染抖動。
+            if (next == cur.selectedKeys) cur
+            else cur.copy(selectedKeys = next, batchReport = null)
         }
     }
 
     fun selectVisible(appKeys: Set<String>) {
         if (appKeys.isEmpty()) return
-        _state.update { cur -> cur.copy(selectedKeys = cur.selectedKeys + appKeys) }
+        _state.update { cur ->
+            val merged = cur.selectedKeys + appKeys
+            if (merged == cur.selectedKeys) cur
+            else cur.copy(selectedKeys = merged, batchReport = null)
+        }
     }
 
     // 清空勾選 (記憶體):只改 selectedKeys,不跑任何 uninstall,不碰持久化。
@@ -3063,6 +3071,7 @@ class DualViewModel(
             if (cur.selectedKeys.isEmpty()) return@update cur
             cur.copy(
                 selectedKeys = emptySet(),
+                batchReport = null,
                 msg = "已清除勾選（未卸載任何分身）",
                 msgKind = MsgKind.INFO,
             )

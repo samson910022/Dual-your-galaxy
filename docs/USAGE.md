@@ -187,6 +187,38 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | `Failure [INSTALL_FAILED_...]` | 來源 APK 不存在或儲存空間不足；先確認主 profile 已安裝該 App |
 | Play 審查相關警告 | 本專案不發 Play 版，請一律使用 GitHub Release 的 APK |
 
+## 6. 來源選取與批次建立（PR-7 P2 #26 階段 1）
+
+個人來源 catalog 為唯讀展示＋勾選：`MainActivity` 經 `PackageManager.getInstalledApplications(0)`
+列舉呼叫者所屬 user 可見的已安裝 App（絕不跨 user 枚舉，不碰 Secure Folder／Knox 容器），
+以 `SourceAppEntry` 唯讀列出；寫入目標仍以 `DualRepository` 跨來源 verified dualId 為準（見 §3），
+本表只決定「要對哪個包名打勾」。
+
+- 搜尋／系統開關語義：搜尋列比對應用名稱或包名子字串（大小寫無關，空白不過濾），
+  只改變顯示範圍；「系統應用」開關只切換是否顯示系統 App，兩者皆不觸發寫入。
+  旋轉重建時搜尋字串由 ViewModel 回填（保留過濾條件）。
+- 勾選≠卸載：清單列為 CheckBox，勾選／取消勾選只改 `UiState.selectedKeys`
+ （身分鍵為 `serial:package` 的 AppKey），永不呼叫 uninstall；取消勾選不是移除分身。
+- 保存／取消保存／清除勾選三者區別：
+  「保存選取」只把目前勾選寫入 app-private 持久化（需已知目標 `targetId > 0`，
+  否則按鈕禁用；只保存仍在 catalog 的 key），不寫入任何分身；
+  「取消保存」只刪除持久化條目，不卸載分身、也不清除目前記憶體勾選；
+  「清除勾選」只清空記憶體勾選（顯示「已清除勾選（未卸載任何分身）」），不碰持久化、不卸載。
+- 全選可見截斷語義：清單單次最多渲染前 200 筆（`MAX_SOURCE_ROWS` 效能護欄，
+  超出顯示「…等共 N 筆，僅顯示前 200 筆，全選可見只選前 200 筆」）；
+  「全選可見」與渲染走同一過濾／排序／截斷，只勾選可見前 200 筆，超出請用搜尋縮小範圍。
+  來源清單載入失敗時保留舊列表（不清空），並顯示獨立錯誤行（與「尚未載入」區分）。
+- 批次按鈕計數與部分成功解讀：按鈕顯示「建立 N 個分身」（N＝目前勾選數，無勾選時禁用；
+  批次執行中勾選區與相關按鈕一律禁用，不可中途改勾選）。
+  執行走既有單筆 `cloneVerified` 逐項（包名升冪確定順序），結果分成功／失敗／未知三類：
+  成功才加入 `cloned`，失敗（含 catalog 缺失的 `InvalidPackage`）與未知（需重查）分開列出，
+  部分成功如實呈現（例「成功 1 / 失敗 1 / 未知 0」）；全成功清診斷事件，否則留彙總診斷；
+  只要有 ≥1 成功即把清單標 STALE（保留 targetId 供追溯，不自動重查）。
+  唯讀／佔位通道整批拒絕（不產生報告）；勾選變更後舊報告即清（stale 報告不保留）。
+- 重啟恢復行為：重啟後新 ViewModel＋同一持久化，恢復只打勾（永不自動執行 clone），
+  只恢復仍在目前 catalog 的 key（已卸載的包自動捨去），且同一目標只恢復一次；
+  空 catalog 上不置恢復標記（待 catalog 就緒後仍可重試）；目標變更（profile 變動）時舊選取失效清除。
+
 ## English Summary
 
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
