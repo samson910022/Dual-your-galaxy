@@ -733,6 +733,53 @@ class DualSafetyTest {
         )
     }
 
+    // Reverse CLONE+UNKNOWN (Phase A P1-1 symmetric): VERBOSE same id 95 has
+    // no type line (UNKNOWN) + DUMPSYS CLONE, parent 0 serial 15 consistent,
+    // prop 95. Still Unknown (two-channel CLONE agreement required), so
+    // cloneVerified is NoDual with zero target commands and zero writes.
+    @Test
+    fun unknownPlusCloneSecondChannel_refusesAllWritesAndReads() {
+        val verboseNoType = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+        """.trimIndent()
+        val dumpsysClone = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseNoType,
+            dumpsysOutput = dumpsysClone,
+            propOutput = "95\n",
+        )
+        val repo = DualRepository(gateway)
+
+        // Sanity: the verbose block really parses as UNKNOWN (no type line).
+        val parsedVerbose = SamsungProfileAdapter.parseUserListVerbose(verboseNoType)
+        assertTrue(parsedVerbose.any { it.userId == 95 && it.userType == ProfileUserType.UNKNOWN })
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        assertTrue(
+            "reverse CLONE+UNKNOWN must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "reverse CLONE+UNKNOWN must run zero writes, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().isEmpty(),
+        )
+    }
+
     // Phase B P1-2 e2e: verbose CLONE parentId=0 vs dumpsys CLONE
     // parentId=10 (property agrees on 95) is a parent conflict -> Refused.
     // Resolution is -1, cloneVerified is NoDual, and no target command runs.

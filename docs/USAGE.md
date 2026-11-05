@@ -89,8 +89,8 @@ adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh
 在同一非零 id 上同時給出 `profile.CLONE` 型別，且 parent/serial 門通過：
 parent 須雙通道皆提供、相等、== 0（任一缺失 → Unknown；兩值不等 →
 Refused「conflicting parent」；相等但非 0 → Refused「non-owner parent」政策）；
-serial 雙邊皆有且不等 → Refused「conflicting serial」，任一缺失則容忍放行
-放行（serial != id 屬正常）；
+serial 雙邊皆有且不等 → Refused「conflicting serial」，單 fetch 任一缺失則容忍放行
+（serial != id 屬正常）；跨 fetch 已知→未知亦拒（continuity lost，與實作一致）；
 且系統 property（`getprop sys.dualapp.profile_id`）必須可讀且與該同一 id 一致（必要佐證，不可省略：缺失／空／格式未知 → Unknown 證據不足拒寫；指向不存在 id 或與 CLONE id 不一致 → Refused；不可讀版本按不支援版本明確拒寫，見 #21）；
 任一通道缺失、未知、衝突或歧義（多 CLONE／型別打架／property 缺失→Unknown／property 打架→Refused）一律拒寫、
 拒讀，不猜「第一個非 0 的 id」、不認 label、不固定 95/150、不比整組 flags。
@@ -109,11 +109,13 @@ fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 寫後重核 `after`，不一致即 `VerifyUnknown`（detail 註明 identity-changed，fail
 closed，不計成功）；explicit-ID 入口僅做 fresh 自洽檢查（expected=null），殘餘
 TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）。serial 單邊缺失則
-放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒。
+放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒；跨 fetch 已知→未知亦拒
+（continuity lost，與實作一致）。
+pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＝12 命令（probe 最多 2 次 retry 另計）。
 列表刷新（`refreshVerified()`，Phase D P2-D）為單一 target：一次 `pm list users`（1）
 ＋一次 verified-target fetch（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
 ＋一次 `pm list packages --user <dualId>`（1）＝5 命令（舊 resolve-then-reverify
-列表路徑為 9）；同一 target 全程，resolve→list 漂移在本 API 內消除（explicit
+列表路徑為 9）；同一 target 全程，resolve→list 漂移在本 API 內消除；fetch→probe 殘唯讀窗口（只誤報 presence/absence，不重定向寫入）（explicit
 舊入口殘餘除外）。Auto 降級與單一恢復入口仍由 #25 擁有，本 API 只保證列表
 一致性，不改變政策門。
 
@@ -123,7 +125,7 @@ adb shell cmd user list -v
 #   每個 UserInfo{<id>:<label>:<flags>} 塊內找 User type 行：
 #   目標 id 的兩通道都必須是 android.os.usertype.profile.CLONE（大小寫/分隔符容忍）；
 #   parent 須雙通道皆知、一致、== 0（缺失 Unknown；衝突或非零 Refused）；
-#   serial 雙邊皆有且不等即 Refused，任一缺失則放行（serial != id 屬正常）；
+#   serial 雙邊皆有且不等即 Refused，單 fetch 任一缺失則放行（serial != id 屬正常）；跨 fetch 已知→未知亦拒；
 #   label 含不含 DUAL 都不看；未知一律 fail closed。
 adb shell dumpsys user
 #   同一 id 在此通道同樣必須是 profile.CLONE；若此處是 SYSTEM/MANAGED/SECONDARY

@@ -266,6 +266,7 @@ object PmOutputParser {
     }
 
     // Builds `pm grant --user <dualId> <pkg> <permission>`.
+    // 需 verified-dual id，目前無生產調用 (builder retained for tests).
     fun buildGrant(pkg: String, dualId: Int, permission: String): String {
         val p = ShellEscaper.escapePackage(pkg)
         val u = ShellEscaper.escapeUserId(dualId)
@@ -274,6 +275,7 @@ object PmOutputParser {
     }
 
     // Builds `appops set --user <dualId> <pkg> <op> <mode>`, e.g. mode allow/deny.
+    // 需 verified-dual id，目前無生產調用 (builder retained for tests).
     fun buildAppOpsSet(pkg: String, dualId: Int, op: String, mode: String): String {
         val p = ShellEscaper.escapePackage(pkg)
         val u = ShellEscaper.escapeUserId(dualId)
