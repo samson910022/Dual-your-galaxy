@@ -3,6 +3,7 @@ package com.galaxydual.hook
 
 import java.lang.reflect.Modifier
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -175,5 +176,44 @@ class WhitelistPatchReflectTest {
         val single = out.getValue("ARR")
         assertTrue(single is WhitelistPatch.Outcome.Skipped)
         assertTrue((single as WhitelistPatch.Outcome.Skipped).reason.contains("not static"))
+    }
+
+    // P2 regression (PR #20): a non-public static NON-FINAL field (ROM
+    // variant shape) must still patch via controlled setAccessible --
+    // plain get(null) alone would report "read failed" on it.
+    @Test
+    fun nonPublicStaticNonFinalArrayIsPatchedViaControlledAccessible() {
+        NonPublicStaticHolder.reset()
+        // Sanity: the fixture really is the regression shape.
+        val field = NonPublicStaticHolder::class.java.getDeclaredField("ARR")
+        assertTrue(Modifier.isStatic(field.modifiers))
+        assertFalse(Modifier.isFinal(field.modifiers))
+        assertFalse(Modifier.isPublic(field.modifiers))
+        val out = WhitelistPatch.patchFields(
+            NonPublicStaticHolder::class.java, listOf("ARR"), setOf("b"),
+        )
+        val single = out.getValue("ARR")
+        assertTrue(single is WhitelistPatch.Outcome.Replaced)
+        assertEquals(1, (single as WhitelistPatch.Outcome.Replaced).added)
+        assertEquals(listOf("a", "b"), NonPublicStaticHolder.peekArr().toList())
+        NonPublicStaticHolder.reset()
+    }
+
+    // The non-public static FINAL counterpart is never force-written:
+    // ObserveOnly when readable, Skipped when even the read is denied --
+    // either way the value is untouched and no Replaced/PatchedInPlace.
+    @Test
+    fun nonPublicStaticFinalArrayIsNeverForceWritten() {
+        val field = NonPublicStaticHolder::class.java.getDeclaredField("FINAL_ARR")
+        assertTrue(Modifier.isStatic(field.modifiers))
+        assertTrue(Modifier.isFinal(field.modifiers))
+        assertFalse(Modifier.isPublic(field.modifiers))
+        val out = WhitelistPatch.patchFields(
+            NonPublicStaticHolder::class.java, listOf("FINAL_ARR"), setOf("b"),
+        )
+        val single = out.getValue("FINAL_ARR")
+        assertFalse(single is WhitelistPatch.Outcome.Replaced)
+        assertFalse(single is WhitelistPatch.Outcome.PatchedInPlace)
+        assertEquals(listOf("a"), NonPublicStaticHolder.peekFinalArr().toList())
     }
 }

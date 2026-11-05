@@ -60,8 +60,9 @@ object WhitelistPatch {
     // would silently miss region devices). Missing names map to Skipped.
     //
     // Rules, in order per field: not-static -> Skipped (checked before
-    // get(null) for a precise diagnosis); final -> ObserveOnly (no
-    // setAccessible, no set); Replaced with added == 0 -> recorded without
+    // get(null) for a precise diagnosis); non-final non-public -> controlled
+    // setAccessible (fail-closed Skipped on refusal; see below); final ->
+    // ObserveOnly (no setAccessible, no set); Replaced with added == 0 -> recorded without
     // set() (already complete, no write needed); Replaced with added > 0 ->
     // set() back (non-final only); anything else is recorded as returned.
     fun patchFields(
@@ -95,6 +96,34 @@ object WhitelistPatch {
                 continue
             }
             val isFinal = Modifier.isFinal(field.modifiers)
+            if (!isFinal) {
+                // Controlled accessibility for NON-FINAL fields only: a ROM
+                // variant may declare the holder non-public
+                // (private/protected), which plain get(null) cannot read even
+                // though the field is patchable. setAccessible(true) opens
+                // that path; a throw (SecurityException on hardened ROMs) is
+                // an explicit fail-closed Skipped. Spelled as setAccessible
+                // (not trySetAccessible: absent from the compileSdk 34
+                // android.jar stubs, so it does not compile on this
+                // baseline). FINAL fields never take this path: they stay
+                // observe-only and Field.set is never attempted on them (no
+                // force-write).
+                val accessible = try {
+                    field.isAccessible = true
+                    true
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!accessible) {
+                    results[name] = Outcome.Skipped(
+                        "skip patch $name on ${target.name}: cannot access non-final field " +
+                            "(setAccessible failed, fail-closed)",
+                    )
+                    continue
+                }
+                // Accessible now (or already was); a later get/set failure is
+                // still recorded as Skipped by the precise handlers below.
+            }
             val current = try {
                 field.get(null)
             } catch (t: Throwable) {

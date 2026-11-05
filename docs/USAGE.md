@@ -30,7 +30,7 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`／`selectChannel`＋Shizuku 生命週期）已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`；SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；hook 訊號為 file marker 存在性證據，僅顯示、永不進入路由，[待實機驗證]；`ChannelPreference` 手動選擇 AUTO 預設，`selectChannel` 動態換 gateway；選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，`channelReadyFor` [已支援]），
 以下順序為接線後預期行為，App 內 Shizuku 切換（未授權路徑／首次選路／marker gateway-`cat` 顯示 [待實機驗證]；已授權一鍵、ROOT 一鍵／su／uninstall 已驗，見 §0）：
 
-1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`已啟用（system_server）`／`未偵測到`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
+1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
    observe-only（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗），不可描述為已能擴展包名。
 2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
@@ -120,11 +120,11 @@ adb shell pm uninstall --user 95 com.example.chat
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
-  作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`已啟用（system_server）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（whitelist 政策分支待實作）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
+  作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（whitelist 政策分支待實作）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
 - AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；停用模組後下次啟動降級 Shizuku 為設計意圖，實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
   絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
-- P1 診斷限制（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）：Hook 狀態為四態——已啟用／未偵測到／狀態未知（無權限讀取）／狀態未知（無可用診斷通道）。明選 LSPosed（NoOp）時診斷讀取獨立於所選寫入通道：仍嘗試直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）`cat`；若無任何真通道且直接讀取不可讀（App uid 對 `/data/system` 恆 EACCES），顯示「狀態未知」而非「未偵測到」——後者只保留給確定可讀但缺失的情況（fail-closed 誠實顯示，不再假陰性）。要完整診斷需至少一個探測通過的真通道；診斷結果永不進入路由／`channelReady`（hook-neutral，沿襲 #19）。
+- P1 診斷限制（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）：Hook 狀態為四態——偵測到歷史 Hook 標記（僅存在性證據，未確認本次開機是否生效）／未偵測到／狀態未知（無權限讀取）／狀態未知（無可用診斷通道）。明選 LSPosed（NoOp）時診斷讀取獨立於所選寫入通道：仍嘗試直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）`cat`；若無任何真通道且直接讀取不可讀（App uid 對 `/data/system` 恆 EACCES），顯示「狀態未知」而非「未偵測到」——後者只保留給確定可讀但缺失的情況（fail-closed 誠實顯示，不再假陰性）。要完整診斷需至少一個探測通過的真通道；診斷結果永不進入路由／`channelReady`（hook-neutral，沿襲 #19）。
 
 ## 5. 常見問題
 
