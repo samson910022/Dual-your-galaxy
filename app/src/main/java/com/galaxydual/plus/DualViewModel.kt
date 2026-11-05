@@ -549,6 +549,13 @@ class DualViewModel(
     // and the coalesced trailing run. Must run under opMutex: callers hold
     // it, so this never launches or locks itself.
     private suspend fun reconnectLocked() {
+        // Phase D P2 busy (#24): mark busy BEFORE any suspending probe IO.
+        // swapAutoLocked() suspends on `su -c id -u` (auth prompt can block)
+        // while probeChannels() is the first place that used to set
+        // loading=true -- during that window state.loading stayed false and
+        // MainActivity left its buttons enabled. Idempotent with the
+        // probeChannels/refreshLocked sets below.
+        _state.update { it.copy(loading = true) }
         // P25 Item 3: one probe per round — swapAutoLocked probes once and
         // returns the result for probeChannels to reuse (previously each
         // probed all elevators: double `su -c` cost + double auth-prompt risk).
@@ -1483,6 +1490,10 @@ class DualViewModel(
             recheckJob = myJob
             try {
                 opMutex.withLock {
+                    // Phase D P2 busy (#24): same early-busy as reconnectLocked --
+                    // swapAutoLocked() suspends before probeChannels() sets
+                    // loading, so set it here first (idempotent, msg-preserving).
+                    _state.update { it.copy(loading = true) }
                     // P25 Item 3: one probe per round — see reconnectLocked.
                     if (preference == ChannelPreference.AUTO) {
                         val probe = swapAutoLocked()
