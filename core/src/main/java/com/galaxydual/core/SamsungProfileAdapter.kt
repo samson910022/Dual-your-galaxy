@@ -41,12 +41,11 @@ object SamsungProfileAdapter {
     // `android.os.usertype.profile.CLONE`, `profile_CLONE` and case
     // variants all count. Case-insensitive by design. Right boundary
     // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
-    // TODO(P22-follow-up, fixed): right boundary does not block '_', so
-    // `profile.CLONE_extra` still matched CLONE_MARKER via containsMatchIn;
-    // fixed by routing authorization through isSupportedCloneToken (full
-    // token exact match). CLONE_MARKER body is retained unchanged for
-    // reference/other uses; do not use it for authorization decisions.
-    private val CLONE_MARKER = Regex("(?<![A-Za-z0-9])profile[^A-Za-z0-9]{0,3}clone(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+    // Historical note (P22-follow-up, fixed): old substring-marker right
+    // boundary did not block '_', so `profile.CLONE_extra` once matched
+    // via containsMatchIn; fixed by routing authorization through
+    // isSupportedCloneToken (full token exact match), now the sole
+    // authorization entry (no substring/regex fallback remains).
 
     // Standalone `profile.X` token extractor (separator-tolerant,
     // case-insensitive). Matches dot form (`profile.CLONE`) or 1-3
