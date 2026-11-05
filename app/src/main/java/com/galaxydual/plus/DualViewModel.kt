@@ -504,12 +504,21 @@ class DualViewModel(
     private var refreshJob: Job? = null
     private var refreshPending = false
     private var reconnectPending = false
+    // N1 Phase 1 (issue #34 re-review): manual-vs-auto diagnostic gate.
+    // reconnectPendingUserInitiated ORs every coalesced reconnect request's
+    // userInitiated flag so a manual tap is never downgraded to auto when it
+    // collapses behind an in-flight op (manual wins). Auto binder/onResume
+    // bursts stay false and never gain privileged `cat`.
+    private var reconnectPendingUserInitiated = false
 
     // Recheck single-flight (P2-2): same coalescing gate as refresh(). Binder/
     // permission/onResume bursts collapse to at most one trailing re-probe.
     // Main-confined (see class doc).
     private var recheckJob: Job? = null
     private var recheckPending = false
+    // N1 Phase 1: trailing recheck inherits manual when any collapsed request
+    // was manual (OR, same as reconnect above). Auto stays false.
+    private var recheckPendingUserInitiated = false
 
     // Select latest-wins (P2-2): the in-flight select job, cancelled by the
     // next picker tap. Eagerly assigned in selectChannel() (see below).
@@ -542,7 +551,7 @@ class DualViewModel(
         // Probe elevation channels first; later ops queue behind this, so the
         // first refresh always sees the routed privilege, never a default.
         viewModelScope.launch {
-            opMutex.withLock { probeChannels() }
+            opMutex.withLock { probeChannels(userInitiated = false) }
         }
     }
 
@@ -597,14 +606,23 @@ class DualViewModel(
     // so no tap is lost. Last-wins with reconnect upgrade: a pending
     // reconnect covers a pending refresh in one probe+refresh round; a
     // pending refresh alone re-runs only refreshLocked (refresh semantics
-    // stay probe-free).
+    // stay probe-free). N1 Phase 1: the trailing reconnect inherits the
+    // manual flag (manual wins) so a manual tap collapsed behind an auto op
+    // still diagnoses with privilege; pure-auto bursts stay false. The flag
+    // is consumed per round (same shape as the recheck loop below): a
+    // request arriving during trailing round N is read by round N+1, never
+    // via a stale snapshot held across rounds.
     private suspend fun drainCoalesced() {
         while (refreshPending || reconnectPending) {
             val doReconnect = reconnectPending
+            // Manual wins for THIS round only: consume the flag now so a
+            // later auto request cannot inherit an earlier manual.
+            val trailingManual = reconnectPendingUserInitiated
             refreshPending = false
             reconnectPending = false
+            reconnectPendingUserInitiated = false
             if (doReconnect) {
-                opMutex.withLock { reconnectLocked() }
+                opMutex.withLock { reconnectLocked(userInitiated = trailingManual) }
             } else {
                 opMutex.withLock { refreshLocked() }
             }
@@ -613,8 +631,11 @@ class DualViewModel(
 
     // Probe (with Auto degrade) + refresh body shared by reconnectAndRefresh()
     // and the coalesced trailing run. Must run under opMutex: callers hold
-    // it, so this never launches or locks itself.
-    private suspend fun reconnectLocked() {
+    // it, so this never launches or locks itself. N1 Phase 1: userInitiated
+    // gates privileged diagnostic `cat` (see probeChannels): auto binder/
+    // onResume bursts pass false (direct reads only under LSPOSED), manual
+    // reconnect taps pass true.
+    private suspend fun reconnectLocked(userInitiated: Boolean = false) {
         // Phase D P2 busy (#24): mark busy BEFORE any suspending probe IO.
         // swapAutoLocked() suspends on `su -c id -u` (auth prompt can block)
         // while probeChannels() is the first place that used to set
@@ -627,9 +648,9 @@ class DualViewModel(
         // probed all elevators: double `su -c` cost + double auth-prompt risk).
         if (preference == ChannelPreference.AUTO) {
             val probe = swapAutoLocked()
-            probeChannels(probe)
+            probeChannels(probe, userInitiated = userInitiated)
         } else {
-            probeChannels()
+            probeChannels(userInitiated = userInitiated)
         }
         refreshLocked()
     }
@@ -1549,21 +1570,31 @@ class DualViewModel(
     // place setting loading -- without this early set the trailing round
     // (which previously inlined swapAutoLocked directly) left a window with
     // loading=false and MainActivity buttons enabled.
-    private suspend fun recheckLocked() {
+    private suspend fun recheckLocked(userInitiated: Boolean = false) {
         // Phase D P2 busy (#24): same early-busy as reconnectLocked --
         // swapAutoLocked() suspends before probeChannels() sets
         // loading, so set it here first (idempotent, msg-preserving).
         _state.update { it.copy(loading = true) }
         // P25 Item 3: one probe per round — see reconnectLocked.
+        // N1 Phase 1: userInitiated gates privileged diagnostic `cat`
+        // (auto binder/onResume pass false: LSPOSED stays direct-only).
         if (preference == ChannelPreference.AUTO) {
             val probe = swapAutoLocked()
-            probeChannels(probe)
+            probeChannels(probe, userInitiated = userInitiated)
         } else {
-            probeChannels()
+            probeChannels(userInitiated = userInitiated)
         }
     }
 
-    fun recheckPrivilege() {
+    // N1 Phase 1 (issue #34 re-review): userInitiated gates privileged
+    // diagnostic exec. Auto lifecycle (onResume / binder dead / permission
+    // bursts) must pass false (default): LSPOSED auto diagnosis runs direct
+    // reads only, usable stays empty, never `cat`s through a retained su/
+    // Shizuku instance (each `su -c` is a fresh process with no session
+    // persistence, so an auto `cat` risks an unexpected auth prompt or a
+    // 60 s stall on revoke/per-prompt). Manual taps pass true (see
+    // requestHookRedDiagnosis / MainActivity manual buttons).
+    fun recheckPrivilege(userInitiated: Boolean = false) {
         // Single-flight coalesce (P2-2): same gate shape as refresh(). A tap
         // while a recheck is in flight (including waiting on opMutex behind
         // init/probe) only records one trailing re-run, so binder/permission/
@@ -1572,14 +1603,18 @@ class DualViewModel(
         viewModelScope.launch {
             if (recheckJob?.isActive == true) {
                 recheckPending = true
+                // Manual wins across the coalesced burst (see field docs).
+                recheckPendingUserInitiated = recheckPendingUserInitiated || userInitiated
                 return@launch
             }
             val myJob = currentCoroutineContext()[Job] ?: return@launch
             recheckJob = myJob
             try {
-                opMutex.withLock { recheckLocked() }
+                opMutex.withLock { recheckLocked(userInitiated = userInitiated) }
                 while (recheckPending) {
+                    val trailingManual = recheckPendingUserInitiated
                     recheckPending = false
+                    recheckPendingUserInitiated = false
                     // Re-review #7 B2: hold busy across the mutex handoff so
                     // the trailing round never exposes loading=false while it
                     // waits on opMutex behind another op. The previous round's
@@ -1590,12 +1625,22 @@ class DualViewModel(
                     // in-flight + trailing drain reads as continuous busy and
                     // every probe IO stays under loading=true.
                     _state.update { it.copy(loading = true) }
-                    opMutex.withLock { recheckLocked() }
+                    opMutex.withLock { recheckLocked(userInitiated = trailingManual) }
                 }
             } finally {
                 if (recheckJob === myJob) recheckJob = null
             }
         }
+    }
+
+    // Manual opt-in privileged hook re-diagnosis (N1 Phase 1): runs one
+    // probeChannels round with userInitiated=true, so a parked LSPOSED channel
+    // may `cat` through the retained verified instance. Auto lifecycle never
+    // calls this (it calls recheckPrivilege(false)): auto stays direct-only.
+    // Isolates the auth-risking exec to an explicit user tap; never raises
+    // writeReady (see probeChannels isolation assertion).
+    fun requestHookRedDiagnosis() {
+        recheckPrivilege(userInitiated = true)
     }
 
     // Single "reconnect and update" entry (P25, issue #25): probe (with Auto
@@ -1610,16 +1655,21 @@ class DualViewModel(
     // bound). A reconnect arriving during a refresh upgrades the trailing
     // run to probe+refresh; concurrent reconnects collapse to one trailing
     // reconnect.
-    fun reconnectAndRefresh() {
+    // N1 Phase 1: userInitiated gates privileged diagnostic `cat` (see
+    // probeChannels). Manual Refresh taps pass true; auto binder bursts pass
+    // false (direct reads only under LSPOSED). Existing no-arg callers (tests)
+    // default to auto (false) so only explicit manual taps gain privilege.
+    fun reconnectAndRefresh(userInitiated: Boolean = false) {
         viewModelScope.launch {
             if (refreshJob?.isActive == true) {
                 reconnectPending = true
+                reconnectPendingUserInitiated = reconnectPendingUserInitiated || userInitiated
                 return@launch
             }
             val myJob = currentCoroutineContext()[Job] ?: return@launch
             refreshJob = myJob
             try {
-                opMutex.withLock { reconnectLocked() }
+                opMutex.withLock { reconnectLocked(userInitiated = userInitiated) }
                 drainCoalesced()
             } finally {
                 if (refreshJob === myJob) refreshJob = null
@@ -1632,8 +1682,12 @@ class DualViewModel(
     // matching gateway (su / Shizuku / NoOp; explicit LSPosed still maps to
     // the NoOp placeholder until the P2 hook channel lands -- see
     // assembleChannel), then re-probes privilege and refreshes the lists.
-    // Serialized through opMutex like every other op.
-    fun selectChannel(pref: ChannelPreference) {
+    // Serialized through opMutex like every other op. N1 Phase 1: picker taps
+    // are manual by definition, so MainActivity passes userInitiated=true
+    // explicitly (manual diagnosis allowed); the default stays false
+    // (fail-closed: a programmatic call without a user tap never gains
+    // privileged diagnosis). Auto lifecycle never calls selectChannel.
+    fun selectChannel(pref: ChannelPreference, userInitiated: Boolean = false) {
         // Latest-wins (P2-2): a new picker tap cancels the previous select
         // job, so rapid AUTO -> ROOT -> SHIZUKU taps collapse to the last
         // choice instead of queueing a mutex waiter per event. Eager assign:
@@ -1667,7 +1721,7 @@ class DualViewModel(
                         // Best effort: a failing store never blocks the swap.
                     }
                     swapToLocked(pref)
-                    probeChannels()
+                    probeChannels(userInitiated = userInitiated)
                     refreshLocked()
                 }
             } finally {
@@ -2018,7 +2072,15 @@ class DualViewModel(
         }
     }
 
-    private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null) {
+    // N1 Phase 1: userInitiated gates privileged diagnostic `cat` under
+    // LSPOSED. Auto (false: onResume / binder / init) keeps usable empty, so
+    // diagnosis is direct-reads only (UNKNOWN_* when direct is denied, never
+    // an auto `su -c cat` that risks an auth prompt or a 60 s stall after a
+    // parked revoke). Manual (true: picker switch / reconnect tap /
+    // requestHookRedDiagnosis) may use the retained verified instances.
+    // Diagnosis never feeds ready/routed (hook-neutral, #19): ready is
+    // computed from probes before diagnosis and asserted independent below.
+    private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null, userInitiated: Boolean = false) {
         _state.update { it.copy(loading = true) }
         try {
             // Single probe per call: reuse the swap result when present,
@@ -2055,7 +2117,13 @@ class DualViewModel(
                     shizukuEvidence = DiagnosticEvidence(shizukuGateway, hasShizuku, evidenceGeneration)
                     if (hasShizuku) setRetainedShizukuDiagnostic(shizukuGateway) else clearRetainedShizukuDiagnostic()
                 }
-                ChannelPreference.LSPOSED -> Unit
+                ChannelPreference.LSPOSED -> {
+                    // N1 Phase 1: zero probe -- no evidence rewrite here by
+                    // design (a parked LSPOSED round must not touch evidence).
+                    // Retained expiry for a MANUAL diagnostic failure lives
+                    // post-diagnosis (UNKNOWN_UNREADABLE clears retained +
+                    // stale evidence); auto never clears and never execs.
+                }
             }
             // P25: AUTO follows live probes, not the startup file heuristic.
             // Only the entry without a prior swap (init / selectChannel-AUTO)
@@ -2100,6 +2168,11 @@ class DualViewModel(
             // an unproven channel never executes anything except via a verified
             // diagnostic gateway. No true channel + unreadable direct reads maps
             // to UNKNOWN_NO_DIAGNOSTIC, never to inactive.
+            // Records the usable gateways of this round for the retained
+            // expiry check below (diagnoseHookState swallows per-gateway
+            // failure: an attempted-but-failed `cat` pair collapses into the
+            // status, so the round must remember it attempted an exec).
+            var usableGateways: List<CmdGateway> = emptyList()
             val hook: HookDiagnosis = try {
                 withContext(Dispatchers.IO) {
                     val direct = try {
@@ -2132,24 +2205,71 @@ class DualViewModel(
                     // (fail closed, no retry, no upgrade).
                     val suUsable = isSuEvidenceUsable()
                     val shizukuUsable = isShizukuEvidenceUsable()
+                    // N1 Phase 1: LSPOSED auto (userInitiated=false) forces
+                    // usable empty even when a retained instance exists: a
+                    // retained Kotlin object is NOT a live su session (every
+                    // `su -c` is a fresh process, 60 s timeout, per-prompt
+                    // risk), so an auto `cat` after a parked revoke would pop
+                    // an unexpected auth box or stall. Manual (true) keeps the
+                    // B1 retained path (deduped to one `cat`, zero probes).
                     val usable = when (preference) {
-                        ChannelPreference.LSPOSED -> (candidates.filter {
-                            (it === suGateway && suUsable) ||
-                                (it === shizukuGateway && shizukuUsable)
-                        } + listOfNotNull(
-                            retainedSuDiagnostic,
-                            retainedShizukuDiagnostic,
-                        )).distinct()
+                        ChannelPreference.LSPOSED -> if (!userInitiated) {
+                            emptyList()
+                        } else {
+                            (candidates.filter {
+                                (it === suGateway && suUsable) ||
+                                    (it === shizukuGateway && shizukuUsable)
+                            } + listOfNotNull(
+                                retainedSuDiagnostic,
+                                retainedShizukuDiagnostic,
+                            )).distinct()
+                        }
                         else -> candidates.filter {
                             (it.privilege == Privilege.ROOT && hasRoot) ||
                                 (it.privilege == Privilege.SHELL && hasShizuku)
                         }
                     }
+                    usableGateways = usable
                     diagnoseHookState(direct, usable)
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
+            }
+            // N1 Phase 1 retained expiry: a MANUAL privileged read that proves
+            // the retained channel no longer serves `cat` (revoked while
+            // parked) drops the retained slots (and the stale matched
+            // evidence, which would otherwise re-authorize the same dead
+            // instance on the next manual round via the current-match path).
+            // Auto rounds never reach here (usable empty, no exec), so auto
+            // failures never clear -- the slot survives until a manual round
+            // proves it dead. LSPOSED evidence block above stays Unit: the
+            // clearing lives here, not in the probe-based evidence rewrite.
+            // The expiry signal is the gateway exec itself failing, not just
+            // UNKNOWN_UNREADABLE: positively-absent direct reads
+            // (Readable(null) x2) plus failed `cat`s collapse to INACTIVE
+            // viaGateway=false (direct wins, attempt info lost), so that
+            // outcome with a non-empty usable list is also a proving failure.
+            val gatewayExecFailed = usableGateways.isNotEmpty() &&
+                ((hook.status == HookStatus.UNKNOWN_UNREADABLE && hook.viaGateway) ||
+                    (hook.status == HookStatus.INACTIVE && !hook.viaGateway))
+            if (preference == ChannelPreference.LSPOSED && userInitiated && gatewayExecFailed) {
+                clearRetainedSuDiagnostic()
+                clearRetainedShizukuDiagnostic()
+                // Same-instance reuse would otherwise keep suUsable true via
+                // the stale evidence entry and re-`cat` the dead instance on
+                // the next manual round: fail the stale entries closed here.
+                // Production rebuilds are already mismatched (no-op); the
+                // reuse-fake match branch is what this closes.
+                suEvidence = DiagnosticEvidence(suGateway, false, evidenceGeneration)
+                shizukuEvidence = DiagnosticEvidence(shizukuGateway, false, evidenceGeneration)
+            }
+            // Diagnostic isolation lock (N1 contract 4): hook diagnosis must
+            // never raise writeReady. ready was computed from probes only;
+            // LSPOSED (NoOp placeholder, NONE privilege) is never ready by
+            // construction -- fail loudly if that ever drifts.
+            check(!(preference == ChannelPreference.LSPOSED && ready)) {
+                "diagnostic must never raise writeReady"
             }
             val hookDesc = hook.displayText()
             // P25 messages: explicit choices never cross channels -- the text
