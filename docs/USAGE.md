@@ -50,6 +50,8 @@ val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
 目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
 
+- 併發邊界（#24；術語：busy 即 `UiState.loading`，merge 即 coalesce）：`refresh()` 快速連點合併為一次 trailing 重跑（coalesce，in-flight 之後最多一次待跑，不堆積 mutex 等待者）；`clone`／`remove` 按操作 key 去重，同 key 第二次報 `already in progress` 不排隊，且 clone 與 remove 分屬不同命名空間（`clone:<pkg>`／`remove:<pkg>`）不互斥；所有 repo 呼叫經 `Dispatchers.IO`（`onIo`），執行期間 busy（`UiState.loading=true`）。
+
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
 預期適用無 ROOT 裝置（三星 One UI 4.0+ / Android 12+ 為目標機型，未經實機驗證）。
