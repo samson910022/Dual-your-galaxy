@@ -220,12 +220,14 @@ data class UiState(
     // probed subset, never an unprobed unrelated channel).
     val execIdentity: Privilege = Privilege.NONE,
     // Probed subset proved at least one channel (hasRoot || hasShizuku).
-    // P25 Item 4: probe signal only, NOT proof that `pm list users` is
-    // readable. Counter-example A: SuElevator returns hasRoot=true on
-    // `id -u == 0` even when its `pm list users` fails (dualUserId=-1), so
-    // anyProbePassed is true while refresh reports ChannelError. True PM
-    // readability is decided by refresh (profilesSnapshot Loaded vs
-    // ChannelError, listClonedPackages null vs list), not by this flag.
+    // P25 Item 4: probe signal only, **NOT** proof that `pm list users` is
+    // readable (探測通過 ≠ PM可讀; Phase 3 fail-closed: PM不可讀時寫入被拒,
+    // 以 CHANNEL 呈現, 見 isWritable PM gate). Counter-example A: SuElevator
+    // returns hasRoot=true on `id -u == 0` even when its `pm list users`
+    // fails (dualUserId=-1), so anyProbePassed is true while refresh reports
+    // ChannelError. True PM readability is decided by refresh
+    // (profilesSnapshot Loaded vs ChannelError, listClonedPackages null vs
+    // list), not by this flag.
     // AUTO probes all, so this is device-wide; explicit probes only its own
     // channel (P25 Item 3), so for explicit anyProbePassed == writeReady by
     // construction (unrelated channels intentionally unprobed, never reported).
@@ -1741,8 +1743,9 @@ class DualViewModel(
     // Single "reconnect and update" entry (P25, issue #25): probe (with Auto
     // degrade) + refresh in one mutex hold, so a Shizuku binder/permission
     // lifecycle event never races an in-flight refresh. MainActivity routes
-    // both the Refresh button ("重新連線並更新") and the Shizuku
-    // dead/authorized paths here.
+    // both the 重新連線並更新 button ("重新連線並更新") and the Shizuku
+    // dead/authorized paths here (single entry reconnectAndRefresh; the
+    // standalone refresh() stays probe-free for coalesced trailing runs).
     //
     // P25 Item 2: shares the refresh coalescing gate (same refreshJob plus a
     // reconnectPending upgrade flag) so a binder/button burst collapses to at
@@ -1751,7 +1754,7 @@ class DualViewModel(
     // run to probe+refresh; concurrent reconnects collapse to one trailing
     // reconnect.
     // N1 Phase 1: userInitiated gates privileged diagnostic `cat` (see
-    // probeChannels). Manual Refresh taps pass true; auto binder bursts pass
+    // probeChannels). Manual 重新連線並更新 taps pass true; auto binder bursts pass
     // false (direct reads only under LSPOSED). Existing no-arg callers (tests)
     // default to auto (false) so only explicit manual taps gain privilege.
     fun reconnectAndRefresh(userInitiated: Boolean = false) {

@@ -7,7 +7,7 @@ package com.galaxydual.plus
 // indicator, a Shizuku binder line, a channel picker (Auto/Root/Shizuku/
 // LSPosed buttons + current-channel line + LSPosed hook-status line), the
 // profiles/cloned lists, a package input with clone/remove buttons, a
-// refresh button, a Shizuku permission button, and a status line styled per
+// 重新連線並更新 button, a Shizuku permission button, and a status line styled per
 // MsgKind. Persistence: the picker selection is stored in SharedPreferences
 // by the factory/selectChannel, so a restart remembers it.
 //
@@ -205,7 +205,7 @@ class MainActivity : ComponentActivity() {
     private fun onShizukuChanged(reread: Boolean) {
         // N1 Phase 1: binder/permission callbacks are auto lifecycle, not user
         // taps -- privileged `cat` stays off (false) even on the reread path.
-        // Manual Refresh taps call reconnectAndRefresh(true) directly.
+        // Manual 重新連線並更新 taps call reconnectAndRefresh(true) directly.
         if (reread) vm.reconnectAndRefresh(userInitiated = false) else vm.recheckPrivilege(userInitiated = false)
         updateShizukuLine()
     }
@@ -290,7 +290,7 @@ class MainActivity : ComponentActivity() {
         }
         defaultMsgColor = msgView.currentTextColor
 
-        // Clone/remove share one row; refresh + permission share the next.
+        // Clone/remove share one row; 重新連線並更新 + permission share the next.
         val writeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(cloneBtn, rowParams())
@@ -341,7 +341,7 @@ class MainActivity : ComponentActivity() {
     // honest NONE state); authorized -> single reconnect entry (probe+refresh);
     // otherwise ask Shizuku. The button text mirrors the same boolean split in
     // updateShizukuLine so 文案/動作一致（重連分支為「檢查 Shizuku 並更新」，
-    // 與 Refresh 按鈕「重新連線並更新」區分；未授權分支為「請求 Shizuku 授權」）.
+    // 與重新連線並更新按鈕「重新連線並更新」區分；未授權分支為「請求 Shizuku 授權」）.
     private fun requestShizukuPermission() {
         try {
             if (!Shizuku.pingBinder()) {
@@ -362,7 +362,7 @@ class MainActivity : ComponentActivity() {
     // guards checkSelfPermission so a dead binder shows 未連線, not a crash.
     // P25: the permission button text follows the same boolean binder/
     // permission state (never parsed from the rendered line): 未連線/已授權 ->
-    // "檢查 Shizuku 並更新" (reconnectAndRefresh, 與 Refresh 按鈕的
+    // "檢查 Shizuku 並更新" (reconnectAndRefresh, 與重新連線並更新按鈕的
     // 「重新連線並更新」區分 TalkBack/視覺）; 未授權 -> "請求 Shizuku 授權"
     // (requestPermission).
     private fun updateShizukuLine() {
