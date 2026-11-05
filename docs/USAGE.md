@@ -2,21 +2,23 @@
 # 使用教學 (USAGE)
 
 > 本專案僅經由 GitHub 發佈 sideload APK，不上架 Play 商店。
-> 因此 `MANAGE_EXTERNAL_STORAGE` 等權限僅用於 GitHub 版 APK 暫存，不做 Play 政策宣告。
+> Manifest 目前宣告全檔案存取等權限，但尚未找到對應 APK staging 實作；依 #26 核對必要性。不上 Play 不是保留過寬權限的充分理由。
 > 全程不碰 Secure Folder（Knox 容器）。
 > 本文件描述包含設計目標與未完成流程；凡 [待實作]／[待實機驗證] 皆不宣稱為可用功能，
-> 未經三星實機驗證（與 README「實作狀態」標示體系一致）。
+> 驗證須依個別情境判讀，不能由正常成功案例推論所有通道與安全負向邊界。歷史 S24 寫入紀錄與本輪唯讀調查見下方更新。
+
+> **2026-11-05 更新**：[S24 調查與追蹤計畫](UX_REVIEW_S24.md) 彙整既有 #6/#9 的正常 SHELL clone/remove、手動通道證據，以及新發現與 issues #21–#29。本文較舊 F4a 的「無實機／Factory 靜態選路」敘述屬歷史階段，不代表手動重選仍未實作；未完成項目仍不得宣稱可用。
 
 ## 0. 狀態標示（與 README 一致）
 
-- [已支援] profile 解析安全邊界（只認唯一 DUAL、永不選 user 0）、`pm` 命令封裝
+- [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
-- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋F4b-P1 picker＋P2 marker，S24 抽驗：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`；`DualViewModel.selectChannel/clone/refresh`；ROOT 通道 App 內一鍵 [S24 已驗證]：切 ROOT→`cloned: com.openai.chatgpt`；真 gateway `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；`pm uninstall --user 95` 回滾＋`su -c` 重裝 [S24 已驗證]；SHIZUKU 通道 App 一鍵 [S24 已驗證]（已授權 binder 下切 SHIZUKU→就緒→CLONE 成功）；`path` 主驗證、Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]）。
+- [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；`pm path` 主驗證、Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
 - [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
-- [部分已驗證] LSPosed 載入（system hook＋daagent 新路徑＋marker 主路徑 [S24 已驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
+- [部分已驗證] LSPosed 載入（system hook 雙方法 deoptimize＋hooked [S24 已驗證]、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取） [S24 已驗證]、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效） [S24 已驗證]，其餘 LSPosed 寫入、非空政策 [待實機驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端；其中
   `install-existing --user 95`＋`pm list packages --user 95` 二次確認
-  [S24 已驗證]：ChatGPT `com.openai.chatgpt`，shell 通道，兩次獨立成功）。
+  [S24 已驗證]：裸 pm shell 通道兩次獨立成功）。
 
 Hook 誠實聲明（`docs/HOOK.md` 第 1.1 節，本文引用不再重述為已生效）：
 hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、會記 log，
@@ -46,7 +48,7 @@ val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 
 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕與 `StateFlow` 收集＋Shizuku binder／授權生命週期已接；探測跑在與所選 gateway 同實例的真通道 elevator 上，`channelReady` 僅所選通道探測通過才 `true`（NoOp 回退則 `false` fail-closed）。
-`selectChannel()` 可切換通道（persist＋重建 gateway＋重探＋refresh）；AUTO 下 `refresh()`／`recheckPrivilege()` 重探並更新顯示（privilege／`hookActive`／`hookScopes`／`channelReady`）——顯示更新本身 [待實機驗證] DEVICE-UNVERIFIED。
+目前 `selectChannel()` 已可在 mutex 內重建 gateway、探測與刷新，`recheckPrivilege()` 也會在 AUTO 環境變化時重新選擇；不是只有啟動時的靜態 Factory。`refresh()` 本身只更新清單，不重建 `channelReady`，因此暫態失敗後不保證按 Refresh 就恢復。Auto 降級與單一恢復入口由 #25 追蹤；LSPosed 仍為拒寫的 NoOp 佔位。顯示更新本身 [待實機驗證]。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
 
@@ -82,26 +84,27 @@ adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh
 
 ## 3. 複製 / 移除流程（`adb install --user 95` 範例）
 
-以下 `95` 為雙開 profile 的 userId 範例；實際請以 App 內 `refresh()` 顯示的
-`UserInfo{...}` / `dualUserId` 為準（常見為 95 / 150，機型而異）
-（[已支援]：`core` 的 `resolveDualUserId` 解析＋拒寫邊界有單元測試；[待實機驗證]：App 內 `refresh()` 顯示尚未經三星實機驗證）。
+以下 `95` 僅為命令格式範例，不是推薦目標。App 目前 `refresh()` 顯示的名稱／ID 不提供完整平台身分保證，必須獨立核對型別、parent/group、serial 與 Samsung 證據；不能憑名稱或固定數字。
+此次 S24 的95為Dual、150為Secure Folder，這不是其他機型的固定對照。
+基本owner／歧義防護有單元測試，但完整目標安全邊界仍由 [#21](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/21) 追蹤，不能把範例當成寫入授權。
 
 ```bash
-# 1. 列出所有 profile，確認雙開 userId：只認 DUAL 字樣，且絕對不可選 user 0。
-#    若沒有 DUAL 字樣、或出現多個 DUAL（無法唯一確定），請停手：
-#    先到系統設定開啟 Dual Messenger 任一 App 再重列，切勿猜「第一個非 0 的 id」
-#    （那可能是 Work profile 或其他無關使用者，寫錯目標會動到別人的資料）。
+# 1. 列出全域 user table 作為候選參考；名稱不是寫入授權證據。
+#    必須另外核對支援版本的平台型別、parent/group、serial與Samsung身分證據。
+#    無證據、解析未知或候選衝突時停手，不能猜「第一個非0的id」、95或150。
+#    只有確認尚未建立Dual時，才考慮到三星設定建立；歧義／解析失敗不是同一原因。
 adb shell pm list users
 #   Users:
 #     UserInfo{0:Owner:13} running
 #     UserInfo{95:DUAL_APP:400} running
-#   上例唯一 DUAL 為 95；user 0（Owner）永遠不可作為 --user 目標，
-#   本 App 的 resolveDualUserId / clone / remove 遇到上述情況會直接拒絕寫入。
+#   上例名稱不能單獨證明95是安全目標；user0永遠不可作為寫入目標。
+#   目前名稱resolver與explicit-ID仍有#21追蹤的缺口，不把此範例視為安全保證。
+#   後續寫入示例僅適用於已獨立確認目標、備份並明確同意操作的情境。
 
 # 2. 將已安裝的 App 複製進雙開 profile（不會動到 Secure Folder）
 adb shell pm install-existing --user 95 com.example.chat
 
-# 3. 二次確認是否真的裝進去了
+# 3. 唯讀診斷輔助：查看套件路徑；不能只靠此命令當所有情境的成功證據。
 adb shell pm path --user 95 com.example.chat
 #   package:/data/app/.../base.apk  -> 表示成功
 
@@ -112,8 +115,7 @@ adb shell pm uninstall --user 95 com.example.chat
 - `install-existing` 僅對已存在於主 profile 的 package 有效；全新 APK 請先在主 profile 正常安裝一次。
 - 重啟注意（S24 OneUI 9 兩次觀察，假說待對照實驗）：`pm install-existing --user 95` 建立的雙開連結在硬重啟、軟重啟後各消失一次（user 0 主包與完整安裝的雙開包不受影響）；疑為開機時 DualAppManager 對非白名單條目做對帳清理，恰為本 hook 要放寬的對象。重啟後請以 `pm list packages --user <dualId>` 複驗，消失即重裝。
 - 指令失敗時請看 `msg` 欄（`Failure` / `Unknown package` / `not installed` 皆視為失敗）。
-- 本 App 的 `DualRepository.clone/remove/verify` 即為上述三指令的程式化封裝（[已支援]：`core` 層＋單元測試；
-  App 內一鍵 F4a 已接線（`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed，JVM 組裝測試覆蓋）但 App 內 Shizuku 未授權路徑／首次選路 [待實機驗證] DEVICE-UNVERIFIED（`pm path` 主驗證、marker gateway-`cat` 顯示皆未驗；已授權一鍵、ROOT 一鍵／裸 pm／su／uninstall 已在 S24 驗證，見 §0）。
+- 本 App 的 `DualRepository.clone/remove/verify` 即為上述三指令的程式化封裝（[已支援]：`core` 層＋單元測試＋JVM 組裝測試；App 真 gateway 與 readiness gating 已接線：`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed）。寫後確認以相同目標的 package listing 為準，不再只用 `pm path`（`pm path` 僅輔助診斷，不能當主驗證），錯誤／截斷判定仍待 #22。[S24 已驗證]僅限 App ROOT 一鍵、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、`su -c` 重裝、uninstall 回滾，詳見 §0 與 [S24 調查](UX_REVIEW_S24.md) §5；App ROOT 之外的完整 binder／授權矩陣、App 內 Shizuku 未授權路徑／首次選路、marker gateway-`cat` 顯示及當前 source 可追溯部署仍 [待實機驗證]。
 
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
@@ -127,8 +129,8 @@ adb shell pm uninstall --user 95 com.example.chat
 
 | 症狀 | 原因 / 解法 |
 | --- | --- |
-| 標題列顯示 `(NONE)`（F4a 已接線，[待實機驗證]） | `(NONE)` 僅表示所選通道探測未通過（NoOp 回退／su 缺失／binder 未連線或未授權／探測失敗，fail-closed 唯讀）；重做第 2 節裝置設定／授權後 `refresh()`／`recheckPrivilege()` 會重探，真通道探測通過即切換——但切換本身 DEVICE-UNVERIFIED，未經實機驗證 |
-| `no dual profile` | 三星尚未建立雙開 profile；先到系統設定開啟 Dual Messenger 任一 App |
+| `(NONE)` 或「通道未就緒」 | 先區分所選 gateway、探測能力與 Shizuku binder／授權。未就緒時會拒寫，但 Refresh 本身不重新探測；重選模式或回到前景才會觸發相應重探，仍不保證 Auto 失敗降級。單一恢復流程由 #25 追蹤，不能以標題權限代替實際通道狀態。 |
+| `no dual profile` | 可能是未建立、候選歧義或輸出無法解析，不能一律解讀為尚未建立。先唯讀核對平台身分；不確定即停止寫入，見 #21/#27 |
 | `Failure [INSTALL_FAILED_...]` | 來源 APK 不存在或儲存空間不足；先確認主 profile 已安裝該 App |
 | Play 審查相關警告 | 本專案不發 Play 版，請一律使用 GitHub Release 的 APK |
 
@@ -137,9 +139,9 @@ adb shell pm uninstall --user 95 com.example.chat
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
   fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection, and `pm path` as ground truth are unverified; in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
 - Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then refresh (status switches only when the Shizuku probe passes; otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
-- Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm path --user`;
+- Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm list packages --user` ground truth (not `pm path` alone);
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).
-  `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click and authorized-SHIZUKU one-click verified on S24; Shizuku unauthorized flows and end-to-end remain DEVICE-UNVERIFIED.
+  `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked, daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; Shizuku unauthorized flows, first-time selection, binder dead-guidance, `pm path` as ground truth, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED; outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
 - Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
   any package yet.
-- GitHub sideload builds only; no Play release, so `MANAGE_EXTERNAL_STORAGE` needs no Play filing.
+- GitHub sideload builds only; no Play release. Manifest `MANAGE_EXTERNAL_STORAGE`/`REQUEST_INSTALL_PACKAGES` necessity is still under review per #26 — not shipping on Play does not justify overbroad permissions.
