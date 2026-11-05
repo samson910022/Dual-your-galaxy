@@ -89,9 +89,12 @@ val privilege: Privilege = when {
 5. Hook path (ROOT) may bypass shell by calling the dual-app service directly.
 6. Concurrency boundary (#24; busy = `UiState.loading`, merge = coalesce):
    `opMutex` serializes probe/refresh/clone/remove; rapid refresh taps coalesce
-   into one trailing run, clone/remove dedup by op key (`already in progress`,
-   separate clone/remove namespaces); every repo call runs via `onIo` on
-   `Dispatchers.IO`.
+   into one trailing run, clone/request-remove/confirm dedup by op key (`already in progress`,
+   three namespaces `clone:<pkg>` / `request-remove:<pkg>` / `remove:<pkg>@<id>#<serial>#<ts>` generation-bound by serial);
+   every repo call runs via `onIo` on `Dispatchers.IO`.
+   Write replies `timedOut ‖ transportUnknown ‖ isPostSpawnTransportText ‖ isServiceTimeoutText` go verify-first (single bounded read-only `verifyListProbe`, never resend the write).
+   Reverse observations are always Unknown (present-after-remove / absent-after-clone never claim StillInstalled/VerifyFailed); before/after pin drift → `VerifyUnknown` (identity-changed).
+   `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
 
 ## Non-Goals
 
