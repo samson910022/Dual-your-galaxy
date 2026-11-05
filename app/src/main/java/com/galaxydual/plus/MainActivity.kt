@@ -187,10 +187,12 @@ class MainActivity : ComponentActivity() {
     }
 
     // Shared binder/permission event handling: re-probe privilege and update
-    // state, reloading lists when the channel may be usable.
+    // state, reloading lists when the channel may be usable. P25: the
+    // reread path uses the single reconnectAndRefresh entry (probe with Auto
+    // degrade + refresh); the dead-binder path only re-probes (a refresh
+    // right now could only fail).
     private fun onShizukuChanged(reread: Boolean) {
-        vm.recheckPrivilege()
-        if (reread) vm.refresh()
+        if (reread) vm.reconnectAndRefresh() else vm.recheckPrivilege()
         updateShizukuLine()
     }
 
@@ -233,8 +235,9 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
         }
         refreshBtn = Button(this).apply {
-            text = "Refresh"
-            setOnClickListener { vm.refresh() }
+            // P25 single entry: probe (with Auto degrade) + refresh in one tap.
+            text = "重新連線並更新"
+            setOnClickListener { vm.reconnectAndRefresh() }
         }
         permBtn = Button(this).apply {
             text = "請求 Shizuku 授權"
@@ -308,14 +311,16 @@ class MainActivity : ComponentActivity() {
     private fun rowParams(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
-    // Permission button: no binder -> nothing to request (re-probe keeps the
-    // honest NONE state); authorized -> just reload; otherwise ask Shizuku.
+    // Permission button: no binder -> single reconnect entry (probe keeps the
+    // honest NONE state); authorized -> single reconnect entry (probe+refresh);
+    // otherwise ask Shizuku. The button text mirrors the same split in
+    // updateShizukuLine so文案/動作一致.
     private fun requestShizukuPermission() {
         try {
             if (!Shizuku.pingBinder()) {
-                vm.recheckPrivilege()
+                vm.reconnectAndRefresh()
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                vm.refresh()
+                vm.reconnectAndRefresh()
             } else {
                 Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
             }
@@ -327,8 +332,11 @@ class MainActivity : ComponentActivity() {
 
     // Shizuku binder/authorization line, read live (never cached): pingBinder
     // guards checkSelfPermission so a dead binder shows 未連線, not a crash.
+    // P25: the permission button text follows the same state so文案/動作一致:
+    // 未連線/已授權 -> "重新連線並更新" (reconnectAndRefresh); 未授權 ->
+    // "請求 Shizuku 授權" (requestPermission).
     private fun updateShizukuLine() {
-        shizukuView.text = try {
+        val state: String = try {
             if (!Shizuku.pingBinder()) {
                 "Shizuku：binder 未連線（需安裝並啟動 Shizuku）"
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
@@ -339,21 +347,37 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             "Shizuku：狀態未知（${e.message}）"
         }
+        shizukuView.text = state
+        try {
+            permBtn.text = if (state.contains("未授權")) "請求 Shizuku 授權" else "重新連線並更新"
+        } catch (_: Exception) {
+            // Best effort: updateShizukuLine may run before buildUi in tests.
+        }
     }
 
     // Renders one UiState: privilege indicator, Shizuku line (live), channel
     // picker state + hook signal, both lists, button enabled state, and the
-    // MsgKind-styled status line.
+    // MsgKind-styled status line. P25: shows the resolved gateway (actual
+    // channel backing the repo) with its exec identity, not just the routed
+    // device summary + preference -- so an explicit SHIZUKU pick with ROOT
+    // available reports SHELL/SHIZUKU, never "正在使用 ROOT".
     private fun render(s: UiState) {
-        val channel =
-            if (!s.channelReady) "${s.privilege}（通道未就緒）" else s.privilege.toString()
-        privilegeView.text = "權限：$channel"
-        // Title mirrors the routed privilege for quick manual verification.
-        title = "GalaxyDual Plus ($channel)"
-        // Picker state: persisted selection (restart remembers it via
-        // SharedPreferences; see factory). Always shown so the user can tell
-        // which channel the lists/privilege above were produced with.
-        channelView.text = "通道：${s.channel}（選擇已持久化，重啟 App 記住）"
+        val readyMark = if (s.writeReady) "已就緒" else "未就緒（唯讀）"
+        val readMark = if (s.readCap) "可用" else "不可用"
+        privilegeView.text = "權限：${s.execIdentity}（實際通道 ${s.resolvedGateway}" +
+            "・$readyMark；裝置路由 ${s.privilege}・讀取$readMark）"
+        // Title mirrors the actual execution identity (not the routed
+        // summary) for quick manual verification.
+        title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
+        // Picker state: persisted preference + actual resolved gateway
+        // (restart remembers the preference via SharedPreferences; see
+        // factory). Always shown so the user can tell which channel the
+        // lists/privilege above were produced with. The Auto degrade note
+        // rides here too so the reason survives even when msg is cleared.
+        channelView.text = buildString {
+            append("通道偏好：${s.channel}・實際：${s.resolvedGateway}（選擇已持久化，重啟 App 記住）")
+            if (s.degradeNote.isNotEmpty()) append("；${s.degradeNote}")
+        }
         // Hook signal: LSPosed mode only. ACTIVE shows the recorded scopes as
         // a historical marker (existence evidence only, boot freshness
         // unconfirmed); INACTIVE shows 未偵測到 plus the enable hint; UNKNOWN shows

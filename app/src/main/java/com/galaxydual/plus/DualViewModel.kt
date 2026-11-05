@@ -97,8 +97,14 @@ enum class MsgKind {
 
 // UI state for the dual-app MVP screen; plain data with no Android types
 // except the core Privilege enum. One column per concern: privilege shows the
-// routed elevation decision, profiles/cloned the device ground truth, loading
-// the in-flight flag, and msg (+msgKind) the user-facing status.
+// routed elevation decision, channel the persisted preference, resolvedGateway
+// the actual gateway backing the repo (P25: preference vs actual split, so an
+// explicit SHIZUKU pick with ROOT available never misreports "using ROOT"),
+// execIdentity the declared privilege of that gateway, readCap whether the
+// device proved any channel, writeReady whether the selected channel proved
+// itself, degradeNote the Auto probe-based degrade explanation (empty when
+// none), profiles/cloned the device ground truth, loading the in-flight flag,
+// and msg (+msgKind) the user-facing status.
 data class UiState(
     // Routed elevation level from the elevator probes (ROOT/SHELL/NONE).
     val privilege: Privilege = Privilege.NONE,
@@ -109,7 +115,25 @@ data class UiState(
     // False until the selected real gateway's own probe succeeds (F4a): a
     // su-backed repo needs the su probe (ROOT), a Shizuku-backed repo the
     // Shizuku probe (SHELL); a NoOp repo (NONE) is never ready. Fail closed.
+    // Legacy alias of writeReady (kept so existing callers/tests compile).
     val channelReady: Boolean = false,
+    // Actual gateway backing the repo (P25). For explicit choices this equals
+    // the preference mapping; for AUTO it is the probe-based degrade result
+    // (su denied + Shizuku proven -> SHIZUKU, both fail -> NOOP).
+    val resolvedGateway: ResolvedChannel = ResolvedChannel.NOOP,
+    // Declared privilege of resolvedGateway (ROOT/SHELL/NONE). This is the
+    // actual execution identity, distinct from the routed device summary
+    // above (e.g. explicit SHIZUKU + ROOT available: routed=ROOT but
+    // execIdentity=SHELL).
+    val execIdentity: Privilege = Privilege.NONE,
+    // Device proved at least one channel (hasRoot || hasShizuku).
+    val readCap: Boolean = false,
+    // Selected channel proved itself (same gate as channelReady).
+    val writeReady: Boolean = false,
+    // Auto probe-based degrade explanation (P25). Non-empty only for AUTO
+    // when the probes overrode the file heuristic (su denied -> Shizuku) or
+    // when both probes failed (read-only). Explicit choices clear it.
+    val degradeNote: String = "",
     // Hook-enable signal from the cross-process marker file (F4b-P2).
     // Refreshed on every probe (recheckPrivilege/selectChannel cover all UI
     // entry points). Honest existence+scope evidence only: the marker
@@ -252,6 +276,10 @@ class DualViewModel(
         Boolean,
         String,
     ) -> ChannelAssembly = ::assembleChannel,
+    // Last Auto probe-based degrade explanation (P25). Recomputed on every
+    // probe when preference==AUTO (see degradeAutoLocked); cleared on
+    // explicit selection. Copied into UiState.degradeNote by probeChannels.
+    private var autoDegradeNote: String = "",
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -279,6 +307,8 @@ class DualViewModel(
     private val _state = MutableStateFlow(
         UiState(
             channel = preference,
+            resolvedGateway = currentChannel,
+            execIdentity = gatewayPrivilege,
             msg = "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀",
             msgKind = MsgKind.CHANNEL,
         ),
@@ -1222,6 +1252,8 @@ class DualViewModel(
     // re-resolved first (the environment may have changed since process
     // start: Shizuku started/granted, su appeared). An explicit non-AUTO
     // choice is never overridden here: only selectChannel() changes it.
+    // P25: swapAutoLocked is probe-based (su present but probe-denied +
+    // Shizuku proven -> degrade to SHIZUKU with a recorded reason).
     fun recheckPrivilege() {
         // Single-flight coalesce (P2-2): same gate shape as refresh(). A tap
         // while a recheck is in flight (including waiting on opMutex behind
@@ -1249,6 +1281,21 @@ class DualViewModel(
                 }
             } finally {
                 if (recheckJob === myJob) recheckJob = null
+            }
+        }
+    }
+
+    // Single "reconnect and update" entry (P25, issue #25): probe (with Auto
+    // degrade) + refresh in one mutex hold, so a Shizuku binder/permission
+    // lifecycle event never races an in-flight refresh. MainActivity routes
+    // both the Refresh button ("重新連線並更新") and the Shizuku
+    // dead/authorized paths here.
+    fun reconnectAndRefresh() {
+        viewModelScope.launch {
+            opMutex.withLock {
+                if (preference == ChannelPreference.AUTO) swapAutoLocked()
+                probeChannels()
+                refreshLocked()
             }
         }
     }
@@ -1303,23 +1350,80 @@ class DualViewModel(
         selectJob = job
     }
 
-    // Re-resolves AUTO against the live environment and swaps the gateway
-    // only when the resolution actually changed (preserves the Shizuku
+    // Re-resolves AUTO against live probes and swaps the gateway only when
+    // the probe-based resolution actually changed (preserves the Shizuku
     // binder cache on the common no-change path). Must run under opMutex.
+    // P25 probe-based (issue #25): su file presence alone never grants ROOT;
+    // the elevators are probed for actual capability and resolveAutoProbe
+    // decides: su present but probe-denied + Shizuku proven -> SHIZUKU with
+    // autoDegradeNote recording the reason; both fail -> NOOP read-only;
+    // both succeed -> ROOT (F4a order). Explicit choices never reach here.
     private suspend fun swapAutoLocked() {
+        var hasRoot = false
+        var hasShizuku = false
+        for (elevator in elevators) {
+            try {
+                when (onIo { elevator.probe() }.level) {
+                    Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
+                    Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
+                    Privilege.NONE -> Unit
+                }
+            } catch (_: Exception) {
+                // A throwing probe means no channel from this elevator.
+            }
+        }
+        degradeAutoLocked(hasRoot, hasShizuku)
+    }
+
+    // Applies a probe result to the AUTO selection (P25). Records the degrade
+    // reason and swaps the repo gateway without changing the persisted
+    // preference (preference stays AUTO; currentChannel/resolvedGateway moves).
+    // Elevator instances are reused so fake-injected tests and the Shizuku
+    // binder cache survive the swap. Must run under opMutex.
+    private suspend fun degradeAutoLocked(hasRoot: Boolean, hasShizuku: Boolean) {
         val suPresent = try {
             suPresentCheck()
         } catch (_: Exception) {
             false
         }
-        val shizukuAuth = try {
-            shizukuAuthCheck()
-        } catch (_: Exception) {
-            false
+        val decision = resolveAutoProbe(suPresent, hasRoot, hasShizuku)
+        autoDegradeNote = decision.degradeNote
+        if (decision.channel != currentChannel) {
+            swapToResolvedLocked(decision.channel)
         }
-        val resolved = ChannelPreference.AUTO.resolveChannel(suPresent, shizukuAuth)
-        if (resolved != currentChannel) {
-            swapToLocked(ChannelPreference.AUTO)
+    }
+
+    // Switches the repo gateway to an already-decided ResolvedChannel while
+    // keeping preference==AUTO (P25 degrade path). Reuses the existing
+    // suGateway/shizukuGateway (and their elevators) so probes keep verifying
+    // the actual channels and the Shizuku binding is not dropped on a
+    // no-op. Must run under opMutex.
+    private suspend fun swapToResolvedLocked(desired: ResolvedChannel) {
+        val old = activeGateway
+        val newGateway: CmdGateway = when (desired) {
+            ResolvedChannel.ROOT -> suGateway
+            ResolvedChannel.SHIZUKU -> shizukuGateway
+            ResolvedChannel.NOOP,
+            ResolvedChannel.LSPOSED_PLACEHOLDER,
+            -> NoOpGateway()
+        }
+        activeGateway = newGateway
+        repo = DualRepository(newGateway)
+        gatewayPrivilege = newGateway.privilege
+        currentChannel = desired
+        _state.update {
+            it.copy(
+                channel = preference,
+                resolvedGateway = desired,
+                execIdentity = newGateway.privilege,
+            )
+        }
+        if (old !== newGateway && old is ShizukuCmdGateway) {
+            try {
+                old.close()
+            } catch (_: Exception) {
+                // Best effort: the stale binding dies with the process anyway.
+            }
         }
     }
 
@@ -1331,6 +1435,9 @@ class DualViewModel(
     // opMutex. A swapped-out Shizuku gateway releases its cached binding.
     // Builds through assembleChannelFn (production: the shared
     // assembleChannel; tests: fake-backed assemblies).
+    // P25: an explicit choice clears the Auto degrade note (explicit never
+    // crosses channels); an AUTO file-heuristic swap keeps the note until
+    // probeChannels recomputes it from live probes.
     private suspend fun swapToLocked(pref: ChannelPreference) {
         val suPresent = try {
             suPresentCheck()
@@ -1352,11 +1459,19 @@ class DualViewModel(
         elevators = listOf(SuElevator(suGateway), ShizukuElevator(shizukuGateway))
         preference = pref
         currentChannel = asm.channel
-        _state.update { it.copy(channel = pref) }
+        if (pref != ChannelPreference.AUTO) autoDegradeNote = ""
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
-        // 由使用者重新 request。suspend 且在 opMutex 下，兩次 update 沒問題。
-        _state.update { it.copy(pendingRemove = null) }
+        // 由使用者重新 request。
+        _state.update {
+            it.copy(
+                channel = pref,
+                resolvedGateway = asm.channel,
+                execIdentity = asm.gateway.privilege,
+                degradeNote = if (pref == ChannelPreference.AUTO) autoDegradeNote else "",
+                pendingRemove = null,
+            )
+        }
         if (old !== activeGateway && old is ShizukuCmdGateway) {
             try {
                 old.close()
@@ -1372,10 +1487,18 @@ class DualViewModel(
     //
     // Phase F4a (issue #6): the factory injects elevators backed by the real
     // su/Shizuku gateways, so these probes verify the actual channels.
-    // channelReady is true ONLY when the repo's own gateway channel proved
-    // itself (su repo needs the su/ROOT probe, Shizuku repo the
-    // Shizuku/SHELL probe, NoOp repo never). A selected-but-unproven channel
-    // stays read-only: fail closed, never a fake working channel.
+    // channelReady/writeReady is true ONLY when the repo's own gateway
+    // channel proved itself (su repo needs the su/ROOT probe, Shizuku repo
+    // the Shizuku/SHELL probe, NoOp repo never). A selected-but-unproven
+    // channel stays read-only: fail closed, never a fake working channel.
+    // P25 (issue #25): the result is split five ways -- preference
+    // (channel) vs resolvedGateway (currentChannel) vs execIdentity
+    // (gatewayPrivilege) vs readCap (device proved any channel) vs
+    // writeReady (selected channel proved). For AUTO the same probe results
+    // drive degradeAutoLocked (su denied + Shizuku proven -> SHIZUKU with a
+    // recorded reason; both fail -> NOOP; both succeed -> ROOT), so the
+    // startup file heuristic is corrected on the first probe. Explicit
+    // choices never cross channels here (only AUTO degrades).
     // DEVICE-UNVERIFIED: probe/exec round-trips never ran on a device.
     // PR-3 stage 1 (issue #24): drives loading like every other op (entry sets
     // busy, the single exit update below clears it, the catch path clears it
@@ -1400,6 +1523,13 @@ class DualViewModel(
                     if (e is CancellationException) throw e
                 }
             }
+            // P25: AUTO follows live probes, not the startup file heuristic.
+            // Init and recheck paths reach here without a prior swap, so the
+            // degrade must live here (idempotent with swapAutoLocked above).
+            if (preference == ChannelPreference.AUTO) {
+                degradeAutoLocked(hasRoot, hasShizuku)
+            }
+            val degradeNoteForState = if (preference == ChannelPreference.AUTO) autoDegradeNote else ""
             // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
             // the router encodes that priority, probes only feed it.
             // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
@@ -1412,6 +1542,7 @@ class DualViewModel(
             // H2/H4 pure gate (unit-tested by ChannelReadyTest): identical to
             // the inline when it replaces. Hook signal stays display-only (#19).
             val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku)
+            val readCap = hasRoot || hasShizuku
             // Hook diagnostic signal for the LSPosed picker row (F4b-P2, P1
             // split). Runs on EVERY probe -- including an explicit-LSPosed
             // selection with an unproven/NoOp write channel -- and reads through
@@ -1445,33 +1576,59 @@ class DualViewModel(
                 HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
             }
             val hookDesc = hook.displayText()
+            // P25 messages: explicit choices never cross channels -- the text
+            // states the selected-mode reason plus the optional recovery
+            // entry (switch to Auto or tap "重新連線並更新").
+            val notReadyMsg: String = when {
+                currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER -> {
+                    // LSPosed mode semantics (F4b-P2): the gateway is still
+                    // the NoOp placeholder (whitelist policy branch pending),
+                    // so the channel is honestly never ready. The message
+                    // states the reason plus the hook signal; it never claims
+                    // the channel can execute.
+                    "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
+                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
+                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」"
+                }
+                gatewayPrivilege == Privilege.NONE -> {
+                    if (degradeNoteForState.isNotEmpty()) degradeNoteForState
+                    else "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀；" +
+                        "請檢查授權後點「重新連線並更新」"
+                }
+                else -> {
+                    "所選模式 $preference（${gatewayPrivilege} 通道）探測未通過，" +
+                        "寫入已禁用（明選不跨通道）；" +
+                        "可切到 Auto 或點「重新連線並更新」重試"
+                }
+            }
+            // When degraded-but-ready (Auto -> SHIZUKU proven), surface the
+            // degrade note as INFO so the reason is visible even though writes
+            // work; otherwise ready means silent.
+            val readyMsg = degradeNoteForState
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
-            // kind == NONE 才保留原 msg/msgKind，CHANNEL/FAILED 穿透，不保留。
-            // 其他欄位照寫（loading/hook/ready 照常更新）。
+            // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
+            // 其他欄位照寫（loading/hook/ready/resolved/exec/caps 照常更新）。
             _state.update { cur ->
                 val base = cur.withHookDiagnosis(hook).copy(
                     loading = false,
                     channel = preference,
                     privilege = routed,
                     channelReady = ready,
-                    msg = if (ready) {
-                        ""
-                    } else if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
-                        // LSPosed mode semantics (F4b-P2): the gateway is still
-                        // the NoOp placeholder (whitelist policy branch pending),
-                        // so the channel is honestly never ready. The message
-                        // states the reason plus the hook signal; it never claims
-                        // the channel can execute.
-                        "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                            "寫入已拒絕；Hook 狀態：$hookDesc"
-                    } else if (gatewayPrivilege == Privilege.NONE) {
-                        "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀"
+                    resolvedGateway = currentChannel,
+                    execIdentity = gatewayPrivilege,
+                    readCap = readCap,
+                    writeReady = ready,
+                    degradeNote = degradeNoteForState,
+                    msg = if (ready) readyMsg else notReadyMsg,
+                    msgKind = if (ready) {
+                        if (readyMsg.isNotEmpty()) MsgKind.INFO else MsgKind.NONE
                     } else {
-                        "通道未就緒：已選 ${gatewayPrivilege} 通道但探測未通過，寫入已禁用"
+                        MsgKind.CHANNEL
                     },
-                    msgKind = if (ready) MsgKind.NONE else MsgKind.CHANNEL,
                     )
-                if (cur.pendingRemove != null && base.msgKind == MsgKind.NONE) {
+                if (cur.pendingRemove != null &&
+                    (base.msgKind == MsgKind.NONE || base.msgKind == MsgKind.INFO)
+                ) {
                     base.copy(msg = cur.msg, msgKind = cur.msgKind)
                 } else {
                     base
@@ -1481,7 +1638,7 @@ class DualViewModel(
         // Never swallow coroutine cancellation (see refreshLocked); probes
         // report via privilege/channelReady, but guard against
         // unexpected throws so loading never wedges busy. pendingRemove 開著
-        // 時新 kind == NONE 才保留，CHANNEL/FAILED 穿透，不保留。
+        // 時新 kind == NONE/INFO 才保留，CHANNEL/FAILED 穿透，不保留。
         if (e is CancellationException) throw e
         _state.update { cur ->
             val next = cur.copy(
@@ -1489,7 +1646,9 @@ class DualViewModel(
                 msg = "probe failed: ${e.message ?: e.javaClass.simpleName}",
                 msgKind = MsgKind.FAILED,
             )
-            if (cur.pendingRemove != null && next.msgKind == MsgKind.NONE) {
+            if (cur.pendingRemove != null &&
+                (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+            ) {
                 next.copy(msg = cur.msg, msgKind = cur.msgKind)
             } else {
                 next
@@ -1517,17 +1676,28 @@ class DualViewModel(
                 it.copy(
                     loading = false,
                     msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc",
+                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
+                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
                     msgKind = MsgKind.INVALID,
                 )
             }
             return false
         }
         if (!cur.channelReady) {
+            // P25: explicit never crosses channels -- state the selected-mode
+            // reason plus the optional recovery entry.
+            val reason = if (cur.degradeNote.isNotEmpty() && cur.channel == ChannelPreference.AUTO) {
+                cur.degradeNote
+            } else if (gatewayPrivilege == Privilege.NONE) {
+                "未選中真通道（NoOp 回退），目前為唯讀；請檢查授權後點「重新連線並更新」"
+            } else {
+                "所選模式 ${cur.channel}（${gatewayPrivilege} 通道）探測未通過，" +
+                    "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
+            }
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "通道未就緒：未選中真通道或所選通道探測未通過，寫入已禁用",
+                    msg = reason,
                     msgKind = MsgKind.CHANNEL,
                 )
             }
