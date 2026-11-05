@@ -21,7 +21,9 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.hook.HookMarker
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -2208,5 +2210,406 @@ class AutoDegradeTest {
         assertEquals("已就緒", base.copy(writeReady = true, pmReadable = true).readyMark())
         assertEquals("探測通過，PM不可讀", base.copy(writeReady = true, pmReadable = false).readyMark())
         assertEquals("探測通過，PM未確認", base.copy(writeReady = true, pmReadable = null).readyMark())
+    }
+
+    // Phase 3 F1: cold-start AUTO degrade keeps evidence consistent
+    // (degrade-first, so the round's evidence binds the post-degrade
+    // generation). After init degrades ROOT -> SHIZUKU, a manual LSPOSED
+    // diagnosis must still reach ACTIVE through the retained Shizuku
+    // instance, and a second recheck must not flip the resolution.
+    @Test
+    fun phase3_coldStartAutoDegrade_evidenceConsistent() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        shizukuFake.markerContent = marker
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+        val degraded = vm.state.value
+        assertTrue("degrade note expected, got: \"${degraded.degradeNote}\"", degraded.degradeNote.contains("降級"))
+        assertTrue(degraded.writeReady)
+
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val parked = vm.state.value
+        assertEquals(HookStatus.ACTIVE, parked.hookStatus)
+        assertFalse("diagnosis must never raise writeReady", parked.writeReady)
+    }
+
+    // Phase 3 F2/P3: cross-gate waiting stays busy. A recheck arriving while
+    // a refresh tail is gated on `pm list packages` must read loading=true
+    // for the whole wait (leading busy set synchronously at launch).
+    @Test
+    fun phase3_crossGateRecheckDuringGatedRefresh_staysBusy() {
+        val gate = CompletableDeferred<Unit>()
+        val listPackagesCalls = AtomicInteger(0)
+        val suFake = object : CmdGateway {
+            override val privilege: Privilege = Privilege.ROOT
+            val idUCalls = AtomicInteger(0)
+            private fun usersOut(): String =
+                "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{95:DualApp:400} running\n"
+            private fun verboseOut(): String =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            private fun dumpsysOut(): String =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            override suspend fun run(cmd: String): CmdResult = when {
+                cmd.trim() == "id -u" -> {
+                    idUCalls.incrementAndGet()
+                    CmdResult(exit = 0, out = "0\n", err = "")
+                }
+                cmd == DualRepository.CMD_LIST_USERS ->
+                    CmdResult(exit = 0, out = usersOut(), err = "")
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = verboseOut(), err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = "95\n", err = "")
+                cmd.startsWith("pm list packages") -> {
+                    if (listPackagesCalls.incrementAndGet() == 1) gate.await()
+                    CmdResult(exit = 0, out = "", err = "")
+                }
+                else -> CmdResult(exit = 0, out = "ok", err = "")
+            }
+        }
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = DualViewModel(
+            repo = DualRepository(suFake),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = shizukuFake,
+            activeGateway = suFake,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+
+        vm.refresh()
+        await { listPackagesCalls.get() >= 1 }
+        vm.recheckPrivilege()
+        val busyDeadline = System.currentTimeMillis() + 300
+        while (System.currentTimeMillis() < busyDeadline) {
+            assertTrue(
+                "recheck queued behind a gated refresh tail must stay busy, state=${vm.state.value}",
+                vm.state.value.loading,
+            )
+            Thread.sleep(10)
+        }
+        gate.complete(Unit)
+        await(timeoutMs = 10_000L) { !vm.state.value.loading && vm.state.value.writeReady }
+        assertTrue(vm.state.value.writeReady)
+    }
+
+    // Phase 3 F3: id-ok/pm-fail refuses writes (fail-closed PM gate). Probe
+    // passes (writeReady true) but `pm list users` proved unreadable, so
+    // clone must be refused with the PM message and run zero device writes.
+    @Test
+    fun phase3_pmUnreadable_refusesWrite() {
+        val suFake = FakeSu(rootOk = true)
+        suFake.pmListOk = false
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == false }
+        assertTrue("probe gate stays true on `id -u == 0`", vm.state.value.writeReady)
+
+        val idUBefore = suFake.idUCalls
+        vm.clone("com.example.chat")
+        await { !vm.state.value.loading && vm.state.value.msg.contains("PM 不可讀") }
+        val s = vm.state.value
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue("refusal must name PM unreadability, got: \"${s.msg}\"", s.msg.contains("PM 不可讀"))
+        assertTrue("probe gate unchanged by the refusal", s.writeReady)
+        assertEquals("refused clone must not run new probes", idUBefore, suFake.idUCalls)
+        assertFalse("refused clone must not claim success", s.msg.contains("cloned:"))
+    }
+
+    // Phase 3 F4: a swap that never completes (cancelled/failed assembly)
+    // must never persist: stored stays != memory is forbidden.
+    @Test
+    fun phase3_failedSwap_neverPersists() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val persisted = mutableListOf<ChannelPreference>()
+        val failingFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            throw CancellationException("test cancel before swap")
+        }
+        val vm = DualViewModel(
+            repo = DualRepository(suFake),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = persisted::add,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { true },
+            suGateway = suFake,
+            shizukuGateway = shizukuFake,
+            activeGateway = suFake,
+            currentChannel = ResolvedChannel.ROOT,
+            assembleChannelFn = failingFactory,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading }
+        vm.selectChannel(ChannelPreference.SHIZUKU)
+        Thread.sleep(500)
+        assertTrue("failed swap must never persist, got: $persisted", persisted.isEmpty())
+        assertEquals("in-memory preference unchanged", ChannelPreference.AUTO, vm.state.value.channel)
+    }
+
+    // Phase 3 F5 (CE successor convention): a select cancelled mid-probe by
+    // a newer tap settles without a wedge -- the successor owns loading and
+    // the final state converges (loading false, last channel wins).
+    @Test
+    fun phase3_cancelThenReselect_loadingSettles() {
+        val probeGate = java.util.concurrent.atomic.AtomicReference<CompletableDeferred<Unit>?>(null)
+        val idUCalls = AtomicInteger(0)
+        val suFake = object : CmdGateway {
+            override val privilege: Privilege = Privilege.ROOT
+            private fun usersOut(): String =
+                "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{95:DualApp:400} running\n"
+            private fun verboseOut(): String =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            private fun dumpsysOut(): String =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            override suspend fun run(cmd: String): CmdResult = when {
+                cmd.trim() == "id -u" -> {
+                    idUCalls.incrementAndGet()
+                    probeGate.get()?.await()
+                    CmdResult(exit = 0, out = "0\n", err = "")
+                }
+                cmd == DualRepository.CMD_LIST_USERS ->
+                    CmdResult(exit = 0, out = usersOut(), err = "")
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = verboseOut(), err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = "95\n", err = "")
+                cmd.startsWith("pm list packages") ->
+                    CmdResult(exit = 0, out = "", err = "")
+                else -> CmdResult(exit = 0, out = "ok", err = "")
+            }
+        }
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = DualViewModel(
+            repo = DualRepository(suFake),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { true },
+            suGateway = suFake,
+            shizukuGateway = shizukuFake,
+            activeGateway = suFake,
+            currentChannel = ResolvedChannel.ROOT,
+            assembleChannelFn = reuseFactory,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading }
+        idUCalls.set(0)
+        probeGate.set(CompletableDeferred())
+
+        vm.selectChannel(ChannelPreference.ROOT)
+        await { idUCalls.get() >= 1 }
+        assertTrue("loser select must hold busy while its probe is gated", vm.state.value.loading)
+        vm.selectChannel(ChannelPreference.SHIZUKU)
+        probeGate.getAndSet(null)?.complete(Unit)
+        await(timeoutMs = 10_000L) {
+            !vm.state.value.loading && vm.state.value.channel == ChannelPreference.SHIZUKU
+        }
+        val s = vm.state.value
+        assertEquals(ChannelPreference.SHIZUKU, s.channel)
+        assertFalse("successor must settle loading (no CE wedge)", s.loading)
+        assertTrue("winner SHIZUKU with proven shell must be writable", s.writeReady)
+    }
+
+    // Phase 3 F6: non-LSPOSED diagnosis uses the same identity gate as
+    // LSPOSED. A stale caller-supplied list holding a displaced old ROOT
+    // instance must not serve `cat` even though the current probe passed.
+    @Test
+    fun phase3_nonLsposedStaleList_excluded() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val staleSu = FakeSu(rootOk = true)
+        staleSu.markerContent = marker
+        val vm = DualViewModel(
+            repo = DualRepository(suFake),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+            preference = ChannelPreference.ROOT,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = shizukuFake,
+            activeGateway = suFake,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { listOf(staleSu) },
+        )
+        vms.add(vm)
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val s = vm.state.value
+        assertTrue("readiness follows the current probe", s.writeReady)
+        assertEquals(
+            "stale instance must never serve `cat`",
+            0,
+            staleSu.catCalls,
+        )
+        assertTrue(
+            "stale-only candidates must yield UNKNOWN_*, got: ${s.hookStatus}",
+            s.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                s.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+    }
+
+    // Phase 3 F8: same-pref select skips the rebuild (no factory churn) but
+    // still re-probes + refreshes.
+    @Test
+    fun phase3_samePrefSelect_skipsRebuild() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val factoryCalls = AtomicInteger(0)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            factoryCalls.incrementAndGet()
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        factoryCalls.set(0)
+        val idUBefore = suFake.idUCalls
+        vm.selectChannel(ChannelPreference.AUTO)
+        await { !vm.state.value.loading && suFake.idUCalls > idUBefore }
+        Thread.sleep(200)
+        await { !vm.state.value.loading }
+        assertEquals("same-pref select must not rebuild", 0, factoryCalls.get())
+        assertEquals(ChannelPreference.AUTO, vm.state.value.channel)
+        assertTrue("same-pref select still re-probes", vm.state.value.writeReady)
+    }
+
+    // Phase 3 F7: AUTO recovery/upgrade back to ROOT is silent by design
+    // (empty note). Only downward overrides record a reason.
+    @Test
+    fun phase3_autoUpgradeToRoot_silent() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
+        assertTrue("downward note expected, got: \"${vm.state.value.degradeNote}\"", vm.state.value.degradeNote.contains("唯讀"))
+
+        suFake.rootOk = true
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.ROOT }
+        val s = vm.state.value
+        assertTrue("upgraded ROOT must be writable", s.writeReady)
+        assertTrue("upgrade to ROOT is silent by design, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
     }
 }
