@@ -5,11 +5,18 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 # Phase A1: least-privilege top-level permissions (checkout + cache only need read).
 permissions:
   contents: read
+
+# Phase 1: cancel same-ref pile-up (rapid pushes / PR syncs).
+# push is main-only so feature commits run once via pull_request (no push+PR double).
+# cancel-in-progress is false only for direct push to refs/heads/main; PR merge refs (refs/pull/N/merge) still cancel superseded runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:
