@@ -312,6 +312,21 @@ class DualViewModel(
     // probe when preference==AUTO (see degradeAutoLocked); cleared on
     // explicit selection. Copied into UiState.degradeNote by probeChannels.
     private var autoDegradeNote: String = "",
+    // Phase A P2 regression fix: verified diagnostic capability cache.
+    // AUTO full probes (which probe all elevators) record the proven channels
+    // here; an explicit-LSPOSED round probes none, so its diagnosis filters
+    // hookDiagnosticGateways() by this cache instead of the current (empty)
+    // probe result -- restoring the pre-P25-Item-3 behavior where a true
+    // channel diagnosed the marker even under the NoOp selection, without
+    // re-introducing `su -c id -u` probes on the LSPOSED path (no new su auth
+    // prompt). Diagnostic-only: never feeds routing/readiness (hook-neutral,
+    // #19). Cold-start LSPOSED (empty cache) diagnoses via direct reads only,
+    // so UNKNOWN_NO_DIAGNOSTIC there is correct, not a bug. Mutable: updated
+    // on AUTO probes only (explicit single-channel probes are partial and
+    // LSPOSED probes none, so neither may wipe it); survives selectChannel
+    // swaps. Test seam: constructor injection allows manual cache setup.
+    private var lastVerifiedHasRoot: Boolean = false,
+    private var lastVerifiedHasShizuku: Boolean = false,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -319,9 +334,10 @@ class DualViewModel(
     // real-channel gateways INDEPENDENT of the selected write channel, so an
     // explicit-LSPosed (NoOp) selection still diagnoses through any
     // probe-verified ROOT/SHIZUKU channel; probeChannels further gates that
-    // list by hasRoot/hasShizuku (an unproven gateway is not a diagnostic
-    // path). Never throws by contract; probeChannels guards with try/catch
-    // regardless.
+    // list by hasRoot/hasShizuku for non-LSPOSED, and by the
+    // lastVerifiedHasRoot/Shizuku AUTO cache for LSPOSED (an unproven gateway
+    // is not a diagnostic path). Never throws by contract; probeChannels
+    // guards with try/catch regardless.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
     // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
@@ -1649,6 +1665,11 @@ class DualViewModel(
         preference = pref
         currentChannel = asm.channel
         if (pref != ChannelPreference.AUTO) autoDegradeNote = ""
+        // Phase A P2: lastVerifiedHasRoot/Shizuku deliberately SURVIVES here
+        // (unlike autoDegradeNote): it records environment capability proven
+        // by the last AUTO full probe, so a later explicit-LSPOSED selection
+        // can still diagnose via those already-authorized channels without
+        // new probes.
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
         // 由使用者重新 request。
@@ -1737,6 +1758,16 @@ class DualViewModel(
             val probe = reusedProbe ?: probeOnce()
             val hasRoot = probe.hasRoot
             val hasShizuku = probe.hasShizuku
+            // Phase A P2 regression fix: record AUTO-verified capability for
+            // later LSPOSED diagnosis. AUTO probes all elevators, so its
+            // result is the diagnostic ground truth. Explicit rounds must NOT
+            // touch the cache: LSPOSED probes none (would wipe to false) and
+            // explicit single-channel probes are partial (would misrepresent
+            // the environment). Diagnostic-only: never feeds routing/readiness.
+            if (preference == ChannelPreference.AUTO) {
+                lastVerifiedHasRoot = hasRoot
+                lastVerifiedHasShizuku = hasShizuku
+            }
             // P25: AUTO follows live probes, not the startup file heuristic.
             // Only the entry without a prior swap (init / selectChannel-AUTO)
             // degrades here; recheck/reconnect already degraded via
@@ -1764,11 +1795,17 @@ class DualViewModel(
             // selection with an unproven/NoOp write channel -- and reads through
             // INDEPENDENT diagnostic paths: direct MarkerReads first, then `cat`
             // over probe-verified real gateways only (a declared-ROOT/SHELL
-            // gateway whose probe failed is not a usable path). Diagnosis never
-            // feeds `ready`/`routed` above (hook-neutral) and an unproven channel
-            // never executes anything except via a verified diagnostic gateway.
-            // No true channel + unreadable direct reads maps to
-            // UNKNOWN_NO_DIAGNOSTIC, never to inactive.
+            // gateway whose probe failed is not a usable path). Phase A P2 fix:
+            // LSPOSED probes none, so the current hasRoot/hasShizuku are always
+            // false here; filter by the AUTO-verified cache instead (no new
+            // `su -c id -u` probe, no new su auth prompt -- the `cat` itself
+            // reuses already-authorized channels per the #27 contract).
+            // Cold-start LSPOSED (empty cache) yields empty usable, so diagnosis
+            // is direct-only and UNKNOWN_NO_DIAGNOSTIC there is correct.
+            // Diagnosis never feeds `ready`/`routed` above (hook-neutral) and
+            // an unproven channel never executes anything except via a verified
+            // diagnostic gateway. No true channel + unreadable direct reads maps
+            // to UNKNOWN_NO_DIAGNOSTIC, never to inactive.
             val hook: HookDiagnosis = try {
                 withContext(Dispatchers.IO) {
                     val direct = try {
@@ -1783,9 +1820,15 @@ class DualViewModel(
                         if (e is CancellationException) throw e
                         emptyList()
                     }
-                    val usable = candidates.filter {
-                        (it.privilege == Privilege.ROOT && hasRoot) ||
-                            (it.privilege == Privilege.SHELL && hasShizuku)
+                    val usable = when (preference) {
+                        ChannelPreference.LSPOSED -> candidates.filter {
+                            (it.privilege == Privilege.ROOT && lastVerifiedHasRoot) ||
+                                (it.privilege == Privilege.SHELL && lastVerifiedHasShizuku)
+                        }
+                        else -> candidates.filter {
+                            (it.privilege == Privilege.ROOT && hasRoot) ||
+                                (it.privilege == Privilege.SHELL && hasShizuku)
+                        }
                     }
                     diagnoseHookState(direct, usable)
                 }
