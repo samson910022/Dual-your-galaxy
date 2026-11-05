@@ -777,7 +777,8 @@ class InventorySelectionTest {
         vm.cloneSelected()
         vm.clone("com.example.good")
         // 同步斷言：慢批次仍在 IO 停留，單筆拒絕訊息不可能被覆寫。
-        assertEquals("already in progress: com.example.good", vm.state.value.msg)
+        // 新 base 口徑：msg 內包名經 sanitizeForDisplay 遮蔽為 <pkg>。
+        assertEquals("already in progress: <pkg>", vm.state.value.msg)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         assertEquals(2, vm.state.value.batchReport!!.successCount)
