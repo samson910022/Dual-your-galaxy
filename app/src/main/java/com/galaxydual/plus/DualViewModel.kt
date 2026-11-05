@@ -423,17 +423,6 @@ class DualViewModel(
     // entries right after with the new generation). A test factory reusing
     // the same fake keeps the generation, exercising the match branch.
     private var evidenceGeneration: Long = 0L,
-    // Channel assembly seam: production passes real assembleChannel (fresh
-    // SuCmdGateway/ShizukuCmdGateway every swap); tests inject a fake
-    // factory returning countable CmdGateway fakes (same vs new instances
-    // per test) so selectChannel + rebuild runs for real instead of
-    // constructor-injecting booleans. Signature mirrors assembleChannel.
-    private val assembleChannelFn: (
-        ChannelPreference,
-        Boolean,
-        Boolean,
-        String,
-    ) -> ChannelAssembly = ::assembleChannel,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -2052,8 +2041,8 @@ class DualViewModel(
                 }
                 gatewayPrivilege == Privilege.NONE -> {
                     if (degradeNoteForState.isNotEmpty()) degradeNoteForState
-                    else "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀；" +
-                        "請檢查授權後點「重新連線並更新」"
+                    else "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
+                        "寫入已禁用；請檢查授權後點「重新連線並更新」"
                 }
                 else -> {
                     "所選模式 $preference（${gatewayPrivilege} 通道）探測未通過，" +
@@ -2157,8 +2146,8 @@ class DualViewModel(
             val reason = if (cur.degradeNote.isNotEmpty() && cur.channel == ChannelPreference.AUTO) {
                 cur.degradeNote
             } else if (gatewayPrivilege == Privilege.NONE) {
-                "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀；" +
-                    "請檢查授權後點「重新連線並更新」"
+                "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
+                    "寫入已禁用；請檢查授權後點「重新連線並更新」"
             } else {
                 "所選模式 ${cur.channel}（${gatewayPrivilege} 通道）探測未通過，" +
                     "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
