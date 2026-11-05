@@ -78,11 +78,28 @@ Verify (two different things — do not confuse):
   ```
 
 - APK file checksum = integrity of one specific file, changes every
-  build. Check with:
+  build. Two cases — do not mix the filenames:
+  - Locally signed file (local-only): `app-release-signed.apk` plus
+    its sidecar `app-release-signed.apk.sha256` in the same folder.
+    Check with:
 
-  ```bash
-  sha256sum -c app-release-signed.apk.sha256
-  ```
+    ```bash
+    sha256sum -c app-release-signed.apk.sha256
+    ```
+
+  - GitHub Release download: `app-release.apk` plus `SHA256SUMS.txt`
+    in the same folder. Check with:
+
+    ```bash
+    sha256sum -c SHA256SUMS.txt
+    ```
+
+    Optionally confirm the signing key on the downloaded APK:
+
+    ```bash
+    apksigner verify --print-certs app-release.apk
+    # compare the SHA-256 digest of certificate with the canonical value
+    ```
 
   A fingerprint mismatch means a different key; a checksum mismatch
   means a corrupted/modified file. Transcribe fingerprints exactly —
