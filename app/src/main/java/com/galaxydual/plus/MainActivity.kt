@@ -427,7 +427,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
-    // (buildDiagnosticExport 經兩道遮蔽：先包名後路徑，大小受限)；只有使用者
+    // (buildDiagnosticExport 經四道遮蔽：先郵件後包名後 IP，最後路徑，大小受限)；只有使用者
     // 主動點按才顯示，無自動上傳、無網路呼叫、無後台傳送。
     // P2-4 誠實文案：遮蔽仍非全面保證，標題與按鈕須明示「分享前請人工確認」，
     // 不得只寫「已遮蔽」使人誤信絕對乾淨。
@@ -455,7 +455,7 @@ class MainActivity : ComponentActivity() {
                             diagnosticExportCopyText(state),
                         ),
                     )
-                    msgView.text = "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳，分享前請人工確認）"
+                    msgView.text = DIAGNOSTIC_COPY_SUCCESS_TEXT
                     msgView.setTextColor(colorFor(MsgKind.INFO))
                 } catch (e: Exception) {
                     msgView.text = "複製失敗：${sanitizeForDisplay(e.message ?: "unknown")}"
@@ -683,7 +683,7 @@ class MainActivity : ComponentActivity() {
         // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
         // 本地確認畫面必須顯示完整 package + label + user/serial，
         // 不經 sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
-        // 診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
+        // 診斷匯出/日誌仍經四道遮蔽（見 buildDiagnosticExport）。
         val message = buildRemoveConfirmMessage(
             pkg = pending.pkg,
             appLabel = appLabel,
@@ -824,8 +824,8 @@ internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildSt
         append("診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}")
         if (expanded) {
             if (diag.exit != null) append("\n  exit=${diag.exit}")
-            // 本機顯示經 sanitizeForDisplay (control 壓空白+兩道遮蔽+take500，
-            // 與其他顯示一致；匯出為兩道遮蔽全量，見 buildDiagnosticExport)。
+            // 本機顯示經 sanitizeForDisplay (control 壓空白+四道遮蔽+take500，
+            // 與其他顯示一致；匯出為四道遮蔽全量，見 buildDiagnosticExport)。
             if (diag.techDetail.isNotEmpty()) {
                 append("\n  細節（本機顯示遮蔽版，與匯出一致）：")
                 append("${sanitizeForDisplay(diag.techDetail)}（點此收合）")
@@ -841,6 +841,11 @@ internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildSt
 // 使用者主動觸發才複製，不做自動傳輸/share。
 const val DIAGNOSTIC_COPY_BUTTON_TEXT = "複製已遮蔽內容（分享前請人工確認）"
 
+// StageD D4 剪貼簿複製成功訊息（頂層 const，JVM 可測）：維持使用者主動觸發+
+// 警示，補「用後請清除剪貼簿」並保留「僅本機剪貼簿」（不做自動傳輸/share）。
+const val DIAGNOSTIC_COPY_SUCCESS_TEXT =
+    "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳，分享前請人工確認，用後請清除剪貼簿）"
+
 // 診斷行無障礙描述 (含展開狀態，供 contentDescription + 切換宣告)。
 internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
     val diag = s.diagnose
@@ -855,7 +860,7 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 // sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
 // m3 行注入防護：pkg/appLabel/profileLabel 先過 sanitizeUserEcho
 // (保原文、去換行，不 redact)，結構換行保留，欄位內換行壓空白；
-// 診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
+// 診斷匯出/日誌仍經四道遮蔽（見 buildDiagnosticExport）。
 // - pkg：待移除完整包名（raw，呼叫端傳 pending.pkg）。
 // - appLabel：PackageManager 解析顯示名；失敗時呼叫端回退傳 pkg
 //  （見 resolveAppLabel），兩種皆須含完整 pkg + user/serial。

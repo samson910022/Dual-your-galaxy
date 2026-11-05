@@ -14,9 +14,10 @@
 // - Hook 時間證據: 沿用 HookStateProvider 的四態 + scope，另加 queriedAtMs
 //   (App 何時查的) 與 markerTimeMs (marker 內 timeMs 行，HookMarker.parseTimeMs)。
 // - DiagnoseEvent: 穩定錯誤碼 + 繁中摘要/下一步 + 可展開 exit/技術 detail
-//   (大小受限，純顯示)。匯出經兩道遮蔽 (契約)：先 redactPii (包名等
-//   dotted token -> <pkg>)，再 redactPaths (含 / 路徑 token -> <path>)；
-//   順序固定 (先包名後路徑)，僅使用者預覽/主動匯出，無自動上傳
+//   (大小受限，純顯示)。匯出經四道遮蔽 (契約)：先 redactEmail (郵件 →
+//   <email>)，再 redactPii 內包名 (dotted token -> <pkg>)+IP (-> <ip>)，
+//   最後 redactPaths (含 / 路徑 token -> <path>)；
+//   順序固定 (先郵件後包名後 IP，最後路徑)，僅使用者預覽/主動匯出，無自動上傳
 //   (本檔案無任何網路呼叫)。本機展開顯示亦用同一遮蔽 (見 MainActivity)。
 // - 時間一律 wall-clock (System.currentTimeMillis)：有回撥/偽造風險，僅為
 //   存在性證據，絕不作授權依據。needsRefresh 把未來時間戳 (now < queryTime)
@@ -366,28 +367,49 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
     is ProfilesSnapshot.ChannelError -> diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = detail)
 }
 
-// 個資遮蔽 (純函數)：把 dotted 包名 token 換成 <pkg>，數字 uid/serial 不動
-// (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
-// 匯出/預覽一律先過此函數再過 redactPaths (先包名後路徑，順序固定)；
+// 個資遮蔽 (純函數)：四道——郵件→包名→IP→路徑 (順序固定)。
+// - redactEmail：[\w.+-]+@[\w.-]+ → <email> (須置於包名之前：
+//   foo@example.com 的 example.com 會被 PKG_TOKEN 誤判為包名，若包名先走
+//   會碎成 foo@<pkg> 殘留 local-part；郵件先走整段吞入，不殘留)。
+//   PKG_TOKEN/ChannelError tech 可含 UserInfo 整行，故自由文字 label 的
+//   郵件亦須遮 (PATH_TOKEN 不處理無斜線郵件)。
+// - redactPii：dotted 包名 token → <pkg>，數字 uid/serial/exit 不動
+//   (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
+// - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>)；數字 uid/serial/exit
+//   (user 95/serial 15/exit=0) 刻意保留可讀性，不動。
+// 匯出/預覽一律先過郵件再過包名+IP (見 redactPii 實作) 最後過 redactPaths；
 // 無自動上傳 (本模組無網路呼叫)。
 private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
+private val EMAIL_TOKEN = Regex("[\\w.+-]+@[\\w.-]+")
+private val IP_TOKEN = Regex("(?:\\d{1,3}\\.){3}\\d{1,3}")
 
-fun redactPii(text: String): String = PKG_TOKEN.replace(text, "<pkg>")
+internal fun redactEmail(text: String): String = EMAIL_TOKEN.replace(text, "<email>")
 
-// 路徑遮蔽 (純函數，第二道)：把含 / 的完整路徑延展換成 <path>。
-// 保守遮蔽（fail-closed，寧可過度遮蔽不洩漏）：由前斜線起延展，含空白
-// （裝置路徑可含空格，如 /sdcard/My Wedding/Photo 001.png，舊 Regex
+internal fun redactIp(text: String): String = IP_TOKEN.replace(text, "<ip>")
+
+fun redactPii(text: String): String = redactIp(PKG_TOKEN.replace(redactEmail(text), "<pkg>"))
+
+// 路徑遮蔽 (純函數，末道)：把含 / 的完整路徑延展換成 <path>。
+// 保守遮蔽（fail-closed，寧可過度遮蔽不洩漏）：由前斜線起延展，含 U+0020
+// 空格（裝置路徑可含空格，如 /sdcard/My Wedding/Photo 001.png，舊 Regex
 // "/[\w./-]+" 遇空格即斷裂殘留 "My Wedding/Photo 001.png"，故延展須含
-// 空白），遇換行/控制字元/引號（"'`）/特定分隔（<>|*?）才止；未列入止集
-// 者一律吞入（含空格與標點，同一行尾隨文案可能被連帶遮蔽，可接受）。
+// 空格；精確化：僅 U+0020 空格，TAB (\t, U+0009) 屬 \u0000-\u001F 止集不吞），
+// 遇換行/控制字元/引號（"'`）/特定分隔（<>|*?）才止；未列入止集
+// 者一律吞入（含 U+0020 空格與標點，同一行尾隨文案可能被連帶遮蔽，可接受）。
 // Unicode 支援：延展採否定字元集（未排除者全收），自然含 \p{L}（CJK 中文
 // 如 /sdcard/照片/婚禮照 001.png 全遮）；\w（[A-Za-z0-9_]，Kotlin Regex
 // \w 不含中文）已棄用，刻意不用白名單（白名單本身即外洩面）。
 // 心智驗證："/sdcard/My Wedding/Photo 001.png" 全遮；Unicode 路徑全遮；
 // 引號路徑（"/sdcard/a b.png"）止於引號、內部全遮；日期 "2026-11-05 12:34"
 // 無斜線不受影響；純中文文案無斜線不受影響；"exit=0" 無斜線不受影響。
-// 與 redactPii 順序固定為先包名後路徑。
+// 順序固定為先郵件後包名後 IP，最後路徑 (見 redactPii + sanitizeForDisplay)。
 // 已知取捨（保留現狀，僅文件化，採 (a) 不改 regex 只補註解+鎖單測）：
+// - 遮蔽順序碎裂：先包名後路徑，故 "/data/data/com.example.chat/files"
+//   先包名得 "/data/data/<pkg>/files" (PKG 吞掉中段)，再路徑因止集含 <>
+//   切成 "<path><pkg><path>" 三段碎裂；無 raw 外洩但洩結構訊號 (三段式，
+//   暗示中段為 dotted token)，可接受；不得為此調順序 (路徑先走會整吞包名
+//   雖整潔，但郵件域名先遮才能保 local-part 不殘留，順序以郵件優先為準)。
+//   單測鎖定二選一 (整遮 <path> 或碎裂 <path><pkg><path> 皆可，禁 raw)。
 // - "a/b" 類正常文案會被誤傷為 <path>（fail-closed，可接受：
 //   遮蔽過度只損可讀性，不洩個資；白名單本身即外洩面，刻意不做）。
 // - 反斜線（C:\...）仍超出 Android 威脅模型，不處理
@@ -399,15 +421,16 @@ fun redactPii(text: String): String = PKG_TOKEN.replace(text, "<pkg>")
 //   不為此放寬止集（放寬即外洩面）。
 // - 裸 / 非敏感不斷言：單一 "/"（如 "a / b"）雖命中 regex，但非路徑個資，
 //   單測不斷言裸 / 被遮（見 redactPaths_globTail_residual 鎖定殘留語意）。
-// - 相對路徑超出模型：無前斜線者（如 "sdcard/a.png"）從不命中，超出本函數
-//   威脅模型（裝置路徑皆為絕對路徑），不處理。
+// - 相對路徑中 / 起子段仍會被遮（實測 sdcard/a.png → sdcard<path>，
+//   因其中 "/a.png" 命中 PATH_TOKEN），屬過遮可接受；裝置路徑皆為絕對路徑，
+//   相對路徑不另設模型；不處理反斜線 (見上)。
 // - 遮蔽仍非全面保證（見匯出文案「分享前請人工確認」），不得宣稱絕對乾淨。
 private val PATH_TOKEN = Regex("/\\S[^\n\r\u0000-\u001F\u007F\"'`<>|*?]*")
 
 internal fun redactPaths(text: String): String = PATH_TOKEN.replace(text, "<path>")
 
-// 顯示前淨化 (純函數)：壓 control 字元 (含換行) 為單空白，再走兩道遮蔽
-// (先包名後路徑)，最後 take(500) 有界。所有直接 catch 的 e.message 插值
+// 顯示前淨化 (純函數)：壓 control 字元 (含換行) 為單空白，再走四道遮蔽
+// (先郵件後包名後 IP，最後路徑：redactPii 內含郵件→包名→IP，外層再套路徑)，最後 take(500) 有界。所有直接 catch 的 e.message 插值
 // (VM 5 處 + Activity 2 處) 顯示前一律經此函數；經 gateway detail 進 msg
 // 的間接鏈 (snap.detail/res.detail/channelDetail) 亦經此函數覆蓋。
 // techDetail 顯示前同理 (之後再 take MAX_DIAG_DETAIL_CHARS)。
@@ -442,7 +465,7 @@ fun redactPackage(pkg: String): String {
 fun buildDiagnosticExport(state: UiState): String {
     // m2 匯出行注入防護 (入口全量清洗，與 redact 同層；顯示側不動)：
     // 使用者/通道可控字串 (source/techDetail/detail/scopes) 先過
-    // CONTROL_CHARS→" " (全量，不截斷)，再進兩道遮蔽；結構換行
+    // CONTROL_CHARS→" " (全量，不截斷)，再進四道遮蔽 (郵件→包名→IP→路徑)；結構換行
     // (appendLine 自身) 保留，只壓欄位內換行，避免偽造匯出行。
     fun clean(s: String): String = s.replace(CONTROL_CHARS, " ")
     val sb = StringBuilder()
@@ -482,7 +505,7 @@ fun buildDiagnosticExport(state: UiState): String {
             "查詢於=${formatTimeMs(state.hookQueriedAtMs)}",
     )
     sb.appendLine("通道：偏好=${state.channel} 實際=${state.resolvedGateway} 執行身份=${state.execIdentity}")
-    // 兩道遮蔽 (順序固定：先包名後路徑)，與 sanitizeForDisplay/本機顯示一致。
+    // 四道遮蔽 (順序固定：先郵件後包名後 IP，最後路徑)，與 sanitizeForDisplay/本機顯示一致。
     val redacted = redactPaths(redactPii(sb.toString()))
     return if (redacted.length <= MAX_DIAG_EXPORT_CHARS) redacted else redacted.take(MAX_DIAG_EXPORT_CHARS)
 }
