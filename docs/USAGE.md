@@ -102,7 +102,7 @@ fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 `verifyState` 回 `Unknown`、`verify` Boolean 回 `false`（已 `@Deprecated`）、
 `listClonedPackages` 回 `null`，不探測目標、不寫入（仍做 snapshot＋identity fetch 唯讀）。
 `pm list users` 的名稱僅供顯示，永不進入授權判定；user 0 永遠不可作為寫入目標。
-CLONE 僅認全 token 精確拼寫（`profile.CLONE` 及其 `_`/`-`/空白分隔符變體，大小寫-insensitive）；`CLONE_extra`／`CLONE-EXTRA`／`CLONE.X`／`CLONEable` 等未知後綴一律非 CLONE（fail closed）。type 行內非 profile token 的附註文字（如括號說明）予以忽略（註釋容忍，見 `SamsungProfileAdapter` KDoc）；`profile.CLONE/evil` 類斜線尾詞同屬忽略（已知 trade-off，usertype 真值不含此形）。
+CLONE 僅認全 token 精確拼寫：`profile`＋單點 `.` 或 1–3 個列舉分隔符（空格／`_`／`-`/Tab）＋全字 `clone`（大小寫-insensitive）；`!`／`?`／`:`／`/` 等任意標點分隔一律非 CLONE（fail closed）；`CLONE_extra`／`CLONE-EXTRA`／`CLONE.X`／`CLONEable` 等未知後綴一律非 CLONE；`profile.CLONE/evil` 類斜線尾詞一律非 CLONE（tainted→OTHER，不再忽略；唯一例外是 `/` 後緊接另一個 `profile` token，如 `MANAGED/profile.CLONE`，此時走雙 token 混合→UNKNOWN，仍拒寫）。type 行內非 profile token 的附註文字予以忽略。
 此次 S24 的 95 為 Dual、150 為 Secure Folder，這不是其他機型的固定對照。
 執行前核對 serial/parent（ID 重用防護，Phase D）：auto 路徑攜帶 resolve 時 identity
 作 `expected`，guard 以 fresh 比對——同 id 但 serial／parent 雙邊皆有且不等即拒
