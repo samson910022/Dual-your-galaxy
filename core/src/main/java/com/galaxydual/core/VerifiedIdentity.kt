@@ -15,6 +15,20 @@ package com.galaxydual.core
 // is always rethrown and must never be swallowed by callers.
 // Phase D: fetchVerifiedTarget() is the single source; fetchVerifiedDualId()
 // delegates to it (target?.userId ?: -1, behavior unchanged).
+//
+// Truncation (PR-2, issue #22; cross-PR review follow-up): identity evidence
+// truncation must fail closed on every channel. isIdentityChannelOk
+// (issue #21 gate) only judges exit + error-semantic lines and never sees
+// the capture flag, so an exit-0 truncated `cmd user list -v` / `dumpsys user`
+// would otherwise parse as a partial candidate set and could hide a
+// conflicting CLONE candidate yet still confirm a single id. Any truncated
+// identity capture therefore maps to null (unknown/refused) without parsing.
+// Relation to gates: #21 owns WHO may be targeted (cross-source agreement);
+// #22 owns HOW a capture is trusted (truncated capture is untrusted, never
+// presence/absence evidence). A truncated property is NOT "no claim":
+// it may hide a mismatch, so it also refuses (null). isSuccess() itself is
+// unchanged: install/uninstall outputs are assumed small and keep the
+// exit + error-line rule (Phase C2 issue #8).
 internal suspend fun CmdGateway.fetchVerifiedDualId(): Int =
     fetchVerifiedTarget()?.userId ?: -1
 
@@ -49,6 +63,7 @@ internal suspend fun CmdGateway.fetchVerifiedTarget(): VerifiedTarget? {
         if (e is kotlin.coroutines.cancellation.CancellationException) throw e
         return null
     }
+    if (verboseRes.truncated || dumpsysRes.truncated) return null
     if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return null
     if (!PmOutputParser.isIdentityChannelOk(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) return null
     if (!PmOutputParser.isIdentityChannelOk(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return null
@@ -58,6 +73,9 @@ internal suspend fun CmdGateway.fetchVerifiedTarget(): VerifiedTarget? {
         if (e is kotlin.coroutines.cancellation.CancellationException) throw e
         null
     }
+    // Truncated property is not "no claim": a cut payload may hide a
+    // mismatch, so fail closed to null (same review item as above).
+    if (propRes != null && propRes.truncated) return null
     val propertyId = propRes
         ?.takeIf { PmOutputParser.isIdentityChannelOk(it.out + "\n" + it.err, it.exit) }
         ?.let { PmOutputParser.parseDualPropertyId(it.out) }
