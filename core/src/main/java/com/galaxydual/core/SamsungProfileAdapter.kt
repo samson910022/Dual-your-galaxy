@@ -47,13 +47,20 @@ object SamsungProfileAdapter {
     // isSupportedCloneToken (full token exact match), now the sole
     // authorization entry (no substring/regex fallback remains).
 
-    // Standalone `profile.X` token extractor (separator-tolerant,
+    // Standalone `profile.X` token extractor (separator-enumerated,
     // case-insensitive). Matches dot form (`profile.CLONE`) or 1-3
-    // non-alphanumeric separators plus a name (`profile_CLONE`,
-    // `profile-CLONE`, `profile CLONE`). The name class is
-    // `[A-Za-z0-9_.-]+` so suffixes are never truncated (`profile.CLONE-EXTRA`
-    // stays one token instead of being cut to `profile.CLONE`); `/` remains
-    // a terminator (residual tolerance: `a/b` splits tokens).
+    // enumerated separators (space/`_`/`-`/Tab) plus a name
+    // (`profile_CLONE`, `profile-CLONE`, `profile CLONE`). Only `.`/`_`/`-`/
+    // whitespace (space/Tab) 1-3 chars count as separators; `!`/`?`/`:`/`/`
+    // and any other punctuation are NOT separators and yield no token
+    // (fail closed: `profile!CLONE`/`profile:::CLONE`/`profile/CLONE` are
+    // OTHER via the no-token path, never CLONE). Consecutive enumerated
+    // separators (e.g. double space) are still tolerated as documented
+    // leniency. The name class is `[A-Za-z0-9_.-]+` so suffixes are never
+    // truncated (`profile.CLONE-EXTRA` stays one token instead of being cut
+    // to `profile.CLONE`); `/` remains a terminator (residual tolerance:
+    // `a/b` splits tokens; a trailing `/...` after CLONE is handled by
+    // TAINTED_CLONE_TAIL, not by the extractor).
     // Zero-separator glued forms (`profileCloneable`) yield no token by
     // construction.
     // Used for token-level type uniqueness (P1-1): each type mention's
@@ -62,15 +69,34 @@ object SamsungProfileAdapter {
     // any other `profile.X` token counts as other evidence. Kept
     // boundary-free by spec; callers ignore matches glued to a preceding
     // ASCII letter/digit (`myprofile.CLONE`) so they fall back to OTHER.
-    private val PROFILE_TOKEN = Regex("profile(?:\\.[A-Za-z0-9_.-]+|[^A-Za-z0-9]{1,3}[A-Za-z0-9_.-]+)", RegexOption.IGNORE_CASE)
+    private val PROFILE_TOKEN = Regex("profile(?:\\.[A-Za-z0-9_.-]+|[ _\\-\\t]{1,3}[A-Za-z0-9_.-]+)", RegexOption.IGNORE_CASE)
 
-    // Full-token CLONE allowlist (P1 full-token boundary): `profile` + 1-3
-    // non-alphanumeric separators + `clone`, whole-token match,
-    // case-insensitive. `profile.CLONE`/`profile_CLONE`/`profile-CLONE`/
-    // `profile CLONE` -> true; `profile.CLONE_extra`/`profile.CLONE-EXTRA`/
-    // `profile.CLONE.X`/`profileCloneable` -> false.
+    // Full-token CLONE allowlist (P1 full-token boundary, P1-R6 enumerated):
+    // `profile` + single `.` OR 1-3 enumerated separators (space/`_`/`-`/
+    // Tab) + full word `clone`, whole-token match, case-insensitive.
+    // `profile.CLONE`/`profile_CLONE`/`profile-CLONE`/`profile CLONE`
+    // (incl. consecutive enumerated separators such as double space) ->
+    // true; `profile.CLONE_extra`/`profile.CLONE-EXTRA`/`profile.CLONE.X`/
+    // `profileCloneable` -> false; `profile!CLONE`/`profile?CLONE`/
+    // `profile:CLONE`/`profile:::CLONE`/`profile/CLONE` -> false (arbitrary
+    // punctuation is never a separator).
     private fun isSupportedCloneToken(token: String): Boolean =
-        Regex("^profile[^A-Za-z0-9]{1,3}clone$", RegexOption.IGNORE_CASE).matches(token)
+        Regex("^profile(?:\\.clone|[ _\\-\\t]{1,3}clone)$", RegexOption.IGNORE_CASE).matches(token)
+
+    // Tainted CLONE tail (P1-R6 fail-closed): a CLONE token (dot form or
+    // enumerated separators) followed by optional whitespace + `/`, where
+    // the `/` does NOT open another `profile` token. `profile.CLONE/evil`,
+    // `profile.CLONE/` and `profile.CLONE / evil` match (tainted -> OTHER);
+    // `profile.MANAGED/profile.CLONE` does not match (the `/` opens another
+    // `profile` token, so the mention still goes through the normal
+    // two-token UNKNOWN rule). Relation to the `/` terminator: PROFILE_TOKEN
+    // intentionally stops at `/`, which would otherwise let the trailing
+    // word silently drop and leave a clean CLONE token; this guard re-adds
+    // the trailing-slash signal so such mentions fail closed to OTHER
+    // (single tainted CLONE) instead of CLONE. A mixed `CLONE, CLONE/evil`
+    // mention is likewise OTHER (fail closed, never CLONE-by-priority).
+    private val TAINTED_CLONE_TAIL =
+        Regex("profile(?:\\.|[ _\\-\\t]{1,3})clone\\s*/(?!\\s*profile)", RegexOption.IGNORE_CASE)
 
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
@@ -203,6 +229,14 @@ object SamsungProfileAdapter {
     // - Same mention holding both clone and other tokens is an intra-mention
     //   contradiction -> UNKNOWN for the block (covers whitespace, `/`,
     //   `,`, `;` or any other separator, since tokens ignore separators).
+    // - Tainted CLONE tail (P1-R6 fail-closed): within one mention, a CLONE
+    //   token followed by optional whitespace + `/` (not opening another
+    //   `profile` token, see TAINTED_CLONE_TAIL) taints the mention: a
+    //   single `profile.CLONE/evil` (or trailing-slash) mention has
+    //   segClone forced false and segOther forced true -> OTHER for the
+    //   block; `profile.MANAGED/profile.CLONE` is untainted (slash opens
+    //   another `profile` token) and stays on the two-token UNKNOWN rule;
+    //   a mixed `CLONE, CLONE/evil` mention is OTHER (fail closed).
     // - Block verdict: any intra-mention contradiction -> UNKNOWN; else
     //   hasCloneSeg && hasOtherSeg (across mentions) -> UNKNOWN
     //   (cross-mention contradiction); else CLONE / OTHER / UNKNOWN.
@@ -223,8 +257,11 @@ object SamsungProfileAdapter {
                 hasOtherSeg = true
                 continue
             }
-            val segClone = tokens.any { isSupportedCloneToken(it) }
-            val segOther = tokens.any { !isSupportedCloneToken(it) }
+            // Tainted CLONE tail fails the mention closed: a `/...` tail
+            // (not opening another profile token) can never be CLONE.
+            val tainted = TAINTED_CLONE_TAIL.containsMatchIn(value)
+            val segClone = tokens.any { isSupportedCloneToken(it) } && !tainted
+            val segOther = tokens.any { !isSupportedCloneToken(it) } || tainted
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true
@@ -246,8 +283,10 @@ object SamsungProfileAdapter {
                 hasOtherSeg = true
                 continue
             }
-            val segClone = tokens.any { isSupportedCloneToken(it) }
-            val segOther = tokens.any { !isSupportedCloneToken(it) }
+            // Same taint rule as the explicit-value path above.
+            val tainted = TAINTED_CLONE_TAIL.containsMatchIn(remainder)
+            val segClone = tokens.any { isSupportedCloneToken(it) } && !tainted
+            val segOther = tokens.any { !isSupportedCloneToken(it) } || tainted
             if (segClone && segOther) return ProfileUserType.UNKNOWN
             if (segClone) hasCloneSeg = true
             if (segOther) hasOtherSeg = true

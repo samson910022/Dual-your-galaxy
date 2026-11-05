@@ -1121,4 +1121,151 @@ class DualSafetyTest {
             },
         )
     }
+
+    // Phase A P1-R6 enumerated-separator e2e (owner BLOCKER): both channels
+    // type user 95 as `android.os.usertype.profile!CLONE` (parent 0, serial
+    // 15, prop 95). `!` is not an enumerated separator, so the mention
+    // yields no token -> OTHER on both channels; resolution is -1 and every
+    // entry refuses with zero target commands (notably zero
+    // `pm list packages --user` probes).
+    @Test
+    fun cloneBangSeparatorBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseBang = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile!CLONE
+        """.trimIndent()
+        val dumpsysBang = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile!CLONE
+        """.trimIndent()
+        // Sanity: both punctuation blocks parse as OTHER (single-mention, no mixing).
+        assertTrue(
+            SamsungProfileAdapter.parseUserListVerbose(verboseBang).any {
+                it.userId == 95 && it.userType == ProfileUserType.OTHER
+            },
+        )
+        assertTrue(
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysBang).any {
+                it.userId == 95 && it.userType == ProfileUserType.OTHER
+            },
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseBang,
+            dumpsysOutput = dumpsysBang,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile!CLONE must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
+
+    // Phase A P1-R6 tainted-tail e2e (fail-closed): both channels type user
+    // 95 as `android.os.usertype.profile.CLONE/evil` (parent 0, serial 15,
+    // prop 95). The `/evil` tail taints the mention -> OTHER on both
+    // channels; resolution is -1 and every entry refuses with zero target
+    // commands (notably zero `pm list packages --user` probes).
+    @Test
+    fun cloneSlashTailBothChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseTainted = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE/evil
+        """.trimIndent()
+        val dumpsysTainted = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE/evil
+        """.trimIndent()
+        // Sanity: both tainted blocks parse as OTHER (single-mention, no mixing).
+        assertTrue(
+            SamsungProfileAdapter.parseUserListVerbose(verboseTainted).any {
+                it.userId == 95 && it.userType == ProfileUserType.OTHER
+            },
+        )
+        assertTrue(
+            SamsungProfileAdapter.parseDumpsysUser(dumpsysTainted).any {
+                it.userId == 95 && it.userType == ProfileUserType.OTHER
+            },
+        )
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseTainted,
+            dumpsysOutput = dumpsysTainted,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+
+        val cloneRes = runSuspend { repo.clone("com.example.chat", 95) }
+        assertEquals(1, cloneRes.exit)
+        assertTrue(cloneRes.err.startsWith("refused:"))
+
+        val removeRes = runSuspend { repo.remove("com.example.chat", 95) }
+        assertEquals(1, removeRes.exit)
+        assertTrue(removeRes.err.startsWith("refused:"))
+
+        assertTrue(
+            runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
+        )
+        assertNull(runSuspend { repo.listClonedPackages(95) })
+
+        assertTrue(
+            "profile.CLONE/evil must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no install/uninstall/list target command may run, got: ${gateway.commands}",
+            gateway.commands.none {
+                it.startsWith("pm install-existing") ||
+                    it.startsWith("pm uninstall") ||
+                    it.startsWith("pm list packages")
+            },
+        )
+    }
 }
