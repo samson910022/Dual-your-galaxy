@@ -60,11 +60,14 @@ enum class InventoryFreshness {
 // 清單快照：refresh 的 ground truth 附帶何時、何地查的。
 // - source: 查詢命令 (如 "pm list packages --user 95")，失敗時為 "pm list users"。
 // - targetId: 查證過的 dualId (NO_TARGET_ID=無目標)。
+// - targetSerial: 該目標的平台 serial (PR-37 Phase B #3 serial 綁定；null=未知/
+//   legacy，絕不單獨作為授權依據，僅與 targetId 配對比對)。
 // - queryTimeMs: wall-clock (nowWallMs)，0=從未查詢。
 // - freshness/count: 見上；count 為成功列舉筆數 (UNKNOWN/STALE 仍保留舊筆數語意由呼叫端決定)。
 data class InventorySnapshot(
     val source: String = "",
     val targetId: Int = NO_TARGET_ID,
+    val targetSerial: Int? = null,
     val queryTimeMs: Long = 0L,
     val freshness: InventoryFreshness = InventoryFreshness.UNKNOWN,
     val count: Int = 0,
@@ -111,6 +114,8 @@ fun InventorySnapshot.toStaleOrUnknown(
 ): InventorySnapshot =
     if (freshness == InventoryFreshness.FRESH) {
         // 理由見上：target 有效即覆寫 (drift 不丟)、source 沿用傳入、queryTime 保持舊值。
+        // Serial 保留：此函數只降新鮮度不改身份，呼叫端改寫目標時須另行
+        // 設定 targetSerial（新目標配新 serial，舊 serial 永不殘留到新 id）。
         copy(
             source = source,
             targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
@@ -120,6 +125,9 @@ fun InventorySnapshot.toStaleOrUnknown(
         InventorySnapshot(
             source = source,
             targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
+            // UNKNOWN 亦保留舊 serial（舊資料不謊稱新鮮亦不丟失；暫態通道失敗
+            // 不得銷毀已綁定的 serial 身份，否則 v2 持久選取會被誤判失效）。
+            targetSerial = this.targetSerial,
             queryTimeMs = now,
             freshness = InventoryFreshness.UNKNOWN,
             count = this.count,
@@ -304,6 +312,8 @@ fun CloneOutcome.toDiagnoseCode(): DiagnoseCode = when (this) {
     is CloneOutcome.InstallFailed -> DiagnoseCode.OP_FAILED
     is CloneOutcome.VerifyFailed -> DiagnoseCode.VERIFY_MISMATCH
     is CloneOutcome.VerifyUnknown -> DiagnoseCode.VERIFY_UNKNOWN
+    // 原子 pin 漂移：目標已變更、零寫入，與 VERIFY_MISMATCH 同式。
+    is CloneOutcome.TargetMismatch -> DiagnoseCode.VERIFY_MISMATCH
 }
 
 // RemoveOutcome -> 穩定碼映射。
@@ -341,6 +351,9 @@ fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseE
             if (pkg.isBlank()) "pkg not installed for user $dualId"
             else "${redactPackage(pkg)} not installed for user $dualId"
         is CloneOutcome.VerifyUnknown -> redactPii(detail)
+        is CloneOutcome.TargetMismatch ->
+            "verified id $actualId != expected $expectedId " +
+                "(serial ${actualSerial ?: "?"} != ${expectedSerial ?: "?"})"
         else -> ""
     }
     return diagnoseEvent(code, exit = exit, techDetail = tech)

@@ -94,6 +94,23 @@ sealed interface CloneOutcome {
 
     // Install reported success but the re-check channel failed: unknown.
     data class VerifyUnknown(val dualId: Int, val detail: String = "") : CloneOutcome
+
+    /**
+     * Pinned serial-bound target moved between the batch pin and this item's
+     * own snapshot (PR-37 Phase B, P1 #2 atomic pin): the caller's expected
+     * (id, serial) no longer matches the live verified target. Zero installs
+     * ran for this item. Callers map this to the existing drift handling
+     * (partial + VERIFY_MISMATCH + stop + STALE), never to a per-item
+     * failed/unknown record. [actualSerial] is null when the mismatch was
+     * caught at the id gate (serial not yet re-fetched) or when the live
+     * target carries no confirmable serial.
+     */
+    data class TargetMismatch(
+        val expectedId: Int,
+        val actualId: Int,
+        val expectedSerial: Int?,
+        val actualSerial: Int?,
+    ) : CloneOutcome
 }
 
 // Outcome of a pinned remove: resolve once, uninstall and re-check on the
@@ -858,6 +875,82 @@ class DualRepository(
             is VerifyState.Installed -> CloneOutcome.Success(dualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, state.detail)
+        }
+    }
+
+    /**
+     * Pinned clone with an expected serial-bound target (PR-37 Phase B, P1 #2
+     * atomic pin, issue #26): eliminates the preflight→clone TOCTOU by
+     * pinning inside a single flow. The caller passes the batch-time pinned
+     * ([expectedDualId], [expectedSerial]); this call snapshots, re-resolves
+     * the verified id AND the serial-bound target, and refuses (fail closed,
+     * zero installs) when either no longer matches the expectation:
+     * id mismatch (or an unresolvable id) maps to [CloneOutcome.NoDual] when
+     * nothing is confirmed, otherwise to [CloneOutcome.TargetMismatch];
+     * serial mismatch -- including a null [expectedSerial] (the caller cannot
+     * verify at all) or an unavailable live serial -- maps to
+     * [CloneOutcome.TargetMismatch]. Only a full (id, serial) match runs the
+     * original install + verify flow on [expectedDualId].
+     *
+     * Additive only: [cloneVerified] is untouched and keeps its exact
+     * behavior; single callers keep using it.
+     */
+    suspend fun cloneVerifiedExpected(
+        pkg: String,
+        expectedDualId: Int,
+        expectedSerial: Int?,
+    ): CloneOutcome {
+        val snap = profilesSnapshot()
+        if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
+        val profiles = (snap as ProfilesSnapshot.Loaded).profiles
+        val verified = fetchVerifiedDualId()
+        if (verified < 0 || expectedDualId < 0) return CloneOutcome.NoDual
+        if (verified != expectedDualId) {
+            return CloneOutcome.TargetMismatch(
+                expectedId = expectedDualId,
+                actualId = verified,
+                expectedSerial = expectedSerial,
+                // Id gate fires before the serial re-fetch below, so the
+                // live serial is not yet known here (null, documented).
+                actualSerial = null,
+            )
+        }
+        if (profiles.none { it.userId == expectedDualId }) return CloneOutcome.NoDual
+        // Serial gate AFTER the id gate, BEFORE any install (mirrors
+        // removeVerifiedExpected): a recreated profile (same id, fresh
+        // serial) must never receive the install.
+        val second = fetchDualTarget()
+        if (second is DualTargetResult.Confirmed && second.target.userId != expectedDualId) {
+            return CloneOutcome.TargetMismatch(
+                expectedId = expectedDualId,
+                actualId = second.target.userId,
+                expectedSerial = expectedSerial,
+                actualSerial = second.target.serial,
+            )
+        }
+        val actualSerial = (second as? DualTargetResult.Confirmed)?.target?.serial
+        if (expectedSerial == null || actualSerial != expectedSerial) {
+            return CloneOutcome.TargetMismatch(
+                expectedId = expectedDualId,
+                actualId = expectedDualId,
+                expectedSerial = expectedSerial,
+                actualSerial = actualSerial,
+            )
+        }
+        val clean = pkg.trim()
+        val installCmd = try {
+            PmOutputParser.buildInstallExisting(clean, expectedDualId)
+        } catch (e: IllegalArgumentException) {
+            return CloneOutcome.InvalidPackage(clean)
+        }
+        val res = gateway.run(installCmd)
+        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
+            return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
+        }
+        return when (val state = verifyListProbe(clean, expectedDualId)) {
+            is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
+            is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(expectedDualId)
+            is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, state.detail)
         }
     }
 

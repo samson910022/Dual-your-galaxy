@@ -73,13 +73,25 @@ class InventorySelectionTest {
         // verboseCalls+1，使批次 pin 仍見舊目標、首項 preflight 即見新目標
         //（0 項完成即 drift，零 install）。
         var resolveSwitchAfterVerbose: Int = -1,
+        // PR-37 Phase B #2 serial 綁定測試鉤子：雙 verbose/dumpsys 通道回報的
+        // serial（預設 15；改寫即模擬同 id 重建的新 serial，id 不變）。
+        var dualSerial: Int = 15,
+        // PR-37 Phase B #1 原子 pin 測試鉤子：當 CMD_LIST_USERS 呼叫次數超過此
+        // 閾值後，身份通道整體切到 switchDualIdTo（-1 停用）。批次 pin
+        //（fetchDualTarget：verbose/dumpsys/prop）不經此通道，故 pin 仍見舊
+        // 目標、首項 snapshot 即見新目標（零 install，斷言 drift partial）。
+        var switchDualIdAfterListUsers: Int = -1,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         val installCalls = mutableListOf<String>()
         val uninstallCalls = mutableListOf<String>()
         var verboseCalls: Int = 0
+        var listUsersCalls: Int = 0
 
         private fun effectiveDualId(): Int {
+            if (switchDualIdAfterListUsers >= 0 && listUsersCalls > switchDualIdAfterListUsers) {
+                return switchDualIdTo
+            }
             if (switchDualIdAfterInstalls >= 0 && installCalls.size >= switchDualIdAfterInstalls) {
                 return switchDualIdTo
             }
@@ -108,7 +120,7 @@ class InventorySelectionTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$id:DualApp:400} running:\n" +
-                "    Serial: 15\n" +
+                "    Serial: $dualSerial\n" +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
         }
@@ -123,7 +135,7 @@ class InventorySelectionTest {
             return "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$id:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$id:DualApp:400} serialNo=$dualSerial:\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
         }
@@ -134,6 +146,7 @@ class InventorySelectionTest {
                 else CmdResult(exit = 0, out = "1000\n", err = "")
             cmd == DualRepository.CMD_LIST_USERS -> {
                 if (profilesSnapshotThrows) throw RuntimeException("boom snapshot")
+                listUsersCalls += 1
                 CmdResult(exit = 0, out = usersOut(), err = "")
             }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
@@ -232,7 +245,7 @@ class InventorySelectionTest {
             currentChannel = ResolvedChannel.ROOT,
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
-            nowMs = { clock.now() },
+            nowWallMs = { clock.now() },
             selectionStore = store,
         )
         vms.add(vm)
@@ -859,8 +872,8 @@ class InventorySelectionTest {
         vm.cloneSelected()
         vm.clone("com.example.good")
         // 同步斷言：慢批次仍在 IO 停留，單筆拒絕訊息不可能被覆寫。
-        // 新 base 口徑：msg 內包名經 sanitizeForDisplay 遮蔽為 <pkg>。
-        assertEquals("already in progress: <pkg>", vm.state.value.msg)
+        // 新 base 口徑：msg 回音用 sanitizeUserEcho（不遮蔽包名）。
+        assertEquals("already in progress: com.example.good", vm.state.value.msg)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         assertEquals(2, vm.state.value.batchReport!!.successCount)
@@ -1020,7 +1033,9 @@ class InventorySelectionTest {
         vm.toggleSelection("0:com.example.chat")
         vm.persistSelection(95)
         await { vm.state.value.msg.startsWith("已保存選取") }
-        assertEquals(setOf("0:com.example.chat"), backend.store().loadSelected(95))
+        // Phase B #2：VM 持久化寫入 v2 快照（id＋serial），id-only 讀取不再
+        // 匹配（拒絕靜默降級），須攜帶當下 serial 才有效。
+        assertEquals(setOf("0:com.example.chat"), backend.store().loadSelected(95, 15))
     }
 
     // Phase B #2：批次中途 95→96，首項成功後漂移即停，第二項零裝置寫入。
@@ -1238,5 +1253,183 @@ class InventorySelectionTest {
         await { vm.state.value.batchReport != null && !vm.state.value.loading }
         assertEquals(1, vm.state.value.batchReport!!.successCount)
         assertEquals(listOf("com.example.good"), gw.installCalls)
+    }
+
+    // PR-37 Phase B #2 serial 綁定（store 層）：v2 快照（serial 行）須
+    // (id,serial) 相符才有效；legacy 快照（無 serial 行）僅比 id（恢復綁定
+    // id-only，不靜默提升為完全體）；不符即清除陳舊條目。
+    @Test
+    fun store_serialBinding_v2RequiresSerialMatch_legacyIdOnly() {
+        val backend = MapBackend()
+        // legacy 行（無 serial 行）：id-only 有效，serial 參數不影響。
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1000L),
+        )
+        assertEquals(setOf("0:com.example.a"), backend.store().loadSelected(95))
+        assertEquals(
+            "legacy snapshot stays id-only even when a serial is offered",
+            setOf("0:com.example.a"), backend.store().loadSelected(95, 999),
+        )
+        assertNull(
+            "legacy serial must parse as null",
+            backend.store().loadSnapshot()?.knownTargetSerial,
+        )
+        // v2 行（serial 已知）：必須 (id,serial) 相符。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.b"), 2000L, 15,
+            ),
+        )
+        val snap = backend.store().loadSnapshot()
+        assertEquals(95, snap?.knownTargetId)
+        assertEquals(15, snap?.knownTargetSerial)
+        assertTrue(
+            "serial line must round-trip",
+            backend.map[SELECTION_KEY]!!.contains("serial=15"),
+        )
+        assertEquals(setOf("0:com.example.b"), backend.store().loadSelected(95, 15))
+        assertEquals(
+            "same id with a fresh serial must not reuse the old selection",
+            emptySet<String>(), backend.store().loadSelected(95, 41),
+        )
+        assertNull("mismatch must clear the stale entry", backend.store().loadSnapshot())
+        // id-only 讀取遇到 v2 行：失效並清除（拒絕靜默降級）。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.c"), 3000L, 15,
+            ),
+        )
+        assertEquals(emptySet<String>(), backend.store().loadSelected(95))
+        assertNull(backend.store().loadSnapshot())
+    }
+
+    // PR-37 Phase B #1 原子 pin：批次 pin（fetchDualTarget，不經
+    // CMD_LIST_USERS）見 95，首項 snapshot 即見 96——core 在同一流程內
+    // snapshot＋resolve＋比對並拒絕（TargetMismatch），零 `--user 96`
+    // install，partial/drift 口徑與舊 VM preflight 一致。
+    @Test
+    fun batch_pinnedClone_snapshotSwitch_zeroInstall() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a1")
+        vm.toggleSelection("0:com.example.a2")
+        // pin（fetchDualTarget）不經 CMD_LIST_USERS 故仍見 95；首項 snapshot
+        // 即見 96（批次起始走 Confirmed 快捷路徑，不另跑鑑別 snapshot）。
+        gw.switchDualIdAfterListUsers = gw.listUsersCalls
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals("drift must stop before the first item: no fake outcome", 0, report.items.size)
+        assertEquals(0, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertTrue("zero-completed drift must never reach the device", gw.installCalls.isEmpty())
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+        assertEquals(96, vm.state.value.inventory.targetId)
+        assertTrue("drift must clear selection", vm.state.value.selectedKeys.isEmpty())
+        val last = vm.state.value.lastOperation
+        assertNotNull(last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.FAILED, last.phase)
+        assertTrue(last.detail.contains("目標已變更"))
+        assertTrue(last.detail.contains("已完成 0/共 2"))
+        assertTrue(vm.state.value.msg.contains("目標已變更"))
+        assertTrue(vm.state.value.msg.contains("已完成 0/共 2"))
+        assertTrue(vm.state.value.msg.contains("已清空舊勾選"))
+        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+        assertFalse(vm.state.value.loading)
+    }
+
+    // PR-37 Phase B #2 serial 綁定：同 id 不同 serial 重建——v2 舊選取不作用
+    // 到新 profile（恢復無效＋條目清除），refresh 明示目標變更並清空舊勾選。
+    @Test
+    fun serialRebuild_v2Selection_doesNotApplyToNewProfile() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        await { vm.state.value.inventory.targetSerial == 15 }
+        vm.toggleSelection("0:com.example.chat")
+        vm.persistSelection(95)
+        await { vm.state.value.msg.startsWith("已保存選取") }
+        assertEquals(15, backend.store().loadSnapshot()?.knownTargetSerial)
+        // 同 id 重建：serial 15 → 41（id 不變）。
+        gw.dualSerial = 41
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 41
+        }
+        // 舊勾選已清空（bound (95,15) ≠ (95,41)），舊持久選取已失效清除。
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertTrue(vm.state.value.msg.contains("目標已變更"))
+        // 舊選取不作用到新 profile：顯式恢復亦無效。
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertNull(
+            "stale v2 entry must be cleared on serial mismatch",
+            backend.store().loadSnapshot(),
+        )
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // PR-37 Phase B #2 遷移 (a)：legacy 快照（無 serial 行）恢復後綁定 id-only，
+    // 批次拒絕靜默提升為完全體（整批拒絕、零 install），重新勾選即綁完全體。
+    @Test
+    fun serialRebuild_legacySelection_bindsIdOnly_batchRefuses() {
+        val backend = MapBackend()
+        // 舊版存檔：無 serial 行。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.chat"), 1000L,
+            ),
+        )
+        assertNull(backend.store().loadSnapshot()?.knownTargetSerial)
+        val gw = FakeRepo()
+        gw.dualSerial = 41
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { "0:com.example.chat" in vm.state.value.selectedKeys }
+        // legacy 恢復：勾選回來了（id-only 容忍），但批次必須拒絕（bound
+        // id-only ≠ live 完全體），零 install。
+        vm.cloneSelected()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("選取已綁定舊目標，已清空，請重新勾選確認")
+        }
+        assertEquals(
+            "id-only bound must never silently upgrade to a full batch",
+            0, gw.installCalls.size,
+        )
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertNull(vm.state.value.batchReport)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        // 重新勾選即綁完全體，批次可執行。
+        vm.toggleSelection("0:com.example.chat")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(1, vm.state.value.batchReport!!.successCount)
+        assertEquals(listOf("com.example.chat"), gw.installCalls)
     }
 }

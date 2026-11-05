@@ -108,6 +108,7 @@ explicit id 即使存在於 `pm list users`，只要不是當下 Confirmed 目�
 fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
 `verifyState` 回 `Unknown`、`verify` Boolean 回 `false`（已 `@Deprecated`）、
 `listClonedPackages` 回 `null`，不探測目標、不寫入（仍做 snapshot＋identity fetch 唯讀）。
+同 id 重建（serial 變更）視為不同目標：批次 pin 與移除確認皆比對 `(id, serial)`，不一致零寫入。
 `pm list users` 的名稱僅供顯示，永不進入授權判定；user 0 永遠不可作為寫入目標。
 CLONE 僅認全 token 精確拼寫：`profile`＋單點 `.` 或 1–3 個列舉分隔符（空格／`_`／`-`／Tab 任意混搭，如 double space、`__`、` -` 皆計，4 個以上即無 token→OTHER）＋全字 `clone`（大小寫-insensitive）；`!`／`?`／`:`／`/` 等任意其他標點永不為分隔符，一律無 token→OTHER（fail closed）；`CLONE_extra`／`CLONE-EXTRA`／`CLONE.X`／`CLONEable` 等未知後綴一律非 CLONE；`profile.CLONE/evil` 類斜線尾詞一律 tainted→OTHER：`/` 僅在後緊接另一個合法 `profile.X` token（`profile`＋單點或 1–3 個列舉分隔符＋名稱，如 `profile.MANAGED`／`profile.CLONE`，含 FQ `android.os.usertype.profile.X`）時豁免，此時走雙 token 混合→UNKNOWN 仍拒寫；`/profile!evil`、`/profilegarbage`、裸 `/profile`、`/profileX` 等非 token 一律不豁免，仍 tainted→OTHER；括號內斜線如 `(a/b)` 即使無裸 slash 語義亦保守降級→OTHER（fail closed；實機 type 行無此形狀）。殘留驗證（唯一授權＝全 token 匹配＋slash-guard＋殘留驗證）：附註僅指空白／Tab 與恰一次的 `(default)`（大小寫-insensitive，前後可空白）；直接貼在 CLONE 後的任何其他字元（含 `!evil` `?evil` `:evil` `;evil` `,evil` `@#$%^&*+=|\`、全形 slash、零寬／control、非 default 括號 `[evil]` `(evil)` `(a/b)`、`(default)evil` 多餘尾詞、雙 `(default)`）一律殘留→OTHER；逗號分隔重複 CLONE（如 `CLONE, CLONE`）亦殘留→OTHER（從嚴）。僅 `profile.CLONE (default)` 容忍為 CLONE；`MANAGED, CLONE`／`MANAGED/CLONE` 類真混合走雙 token 矛盾→UNKNOWN，仍拒寫。
 此次 S24 的 95 為 Dual、150 為 Secure Folder，這不是其他機型的固定對照。
