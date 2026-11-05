@@ -28,8 +28,20 @@ CI / Release:
 - Fail-closed by design: if any secret is missing on a tag build, the
   signing step fails the job and nothing is published. There is no
   `unsigned` fallback asset — do not add one.
-- STATUS: SIGN_* secrets configured; tag v0.0.0-dryrun passed end-to-end
-  (see #5 close comment). Formal v* tags follow the same path.
+- STATUS (as of 2026-11-04): 4 SIGN_* secrets (`SIGN_STORE_BASE64` /
+  `SIGN_STORE_PASSWORD` / `SIGN_KEY_ALIAS` / `SIGN_KEY_PASSWORD`) present
+  and valid for that run; tag v0.0.0-dryrun
+  [run 41800791298](https://github.com/samson910022/Galaxy-Dual-app-Plus/actions/runs/41800791298)
+  passed end-to-end: keystore restore + `./gradlew assembleRelease` +
+  `apksigner verify` + single `SHA256SUMS.txt` (SHA-256, `sha256sum -c`
+  verified); same-run attempts 1-2 red as observed (base64 invalid /
+  password incorrect), attempt 3 green; fail-closed by design; CI green
+  covers build+verify, manual download verified + cert SHA-256 matches the
+  canonical fingerprint at the top of this file (see
+  [#5 close comment](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/5#issuecomment-6626662388)).
+  Push tags `v*` trigger the same workflow; re-verify on first real `v*`
+  or after rotation/workflow change. Green non-tag CI does not prove the
+  tag path.
 - Local sign (complete — pass alias and both passwords explicitly):
 
   ```bash
