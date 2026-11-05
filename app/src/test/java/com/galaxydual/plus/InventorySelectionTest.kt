@@ -51,6 +51,13 @@ class InventorySelectionTest {
         val installFail: MutableSet<String> = mutableSetOf(),
         val hideFromList: MutableSet<String> = mutableSetOf(),
         val installedForUser: MutableSet<String> = mutableSetOf(),
+        // M13 測試鉤子：當 installCalls 達到此數後，verbose/dumpsys 不再回報
+        // 分身用戶（模擬批次中途分身消失；-1 停用）。identity 解析在 install
+        // 之前，故首項仍打一次裝置，後續項才 NoDual。
+        var vanishDualAfterInstalls: Int = -1,
+        // B2 測試鉤子：install 分支在 IO 執行緒上停留此毫秒數，讓首批慢批次
+        // 在持有 inFlight key 時可被併發第二批/單筆觀測到。預設 0（無行為變化）。
+        var installDelayMs: Long = 0L,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         val installCalls = mutableListOf<String>()
@@ -60,8 +67,14 @@ class InventorySelectionTest {
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{$dualId:DualApp:400} running\n"
 
-        private fun verboseOut(): String =
-            "Users:\n" +
+        private fun verboseOut(): String {
+            if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
+                return "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n"
+            }
+            return "Users:\n" +
                 "  UserInfo{0:Owner:13} running:\n" +
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
@@ -69,14 +82,21 @@ class InventorySelectionTest {
                 "    Serial: 15\n" +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
+        }
 
-        private fun dumpsysOut(): String =
-            "Users:\n" +
+        private fun dumpsysOut(): String {
+            if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
+                return "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n"
+            }
+            return "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} serialNo=15:\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
+        }
 
         override suspend fun run(cmd: String): CmdResult = when {
             cmd.trim() == "id -u" ->
@@ -93,6 +113,7 @@ class InventorySelectionTest {
             cmd.startsWith("pm install-existing") -> {
                 val pkg = cmd.trim().split(" ").last()
                 installCalls.add(pkg)
+                if (installDelayMs > 0) Thread.sleep(installDelayMs)
                 if (pkg in installFail) {
                     CmdResult(exit = 1, out = "", err = "Failure [INSTALL_FAILED]")
                 } else {
@@ -281,7 +302,8 @@ class InventorySelectionTest {
     }
 
     // 重啟恢復：新 ViewModel + 同一 store，恢復只打勾（不重送寫入），
-    // 且只恢復仍在 catalog 的包。
+    // 只恢復仍在 catalog 的 key（catalog 缺失的殘留 key 被捨去）；
+    // 已有手動勾選時 restore 永不覆蓋。
     @Test
     fun selection_restartRecovery_checksButNeverClones() {
         val backend = MapBackend()
@@ -295,9 +317,20 @@ class InventorySelectionTest {
         vm1.persistSelection(95)
         await { vm1.state.value.msg.startsWith("已保存選取 2 項") }
         assertEquals(0, gw.installCalls.size)
+        // catalog 已無的殘留 key（已解除安裝的 gone-pkg）：直接寫入 store
+        // 模擬舊存檔（persistSelection 只存 catalog 內 key，寫不進 gone-pkg）。
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat", "0:com.example.mail", "0:com.example.gone"),
+                2000L,
+            ),
+        )
 
-        // 重啟：新 ViewModel，同一 store，catalog 缺 mail（已卸載）。
+        // 重啟：新 ViewModel，同一 store；catalog 含 chat/mail/extra，不含 gone。
         val vm2 = makeVm(gw, clock, backend.store())
+        await { vm2.state.value.channelReady }
         vm2.setSourceCatalog(
             listOf(
                 SourceAppEntry("com.example.chat", "Chat App", 0, false),
@@ -308,9 +341,31 @@ class InventorySelectionTest {
         vm2.restoreSelection(95)
         await { "0:com.example.chat" in vm2.state.value.selectedKeys }
         assertEquals(
-            "only packages still in the catalog are restored",
+            "only keys still in the catalog are restored (gone-pkg dropped)",
             setOf("0:com.example.chat", "0:com.example.mail"),
             vm2.state.value.selectedKeys,
+        )
+        assertEquals("restore must not clone", 0, gw.installCalls.size)
+        assertEquals("restore must not uninstall", 0, gw.uninstallCalls.size)
+
+        // 已有手動勾選時 restore 永不覆蓋：先勾選再設 catalog（同步阻斷
+        // setSourceCatalog 的自動補恢復），restore 必須是同步 no-op。
+        val vm3 = makeVm(gw, clock, backend.store())
+        await { vm3.state.value.channelReady }
+        vm3.toggleSelection("0:com.example.extra")
+        vm3.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat App", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+                SourceAppEntry("com.example.extra", "Extra", 0, false),
+            ),
+        )
+        vm3.restoreSelection(95)
+        await { vm3.state.value.selectedKeys == setOf("0:com.example.extra") }
+        assertEquals(
+            "restore must never overwrite existing manual selection",
+            setOf("0:com.example.extra"),
+            vm3.state.value.selectedKeys,
         )
         assertEquals("restore must not clone", 0, gw.installCalls.size)
         assertEquals("restore must not uninstall", 0, gw.uninstallCalls.size)
@@ -334,9 +389,10 @@ class InventorySelectionTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
         assertTrue(vm.state.value.sourceCatalog.isEmpty())
-        // 空 catalog 上恢復：無勾選可恢復，且不得毒化同 target 的後續重試。
+        // 空 catalog 上恢復是同步 no-op：early-return 發生在任何 I/O 懸掛點
+        // 之前，且此時 opMutex 空閒（channelReady 已在探測退出時寫入），故在
+        // Unconfined 下呼叫執行緒內即完成——直接斷言，不 sleep 輪詢。
         vm.restoreSelection(95)
-        Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
         // 後載非空 catalog：顯式重試仍能恢復（setSourceCatalog 亦會補觸一次）。
         vm.setSourceCatalog(catalog())
@@ -543,7 +599,9 @@ class InventorySelectionTest {
         assertEquals(1, report.successCount)
         assertEquals(1, report.failedCount)
         assertEquals(0, report.unknownCount)
-        assertEquals(0, gw.installCalls.count { it == "0:com.example.ghost" })
+        // 缺失 key 永不打裝置（install 側記的是裸包名，此處必須比裸包名）。
+        assertTrue(gw.installCalls.none { it == "com.example.ghost" })
+        assertEquals(listOf("com.example.good"), gw.installCalls)
     }
 
     // 空選取：拒絕，不碰裝置。
@@ -559,7 +617,10 @@ class InventorySelectionTest {
         assertEquals(0, gw.installCalls.size)
     }
 
-    // 唯讀通道：整批拒絕，零安裝呼叫。
+    // 唯讀通道：整批拒絕，零安裝呼叫。哨兵法：probe 靜默後先把 msg 壓成
+    // 已知哨兵（clearSelectionLocal 同步改寫，不碰裝置），再重建勾選並呼叫
+    // cloneSelected；之後的 msg 變化只能來自本次拒絕，消除「呼叫前已成立」
+    // 的空洞通過。
     @Test
     fun batch_readOnly_refusesWholeBatch() {
         val backend = MapBackend()
@@ -570,9 +631,193 @@ class InventorySelectionTest {
         assertFalse(vm.state.value.channelReady)
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
         vm.toggleSelection("0:com.example.good")
+        vm.clearSelectionLocal()
+        assertTrue(vm.state.value.msg.startsWith("已清除勾選"))
+        vm.toggleSelection("0:com.example.good")
+        val before = vm.state.value.msg
         vm.cloneSelected()
-        await { vm.state.value.msg.isNotEmpty() && !vm.state.value.loading }
-        assertNull("read-only must not produce a batch report", vm.state.value.batchReport)
+        await { !vm.state.value.loading && vm.state.value.msg != before }
+        val st = vm.state.value
+        assertEquals(MsgKind.CHANNEL, st.msgKind)
+        assertTrue(
+            "read-only refusal must name the cause: ${st.msg}",
+            st.msg.contains("探測未通過") || st.msg.contains("唯讀") ||
+                st.msg.contains("read-only") || st.msg.contains("寫入已禁用"),
+        )
+        assertNull("read-only must not produce a batch report", st.batchReport)
+        assertEquals("selection must survive refusal", setOf("0:com.example.good"), st.selectedKeys)
         assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // (a) 批次執行順序：包名升冪，與勾選順序無關；裝置呼叫順序一致。
+    @Test
+    fun batch_executesInPackageNameAscendingOrder() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.zeta", "Zeta", 0, false),
+                SourceAppEntry("com.example.alpha", "Alpha", 0, false),
+                SourceAppEntry("com.example.mid", "Mid", 0, false),
+            ),
+        )
+        vm.toggleSelection("0:com.example.zeta")
+        vm.toggleSelection("0:com.example.mid")
+        vm.toggleSelection("0:com.example.alpha")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val pkgs = listOf("com.example.alpha", "com.example.mid", "com.example.zeta")
+        assertEquals(pkgs, vm.state.value.batchReport!!.items.map { it.pkg })
+        assertEquals("device calls must follow the same ascending order", pkgs, gw.installCalls)
+    }
+
+    // (b) 單一 catalog 缺失 key：InvalidPackage、計 failed（非 unknown）、零裝置呼叫。
+    @Test
+    fun batch_missingKey_recordsInvalidPackageWithoutDeviceCall() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.ghost")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(1, report.items.size)
+        assertTrue(report.items.single().outcome is CloneOutcome.InvalidPackage)
+        assertEquals(0, report.successCount)
+        assertEquals(1, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertTrue(gw.installCalls.isEmpty())
+    }
+
+    // (c/M13) 首個 NoDual 後短路：首項成功，剩餘項同記 NoDual，不再打裝置。
+    @Test
+    fun batch_noDualShortCircuit_skipsRemainingDeviceCalls() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        // 首個 install 完成後分身身份消失：後續解析皆 NoDual。
+        gw.vanishDualAfterInstalls = 1
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+                SourceAppEntry("com.example.a3", "A3", 0, false),
+            ),
+        )
+        vm.toggleSelection("0:com.example.a3")
+        vm.toggleSelection("0:com.example.a2")
+        vm.toggleSelection("0:com.example.a1")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(3, report.items.size)
+        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(report.items[1].outcome is CloneOutcome.NoDual)
+        assertTrue(report.items[2].outcome is CloneOutcome.NoDual)
+        assertEquals("short-circuit must stop device calls after the first NoDual",
+            1, gw.installCalls.size)
+        assertEquals(1, report.successCount)
+        assertEquals(2, report.failedCount)
+        assertEquals(0, report.unknownCount)
+    }
+
+    // (d/B2) 併發第二批：慢批次持有 batch:clone 期間，第二批整批拒絕。
+    @Test
+    fun batch_concurrentSecondBatch_reportsAlreadyInProgress() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        gw.installDelayMs = 500L
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.good", "Good", 0, false),
+                SourceAppEntry("com.example.other", "Other", 0, false),
+            ),
+        )
+        vm.toggleSelection("0:com.example.good")
+        vm.toggleSelection("0:com.example.other")
+        vm.cloneSelected()
+        vm.cloneSelected()
+        // 同步斷言：慢批次仍在 IO 停留，首批完成訊息不可能搶先覆寫。
+        assertEquals("already in progress: batch clone", vm.state.value.msg)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(2, vm.state.value.batchReport!!.successCount)
+        assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // (d/B2) 批次認領方向：慢批次持有 clone:<pkg> 期間，遲到單筆報 already in progress 且零裝置呼叫。
+    @Test
+    fun batch_claimsRejectLateSingleClone() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        gw.installDelayMs = 500L
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.good", "Good", 0, false),
+                SourceAppEntry("com.example.other", "Other", 0, false),
+            ),
+        )
+        vm.toggleSelection("0:com.example.good")
+        vm.toggleSelection("0:com.example.other")
+        vm.cloneSelected()
+        vm.clone("com.example.good")
+        // 同步斷言：慢批次仍在 IO 停留，單筆拒絕訊息不可能被覆寫。
+        assertEquals("already in progress: com.example.good", vm.state.value.msg)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(2, vm.state.value.batchReport!!.successCount)
+        assertEquals("refused single must never reach the device",
+            listOf("com.example.good", "com.example.other"), gw.installCalls)
+    }
+
+    // (f) loadSelected(-1/0)：回空且不刪檔（未知目標讀取永不破壞已存資料）。
+    @Test
+    fun loadSelected_nonPositiveTarget_neverDeletesFile() {
+        val backend = MapBackend()
+        val store = backend.store()
+        assertTrue(store.save(SELECTION_SOURCE_CATALOG, 95, setOf("0:com.example.a"), 1000L))
+        assertEquals(emptySet<String>(), store.loadSelected(-1))
+        assertEquals(emptySet<String>(), store.loadSelected(0))
+        assertEquals(
+            "negative/zero target reads must not delete the file",
+            setOf("0:com.example.a"),
+            backend.store().loadSelected(95),
+        )
+    }
+
+    // (h) selectVisible：VM 層為純合併（union），不截斷；200 上限在
+    // MainActivity.currentVisibleKeys（UI 層，private，不可 VM 單測）。
+    @Test
+    fun selectVisible_mergesWithoutTruncation() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        vm.toggleSelection("0:com.example.chat")
+        vm.selectVisible(setOf("0:com.example.mail", "0:com.example.chat"))
+        assertEquals(
+            setOf("0:com.example.chat", "0:com.example.mail"),
+            vm.state.value.selectedKeys,
+        )
+        vm.selectVisible(emptySet())
+        assertEquals(2, vm.state.value.selectedKeys.size)
+        val many = (0 until 201).map { "0:com.example.app$it" }.toSet()
+        vm.selectVisible(many)
+        assertTrue(vm.state.value.selectedKeys.containsAll(many))
     }
 }
