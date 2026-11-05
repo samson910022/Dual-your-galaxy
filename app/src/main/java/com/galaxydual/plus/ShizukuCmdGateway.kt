@@ -171,6 +171,43 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
         truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
     )
 
+// Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
+// needs a real IBinder (synchronous binder.transact on a Parcel pair), so its
+// catch chain is not JVM-testable -- only this mapping is (GatewayAssemblyTest
+// pins it for Cancellation / Interrupted / generic). Extracted 1:1 from
+// transactExec's catch chain; current behavior preserved, no wire / timeout /
+// retry change:
+//   - CancellationException is NOT mapped: it is rethrown to stay
+//     coroutine-correct (the selectChannel latest-wins handover depends on
+//     it). This function rethrows it as well so a direct caller cannot
+//     accidentally swallow cancellation as transportUnknown.
+//   - InterruptedException (the block's own interrupt, unwrapped from the
+//     future by awaitBounded) maps to transportUnknown(): post-dispatch by
+//     construction -- the service may already have executed pm while the
+//     client holds no reply, so the repository reconciles read-only instead
+//     of claiming definite failure. timedOut stays false (a transport loss,
+//     not a client-wait expiry).
+//   - Every other Exception (transact RemoteException -- android.os.
+//     RemoteException is an android.jar stub that throws "Stub!" when
+//     instantiated on the JVM, so it cannot be constructed in a unit test;
+//     it shares transactExec's generic catch (e: Exception) branch, pinned
+//     here by the RuntimeException/IOException tests -- binder death
+//     mid-call, reply readInt/readString decode failure) maps to
+//     transportUnknown() for the same post-dispatch reason.
+//     NOTE (generic-branch audit): the pre-extraction code already mapped the
+//     generic branch to transportUnknown(), NOT to remoteFailed() -- no
+//     definite-failure misclassification existed, so no behavior fix was
+//     needed; the extraction preserves transportUnknown() as-is.
+// Pure: no binder touch, no Thread.interrupted() consume, no dropBinding --
+// those side effects stay in transactExec's catch blocks (the interrupt-flag
+// consume in particular must run on the catching thread, not inside a pure
+// mapper that unit tests call on arbitrary threads).
+internal fun mapPostDispatchError(e: Exception): CmdResult {
+    if (e is CancellationException) throw e
+    if (e is InterruptedException) return ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
+    return ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
+}
+
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
 // class with both constructors: Shizuku v13 tries the Context constructor
@@ -316,13 +353,15 @@ class ShizukuCmdGateway(
     // The stale cache is dropped on every failure path so the next call
     // rebinds instead of reusing a dead handle.
     //
-    // Bounded deadline (PR-32 P1-1): the Parcel transact below is a
-    // synchronous binder.transact(flags=0) that Dispatchers.IO cannot
-    // interrupt, so the previous withTimeoutOrNull wrapper did not bound the
-    // client wait (a hung transact kept the caller suspended past the
-    // deadline). The block now runs via awaitBounded(EXEC_TIMEOUT_MS)
-    // (Future.get on a per-call "shizuku-transact-N" daemon thread): the client
-    // wait always returns by the deadline with null, while the Binder call
+    // Bounded deadline (PR-32 P1-1, P2 Job-cancellation-safe rework): the
+    // Parcel transact below is a synchronous binder.transact(flags=0) that
+    // Dispatchers.IO cannot interrupt, so the previous withTimeoutOrNull
+    // wrapper did not bound the client wait (a hung transact kept the caller
+    // suspended past the deadline). The block now runs via
+    // awaitBounded(EXEC_TIMEOUT_MS) on the shared bounded "shizuku-transact"
+    // pool while the caller suspends: the client wait always returns by the
+    // deadline with null, Job cancellation (e.g. selectChannel latest-wins)
+    // stops the wait at once with CancellationException, and the Binder call
     // itself is never force-stopped.
     //
     // Late-result isolation: after the deadline the caller stops waiting and
@@ -388,23 +427,24 @@ class ShizukuCmdGateway(
         } catch (e: CancellationException) {
             throw e
         } catch (e: InterruptedException) {
-            // awaitBounded restores the interrupt flag before rethrowing; this
-            // path converts the interrupt into a value return, so consume the
-            // flag here -- otherwise it would linger on the pooled
-            // Dispatchers.IO worker that runs this gateway.
+            // The block's own interrupt, unwrapped from the future by
+            // awaitBounded (the caller's Dispatchers.IO thread suspended and
+            // was never interrupted, so the consume below is a no-op unless
+            // the pool worker's flag somehow leaked -- kept as hygiene).
             // Post-dispatch by construction (thrown at/after transact): the
-            // service may have executed, so transportUnknown, never a
-            // definite failure.
+            // service may have executed, so transportUnknown via the pure
+            // mapPostDispatchError() (JVM-pinned), never a definite failure.
             Thread.interrupted()
             bindMutex.withLock { dropBindingLocked() }
-            ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
+            mapPostDispatchError(e)
         } catch (e: Exception) {
             // Post-dispatch by construction (transact RemoteException, binder
             // death mid-call, or reply readInt/readString decode failure):
             // the service may have executed pm with no reply to judge, so
-            // reconcile read-only instead of claiming definite failure.
+            // reconcile read-only via the pure mapPostDispatchError()
+            // (JVM-pinned) instead of claiming definite failure.
             bindMutex.withLock { dropBindingLocked() }
-            ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
+            mapPostDispatchError(e)
         }
     }
 

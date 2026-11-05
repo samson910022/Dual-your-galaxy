@@ -15,11 +15,13 @@ import com.galaxydual.core.TRUNCATION_MARKER
 import com.galaxydual.core.TrustedList
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class GatewayAssemblyTest {
@@ -103,6 +105,66 @@ class GatewayAssemblyTest {
             assertTrue(!pre.timedOut)
             assertTrue(!pre.transportUnknown)
         }
+    }
+
+    // E2 P1-2 follow-up: transactExec needs a real IBinder (synchronous
+    // binder.transact on a Parcel pair), so its post-dispatch catch chain has
+    // zero JVM execution -- only the pure mapPostDispatchError() extraction
+    // is covered here. These tests pin the extraction 1:1 to the catch chain:
+    // Cancellation rethrows (never swallowed into a result), Interrupted and
+    // generic both map to transportUnknown (unknown-after-send, timedOut
+    // stays false). The stale-cache dropBinding side effect stays in
+    // transactExec and is NOT asserted here (needs a real binder).
+    @Test fun postDispatchError_cancellationPropagates() {
+        try {
+            mapPostDispatchError(CancellationException("cancel"))
+            fail("CancellationException must propagate, not map to a CmdResult")
+        } catch (e: CancellationException) {
+            assertEquals("cancel", e.message)
+        }
+    }
+
+    // InterruptedException (the block's own interrupt unwrapped from the
+    // future by awaitBounded) is post-dispatch: transportUnknown, never a
+    // definite failure. Pure mapper touches no thread flag, so calling it
+    // here is side-effect free (the Thread.interrupted() consume stays in
+    // transactExec's catch block).
+    @Test fun postDispatchError_interruptedMapsToTransportUnknown() {
+        val res = mapPostDispatchError(InterruptedException("pool interrupt"))
+        assertNotEquals(0, res.exit)
+        assertTrue("interrupted post-dispatch must carry transportUnknown, got: $res", res.transportUnknown)
+        assertTrue(!res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("pool interrupt"))
+        assertTrue(res.err.contains("may have executed"))
+    }
+
+    // Generic branch (transact RemoteException / binder death mid-call):
+    // android.os.RemoteException is an android.jar stub that throws "Stub!"
+    // on instantiation, so it cannot be constructed on the JVM -- but it
+    // extends Exception and shares transactExec's generic catch (e:
+    // Exception) branch with the RuntimeException below, so this pins the
+    // same mapping the wire RemoteException takes (transportUnknown, never
+    // remoteFailed/definite failure).
+    @Test fun postDispatchError_genericRuntimeMapsToTransportUnknown() {
+        val res = mapPostDispatchError(RuntimeException("binder died"))
+        assertNotEquals(0, res.exit)
+        assertTrue("generic post-dispatch must carry transportUnknown, got: $res", res.transportUnknown)
+        assertTrue(!res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("binder died"))
+        assertTrue(res.err.contains("may have executed"))
+    }
+
+    // Generic branch, decode-failure representative (reply readInt/readString
+    // throwing mid-decode): same transportUnknown mapping as above.
+    @Test fun postDispatchError_decodeFailureIoMapsToTransportUnknown() {
+        val res = mapPostDispatchError(IOException("reply decode failed"))
+        assertNotEquals(0, res.exit)
+        assertTrue("decode failure post-dispatch must carry transportUnknown, got: $res", res.transportUnknown)
+        assertTrue(!res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("reply decode failed"))
     }
 
     // PR-32 P1-1: Su client-side wait timeout (SU_EXEC_TIMEOUT path) carries

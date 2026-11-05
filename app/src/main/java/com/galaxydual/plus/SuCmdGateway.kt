@@ -85,6 +85,16 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         // Honest flag + marker: the process was killed mid-stream, so the capture is
         // incomplete by construction even when nothing hit the cap. exit=1,
         // so parser outcomes are unchanged (Unknown either way).
+        // E2 MINOR note: proc is already destroyForcibly'd above, and the
+        // remote pm may have executed before the kill -- unknown-after-send
+        // by construction. This branch is almost unreachable in practice:
+        // the wait runs on a Dispatchers.IO worker that is essentially never
+        // thread-interrupted (coroutine cancellation arrives as
+        // CancellationException, not InterruptedException). Full
+        // unknown-after-send coverage for this path stays a follow-up item;
+        // mapping intentionally unchanged here (comment only, no
+        // transportUnknown flag on the su channel -- scope guard against
+        // range creep).
         return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true)
     }
     if (!exited) {
