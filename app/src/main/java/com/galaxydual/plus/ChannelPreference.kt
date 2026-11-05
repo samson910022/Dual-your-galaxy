@@ -13,8 +13,12 @@
 //   explicit prefs file + key, default AUTO, unknown/blank stored values
 //   fall back to AUTO. The string mapping is pure Kotlin so JVM unit tests
 //   cover it; only load/save touch the Android stub.
-// - Auto semantics are unchanged from the F4a factory: su file presence
-//   first, then Shizuku binder alive + authorized, else NoOp fail-closed.
+// - Auto semantics are probe-based after the first probe (P25): the startup
+//   pick keeps the F4a file heuristic (su presence first, then Shizuku auth,
+//   else NoOp) so the factory stays I/O-free, but DualViewModel degrades that
+//   pick once elevator probes report actual capability (see resolveAutoProbe):
+//   su present but probe-denied + Shizuku proven -> SHIZUKU with a degrade
+//   note; both probes failing -> NOOP read-only; both succeeding -> ROOT.
 //   The hook channel is never auto-selected (conservative continuation:
 //   the marker signal is display-only evidence, see HookMarker, and must
 //   never grant privilege without on-device verification).
@@ -82,8 +86,10 @@ fun SharedPreferences.saveChannelPreference(pref: ChannelPreference) {
 
 // Resolves a preference to the gateway channel to build. Pure: covered by
 // JVM unit tests.
-// - AUTO: su presence first, then Shizuku authorized, else NOOP (F4a order,
-//   hook never auto-selected).
+// - AUTO (startup heuristic): su presence first, then Shizuku authorized,
+//   else NOOP (F4a order, hook never auto-selected). This stays I/O-free for
+//   the factory; the probe-based correction lives in resolveAutoProbe below
+//   and is applied by DualViewModel once elevator probes report.
 // - Explicit ROOT/SHIZUKU win regardless of probes (probes fail closed
 //   later when the channel is actually unusable).
 // - Explicit LSPOSED is a placeholder until P2 (hook enable detection).
@@ -98,6 +104,53 @@ fun ChannelPreference.resolveChannel(suPresent: Boolean, shizukuAuthorized: Bool
             else -> ResolvedChannel.NOOP
         }
     }
+
+// Probe-based Auto decision (P25, issue #25): corrects the startup file
+// heuristic once elevator probes report actual capability. Pure: covered by
+// AutoDegradeTest.
+// - hasRoot true -> ROOT (su first; covers both-probes-succeed: follows the
+//   F4a preference order, no degrade note).
+// - else hasShizuku true -> SHIZUKU; when suPresent is also true the su file
+//   exists but its probe was denied, so this is a degrade and the note
+//   records the reason plus the recovery entry.
+// - else NOOP read-only with a note stating both probes failed plus recovery.
+// Explicit preferences never reach here (the ViewModel only calls this for
+// AUTO): explicit choices never cross channels, they fail closed with their
+// own message instead.
+data class AutoProbeDecision(
+    val channel: ResolvedChannel,
+    val degradeNote: String,
+)
+
+fun resolveAutoProbe(
+    suPresent: Boolean,
+    hasRoot: Boolean,
+    hasShizuku: Boolean,
+): AutoProbeDecision = when {
+    hasRoot -> AutoProbeDecision(ResolvedChannel.ROOT, "")
+    hasShizuku -> if (suPresent) {
+        AutoProbeDecision(
+            ResolvedChannel.SHIZUKU,
+            "Auto 已依實測降級：檢測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；" +
+                "如需恢復 ROOT 請檢查 su 授權後點「重新連線並更新」",
+        )
+    } else {
+        AutoProbeDecision(ResolvedChannel.SHIZUKU, "")
+    }
+    else -> if (suPresent) {
+        AutoProbeDecision(
+            ResolvedChannel.NOOP,
+            "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；" +
+                "請檢查授權後點「重新連線並更新」",
+        )
+    } else {
+        AutoProbeDecision(
+            ResolvedChannel.NOOP,
+            "Auto 實測無可用通道（su 不存在且 Shizuku 未通過），目前唯讀；" +
+                "授權 Shizuku 或取得 ROOT 後點「重新連線並更新」",
+        )
+    }
+}
 
 // Builds the gateway for a resolved channel. Constructor-only, no I/O, so
 // JVM-constructible (same pattern as GatewayAssemblyTest). LSPosed builds
