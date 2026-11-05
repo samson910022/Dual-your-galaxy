@@ -80,9 +80,9 @@ Hook Builder 統一使用
 讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
 `DAUtility.getWhiteListPkgs`／`*InSystemServer`、`DualAppManager.*WhitelistPackage*`
 （未來非空政策接上時的方法級 hook 目標）。lspd 日誌已確認 daagent 行程載入
-含該欄位的類（`found ... static=true` 跨多代行程）；勝出路徑歸因靠新建的
-`using <class> for daagent hooks` 行，下次 daagent 行程重啟後驗證
-（禁重啟期間以舊行程駐留為準）。
+含該欄位的類（`found ... static=true` 跨多代行程）；
+`using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
+[S24 已驗證]（新路徑連續命中 7 次、零退回，方法零掛載符合抽象類預期）。
 
 - 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`**（＋`..._FOR_CHINA` 變體；
   僅診斷記 log＋合併用，找不到就略過，不拋錯）。
@@ -133,8 +133,9 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
 - App uid／`run-as` 皆不可讀任一路徑 [S24 已驗證]：直接讀取恆為
   「未偵測到」（fail-closed 符合設計）；有 SHELL／ROOT 通道就緒時才走
   gateway `cat` 重試（[待實機驗證]）。
-- daagent 新類路徑（provider 首選）掛載待 daagent 行程重啟後以
-  `using <class> for daagent hooks` 行驗證 [待重啟驗]（禁重啟期間舊行程駐留）。
+- daagent 新類路徑（provider 首選）掛載 [S24 已驗證]：
+  `using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
+  連續命中（daagent 自然重啟後新碼載入，零退回、零 `not present`）。
 
 ## 2. Scope 勾選教學
 

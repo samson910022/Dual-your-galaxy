@@ -35,7 +35,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 - [已支援] lint／CI 閘門（`./gradlew` 固定 8.7、fail-fast quality gates、DEX 檢查）。
 - [待實機驗證] App 內一鍵 clone 真通道（已接線 DEVICE-UNVERIFIED：`MainActivity` 已有 Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕＋Hook marker 行＋`StateFlow` 收集，Shizuku binder／授權生命週期已接；`DualViewModel.clone/remove/refresh/recheckPrivilege/selectChannel` 邏輯存在；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` 改由各通道探測結果 gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）；marker round-trip、binder round-trip、授權四情境、su 實機行為、App 內一鍵端到端皆未驗（注：裸 `pm install-existing --user 95`＋list 二次確認 [S24 已驗證]，見下條）。
 - [待實作] 非空 whitelist policy（`EXTRA_WHITELIST_PACKAGES` 預設為空，hook 為 observe-only；接上政策來源前不放寬任何包名）。
-- [部分已驗證] LSPosed 載入（system scope 注入＋hook 安裝 [S24 已驗證]：lspd 日誌確認 `DualAppManagerService` 雙方法 deoptimize＋hooked；daagent 類路徑已修正待重啟驗）／Shizuku 四情境（無實機）／雙開實機：`pm install-existing --user 95 com.openai.chatgpt`＋list 二次確認 [S24 已驗證]（shell 通道，兩次獨立成功）；`uninstall` 回滾、App 內一鍵全流程仍 [待實機驗證]。
+- [部分已驗證] LSPosed 載入（system scope 注入＋hook 安裝 [S24 已驗證]：lspd 日誌確認 `DualAppManagerService` 雙方法 deoptimize＋hooked；daagent provider 新路徑連續命中 7 次 [S24 已驗證]）／Shizuku 四情境（無實機）／雙開實機：`pm install-existing --user 95 com.openai.chatgpt`＋list 二次確認 [S24 已驗證]（shell 通道，兩次獨立成功）；`uninstall` 回滾、App 內一鍵全流程仍 [待實機驗證]。
 
 凡標 [待實作]／[待實機驗證] 者，皆不可描述為「可用功能」；下文路由／自動模式描述的是設計意圖與 `core` 純函數行為，不是已接通的 App 流程。
 
