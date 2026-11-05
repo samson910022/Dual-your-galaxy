@@ -614,30 +614,35 @@ class DualRepository(
             return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
         // Unknown-after-send (PR-32 P1-1 timeout, extended by P1-2
-        // transport-unknown): the reply was abandoned or lost -- the remote
-        // pm may still have executed -- so exit/out/err are untrusted
-        // regardless of isSuccess. NEVER map this to InstallFailed (that
-        // would claim "not cloned" while the device may hold the clone, and
-        // the UI would drop it wrongly).
+        // transport-unknown, extended by Phase A1 post-spawn text): the reply
+        // was abandoned or lost -- the remote pm may still have executed --
+        // so exit/out/err are untrusted regardless of isSuccess. NEVER map
+        // this to InstallFailed (that would claim "not cloned" while the
+        // device may hold the clone, and the UI would drop it wrongly).
         // Instead run ONE bounded read-only verifyListProbe (same retry/
         // delayFn/thrown-defense as the normal path, no write resend) with
         // an after-pin first: Installed -> Success, clean-but-absent ->
         // VerifyUnknown (reverse, write may still land), Unknown ->
         // VerifyUnknown (nothing is added; the next refresh converges).
-        // Trigger: res.timedOut (client abandoned the wait) OR
-        // res.transportUnknown (post-dispatch reply loss: transact threw,
-        // binder died mid-call, reply decode failed -- timedOut=false with
-        // the flag set, set client-side by Shizuku transactExec) OR
+        // Trigger (isUnknownAfterSend): res.timedOut (client abandoned the
+        // wait) OR res.transportUnknown (post-dispatch reply loss: transact
+        // threw, binder died mid-call, reply decode failed, su wait/drain
+        // interrupt -- timedOut=false with the flag set) OR
         // isServiceTimeoutText(res.err) -- the GalaxyExecService 60 s
         // captureProcess timeout arrives over the parcel as exit=1 + its
         // "timeout after ..." text with both flags false (only the marker
-        // survives the (exit, out, err) reply). Anchored prefixes exclude the
-        // bind-failure wrapper and ordinary "timeout" words in pm output.
-        // Scope: only these three signals take this path. Pre-dispatch
+        // survives the (exit, out, err) reply) OR
+        // isPostSpawnTransportText(res.err) -- the Phase A1 wire-frozen
+        // backstop ("interrupted: ..." from a post-spawn wait/drain
+        // interrupt, "service exec failed: ..." from the service catch after
+        // spawn). Anchored prefixes exclude the bind-failure wrapper,
+        // "spawn failed: ..." (pre-spawn definite: exec threw, process never
+        // started), and ordinary "timeout"/"Failure" words in pm output.
+        // Scope: only these four signals take this path. Pre-dispatch
         // refusals (command never sent: no binder, not authorized, bind
-        // failure -- both flags false, plain err text) and explicit pm
-        // failures (pm reports Failure[...]) stay on the isSuccess
-        // judgement below -> definite InstallFailed.
+        // failure -- both flags false, plain err text), pre-spawn spawn
+        // failures, and explicit pm failures (pm reports Failure[...]) stay
+        // on the isSuccess judgement below -> definite InstallFailed.
         // After-pin (Phase E P1-1): the probe below is the report-only
         // evidence, but the serial may have changed while the client was
         // waiting -- re-fetch and require the before/after pin to still hold
@@ -649,8 +654,9 @@ class DualRepository(
         // "not cloned" while the device may hold the clone. The next
         // refresh converges from ground truth.
         if (isUnknownAfterSend(res)) {
-            val byText = !res.timedOut && !res.transportUnknown
             val transportLost = res.transportUnknown
+            val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
+            val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val after = fetchVerifiedTarget()
             val drift = checkTargetDrift(before, after)
             if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
@@ -659,9 +665,9 @@ class DualRepository(
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
                         dualId,
-                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText, transportLost = transportLost),
+                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err),
                     )
-                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost))
+                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err))
             }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
@@ -718,20 +724,24 @@ class DualRepository(
             return RemoveOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
         // Unknown-after-send (PR-32 P1-1 timeout, extended by P1-2
-        // transport-unknown): same contract as cloneVerified above -- an
-        // abandoned or lost reply leaves exit/out/err untrusted either way,
-        // so NEVER map it to RemoveFailed (that would claim "still
-        // installed" or "remove failed" without knowledge). One bounded
-        // read-only verifyListProbe instead (no write resend, after-pin
-        // first): NotInstalled -> Success, clean present -> VerifyUnknown
-        // (reverse, write may still land), Unknown -> VerifyUnknown
-        // (caller keeps the entry; the next refresh converges).
-        // Trigger: res.timedOut OR res.transportUnknown (post-dispatch reply
-        // loss, timedOut=false with the flag set) OR
-        // isServiceTimeoutText(res.err) (see cloneVerified note -- same
-        // parcel flag-loss backstop). Scope: only these three signals take
-        // this path; pre-dispatch refusals and explicit pm failures stay on
-        // the isSuccess judgement below -> definite RemoveFailed.
+        // transport-unknown, extended by Phase A1 post-spawn text): same
+        // contract as cloneVerified above -- an abandoned or lost reply
+        // leaves exit/out/err untrusted either way, so NEVER map it to
+        // RemoveFailed (that would claim "still installed" or "remove
+        // failed" without knowledge). One bounded read-only verifyListProbe
+        // instead (no write resend, after-pin first): NotInstalled ->
+        // Success, clean present -> VerifyUnknown (reverse, write may still
+        // land), Unknown -> VerifyUnknown (caller keeps the entry; the next
+        // refresh converges).
+        // Trigger (isUnknownAfterSend): res.timedOut OR res.transportUnknown
+        // (post-dispatch reply loss incl. su wait/drain interrupt,
+        // timedOut=false with the flag set) OR isServiceTimeoutText(res.err)
+        // OR isPostSpawnTransportText(res.err) (see cloneVerified note --
+        // same parcel flag-loss backstops for "timeout after ...",
+        // "interrupted: ...", "service exec failed: ..."). Scope: only these
+        // four signals take this path; pre-spawn spawn failures, pre-dispatch
+        // refusals and explicit pm failures stay on the isSuccess judgement
+        // below -> definite RemoveFailed.
         // After-pin (Phase E P1-1, same as cloneVerified): re-fetch and
         // require the before/after pin to hold before trusting a
         // same-direction probe as Success. Reverse observation (clean
@@ -740,8 +750,9 @@ class DualRepository(
         // never claim "still installed" while the removal may be in flight.
         // The next refresh converges from ground truth.
         if (isUnknownAfterSend(res)) {
-            val byText = !res.timedOut && !res.transportUnknown
             val transportLost = res.transportUnknown
+            val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
+            val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val after = fetchVerifiedTarget()
             val drift = checkTargetDrift(before, after)
             if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
@@ -750,9 +761,9 @@ class DualRepository(
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
                         dualId,
-                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText, transportLost = transportLost),
+                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err),
                     )
-                is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost))
+                is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err))
             }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
@@ -863,9 +874,10 @@ class DualRepository(
             return RemoveOutcome.VerifyUnknown(expectedDualId, e.message ?: e.javaClass.simpleName)
         }
         // Unknown-after-send (PR-32 P1-1 timeout, extended by P1-2
-        // transport-unknown; same rule as cloneVerified/removeVerified): an
-        // abandoned or lost write reply proves nothing about the remote
-        // uninstall -- verify read-only instead of claiming failure.
+        // transport-unknown, extended by Phase A1 post-spawn text; same rule
+        // as cloneVerified/removeVerified): an abandoned or lost write reply
+        // proves nothing about the remote uninstall -- verify read-only
+        // instead of claiming failure.
         // After-pin (Phase E P1-1): same synthetic-before pin as the normal
         // path below -- the serial may have changed while the client was
         // waiting, so re-fetch and refuse drift as VerifyUnknown before any
@@ -873,8 +885,9 @@ class DualRepository(
         // StillInstalled: the probe ran right after the timeout and the
         // uninstall may still land after it. No write resend on any arm.
         if (isUnknownAfterSend(res)) {
-            val byText = !res.timedOut && !res.transportUnknown
             val transportLost = res.transportUnknown
+            val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
+            val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val syntheticTimeoutBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
             val timeoutAfter = fetchVerifiedTarget()
             val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
@@ -884,12 +897,12 @@ class DualRepository(
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
                         expectedDualId,
-                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText, transportLost = transportLost),
+                        writeTimeoutReverseDetail(observed = "present", intended = "remove", byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err),
                     )
                 is VerifyState.Unknown ->
                     RemoveOutcome.VerifyUnknown(
                         expectedDualId,
-                        writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost),
+                        writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err),
                     )
             }
         }
@@ -1145,45 +1158,61 @@ class DualRepository(
     }
 
     // Unknown-after-send discriminator (PR-32 P1-1 timeout, extended by P1-2
-    // transport-unknown): a write reply is untrusted -- and must reconcile
-    // read-only instead of claiming definite failure -- when the client
-    // abandoned the wait (timedOut), the post-dispatch reply was lost
-    // (transportUnknown), or the frozen-wire service-side timeout text is
-    // recognized (isServiceTimeoutText backstop). Pre-dispatch refusals and
-    // explicit pm failures carry none of these and stay on the isSuccess
-    // judgement -> definite failure.
+    // transport-unknown, extended by Phase A1 post-spawn transport text):
+    // a write reply is untrusted -- and must reconcile read-only instead of
+    // claiming definite failure -- when the client abandoned the wait
+    // (timedOut), the post-dispatch reply was lost (transportUnknown), the
+    // frozen-wire service-side timeout text is recognized
+    // (isServiceTimeoutText backstop), or the frozen-wire post-spawn
+    // transport text is recognized (isPostSpawnTransportText backstop:
+    // "interrupted: ..." from a su/service wait/drain interrupt after spawn,
+    // "service exec failed: ..." from the GalaxyExecService catch after
+    // spawn). Pre-spawn definite signals -- "spawn failed: ..." (exec threw,
+    // process never started), pre-dispatch refusals (no binder, not
+    // authorized, bind failure), and explicit pm failures (Failure[...]) --
+    // carry none of these and stay on the isSuccess judgement -> definite
+    // failure.
     private fun isUnknownAfterSend(res: CmdResult): Boolean =
-        res.timedOut || res.transportUnknown || isServiceTimeoutText(res.err)
+        res.timedOut || res.transportUnknown || isServiceTimeoutText(res.err) || isPostSpawnTransportText(res.err)
 
     // Detail prefix for the unknown-after-send path (PR-32 P1-1 timeout,
-    // extended by P1-2 transport-unknown): the write reply is untrusted, so
-    // the VerifyUnknown detail names that first and keeps the read-only
-    // probe detail after it. byText=true marks the wire-frozen backstop: the
-    // flag was lost on the parcel and the timeout was recognized by anchored
-    // producer-prefix text instead. transportLost=true marks the P1-2
-    // post-dispatch reply loss (transact threw / binder died mid-call /
-    // reply decode failed): timedOut=false with transportUnknown=true. The
-    // ViewModel already renders VerifyUnknown as "result unknown"
-    // (MsgKind.CHANNEL) and keeps the UI list for the next refresh -- no
-    // VM/MainActivity change needed.
-    private fun writeTimeoutDetail(probeDetail: String, byText: Boolean = false, transportLost: Boolean = false): String {
+    // extended by P1-2 transport-unknown, extended by Phase A1 post-spawn
+    // text): the write reply is untrusted, so the VerifyUnknown detail names
+    // that first and keeps the read-only probe detail after it. byText=true
+    // marks the wire-frozen timeout backstop: the flag was lost on the parcel
+    // and the timeout was recognized by anchored producer-prefix text
+    // instead. transportLost=true marks the P1-2 post-dispatch reply loss
+    // (transact threw / binder died mid-call / reply decode failed):
+    // timedOut=false with transportUnknown=true. postSpawnByText=true marks
+    // the Phase A1 wire-frozen post-spawn backstop ("interrupted: ..." /
+    // "service exec failed: ..."): the flag was lost on the parcel and the
+    // post-spawn transport failure was recognized by anchored text instead;
+    // writeErr carries the original err snippet (bounded take(200)) so the
+    // detail names the concrete signal. The ViewModel already renders
+    // VerifyUnknown as "result unknown" (MsgKind.CHANNEL) and keeps the UI
+    // list for the next refresh -- no VM/MainActivity change needed.
+    private fun writeTimeoutDetail(probeDetail: String, byText: Boolean = false, transportLost: Boolean = false, postSpawnByText: Boolean = false, writeErr: String = ""): String {
         val head =
             if (transportLost) "write reply lost (transport unknown, may have executed)"
+            else if (postSpawnByText) "write reply unknown post-spawn (may have executed; recognized by text; wire layout frozen; write err: ${writeErr.take(200)})"
             else if (byText) "write reply timed out (service-side timeout recognized by text; wire layout frozen)"
             else "write reply timed out"
         return if (probeDetail.isEmpty()) head else "$head; $probeDetail"
     }
 
     // Reverse-observation detail for the unknown-after-send path (Phase E
-    // P1-1, extended by P1-2 transport-unknown): the write reply is
-    // untrusted, so an immediate post-send probe showing the opposite of the
-    // intended write (absent right after a clone, present right after a
-    // remove) proves nothing -- the remote write may still land after the
-    // probe completed. Treated as unknown (never a terminal
-    // failure/success); the next refresh converges from ground truth.
-    private fun writeTimeoutReverseDetail(observed: String, intended: String, byText: Boolean = false, transportLost: Boolean = false): String {
+    // P1-1, extended by P1-2 transport-unknown, extended by Phase A1
+    // post-spawn text): the write reply is untrusted, so an immediate
+    // post-send probe showing the opposite of the intended write (absent
+    // right after a clone, present right after a remove) proves nothing --
+    // the remote write may still land after the probe completed. Treated as
+    // unknown (never a terminal failure/success); the next refresh converges
+    // from ground truth. Flag/text marking is the same tri-state-plus-text
+    // rule as writeTimeoutDetail above.
+    private fun writeTimeoutReverseDetail(observed: String, intended: String, byText: Boolean = false, transportLost: Boolean = false, postSpawnByText: Boolean = false, writeErr: String = ""): String {
         val head =
             if (transportLost) "write reply lost (transport unknown, may have executed)"
+            else if (postSpawnByText) "write reply unknown post-spawn (may have executed; recognized by text; wire layout frozen; write err: ${writeErr.take(200)})"
             else if (byText) "write reply timed out (service-side timeout recognized by text; wire layout frozen)"
             else "write reply timed out"
         return "$head; immediate post-timeout probe shows $observed opposite the intended $intended -- " +

@@ -1157,4 +1157,195 @@ class VerifyRetryTest {
         assertEquals(0, gateway.listCalls)
         assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
     }
+
+    // Phase A1 (PR #40 Re-review P1): post-spawn interrupt text backstop.
+    // "interrupted: ..." arrives over the frozen wire with flags lost
+    // (service-side wait/drain interrupt after spawn) -- must reconcile
+    // read-only, never claim definite failure.
+    @Test
+    fun isPostSpawnTransportText_onlyMatchesAnchoredPostSpawnPrefixes() {
+        assertTrue(isPostSpawnTransportText("interrupted: wait interrupted"))
+        assertTrue(isPostSpawnTransportText("interrupted: drain join interrupted: sleep"))
+        assertTrue(isPostSpawnTransportText("service exec failed: boom"))
+        assertTrue(isPostSpawnTransportText("service exec failed: interrupted: boom"))
+        assertTrue(!isPostSpawnTransportText("spawn failed: No such file or directory"))
+        assertTrue(!isPostSpawnTransportText("su failed: boom"))
+        assertTrue(!isPostSpawnTransportText("shizuku: bind failed: bind timed out after 10000ms"))
+        assertTrue(!isPostSpawnTransportText("Failure [INSTALL_FAILED_INVALID_APK: bad]"))
+        assertTrue(!isPostSpawnTransportText("Failure [DELETE_FAILED_INTERNAL_ERROR]"))
+        assertTrue(!isPostSpawnTransportText("Error: interrupted while waiting"))
+        assertTrue(!isPostSpawnTransportText("timeout after 60000ms: sh"))
+        assertTrue(!isPostSpawnTransportText("shizuku: exec timed out after 60000ms"))
+        assertTrue(!isPostSpawnTransportText(""))
+    }
+
+    // Phase A1: clone write interrupted post-spawn (text backstop, flags
+    // lost on the wire) + immediate clean REVERSE probe (absent) ->
+    // VerifyUnknown (NOT VerifyFailed -- the install may still land after
+    // the probe). Single write (no resend), single probe, no settle wait.
+    // The Unknown outcome keeps the UI list untouched (caller only appends
+    // on Success); the next refresh converges from ground truth.
+    @Test
+    fun cloneVerified_interruptedText_probeAbsent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "interrupted: wait interrupted", truncated = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("interrupted"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1: clone write service-side failure post-spawn (text backstop)
+    // + clean reverse probe (absent) -> VerifyUnknown (never InstallFailed).
+    @Test
+    fun cloneVerified_serviceExecFailedText_probeAbsent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "service exec failed: boom")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("service exec failed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1: remove write interrupted post-spawn (text backstop) +
+    // immediate clean REVERSE probe (present) -> VerifyUnknown (NOT
+    // StillInstalled -- the uninstall may still land after the probe).
+    // Single write, single probe.
+    @Test
+    fun removeVerified_interruptedText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "interrupted: wait interrupted", truncated = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("interrupted"))
+        assertTrue("detail must explain the reverse observation is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1: remove write service-side failure post-spawn (text backstop)
+    // + clean reverse probe (present) -> VerifyUnknown (never RemoveFailed).
+    @Test
+    fun removeVerified_serviceExecFailedText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "service exec failed: boom")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("service exec failed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1: expected-remove write interrupted post-spawn (text backstop)
+    // + clean reverse probe (present) -> VerifyUnknown (NOT StillInstalled).
+    // Third pinned path walks the same after-pin + single probe + reverse
+    // Unknown + no resend contract.
+    @Test
+    fun removeVerifiedExpected_interruptedText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "interrupted: wait interrupted", truncated = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("interrupted"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1: expected-remove write service-side failure post-spawn (text
+    // backstop) + clean reverse probe (present) -> VerifyUnknown (never
+    // RemoveFailed).
+    @Test
+    fun removeVerifiedExpected_serviceExecFailedText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "service exec failed: boom")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must keep the write signal, got: \"$detail\"", detail.contains("service exec failed"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A1对照: pre-spawn spawn failure stays definite on all three
+    // paths (process never started, pm could not have executed) -- no
+    // read-only probe, no Unknown inflation.
+    @Test
+    fun cloneVerified_spawnFailedText_isInstallFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "spawn failed: No such file or directory")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected InstallFailed, got: $outcome", outcome is CloneOutcome.InstallFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerified_spawnFailedText_isRemoveFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "spawn failed: No such file or directory")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected RemoveFailed, got: $outcome", outcome is RemoveOutcome.RemoveFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerifiedExpected_spawnFailedText_isRemoveFailedWithoutProbe() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "spawn failed: No such file or directory")
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected RemoveFailed, got: $outcome", outcome is RemoveOutcome.RemoveFailed)
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(0, gateway.listCalls)
+        assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
+    }
 }
