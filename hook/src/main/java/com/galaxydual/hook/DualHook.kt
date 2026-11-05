@@ -121,9 +121,10 @@ class DualHook : XposedModule() {
         // provider path vs legacy fallback in lspd logs (field-found lines alone
         // cannot, both candidates carry the same field names).
         logi("using ${target.name} for daagent hooks")
-        // Best-effort diagnostics: confirm the expected constant exists.
-        // First candidate present wins; CHINA variant is accepted as fallback.
-        val diagnosticField = WHITELIST_FIELD_CANDIDATES.firstOrNull { name ->
+        // Best-effort diagnostics: report every candidate field's presence
+        // (both standard and _FOR_CHINA names are patch targets below, so the
+        // log shows which ones this ROM actually carries).
+        val presentFields = WHITELIST_FIELD_CANDIDATES.filter { name ->
             try {
                 target.getDeclaredField(name)
                 true
@@ -131,15 +132,21 @@ class DualHook : XposedModule() {
                 false
             }
         }
-        if (diagnosticField != null) {
-            try {
-                val field = target.getDeclaredField(diagnosticField)
-                logi("found $diagnosticField : ${field.type.name} static=${Modifier.isStatic(field.modifiers)}")
-            } catch (_: Throwable) {
-                logi("field $diagnosticField not found on ${target.name}")
-            }
-        } else {
+        if (presentFields.isEmpty()) {
             logi("field $WHITELIST_FIELD_NAME not found on ${target.name}")
+        } else {
+            for (diagnosticField in presentFields) {
+                try {
+                    val field = target.getDeclaredField(diagnosticField)
+                    logi(
+                        "found $diagnosticField : ${field.type.name} " +
+                            "static=${Modifier.isStatic(field.modifiers)} " +
+                            "final=${Modifier.isFinal(field.modifiers)}",
+                    )
+                } catch (_: Throwable) {
+                    logi("field $diagnosticField not found on ${target.name}")
+                }
+            }
         }
         // Patch the static whitelist right after <clinit> finishes.
         var installed = 0
@@ -247,61 +254,35 @@ class DualHook : XposedModule() {
     // Kept as a separate function so that future work touches exactly one seam.
     internal fun remotePolicySnapshot(): Set<String> = emptySet()
 
-    // Merges policy entries into DUAL_APP_WHITELIST_PACKAGES after class init.
-    // Thin reflective shell over the pure WhitelistPatch decision object
-    // (unit-tested): every give-up path logs why (locatable diagnostics);
-    // success logs how many entries were added. The original whitelist is
-    // never shrunk.
+    // Merges policy entries into the WhiteListApps static whitelists after
+    // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
+    // BOTH candidate fields are attempted (the ROM may read the _FOR_CHINA
+    // field per region/sales code, so first-wins would silently miss region
+    // devices); every per-field outcome is logged (locatable diagnostics).
+    // The original whitelist is never shrunk.
+    //
+    // Empty policy today (STATIC_SEED and the remote snapshot are both
+    // empty; no policy source wired): returns before touching reflection,
+    // so current behavior is observe-only and unaffected by the final-field
+    // / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
         if (extra.isEmpty()) return
-        // First existing field wins: standard name preferred, CHINA variant fallback.
-        val fieldName = WHITELIST_FIELD_CANDIDATES.firstOrNull { name ->
-            try {
-                target.getDeclaredField(name)
-                true
-            } catch (_: Throwable) {
-                false
-            }
-        }
-        if (fieldName == null) {
-            logi("patch skipped on ${target.name}: no whitelist field found")
-            return
-        }
-        try {
-            val field = target.getDeclaredField(fieldName)
-            // Static check BEFORE get(null): an instance field's get(null)
-            // throws IllegalArgumentException, which would mask the precise
-            // "not static" diagnosis. WhitelistPatch keeps its own isStatic
-            // guard as defense-in-depth for direct callers/tests.
-            if (!Modifier.isStatic(field.modifiers)) {
-                logi("skip patch $fieldName on ${target.name}: field is not static")
-                return
-            }
-            field.isAccessible = true
-            val current = try {
-                field.get(null)
-            } catch (t: Throwable) {
-                logi("patch $fieldName on ${target.name} failed: ${t.message}")
-                return
-            }
-            when (val outcome = WhitelistPatch.apply(current, true, extra, fieldName, target.name)) {
+        val results = WhitelistPatch.patchFields(target, WHITELIST_FIELD_CANDIDATES, extra)
+        for ((fieldName, outcome) in results) {
+            when (outcome) {
                 is WhitelistPatch.Outcome.PatchedInPlace ->
                     logi("patched $fieldName on ${target.name} (MutableList): +${outcome.added} entries")
                 is WhitelistPatch.Outcome.Replaced -> {
-                    try {
-                        field.set(null, outcome.value)
-                    } catch (t: Throwable) {
-                        logi("patch $fieldName on ${target.name} failed: ${t.message}")
-                        return
+                    if (outcome.added == 0) {
+                        logi("patch $fieldName on ${target.name} already complete, no write")
+                    } else {
+                        logi("patched $fieldName on ${target.name} (String[]): +${outcome.added} entries")
                     }
-                    logi("patched $fieldName on ${target.name} (String[]): +${outcome.added} entries")
                 }
                 is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason)
+                is WhitelistPatch.Outcome.ObserveOnly -> logi(outcome.reason)
             }
-        } catch (t: Throwable) {
-            // Leave the original whitelist untouched on any reflection mismatch.
-            logi("patch $fieldName on ${target.name} failed: ${t.message}")
         }
     }
 
