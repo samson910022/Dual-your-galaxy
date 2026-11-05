@@ -31,14 +31,14 @@ class ShizukuElevator(
     val dumpsysUserCmd: String = DualRepository.CMD_DUMPSYS_USER
     val getpropDualCmd: String = DualRepository.CMD_GETPROP_DUAL
 
-    // Probe: `pm list users` must pass the shared pm isSuccess gate (same as
+    // Probe: `pm list users` must pass the pm-list dedicated gate (same as
     // profilesSnapshot()); dual id resolved via the verified cross-source
     // boundary (exactly one CLONE-typed non-zero id agreeing across
     // `cmd user list -v` + `dumpsys user` (+ property when present),
     // else -1). The pm-list label is never read.
     override suspend fun probe(): ProbeResult {
         val res = gateway.run(listUsersCmd)
-        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
+        if (!PmOutputParser.isListUsersOutputOk(res.out + "\n" + res.err, res.exit)) {
             return ProbeResult(
                 level = Privilege.NONE,
                 hasShizuku = false,
@@ -83,8 +83,8 @@ class SuElevator(
     val dumpsysUserCmd: String = DualRepository.CMD_DUMPSYS_USER
     val getpropDualCmd: String = DualRepository.CMD_GETPROP_DUAL
 
-    // Probe: `id -u` must print 0; `pm list users` must pass the shared pm
-    // isSuccess gate (same as profilesSnapshot(), so an exit-0 listing
+    // Probe: `id -u` must print 0; `pm list users` must pass the pm-list
+    // dedicated gate (same as profilesSnapshot(), so an exit-0 listing
     // carrying Failure text yields dual -1 without losing ROOT); then resolve
     // the dual profile id via the verified cross-source boundary (never the
     // pm-list label).
@@ -100,7 +100,7 @@ class SuElevator(
             )
         }
         val usersRes = gateway.run(listUsersCmd)
-        if (!PmOutputParser.isSuccess(usersRes.out + "\n" + usersRes.err, usersRes.exit)) {
+        if (!PmOutputParser.isListUsersOutputOk(usersRes.out + "\n" + usersRes.err, usersRes.exit)) {
             return ProbeResult(
                 level = Privilege.ROOT,
                 hasShizuku = false,
