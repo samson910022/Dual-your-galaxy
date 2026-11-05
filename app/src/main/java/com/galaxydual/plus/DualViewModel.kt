@@ -1541,6 +1541,28 @@ class DualViewModel(
     // choice is never overridden here: only selectChannel() changes it.
     // P25: swapAutoLocked is probe-based (su present but probe-denied +
     // Shizuku proven -> degrade to SHIZUKU with a recorded reason).
+    // Single-round recheck body shared by the leading and trailing runs.
+    // Must run under opMutex: callers hold it, so this never launches or
+    // locks itself. Sets loading BEFORE any suspending probe IO
+    // (Phase D P2 busy, issue #24; re-review #7 B2): swapAutoLocked()
+    // suspends on `su -c id -u` while probeChannels() used to be the first
+    // place setting loading -- without this early set the trailing round
+    // (which previously inlined swapAutoLocked directly) left a window with
+    // loading=false and MainActivity buttons enabled.
+    private suspend fun recheckLocked() {
+        // Phase D P2 busy (#24): same early-busy as reconnectLocked --
+        // swapAutoLocked() suspends before probeChannels() sets
+        // loading, so set it here first (idempotent, msg-preserving).
+        _state.update { it.copy(loading = true) }
+        // P25 Item 3: one probe per round — see reconnectLocked.
+        if (preference == ChannelPreference.AUTO) {
+            val probe = swapAutoLocked()
+            probeChannels(probe)
+        } else {
+            probeChannels()
+        }
+    }
+
     fun recheckPrivilege() {
         // Single-flight coalesce (P2-2): same gate shape as refresh(). A tap
         // while a recheck is in flight (including waiting on opMutex behind
@@ -1555,30 +1577,20 @@ class DualViewModel(
             val myJob = currentCoroutineContext()[Job] ?: return@launch
             recheckJob = myJob
             try {
-                opMutex.withLock {
-                    // Phase D P2 busy (#24): same early-busy as reconnectLocked --
-                    // swapAutoLocked() suspends before probeChannels() sets
-                    // loading, so set it here first (idempotent, msg-preserving).
-                    _state.update { it.copy(loading = true) }
-                    // P25 Item 3: one probe per round — see reconnectLocked.
-                    if (preference == ChannelPreference.AUTO) {
-                        val probe = swapAutoLocked()
-                        probeChannels(probe)
-                    } else {
-                        probeChannels()
-                    }
-                }
+                opMutex.withLock { recheckLocked() }
                 while (recheckPending) {
                     recheckPending = false
-                    opMutex.withLock {
-                        // P25 Item 3: one probe per round — see reconnectLocked.
-                        if (preference == ChannelPreference.AUTO) {
-                            val probe = swapAutoLocked()
-                            probeChannels(probe)
-                        } else {
-                            probeChannels()
-                        }
-                    }
+                    // Re-review #7 B2: hold busy across the mutex handoff so
+                    // the trailing round never exposes loading=false while it
+                    // waits on opMutex behind another op. The previous round's
+                    // probeChannels() tail cleared loading; without this the
+                    // trailing swapAutoLocked() suspend (`su -c id -u`) runs
+                    // with buttons enabled. Idempotent with the recheckLocked
+                    // entry set below; no suspension between the two, so the
+                    // in-flight + trailing drain reads as continuous busy and
+                    // every probe IO stays under loading=true.
+                    _state.update { it.copy(loading = true) }
+                    opMutex.withLock { recheckLocked() }
                 }
             } finally {
                 if (recheckJob === myJob) recheckJob = null
