@@ -83,8 +83,13 @@ class WhitelistPatchReflectTest {
     fun applyReportsObserveOnlyForFinalField() {
         val arr = arrayOf("a")
         val out = WhitelistPatch.apply(arr, true, setOf("b"), "F", "C", isFinal = true)
-        assertTrue(out is WhitelistPatch.Outcome.ObserveOnly)
-        assertTrue((out as WhitelistPatch.Outcome.ObserveOnly).reason.contains("F"))
+        assertTrue("final field should be ObserveOnly", out is WhitelistPatch.Outcome.ObserveOnly)
+        val o = out as WhitelistPatch.Outcome.ObserveOnly
+        assertTrue("reason should mention field, was: ${o.reason}", o.reason.contains("F"))
+        assertTrue(
+            "reason should carry observe-only marker, was: ${o.reason}",
+            o.reason.contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
         assertEquals(listOf("a"), arr.toList())
     }
 
@@ -95,8 +100,13 @@ class WhitelistPatchReflectTest {
         )
         assertEquals(1, out.size)
         val single = out.getValue("FINAL_ARR")
-        assertTrue(single is WhitelistPatch.Outcome.ObserveOnly)
-        assertTrue((single as WhitelistPatch.Outcome.ObserveOnly).reason.contains("FINAL_ARR"))
+        assertTrue("FINAL_ARR should be ObserveOnly", single is WhitelistPatch.Outcome.ObserveOnly)
+        val s = single as WhitelistPatch.Outcome.ObserveOnly
+        assertTrue("reason should mention field, was: ${s.reason}", s.reason.contains("FINAL_ARR"))
+        assertTrue(
+            "reason should carry observe-only marker, was: ${s.reason}",
+            s.reason.contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
+        )
         assertEquals(listOf("a"), FinalHolder.FINAL_ARR.toList())
     }
 
@@ -153,7 +163,13 @@ class WhitelistPatchReflectTest {
             emptySet(),
         )
         assertEquals(2, out.size)
-        assertTrue(out.values.all { it is WhitelistPatch.Outcome.Skipped })
+        val allSkipped = out.values.all { it is WhitelistPatch.Outcome.Skipped }
+        assertTrue("empty policy should leave all fields Skipped", allSkipped)
+        val reasons = out.values.map { (it as WhitelistPatch.Outcome.Skipped).reason }
+        assertTrue(
+            "empty-policy Skipped reasons should carry observe-only marker, was: $out",
+            reasons.all { it.contains(WhitelistPatch.OBSERVE_ONLY_MARKER) },
+        )
         assertSame(beforeStd, DualHolder.DUAL_APP_WHITELIST_PACKAGES)
         assertSame(beforeChina, DualHolder.DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA)
     }
