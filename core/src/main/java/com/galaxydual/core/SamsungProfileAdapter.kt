@@ -13,7 +13,8 @@ sealed interface DualResolution {
         val confidence: IdentityConfidence = IdentityConfidence.HIGH,
     ) : DualResolution
 
-    // Not enough agreeing evidence (no CLONE claim, or a single source only).
+    // Not enough agreeing evidence (no dual-CLONE agreement: no CLONE claim,
+    // CLONE on one verbose channel only, or CLONE+UNKNOWN across channels).
     data object Unknown : DualResolution
 
     // Evidence contradicts itself or policy forbids the target: ambiguous
@@ -143,14 +144,17 @@ object SamsungProfileAdapter {
 
     // Cross-source resolver (PR-1, issue #21). Returns Confirmed(HIGH) ONLY
     // when every agreeing source points at one identical non-owner userId:
-    // - at least one USER_LIST_V claim AND one DUMPSYS claim with
-    //   userType CLONE on that id (two independent channels agree), and
+    // - USER_LIST_V carries a CLONE claim on that id AND DUMPSYS carries a
+    //   CLONE claim on that id (two independent channels agree on the TYPE,
+    //   not just on the id's presence: an UNKNOWN entry -- no type line --
+    //   on either side never counts, so CLONE+UNKNOWN is Unknown), and
     // - when a property id is known (explicit argument OR PROP-sourced
     //   candidates), it equals that same id (triple agreement).
     // Everything else is Unknown (insufficient evidence) or Refused
-    // (contradiction/ambiguity/policy). NEVER label-based: .label and
-    // .serial are not read here at all (serial != userId is normal and a
-    // DUAL-containing label proves nothing).
+    // (contradiction/ambiguity/policy). An OTHER claim on the id from
+    // either verbose channel is a contradiction (Refused). NEVER
+    // label-based: .label and .serial are not read here at all (serial !=
+    // userId is normal and a DUAL-containing label proves nothing).
     //
     // @param candidates parsed claims from any sources (PROP entries act as
     //   property claims when present).
@@ -208,19 +212,34 @@ object SamsungProfileAdapter {
             return DualResolution.Refused("property id $effectiveProp disagrees with clone user $id")
         }
 
-        val sources = typed.filter { it.userId == id }.map { it.source }.toSet()
-        val twoChannel = IdentitySource.USER_LIST_V in sources && IdentitySource.DUMPSYS in sources
-        if (!twoChannel) return DualResolution.Unknown
+        val verboseClone = typed.any {
+            it.userId == id &&
+                it.source == IdentitySource.USER_LIST_V &&
+                it.userType == ProfileUserType.CLONE
+        }
+        val dumpsysClone = typed.any {
+            it.userId == id &&
+                it.source == IdentitySource.DUMPSYS &&
+                it.userType == ProfileUserType.CLONE
+        }
+        // Dual-CLONE gate (PR-33 S1, P1): BOTH verbose channels must
+        // explicitly type this id CLONE. An UNKNOWN entry (no type line) on
+        // either side is insufficient evidence -> Unknown, never Confirmed.
+        // (OTHER on either side already Refused above.)
+        if (!verboseClone || !dumpsysClone) return DualResolution.Unknown
         return DualResolution.Confirmed(id)
     }
 
     // Serial-bound dual target (PR-33 R2, P1). First confirms the id through
-    // the existing resolveDual (non-Confirmed maps to null, fail closed),
-    // then requires the USER_LIST_V and DUMPSYS claims for that id to carry
-    // non-null EQUAL serials. PROP-sourced serials are ignored: the property
-    // channel is id-only by contract (a numeric id claim, never identity
-    // evidence). Any missing/mismatched serial maps to null so callers can
-    // refuse the write instead of targeting a possibly-recreated profile.
+    // the existing resolveDual -- which itself requires a dual-CLONE
+    // consensus (USER_LIST_V CLONE on the id AND DUMPSYS CLONE on the id;
+    // CLONE+UNKNOWN is Unknown, never Confirmed) -- so non-Confirmed maps
+    // to null, fail closed. Then requires the USER_LIST_V and DUMPSYS
+    // claims for that id to carry non-null EQUAL serials. PROP-sourced
+    // serials are ignored: the property channel is id-only by contract (a
+    // numeric id claim, never identity evidence). Any missing/mismatched
+    // serial maps to null so callers can refuse the write instead of
+    // targeting a possibly-recreated profile.
     //
     // @param candidates parsed claims from any sources (same contract as
     //   resolveDual).

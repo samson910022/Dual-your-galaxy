@@ -1,7 +1,9 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+import kotlin.coroutines.startCoroutine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -337,5 +339,185 @@ class ProfileIdentityTest {
             DualResolution.Unknown,
             SamsungProfileAdapter.resolveDual(emptyList(), propertyId = 95),
         )
+    }
+
+    // PR-33 S1 (P1 cross-source CLONE consensus): USER_LIST_V CLONE on 95
+    // plus DUMPSYS UNKNOWN on 95 (no type line, same serial 15) is
+    // insufficient evidence -> Unknown, and the serial-bound target is null
+    // (fail closed). Guards the old loose rule where any two-channel id
+    // presence counted as Confirmed.
+    @Test
+    fun clonePlusUnknown_refusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates))
+        assertEquals(
+            -1,
+            PmOutputParser.resolveDualUserIdVerified(
+                userListVerbose = """
+                    Users:
+                      UserInfo{0:Owner:13} running:
+                        Serial number: 0
+                        User type: android.os.usertype.full.SYSTEM
+                      UserInfo{95:DualApp:400} running:
+                        Serial: 15
+                        parentId=0
+                        User type: android.os.usertype.profile.CLONE
+                """.trimIndent(),
+                dumpsysUser = """
+                    Users:
+                      UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                        userType=android.os.usertype.full.SYSTEM
+                      UserInfo{95:DualApp:400} serialNo=15:
+                        parentId=0
+                """.trimIndent(),
+            ),
+        )
+    }
+
+    // Symmetric case: USER_LIST_V UNKNOWN plus DUMPSYS CLONE on the same id
+    // (same serial) is likewise Unknown/null, never Confirmed.
+    @Test
+    fun unknownPlusClone_refusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates))
+        assertNull(
+            PmOutputParser.resolveDualTargetVerified(
+                userListVerbose = """
+                    Users:
+                      UserInfo{0:Owner:13} running:
+                        Serial number: 0
+                        User type: android.os.usertype.full.SYSTEM
+                      UserInfo{95:DualApp:400} running:
+                        Serial: 15
+                        parentId=0
+                """.trimIndent(),
+                dumpsysUser = """
+                    Users:
+                      UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                        userType=android.os.usertype.full.SYSTEM
+                      UserInfo{95:DualApp:400} serialNo=15:
+                        parentId=0
+                        userType=android.os.usertype.profile.CLONE
+                """.trimIndent(),
+            ),
+        )
+    }
+
+    // Both-CLONE success case (dual consensus + serial binding): retained and
+    // strengthened to pin the serial-bound target, so the P1 gate keeps a
+    // positive proof alongside the two refusal cases above.
+    @Test
+    fun bothClone_confirmsDualTargetWithSerial() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15),
+            SamsungProfileAdapter.resolveDualTarget(candidates),
+        )
+    }
+
+    // End-to-end repository gate (PR-33 S1): V=CLONE/serial15 plus
+    // D=UNKNOWN/serial15 resolves to NoDual (id never Confirmed), so
+    // removeVerifiedExpected runs zero uninstalls (fail closed). Uses a
+    // local fake gateway in the DualSafetyTest style (core has no
+    // coroutines dependency, hence the minimal runSuspend helper).
+    @Test
+    fun clonePlusUnknown_repoGateRefusesWithZeroUninstall() {
+        val verboseClone = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsysUnknown = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+        """.trimIndent()
+        val gateway = CloneUnknownFakeGateway(
+            verboseOut = verboseClone,
+            dumpsysOut = dumpsysUnknown,
+        )
+        val repo = DualRepository(gateway)
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.fetchDualTarget() } is DualTargetResult.NoDual)
+        val outcome = runSuspend {
+            repo.removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected NoDual, got: $outcome", outcome is RemoveOutcome.NoDual)
+        assertEquals(0, gateway.uninstallRuns)
+        assertTrue(
+            "no uninstall may run on CLONE+UNKNOWN, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
+        )
+    }
+
+    // Local fake gateway for the CLONE+UNKNOWN repository gate test above:
+    // serves canned identity channels plus the uninstall/list probes and
+    // records every command so the test can prove zero uninstalls.
+    private class CloneUnknownFakeGateway(
+        private val verboseOut: String,
+        private val dumpsysOut: String,
+    ) : CmdGateway {
+        override val privilege: Privilege = Privilege.SHELL
+        val commands = mutableListOf<String>()
+        var uninstallRuns = 0
+
+        override suspend fun run(cmd: String): CmdResult {
+            commands.add(cmd)
+            return when {
+                cmd == DualRepository.CMD_LIST_USERS ->
+                    CmdResult(
+                        exit = 0,
+                        out = "Users:\n" +
+                            "\tUserInfo{0:Owner:13} running\n" +
+                            "\tUserInfo{95:DualApp:400} running\n",
+                        err = "",
+                    )
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = verboseOut, err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = 0, out = dumpsysOut, err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = "", err = "")
+                cmd.startsWith("pm uninstall") -> {
+                    uninstallRuns++
+                    CmdResult(exit = 0, out = "Success", err = "")
+                }
+                cmd.startsWith("pm list packages") ->
+                    CmdResult(exit = 0, out = "", err = "")
+                else -> CmdResult(exit = 0, out = "ok", err = "")
+            }
+        }
+    }
+
+    private fun <T> runSuspend(block: suspend () -> T): T {
+        var result: Result<T>? = null
+        block.startCoroutine(
+            object : kotlin.coroutines.Continuation<T> {
+                override val context = kotlin.coroutines.EmptyCoroutineContext
+                override fun resumeWith(r: Result<T>) {
+                    result = r
+                }
+            },
+        )
+        return (result ?: error("suspend block never resumed")).getOrThrow()
     }
 }
