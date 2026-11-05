@@ -1368,7 +1368,8 @@ class DualViewModel(
                     Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
                     Privilege.NONE -> Unit
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 // A throwing probe means no channel from this elevator.
             }
         }
@@ -1383,7 +1384,8 @@ class DualViewModel(
     private suspend fun degradeAutoLocked(hasRoot: Boolean, hasShizuku: Boolean) {
         val suPresent = try {
             suPresentCheck()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             false
         }
         val decision = resolveAutoProbe(suPresent, hasRoot, hasShizuku)
@@ -1411,17 +1413,22 @@ class DualViewModel(
         repo = DualRepository(newGateway)
         gatewayPrivilege = newGateway.privilege
         currentChannel = desired
+        // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
+        // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
+        // 由使用者重新 request（與 swapToLocked 一致；confirm 仍有重驗雙保險）。
         _state.update {
             it.copy(
                 channel = preference,
                 resolvedGateway = desired,
                 execIdentity = newGateway.privilege,
+                pendingRemove = null,
             )
         }
         if (old !== newGateway && old is ShizukuCmdGateway) {
             try {
                 old.close()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
@@ -1439,14 +1446,22 @@ class DualViewModel(
     // crosses channels); an AUTO file-heuristic swap keeps the note until
     // probeChannels recomputes it from live probes.
     private suspend fun swapToLocked(pref: ChannelPreference) {
+        // Snapshot BEFORE the swap: assembleChannel builds fresh su/shizuku
+        // instances below, so the displaced idle Shizuku would otherwise leak
+        // its cached UserService binding. suGateway/shizukuGateway always have
+        // defaults (never lateinit), so this snapshot is safe on every path.
+        val oldSu = suGateway
+        val oldShizuku = shizukuGateway
         val suPresent = try {
             suPresentCheck()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             false
         }
         val shizukuAuth = try {
             shizukuAuthCheck()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             false
         }
         val asm = assembleChannelFn(pref, suPresent, shizukuAuth, appPackageName)
@@ -1475,6 +1490,32 @@ class DualViewModel(
         if (old !== activeGateway && old is ShizukuCmdGateway) {
             try {
                 old.close()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                // Best effort: the stale binding dies with the process anyway.
+            }
+        }
+        // Release displaced idle Shizuku instances (assembleChannel builds
+        // fresh ones every swap; the unpicked idle instance is otherwise
+        // dropped without closing). Never the newly installed instances;
+        // double-close with the block above is safe (close is idempotent).
+        if (oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
+            oldShizuku !== activeGateway && oldShizuku is ShizukuCmdGateway
+        ) {
+            try {
+                oldShizuku.close()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                // Best effort: the stale binding dies with the process anyway.
+            }
+        }
+        // Defensive: suGateway is a SuCmdGateway by construction, but tests
+        // may inject any CmdGateway -- never leak a Shizuku hiding there.
+        if (oldSu !== suGateway && oldSu !== shizukuGateway &&
+            oldSu !== activeGateway && oldSu is ShizukuCmdGateway
+        ) {
+            try {
+                oldSu.close()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 // Best effort: the stale binding dies with the process anyway.
@@ -1557,12 +1598,14 @@ class DualViewModel(
                 withContext(Dispatchers.IO) {
                     val direct = try {
                         hookDirectReads()
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
                         listOf(MarkerRead.Denied, MarkerRead.Denied)
                     }
                     val candidates = try {
                         hookDiagnosticGateways()
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
                         emptyList()
                     }
                     val usable = candidates.filter {
