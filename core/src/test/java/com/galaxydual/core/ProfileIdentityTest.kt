@@ -857,7 +857,8 @@ class ProfileIdentityTest {
     @Test
     fun cloneExactAllowlistVariants_areClone() {
         // Parameterized allowlist: dot/underscore/hyphen/space separators plus
-        // case-insensitivity all stay CLONE.
+        // case-insensitivity all stay CLONE. Consecutive enumerated
+        // separators (double space) are documented leniency, still CLONE.
         val cases = listOf(
             "android.os.usertype.profile.CLONE",
             "android.os.usertype.profile.clone",
@@ -865,11 +866,87 @@ class ProfileIdentityTest {
             "profile_CLONE",
             "profile-CLONE",
             "profile CLONE",
+            "profile  CLONE",
+            "android.os.usertype.profile_CLONE",
+            "android.os.usertype.profile-CLONE",
         )
         for (value in cases) {
             assertEquals(
                 "value must be CLONE: $value",
                 ProfileUserType.CLONE,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
+
+    // ---- Phase A P1-R6: enumerated-separator allowlist (issue #21 R6 BLOCKER) ----
+    // Only `.`/`_`/`-`/whitespace (space/Tab) 1-3 chars separate `profile`
+    // from `clone`. `!`/`?`/`:`/`/` and any other punctuation are NOT
+    // separators: each value below is the ONLY type mention, so OTHER proves
+    // the punctuation form alone refuses (not an UNKNOWN mixture).
+
+    @Test
+    fun punctuationSeparatedClone_isOtherNotClone() {
+        val cases = listOf(
+            "android.os.usertype.profile!CLONE",
+            "profile!CLONE",
+            "android.os.usertype.profile?CLONE",
+            "profile?CLONE",
+            "android.os.usertype.profile:::CLONE",
+            "profile:::CLONE",
+            "android.os.usertype.profile/CLONE",
+            "profile/CLONE",
+            "android.os.usertype.profile:CLONE",
+            "profile:CLONE",
+        )
+        for (value in cases) {
+            assertEquals(
+                "punctuation must be OTHER, got CLONE/UNKNOWN: $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
+
+    // ---- Phase A P1-R6: tainted CLONE tail (fail-closed) ----
+    // A CLONE token followed by optional whitespace + `/` (not opening
+    // another `profile` token) is tainted -> OTHER, never CLONE. The
+    // `MANAGED/profile.CLONE` slash dual-token form stays UNKNOWN
+    // (regression locked: slash opens another profile token, untainted).
+
+    @Test
+    fun cloneSlashTail_isOtherNotClone() {
+        val cases = listOf(
+            "profile.CLONE/evil",
+            "android.os.usertype.profile.CLONE/evil",
+            "profile.CLONE/",
+            "android.os.usertype.profile.CLONE/",
+            "profile.CLONE / evil",
+            "android.os.usertype.profile.CLONE / evil",
+        )
+        for (value in cases) {
+            assertEquals(
+                "slash tail must be OTHER, got CLONE/UNKNOWN: $value",
+                ProfileUserType.OTHER,
+                parseSingleVerboseType(value),
+            )
+        }
+    }
+
+    @Test
+    fun slashSeparatedManagedAndClone_staysUnknown() {
+        // Explicit R6 regression lock: `MANAGED/profile.CLONE` slash
+        // dual-token is an intra-mention contradiction -> UNKNOWN (the
+        // taint guard explicitly exempts `/` followed by another profile
+        // token, so this must NOT flip to OTHER).
+        val cases = listOf(
+            "android.os.usertype.profile.MANAGED/android.os.usertype.profile.CLONE",
+            "profile.MANAGED/profile.CLONE",
+        )
+        for (value in cases) {
+            assertEquals(
+                "slash dual-token must stay UNKNOWN: $value",
+                ProfileUserType.UNKNOWN,
                 parseSingleVerboseType(value),
             )
         }
