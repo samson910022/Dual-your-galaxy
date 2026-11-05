@@ -21,6 +21,26 @@ sealed interface DualTargetResult {
     data object SerialUnavailable : DualTargetResult
 }
 
+// Typed dual-id resolution (Round 2 Phase B P2-5): tells "confirmed" apart
+// from "confirmed absent" and from "unconfirmable", so callers never mistake
+// a failed typed channel for a missing profile. The legacy Int entry below
+// folds Absent and Unknown together (-1); it is kept unchanged for
+// compatibility, new callers must use this typed entry.
+sealed interface DualIdResolution {
+    // Clean typed channels agree on one non-owner id: safe to target.
+    data class Confirmed(val userId: Int) : DualIdResolution
+
+    // Clean typed channels parsed fine but claim no dual profile: the device
+    // genuinely has no usable dual target right now.
+    data object Absent : DualIdResolution
+
+    // The identity cannot be established: a typed channel threw/failed, or
+    // the evidence contradicts itself / is too thin to confirm either way.
+    // Callers must treat this as "unknown" (keep old data, report channel),
+    // never as "no dual".
+    data class Unknown(val detail: String = "") : DualIdResolution
+}
+
 // Profile-list snapshot distinguishing channel failure from an empty parse.
 // Phase C3 (issue #9): listProfiles() collapses both to emptyList by design
 // (C2 contract, kept); callers that must tell "channel failed" apart from
@@ -252,6 +272,75 @@ class DualRepository(
     // Never throws: gateway errors collapse to -1 (fail closed); only
     // coroutine cancellation is rethrown by the shared fetcher itself.
     private suspend fun fetchVerifiedDualId(): Int = gateway.fetchVerifiedDualId()
+
+    // Typed verified entry (Round 2 Phase B P2-5): same three gateway runs
+    // and the same fail-closed channel checks as the shared fetcher above,
+    // but keeps the failure reason instead of folding everything to -1:
+    // - Confirmed(id): clean channels whose CLONE claims agree on one id.
+    // - Absent: clean channels that parse to real user blocks on BOTH
+    //   sources yet claim no dual profile anywhere (genuinely no target,
+    //   not a broken channel: a single non-empty source alone proves
+    //   nothing, the other channel may just be broken).
+    // - Unknown: a typed channel threw/failed (exit/isSuccess), the outputs
+    //   parse to no user blocks at all (untrustworthy capture), the two
+    //   sources contradict each other (Refused), or a single source alone
+    //   claims a clone (insufficient evidence: the other channel may just be
+    //   broken, so absence must not be claimed).
+    // Never throws except on coroutine cancellation. The legacy Int entries
+    // above are untouched; this is purely additive.
+    // NOTE (p25-rebase adapt): the Int path above stays delegated to the
+    // shared fetcher (single source, no duplication); only this typed entry
+    // runs its own three gateway calls because it needs per-channel failure
+    // reasons the Int seam cannot carry.
+    suspend fun resolveDualUserIdTyped(): DualIdResolution {
+        val verboseRes = try {
+            gateway.run(CMD_USER_LIST_VERBOSE)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualIdResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
+        }
+        val dumpsysRes = try {
+            gateway.run(CMD_DUMPSYS_USER)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualIdResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
+        }
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) {
+            return DualIdResolution.Unknown(
+                "typed channel exit (verbose=${verboseRes.exit} dumpsys=${dumpsysRes.exit})",
+            )
+        }
+        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) {
+            return DualIdResolution.Unknown("typed verbose channel reports failure")
+        }
+        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) {
+            return DualIdResolution.Unknown("typed dumpsys channel reports failure")
+        }
+        val propRes = try {
+            gateway.run(CMD_GETPROP_DUAL)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            null
+        }
+        val propertyId = propRes
+            ?.takeIf { it.exit == 0 }
+            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
+        val verboseClaims = SamsungProfileAdapter.parseUserListVerbose(verboseRes.out)
+        val dumpsysClaims = SamsungProfileAdapter.parseDumpsysUser(dumpsysRes.out)
+        val candidates = verboseClaims + dumpsysClaims
+        return when (val resolution = SamsungProfileAdapter.resolveDual(candidates, propertyId)) {
+            is DualResolution.Confirmed -> DualIdResolution.Confirmed(resolution.userId)
+            is DualResolution.Refused -> DualIdResolution.Unknown(resolution.reason)
+            is DualResolution.Unknown -> {
+                val anyCloneClaim = candidates.any { it.userType == ProfileUserType.CLONE }
+                if (!anyCloneClaim && verboseClaims.isNotEmpty() && dumpsysClaims.isNotEmpty()) {
+                    DualIdResolution.Absent
+                } else {
+                    DualIdResolution.Unknown("insufficient identity evidence")
+                }
+            }
+        }
+    }
 
     // Phase D target fetch: same shared fetch as above but preserves the
     // serial/parentId continuity signals for ID-reuse protection. Null means

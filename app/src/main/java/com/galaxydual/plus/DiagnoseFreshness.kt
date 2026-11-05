@@ -5,7 +5,9 @@
 // 本檔案只放純 Kotlin 狀態模型 (JVM 可測, 無 Android 依賴):
 // - InventorySnapshot: 清單 ground truth 的來源/目標身份/查詢時間/新鮮度
 //   (FRESH / STALE / UNKNOWN)。refresh 成功才 FRESH；通道失敗/查不到為
-//   UNKNOWN；目標重建 (dualId 改變) 或通道全失時舊資料標 STALE (不謊稱新鮮)。
+//   UNKNOWN；目標重建 (dualId 改變)、通道全失、過期，或選定通道失效
+//   (P2-4：選定且應可執行的通道不可用——resolved 改變或 ready 變 false——
+//   即使他通道 probe 成功，舊資料照樣標 STALE，不謊稱新鮮) 時舊資料標 STALE。
 // - LastOperation: 最近一次 clone/remove 的歷史結果 (opId/appKey/pinnedTarget/
 //   phase/time)。普通 probe 成功不清 UNKNOWN，需重新查證 (下一次 pinned
 //   clone/remove verify) 才覆寫；probe/refresh 只保留不清除。
@@ -35,7 +37,16 @@ import java.util.Locale
 // 無目標哨兵：verified dualId 未知時 (resolveDualUserId 回 -1，見
 // DualRepository/PmOutputParser 契約：Confirmed 以外一律 -1) 的佔位值。
 // 取代散落的 -1 字面量 (targetId/pinnedTarget 預設與比較處)；語意不變。
+// P2-5 補充：-1（typed Unknown/Absent 皆折疊於此）一律視為「無法確認」——
+// 呼叫端不得據此報 NO_DUAL/清空舊單；真正確認無 dual 改走 repo 的 typed
+// 入口 resolveDualUserIdTyped() -> DualIdResolution.Absent。
 const val NO_TARGET_ID: Int = -1
+
+// 使用者包名輸入上限 (P2-8)：trim() 後超過此長度即 INVALID_INPUT 拒絕執行
+// （取代舊 take(256) 靜默截斷：截斷會把超長輸入變形成另一個包名再執行，
+// 誠實做法是拒絕）。clone/requestRemove 共用；confirmRemove 沿用 request
+// 時已驗證的 pending，不再檢查。
+const val MAX_PACKAGE_INPUT_CHARS: Int = 256
 
 // 清單新鮮度：FRESH=本次查詢可信；STALE=舊資料 (目標已變/通道已失/過期)；
 // UNKNOWN=從未成功查到或上次查詢不可信。
@@ -420,3 +431,8 @@ fun buildDiagnosticExport(state: UiState): String {
     val redacted = redactPaths(redactPii(sb.toString()))
     return if (redacted.length <= MAX_DIAG_EXPORT_CHARS) redacted else redacted.take(MAX_DIAG_EXPORT_CHARS)
 }
+
+// 匯出複製用純文字 (P2-7)：對話框預覽與剪貼簿複製共用同一字串——直接回傳
+// buildDiagnosticExport(state)，保證「預覽所見即複製所得」，兩者一字不差。
+// MainActivity 的複製按鈕只拷貝此函數結果（使用者主動觸發，不做自動傳輸）。
+fun diagnosticExportCopyText(state: UiState): String = buildDiagnosticExport(state)

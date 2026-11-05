@@ -18,7 +18,9 @@ package com.galaxydual.plus
 // the Activity onRequestPermissionsResult override is kept as a defensive seam
 // (Shizuku delivers via its own listener; the override only reacts when our
 // code matches). onResume routes into vm.onForeground(): 過期 FRESH 先補標
-// STALE，inventory/hook 任一 UNKNOWN/STALE 即自動重查 (probe+refresh)，
+// STALE，inventory 非 FRESH 或通道改變 (resolved/ready 變化) 即自動重查
+// (probe+refresh)，否則只輕探 (hook UNKNOWN 只重 probe，不觸發全量重查，
+// 見 P2-6)，
 // 否則只輕探 (PR-6 P2 #27 後半)。Every binder/permission event routes into
 // vm.reconnectAndRefresh() (reread path: probe with Auto degrade +
 // refresh) or vm.recheckPrivilege() (dead-binder path: probe only), so the
@@ -34,6 +36,8 @@ package com.galaxydual.plus
 // by UiState.pendingRemove (syncRemoveDialog): confirm calls
 // vm.confirmRemove(), cancel/back calls vm.cancelRemove(). Rotation re-shows
 // the same pending from the retained ViewModel with no re-send.
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -184,8 +188,9 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         // PR-6 P2 (#27 後半)：前景不只 recheck。onForeground 先把過期
-        // FRESH 補標 STALE，inventory/hook 任一 UNKNOWN/STALE 即自動重查
-        // (probe+refresh)，否則只輕探 (內含 probe，覆蓋 recheck 語意)。
+        // FRESH 補標 STALE，inventory 非 FRESH 或通道改變 (resolved/ready
+        // 變化) 即自動重查 (probe+refresh)，否則只輕探。
+        // P2-6：hook UNKNOWN 不再觸發全量重查（probe 本就重跑 hook 診斷）。
         // P2-1 (base)：auto 路徑預設 allowPrivilegedHookDiagnosis=false，
         // 不執行特權 cat，與直接調 recheckPrivilege(false) 同契約。
         vm.onForeground()
@@ -422,6 +427,9 @@ class MainActivity : ComponentActivity() {
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽的本機文字 (buildDiagnosticExport
     // 經兩道遮蔽：先包名後路徑，大小受限)；只有使用者主動點按才顯示，無自動上傳、
     // 無網路呼叫、無後台傳送。
+    // P2-7：對話框另附「複製已遮蔽內容」按鈕（見 DIAGNOSTIC_COPY_BUTTON_TEXT）：
+    // 使用者主動觸發才經 ClipboardManager 複製已遮蔽文本到本機剪貼簿；複製內容
+    // 與預覽同字串 (diagnosticExportCopyText)，不做自動傳輸/share。
     private fun showDiagnosticExport() {
         val state = lastState ?: vm.state.value
         val preview = buildDiagnosticExport(state)
@@ -434,6 +442,22 @@ class MainActivity : ComponentActivity() {
             .setTitle("診斷匯出預覽（已遮蔽，無自動上傳）")
             .setMessage(preview)
             .setCancelable(true)
+            .setNeutralButton(DIAGNOSTIC_COPY_BUTTON_TEXT) { _, _ ->
+                try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(
+                        ClipData.newPlainText(
+                            "galaxy-dual-diagnostic",
+                            diagnosticExportCopyText(state),
+                        ),
+                    )
+                    msgView.text = "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳）"
+                    msgView.setTextColor(colorFor(MsgKind.INFO))
+                } catch (e: Exception) {
+                    msgView.text = "複製失敗：${sanitizeForDisplay(e.message ?: "unknown")}"
+                    msgView.setTextColor(colorFor(MsgKind.CHANNEL))
+                }
+            }
             .setPositiveButton("關閉", null)
             .show()
     }
@@ -807,6 +831,10 @@ internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildSt
         }
     }
 }
+
+// P2-7 匯出複製按鈕文案（頂層 const，JVM 可測；測試鎖定繁中字面）。
+// 使用者主動觸發才複製，不做自動傳輸/share。
+const val DIAGNOSTIC_COPY_BUTTON_TEXT = "複製已遮蔽內容"
 
 // 診斷行無障礙描述 (含展開狀態，供 contentDescription + 切換宣告)。
 internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
