@@ -256,13 +256,14 @@ class DualRepository(
         }
 
     // Tri-state variant of verify(pkg, dualId): Installed only when the
-    // `pm list packages` probe exits 0 AND the parsed set contains the
-    // package (exact match); NotInstalled when the probe exits 0 but the
-    // set lacks it (confirmed absent); Unknown when the id is
-    // guard-refused, the package token is invalid, or the probe exits
-    // non-zero (channel failure). C1 guard is unchanged; the shared C2
-    // isSuccess rule is intentionally NOT applied to the list probe here
-    // (see verifyOnProfiles): only the result granularity is new.
+    // `pm list packages` probe parses as TrustedFull containing the package
+    // (exact match); NotInstalled on a clean listing that lacks it
+    // (TrustedFull of other packages, or TrustedEmpty: confirmed absent);
+    // Unknown when the id is guard-refused, the package token is invalid, or
+    // the probe parses as Unknown (truncated capture, non-zero exit after
+    // retries, or error-semantic text per the shared C2 line rule). C1 guard
+    // is unchanged; the mapping itself is owned by verifyListProbe (PR-2
+    // stage 2, issue #22).
     suspend fun verifyState(pkg: String, dualId: Int): VerifyState {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return VerifyState.Unknown(snap.detail)
@@ -271,8 +272,10 @@ class DualRepository(
     }
 
     // Lists the dual profile's actual packages (ground truth for refresh).
-    // Null means unknown: no verified dual profile, channel failure, or guard
-    // refusal. Non-null (possibly empty) is authoritative: refresh rebuilds
+    // Null means unknown: no verified dual profile, channel failure, guard
+    // refusal, or an untrusted listing (truncated / non-zero / error-semantic:
+    // never an authoritative empty). Non-null (possibly empty) is
+    // authoritative: refresh rebuilds
     // `cloned` from it, so external installs/removals sync and a fresh
     // ViewModel discovers pre-existing clones. Uses `pm list packages
     // --user <dualId>` (see PmOutputParser.buildListPackages); per-package
@@ -379,21 +382,22 @@ class DualRepository(
     // exact set lookup so a superstring never mis-hits (com.example.app2
     // does not imply com.example.app).
     //
-    // Exit-only semantics: exit != 0 (after retries below) maps to Unknown
-    // (detail kept); exit == 0 with the package present is Installed, and
-    // exit == 0 without it is NotInstalled -- even when the output carries
-    // an error-ish text. The shared C2 isSuccess rule is deliberately NOT
-    // used here: absence text is absence evidence, and folding it into
-    // Unknown would turn a confirmed removal into "unknown" (remove) or a
-    // fake clone success into "unknown" instead of VerifyFailed (clone).
-    // Every other flow (list/install/uninstall/packages) keeps isSuccess.
+    // Trusted tri-state semantics (PR-2 stage 2, issue #22): the final probe
+    // CmdResult is judged by parsePackagesTrusted. A clean listing decides
+    // presence by exact membership (Installed) or confirmed absence
+    // (NotInstalled -- TrustedEmpty, or TrustedFull of other packages); an
+    // untrusted capture is Unknown (detail kept: exit code, truncation, or
+    // the error-semantic line). In particular an exit-0 "Unknown package" /
+    // SecurityException / Failure text is Unknown, NOT confirmed-absent: only
+    // a format-clean listing is absence evidence. Install/uninstall-side
+    // channels keep isSuccess; only this list probe and the refresh listing
+    // use the trusted rule.
     //
-    // Retry (retained): a non-zero list probe is retried at most twice with
-    // a 1500 ms settle wait before reporting Unknown, covering transient
-    // binder/timeout blips. gateway.run is a blocking suspend with no
-    // dispatcher assumption, hence Thread.sleep (core has no
-    // kotlinx-coroutines dependency for delay). Only three consecutive
-    // non-zero exits map to Unknown.
+    // Retry (retained, PR-3 owns it): a non-zero list probe is retried at most
+    // twice with a 1500 ms settle wait before the trusted parse, covering
+    // transient binder/timeout blips. gateway.run is a blocking suspend with
+    // no dispatcher assumption, hence Thread.sleep (core has no
+    // kotlinx-coroutines dependency for delay).
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -416,8 +420,8 @@ class DualRepository(
     // List-only re-check for an already-verified id (pinned flows): runs the
     // `pm list packages --user <dualId>` probe WITHOUT re-resolving identity,
     // so the write and the check share one verified target and cannot drift.
-    // All tri-state/exit-only/retry semantics are identical to the explicit
-    // path below (PR-2 owns that contract; stage 2 only changes WHO may be
+    // All tri-state/trusted-parse/retry semantics are identical to the explicit
+    // path below (PR-2 owns that contract; #21 only changes WHO may be
     // probed, never HOW the probe is judged).
     private suspend fun verifyListProbe(pkg: String, dualId: Int): VerifyState {
         val clean = pkg.trim()
@@ -438,19 +442,27 @@ class DualRepository(
             res = gateway.run(cmd)
             attempts++
         }
-        if (res.exit != 0) {
-            return VerifyState.Unknown(res.err.ifEmpty { res.out.ifEmpty { "verify failed (exit=${res.exit})" } })
-        }
-        return if (clean in PmOutputParser.parsePackages(res.out)) {
-            VerifyState.Installed
-        } else {
-            VerifyState.NotInstalled
+        // Trusted tri-state (PR-2 stage 2, issue #22): the final probe result
+        // is judged by parsePackagesTrusted, not by exit code alone. A clean
+        // listing that lacks the package -- TrustedEmpty, or TrustedFull of
+        // other packages (including a filtered-style empty) -- is confirmed
+        // absent (NotInstalled); only an untrusted capture (truncated,
+        // non-zero after the retries above, or error-semantic text such as
+        // "Unknown package"/SecurityException/Failure with exit 0) is
+        // Unknown. Membership stays an exact set lookup (superstrings never
+        // hit). Retry/sleep policy is unchanged (PR-3 owns it).
+        return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
+            is TrustedList.TrustedFull ->
+                if (clean in trusted.packages) VerifyState.Installed else VerifyState.NotInstalled
+            is TrustedList.TrustedEmpty -> VerifyState.NotInstalled
+            is TrustedList.Unknown -> VerifyState.Unknown(trusted.detail)
         }
     }
 
     // Runs `pm list packages --user <dualId>` for an already-pinned snapshot.
-    // Guard-refused ids and failed listings yield null (unknown), never throw.
-    // Stage 2 adds the verified-dual gate: existence alone never suffices.
+    // Guard-refused ids and untrusted listings yield null (unknown), never
+    // throw. The verified-dual gate (#21) is unchanged: existence alone never
+    // suffices; the trusted parse (#22) is owned by listProbe.
     private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>): List<String>? {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
         val verified = fetchVerifiedDualId()
@@ -459,7 +471,11 @@ class DualRepository(
     }
 
     // List-only probe for an already-verified id (auto listing path): no
-    // identity re-resolution, same isSuccess ground-truth semantics as before.
+    // identity re-resolution. Trusted tri-state (PR-2 stage 2, issue #22):
+    // TrustedFull yields its packages, TrustedEmpty yields confirmed-empty
+    // (emptyList, authoritative), and Unknown (truncated / non-zero /
+    // error-semantic) yields null -- never an authoritative empty list, so
+    // refresh keeps the previous `cloned` instead of wiping it.
     private suspend fun listProbe(dualId: Int): List<String>? {
         val cmd = try {
             PmOutputParser.buildListPackages(dualId)
@@ -467,7 +483,10 @@ class DualRepository(
             return null
         }
         val res = gateway.run(cmd)
-        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) return null
-        return PmOutputParser.parsePackages(res.out)
+        return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
+            is TrustedList.TrustedFull -> trusted.packages
+            is TrustedList.TrustedEmpty -> emptyList()
+            is TrustedList.Unknown -> null
+        }
     }
 }
