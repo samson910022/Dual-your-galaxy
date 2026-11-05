@@ -41,6 +41,9 @@ object SamsungProfileAdapter {
     // `android.os.usertype.profile.CLONE`, `profile_CLONE` and case
     // variants all count. Case-insensitive by design. Right boundary
     // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
+    // TODO(P22-follow-up): right boundary does not block '_', so
+    // profile.CLONE_extra still counts as CLONE; confirm with real-device
+    // corpus before tightening to [A-Za-z0-9_].
     private val CLONE_MARKER = Regex("(?<![A-Za-z0-9])profile[^A-Za-z0-9]{0,3}clone(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
 
     // Standalone `profile.X` token extractor (separator-tolerant,

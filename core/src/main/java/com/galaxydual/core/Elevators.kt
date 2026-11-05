@@ -46,6 +46,14 @@ class ShizukuElevator(
                 dualUserId = -1,
             )
         }
+        if (res.truncated) {
+            return ProbeResult(
+                level = Privilege.NONE,
+                hasShizuku = false,
+                hasRoot = false,
+                dualUserId = -1,
+            )
+        }
         val dualId = resolveVerifiedDualId()
         return ProbeResult(
             level = Privilege.SHELL,
@@ -101,6 +109,14 @@ class SuElevator(
         }
         val usersRes = gateway.run(listUsersCmd)
         if (!PmOutputParser.isListUsersOutputOk(usersRes.out + "\n" + usersRes.err, usersRes.exit)) {
+            return ProbeResult(
+                level = Privilege.ROOT,
+                hasShizuku = false,
+                hasRoot = true,
+                dualUserId = -1,
+            )
+        }
+        if (usersRes.truncated) {
             return ProbeResult(
                 level = Privilege.ROOT,
                 hasShizuku = false,

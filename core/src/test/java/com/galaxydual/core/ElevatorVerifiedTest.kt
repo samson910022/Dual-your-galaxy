@@ -22,6 +22,7 @@ class ElevatorVerifiedTest {
         var listUsersOutput: String = DEFAULT_USERS_95,
         var listUsersErr: String = "",
         var listUsersExit: Int = 0,
+        var listUsersTruncated: Boolean = false,
         var userListVerboseOutput: String = DEFAULT_VERBOSE_95,
         var userListVerboseErr: String = "",
         var userListVerboseExit: Int = 0,
@@ -41,7 +42,7 @@ class ElevatorVerifiedTest {
             }
             return when (cmd) {
                 DualRepository.CMD_LIST_USERS ->
-                    CmdResult(exit = listUsersExit, out = listUsersOutput, err = listUsersErr)
+                    CmdResult(exit = listUsersExit, out = listUsersOutput, err = listUsersErr, truncated = listUsersTruncated)
                 DualRepository.CMD_USER_LIST_VERBOSE ->
                     CmdResult(exit = userListVerboseExit, out = userListVerboseOutput, err = userListVerboseErr)
                 DualRepository.CMD_DUMPSYS_USER ->
@@ -191,6 +192,24 @@ class ElevatorVerifiedTest {
         )
         // Sanity: the pm channel itself sees the failure.
         assertTrue(runSuspend { DualRepository(gateway).listProfiles() }.isEmpty())
+
+        val shizuku = runSuspend { ShizukuElevator(gateway).probe() }
+        assertEquals(Privilege.NONE, shizuku.level)
+        assertEquals(false, shizuku.hasShizuku)
+        assertEquals(-1, shizuku.dualUserId)
+
+        val su = runSuspend { SuElevator(suGateway(gateway)).probe() }
+        assertEquals(Privilege.ROOT, su.level)
+        assertEquals(true, su.hasRoot)
+        assertEquals(-1, su.dualUserId)
+    }
+
+    // Truncated `pm list users` fails closed on both elevator probes (same as
+    // profilesSnapshot truncated -> ChannelError): Shizuku drops to NONE/-1;
+    // su keeps ROOT (root proof stands) with dual -1.
+    @Test
+    fun pmListUsersTruncated_shizukuNone_suRootMinusOne() {
+        val gateway = FakeGateway(listUsersTruncated = true)
 
         val shizuku = runSuspend { ShizukuElevator(gateway).probe() }
         assertEquals(Privilege.NONE, shizuku.level)

@@ -143,6 +143,9 @@ class DualRepository(
             gateway.run(CMD_LIST_USERS)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return ProfilesSnapshot.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             return ProfilesSnapshot.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
@@ -771,6 +774,9 @@ class DualRepository(
             gateway.run(cmd)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
         } catch (_: Exception) {
             return null
         }
