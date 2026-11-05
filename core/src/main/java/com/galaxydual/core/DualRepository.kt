@@ -115,43 +115,20 @@ class DualRepository(
     // non-zero user" fallback by design.
     suspend fun resolveDualUserId(): Int = fetchVerifiedDualId()
 
-    // Explicit verified entry (same fetch as resolveDualUserId): raw verbose
-    // outputs are gateway-owned, so this suspend variant fetches them itself.
+    // Explicit verified entry: compat alias for resolveDualUserId() (the
+    // canonical entry). Both run the same shared fetch; this overload exists
+    // only so existing callers keep compiling.
     // For pure parsing without I/O use
     // PmOutputParser.resolveDualUserIdVerified(userListVerbose, dumpsysUser,
     // propertyId) directly.
-    suspend fun resolveDualUserIdVerified(): Int = fetchVerifiedDualId()
+    suspend fun resolveDualUserIdVerified(): Int = resolveDualUserId()
 
-    // Single shared identity fetch: runs both verbose channels plus the dual
-    // property, then maps Confirmed -> id, Unknown/Refused -> -1. A failed
-    // typed channel (non-zero exit or error-semantic output) yields -1 without
-    // guessing; a missing/unparseable property is "no claim" (null) and still
-    // allows a two-channel agreement to confirm (single source never does).
-    // Never throws: gateway errors collapse to -1 (fail closed).
-    private suspend fun fetchVerifiedDualId(): Int {
-        val verboseRes = try {
-            gateway.run(CMD_USER_LIST_VERBOSE)
-        } catch (_: Exception) {
-            return -1
-        }
-        val dumpsysRes = try {
-            gateway.run(CMD_DUMPSYS_USER)
-        } catch (_: Exception) {
-            return -1
-        }
-        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) return -1
-        if (!PmOutputParser.isSuccess(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) return -1
-        if (!PmOutputParser.isSuccess(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) return -1
-        val propRes = try {
-            gateway.run(CMD_GETPROP_DUAL)
-        } catch (_: Exception) {
-            null
-        }
-        val propertyId = propRes
-            ?.takeIf { it.exit == 0 }
-            ?.let { PmOutputParser.parseDualPropertyId(it.out) }
-        return PmOutputParser.resolveDualUserIdVerified(verboseRes.out, dumpsysRes.out, propertyId)
-    }
+    // Shared identity fetch: delegates to the Phase-2 shared fetcher
+    // (see VerifiedIdentity.kt), the single source every resolver and both
+    // Elevator probes share. Method name kept so callers keep compiling.
+    // Never throws: gateway errors collapse to -1 (fail closed); only
+    // coroutine cancellation is rethrown by the shared fetcher itself.
+    private suspend fun fetchVerifiedDualId(): Int = gateway.fetchVerifiedDualId()
 
     // Clones a package into the dual profile via `pm install-existing`.
     suspend fun clone(pkg: String): CmdResult {

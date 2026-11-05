@@ -303,6 +303,31 @@ object PmOutputParser {
         return true
     }
 
+    // Identity-channel gate (Phase 2, issue #21): strict variant of isSuccess
+    // for the verified-identity channels (`cmd user list -v`, `dumpsys user`,
+    // `getprop sys.dualapp.profile_id`). Differences from isSuccess (which
+    // stays the pm-channel rule used by profilesSnapshot and the pm-list
+    // probe gate):
+    // - No INSTALL_FAILED_ALREADY_EXISTS exemption: idempotent-success is a
+    //   pm install semantic; an identity dump carrying an install code (or
+    //   any Failure line) is still error-semantic output and must fail the
+    //   channel closed instead of confirming an id.
+    // - No EXEMPT_LINE filtering: package:/path echoes and "installed for
+    //   user" success echoes are pm success payloads, never legitimate
+    //   identity content; every non-blank line is tested against ERROR_LINE.
+    // exit != 0 is always failure here (unlike isSuccess, where the
+    // ALREADY_EXISTS exemption is checked before exit and can still report
+    // success on a non-zero exit).
+    fun isIdentityChannelOk(output: String, exit: Int): Boolean {
+        if (exit != 0) return false
+        for (raw in output.lines()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
+        }
+        return true
+    }
+
     // Legacy entry point kept for compatibility: parses key=value token lines.
     // Example: "package:/data/app/xxx basePackage=com.foo userId=150 enabled=true".
     fun parse(lines: List<String>): List<DualAppInfo> {
