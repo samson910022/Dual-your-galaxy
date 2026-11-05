@@ -159,8 +159,9 @@ object SamsungProfileAdapter {
 
     // Cross-source resolver (PR-1, issue #21). Returns Confirmed(HIGH) ONLY
     // when every agreeing source points at one identical non-owner userId:
-    // - at least one USER_LIST_V claim AND one DUMPSYS claim with
-    //   userType CLONE on that id (two independent channels agree), and
+    // - USER_LIST_V claim AND DUMPSYS claim BOTH type that same id as
+    //   userType CLONE (two independent CLONE claims; CLONE on one channel
+    //   plus UNKNOWN on the other is Unknown, never Confirmed), and
     // - when a property id is known (explicit argument OR PROP-sourced
     //   candidates), it equals that same id (triple agreement).
     // Everything else is Unknown (insufficient evidence) or Refused
@@ -233,8 +234,8 @@ object SamsungProfileAdapter {
             return DualResolution.Refused("property id $effectiveProp disagrees with clone user $id")
         }
 
-        val sources = typed.filter { it.userId == id }.map { it.source }.toSet()
-        val twoChannel = IdentitySource.USER_LIST_V in sources && IdentitySource.DUMPSYS in sources
+        val cloneSources = typed.filter { it.userId == id && it.userType == ProfileUserType.CLONE }.map { it.source }.toSet()
+        val twoChannel = IdentitySource.USER_LIST_V in cloneSources && IdentitySource.DUMPSYS in cloneSources
         if (!twoChannel) return DualResolution.Unknown
         return DualResolution.Confirmed(id)
     }
