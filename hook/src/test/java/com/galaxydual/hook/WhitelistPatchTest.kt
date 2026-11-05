@@ -134,4 +134,44 @@ class WhitelistPatchTest {
         assertTrue(reason.contains("MY_FIELD"))
         assertTrue(reason.contains("com.foo.Bar"))
     }
+
+    // Simulates a hostile custom list: lands the element, then throws on the
+    // 2nd insert of the patch (one-shot; rollback re-inserts must succeed).
+    private class PartialFailList(
+        private val backing: MutableList<String> = mutableListOf(),
+    ) : AbstractMutableList<String>() {
+        private var inserts = 0
+        private var armed = true
+
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            inserts++
+            if (armed && inserts == 2) {
+                armed = false
+                backing.add(index, element) // partial insert lands, then throw
+                throw IllegalStateException("injected partial failure")
+            }
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+    }
+
+    @Test
+    fun partialFailureLeavesOriginalUntouchedAndSkipped() {
+        val list = PartialFailList(mutableListOf("a"))
+        val out = WhitelistPatch.apply(list, true, setOf("b", "c"), "F", "C")
+        assertTrue(out is WhitelistPatch.Outcome.Skipped)
+        assertEquals(listOf("a"), list)
+    }
+
+    @Test
+    fun unionDedupOrderUnaffectedByCopyOnWrite() {
+        val list = mutableListOf("a", "b")
+        val out = WhitelistPatch.apply(list, true, setOf("b", "c", "a", "d"), "F", "C")
+        assertTrue(out is WhitelistPatch.Outcome.PatchedInPlace)
+        assertEquals(2, (out as WhitelistPatch.Outcome.PatchedInPlace).added)
+        assertEquals(listOf("a", "b", "c", "d"), list)
+    }
 }

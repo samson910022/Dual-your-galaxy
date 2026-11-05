@@ -84,11 +84,20 @@ Hook Builder 統一使用
 `using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
 [S24 已驗證]（新路徑連續命中 7 次、零退回，方法零掛載符合抽象類預期）。
 
-- 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`**（＋`..._FOR_CHINA` 變體；
-  僅診斷記 log＋合併用，找不到就略過，不拋錯）。
+- 反射尋找欄位 **`DUAL_APP_WHITELIST_PACKAGES`** 與 **`..._FOR_CHINA`** 變體：
+  兩個候選欄位只要存在**都會**嘗試合併（分別記錄結果），不存在者略過不拋錯。
+  地區風險說明：ROM 另持 `CHINA_SALES_CODES`，可能按地區／銷售碼讀取
+  `_FOR_CHINA` 欄位；若採「先命中先 patch」單欄位策略，`_FOR_CHINA`
+  將永遠被跳過，國行裝置靜默失效——故雙欄位全覆蓋（見 `WhitelistPatch.patchFields`）。
 - `hookClassInitializer`：在 `<clinit>` 跑完後把政策集合併入靜態欄位
   （支援 `MutableList`／`String[]` 兩種形態；非 static、型別不合、反射失敗
   一律放棄**並記 log**，方便定位）。
+  - `static final`（ROM 實為 `static final String[]`）：**observe-only，不寫入**。
+    普通 `Field.set()` 無法重指派 final 欄位（JVM 拋 `IllegalAccessException`，
+    見 `WhitelistPatchReflectTest` 行為鎖定測試）；不做 `setAccessible` 強寫，
+    ART 行為未驗證、不宣稱可覆寫。結果以 `Outcome.ObserveOnly` 明確記錄，
+    絕不靜默當成功。
+  - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
 - 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：
   無實機證據前縮窄正則可能漏掉真正的查詢方法；簽名守衛兜底——
@@ -205,7 +214,8 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取）：
 - System side: reflectively hooks `DualAppManagerService#getAllWhitelistedPackages` /
   `#isInstalledWhitelistedPackage` (`dual_app` transactions ~1/2/3/4, verify per One UI),
   with best-effort `deoptimize()` (callee-only, effect unverified) and `PROTECTIVE` exception mode.
-- Agent side: patches `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` after `<clinit>` and
+- Agent side: patches both `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` and
+  `#..._FOR_CHINA` after `<clinit>` (static-final fields stay observe-only, never force-written) and
   hooks `*hitelist*` query methods (fuzzy match kept for lack of on-device evidence;
   signature guard keeps unknown shapes observe-only); non-scope processes get `detach()`.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
