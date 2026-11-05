@@ -357,6 +357,20 @@ object PmOutputParser {
         return true
     }
 
+    // `pm list users` gate (Phase C P2-C, issue #21): label-neutrality for the
+    // pm-list channel. Strips all strict single-line `UserInfo{...}` header
+    // substrings (same IDENTITY_HEADER_STRIP shape as isIdentityChannelOk)
+    // before delegating to isSuccess unchanged, so a renamed label carrying
+    // error keywords (`UserInfo{95:Error:400}`, `{95:Failure:400}`,
+    // `{10:not found:30}`) can never fail the pm-list gate: the label is
+    // display-only by contract (renames do not change authorization). Only
+    // non-header body lines carry error semantics, so a genuine body
+    // `Failure [...]` line (stdout or stderr) still fails. This is a
+    // `pm list users` command-specific structural distinction; the isSuccess
+    // body (install-channel protection) itself is untouched.
+    fun isListUsersOutputOk(output: String, exit: Int): Boolean =
+        isSuccess(IDENTITY_HEADER_STRIP.replace(output, ""), exit)
+
     // Legacy entry point kept for compatibility: parses key=value token lines.
     // Example: "package:/data/app/xxx basePackage=com.foo userId=150 enabled=true".
     fun parse(lines: List<String>): List<DualAppInfo> {

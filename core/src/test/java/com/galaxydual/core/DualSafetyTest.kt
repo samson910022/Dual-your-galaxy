@@ -30,6 +30,7 @@ class DualSafetyTest {
     private class FakeGateway(
         var listUsersOutput: String = DEFAULT_USERS_95,
         var listUsersExit: Int = 0,
+        var listUsersErr: String = "",
         var userListVerboseOutput: String = DEFAULT_VERBOSE_95,
         var userListVerboseExit: Int = 0,
         var dumpsysOutput: String = DEFAULT_DUMPSYS_95,
@@ -46,7 +47,7 @@ class DualSafetyTest {
             commands.add(cmd)
             return when {
                 cmd == DualRepository.CMD_LIST_USERS ->
-                    CmdResult(exit = listUsersExit, out = listUsersOutput, err = "")
+                    CmdResult(exit = listUsersExit, out = listUsersOutput, err = listUsersErr)
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                     CmdResult(exit = userListVerboseExit, out = userListVerboseOutput, err = "")
                 cmd == DualRepository.CMD_DUMPSYS_USER ->
@@ -851,5 +852,51 @@ class DualSafetyTest {
             "no write command may run on intra-block serial contradiction, got: ${gateway.writeCommands()}",
             gateway.writeCommands().isEmpty(),
         )
+    }
+
+    // Phase C P2-C e2e (pm-list label neutrality): a pm-list header renamed
+    // to an error keyword (`UserInfo{95:Error:400}`, exit 0) is display-only
+    // and never fails the pm-list gate, while the verified identity (dual
+    // CLONE parent0 serial 15 + prop 95) still confirms 95. profilesSnapshot
+    // is Loaded (containing 95), cloneVerified succeeds, and the Shizuku
+    // probe stays SHELL. Contrast: a genuine body Failure on stderr still
+    // yields ChannelError / NONE.
+    @Test
+    fun errorLabelledPmListHeader_staysLoadedAndCloneVerified() {
+        val errorLabelUsers =
+            "Users:\n" +
+                "\tUserInfo{0:Owner:13} running\n" +
+                "\tUserInfo{95:Error:400} running\n"
+        val gateway = FakeGateway(
+            listUsersOutput = errorLabelUsers,
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        val repo = DualRepository(gateway)
+
+        val snap = runSuspend { repo.profilesSnapshot() }
+        assertTrue("Error-labelled header must stay Loaded, got: $snap", snap is ProfilesSnapshot.Loaded)
+        val loaded = snap as ProfilesSnapshot.Loaded
+        assertTrue(loaded.profiles.any { it.userId == 95 })
+
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("cloneVerified must succeed despite Error label, got: $outcome", outcome is CloneOutcome.Success)
+        assertEquals(95, (outcome as CloneOutcome.Success).dualId)
+
+        val shizuku = runSuspend { ShizukuElevator(gateway).probe() }
+        assertEquals(Privilege.SHELL, shizuku.level)
+        assertEquals(95, shizuku.dualUserId)
+
+        // Contrast: a genuine body Failure on stderr still fails the gate.
+        val bad = FakeGateway(
+            listUsersOutput = errorLabelUsers,
+            listUsersErr = "Failure [INSTALL_FAILED_INVALID_APK: bad]",
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = FakeGateway.DEFAULT_PROP_95,
+        )
+        assertTrue(runSuspend { DualRepository(bad).profilesSnapshot() } is ProfilesSnapshot.ChannelError)
+        assertEquals(Privilege.NONE, runSuspend { ShizukuElevator(bad).probe() }.level)
     }
 }

@@ -317,4 +317,54 @@ class PmIsSuccessTest {
         // No package:com.example.chat line, so confirmed absent.
         assertFalse(runSuspend { repo.verify("com.example.chat", 95) })
     }
+
+    // Phase C P2-C (pm-list label neutrality): UserInfo headers carrying
+    // error keywords are display-only and never fail the pm-list gate.
+    @Test
+    fun isListUsersOutputOk_errorLabelledHeader_isOk() {
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Error:400} running\n",
+                0,
+            ),
+        )
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Failure:400} running\n",
+                0,
+            ),
+        )
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{10:not found:30} running\n",
+                0,
+            ),
+        )
+    }
+
+    // Phase C P2-C: a genuine body Failure line (stdout or stderr) still fails
+    // the pm-list gate, as does any non-zero exit.
+    @Test
+    fun isListUsersOutputOk_trueFailureOrNonZeroExit_isNotOk() {
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n",
+                0,
+            ),
+        )
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:DUAL_APP:400} running\n" +
+                    "\nFailure [INSTALL_FAILED_INVALID_APK: bad]",
+                0,
+            ),
+        )
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Error:400} running\n",
+                1,
+            ),
+        )
+        assertFalse(PmOutputParser.isListUsersOutputOk("", 1))
+    }
 }
