@@ -176,14 +176,29 @@ object PmOutputParser {
         userListVerbose: String,
         dumpsysUser: String,
         propertyId: Int? = null,
-    ): Int {
+    ): Int = resolveDualTarget(userListVerbose, dumpsysUser, propertyId)?.userId ?: -1
+
+    // Verified-target resolution (Phase D, issue #21): same single source as
+    // resolveDualUserIdVerified but preserves the Phase B identity continuity
+    // signals. Maps Confirmed(id, serial, parentId) -> VerifiedTarget,
+    // Unknown/Refused -> null (fail closed, never guess a target).
+    fun resolveDualTarget(
+        userListVerbose: String,
+        dumpsysUser: String,
+        propertyId: Int? = null,
+    ): VerifiedTarget? {
         val candidates =
             SamsungProfileAdapter.parseUserListVerbose(userListVerbose) +
                 SamsungProfileAdapter.parseDumpsysUser(dumpsysUser)
         return when (val resolution = SamsungProfileAdapter.resolveDual(candidates, propertyId)) {
-            is DualResolution.Confirmed -> resolution.userId
-            is DualResolution.Unknown -> -1
-            is DualResolution.Refused -> -1
+            is DualResolution.Confirmed ->
+                VerifiedTarget(
+                    userId = resolution.userId,
+                    serial = resolution.serial,
+                    parentId = resolution.parentId,
+                )
+            is DualResolution.Unknown -> null
+            is DualResolution.Refused -> null
         }
     }
 

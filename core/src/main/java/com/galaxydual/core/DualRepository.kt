@@ -130,11 +130,20 @@ class DualRepository(
     // coroutine cancellation is rethrown by the shared fetcher itself.
     private suspend fun fetchVerifiedDualId(): Int = gateway.fetchVerifiedDualId()
 
+    // Phase D target fetch: same shared fetch as above but preserves the
+    // serial/parentId continuity signals for ID-reuse protection. Null means
+    // Unknown/Refused/channel failure (fail closed).
+    private suspend fun fetchVerifiedTarget(): VerifiedTarget? = gateway.fetchVerifiedTarget()
+
     // Clones a package into the dual profile via `pm install-existing`.
+    // Auto path carries the resolve-time identity as `expected`: the fresh
+    // re-check inside the write must still agree on serial/parentId
+    // (both-present-and-unequal refuses, suspecting ID reuse); a null
+    // resolve maps to the original "no dual profile" refusal.
     suspend fun clone(pkg: String): CmdResult {
-        val dualId = resolveDualUserId()
-        if (dualId < 0) return CmdResult(exit = 1, out = "", err = "no dual profile")
-        return clone(pkg, dualId)
+        val expected = fetchVerifiedTarget()
+        if (expected == null) return CmdResult(exit = 1, out = "", err = "no dual profile")
+        return clone(pkg, expected.userId, expected)
     }
 
     // Clones a package into an explicit dual profile id.
@@ -142,36 +151,60 @@ class DualRepository(
     // current `pm list users` snapshot, and ids that are not the Confirmed
     // cross-source target, so a stale, mistyped, or non-Dual id can never
     // redirect the write at the wrong profile.
-    suspend fun clone(pkg: String, dualId: Int): CmdResult {
-        checkExplicitDualId(dualId)?.let { return it }
+    // Residual TOCTOU note: the explicit-id entry checks only fresh
+    // self-consistency (expected = null); a profile deleted and recreated
+    // under the same id between this check and the write is not detected
+    // here. Auto/pinned flows carry `expected` (or re-check after the
+    // write) to close that window; explicit callers accept the residual.
+    suspend fun clone(pkg: String, dualId: Int): CmdResult = clone(pkg, dualId, null)
+
+    // Private write carrying the resolve-time identity for ID-reuse
+    // protection (Phase D): `expected` is the auto-path target; the fresh
+    // target must still agree on serial/parentId (see checkExplicitDualId).
+    private suspend fun clone(pkg: String, dualId: Int, expected: VerifiedTarget?): CmdResult {
+        checkExplicitDualId(dualId, expected)?.let { return it }
         val cmd = PmOutputParser.buildInstallExisting(pkg, dualId)
         return gateway.run(cmd)
     }
 
     // Removes the clone from the dual profile via `pm uninstall --user`.
+    // Auto path carries the resolve-time identity as `expected` (same
+    // ID-reuse guard as clone(pkg) above).
     suspend fun remove(pkg: String): CmdResult {
-        val dualId = resolveDualUserId()
-        if (dualId < 0) return CmdResult(exit = 1, out = "", err = "no dual profile")
-        return remove(pkg, dualId)
+        val expected = fetchVerifiedTarget()
+        if (expected == null) return CmdResult(exit = 1, out = "", err = "no dual profile")
+        return remove(pkg, expected.userId, expected)
     }
 
     // Removes the clone from an explicit dual profile id.
     // Same verified-dual guard as clone(pkg, dualId): see checkExplicitDualId.
-    suspend fun remove(pkg: String, dualId: Int): CmdResult {
-        checkExplicitDualId(dualId)?.let { return it }
+    // Residual TOCTOU note: same as the explicit clone entry above
+    // (expected = null, fresh self-consistency only).
+    suspend fun remove(pkg: String, dualId: Int): CmdResult = remove(pkg, dualId, null)
+
+    // Private write carrying the resolve-time identity (Phase D, same as
+    // the private clone overload above).
+    private suspend fun remove(pkg: String, dualId: Int, expected: VerifiedTarget?): CmdResult {
+        checkExplicitDualId(dualId, expected)?.let { return it }
         val cmd = PmOutputParser.buildUninstall(pkg, dualId)
         return gateway.run(cmd)
     }
 
     // Validates an explicit dual profile id against the current snapshot AND the
-    // verified cross-source identity (PR-1 stage 2, issue #21).
+    // verified cross-source identity (PR-1 stage 2, issue #21), plus Phase D
+    // ID-reuse protection: when `expected` (the resolve-time target carried
+    // by auto paths) is non-null and the fresh target still names the same
+    // id, both-present-and-unequal serial/parentId refuses (the id was
+    // reused by a different profile incarnation). Either side missing is
+    // tolerated (Phase B upgrade path, same as the resolver): only a
+    // positive disagreement refuses.
     // Returns a refusal CmdResult, or null when the id is safe to target.
     // Refuses dualId 0 (owner profile, must never be written) and any id not
     // present in this call's `pm list users` snapshot (stale/mistyped id),
     // plus any id that is not the currently Confirmed dual target (exists but
     // non-Dual: Work/Secondary/Secure Folder, renamed DUAL-label, type
     // conflict, property mismatch, or unknown). Existence alone never suffices.
-    private suspend fun checkExplicitDualId(dualId: Int): CmdResult? {
+    private suspend fun checkExplicitDualId(dualId: Int, expected: VerifiedTarget? = null): CmdResult? {
         if (dualId <= 0) {
             return CmdResult(
                 exit = 1,
@@ -187,25 +220,46 @@ class DualRepository(
                 err = "refused: unknown dual profile id ($dualId), not in current snapshot",
             )
         }
-        val verified = fetchVerifiedDualId()
-        if (verified != dualId) {
+        val fresh = fetchVerifiedTarget()
+        if (fresh == null || fresh.userId != dualId) {
             return CmdResult(
                 exit = 1,
                 out = "",
                 err = "refused: id $dualId is not the verified dual target" +
-                    " (verified=${if (verified < 0) "none" else verified})",
+                    " (verified=${fresh?.userId?.toString() ?: "none"})",
             )
+        }
+        if (expected != null) {
+            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
+                return CmdResult(
+                    exit = 1,
+                    out = "",
+                    err = "refused: id $dualId identity reuse suspected" +
+                        " (serial changed expected=${expected.serial} fresh=${fresh.serial})",
+                )
+            }
+            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) {
+                return CmdResult(
+                    exit = 1,
+                    out = "",
+                    err = "refused: id $dualId identity reuse suspected" +
+                        " (parent changed expected=${expected.parentId} fresh=${fresh.parentId})",
+                )
+            }
         }
         return null
     }
 
     // Double-checks installation via `pm list packages --user <dualId>`
     // ground truth (exact membership). Returns true only when the probe
-    // exits 0 and the parsed set contains the package.
+    // exits 0 and the parsed set contains the package. Auto path carries
+    // the resolve-time identity as `expected` (Phase D ID-reuse guard);
+    // a null resolve maps to false (same as the old -1 behavior).
     suspend fun verify(pkg: String): Boolean {
-        val dualId = resolveDualUserId()
-        if (dualId < 0) return false
-        return verifyState(pkg, dualId) is VerifyState.Installed
+        val expected = fetchVerifiedTarget() ?: return false
+        val snap = profilesSnapshot()
+        if (snap is ProfilesSnapshot.ChannelError) return false
+        return verifyOnProfiles(pkg, expected.userId, (snap as ProfilesSnapshot.Loaded).profiles, expected) is VerifyState.Installed
     }
 
     // Verifies against an explicit dual profile id.
@@ -216,6 +270,8 @@ class DualRepository(
     // consistency first: a stale, mistyped, or non-Dual id must never be
     // probed, and callers get graceful false instead of an
     // IllegalArgumentException from the command builder.
+    // Residual TOCTOU note: explicit-id entries check only fresh
+    // self-consistency (expected = null); see the explicit clone entry.
     //
     // DEPRECATED (PR-1 stage 2, issue #21): the Boolean folds NotInstalled and
     // Unknown together (both false). Callers that must tell "confirmed absent"
@@ -241,11 +297,13 @@ class DualRepository(
     // explicit paths; the shared C2
     // isSuccess rule is intentionally NOT applied to the list probe here
     // (see verifyOnProfiles): only the result granularity is new.
+    // Residual TOCTOU note: explicit-id entries check only fresh
+    // self-consistency (expected = null); auto verify(pkg) carries expected.
     suspend fun verifyState(pkg: String, dualId: Int): VerifyState {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return VerifyState.Unknown(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        return verifyOnProfiles(pkg, dualId, profiles)
+        return verifyOnProfiles(pkg, dualId, profiles, null)
     }
 
     // Lists the dual profile's actual packages (ground truth for refresh).
@@ -256,41 +314,47 @@ class DualRepository(
     // --user <dualId>` (see PmOutputParser.buildListPackages); per-package
     // `pm path` probing alone could never discover names nobody asked about.
     // Resolution is verified cross-source (stage 2): a DUAL-labeled but
-    // untyped id never authorizes a listing.
+    // untyped id never authorizes a listing. Auto path carries the
+    // resolve-time identity as `expected` (Phase D ID-reuse guard).
     suspend fun listClonedPackages(): List<String>? {
+        val expected = fetchVerifiedTarget() ?: return null
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return null
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = fetchVerifiedDualId()
-        if (dualId < 0) return null
-        if (profiles.none { it.userId == dualId }) return null
-        return listProbe(dualId)
+        if (profiles.none { it.userId == expected.userId }) return null
+        return listOnProfiles(expected.userId, profiles, expected)
     }
 
     // Explicit-id variant with the same verified-dual guard (stage 2) as clone(pkg, dualId):
     // dualId 0 and ids absent from this call's snapshot yield null (unknown)
     // without probing; an invalid builder token also yields null.
+    // Residual TOCTOU note: explicit-id entries check only fresh
+    // self-consistency (expected = null); auto listClonedPackages() carries expected.
     suspend fun listClonedPackages(dualId: Int): List<String>? {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return null
-        return listOnProfiles(dualId, (snap as ProfilesSnapshot.Loaded).profiles)
+        return listOnProfiles(dualId, (snap as ProfilesSnapshot.Loaded).profiles, null)
     }
 
-    // Pinned clone (Phase C3, issue #9): resolves the verified dual id ONCE via
-    // the cross-source resolver, then runs install-existing AND the
-    // `pm list packages` re-check against that same id -- never one guess for
-    // the write and another for the check. Success is reported only when the
-    // re-check confirms Installed; a clean-but-absent re-check is VerifyFailed
+    // Pinned clone (Phase C3, issue #9; Phase D target pinning): captures the
+    // verified target BEFORE the write, then re-fetches AFTER the write and
+    // requires same id plus both-present-equal serial/parentId before the
+    // `pm list packages` re-check. A null/drifted after-target maps to
+    // VerifyUnknown("identity-changed ...") fail closed (never Success, never
+    // counted as cloned). Success is reported only when the re-check then
+    // confirms Installed; a clean-but-absent re-check is VerifyFailed
     // (fake success, issue #9), a failed re-check channel is VerifyUnknown.
     // Neither is added to cloned. Unknown/Refused identity maps to NoDual
     // (fail closed); the pinned re-check itself does not re-resolve identity
-    // so the write and the check cannot drift to different users.
+    // beyond the before/after pin so the write and the check cannot drift to
+    // different users.
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = fetchVerifiedDualId()
-        if (dualId < 0) return CloneOutcome.NoDual
+        val before = fetchVerifiedTarget()
+        if (before == null) return CloneOutcome.NoDual
+        val dualId = before.userId
         if (profiles.none { it.userId == dualId }) return CloneOutcome.NoDual
         val clean = pkg.trim()
         val installCmd = try {
@@ -302,6 +366,9 @@ class DualRepository(
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
+        val after = fetchVerifiedTarget()
+        val drift = checkTargetDrift(before, after)
+        if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
         return when (val state = verifyListProbe(clean, dualId)) {
             is VerifyState.Installed -> CloneOutcome.Success(dualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
@@ -309,9 +376,10 @@ class DualRepository(
         }
     }
 
-    // Pinned remove (Phase C3, issue #9): same single-verified-id pinning as
-    // cloneVerified. Only a post-uninstall re-check of NotInstalled counts as
-    // removed; still-present is StillInstalled, an uncheckable channel is
+    // Pinned remove (Phase C3, issue #9; Phase D target pinning): same
+    // before/after identity pin as cloneVerified. Only a post-uninstall
+    // re-check of NotInstalled counts as removed; still-present is
+    // StillInstalled, an uncheckable channel or a drifted after-target is
     // VerifyUnknown (caller keeps the entry: fail closed). A failed uninstall
     // stays RemoveFailed by design (C2 scope: uninstall-side "Unknown
     // package" is not idempotent-success); refresh later syncs the display
@@ -320,8 +388,9 @@ class DualRepository(
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val dualId = fetchVerifiedDualId()
-        if (dualId < 0) return RemoveOutcome.NoDual
+        val before = fetchVerifiedTarget()
+        if (before == null) return RemoveOutcome.NoDual
+        val dualId = before.userId
         if (profiles.none { it.userId == dualId }) return RemoveOutcome.NoDual
         val clean = pkg.trim()
         val uninstallCmd = try {
@@ -333,11 +402,34 @@ class DualRepository(
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
             return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
         }
+        val after = fetchVerifiedTarget()
+        val drift = checkTargetDrift(before, after)
+        if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
         return when (val state = verifyListProbe(clean, dualId)) {
             is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, state.detail)
         }
+    }
+
+    // Phase D drift check for pinned flows: after must be non-null, name the
+    // same id, and agree on serial/parentId whenever both sides carry them.
+    // Either side missing is tolerated (Phase B upgrade path); only a
+    // positive disagreement (or a vanished/renamed target) drifts. Returns
+    // the detail string (always containing "identity-changed") or null when
+    // the pin holds.
+    private fun checkTargetDrift(before: VerifiedTarget, after: VerifiedTarget?): String? {
+        if (after == null) return "identity-changed: target vanished after write (before=${before.userId})"
+        if (after.userId != before.userId) {
+            return "identity-changed: id drifted before=${before.userId} after=${after.userId}"
+        }
+        if (before.serial != null && after.serial != null && before.serial != after.serial) {
+            return "identity-changed: serial reuse suspected before=${before.serial} after=${after.serial}"
+        }
+        if (before.parentId != null && after.parentId != null && before.parentId != after.parentId) {
+            return "identity-changed: parent reuse suspected before=${before.parentId} after=${after.parentId}"
+        }
+        return null
     }
 
     // Runs the `pm list packages --user <dualId>` re-check for an
@@ -372,7 +464,7 @@ class DualRepository(
     // dispatcher assumption, hence Thread.sleep (core has no
     // kotlinx-coroutines dependency for delay). Only three consecutive
     // non-zero exits map to Unknown.
-    private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>): VerifyState {
+    private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
         }
@@ -381,12 +473,30 @@ class DualRepository(
         // but non-Dual id (Work/Secondary/Secure Folder, renamed DUAL-label,
         // type conflict, property mismatch) maps to Unknown (fail closed),
         // never to a probe of the wrong user.
-        val verified = fetchVerifiedDualId()
-        if (verified != dualId) {
+        // Phase D ID-reuse protection: when `expected` is non-null, a fresh
+        // target naming the same id must still agree on serial/parentId
+        // (both-present-and-unequal -> Unknown reuse refusal); either side
+        // missing is tolerated (Phase B upgrade path).
+        val fresh = fetchVerifiedTarget()
+        if (fresh == null || fresh.userId != dualId) {
             return VerifyState.Unknown(
                 "refused: id $dualId is not the verified dual target" +
-                    " (verified=${if (verified < 0) "none" else verified})",
+                    " (verified=${fresh?.userId?.toString() ?: "none"})",
             )
+        }
+        if (expected != null) {
+            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) {
+                return VerifyState.Unknown(
+                    "refused: id $dualId identity reuse suspected" +
+                        " (serial changed expected=${expected.serial} fresh=${fresh.serial})",
+                )
+            }
+            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) {
+                return VerifyState.Unknown(
+                    "refused: id $dualId identity reuse suspected" +
+                        " (parent changed expected=${expected.parentId} fresh=${fresh.parentId})",
+                )
+            }
         }
         return verifyListProbe(pkg, dualId)
     }
@@ -429,10 +539,16 @@ class DualRepository(
     // Runs `pm list packages --user <dualId>` for an already-pinned snapshot.
     // Guard-refused ids and failed listings yield null (unknown), never throw.
     // Stage 2 adds the verified-dual gate: existence alone never suffices.
-    private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>): List<String>? {
+    // Phase D ID-reuse protection: same both-present-and-unequal serial/parent
+    // rule as verifyOnProfiles above; either side missing is tolerated.
+    private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): List<String>? {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
-        val verified = fetchVerifiedDualId()
-        if (verified != dualId) return null
+        val fresh = fetchVerifiedTarget()
+        if (fresh == null || fresh.userId != dualId) return null
+        if (expected != null) {
+            if (expected.serial != null && fresh.serial != null && expected.serial != fresh.serial) return null
+            if (expected.parentId != null && fresh.parentId != null && expected.parentId != fresh.parentId) return null
+        }
         return listProbe(dualId)
     }
 

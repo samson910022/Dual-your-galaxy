@@ -1,0 +1,212 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+package com.galaxydual.core
+
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.startCoroutine
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+// Phase D ID-reuse protection (issue #21, owner P1-3): an Android user id may
+// be recycled for a different profile incarnation. The id alone is not the
+// identity -- serial/parentId pin the instance. A same-id target whose serial
+// (or parent) positively disagrees between resolve time and use time must be
+// refused (auto paths) or reported VerifyUnknown (pinned post-write re-check),
+// fail closed with zero mis-targeted writes. Either side missing is tolerated
+// (Phase B upgrade path): only both-present-and-unequal refuses.
+class ReuseProtectionTest {
+    // Mutable gateway: per-identity-fetch serials plus an optional post-write
+    // drift. Identity fetch index increments per dumpsys call (verbose then
+    // dumpsys form one fetch); serial lists shorter than the fetch count hold
+    // their last value. Setting flipAfterWrite flips all later identity reads
+    // to that serial once any install/uninstall command has run.
+    private class FlipGateway(
+        var listUsersOutput: String = DEFAULT_USERS,
+        var propOutput: String = DEFAULT_PROP,
+        var listPackagesOutput: String = "package:com.example.chat",
+        var listPackagesExit: Int = 0,
+        var verboseSerials: MutableList<Int?> = mutableListOf(15),
+        var dumpsysSerials: MutableList<Int?> = mutableListOf(15),
+        var flipAfterWrite: Int? = null,
+    ) : CmdGateway {
+        override val privilege: Privilege = Privilege.SHELL
+        val commands = mutableListOf<String>()
+        private var fetchIndex = 0
+        private var drifted = false
+
+        private fun serialFor(idx: Int, list: List<Int?>): Int? {
+            if (drifted && flipAfterWrite != null) return flipAfterWrite
+            return if (idx < list.size) list[idx] else list.last()
+        }
+
+        private fun buildVerbose(serial: Int?): String {
+            val serialLine = if (serial != null) "\n    Serial: $serial" else ""
+            return "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} running:\n" +
+                "    Flags: 0x00000190$serialLine\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.CLONE\n"
+        }
+
+        private fun buildDumpsys(serial: Int?): String {
+            val serialPart = if (serial != null) " serialNo=$serial" else ""
+            return "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400}$serialPart:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        }
+
+        override suspend fun run(cmd: String): CmdResult {
+            commands.add(cmd)
+            return when {
+                cmd == DualRepository.CMD_LIST_USERS ->
+                    CmdResult(exit = 0, out = listUsersOutput, err = "")
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = buildVerbose(serialFor(fetchIndex, verboseSerials)), err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER -> {
+                    val out = buildDumpsys(serialFor(fetchIndex, dumpsysSerials))
+                    fetchIndex++
+                    CmdResult(exit = 0, out = out, err = "")
+                }
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = propOutput, err = "")
+                cmd.startsWith("pm install-existing") || cmd.startsWith("pm uninstall") -> {
+                    drifted = true
+                    CmdResult(exit = 0, out = "ok", err = "")
+                }
+                cmd.startsWith("pm list packages") ->
+                    CmdResult(exit = listPackagesExit, out = listPackagesOutput, err = "")
+                else -> CmdResult(exit = 0, out = "ok", err = "")
+            }
+        }
+
+        fun installWrites(): List<String> = commands.filter { it.startsWith("pm install-existing") }
+
+        fun targetCommandsFor(userId: Int): List<String> = commands.filter {
+            it.contains("--user $userId")
+        }
+
+        companion object {
+            const val DEFAULT_USERS =
+                "Users:\n" +
+                    "\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{95:DUAL_APP:400} running\n"
+            const val DEFAULT_PROP = "95\n"
+        }
+    }
+
+    private fun <T> runSuspend(block: suspend () -> T): T {
+        var result: Result<T>? = null
+        block.startCoroutine(
+            object : Continuation<T> {
+                override val context = EmptyCoroutineContext
+                override fun resumeWith(r: Result<T>) {
+                    result = r
+                }
+            },
+        )
+        return (result ?: error("suspend block never resumed")).getOrThrow()
+    }
+
+    // Auto clone with a reused id (resolve serial 15, fresh serial 99) is
+    // refused with zero install-existing writes. Refused (not NoDual) proves
+    // the reuse guard fired rather than a plain unknown.
+    @Test
+    fun autoClone_reusedIdRefusedWithoutWrite() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15, 99),
+            dumpsysSerials = mutableListOf(15, 99),
+        )
+        val repo = DualRepository(gateway)
+        val res = runSuspend { repo.clone("com.example.chat") }
+        assertEquals(1, res.exit)
+        assertTrue("expected reuse refusal, got: ${res.err}", res.err.startsWith("refused:") && res.err.contains("reuse"))
+        assertTrue(
+            "reused id must never be written, got: ${gateway.commands}",
+            gateway.installWrites().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Pinned clone whose identity drifts across the write (15 -> 99) reports
+    // VerifyUnknown (detail notes identity-changed), never Success, even
+    // though the install and the list probe both succeed.
+    @Test
+    fun pinnedClone_driftAfterWriteYieldsVerifyUnknown() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15),
+            dumpsysSerials = mutableListOf(15),
+            flipAfterWrite = 99,
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val outcome = runSuspend { repo.cloneVerified("com.example.chat") }
+        assertTrue("drift must be VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        assertTrue(
+            "detail must note identity-changed, got: ${(outcome as CloneOutcome.VerifyUnknown).detail}",
+            outcome.detail.contains("identity-changed"),
+        )
+        // The write itself ran once (pinning cannot prevent the already-sent
+        // command); the contract is fail-closed reporting, never Success.
+        assertEquals(1, gateway.installWrites().size)
+    }
+
+    // Serial single-side missing is tolerated (Phase B upgrade path): only
+    // both-present-and-unequal refuses. Both directions must still write.
+    @Test
+    fun serialSingleSideMissing_tolerated() {
+        // expected.serial == null (both channels silent at resolve), fresh 15.
+        val missingFirst = FlipGateway(
+            verboseSerials = mutableListOf(null, 15),
+            dumpsysSerials = mutableListOf(null, 15),
+        )
+        val first = runSuspend { DualRepository(missingFirst).clone("com.example.chat") }
+        assertEquals("missing-expected must be tolerated, got: $first", 0, first.exit)
+        assertEquals(1, missingFirst.installWrites().size)
+
+        // fresh.serial == null (channels fall silent after resolve), expected 15.
+        val missingFresh = FlipGateway(
+            verboseSerials = mutableListOf(15, null),
+            dumpsysSerials = mutableListOf(15, null),
+        )
+        val second = runSuspend { DualRepository(missingFresh).clone("com.example.chat") }
+        assertEquals("missing-fresh must be tolerated, got: $second", 0, second.exit)
+        assertEquals(1, missingFresh.installWrites().size)
+    }
+
+    // Direct parser mapping: Confirmed carries the target, Unknown/Refused
+    // map to null (single source for resolveDualUserIdVerified).
+    @Test
+    fun resolveDualTarget_mapsConfirmedOnly() {
+        val verbose =
+            "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+        val dumpsys =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val target = PmOutputParser.resolveDualTarget(verbose, dumpsys, 95)
+        assertEquals(VerifiedTarget(userId = 95, serial = 15, parentId = 0), target)
+        assertEquals(95, PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95))
+        assertEquals(null, PmOutputParser.resolveDualTarget(verbose, dumpsys, null))
+        assertEquals(null, PmOutputParser.resolveDualTarget(verbose, dumpsys, 96))
+    }
+}
