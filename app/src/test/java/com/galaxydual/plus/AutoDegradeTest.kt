@@ -515,7 +515,11 @@ class AutoDegradeTest {
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
 
         vm.refresh()
-        await { !vm.state.value.loading && vm.state.value.msg == "no clones installed" }
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("no clones installed") &&
+                vm.state.value.msg.contains("降級")
+        }
 
         val s = vm.state.value
         assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
@@ -524,6 +528,10 @@ class AutoDegradeTest {
         assertTrue("degraded SHIZUKU refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
         assertTrue("degraded SHIZUKU must stay writable", s.writeReady)
         assertTrue("degrade note must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertTrue(
+            "refresh INFO must carry the degrade note, got: \"${s.msg}\"",
+            s.msg.contains("no clones installed") && s.msg.contains("降級"),
+        )
     }
 
     // Phase 2: a re-probe that does NOT swap (already SHIZUKU, still SHIZUKU)
@@ -640,5 +648,98 @@ class AutoDegradeTest {
         assertEquals(ChannelPreference.ROOT, s.channel)
         assertTrue("explicit choice clears the Auto degrade note, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
         assertNull("channel switch must drop the stale pending (fail closed)", s.pendingRemove)
+    }
+
+    // P25 Item 1: probe -> refresh must keep the degrade reason visible.
+    // su denied + Shizuku proven degrades to SHIZUKU; after
+    // reconnectAndRefresh() the refresh INFO ("no clones installed") must be
+    // combined with the degrade note, not overwritten by it.
+    @Test
+    fun reconnect_degradeSurvivesRefresh_combinedMsg() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        // Empty listing so the refresh base is the neutral INFO branch.
+        shizukuFake.installedPkgs.clear()
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+
+        vm.reconnectAndRefresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("no clones installed") &&
+                vm.state.value.msg.contains("降級")
+        }
+
+        val s = vm.state.value
+        assertEquals(ChannelPreference.AUTO, s.channel)
+        assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
+        assertTrue("degradeNote must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertTrue(
+            "refresh INFO must combine with degrade note, got: \"${s.msg}\"",
+            s.msg.contains("no clones installed") && s.msg.contains("降級"),
+        )
+        assertEquals(MsgKind.INFO, s.msgKind)
+        assertTrue("degraded SHIZUKU must stay writable", s.writeReady)
+        // channelView short-tag condition (MainActivity appends
+        // "已自 Auto 降級，詳見狀態列" exactly when degradeNote is non-empty).
+        assertTrue(
+            "channelView must show the degrade short tag (degradeNote non-empty)",
+            s.degradeNote.isNotEmpty(),
+        )
+        assertTrue("refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
+    }
+
+    // P25 Item 1 (error priority): both probes failing degrades to NOOP
+    // read-only; the NoOp repo cannot list profiles so refresh ends as
+    // CHANNEL error. The error must win (pass through, not covered by the
+    // degrade note), while the degrade reason stays in degradeNote +
+    // channelView short tag.
+    @Test
+    fun reconnect_noopDegradeRefresh_keepsErrorAndNote() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
+        assertTrue(
+            "precondition: AUTO must have degraded to NOOP, got: \"${vm.state.value.degradeNote}\"",
+            vm.state.value.degradeNote.contains("唯讀"),
+        )
+
+        vm.reconnectAndRefresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.NOOP &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertEquals(ResolvedChannel.NOOP, s.resolvedGateway)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue(
+            "error must pass through (not covered by degrade), got: \"${s.msg}\"",
+            s.msg.contains("channel error"),
+        )
+        assertTrue("degradeNote must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("唯讀"))
+        assertFalse("NOOP must never be writable", s.writeReady)
+        // channelView short-tag condition: degradeNote non-empty under AUTO.
+        assertEquals(ChannelPreference.AUTO, s.channel)
+        assertTrue(
+            "channelView must show the degrade short tag (degradeNote non-empty)",
+            s.degradeNote.isNotEmpty(),
+        )
     }
 }
