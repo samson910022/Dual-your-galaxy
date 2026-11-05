@@ -481,9 +481,10 @@ class RemoveConfirmTest {
     }
 
     // A second confirm after a successful one finds no pending and runs no
-    // second uninstall.
+    // second uninstall; the pinned success result ("removed: ...") is kept,
+    // not overwritten by the late no-pending report (PR-33 S2, P2 終態釘住).
     @Test
-    fun confirm_secondConfirmAfterSuccess_reportsNoPending() {
+    fun confirm_secondConfirmAfterSuccess_pinsResult() {
         val gw = FakeRepoGateway(dualId = 95)
         val vm = makeVm(gw)
         awaitReady(vm)
@@ -496,10 +497,12 @@ class RemoveConfirmTest {
         assertEquals("first confirm must run one uninstall", 1, gw.uninstallCalls)
 
         vm.confirmRemove()
-        awaitVm(vm) { vm.state.value.msg.contains("沒有待確認") }
+        awaitVm(vm) { !vm.state.value.loading }
 
         assertEquals("second confirm must not run another uninstall", 1, gw.uninstallCalls)
         assertNull(vm.state.value.pendingRemove)
+        assertEquals("removed: com.example.chat", vm.state.value.msg)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
     }
 
     // Cancel with nothing pending is a no-op: pending stays null, no
@@ -657,5 +660,28 @@ class RemoveConfirmTest {
         assertEquals("cancel-during-confirm must not uninstall", 0, gw.uninstallCalls)
         assertNull(vm.state.value.pendingRemove)
         assertFalse(vm.state.value.loading)
+    }
+
+    // PR-33 S2 (P2 終態結果釘住): a serial second confirm after success must
+    // not overwrite the pinned "removed: ..." result with the no-pending
+    // report; no second uninstall runs and pending stays null.
+    @Test
+    fun confirm_afterSuccess_doesNotOverwriteResult() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.msg == "removed: com.example.chat" }
+
+        vm.confirmRemove()
+        awaitVm(vm) { !vm.state.value.loading }
+
+        assertEquals("removed: com.example.chat", vm.state.value.msg)
+        assertEquals("late confirm must not run another uninstall", 1, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
     }
 }

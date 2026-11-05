@@ -794,8 +794,10 @@ class DualViewModel(
         viewModelScope.launch {
             val pendingAtCall = _state.value.pendingRemove
             if (pendingAtCall == null) {
-                _state.update {
-                    it.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
+                // 終態成功不被遲到/重複 confirm 覆寫（結果釘住）；其餘才報無待確認。
+                _state.update { cur ->
+                    if (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: ")) cur
+                    else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
                 }
                 return@launch
             }
