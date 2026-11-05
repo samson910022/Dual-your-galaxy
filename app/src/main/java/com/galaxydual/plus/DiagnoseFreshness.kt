@@ -59,7 +59,7 @@ enum class InventoryFreshness {
 // 清單快照：refresh 的 ground truth 附帶何時、何地查的。
 // - source: 查詢命令 (如 "pm list packages --user 95")，失敗時為 "pm list users"。
 // - targetId: 查證過的 dualId (NO_TARGET_ID=無目標)。
-// - queryTimeMs: wall-clock (nowMs)，0=從未查詢。
+// - queryTimeMs: wall-clock (nowWallMs)，0=從未查詢。
 // - freshness/count: 見上；count 為成功列舉筆數 (UNKNOWN/STALE 仍保留舊筆數語意由呼叫端決定)。
 data class InventorySnapshot(
     val source: String = "",
@@ -399,6 +399,11 @@ fun redactPackage(pkg: String): String {
 // 輸入 UiState，輸出多行繁中文字；呼叫端 (MainActivity 匯出按鈕) 只負責顯示，
 // 不做任何網路上傳 (契約見檔頭與 MainActivity 註解)。
 fun buildDiagnosticExport(state: UiState): String {
+    // m2 匯出行注入防護 (入口全量清洗，與 redact 同層；顯示側不動)：
+    // 使用者/通道可控字串 (source/techDetail/detail/scopes) 先過
+    // CONTROL_CHARS→" " (全量，不截斷)，再進兩道遮蔽；結構換行
+    // (appendLine 自身) 保留，只壓欄位內換行，避免偽造匯出行。
+    fun clean(s: String): String = s.replace(CONTROL_CHARS, " ")
     val sb = StringBuilder()
     sb.appendLine("【診斷匯出（已遮蔽，僅本機預覽）】")
     val diag = state.diagnose
@@ -407,13 +412,13 @@ fun buildDiagnosticExport(state: UiState): String {
         sb.appendLine("摘要：${diag.summaryZh}")
         sb.appendLine("下一步：${diag.nextStepZh}")
         if (diag.exit != null) sb.appendLine("exit：${diag.exit}")
-        if (diag.techDetail.isNotEmpty()) sb.appendLine("技術細節：${diag.techDetail}")
+        if (diag.techDetail.isNotEmpty()) sb.appendLine("技術細節：${clean(diag.techDetail)}")
     } else {
         sb.appendLine("錯誤碼：OK（無異常）")
     }
     sb.appendLine(
         "清單：${state.inventory.freshness} target=${state.inventory.targetId} " +
-            "筆數=${state.inventory.count} 來源=${state.inventory.source} " +
+            "筆數=${state.inventory.count} 來源=${clean(state.inventory.source)} " +
             "查詢於=${formatTimeMs(state.inventory.queryTimeMs)}",
     )
     val last = state.lastOperation
@@ -423,15 +428,15 @@ fun buildDiagnosticExport(state: UiState): String {
         val targetPart =
             if (last.pinnedTarget > NO_TARGET_ID) " target=${last.pinnedTarget}" else ""
         sb.appendLine(
-            "上次操作：${redactPackage(last.appKey)}$targetPart " +
+            "上次操作：${redactPackage(clean(last.appKey))}$targetPart " +
                 "相位=${last.phase} 時間=${formatTimeMs(last.timeMs)}",
         )
-        if (last.detail.isNotEmpty()) sb.appendLine("操作細節：${last.detail}")
+        if (last.detail.isNotEmpty()) sb.appendLine("操作細節：${clean(last.detail)}")
     } else {
         sb.appendLine("上次操作：無")
     }
     sb.appendLine(
-        "Hook：${state.hookStatus} 範圍=${state.hookScopes.sorted().joinToString(",")} " +
+        "Hook：${state.hookStatus} 範圍=${clean(state.hookScopes.sorted().joinToString(","))} " +
             "marker時間=${state.hookMarkerTimeMs?.let { formatTimeMs(it) } ?: "未知"} " +
             "查詢於=${formatTimeMs(state.hookQueriedAtMs)}",
     )

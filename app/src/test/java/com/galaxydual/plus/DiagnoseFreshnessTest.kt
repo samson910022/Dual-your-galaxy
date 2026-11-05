@@ -120,7 +120,7 @@ class DiagnoseFreshnessTest {
         Dispatchers.resetMain()
     }
 
-    // Monotonic fake clock: every nowMs() call advances, so probe vs
+    // Monotonic fake clock: every wall/mono clock call advances, so probe vs
     // operation timestamps are deterministically ordered.
     private class FakeClock(var tick: Long = 0L) {
         fun now(): Long {
@@ -151,7 +151,9 @@ class DiagnoseFreshnessTest {
             currentChannel = ResolvedChannel.ROOT,
             hookDirectReads = directReads,
             hookDiagnosticGateways = { emptyList() },
-            nowMs = { clock.now() },
+            // C1 雙時鐘測試同餵：wall/mono 共用同一 fake，沿既有 JumpClock/FakeClock 模式。
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
         )
         vms.add(vm)
         return vm

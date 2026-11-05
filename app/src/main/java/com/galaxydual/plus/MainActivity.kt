@@ -848,6 +848,8 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
 // 本地確認畫面顯示完整 package + label + user/serial，不經
 // sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
+// m3 行注入防護：pkg/appLabel/profileLabel 先過 sanitizeUserEcho
+// (保原文、去換行，不 redact)，結構換行保留，欄位內換行壓空白；
 // 診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
 // - pkg：待移除完整包名（raw，呼叫端傳 pending.pkg）。
 // - appLabel：PackageManager 解析顯示名；失敗時呼叫端回退傳 pkg
@@ -861,8 +863,8 @@ internal fun buildRemoveConfirmMessage(
     dualId: Int,
     serial: Int,
 ): String =
-    "應用：$appLabel（$pkg）\n" +
-        "已驗證目標：user $dualId（$profileLabel，serial $serial）\n" +
+    "應用：${sanitizeUserEcho(appLabel)}（${sanitizeUserEcho(pkg)}）\n" +
+        "已驗證目標：user $dualId（${sanitizeUserEcho(profileLabel)}，serial $serial）\n" +
         "警告：將刪除該分身的使用者資料且無法復原；" +
         "僅影響分身（user $dualId），不影響主 profile。"
 
@@ -925,10 +927,12 @@ private class DualViewModelFactory(
                 shizukuAuthCheck = { shizukuAuthorizedNow() },
                 activeGateway = asm.gateway,
                 currentChannel = asm.channel,
-                // PR-33 S3: TTL 用 monotonic（boot 起算），免 wall-clock 回撥延長
-                // 有效期；pending 不跨重啟（process death 清除），reboot 重置無影響。
-                // JVM 預設（currentTimeMillis）保留給測試注入。
-                nowMs = { SystemClock.elapsedRealtime() },
+                // C1 雙時鐘：wall 供清單/hook/操作時間證據 (顯示用)，
+                // mono 供同意時效 (TTL，免 wall 回撥延長有效期)；
+                // pending 不跨重啟 (process death 清除)，reboot 重置無影響。
+                // JVM 預設皆 currentTimeMillis，測試注入可控 fake。
+                nowWallMs = { System.currentTimeMillis() },
+                nowMonoMs = { SystemClock.elapsedRealtime() },
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
