@@ -86,11 +86,18 @@ Verify (two different things — do not confuse):
   build. Two cases — do not mix the filenames:
   - Locally signed file (local-only): `app-release-signed.apk` plus
     its sidecar `app-release-signed.apk.sha256` in the same folder.
-    Check with:
+    Generate the sidecar first (the sign step above only outputs
+    the `.apk`), then check with:
 
     ```bash
+    sha256sum app-release-signed.apk > app-release-signed.apk.sha256
     sha256sum -c app-release-signed.apk.sha256
     ```
+
+    A locally generated checksum is only for later integrity
+    comparison, not an independent trusted-source verification;
+    for official downloads, the Release `SHA256SUMS.txt` and
+    certificate comparison remain authoritative.
 
   - GitHub Release download: `app-release.apk` plus `SHA256SUMS.txt`
     in the same folder. Check with:
