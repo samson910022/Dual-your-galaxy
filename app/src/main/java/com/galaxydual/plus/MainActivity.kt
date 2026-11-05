@@ -652,8 +652,10 @@ class MainActivity : ComponentActivity() {
         }
         shownPending = pending
         val appLabel = resolveAppLabel(pending.pkg)
-        val message = "應用：$appLabel（${pending.pkg}）\n" +
-            "已驗證目標：user ${pending.dualId}（${pending.profileLabel}）\n" +
+        // 理由 (m2 包名回音消毒)：對話框顯示用插值經 sanitizeForDisplay；
+        // 儲存的 pending.pkg/profileLabel 保持 raw (VM 狀態不動)。
+        val message = "應用：${sanitizeForDisplay(appLabel)}（${sanitizeForDisplay(pending.pkg)}）\n" +
+            "已驗證目標：user ${pending.dualId}（${sanitizeForDisplay(pending.profileLabel)}）\n" +
             "警告：將刪除該分身的使用者資料且無法復原；" +
             "僅影響分身（user ${pending.dualId}），不影響主 profile。"
         try {
@@ -742,10 +744,15 @@ internal fun renderInventoryText(s: UiState): String = buildString {
 }
 
 // 上次操作獨立行 (原附於清單行尾)；無操作顯示「無」(與匯出同詞)。
+// 理由 (security-low)：不再顯示 raw opId (含完整包名與世代序號)，改顯示
+// redactPackage(appKey)+phase (+targetId 若有效)，避免個資回音；儲存的
+// opId/appKey 保持 raw (VM 狀態/測試仍直讀)。
 internal fun renderLastOpText(s: UiState): String {
     val last = s.lastOperation
     return if (last != null) {
-        "上次操作：${last.opId} 相位 ${last.phase}"
+        val targetPart =
+            if (last.pinnedTarget > NO_TARGET_ID) " target=${last.pinnedTarget}" else ""
+        "上次操作：${redactPackage(last.appKey)}$targetPart 相位 ${last.phase}"
     } else {
         "上次操作：無"
     }

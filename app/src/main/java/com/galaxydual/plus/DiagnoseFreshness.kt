@@ -81,12 +81,16 @@ fun InventorySnapshot.needsRefresh(now: Long, maxAgeMs: Long = INVENTORY_STALE_A
             (now - queryTimeMs) >= maxAgeMs
     }
 
-// 舊資料標 STALE (FRESH->STALE，原 target/queryTime 保留供追溯)；
+// 舊資料標 STALE (FRESH->STALE，queryTime 保持舊值供追溯，理由：沿用現行
+// FRESH 保留語意，STALE 只降新鮮度不謊稱重新查詢)；source 沿用傳入 (理由：
+// 呼叫端傳本次命令，匯出可追溯本次失敗的查詢命令)；targetId 有效
+// (>NO_TARGET_ID) 即覆寫 (理由：drift 新目標如 96 不再丟棄，UI 可見新目標)；
+// 無效時回退保留舊身份。count 一律保留舊筆數 (舊資料不謊稱新鮮亦不丟失)。
 // 否則新建 UNKNOWN (記錄這次查詢的 source，不謊稱新鮮)。
 // UNKNOWN 分支保留舊身份/筆數供追溯：呼叫端傳入有效 target (非哨兵) 才覆寫
 // (傳 NO_TARGET_ID 表未知，回退保留 this.targetId，傳入的 targetId 不再丟棄)；
 // count 一律保留舊筆數，與 FRESH->STALE 一致 (舊資料不謊稱新鮮亦不丟失)。
-// DualViewModel.refreshLocked 各失敗分支共用。
+// DualViewModel.refreshLocked 各失敗分支共用；寫前拒絕分支 (M3) 亦經此降級。
 // (原名 staleOrUnknownLocked；測試無引用故改名，語意/行為不變。)
 fun InventorySnapshot.toStaleOrUnknown(
     now: Long,
@@ -94,7 +98,12 @@ fun InventorySnapshot.toStaleOrUnknown(
     targetId: Int = NO_TARGET_ID,
 ): InventorySnapshot =
     if (freshness == InventoryFreshness.FRESH) {
-        copy(freshness = InventoryFreshness.STALE)
+        // 理由見上：target 有效即覆寫 (drift 不丟)、source 沿用傳入、queryTime 保持舊值。
+        copy(
+            source = source,
+            targetId = if (targetId > NO_TARGET_ID) targetId else this.targetId,
+            freshness = InventoryFreshness.STALE,
+        )
     } else {
         InventorySnapshot(
             source = source,
@@ -389,9 +398,13 @@ fun buildDiagnosticExport(state: UiState): String {
     )
     val last = state.lastOperation
     if (last != null) {
+        // 理由 (security-low)：不再顯示 raw opId (含完整包名)，改顯示
+        // redactPackage(appKey)+phase (+targetId 若有效)；儲存的 opId/appKey 保持 raw。
+        val targetPart =
+            if (last.pinnedTarget > NO_TARGET_ID) " target=${last.pinnedTarget}" else ""
         sb.appendLine(
-            "上次操作：${last.opId} ${redactPackage(last.appKey)} " +
-                "target=${last.pinnedTarget} 相位=${last.phase} 時間=${formatTimeMs(last.timeMs)}",
+            "上次操作：${redactPackage(last.appKey)}$targetPart " +
+                "相位=${last.phase} 時間=${formatTimeMs(last.timeMs)}",
         )
         if (last.detail.isNotEmpty()) sb.appendLine("操作細節：${last.detail}")
     } else {
