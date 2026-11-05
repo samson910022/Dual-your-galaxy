@@ -222,6 +222,9 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - 重啟恢復行為：重啟後新 ViewModel＋同一持久化，恢復只打勾（永不自動執行 clone），
   只恢復仍在目前 catalog 的 key（已卸載的包自動捨去），且同一目標只恢復一次；
   空 catalog 上不置恢復標記（待 catalog 就緒後仍可重試）；目標變更（profile 變動）時舊選取失效清除。
+- 誠實性註記：本節 UI 呈現行為（搜尋／開關／勾選／截斷／批次文案／旋轉回填／重啟恢復）以單元測試＋靜態審查為證；
+  TalkBack 朗讀、旋轉重建實機表現、長清單圖示效能、真通道 batch 端到端仍 [待實機驗證]（與 §0／§4 及 PR body 的 Device verification left open 口徑一致），
+  不得宣稱為已通過實機驗證。
 
 ## English Summary
 
