@@ -7,11 +7,13 @@ import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualRepository
+import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RemoveOutcome
+import com.galaxydual.core.VerifyState
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
@@ -28,6 +30,41 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+// Pending two-phase remove confirmation (PR-4 P1, issue #23).
+//
+// Created by requestRemove(pkg) and consumed by confirmRemove(); cleared by
+// cancelRemove() or by any confirm rejection/execution. All fields are a
+// snapshot of the request moment so confirmRemove can re-verify that the
+// target did not move under the dialog:
+//
+// - pkg: trimmed package the user asked to remove.
+// - dualId: verified cross-source dual target at request time (never the
+//   pm-list label).
+// - dualSerial: agreed platform serial for that target at request time
+//   (PR-33 R2, P1 serial binding). A delete+recreate reuses the user id and
+//   label but mints a fresh serial, so confirmRemove re-verifies (id, serial)
+//   together and refuses a serial mismatch without uninstalling.
+// - profileLabel: display label of that target at request time (second
+//   "selection unchanged" signal besides the id).
+// - requestedAtMs: clock reading at request time (consent generation,
+//   same clock source as the TTL check). confirmRemove rejects a stale
+//   consent older than REMOVE_CONFIRM_TTL_MS (fail closed, must request
+//   again); the serial/id/label re-check still guards a moved target
+//   regardless of age.
+//
+// Rotation policy (explicit choice, pinned by RemoveConfirmTest): pending
+// lives in UiState inside the ViewModel, so a config rotation (Activity
+// recreate, ViewModel retained) KEEPS the pending and the dialog re-shows
+// from state with no re-send. A ViewModel recreation (process death) starts
+// with pendingRemove == null (fail closed): the user must request again.
+data class PendingRemove(
+    val pkg: String,
+    val dualId: Int,
+    val dualSerial: Int,
+    val profileLabel: String,
+    val requestedAtMs: Long,
+)
 
 // Error class of the user-facing message, so the UI (F3) can render channel
 // failures differently from validation refusals or verify mismatches.
@@ -94,6 +131,13 @@ data class UiState(
     val msg: String = "",
     // Error class of msg; NONE when msg is empty.
     val msgKind: MsgKind = MsgKind.NONE,
+    // Two-phase remove confirmation (PR-4 P1, issue #23): set by
+    // requestRemove(), consumed by confirmRemove(), cleared by cancelRemove()
+    // and by every confirm outcome (executed or rejected). Non-null means the
+    // MainActivity must show the confirmation dialog; null means no dialog.
+    // Survives config rotation (ViewModel retained); a recreated ViewModel
+    // starts null (fail closed, must request again).
+    val pendingRemove: PendingRemove? = null,
 )
 
 // Android ViewModel owning the dual-app screen state (Phase F2, issue #6).
@@ -111,8 +155,12 @@ data class UiState(
 // instead of racing last-writer-wins on `cloned`/`loading`. Two bounds keep
 // rapid UI taps from piling an unbounded queue on that mutex: refresh()
 // coalesces (at most one pending re-run behind the in-flight one) and
-// clone/remove dedup by operation key (a second identical write while the
-// first is in flight reports "already in progress" instead of queueing).
+// clone/request-remove/confirm dedup by operation key (a second identical
+// write while the first is in flight reports "already in progress" instead
+// of queueing). Confirm keys are per generation
+// (`remove:<pkg>@<dualId>#<serial>#<ts>`, PR-33 R2: the serial joins the
+// generation so a stale dialog never blocks a fresh one, even across a
+// delete+recreate that reuses the id) so a stale dialog never blocks a fresh one.
 // Every repository call runs under Dispatchers.IO (see onIo): the core retry
 // settle wait blocks its caller thread, so running it on Main would stall
 // the Main dispatcher heartbeat for up to ~3 s per probe. Public entry
@@ -134,6 +182,13 @@ data class UiState(
 // reason, never executed. The marker never feeds privilege routing
 // (hasLsposed stays false below): a present marker is not proof of a live,
 // effective hook, so it must not grant privilege.
+//
+// PR-4 P1 (issue #23): remove is two-phase. requestRemove(pkg) only records
+// PendingRemove (verified id + serial + label + timestamp); confirmRemove()
+// re-checks (verified id equal, serial equal, label equal, still writable)
+// and only then runs repo.removeVerifiedExpected. cancelRemove() drops the
+// pending. Rapid double confirm executes at most once via the shared
+// inFlightWrites dedup.
 class DualViewModel(
     private var repo: DualRepository,
     // Declared privilege of the gateway backing `repo`. F4a wires the real
@@ -186,7 +241,18 @@ class DualViewModel(
     // regardless.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
+    // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
+    // monotonic clock in production). Defaults to the real wall clock so
+    // JVM tests need no Android runtime; tests inject a controllable fake.
+    // Constructor stays Android-free; the factory wires elapsedRealtime.
+    private val nowMs: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
+    companion object {
+        // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
+        // open longer than this must re-request; confirmRemove clears the
+        // stale pending with INVALID + 重新確認 and runs zero uninstalls.
+        const val REMOVE_CONFIRM_TTL_MS = 5 * 60 * 1000L
+    }
     private val _state = MutableStateFlow(
         UiState(
             channel = preference,
@@ -210,15 +276,17 @@ class DualViewModel(
     private var refreshJob: Job? = null
     private var refreshPending = false
 
-    // In-flight write dedup keys ("clone:<pkg>" / "remove:<pkg>", PR-3 stage 1,
-    // issue #24). A duplicate op while the first is still running reports
+    // In-flight write dedup keys ("clone:<pkg>" / "request-remove:<pkg>" /
+    // "remove:<pkg>@<id>#<serial>#<ts>", PR-3 stage 1, issue #24 + PR-4 P23
+    // stage 2, PR-33 R2 adds the serial to the generation).
+    // A duplicate op while the first is still running reports
     // "already in progress" instead of queueing behind the mutex. Clone and
     // remove use distinct keys so an intentional clone-then-remove sequence on
     // the same package is never collapsed. Main-confined (see class doc).
     private val inFlightWrites = mutableSetOf<String>()
 
     // Single constructor for in-flight write dedup keys; keeps the
-    // "clone:<pkg>" / "remove:<pkg>" namespaces consistent.
+    // "clone:<pkg>" / "request-remove:<pkg>" namespaces consistent.
     private fun opKey(op: String, pkg: String) = "$op:$pkg"
 
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
@@ -282,18 +350,30 @@ class DualViewModel(
     // settle wait never blocks Main; StateFlow updates stay thread-safe from
     // any dispatcher.
     private suspend fun refreshLocked() {
-        // Mark busy first so the UI can render a spinner.
-        _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+        // Mark busy first so the UI can render a spinner. Dialog 開著時狀態列
+        // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
+        // loading=true（refresh 不應驅散確認對話框的提示）。
+        _state.update {
+            if (it.pendingRemove != null) it.copy(loading = true)
+            else it.copy(loading = true, msg = "", msgKind = MsgKind.NONE)
+        }
         try {
             when (val snap = onIo { repo.profilesSnapshot() }) {
                 is ProfilesSnapshot.ChannelError ->
-                    _state.update {
-                        it.copy(
+                    _state.update { cur ->
+                        val next = cur.copy(
                             loading = false,
                             profiles = emptyList(),
                             msg = "channel error: ${snap.detail}",
                             msgKind = MsgKind.CHANNEL,
                         )
+                        if (cur.pendingRemove != null &&
+                            (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                        ) {
+                            next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                        } else {
+                            next
+                        }
                     }
                 is ProfilesSnapshot.Loaded -> {
                     val profiles = snap.profiles
@@ -304,19 +384,26 @@ class DualViewModel(
                     // the listing below.
                     val dualId = onIo { repo.resolveDualUserId() }
                     if (dualId < 0) {
-                        _state.update {
-                            it.copy(
+                        _state.update { cur ->
+                            val next = cur.copy(
                                 loading = false,
                                 profiles = profiles,
                                 cloned = emptyList(),
                                 msg = "no dual profile",
                                 msgKind = MsgKind.NO_DUAL,
                             )
+                            if (cur.pendingRemove != null &&
+                                (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                            ) {
+                                next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                            } else {
+                                next
+                            }
                         }
                     } else {
                         val groundTruth = onIo { repo.listClonedPackages(dualId) }
                         _state.update { cur ->
-                            if (groundTruth == null) {
+                            val next = if (groundTruth == null) {
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -341,6 +428,13 @@ class DualViewModel(
                                     msgKind = MsgKind.NONE,
                                 )
                             }
+                            if (cur.pendingRemove != null &&
+                                (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                            ) {
+                                next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                            } else {
+                                next
+                            }
                         }
                     }
                 }
@@ -350,12 +444,20 @@ class DualViewModel(
             // cooperative and refresh() coalescing still drains correctly.
             if (e is CancellationException) throw e
             // Gateways report via CmdResult, but guard against unexpected throws.
-            _state.update {
-                it.copy(
+            // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
+            _state.update { cur ->
+                val next = cur.copy(
                     loading = false,
                     msg = "refresh failed: ${e.message ?: e.javaClass.simpleName}",
                     msgKind = MsgKind.FAILED,
                 )
+                if (cur.pendingRemove != null &&
+                    (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                ) {
+                    next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                } else {
+                    next
+                }
             }
         }
     }
@@ -485,11 +587,22 @@ class DualViewModel(
         }
     }
 
-    // Removes pkg from the dual profile; drops it from cloned ONLY when the
-    // pinned re-check confirms it absent. Anything else (failed uninstall,
-    // still present, uncheckable channel) keeps the entry: fail closed.
-    // Refused while the channel is not ready or privilege is NONE.
-    fun remove(pkg: String) {
+    // Two-phase remove, phase 1 (PR-4 P1, issue #23): records what the user
+    // asked to remove WITHOUT touching the device uninstall path. Resolves
+    // the serial-bound verified target once (cross-source id + agreed serial
+    // + display label, PR-33 R2) and stores it in UiState.pendingRemove so
+    // MainActivity can render the confirmation dialog from state
+    // (rotation-safe: the dialog is state driven, never re-sent). No `pm
+    // uninstall` runs here by construction. Refused (no pending) while the
+    // channel is not writable, when no dual target exists, or when the id is
+    // confirmed but its serial cannot be established. A second request
+    // overwrites the first (last wins); the confirm step re-validates, so a
+    // stale overwrite cannot execute.
+    // PR-33 R3 (P2 安裝狀態 + 時效): stores nowMs() as the consent
+    // generation and refuses before storing when the package is not
+    // installed (NotInstalled -> INFO 無需移除, Unknown -> CHANNEL fail
+    // closed), so a no-op removal never opens a dialog.
+    fun requestRemove(pkg: String) {
         viewModelScope.launch {
             // Validate input early without touching the device.
             if (pkg.isBlank()) {
@@ -497,10 +610,14 @@ class DualViewModel(
                 return@launch
             }
             val trimmed: String = pkg.trim()
-            // Write dedup (PR-3 stage 1, issue #24): same contract as clone()
-            // above, keyed "remove:<pkg>" so an intentional clone-then-remove
-            // sequence on the same package is never collapsed.
-            val key = opKey("remove", trimmed)
+            // Write dedup (PR-4 P23 stage 2, 比照 clone()): a second identical
+            // requestRemove while the first is still in flight reports
+            // "already in progress" instead of queueing another mutex waiter +
+            // device round-trip. request(request-remove:) vs confirm(remove:@#)
+            // vs clone(clone:) 三命名空間互不擋。Checked before the mutex hold
+            // (Main-confined add); released in finally
+            // so a cancelled/failed op never wedges the key.
+            val key = opKey("request-remove", trimmed)
             if (!inFlightWrites.add(key)) {
                 _state.update {
                     it.copy(msg = "already in progress: $trimmed", msgKind = MsgKind.INFO)
@@ -513,87 +630,123 @@ class DualViewModel(
                     if (!isWritable()) return@withLock
                     _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
                     try {
-                        // Single-snapshot pinned flow inside the repository.
-                        // onIo: the core retry settle wait must never run on Main.
-                        when (val res = onIo { repo.removeVerified(trimmed) }) {
-                        is RemoveOutcome.Success ->
-                            _state.update { cur ->
-                                cur.copy(
-                                    loading = false,
-                                    cloned = cur.cloned.filterNot { it == trimmed },
-                                    msg = "removed: $trimmed",
-                                    msgKind = MsgKind.INFO,
-                                )
+                        when (val snap = onIo { repo.profilesSnapshot() }) {
+                            is ProfilesSnapshot.ChannelError ->
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingRemove = null,
+                                        msg = "remove result unknown: " +
+                                            "channel error: ${snap.detail}",
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            is ProfilesSnapshot.Loaded -> {
+                                when (val target = onIo { repo.fetchDualTarget() }) {
+                                    is DualTargetResult.NoDual ->
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                msg = "no dual profile",
+                                                msgKind = MsgKind.NO_DUAL,
+                                            )
+                                        }
+                                    is DualTargetResult.SerialUnavailable ->
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                msg = "無法驗證分身身分（serial 缺失），請重試",
+                                                msgKind = MsgKind.NO_DUAL,
+                                            )
+                                        }
+                                    is DualTargetResult.Confirmed -> {
+                                        val dualId = target.target.userId
+                                        val label =
+                                            snap.profiles.firstOrNull { it.userId == dualId }?.label
+                                        if (label == null) {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "no dual profile",
+                                                    msgKind = MsgKind.NO_DUAL,
+                                                )
+                                            }
+                                        } else {
+                                            // P2 安裝檢查 (PR-33 R3): only an
+                                            // Installed package opens a
+                                            // dialog; a confirmed-absent
+                                            // package is a no-op INFO, an
+                                            // uncheckable channel is CHANNEL
+                                            // fail closed (never a dialog).
+                                            when (val st = onIo { repo.verifyState(trimmed, dualId) }) {
+                                                is VerifyState.Installed -> {
+                                                    val pending = PendingRemove(
+                                                        pkg = trimmed,
+                                                        dualId = dualId,
+                                                        dualSerial = target.target.serial,
+                                                        profileLabel = label,
+                                                        requestedAtMs = nowMs(),
+                                                    )
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = pending,
+                                                            msg = "等待確認移除：$trimmed（user $dualId）",
+                                                            msgKind = MsgKind.INFO,
+                                                        )
+                                                    }
+                                                }
+                                                is VerifyState.NotInstalled ->
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = null,
+                                                            msg = "未安裝，無需移除：$trimmed",
+                                                            msgKind = MsgKind.INFO,
+                                                        )
+                                                    }
+                                                is VerifyState.Unknown ->
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = null,
+                                                            msg = "remove result unknown: " +
+                                                                "cannot verify $trimmed for user $dualId: ${st.detail}",
+                                                            msgKind = MsgKind.CHANNEL,
+                                                        )
+                                                    }
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        is RemoveOutcome.NoDual ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = "no dual profile",
-                                    msgKind = MsgKind.NO_DUAL,
-                                )
-                            }
-                        is RemoveOutcome.ChannelError ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = "remove result unknown: " +
-                                        "channel error: ${res.detail}",
-                                    msgKind = MsgKind.CHANNEL,
-                                )
-                            }
-                        is RemoveOutcome.InvalidPackage ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = "invalid package",
-                                    msgKind = MsgKind.INVALID,
-                                )
-                            }
-                        is RemoveOutcome.RemoveFailed ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = res.detail,
-                                    msgKind = MsgKind.FAILED,
-                                )
-                            }
-                        is RemoveOutcome.StillInstalled ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = "remove failed: $trimmed " +
-                                        "still installed for user ${res.dualId}",
-                                    msgKind = MsgKind.VERIFY,
-                                )
-                            }
-                        is RemoveOutcome.VerifyUnknown ->
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    msg = "remove result unknown: " +
-                                        "cannot verify removal of $trimmed " +
-                                        "for user ${res.dualId}: ${res.detail}",
-                                    msgKind = MsgKind.CHANNEL,
-                                )
-                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                pendingRemove = null,
+                                msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
+                                msgKind = MsgKind.FAILED,
+                            )
+                        }
                     }
-                } catch (e: Exception) {
-                    // Never swallow coroutine cancellation (see refreshLocked).
-                    if (e is CancellationException) throw e
-                    _state.update {
-                        it.copy(
-                            loading = false,
-                            msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
-                            msgKind = MsgKind.FAILED,
-                        )
-                    }
-                }
                 } finally {
-                    // Release the dedup key BEFORE the mutex is released (see
-                    // clone()): lets the next identical op in immediately. The
-                    // outer finally re-removes idempotently to cover
-                    // cancel-while-queued.
+                    // Release the dedup key BEFORE the mutex is released, so a
+                    // next identical op arriving right after this one finishes
+                    // is accepted instead of wrongly refused. The outer finally
+                    // re-removes idempotently to cover cancel-while-queued
+                    // (thrown before entering withLock).
                     inFlightWrites.remove(key)
                 }
                 }
@@ -602,6 +755,396 @@ class DualViewModel(
             }
         }
     }
+
+    // Two-phase remove, cancel (PR-4 P1, issue #23): drops the pending
+    // confirmation without running any uninstall. Synchronous (no device
+    // I/O) so the dialog dismisses immediately, including the back-button /
+    // outside-tap cancel path. A no-op when nothing is pending. Intentionally
+    // leaves loading untouched so an in-flight confirm/refresh spinner is
+    // never overwritten by the cancel.
+    fun cancelRemove() {
+        _state.update { cur ->
+            val pending = cur.pendingRemove ?: return@update cur
+            cur.copy(
+                pendingRemove = null,
+                msg = "已取消移除：${pending.pkg}",
+                msgKind = MsgKind.INFO,
+            )
+        }
+    }
+
+    // Two-phase remove, phase 2 (PR-4 P1, issue #23): executes the pending
+    // uninstall. Re-verifies under opMutex before running anything:
+    // verified id still equals the requested target, the agreed serial still
+    // matches (PR-33 R2: a delete+recreate reuses id+label with a fresh
+    // serial, so a serial mismatch refuses without uninstalling), the
+    // recorded profile label still matches (selection unchanged), and the
+    // channel is still writable. Any mismatch clears the pending and refuses
+    // with a message that asks for a fresh confirmation -- never executes a
+    // moved target. Rapid double-taps execute at most once via the shared
+    // inFlightWrites dedup (second concurrent confirm reports "already in
+    // progress"). Drops the pending entry from cloned ONLY when the pinned
+    // re-check confirms it absent (same fail-closed rule as the old direct
+    // remove). 最終授權者是 repo pinned API，VM pre-check 只是 fail-fast.
+    // PR-33 R3 (P2 安裝狀態 + 時效): after the serial/label checks, a stale
+    // consent (nowMs() - requestedAtMs > REMOVE_CONFIRM_TTL_MS) is refused
+    // first (cheap, no IO), then the package is re-verified Installed via
+    // repo.verifyState (NotInstalled -> INFO 無需移除 without touching
+    // cloned, Unknown -> CHANNEL fail closed) -- only then runs
+    // removeVerifiedExpected.
+    fun confirmRemove() {
+        viewModelScope.launch {
+            val pendingAtCall = _state.value.pendingRemove
+            if (pendingAtCall == null) {
+                // 終態成功不被遲到/重複 confirm 覆寫（結果釘住）；其餘才報無待確認。
+                _state.update { cur ->
+                    if (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: ")) cur
+                    else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
+                }
+                return@launch
+            }
+            // Write dedup 按世代 (PR-4 P23 stage 2, PR-33 R2 加 serial): key 綁定
+            // pending 世代 (pkg@dualId#serial#requestedAtMs)，避免 v1 卡鎖時 v2
+            // 合法確認被誤殺；a second concurrent confirm of the SAME
+            // generation reports instead of queueing a second uninstall.
+            val key = "remove:${pendingAtCall.pkg}@${pendingAtCall.dualId}" +
+                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}"
+            if (!inFlightWrites.add(key)) {
+                _state.update {
+                    it.copy(
+                        msg = "already in progress: ${pendingAtCall.pkg}",
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+                return@launch
+            }
+            try {
+                opMutex.withLock {
+                    try {
+                    // Re-read inside the lock: a cancelRemove() queued ahead
+                    // of us must win (fail closed, run nothing).
+                    val cur = _state.value.pendingRemove
+                    if (cur == null) return@withLock
+                    // Full-equality guard (full-equality 含 pkg/timestamp，覆寫即拒):
+                    // any overwrite means a newer request replaced ours. 舊 confirm
+                    // abort，保留新 pending，由使用者確認新目標：只清 loading，不動
+                    // pendingRemove 與 msg（保留新 request 的 pending 與「等待確認」訊息），
+                    // 與 post-IO 一致（preserve 式）。
+                    if (cur != pendingAtCall) {
+                        _state.update { it.copy(loading = false) }
+                        return@withLock
+                    }
+                    if (!isWritable()) {
+                        // isWritable already reported the reason into msg;
+                        // drop the stale pending so the next attempt must
+                        // request again (never execute a stale target).
+                        _state.update { it.copy(pendingRemove = null) }
+                        return@withLock
+                    }
+                    _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+                    try {
+                        // Single-snapshot pinned flow inside the repository.
+                        // onIo: the core retry settle wait must never run on Main.
+                        val freshId = onIo { repo.resolveDualUserId() }
+                        if (freshId < 0) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "no dual profile",
+                                    msgKind = MsgKind.NO_DUAL,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (freshId != cur.dualId) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "移除目標已變更（verified id " +
+                                        "$freshId ≠ ${cur.dualId}），請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
+                        // P1 serial binding (PR-33 R2): re-fetch the
+                        // serial-bound target and compare the agreed serial.
+                        // A delete+recreate under the dialog reuses id+label
+                        // with a fresh serial: mismatch -- or no confirmable
+                        // serial at all -- clears the pending and refuses
+                        // (INVALID + 重新確認), running zero uninstalls.
+                        // VM pre-check 只是 fail-fast，最終授權仍是 repo 的
+                        // removeVerifiedExpected(expectedSerial)。
+                        val freshSerial = (
+                            onIo { repo.fetchDualTarget() } as? DualTargetResult.Confirmed
+                            )?.takeIf { it.target.userId == cur.dualId }?.target?.serial
+                        if (freshSerial == null) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "移除目標無法驗證（serial 缺失），請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (freshSerial != cur.dualSerial) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingRemove = null,
+                                    msg = "移除目標已變更（serial " +
+                                        "$freshSerial ≠ ${cur.dualSerial}），請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
+                        when (val snap = onIo { repo.profilesSnapshot() }) {
+                            is ProfilesSnapshot.ChannelError ->
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingRemove = null,
+                                        msg = "remove result unknown: " +
+                                            "channel error: ${snap.detail}",
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            is ProfilesSnapshot.Loaded -> {
+                                val label =
+                                    snap.profiles.firstOrNull { it.userId == cur.dualId }?.label
+                                if (label == null) {
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            profiles = snap.profiles,
+                                            pendingRemove = null,
+                                            msg = "no dual profile",
+                                            msgKind = MsgKind.NO_DUAL,
+                                        )
+                                    }
+                                } else if (label != cur.profileLabel) {
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            profiles = snap.profiles,
+                                            pendingRemove = null,
+                                            msg = "移除目標已變更（$label ≠ " +
+                                                "${cur.profileLabel}），請重新確認",
+                                            msgKind = MsgKind.INVALID,
+                                        )
+                                    }
+                                } else {
+                                    // P2 時效 (PR-33 R3): no extra verify IO
+                                    // (TTL 判在既有 IO 之後). A stale consent
+                                    // is refused with zero uninstalls
+                                    // (INVALID + 重新確認).
+                                    if (nowMs() - cur.requestedAtMs > REMOVE_CONFIRM_TTL_MS) {
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                msg = "確認已過期，請重新確認移除",
+                                                msgKind = MsgKind.INVALID,
+                                            )
+                                        }
+                                        return@withLock
+                                    }
+                                    // P2 安裝重驗 (PR-33 R3): the package may
+                                    // be gone already (external uninstall).
+                                    // NotInstalled clears without uninstall
+                                    // (INFO 無需移除, cloned left for refresh
+                                    // to sync); Unknown clears CHANNEL fail
+                                    // closed. Only Installed proceeds.
+                                    when (val st = onIo { repo.verifyState(cur.pkg, cur.dualId) }) {
+                                        is VerifyState.Installed -> Unit
+                                        is VerifyState.NotInstalled -> {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "未安裝，無需移除：${cur.pkg}",
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
+                                            return@withLock
+                                        }
+                                        is VerifyState.Unknown -> {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "remove result unknown: " +
+                                                        "cannot verify ${cur.pkg} " +
+                                                        "for user ${cur.dualId}: ${st.detail}",
+                                                    msgKind = MsgKind.CHANNEL,
+                                                )
+                                            }
+                                            return@withLock
+                                        }
+                                    }
+                                    // Cancel-during-confirm race (B2): the IO above
+                                    // (freshId + snapshot) may have interleaved a
+                                    // cancelRemove(); re-check the pending is still
+                                    // ours before running the uninstall. Clear only
+                                    // loading here (只清 loading): keep pendingRemove
+                                    // and msg so the cancel message or the new
+                                    // request's pending survives.
+                                    if (_state.value.pendingRemove != cur) {
+                                        _state.update { it.copy(loading = false) }
+                                        return@withLock
+                                    }
+                                    when (val res = onIo { repo.removeVerifiedExpected(cur.pkg, cur.dualId, cur.dualSerial) { _state.value.pendingRemove == cur } }) {
+                                        is RemoveOutcome.Success ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    cloned = it.cloned.filterNot { p -> p == cur.pkg },
+                                                    pendingRemove = null,
+                                                    msg = "removed: ${cur.pkg}",
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
+                                        is RemoveOutcome.NoDual ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "no dual profile",
+                                                    msgKind = MsgKind.NO_DUAL,
+                                                )
+                                            }
+                                        is RemoveOutcome.ChannelError ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "remove result unknown: " +
+                                                        "channel error: ${res.detail}",
+                                                    msgKind = MsgKind.CHANNEL,
+                                                )
+                                            }
+                                        is RemoveOutcome.InvalidPackage ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "invalid package",
+                                                    msgKind = MsgKind.INVALID,
+                                                )
+                                            }
+                                        is RemoveOutcome.RemoveFailed ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = res.detail,
+                                                    msgKind = MsgKind.FAILED,
+                                                )
+                                            }
+                                        is RemoveOutcome.StillInstalled ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "remove failed: ${cur.pkg} " +
+                                                        "still installed for user ${res.dualId}",
+                                                    msgKind = MsgKind.VERIFY,
+                                                )
+                                            }
+                                        is RemoveOutcome.VerifyUnknown ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "remove result unknown: " +
+                                                        "cannot verify removal of ${cur.pkg} " +
+                                                        "for user ${res.dualId}: ${res.detail}",
+                                                    msgKind = MsgKind.CHANNEL,
+                                                )
+                                            }
+                                        is RemoveOutcome.TargetMoved ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "移除目標已變更（verified id ${res.verified} ≠ ${res.expected}），請重新確認",
+                                                    msgKind = MsgKind.INVALID,
+                                                )
+                                            }
+                                        // P1 serial binding (PR-33 R2): the repo
+                                        // refused a serial mismatch (or an
+                                        // unavailable serial) with zero
+                                        // uninstalls -- same INVALID +
+                                        // 重新確認 shape as TargetMoved.
+                                        is RemoveOutcome.SerialMismatch ->
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "移除目標已變更（serial " +
+                                                        "${res.actual ?: "缺失"} ≠ " +
+                                                        "${res.expected ?: "缺失"}），請重新確認",
+                                                    msgKind = MsgKind.INVALID,
+                                                )
+                                            }
+                                        is RemoveOutcome.Cancelled ->
+                                            _state.update { it.copy(loading = false) }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                pendingRemove = null,
+                                msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
+                                msgKind = MsgKind.FAILED,
+                            )
+                        }
+                    }
+                } finally {
+                    // Release the dedup key BEFORE the mutex is released, so a
+                    // next identical op arriving right after this one finishes
+                    // is accepted instead of wrongly refused. The outer finally
+                    // re-removes idempotently to cover cancel-while-queued
+                    // (thrown before entering withLock).
+                    inFlightWrites.remove(key)
+                }
+                }
+            } finally {
+                inFlightWrites.remove(key)
+            }
+        }
+    }
+
+    // Legacy single-tap entry (pre-P23): now only opens the confirmation
+    // (phase 1). Kept so existing callers keep compiling; new code must call
+    // requestRemove() explicitly. Never executes an uninstall.
+    @Deprecated(
+        message = "Two-phase removal: use requestRemove + confirmRemove; " +
+            "remove() no longer executes an uninstall.",
+        ReplaceWith("requestRemove(pkg)"),
+    )
+    fun remove(pkg: String) = requestRemove(pkg)
 
     // Re-probes elevation channels after a binder/permission lifecycle event
     // (Phase F3, issue #6): called from MainActivity's Shizuku binder/permission
@@ -692,6 +1235,10 @@ class DualViewModel(
         preference = pref
         currentChannel = asm.channel
         _state.update { it.copy(channel = pref) }
+        // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
+        // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
+        // 由使用者重新 request。suspend 且在 opMutex 下，兩次 update 沒問題。
+        _state.update { it.copy(pendingRemove = null) }
         if (old !== activeGateway && old is ShizukuCmdGateway) {
             try {
                 old.close()
@@ -780,45 +1327,60 @@ class DualViewModel(
                 HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
             }
             val hookDesc = hook.displayText()
-            _state.update {
-                it.withHookDiagnosis(hook).copy(
+            // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
+            // kind == NONE 才保留原 msg/msgKind，CHANNEL/FAILED 穿透，不保留。
+            // 其他欄位照寫（loading/hook/ready 照常更新）。
+            _state.update { cur ->
+                val base = cur.withHookDiagnosis(hook).copy(
                     loading = false,
                     channel = preference,
                     privilege = routed,
                     channelReady = ready,
-                msg = if (ready) {
-                    ""
-                } else if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
-                    // LSPosed mode semantics (F4b-P2): the gateway is still
-                    // the NoOp placeholder (whitelist policy branch pending),
-                    // so the channel is honestly never ready. The message
-                    // states the reason plus the hook signal; it never claims
-                    // the channel can execute.
-                    "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc"
-                } else if (gatewayPrivilege == Privilege.NONE) {
-                    "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀"
+                    msg = if (ready) {
+                        ""
+                    } else if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
+                        // LSPosed mode semantics (F4b-P2): the gateway is still
+                        // the NoOp placeholder (whitelist policy branch pending),
+                        // so the channel is honestly never ready. The message
+                        // states the reason plus the hook signal; it never claims
+                        // the channel can execute.
+                        "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
+                            "寫入已拒絕；Hook 狀態：$hookDesc"
+                    } else if (gatewayPrivilege == Privilege.NONE) {
+                        "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀"
+                    } else {
+                        "通道未就緒：已選 ${gatewayPrivilege} 通道但探測未通過，寫入已禁用"
+                    },
+                    msgKind = if (ready) MsgKind.NONE else MsgKind.CHANNEL,
+                    )
+                if (cur.pendingRemove != null && base.msgKind == MsgKind.NONE) {
+                    base.copy(msg = cur.msg, msgKind = cur.msgKind)
                 } else {
-                    "通道未就緒：已選 ${gatewayPrivilege} 通道但探測未通過，寫入已禁用"
-                },
-                msgKind = if (ready) MsgKind.NONE else MsgKind.CHANNEL,
-                )
+                    base
+                }
             }
     } catch (e: Exception) {
         // Never swallow coroutine cancellation (see refreshLocked); probes
         // report via privilege/channelReady, but guard against
-        // unexpected throws so loading never wedges busy.
+        // unexpected throws so loading never wedges busy. pendingRemove 開著
+        // 時新 kind == NONE 才保留，CHANNEL/FAILED 穿透，不保留。
         if (e is CancellationException) throw e
-        _state.update {
-            it.copy(
+        _state.update { cur ->
+            val next = cur.copy(
                 loading = false,
                 msg = "probe failed: ${e.message ?: e.javaClass.simpleName}",
                 msgKind = MsgKind.FAILED,
             )
+            if (cur.pendingRemove != null && next.msgKind == MsgKind.NONE) {
+                next.copy(msg = cur.msg, msgKind = cur.msgKind)
+            } else {
+                next
+            }
         }
     }
     }
 
+    // 注意：帶副作用，拒絕時會寫入 msg+loading=false。
     // Write guard: a real (non-NoOp) ready channel with SHELL or better.
     // Reports the refusal into msg and returns false when writes are off.
     // Must run under opMutex.
