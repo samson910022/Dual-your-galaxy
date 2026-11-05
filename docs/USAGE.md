@@ -91,8 +91,8 @@ parent 須雙通道皆提供、相等、== 0（任一缺失 → Unknown；兩值
 Refused「conflicting parent」；相等但非 0 → Refused「non-owner parent」政策）；
 serial 雙邊皆有且不等 → Refused「conflicting serial」，任一缺失則容忍放行
 放行（serial != id 屬正常）；
-且系統 property（`getprop sys.dualapp.profile_id`，若可讀）不與之矛盾；
-任一通道缺失、未知、衝突或歧義（多 CLONE／型別打架／property 打架）一律拒寫、
+且系統 property（`getprop sys.dualapp.profile_id`）必須可讀且與該同一 id 一致（必要佐證，不可省略：缺失／空／格式未知 → Unknown 證據不足拒寫；指向不存在 id 或與 CLONE id 不一致 → Refused；不可讀版本按不支援版本明確拒寫，見 #21）；
+任一通道缺失、未知、衝突或歧義（多 CLONE／型別打架／property 缺失→Unknown／property 打架→Refused）一律拒寫、
 拒讀，不猜「第一個非 0 的 id」、不認 label、不固定 95/150、不比整組 flags。
 App 內 `DualRepository`／雙 Elevator 探測即執行此契約（命令字串與 adapter 共用，fetch 經 `VerifiedIdentity.kt` 共用 fetch，[已支援] PR-1 階段2）：
 `resolveDualUserIdVerified(userListVerbose, dumpsysUser, propertyId)` 僅在
@@ -116,8 +116,8 @@ adb shell dumpsys user
 #   同一 id 在此通道同樣必須是 profile.CLONE；若此處是 SYSTEM/MANAGED/SECONDARY
 #   或無型別行，即與上一通道矛盾或證據不足 -> 拒寫。
 adb shell getprop sys.dualapp.profile_id
-#   若可讀，其值必須等於上述同一 id；不可讀/空/格式未知視為無主張（仍需雙通道一致才放行），
-#   指向不存在 id 或與 CLONE id 不一致 -> 拒寫。
+#   其值必須等於上述同一 id（必要佐證）；不可讀/空/格式未知 → Unknown 證據不足拒寫（不可讀版本按不支援版本明確拒寫），
+#   指向不存在 id 或與 CLONE id 不一致 -> Refused 拒寫。
 
 # 2. 僅在上一步確認同一 <dualId> 後，才可用該 id 執行寫入（示例用 95 佔位，
 #    實際必須填上一步 Confirmed 的 id；未確認、未知、矛盾時不執行以下任何一行）。

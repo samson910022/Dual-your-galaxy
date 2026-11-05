@@ -153,30 +153,30 @@ class ElevatorVerifiedTest {
         assertEquals(-1, runSuspend { SuElevator(suGateway(gateway)).probe() }.dualUserId)
     }
 
-    // A throwing property channel is "no claim" (null), not a failure: two
-    // agreeing CLONE channels still confirm on every surface.
+    // Phase C P2-2: a throwing property channel is "no claim" (null) and
+    // now yields Unknown (property required); probe levels are unchanged.
     @Test
-    fun propThrow_stillConfirmsOnTwoChannels() {
+    fun propThrow_resolvesMinusOneOnTwoChannels() {
         val gateway = FakeGateway(propThrows = true)
-        assertEquals(95, runSuspend { DualRepository(gateway).resolveDualUserId() })
-        assertEquals(95, runSuspend { DualRepository(gateway).resolveDualUserIdVerified() })
+        assertEquals(-1, runSuspend { DualRepository(gateway).resolveDualUserId() })
+        assertEquals(-1, runSuspend { DualRepository(gateway).resolveDualUserIdVerified() })
         val shizuku = runSuspend { ShizukuElevator(gateway).probe() }
         assertEquals(Privilege.SHELL, shizuku.level)
-        assertEquals(95, shizuku.dualUserId)
+        assertEquals(-1, shizuku.dualUserId)
         val su = runSuspend { SuElevator(suGateway(gateway)).probe() }
         assertEquals(Privilege.ROOT, su.level)
-        assertEquals(95, su.dualUserId)
+        assertEquals(-1, su.dualUserId)
     }
 
     // Multi-line dirty property output parses to null (no claim), so two
-    // agreeing CLONE channels still confirm.
+    // agreeing CLONE channels now yield Unknown (property required).
     @Test
-    fun propDirtyMultiline_stillConfirms() {
+    fun propDirtyMultiline_resolvesMinusOne() {
         val gateway = FakeGateway(propOutput = "95\n95\n")
         assertEquals(null, PmOutputParser.parseDualPropertyId(gateway.propOutput))
-        assertEquals(95, runSuspend { DualRepository(gateway).resolveDualUserId() })
-        assertEquals(95, runSuspend { ShizukuElevator(gateway).probe() }.dualUserId)
-        assertEquals(95, runSuspend { SuElevator(suGateway(gateway)).probe() }.dualUserId)
+        assertEquals(-1, runSuspend { DualRepository(gateway).resolveDualUserId() })
+        assertEquals(-1, runSuspend { ShizukuElevator(gateway).probe() }.dualUserId)
+        assertEquals(-1, runSuspend { SuElevator(suGateway(gateway)).probe() }.dualUserId)
     }
 
     // pm-list probe gate shares isSuccess with profilesSnapshot: exit 0 with

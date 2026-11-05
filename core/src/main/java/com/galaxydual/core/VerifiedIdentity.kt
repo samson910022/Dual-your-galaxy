@@ -1,16 +1,18 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
-// Shared verified-identity fetch (Phase 2, issue #21): the single source of
-// truth for the dual-profile id used by DualRepository.fetchVerifiedDualId()
-// and both Elevator probes. Runs both verbose channels plus the dual property,
-// then maps Confirmed -> id, Unknown/Refused/channel failure -> -1 (fail
-// closed). A failed typed channel (non-zero exit or error-semantic output per
-// isIdentityChannelOk) yields -1 without guessing; a missing/unparseable
-// property is "no claim" (null) and still allows a two-channel agreement to
-// confirm (a single source never confirms). Never throws for gateway errors
-// (they collapse to -1 / null claim); coroutine cancellation is always
-// rethrown and must never be swallowed by callers.
+// Shared verified-identity fetch (Phase 2, issue #21; Phase C P2-2 property
+// required): the single source of truth for the dual-profile id used by
+// DualRepository.fetchVerifiedDualId() and both Elevator probes. Runs both
+// verbose channels plus the dual property, then maps Confirmed -> id,
+// Unknown/Refused/channel failure -> -1 (fail closed). A failed typed channel
+// (non-zero exit or error-semantic output per isIdentityChannelOk) yields -1
+// without guessing; a missing/unparseable property is "no claim" (null) and
+// now yields Unknown (property is required corroboration, not optional;
+// mismatch stays Refused). A version that cannot read the property refuses
+// explicitly as an unsupported version (#21 acceptance). Never throws for
+// gateway errors (they collapse to -1 / null claim); coroutine cancellation
+// is always rethrown and must never be swallowed by callers.
 internal suspend fun CmdGateway.fetchVerifiedDualId(): Int {
     val verboseRes = try {
         run(DualRepository.CMD_USER_LIST_VERBOSE)
