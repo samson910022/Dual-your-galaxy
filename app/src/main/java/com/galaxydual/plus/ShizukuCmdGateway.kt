@@ -91,17 +91,30 @@ object ShizukuExecProtocol {
     const val SERVICE_VERSION = 2
 }
 
-// Pure error mapping for every Shizuku-side failure: binder dead, missing
-// authorization, bind failure, remote failure, timeout. All exit != 0 with an
-// explicit message; pure Kotlin so GatewayAssemblyTest covers it on the JVM.
-// Only timedOut() sets CmdResult.timedOut (PR-32 P1-1 unknown-after-send:
-// the client abandoned the wait, the remote pm may still have executed, so
-// the repository must verify read-only instead of claiming failure).
+// Pure error mapping for every Shizuku-side failure. Tri-state contract
+// (PR-32 P1-1 timeout, extended by P1-2 transport-unknown): the repository
+// judges a write reply by three mutually exclusive knowledge states, and
+// only the error factories below (plus decodeExecReply) produce them.
+//   1. Explicit pm failure -- the service ran pm and answered: exit/out/err
+//      come from decodeExecReply() and DualRepository judges them with
+//      isSuccess (Failure[...] -> InstallFailed/RemoveFailed). Neither flag.
+//   2. Definitely not sent (pre-dispatch) -- the command never reached the
+//      service: noBinder / notAuthorized / bindFailed (all thrown before
+//      transactExec's binder.transact), binderDead() on the pre-transact
+//      isBinderAlive check, and remoteFailed() on the pre-bind permission
+//      check. timedOut=false, transportUnknown=false -> the repository
+//      claims definite failure (InstallFailed/RemoveFailed).
+//   3. Possibly sent but reply lost (post-dispatch) -- transact threw
+//      (RemoteException/binder death), the binder died mid-call, or the
+//      reply decode failed: transportUnknown(), timedOut=false but
+//      transportUnknown=true -> the repository reconciles read-only
+//      (after-pin + single verifyListProbe, reverse -> Unknown, never an
+//      auto resend), same rule as the timedOut() client-wait expiry.
+// Only timedOut() sets timedOut; only transportUnknown() sets
+// transportUnknown. All cases are exit != 0 with an explicit message; pure
+// Kotlin so GatewayAssemblyTest covers it on the JVM.
 // No truncated flag needed here: every case is exit != 0, which the trusted
 // parser already maps to Unknown without consulting the flag.
-// Scope: other transport-unknown (binder-dead, bindFailed, remoteFailed,
-// noBinder, notAuthorized) stays timedOut=false -- follow-up, not inflated
-// here (only a client-side wait timeout is known-ambiguous this narrowly).
 object ShizukuExecErrors {
     fun noBinder(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: binder not connected (install/start Shizuku first)")
@@ -117,6 +130,23 @@ object ShizukuExecErrors {
 
     fun remoteFailed(detail: String): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: remote exec failed: $detail")
+
+    // Post-dispatch reply loss (PR-32 P1-2): the write was (or may have been)
+    // dispatched -- transact threw, the binder died mid-call, or the reply
+    // decode failed -- but no reply arrived. timedOut=false (the client wait
+    // did NOT expire; this is a transport loss, not a deadline) with
+    // transportUnknown=true so the repository reconciles read-only instead
+    // of claiming definite failure. Pre-dispatch refusals (noBinder /
+    // notAuthorized / bindFailed / pre-transact binderDead / pre-bind
+    // remoteFailed) must NOT use this: the command never reached the
+    // service, so they stay definite failures.
+    fun transportUnknown(detail: String): CmdResult =
+        CmdResult(
+            exit = 1,
+            out = "",
+            err = "shizuku: transport unknown (reply lost, may have executed): $detail",
+            transportUnknown = true,
+        )
 
     fun timedOut(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms", timedOut = true)
@@ -280,12 +310,13 @@ class ShizukuCmdGateway(
             binder
         }
 
-    // One exec round-trip with a bounded client wait. Dead binder /
-    // RemoteException / timeout all map to explicit CmdResult errors; the
-    // stale cache is dropped so the next call rebinds instead of reusing a
-    // dead handle.
+    // One exec round-trip with a bounded client wait. Pre-dispatch refusals
+    // (dead binder on the entry liveness check) stay definite failures via
+    // binderDead(); post-dispatch reply loss maps to transportUnknown().
+    // The stale cache is dropped on every failure path so the next call
+    // rebinds instead of reusing a dead handle.
     //
-    // Bounded deadline (PR-32 P1-2): the Parcel transact below is a
+    // Bounded deadline (PR-32 P1-1): the Parcel transact below is a
     // synchronous binder.transact(flags=0) that Dispatchers.IO cannot
     // interrupt, so the previous withTimeoutOrNull wrapper did not bound the
     // client wait (a hung transact kept the caller suspended past the
@@ -310,6 +341,15 @@ class ShizukuCmdGateway(
     // dropBindingLocked() on the timeout path additionally guarantees the
     // next run() rebinds fresh instead of reusing the timed-out handle.
     // A delivered write is never blindly resent by this gateway.
+    //
+    // Tri-state dispatch rule (PR-32 P1-2): anything thrown at or after
+    // binder.transact -- transact RemoteException/binder death, reply
+    // readInt/readString decode failure, or the await interrupt -- means the
+    // service may already have executed pm while the client holds no reply,
+    // so it returns transportUnknown() (timedOut=false,
+    // transportUnknown=true) for read-only reconciliation, NEVER a definite
+    // failure. Only the pre-transact liveness refusal above (command never
+    // sent) stays binderDead() -> definite failure.
     private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
         if (!binder.isBinderAlive) {
             bindMutex.withLock { dropBindingLocked() }
@@ -349,15 +389,22 @@ class ShizukuCmdGateway(
             throw e
         } catch (e: InterruptedException) {
             // awaitBounded restores the interrupt flag before rethrowing; this
-            // path converts the interrupt into a value return (remoteFailed),
-            // so consume the flag here -- otherwise it would linger on the
-            // pooled Dispatchers.IO worker that runs this gateway.
+            // path converts the interrupt into a value return, so consume the
+            // flag here -- otherwise it would linger on the pooled
+            // Dispatchers.IO worker that runs this gateway.
+            // Post-dispatch by construction (thrown at/after transact): the
+            // service may have executed, so transportUnknown, never a
+            // definite failure.
             Thread.interrupted()
             bindMutex.withLock { dropBindingLocked() }
-            ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName)
+            ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
         } catch (e: Exception) {
+            // Post-dispatch by construction (transact RemoteException, binder
+            // death mid-call, or reply readInt/readString decode failure):
+            // the service may have executed pm with no reply to judge, so
+            // reconcile read-only instead of claiming definite failure.
             bindMutex.withLock { dropBindingLocked() }
-            ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName)
+            ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
         }
     }
 

@@ -40,7 +40,8 @@ private val transactThreadSeq = AtomicLong(0)
 
 // Runs [block] with a bounded client wait. Returns the block value on time,
 // null on timeout (caller maps null to timedOut). Exceptions from [block]
-// propagate unwrapped to the caller (transactExec maps them to remoteFailed;
+// propagate unwrapped to the caller (transactExec maps them to
+// transportUnknown -- post-dispatch reply loss, never a definite failure;
 // CancellationException passes through the caller's existing rethrow).
 // A Future.get interrupt restores the interrupt flag and rethrows so the
 // caller's cancellation/error path observes it.

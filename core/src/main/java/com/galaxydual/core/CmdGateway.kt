@@ -44,6 +44,24 @@ data class CmdResult(
     // the same unknown-after-send signal -- text backstop only, no wire
     // change.
     val timedOut: Boolean = false,
+    // Post-dispatch transport-unknown flag (PR-32 P1-2, unknown-after-send).
+    // Contract: the producer must set transportUnknown=true when the write
+    // was (or may have been) dispatched to the remote service but the reply
+    // was lost -- transact threw, the binder died mid-call, or the reply
+    // decode failed. The remote pm may already have executed, so exit/out/
+    // err are untrusted and must NOT be judged by isSuccess/exit code --
+    // same consumer rule as timedOut (read-only verifyListProbe, no write
+    // resend, reverse observation maps to Unknown). Defaults to false so
+    // every existing CmdResult(...) call site keeps compiling and keeps its
+    // old meaning. tri-state rule for write replies:
+    // explicit pm failure (pm reports Failure[...], both flags false) ->
+    // definite failure; pre-dispatch refusal (command never sent: no binder,
+    // not authorized, bind failure -- both flags false) -> definite failure;
+    // post-dispatch reply loss (timedOut OR transportUnknown OR
+    // isServiceTimeoutText) -> reconcile read-only, never claim failure.
+    // Set client-side only (Shizuku transactExec catch path); never crosses
+    // the frozen (exit, out, err) parcel -- same wire constraint as timedOut.
+    val transportUnknown: Boolean = false,
 ) {
     // Backward-compatible aliases for the older field names.
     val exitCode: Int get() = exit

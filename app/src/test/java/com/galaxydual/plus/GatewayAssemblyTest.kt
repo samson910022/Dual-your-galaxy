@@ -72,6 +72,7 @@ class GatewayAssemblyTest {
             ShizukuExecErrors.notAuthorized() to "not authorized",
             ShizukuExecErrors.bindFailed("boom") to "boom",
             ShizukuExecErrors.remoteFailed("boom") to "boom",
+            ShizukuExecErrors.transportUnknown("reply decode failed") to "transport unknown",
             ShizukuExecErrors.timedOut() to "timed out",
         )
         for ((res, needle) in cases) {
@@ -80,16 +81,28 @@ class GatewayAssemblyTest {
         }
     }
 
-    // PR-32 P1-1: only the client-side wait timeout carries timedOut=true
-    // (unknown-after-send); every other transport-unknown stays false
-    // (follow-up scope, never inflated here).
-    @Test fun shizukuErrors_onlyTimedOutCarriesFlag() {
+    // PR-32 P1-1 + P1-2 tri-state: only the client-side wait timeout carries
+    // timedOut=true (unknown-after-send); only the post-dispatch reply loss
+    // carries transportUnknown=true (unknown-after-send, timedOut=false);
+    // every pre-dispatch refusal (never sent) carries neither flag and stays
+    // a definite failure.
+    @Test fun shizukuErrors_triStateFlagsAreExclusive() {
         assertTrue(ShizukuExecErrors.timedOut().timedOut)
-        assertTrue(!ShizukuExecErrors.noBinder().timedOut)
-        assertTrue(!ShizukuExecErrors.binderDead().timedOut)
-        assertTrue(!ShizukuExecErrors.notAuthorized().timedOut)
-        assertTrue(!ShizukuExecErrors.bindFailed("boom").timedOut)
-        assertTrue(!ShizukuExecErrors.remoteFailed("boom").timedOut)
+        assertTrue(!ShizukuExecErrors.timedOut().transportUnknown)
+        val lost = ShizukuExecErrors.transportUnknown("reply decode failed")
+        assertTrue(lost.transportUnknown)
+        assertTrue(!lost.timedOut)
+        assertTrue(lost.err.contains("may have executed"))
+        for (pre in listOf(
+            ShizukuExecErrors.noBinder(),
+            ShizukuExecErrors.binderDead(),
+            ShizukuExecErrors.notAuthorized(),
+            ShizukuExecErrors.bindFailed("boom"),
+            ShizukuExecErrors.remoteFailed("boom"),
+        )) {
+            assertTrue(!pre.timedOut)
+            assertTrue(!pre.transportUnknown)
+        }
     }
 
     // PR-32 P1-1: Su client-side wait timeout (SU_EXEC_TIMEOUT path) carries
