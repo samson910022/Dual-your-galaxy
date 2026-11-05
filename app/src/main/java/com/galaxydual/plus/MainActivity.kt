@@ -383,13 +383,14 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: the state render must never depend on Shizuku.
         }
-        val readyMark = if (s.writeReady) "已就緒" else "未就緒（唯讀）"
+        val readyMark = s.readyMark()
         // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
         // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
         // 未探測，絕不顯示未通過；明選 SHIZUKU 成功不代表 ROOT 不存在。
         // 真可讀 = (pmReadable == true) + writeReady：probe 身分
         // (execIdentity/anyProbePassed) 與 PM 讀 (pmReadable) / 寫 (writeReady)
-        // 絕不混為一布林 (P25 Item 4)。
+        // 絕不混為一布林 (P25 Item 4)。Phase 2 P3: readyMark 為雙條件
+        // (writeReady + pmReadable)，探測通過但 PM 未確認/不可讀不顯示已就緒。
         val probeMark = s.probeResultMark()
         val scopeLabel = s.probeScope.displayLabel()
         val pmMark = s.pmReadableText()

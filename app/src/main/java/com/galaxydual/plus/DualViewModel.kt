@@ -245,6 +245,10 @@ data class UiState(
     // `pm list users`, not `pm list packages` (a clone-list null still leaves
     // this true). True readability = (pmReadable == true) plus writeReady;
     // never collapse probe identity / PM-read / PM-write into one boolean.
+    // Phase 2 expiry: swapToLocked/swapToResolvedLocked (gateway 已換) 即
+    // null；probeChannels 在失去 readiness（ready false: NOOP 回退/撤銷/
+    // binder dead）時釘 null（舊 refresh 快照過期）。僅 refresh 能寫
+    // true/false。
     val pmReadable: Boolean? = null,
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
@@ -1746,12 +1750,17 @@ class DualViewModel(
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
         // 由使用者重新 request（與 swapToLocked 一致；confirm 仍有重驗雙保險）。
+        // Phase 2 (P25 Item 4): gateway 已換，上次 refresh 的 `pm list users`
+        // 結果即過期 -- pmReadable 回到 null（未知），僅 refresh 能重建
+        // true/false；probe 永不寫入此欄（失去 readiness 時由 probeChannels
+        // 再釘 null，見下）。
         _state.update {
             it.copy(
                 channel = preference,
                 resolvedGateway = desired,
                 execIdentity = newGateway.privilege,
                 pendingRemove = null,
+                pmReadable = null,
             )
         }
         if (old !== newGateway && old is ShizukuCmdGateway) {
@@ -1820,6 +1829,9 @@ class DualViewModel(
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
         // 由使用者重新 request。
+        // Phase 2 (P25 Item 4): 同 swapToResolvedLocked -- 上次 refresh 的
+        // `pm list users` 結果隨 gateway 過期，回到 null（未知），僅 refresh
+        // 能重建 true/false。
         _state.update {
             it.copy(
                 channel = pref,
@@ -1827,6 +1839,7 @@ class DualViewModel(
                 execIdentity = asm.gateway.privilege,
                 degradeNote = if (pref == ChannelPreference.AUTO) autoDegradeNote else "",
                 pendingRemove = null,
+                pmReadable = null,
             )
         }
         if (old !== activeGateway && old is ShizukuCmdGateway) {
@@ -2055,8 +2068,10 @@ class DualViewModel(
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
             // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
             // 其他欄位照寫（loading/hook/ready/resolved/exec/caps 照常更新）。
-            // Phase C P2: probeScope follows preference (本次探測範圍); probe
-            // never writes pmReadable (refresh owns it) -- copy preserves it.
+            // Phase 2 (P25 Item 4): probe 只在失去 readiness 時使 pmReadable
+            // 過期 -- ready false（NOOP 回退/撤銷/通道失敗/binder dead）即
+            // null（未知），因舊 refresh 結果屬於舊通道/舊授權；ready true
+            // 時保留（同通道仍可讀，快照未失效）。僅 refresh 能寫 true/false。
             _state.update { cur ->
                 val base = cur.withHookDiagnosis(hook).copy(
                     loading = false,
@@ -2068,6 +2083,7 @@ class DualViewModel(
                     anyProbePassed = anyProbePassed,
                     probeScope = preference.probeScope(),
                     writeReady = ready,
+                    pmReadable = if (!ready) null else cur.pmReadable,
                     degradeNote = degradeNoteForState,
                     msg = if (ready) readyMsg else notReadyMsg,
                     msgKind = if (ready) {
@@ -2089,10 +2105,12 @@ class DualViewModel(
         // report via privilege/channelReady, but guard against
         // unexpected throws so loading never wedges busy. pendingRemove 開著
         // 時新 kind == NONE/INFO 才保留，CHANNEL/FAILED 穿透，不保留。
+        // Phase 2: probe 拋錯（binder dead 等）同樣使 pmReadable 過期 -> null。
         if (e is CancellationException) throw e
         _state.update { cur ->
             val next = cur.copy(
                 loading = false,
+                pmReadable = null,
                 msg = "probe failed: ${e.message ?: e.javaClass.simpleName}",
                 msgKind = MsgKind.FAILED,
             )
@@ -2211,4 +2229,15 @@ fun UiState.pmReadableText(): String = when (pmReadable) {
     true -> "PM可讀"
     false -> "PM不可讀"
     null -> "PM未知"
+}
+
+// Phase 2 P3 (P25 Item 4): 雙條件就緒標記 -- writeReady（探測門）+ pmReadable
+//（PM 讀取）缺一不可。writeReady false -> 未就緒（唯讀）不變；writeReady true
+// 但 pmReadable false/null -> 探測通過但 PM 未證明可讀，絕不顯示單純已就緒。
+// 僅 (true + true) 顯示已就緒。
+fun UiState.readyMark(): String = when {
+    !writeReady -> "未就緒（唯讀）"
+    pmReadable == true -> "已就緒"
+    pmReadable == false -> "探測通過，PM不可讀"
+    else -> "探測通過，PM未確認"
 }
