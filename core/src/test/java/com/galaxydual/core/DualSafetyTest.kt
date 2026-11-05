@@ -711,4 +711,46 @@ class DualSafetyTest {
             },
         )
     }
+
+    // Phase B P1-2 e2e: verbose CLONE parentId=0 vs dumpsys CLONE
+    // parentId=10 (property agrees on 95) is a parent conflict -> Refused.
+    // Resolution is -1, cloneVerified is NoDual, and no target command runs.
+    @Test
+    fun parentConflictAcrossChannels_e2eRefusesWithoutTargetCommands() {
+        val verboseParentZero = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsysParentTen = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=10
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val gateway = FakeGateway(
+            userListVerboseOutput = verboseParentZero,
+            dumpsysOutput = dumpsysParentTen,
+            propOutput = "95\n",
+        )
+        val repo = DualRepository(gateway)
+
+        assertEquals(-1, runSuspend { repo.resolveDualUserId() })
+        assertTrue(runSuspend { repo.cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "parent conflict must not target user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "no write command may run on parent conflict, got: ${gateway.writeCommands()}",
+            gateway.writeCommands().isEmpty(),
+        )
+    }
 }
