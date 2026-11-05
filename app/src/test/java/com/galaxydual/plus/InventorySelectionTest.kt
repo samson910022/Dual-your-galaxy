@@ -27,6 +27,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
@@ -76,6 +77,11 @@ class InventorySelectionTest {
         // PR-37 Phase B #2 serial 綁定測試鉤子：雙 verbose/dumpsys 通道回報的
         // serial（預設 15；改寫即模擬同 id 重建的新 serial，id 不變）。
         var dualSerial: Int = 15,
+        // PR-37 Phase C #5 測試鉤子：當 installCalls 達到此數後，verbose/
+        // dumpsys 身分通道回 exit!=0（模擬批次中途身分通道暫時無法判定；
+        // -1 停用）。typed 解析走 Unknown → core 回 ChannelError（非 NoDual），
+        // 批次應計入 unknown、不短路、不宣稱 no dual。
+        var failIdentityAfterInstalls: Int = -1,
         // PR-37 Phase B #1 原子 pin 測試鉤子：當 CMD_LIST_USERS 呼叫次數超過此
         // 閾值後，身份通道整體切到 switchDualIdTo（-1 停用）。批次 pin
         //（fetchDualTarget：verbose/dumpsys/prop）不經此通道，故 pin 仍見舊
@@ -151,10 +157,18 @@ class InventorySelectionTest {
             }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
                 verboseCalls += 1
-                CmdResult(exit = 0, out = verboseOut(), err = "")
+                if (failIdentityAfterInstalls >= 0 && installCalls.size >= failIdentityAfterInstalls) {
+                    CmdResult(exit = 1, out = "", err = "identity down")
+                } else {
+                    CmdResult(exit = 0, out = verboseOut(), err = "")
+                }
             }
             cmd == DualRepository.CMD_DUMPSYS_USER ->
-                CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                if (failIdentityAfterInstalls >= 0 && installCalls.size >= failIdentityAfterInstalls) {
+                    CmdResult(exit = 1, out = "", err = "identity down")
+                } else {
+                    CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                }
             cmd == DualRepository.CMD_GETPROP_DUAL ->
                 CmdResult(exit = 0, out = "${effectiveDualId()}\n", err = "")
             cmd.startsWith("pm install-existing") -> {
@@ -214,10 +228,25 @@ class InventorySelectionTest {
 
     // HashMap-backed SelectionStore: models the app-private prefs file; a new
     // SelectionStore over the same map models a restarted process client.
+    // R4 #2 hold/release：blockLoad=true 時首個 loadRaw 在 IO 執行緒上阻塞
+    //（loadEntered 倒數→測試執行緒手動操作→loadRelease 放行），精確模擬
+    // restore I/O 懸掛途中使用者仍可操作（toggle 不持 mutex，可交錯；mutex
+    // 持有者 restore 的提交守衛必須放棄）。預設 false，既有測試行為不變。
     private class MapBackend {
         val map = mutableMapOf<String, String?>()
+        @Volatile var blockLoad: Boolean = false
+        val loadEntered = java.util.concurrent.CountDownLatch(1)
+        val loadRelease = java.util.concurrent.CountDownLatch(1)
         fun store(): SelectionStore = SelectionStore(
-            loadRaw = { map[SELECTION_KEY] },
+            loadRaw = {
+                if (blockLoad) {
+                    loadEntered.countDown()
+                    loadRelease.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    map[SELECTION_KEY]
+                } else {
+                    map[SELECTION_KEY]
+                }
+            },
             saveRaw = { raw ->
                 if (raw == null) map.remove(SELECTION_KEY) else map[SELECTION_KEY] = raw
                 true
@@ -1513,5 +1542,280 @@ class InventorySelectionTest {
         )
         assertEquals(0, gw.installCalls.size)
         assertEquals(0, gw.uninstallCalls.size)
+    }
+
+    // PR-37 Phase C (review R4 #5)：批次中途身分通道暫時無法判定（首項成功後
+    // verbose/dumpsys exit!=0）→ 該項 ChannelError（非 NoDual），零寫入、
+    // 不觸發 M13 短路；彙總計入 unknown（非 failed），STALE＋VERIFY_UNKNOWN，
+    // msg/diagnose 永不宣稱 no dual。
+    @Test
+    fun batch_identityUnknown_countsUnknownWithoutShortCircuit() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        // 首個 install 完成後身分通道失效：首項成功，次項 Unknown。
+        gw.failIdentityAfterInstalls = 1
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a1")
+        vm.toggleSelection("0:com.example.a2")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(2, report.items.size)
+        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(
+            "identity Unknown must surface as ChannelError, got: ${report.items[1].outcome}",
+            report.items[1].outcome is CloneOutcome.ChannelError,
+        )
+        assertTrue(
+            "identity Unknown must never be reported as NoDual",
+            report.items[1].outcome !is CloneOutcome.NoDual,
+        )
+        assertEquals(
+            "unknown item must never reach the device",
+            listOf("com.example.a1"), gw.installCalls,
+        )
+        assertEquals(1, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(1, report.unknownCount)
+        assertTrue(vm.state.value.cloned.contains("com.example.a1"))
+        assertFalse(vm.state.value.cloned.contains("com.example.a2"))
+        val last = vm.state.value.lastOperation
+        assertNotNull(last)
+        assertEquals("batch:clone", last!!.opId)
+        assertEquals(OpPhase.UNKNOWN, last.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+        assertTrue(
+            "msg must never claim no dual: ${vm.state.value.msg}",
+            !vm.state.value.msg.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(vm.state.value.msg.contains("成功 1 / 失敗 0 / 未知 1"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(InventoryFreshness.STALE, vm.state.value.inventory.freshness)
+    }
+
+    // PR-37 Phase B R4 #2：restore lost-update——hold 住 restore I/O 時手動勾選
+    // B，放棄恢復（仍為 B），批次只裝 B 絕不裝 A；放棄不燒 marker（清空後重試
+    // 可恢復 A）。hold 經 MapBackend loadRaw 阻塞 latch（IO 執行緒），toggle
+    // 不持 mutex 故可交錯；batch 經 opMutex 排在 restore 之後，天然證明 restore
+    // 已完成（deterministic，無 sleep 競態）。
+    @Test
+    fun restore_lostUpdate_manualSelectionWinsAndBatchOnlyB() {
+        val backend = MapBackend()
+        val chatA = "0:com.example.chat"
+        val mailB = "0:com.example.mail"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        // refresh 已驗證後再存檔，避免 refresh 自動補觸提前恢復 A。
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+        )
+        backend.blockLoad = true
+        vm.restoreSelection(95)
+        assertTrue(
+            "restore must reach blocking I/O",
+            backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+        )
+        vm.toggleSelection(mailB)
+        assertEquals(setOf(mailB), vm.state.value.selectedKeys)
+        backend.loadRelease.countDown()
+        // batch 排在 restore 之後：restore 放棄後 batch 才執行。
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        assertEquals(
+            "manual B must survive lost-update restore",
+            setOf(mailB), vm.state.value.selectedKeys,
+        )
+        assertEquals(listOf("com.example.mail"), gw.installCalls)
+        assertFalse(
+            "stale A must never reach the device",
+            gw.installCalls.contains("com.example.chat"),
+        )
+        assertEquals(1, vm.state.value.batchReport!!.successCount)
+        // 不燒 marker：清空後重試可恢復 A。
+        backend.blockLoad = false
+        vm.clearSelectionLocal()
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        vm.restoreSelection(95)
+        await { chatA in vm.state.value.selectedKeys }
+        assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+    }
+
+    // R4 #2 ABA：hold 途中「選 B→清除→空」回到空，isEmpty 無法區分「一直空」，
+    // 必須以 selectionGen 放棄（仍空，不寫 A）；不燒 marker，故重試可恢復 A。
+    @Test
+    fun restore_aba_selectThenClear_abortsAndMarkerNotBurned() {
+        val backend = MapBackend()
+        val chatA = "0:com.example.chat"
+        val mailB = "0:com.example.mail"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+        )
+        backend.blockLoad = true
+        vm.restoreSelection(95)
+        assertTrue(
+            backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+        )
+        vm.toggleSelection(mailB)
+        vm.clearSelectionLocal()
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        backend.loadRelease.countDown()
+        // persist(-1) 經 opMutex 排在 restore 之後：其完成即 restore 已完成。
+        vm.persistSelection(-1)
+        await { vm.state.value.msg.contains("no dual profile") }
+        assertTrue(
+            "ABA empty must not be overwritten by stale restore",
+            vm.state.value.selectedKeys.isEmpty(),
+        )
+        assertEquals(0, gw.installCalls.size)
+        backend.blockLoad = false
+        vm.restoreSelection(95)
+        await { chatA in vm.state.value.selectedKeys }
+        assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+    }
+
+    // R4 #2 catalog 途中更新：hold 途中 setSourceCatalog 新引用（A 缺失），
+    // 提交前引用比對放棄（仍空）；自動補觸亦因交集空不燒 marker；回 V1 重試可恢復。
+    @Test
+    fun restore_catalogMidUpdate_abortsAndMarkerNotBurned() {
+        val backend = MapBackend()
+        val chatA = "0:com.example.chat"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+        )
+        backend.blockLoad = true
+        vm.restoreSelection(95)
+        assertTrue(
+            backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+        )
+        // 途中 catalog 新引用且 A 缺失：提交必須放棄。
+        vm.setSourceCatalog(
+            listOf(SourceAppEntry("com.example.mail", "Mail", 0, false)),
+        )
+        backend.loadRelease.countDown()
+        // refresh 排在 hold＋自動補觸之後：完成即前序皆完成。
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertTrue(
+            "catalog-changed restore must abort, stale A must not appear",
+            vm.state.value.selectedKeys.isEmpty(),
+        )
+        assertEquals(0, gw.installCalls.size)
+        // 不燒 marker：回含 A 的 catalog 重試可恢復。
+        backend.blockLoad = false
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+            ),
+        )
+        vm.restoreSelection(95)
+        await { chatA in vm.state.value.selectedKeys }
+        assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+    }
+
+    // R4 #2 (id,serial) 途中變更：hold 途中 verified 身份 95#15→96#41（直接
+    // 寫 StateFlow 模擬 refresh 已遷移，繞過 mutex 排隊以注入真正的 I/O 途中
+    // 變更；生產中 refresh 經 mutex 串行，此處僅隔離驗證提交守衛 (c)），提交
+    // 必須放棄（仍空）；新目標存檔重試可恢復（marker 未被舊目標燒）。
+    @Test
+    fun restore_identityMidChange_abortsAndMarkerNotBurned() {
+        val backend = MapBackend()
+        val chatA = "0:com.example.chat"
+        val mailB = "0:com.example.mail"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.chat", "Chat", 0, false),
+                SourceAppEntry("com.example.mail", "Mail", 0, false),
+            ),
+        )
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 15
+        }
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+        )
+        backend.blockLoad = true
+        vm.restoreSelection(95)
+        assertTrue(
+            backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+        )
+        // 途中身份遷移：生產為 refresh 持 mutex 寫入，此處為測試確定性直接寫
+        // StateFlow（restore 持 mutex 期間其他 mutex 寫者本就排隊，直接寫即
+        // 模擬「I/O 懸掛途中已遷移」的最新 StateFlow）。
+        val f = vm.javaClass.getDeclaredField("_state")
+        f.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val sf = f.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<UiState>
+        sf.update {
+            it.copy(inventory = it.inventory.copy(targetId = 96, targetSerial = 41))
+        }
+        backend.loadRelease.countDown()
+        vm.persistSelection(-1)
+        await { vm.state.value.msg.contains("no dual profile") }
+        assertTrue(
+            "identity-changed restore must abort",
+            vm.state.value.selectedKeys.isEmpty(),
+        )
+        assertEquals(0, gw.installCalls.size)
+        // 不燒 marker：新目標存檔可恢復。
+        backend.blockLoad = false
+        assertTrue(
+            backend.store().save(SELECTION_SOURCE_CATALOG, 96, setOf(mailB), 3000L, 41),
+        )
+        vm.restoreSelection(96)
+        await { mailB in vm.state.value.selectedKeys }
+        assertEquals(setOf(mailB), vm.state.value.selectedKeys)
     }
 }

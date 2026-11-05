@@ -35,6 +35,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 // Pending two-phase remove confirmation (PR-4 P1, issue #23).
 //
@@ -166,8 +167,9 @@ data class BatchItemResult(
 )
 
 // 一次「建立 N 個分身」的彙總:逐項結果 + 成功/失敗/未知計數。
-// failed = 非 Success 且非 VerifyUnknown (含 NoDual/ChannelError/Invalid/
-// InstallFailed/VerifyFailed);unknown = VerifyUnknown (需重查,不算失敗)。
+// failed = 非 Success 且非 unknown (含 NoDual/Invalid/InstallFailed/
+// VerifyFailed/TargetMismatch);unknown = VerifyUnknown/ChannelError
+// (寫後未查證或身份暫時無法判定，需重查，不算失敗)。
 data class BatchReport(
     val items: List<BatchItemResult> = emptyList(),
     val successCount: Int = 0,
@@ -668,6 +670,15 @@ class DualViewModel(
     //   或 legacy 快照恢復時綁定為 id-only (serial null)；id-only 綁定永不
     //   靜默提升為完全體——批次要求完全體 (id,serial) 相符才執行，否則整批拒絕。
     private var selectionBoundTarget: SelectionTarget = SELECTION_BOUND_NONE
+    // PR-37 Phase B R4 #2：選取變更單調計數（lost-update 競態守衛，ABA 安全）。
+    // - toggle/setSelected/selectVisible/clear（含無-opMutex 使用者路徑）實際
+    //   改變 selectedKeys 時＋1；mutex 下清空（handle/batch drift）與 restore
+    //   提交成功亦＋1（單調，不重用）。
+    // - restore 起始記錄 startGen，提交前比對 gen 未變＋仍為空；中途
+    //   「有→清除→空」與「一直空」以 gen 區分（isEmpty 無法區分 ABA）。
+    // - AtomicLong：Unconfined 測試下 toggle 跑測試執行緒、restore 提交跑 IO
+    //   執行緒，仍可見有序（生產全 Main，同值）。
+    private val selectionGen = AtomicLong(0L)
 
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
     // gateway.run is a blocking suspend with no dispatcher guarantee, and a
@@ -3107,43 +3118,60 @@ class DualViewModel(
     }
 
     fun toggleSelection(appKey: String) {
+        var changed = false
         _state.update { cur ->
             val next = cur.selectedKeys.toMutableSet()
             if (!next.add(appKey)) next.remove(appKey)
             // 勾選變更即清 stale 批次報告（報告只描述上次執行的勾選集合）。
             if (next == cur.selectedKeys) cur
-            else cur.copy(selectedKeys = next, batchReport = null)
+            else {
+                changed = true
+                cur.copy(selectedKeys = next, batchReport = null)
+            }
         }
+        if (changed) selectionGen.incrementAndGet()
         // Phase B #1：已驗證目標下修改勾選即綁定；未驗證時不綁（哨兵，待 refresh 領養）。
         bindSelectionToVerifiedTargetLocked()
     }
 
     fun setSelected(appKey: String, checked: Boolean) {
+        var changed = false
         _state.update { cur ->
             val next = cur.selectedKeys.toMutableSet()
             if (checked) next.add(appKey) else next.remove(appKey)
             // 同上：無實際變更不碰報告，避免重渲染抖動。
             if (next == cur.selectedKeys) cur
-            else cur.copy(selectedKeys = next, batchReport = null)
+            else {
+                changed = true
+                cur.copy(selectedKeys = next, batchReport = null)
+            }
         }
+        if (changed) selectionGen.incrementAndGet()
         bindSelectionToVerifiedTargetLocked()
     }
 
     fun selectVisible(appKeys: Set<String>) {
         if (appKeys.isEmpty()) return
+        var changed = false
         _state.update { cur ->
             val merged = cur.selectedKeys + appKeys
             if (merged == cur.selectedKeys) cur
-            else cur.copy(selectedKeys = merged, batchReport = null)
+            else {
+                changed = true
+                cur.copy(selectedKeys = merged, batchReport = null)
+            }
         }
+        if (changed) selectionGen.incrementAndGet()
         bindSelectionToVerifiedTargetLocked()
     }
 
     // 清空勾選 (記憶體):只改 selectedKeys,不跑任何 uninstall,不碰持久化。
     // 語意:「取消勾選」≠「卸載分身」。
     fun clearSelectionLocal() {
+        var changed = false
         _state.update { cur ->
             if (cur.selectedKeys.isEmpty()) return@update cur
+            changed = true
             cur.copy(
                 selectedKeys = emptySet(),
                 batchReport = null,
@@ -3151,6 +3179,7 @@ class DualViewModel(
                 msgKind = MsgKind.INFO,
             )
         }
+        if (changed) selectionGen.incrementAndGet()
         // Phase B #1：清空即解綁（空集合無歸屬）。
         selectionBoundTarget = SELECTION_BOUND_NONE
     }
@@ -3290,6 +3319,15 @@ class DualViewModel(
     // PR-37 Phase B #2：targetSerial 為當下 verified serial（null=不可驗證）；
     // 綁定 serial 取自存檔快照本身（v2 全、legacy 空），永不靜默提升 id-only
     // 為 (id,serial) 完全體。
+    // PR-37 Phase B R4 #2 lost-update 競態守衛：提交（寫 selectedKeys／marker／
+    // bound）前重讀最新 StateFlow 三比對，任一不符即放棄（不寫選取、不燒 marker、
+    // 靜默：不碰 msg，勿擾民）——
+    // (a) 選取仍為空＋selectionGen 未變（ABA：中途「有→清除→空」gen 已推進，
+    //     isEmpty 無法區分，必須比 gen）；
+    // (b) catalog 引用未變（setSourceCatalog 一律 toList 新實例）＋kept 仍全在
+    //     當前 catalog（交集仍有效）；
+    // (c) 當前 (id,serial) 仍等於起始 verified 身份且等於本次請求目標（防
+    //     請求外 stale＋中途遷移）。
     private suspend fun restoreSelectionLocked(
         targetId: Int,
         targetSerial: Int? = null,
@@ -3306,6 +3344,10 @@ class DualViewModel(
         // 空 catalog 不置 marker：尚未真正嘗試映射，待 catalog 就緒後
         // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
         if (cur.sourceCatalog.isEmpty()) return
+        val startGen = selectionGen.get()
+        val startCatalog = cur.sourceCatalog
+        val startVerified =
+            SelectionTarget(cur.inventory.targetId, cur.inventory.targetSerial)
         val byKey = cur.sourceCatalog.associateBy { it.appKey }
         val available = availableKeys ?: byKey.keys
         val restored = try {
@@ -3333,10 +3375,24 @@ class DualViewModel(
             if (e is CancellationException) throw e
             null
         }?.knownTargetSerial
+        // R4 #2：提交前三比對（最新 StateFlow）。
+        val latest = _state.value
+        // (a) 選取仍允許自動恢復：為空且期間無任何選取變更（gen 守 ABA）。
+        if (latest.selectedKeys.isNotEmpty() || selectionGen.get() != startGen) return
+        // (b) catalog 未變：引用同一實例＋交集仍有效。
+        if (latest.sourceCatalog !== startCatalog) return
+        val curKeys = latest.sourceCatalog.map { it.appKey }.toSet()
+        if (kept.any { it !in curKeys }) return
+        // (c) 驗證身份未變且仍等於本次請求目標。
+        val latestVerified =
+            SelectionTarget(latest.inventory.targetId, latest.inventory.targetSerial)
+        if (latestVerified != startVerified) return
+        if (latestVerified != current) return
         selectionRestoredForTarget = current
         // Phase B #1：恢復成功即綁定到該目標（Phase B #2：serial 配對）。
         selectionBoundTarget = SelectionTarget(targetId, savedSerial)
         _state.update { it.copy(selectedKeys = kept) }
+        selectionGen.incrementAndGet()
     }
 
     // Phase B #1：使用者在已驗證目標下修改勾選時綁定；未驗證不綁（哨兵）。
@@ -3392,6 +3448,8 @@ class DualViewModel(
                     msgKind = MsgKind.INVALID,
                 )
             }
+            // R4 #2：mutex 下清空亦推進 gen（後續 restore 起始即見新值）。
+            selectionGen.incrementAndGet()
         } else if (_state.value.batchReport != null) {
             _state.update { it.copy(batchReport = null) }
         }
@@ -3412,6 +3470,9 @@ class DualViewModel(
     //   已知缺口:remove:<pkg> 未納入本次 batch×single 互斥 (Phase 1 範圍外)。
     // - 一次 isWritable 前置檢查 (唯讀/佔位通道整批拒絕);逐項失敗不中斷
     //   其餘項目 (ChannelError 逐項繼續;NoDual 首見後短路,見下)。
+    //   PR-37 Phase C (R4 #5)：身分暫時無法判定 (exit!=0／noisy／throw) 由 core
+    //   以 ChannelError 回報，走 unknown 口徑逐項繼續、不觸發 M13 短路；僅真
+    //   Absent 才以 NoDual 短路。
     // - NoDual 短路 (M13):首個 NoDual 後剩餘未執行項直接記同一 NoDual,
     //   不再打裝置 (verified target 已消失,繼續打裝置必敗)。
     // - catalog 缺失的 key 以 InvalidPackage 記帳 (計入 failed),顯示用包名
@@ -3703,6 +3764,8 @@ class DualViewModel(
                                 msgKind = MsgKind.INVALID,
                             )
                         }
+                        // R4 #2：mutex 下清空亦推進 gen。
+                        selectionGen.incrementAndGet()
                         return@withLock
                     }
                     // M3:items 外提,catch 可見已累積進度以發 partial。
@@ -3772,6 +3835,9 @@ class DualViewModel(
                                     }
                                 }
                                 is CloneOutcome.NoDual -> {
+                                    // PR-37 Phase C (R4 #5)：core 已用 typed 身分
+                                    // 區分 Absent／Unknown，此分支僅真 Absent 到達
+                                    // (Unknown 走 ChannelError，分進 unknown 口徑)。
                                     items.add(BatchItemResult(appKey, pkg, res))
                                     recordBatchItemUnknownOrFailed(pkg, res)
                                     noDualShort = res
@@ -3812,7 +3878,7 @@ class DualViewModel(
                                     val successD =
                                         items.count { it.outcome is CloneOutcome.Success }
                                     val unknownD =
-                                        items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                                        items.count { isBatchUnknownOutcome(it.outcome) }
                                     val failedD = items.size - successD - unknownD
                                     val partialDrift = BatchReport(
                                         items = items.toList(),
@@ -3872,12 +3938,14 @@ class DualViewModel(
                                             msgKind = MsgKind.FAILED,
                                         )
                                     }
+                                    // R4 #2：mutex 下清空亦推進 gen。
+                                    selectionGen.incrementAndGet()
                                     return@withLock
                                 }
                             }
                         }
                         val success = items.count { it.outcome is CloneOutcome.Success }
-                        val unknown = items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                        val unknown = items.count { isBatchUnknownOutcome(it.outcome) }
                         val failed = items.size - success - unknown
                         val report = BatchReport(
                             items = items.toList(),
@@ -3951,7 +4019,7 @@ class DualViewModel(
                         // M3:批次中斷不丟進度,以已累積 items 發 partial。
                         val now = nowWallMs()
                         val success = items.count { it.outcome is CloneOutcome.Success }
-                        val unknown = items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                        val unknown = items.count { isBatchUnknownOutcome(it.outcome) }
                         val failed = items.size - success - unknown
                         val partial = BatchReport(
                             items = items.toList(),
@@ -3998,6 +4066,17 @@ class DualViewModel(
             }
         }
     }
+
+    // 批次 unknown 口徑 (PR-37 Phase C, review R4 #5)：VerifyUnknown 一直計入
+    // unknown；ChannelError 亦計入 unknown——core cloneVerifiedExpected 把暫時
+    // 無法判定的身分 (exit!=0／noisy 輸出／throw) 以 ChannelError 回報 (fail
+    // closed，零寫入)，通道什麼都沒證明，故為未知、永不計入 failed、永不宣稱
+    // "no dual"。此與逐項中途明細一致 (recordBatchItemUnknownOrFailed 已把
+    // ChannelError 記為 OpPhase.UNKNOWN) 及單筆 "result unknown" 語義一致。
+    // STALE 無需改動：(success>0 || unknown>0) 已涵蓋。真 Absent 仍為 NoDual
+    // (failed 口徑＋M13 短路，不變)。
+    private fun isBatchUnknownOutcome(outcome: CloneOutcome): Boolean =
+        outcome is CloneOutcome.VerifyUnknown || outcome is CloneOutcome.ChannelError
 
     // 批次逐項 detail:沿用單筆 clone 的 msg 語意 (InstallFailed 取通道原文)。
     // TargetMismatch 到達不能（批次內 drift 直接走停止分支，不經此函數）；
