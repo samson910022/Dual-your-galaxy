@@ -41,8 +41,9 @@ object WhitelistPolicy {
             // like isXxx(String pkg): anything else stays observe-only.
             if (args.size != 1 || args[0] !is String) {
                 onLog(
-                    "observe-only $methodDesc: boolean result with unexpected " +
-                        "args (size=${args.size}); returning original",
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
+                        "result with unexpected args (size=${args.size}); " +
+                        "returning original",
                 )
                 return result
             }
@@ -63,8 +64,9 @@ object WhitelistPolicy {
             // Other Collection kinds (Queue, etc.) have unknown contracts;
             // observe-only rather than reshaping them into a List.
             onLog(
-                "observe-only $methodDesc: unsupported collection " +
-                    "${result.javaClass.name}; returning original",
+                "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                    "unsupported collection ${result.javaClass.name}; " +
+                    "returning original",
             )
             return result
         }
@@ -77,8 +79,9 @@ object WhitelistPolicy {
                 .toTypedArray()
         }
         onLog(
-            "observe-only $methodDesc: unrecognized result " +
-                "${result?.javaClass?.name ?: "null"}; returning original",
+            "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                "unrecognized result ${result?.javaClass?.name ?: "null"}; " +
+                "returning original",
         )
         return result
     }

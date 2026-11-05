@@ -48,7 +48,8 @@ services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 確認候選 1 在三次 system_server 啟動皆 `deoptimized`＋`hooked` 成功、
 無 `method not found`。此為 hook 註冊證據，不等於第 3 層 callback 觸發
 （可驗日誌缺：尚無回調命中／放寬包名 log）與第 4 層政策生效
-（預設空政策，observe-only）。候選 2／3 在此 ROM 未命中，保留為 fallback。
+（預設空政策，observe-only；system_server marker 同樣僅證明安裝）。
+候選 2／3 在此 ROM 未命中，保留為 fallback。
 
 模組在 `onSystemServerStarting` 以反射依序嘗試（第一個載入成功者勝出，
 其餘 `try/catch` 略過，非三星 ROM 自動無操作）：
@@ -104,6 +105,13 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     見 `WhitelistPatchReflectTest` 行為鎖定測試）；不做 `setAccessible` 強寫，
     ART 行為未驗證、不宣稱可覆寫。結果以 `Outcome.ObserveOnly` 明確記錄，
     絕不靜默當成功。
+    daagent marker（`scope=daagent`）僅證明至少一個 `WhiteListApps` hook 已安裝
+    （此 ROM 實為 `<clinit>` interceptor），不證明政策已生效
+    （預設空政策下直接返回（語義等同 `Skipped`，未觸及反射）；
+    即使將來政策非空，可讀的 `static-final` 欄位回 `ObserveOnly`，
+    反射失敗（欄位缺失／讀取失敗）則回 `Skipped`，兩者都不寫入，
+    見 `DualHook.patchWhitelistField` 與 `WhitelistPatch.patchFields`／`apply`，
+    故僅觀察）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
 - 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：
@@ -227,3 +235,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   signature guard keeps unknown shapes observe-only); non-scope processes get `detach()`.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
+- The marker proves hook installation only, not policy effect (empty=>no-op,
+  returns early in `DualHook.patchWhitelistField`; readable static-final
+  =>`ObserveOnly`, reflection failure=>`Skipped`, neither writes, see
+  `DualHook.patchWhitelistField` + `WhitelistPatch.patchFields`/`apply`).

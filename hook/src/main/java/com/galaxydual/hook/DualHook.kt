@@ -27,6 +27,8 @@ class DualHook : XposedModule() {
     // Honesty: a stale marker from a previous boot (file survives reboots)
     // can read "active" until rewritten -- the app labels the signal as
     // existence+scope evidence, staleness hardening stays DEVICE-UNVERIFIED.
+    // Marker semantics: install evidence only, not proof policy took effect;
+    // empty policy => observe-only today (see WhitelistPolicy.apply).
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
         val installed = hookDualAppManagerService(param.classLoader)
         if (installed > 0) {
@@ -57,6 +59,14 @@ class DualHook : XposedModule() {
             // Phase F4b-P2: same marker contract as system_server above,
             // scope "daagent". Both processes read-merge-write the same file,
             // so each installed scope survives the other's write.
+            // Marker semantics: install evidence only (at least one WhiteListApps
+            // hook installed, currently the <clinit> interceptor on this ROM),
+            // not proof policy took effect. Empty policy => no-op today
+            // (early return, semantically skipped; no Outcome emitted,
+            // returns before reflection); even with non-empty
+            // policy, readable static-final fields => ObserveOnly
+            // (see DualHook.patchWhitelistField + WhitelistPatch.patchFields/apply;
+            // chain patchWhitelistField->patchFields->apply).
             val installed = hookWhiteListApps(param.defaultClassLoader)
             if (installed > 0) {
                 try {
@@ -160,6 +170,9 @@ class DualHook : XposedModule() {
                     null
                 }
             installed++
+            // Install evidence only (see patchWhitelistField below for effect);
+            // deferred/observe-only reasoning lives in comments, not in the log.
+            logi("hooked ${target.name}#<clinit> (install evidence only)")
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }
@@ -267,7 +280,13 @@ class DualHook : XposedModule() {
     // / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
-        if (extra.isEmpty()) return
+        if (extra.isEmpty()) {
+            logi(
+                "skip patch on ${target.name}: empty policy " +
+                    "(${WhitelistPatch.OBSERVE_ONLY_MARKER})",
+            )
+            return
+        }
         val results = WhitelistPatch.patchFields(target, WHITELIST_FIELD_CANDIDATES, extra)
         for ((fieldName, outcome) in results) {
             when (outcome) {
