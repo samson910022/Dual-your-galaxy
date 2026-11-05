@@ -97,11 +97,14 @@ class DualRepository(
         }
 
     // Same listing as listProfiles() but keeps the channel-failure signal:
-    // ChannelError when the `pm list users` command itself fails the shared
-    // C2 isSuccess rule, Loaded(parse) otherwise. Single gateway call.
+    // ChannelError when the `pm list users` command itself fails the pm-list
+    // dedicated gate (isListUsersOutputOk: shared C2 isSuccess rule over
+    // header-stripped output, so an Error/Failure-labelled UserInfo header is
+    // display-only and never fails the channel), Loaded(parse) otherwise.
+    // Single gateway call.
     suspend fun profilesSnapshot(): ProfilesSnapshot {
         val res = gateway.run(CMD_LIST_USERS)
-        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
+        if (!PmOutputParser.isListUsersOutputOk(res.out + "\n" + res.err, res.exit)) {
             return ProfilesSnapshot.ChannelError(res.err.ifEmpty { res.out.ifEmpty { "channel failed" } })
         }
         return ProfilesSnapshot.Loaded(PmOutputParser.parseUsers(res.out))
