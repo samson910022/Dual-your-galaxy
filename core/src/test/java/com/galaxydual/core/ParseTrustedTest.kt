@@ -226,8 +226,8 @@ class ParseTrustedTest {
         )
         assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
         assertTrue(
-            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
-            res.reason.contains("unexpected listing format"),
+            "reason must name stderr residue, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected stderr"),
         )
 
         val marker = PmOutputParser.parsePackagesTrusted(
@@ -355,21 +355,75 @@ class ParseTrustedTest {
         )
     }
 
-    // Scope pin: a non-empty clean listing ignores residual err text (dirty
-    // err side only fails closed when zero packages are present). The err
-    // channel here carries a non-error-semantic warning, so the listing
-    // stays authoritative TrustedFull by deliberate scope.
+    // P1 BLOCKER #1 (issue #22 review): a non-empty listing no longer
+    // ignores residual err text. A non-error-semantic stderr warning with
+    // packages present is a dirty channel -> Unknown (fail closed). This
+    // flips the old deliberate-scope pin that fixed TrustedFull here.
     @Test
-    fun nonEmptyListing_ignoresResidualErrWarning() {
+    fun nonEmptyListing_withResidualErrWarning_isUnknown() {
         val res = PmOutputParser.parsePackagesTrusted(
             out = "package:com.foo",
             err = "some warning",
             exit = 0,
             truncated = false,
         )
-        assertEquals(
-            TrustedList.TrustedFull(listOf("com.foo")),
-            res,
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name stderr residue, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected stderr") && res.reason.contains("some warning"),
+        )
+    }
+
+    // P1 BLOCKER #1: legal package line + garbage stdout line -> Unknown,
+    // never TrustedFull (the review's `usage:` repro).
+    @Test
+    fun packagePlusGarbageLine_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.example.other\nusage: pm list packages",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected listing format") && res.reason.contains("usage:"),
+        )
+    }
+
+    // P1 BLOCKER #1: legal package line + non-English error line (no EN
+    // keyword for the error scan) -> Unknown via the whitelist, never
+    // TrustedFull.
+    @Test
+    fun packagePlusNonEnglishError_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.example.other\n列出套件失敗，請重試",
+            err = "",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name format, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected listing format"),
+        )
+    }
+
+    // P1 BLOCKER #1: legal package line + non-error-semantic stderr notice
+    // (the review's `notice: partial result` repro) -> Unknown, never
+    // TrustedFull.
+    @Test
+    fun packagePlusStderrNotice_isUnknown() {
+        val res = PmOutputParser.parsePackagesTrusted(
+            out = "package:com.example.other",
+            err = "notice: partial result",
+            exit = 0,
+            truncated = false,
+        )
+        assertTrue("expected Unknown, got $res", res is TrustedList.Unknown)
+        assertTrue(
+            "reason must name stderr residue, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("unexpected stderr") && res.reason.contains("notice: partial result"),
         )
     }
 }

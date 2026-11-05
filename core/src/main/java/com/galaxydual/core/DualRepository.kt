@@ -382,13 +382,14 @@ class DualRepository(
     // Tri-state variant of verify(pkg, dualId): Installed only when the
     // `pm list packages` probe parses as TrustedFull containing the package
     // (exact match); NotInstalled on a whitelist-clean listing that lacks
-    // it (TrustedFull of other packages, or TrustedEmpty: confirmed absent);
+    // it (TrustedFull of other packages -- every stdout line a legal
+    // package: line and stderr blank -- or TrustedEmpty: confirmed absent);
     // Unknown when the id is guard-refused, the package token is invalid, or
     // the probe parses as Unknown (truncated capture, non-zero exit after
-    // retries, error-semantic text per the shared C2 line rule, or
-    // unexpected-format/unexplained-stderr residue per the trusted
-    // structural whitelist). C1 guard is unchanged; the mapping itself is
-    // owned by verifyListProbe (PR-2 stage 2, issue #22).
+    // retries, error-semantic text per the shared C2 line rule, or any
+    // unexpected-format stdout line / unexplained stderr residue per the
+    // trusted structural whitelist). C1 guard is unchanged; the mapping
+    // itself is owned by verifyListProbe (PR-2 stage 2, issue #22).
     // Residual TOCTOU note: explicit-id entries check only fresh
     // self-consistency (expected = null); auto verify(pkg) carries expected.
     suspend fun verifyState(pkg: String, dualId: Int): VerifyState {
@@ -400,7 +401,8 @@ class DualRepository(
 
     // Lists the dual profile's actual packages (ground truth for refresh).
     // Null means unknown: no verified dual profile, channel failure, guard
-    // refusal, or an untrusted listing (truncated / non-zero / error-semantic:
+    // refusal, or an untrusted listing (truncated / non-zero /
+    // error-semantic / unexpected-format stdout / unexplained stderr:
     // never an authoritative empty). Non-null (possibly empty) is
     // authoritative: refresh rebuilds
     // `cloned` from it, so external installs/removals sync and a fresh
@@ -589,11 +591,12 @@ class DualRepository(
     // does not imply com.example.app).
     //
     // Trusted tri-state semantics (PR-2 stage 2, issue #22): the final probe
-    // CmdResult is judged by parsePackagesTrusted. A clean listing decides
-    // presence by exact membership (Installed) or confirmed absence
+    // CmdResult is judged by parsePackagesTrusted. A whitelist-clean listing
+    // decides presence by exact membership (Installed) or confirmed absence
     // (NotInstalled -- TrustedEmpty, or TrustedFull of other packages); an
-    // untrusted capture is Unknown (detail kept: exit code, truncation, or
-    // the error-semantic line). In particular an exit-0 "Unknown package" /
+    // untrusted capture is Unknown (detail kept: exit code, truncation, the
+    // error-semantic line, or the unexpected-format/unexplained-stderr
+    // line). In particular an exit-0 "Unknown package" /
     // SecurityException / Failure text is Unknown, NOT confirmed-absent: only
     // a format-clean listing is absence evidence. Install/uninstall-side
     // channels keep isSuccess; only this list probe and the refresh listing
@@ -700,13 +703,14 @@ class DualRepository(
         // is judged by parsePackagesTrusted, not by exit code alone. A clean
         // full listing (buildListPackages has no filter parameter) that lacks
         // the package -- TrustedEmpty, or TrustedFull of other packages --
-        // is confirmed absent (NotInstalled); only such a full listing may
-        // use this mapping. An untrusted capture (truncated,
-        // non-zero after the retries above, or error-semantic text such as
-        // "Unknown package"/SecurityException/Failure with exit 0) is
-        // Unknown. Membership stays an exact set lookup (superstrings never
-        // hit). Retry/sleep policy is frozen (PR-3 owns it; same policy as
-        // the verifyOnProfiles note above).
+        // is confirmed absent (NotInstalled); only such a whitelist-clean
+        // listing may use this mapping. An untrusted capture (truncated,
+        // non-zero after the retries above, error-semantic text such as
+        // "Unknown package"/SecurityException/Failure with exit 0, or any
+        // unexpected-format stdout line / unexplained stderr residue per the
+        // structural whitelist) is Unknown. Membership stays an exact set
+        // lookup (superstrings never hit). Retry/sleep policy is frozen
+        // (PR-3 owns it; same policy as the verifyOnProfiles note above).
         return PmOutputParser.parsePackagesTrusted(res).toVerify(clean)
     }
 
@@ -732,8 +736,9 @@ class DualRepository(
     // identity re-resolution. Trusted tri-state (PR-2 stage 2, issue #22):
     // TrustedFull yields its packages, TrustedEmpty yields confirmed-empty
     // (emptyList, authoritative), and Unknown (truncated / non-zero /
-    // error-semantic) yields null -- never an authoritative empty list, so
-    // refresh keeps the previous `cloned` instead of wiping it.
+    // error-semantic / unexpected-format stdout / unexplained stderr)
+    // yields null -- never an authoritative empty list, so refresh keeps
+    // the previous `cloned` instead of wiping it.
     // No retry here by design (frozen, PR-3 owns any change -- same policy
     // as verifyOnProfiles above): refresh maps null to "keep old value", so
     // a transient blip costs one stale frame, not data loss.
