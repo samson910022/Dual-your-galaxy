@@ -184,8 +184,11 @@ data class UiState(
 // remove/probe are serialized through opMutex so concurrent calls queue
 // instead of racing last-writer-wins on `cloned`/`loading`. Three bounds keep
 // rapid UI taps from piling an unbounded queue on that mutex: refresh() and
-// recheckPrivilege() each coalesce (at most one pending re-run behind the
-// in-flight one), selectChannel() is latest-wins (a new call cancels the
+// reconnectAndRefresh() share one coalescing gate (at most one pending
+// re-run behind the in-flight op, reconnect upgrades a pending refresh so
+// the Auto degrade is never skipped), recheckPrivilege() coalesces
+// separately (at most one pending re-run behind the in-flight one),
+// selectChannel() is latest-wins (a new call cancels the
 // previous select job), and clone/request-remove/confirm dedup by operation
 // key (a second identical write while the first is in flight reports
 // "already in progress" instead of queueing). Confirm keys are per
@@ -198,7 +201,7 @@ data class UiState(
 // PR-32 P2-1), so running repo calls on Main would stall the Main dispatcher
 // heartbeat. Public entry points are plain functions launching in
 // viewModelScope; the Activity just calls them. All op state below
-// (refreshJob/refreshPending/recheckJob/recheckPending/inFlightWrites plus
+// (refreshJob/refreshPending/reconnectPending/recheckJob/recheckPending/inFlightWrites plus
 // selectJob cleanup) is touched from viewModelScope coroutines
 // (Main-confined) so no extra synchronization is needed, except the
 // selectJob eager store which runs on the caller thread (Main in
@@ -326,14 +329,20 @@ class DualViewModel(
     // Serializes probe/refresh/clone/remove (see class doc).
     private val opMutex = Mutex()
 
-    // Refresh coalescing (PR-3 stage 1, issue #24): the in-flight refresh job
-    // plus at most one pending re-run. A tap while a refresh is active only
-    // flips refreshPending instead of queueing another mutex waiter, so rapid
-    // taps collapse into a single trailing refresh. Main-confined (see class
-    // doc); selectChannel's internal refreshLocked bypasses this gate and
-    // runs inline under its own mutex hold.
+    // Refresh/reconnect coalescing (PR-3 stage 1, issue #24; P25 Item 2):
+    // the in-flight op job plus at most one pending re-run. A tap while an op
+    // is active only flips a pending flag instead of queueing another mutex
+    // waiter, so rapid taps collapse into a single trailing run. refresh() and
+    // reconnectAndRefresh() share one job/pending pair: a trailing reconnect
+    // (probe+refresh) covers a pending refresh, and a trailing refresh covers
+    // only refresh when no reconnect arrived (last-wins with reconnect
+    // upgrade, so a reconnect during a refresh is never lost and the Auto
+    // degrade is never skipped). Main-confined (see class doc);
+    // selectChannel's internal refreshLocked bypasses this gate and runs
+    // inline under its own mutex hold.
     private var refreshJob: Job? = null
     private var refreshPending = false
+    private var reconnectPending = false
 
     // Recheck single-flight (P2-2): same coalescing gate as refresh(). Binder/
     // permission/onResume bursts collapse to at most one trailing re-probe.
@@ -389,10 +398,13 @@ class DualViewModel(
     // empty. Drift is eliminated inside this API (single target throughout);
     // the explicit-id residual remains only in the old entries.
     fun refresh() {
-        // Coalesce rapid taps (PR-3 stage 1, issue #24): while a refresh is
-        // in flight (including waiting on opMutex behind init/probe), only
-        // record that one trailing re-run is wanted. The trailing run covers
-        // every intermediate tap, so the mutex queue never grows past one.
+        // Coalesce rapid taps (PR-3 stage 1, issue #24; P25 Item 2 shares the
+        // gate with reconnect): while an op is in flight (including waiting on
+        // opMutex behind init/probe), only record that one trailing re-run is
+        // wanted. A later reconnect upgrades the trailing run to
+        // probe+refresh (see drainCoalesced), so the degrade is never lost.
+        // The trailing run covers every intermediate tap, so the mutex queue
+        // never grows past one.
         //
         // The gate runs INSIDE viewModelScope.launch (Main-serialized with the
         // drain below): check-and-set (gate) and check-and-clear (drain +
@@ -411,14 +423,40 @@ class DualViewModel(
             refreshJob = myJob
             try {
                 opMutex.withLock { refreshLocked() }
-                while (refreshPending) {
-                    refreshPending = false
-                    opMutex.withLock { refreshLocked() }
-                }
+                drainCoalesced()
             } finally {
                 if (refreshJob === myJob) refreshJob = null
             }
         }
+    }
+
+    // Single trailing-run drain shared by refresh() and reconnectAndRefresh().
+    // Must run inside the in-flight op job on Main (see refresh gate above):
+    // the flag check-and-clear runs synchronously before the next mutex hold,
+    // so no tap is lost. Last-wins with reconnect upgrade: a pending
+    // reconnect covers a pending refresh in one probe+refresh round; a
+    // pending refresh alone re-runs only refreshLocked (refresh semantics
+    // stay probe-free).
+    private suspend fun drainCoalesced() {
+        while (refreshPending || reconnectPending) {
+            val doReconnect = reconnectPending
+            refreshPending = false
+            reconnectPending = false
+            if (doReconnect) {
+                opMutex.withLock { reconnectLocked() }
+            } else {
+                opMutex.withLock { refreshLocked() }
+            }
+        }
+    }
+
+    // Probe (with Auto degrade) + refresh body shared by reconnectAndRefresh()
+    // and the coalesced trailing run. Must run under opMutex: callers hold
+    // it, so this never launches or locks itself.
+    private suspend fun reconnectLocked() {
+        if (preference == ChannelPreference.AUTO) swapAutoLocked()
+        probeChannels()
+        refreshLocked()
     }
 
     // Reload body shared by refresh() and selectChannel(). Must run under
@@ -1343,12 +1381,26 @@ class DualViewModel(
     // lifecycle event never races an in-flight refresh. MainActivity routes
     // both the Refresh button ("重新連線並更新") and the Shizuku
     // dead/authorized paths here.
+    //
+    // P25 Item 2: shares the refresh coalescing gate (same refreshJob plus a
+    // reconnectPending upgrade flag) so a binder/button burst collapses to at
+    // most one trailing re-run instead of queueing a waiter per tap (#24
+    // bound). A reconnect arriving during a refresh upgrades the trailing
+    // run to probe+refresh; concurrent reconnects collapse to one trailing
+    // reconnect.
     fun reconnectAndRefresh() {
         viewModelScope.launch {
-            opMutex.withLock {
-                if (preference == ChannelPreference.AUTO) swapAutoLocked()
-                probeChannels()
-                refreshLocked()
+            if (refreshJob?.isActive == true) {
+                reconnectPending = true
+                return@launch
+            }
+            val myJob = currentCoroutineContext()[Job] ?: return@launch
+            refreshJob = myJob
+            try {
+                opMutex.withLock { reconnectLocked() }
+                drainCoalesced()
+            } finally {
+                if (refreshJob === myJob) refreshJob = null
             }
         }
     }
