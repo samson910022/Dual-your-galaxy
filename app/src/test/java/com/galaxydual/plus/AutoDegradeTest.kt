@@ -1412,4 +1412,159 @@ class AutoDegradeTest {
         assertEquals(false, s.pmReadable)
         assertEquals("PM不可讀", s.pmReadableText())
     }
+
+    // Phase 2: refresh(true) -> revoke -> probe-only recheck -> NOOP expiry.
+    // Stale true must not survive: swapToResolvedLocked clears to null and
+    // probeChannels with ready=false pins null (unknown, not false). Recovery
+    // via reconnect+refresh rebuilds true.
+    @Test
+    fun phase2_refreshTrue_revoke_recheck_expiresToNull_thenRecover() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+        assertNull(vm.state.value.pmReadable)
+
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == true }
+        val fresh = vm.state.value
+        assertTrue(fresh.writeReady)
+        assertEquals(ResolvedChannel.ROOT, fresh.resolvedGateway)
+        assertEquals("已就緒", fresh.readyMark())
+
+        // Revoke both channels (ROOT denied + Shizuku dead) then probe-only.
+        suFake.rootOk = false
+        shizukuFake.shizukuOk = false
+        vm.recheckPrivilege()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.NOOP
+        }
+        // Probe-only: no refresh ran, so readability is unknown (null), never
+        // the stale true; write gate is closed.
+        val expired = vm.state.value
+        assertNull("revoked probe must expire pmReadable to null, got ${expired.pmReadable}", expired.pmReadable)
+        assertEquals("PM未知", expired.pmReadableText())
+        assertFalse(expired.writeReady)
+        assertFalse(expired.anyProbePassed)
+        assertEquals("未就緒（唯讀）", expired.readyMark())
+
+        // Recover ROOT then probe+refresh: fresh refresh rebuilds true.
+        suFake.rootOk = true
+        vm.reconnectAndRefresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.resolvedGateway == ResolvedChannel.ROOT &&
+                vm.state.value.pmReadable == true
+        }
+        val recovered = vm.state.value
+        assertTrue(recovered.writeReady)
+        assertEquals("已就緒", recovered.readyMark())
+    }
+
+    // Phase 2: explicit channel switch clears stale readability; the new
+    // refresh proves the new gateway (false here), never the old true.
+    // Harness: reuse the same fakes across the swap (match-branch factory),
+    // otherwise selectChannel would rebuild REAL gateways and the fake-based
+    // assertions below would be environment-hostage (see
+    // selectChannel_clearsDegradeNoteAndPending).
+    @Test
+    fun phase2_channelSwitch_clearsStalePmReadable() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.pmReadable == true }
+        assertEquals("已就緒", vm.state.value.readyMark())
+
+        // Switch to a failing SHIZUKU: swap nulls, probe keeps null
+        // (ready false), refresh proves false -- stale true must be gone.
+        shizukuFake.shizukuOk = false
+        vm.selectChannel(ChannelPreference.SHIZUKU)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.SHIZUKU &&
+                vm.state.value.pmReadable == false
+        }
+        val switched = vm.state.value
+        assertEquals(ResolvedChannel.SHIZUKU, switched.resolvedGateway)
+        assertFalse(switched.writeReady)
+        assertEquals(false, switched.pmReadable)
+        assertEquals("未就緒（唯讀）", switched.readyMark())
+    }
+
+    // Phase 2 P3: id-ok/pm-fail keeps writeReady true + pmReadable false, and
+    // the UI must NOT claim 已就緒 (dual-condition readyMark).
+    @Test
+    fun phase2_idOkPmFail_readyMarkNotReady() {
+        val suFake = FakeSu(rootOk = true)
+        suFake.pmListOk = false
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+        // Before refresh: probe passed but PM unknown -> not ready.
+        val probed = vm.state.value
+        assertTrue(probed.writeReady)
+        assertNull(probed.pmReadable)
+        assertEquals("探測通過，PM未確認", probed.readyMark())
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.pmReadable == false
+        }
+        val s = vm.state.value
+        assertTrue(s.writeReady)
+        assertEquals(false, s.pmReadable)
+        assertEquals("探測通過，PM不可讀", s.readyMark())
+        assertFalse(
+            "id-ok/pm-fail must never render 已就緒, got: \"${s.readyMark()}\"",
+            s.readyMark() == "已就緒",
+        )
+    }
+
+    // Phase 2 P3: dual-condition matrix for readyMark.
+    @Test
+    fun phase2_readyMark_dualCondition() {
+        val base = UiState(writeReady = false, pmReadable = null)
+        assertEquals("未就緒（唯讀）", base.readyMark())
+        assertEquals("未就緒（唯讀）", base.copy(writeReady = false, pmReadable = true).readyMark())
+        assertEquals("未就緒（唯讀）", base.copy(writeReady = false, pmReadable = false).readyMark())
+        assertEquals("已就緒", base.copy(writeReady = true, pmReadable = true).readyMark())
+        assertEquals("探測通過，PM不可讀", base.copy(writeReady = true, pmReadable = false).readyMark())
+        assertEquals("探測通過，PM未確認", base.copy(writeReady = true, pmReadable = null).readyMark())
+    }
 }
