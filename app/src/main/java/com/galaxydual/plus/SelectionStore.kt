@@ -27,6 +27,9 @@ const val SELECTION_PREFS_NAME = "dual_selection"
 const val SELECTION_KEY = "saved_selection"
 
 // Schema 版本:解析時首行必須完全相符,否則視為損壞 (不做跨版遷移猜測)。
+// PR-37 Phase B #2 serial 綁定：serial 以可選 `serial=` 行攜帶（header 維持
+// v1，不升級）：舊快照無此行即 legacy（id-only，恢復綁定 id-only，見下）；
+// 新寫入在 serial 已知時帶 serial（v2 內容），未知時省略（legacy 形狀）。
 const val SELECTION_SCHEMA = 1
 private const val SELECTION_HEADER = "v1"
 
@@ -41,6 +44,10 @@ data class SavedSelection(
     val source: String = SELECTION_SOURCE_MANUAL,
     // 保存時刻已知的 verified dualId (寫入目標身分,恢復時必須相符)。
     val knownTargetId: Int = -1,
+    // 保存時刻已知的平台 serial (PR-37 Phase B #2 serial 綁定)：null=legacy
+    // 快照（v1 無 serial 行，僅 id-only 有效）；非 null 即 v2 內容，恢復時
+    // 必須與當下 serial 相符，否則舊選取永不作用到重建後的新 profile。
+    val knownTargetSerial: Int? = null,
     // 已勾選 AppKey 集合 ("<serial>:<package>",見 sourceAppKey；排序後保存,
     // 跨重啟位元組穩定。舊版包名格式 (無冒號) 僅恢復側向前容忍,新寫入一律 AppKey)。
     val selectedPackages: Set<String> = emptySet(),
@@ -55,10 +62,12 @@ private val SELECTION_PKG_TOKEN = Regex("^[a-zA-Z0-9._\\-:]+$")
 
 // 序列化 (純函數):首行為版本頭,後續 key=value / pkg= 行。
 // 未知行忽略 (向前容忍),但首行版本不符整筆作廢。
+// serial 行可選 (PR-37 Phase B #2)：已知才寫，legacy 快照無此行。
 fun serializeSelection(s: SavedSelection): String = buildString {
     appendLine(SELECTION_HEADER)
     appendLine("source=${s.source.lines().firstOrNull().orEmpty()}")
     appendLine("target=${s.knownTargetId}")
+    if (s.knownTargetSerial != null) appendLine("serial=${s.knownTargetSerial}")
     appendLine("at=${s.savedAtMs}")
     for (pkg in s.selectedPackages.sorted()) {
         appendLine("pkg=$pkg")
@@ -67,12 +76,14 @@ fun serializeSelection(s: SavedSelection): String = buildString {
 
 // 解析 (純函數):null/空白/版本不符/target 缺失或非法 -> null (損壞)。
 // 個別非法 pkg 行跳過 (不連坐整筆);target <= 0 視為損壞 (無目標的選取無意義)。
+// serial 行缺失/非法 -> null (legacy 快照，僅 id-only 有效)。
 fun parseSelection(raw: String?): SavedSelection? {
     if (raw.isNullOrBlank()) return null
     val lines = raw.lines()
     if (lines.firstOrNull()?.trim() != SELECTION_HEADER) return null
     var source = SELECTION_SOURCE_MANUAL
     var target: Int? = null
+    var serial: Int? = null
     var at = 0L
     val pkgs = mutableSetOf<String>()
     for (line in lines.drop(1)) {
@@ -85,6 +96,9 @@ fun parseSelection(raw: String?): SavedSelection? {
             }
             t.startsWith("target=") -> {
                 target = t.removePrefix("target=").trim().toIntOrNull()
+            }
+            t.startsWith("serial=") -> {
+                serial = t.removePrefix("serial=").trim().toIntOrNull()
             }
             t.startsWith("at=") -> {
                 at = t.removePrefix("at=").trim().toLongOrNull() ?: 0L
@@ -102,6 +116,7 @@ fun parseSelection(raw: String?): SavedSelection? {
         schema = SELECTION_SCHEMA,
         source = source,
         knownTargetId = targetId,
+        knownTargetSerial = serial,
         selectedPackages = pkgs,
         savedAtMs = at,
     )
@@ -109,8 +124,18 @@ fun parseSelection(raw: String?): SavedSelection? {
 
 // 恢復有效性 (純函數):保存的已知目標必須等於當前 verified 目標,
 // 且當前目標必須為合法 dualId (>0,owner 永不接受)。
-fun isSelectionValidFor(saved: SavedSelection, currentTargetId: Int): Boolean =
-    currentTargetId > 0 && saved.knownTargetId == currentTargetId
+// PR-37 Phase B #2 serial 綁定：v2 快照（knownTargetSerial 非 null）另須
+// 當下 serial 相符（null 當下視為不可驗證，直接無效）；legacy 快照
+// （serial null）僅比 id（恢復側綁定 id-only，批次拒絕靜默提升為完全體）。
+fun isSelectionValidFor(
+    saved: SavedSelection,
+    currentTargetId: Int,
+    currentSerial: Int? = null,
+): Boolean {
+    if (currentTargetId <= 0 || saved.knownTargetId != currentTargetId) return false
+    val savedSerial = saved.knownTargetSerial ?: return true
+    return currentSerial != null && savedSerial == currentSerial
+}
 
 // 原子選取 store。loadRaw/saveRaw 注入:
 // - 生產:SharedPreferences 單鍵 commit (見底部綁定)。
@@ -131,10 +156,13 @@ class SelectionStore(
     // 讀已勾選 AppKey:損壞/目標不符皆回傳空集合 (fail closed)。
     // 副作用 (fail-closed 已文件化,有意為之):
     // - 損壞 (有原始字串但解析失敗):主動清除損壞條目,下次 save 覆寫即恢復。
-    // - 目標不符 (profile 變動):清除陳舊條目,舊選取永不復活。
+    // - 目標不符 (profile 變動/serial 重建):清除陳舊條目,舊選取永不復活。
     // - currentTargetId <= 0 (無目標):直接回空且不觸碰存檔 (early return 在
     //   讀取前,絕不刪除；未知目標的讀取永不破壞已存資料)。
-    fun loadSelected(currentTargetId: Int): Set<String> {
+    // - PR-37 Phase B #2：currentSerial 為當下 verified serial（null=不可驗證）；
+    //   v2 快照須相符才有效（同 id 重建的新 serial 永不沿用舊選取），legacy
+    //   快照僅比 id（恢復側綁定 id-only，見 ViewModel，不靜默提升）。
+    fun loadSelected(currentTargetId: Int, currentSerial: Int? = null): Set<String> {
         if (currentTargetId <= 0) return emptySet()
         val raw: String? = try {
             loadRaw()
@@ -156,7 +184,7 @@ class SelectionStore(
             }
             return emptySet()
         }
-        if (!isSelectionValidFor(saved, currentTargetId)) {
+        if (!isSelectionValidFor(saved, currentTargetId, currentSerial)) {
             try {
                 saveRaw(null)
             } catch (_: Exception) {
@@ -168,13 +196,22 @@ class SelectionStore(
     }
 
     // 保存 (原子單鍵 commit)。targetId <= 0 拒絕 (無目標不存)。
-    fun save(source: String, targetId: Int, selected: Set<String>, nowMs: Long): Boolean {
+    // PR-37 Phase B #2：targetSerial 為保存時刻 verified serial（null=未知，
+    // 寫 legacy 形狀，恢復綁定 id-only）；已知才寫 serial 行（v2 內容）。
+    fun save(
+        source: String,
+        targetId: Int,
+        selected: Set<String>,
+        nowMs: Long,
+        targetSerial: Int? = null,
+    ): Boolean {
         if (targetId <= 0) return false
         val payload = serializeSelection(
             SavedSelection(
                 schema = SELECTION_SCHEMA,
                 source = source.ifBlank { SELECTION_SOURCE_MANUAL },
                 knownTargetId = targetId,
+                knownTargetSerial = targetSerial,
                 selectedPackages = selected.toSet(),
                 savedAtMs = nowMs,
             ),

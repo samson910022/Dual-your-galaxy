@@ -652,22 +652,22 @@ class DualViewModel(
     // PR-7 P2 (issue #26):已對哪個目標自動恢復過持久選取 (in-memory marker)。
     // SELECTION_RESTORE_NONE = 從未恢復;恢復只在 selectedKeys 為空時執行
     // 一次 (永不覆蓋使用者當前勾選,永不自動重送寫入)。目標改變 (profile
-    // 變動) 後允許對新目標再恢復一次 (舊目標條目已由 SelectionStore 失效清除)。
-    private var selectionRestoredForTarget: Int = SELECTION_RESTORE_NONE
+    // 變動/serial 重建) 後允許對新目標再恢復一次 (舊目標條目已由 SelectionStore 失效清除)。
+    // PR-37 Phase B #2：marker 為 (id, serial) 配對——同 id 重建（新 serial）
+    // 視為新目標，仍可恢復一次；舊 marker 不阻擋新 serial 的恢復。
+    private var selectionRestoredForTarget: SelectionTarget = SELECTION_RESTORE_NONE
     // PR-7 P2 Phase B #1：選取綁定目標（in-memory）。
     // - restore 成功（kept 非空）或使用者在已驗證目標下修改勾選時綁定到當下
-    //   inventory.targetId；清空勾選後回到哨兵。
+    //   inventory 的 (targetId, targetSerial)；清空勾選後回到哨兵。
     // - refreshLocked 偵測到 verified target 變動（bound 舊≠新）時清空
     //   selectedKeys＋batchReport、重置恢復 marker，msg 明示目標變更。
-    // - Serial 邊界（新 base serial ground truth）：完整綁定應為 (targetId,
-    //   serial)，serial 經 repo.fetchDualTarget() 可得（與 resolveDualUserId
-    //   同為三通道，另一次呼叫）。但 refresh 只存 targetId（InventorySnapshot
-    //   無 serial 欄位，見 DiagnoseFreshness），綁定若取 serial 需在每次
-    //   refresh/勾選時另跑 fetchDualTarget（額外裝置呼叫）。本次 Phase B 刻意
-    //   只綁 id（零額外呼叫），殘留風險如實揭露：delete+recreate 重用同 userId
-    //   但 mint 新 serial 時，id-only 綁定無法區分新舊 profile，舊勾選可能殘留；
-    //   完整修復需 inventory 攜帶 serial 並比較 (id,serial)，留待後續。
-    private var selectionBoundTarget: Int = SELECTION_BOUND_NONE
+    // - Serial 綁定（PR-37 Phase B #2）：綁定為 (id, serial) 配對，由當下
+    //   已驗證 inventory 取得（refresh 以 fetchDualTarget 一次取回 id＋serial，
+    //   與舊 resolveDualUserId 同為三通道、同等裝置呼叫，零額外開銷）。
+    //   殘留風險如實揭露：inventory serial 未知（SerialUnavailable 罕見路徑）
+    //   或 legacy 快照恢復時綁定為 id-only (serial null)；id-only 綁定永不
+    //   靜默提升為完全體——批次要求完全體 (id,serial) 相符才執行，否則整批拒絕。
+    private var selectionBoundTarget: SelectionTarget = SELECTION_BOUND_NONE
 
     // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
     // gateway.run is a blocking suspend with no dispatcher guarantee, and a
@@ -1033,8 +1033,14 @@ class DualViewModel(
                     // CHANNEL_ERROR，不謊稱無 dual。
                     // M2 pm 否決：Absent 前 repo 另收 pm 戶集合否決 typed 漏戶
                     //（null 表無快照不否決；此處快照可用故傳 profiles id 集合）。
+                    // Serial (PR-37 Phase B #3) 來自 fetchDualTarget（同三通道，
+                    // 零額外呼叫由 pin/refresh 共用除外）；SerialUnavailable
+                    // 時 serial 為 null 走 id-only，id 路徑不受影響。
                     val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = profiles.map { it.userId }.toSet()) }
                     val dualId = (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
+                    val dualTarget = onIo { repo.fetchDualTarget() }
+                    val dualSerial =
+                        (dualTarget as? DualTargetResult.Confirmed)?.target?.serial
                     if (dualId <= NO_TARGET_ID) {
                         val now = nowWallMs()
                         // 真正確認無 dual 的唯一條件：typed 稱 Absent 且快照
@@ -1168,7 +1174,10 @@ class DualViewModel(
                                             now = now,
                                             source = PmOutputParser.buildListPackages(dualId),
                                             targetId = dualId,
-                                        ),
+                                            // Listing-time 已驗證對偶已知：
+                                            // 通道失敗的是清單列舉，不是身份本身，
+                                            // 故身份配對沿用本次 listing-time 值。
+                                        ).copy(targetSerial = dualSerial),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.CHANNEL_ERROR,
                                             techDetail = "profiles snapshot " +
@@ -1199,7 +1208,9 @@ class DualViewModel(
                                             now = now,
                                             source = PmOutputParser.buildListPackages(dualId),
                                             targetId = newTarget,
-                                        ),
+                                            // 真漂移 (newTarget != dualId 恆成立)：
+                                            // 舊 serial 永不殘留到新 id。
+                                        ).copy(targetSerial = null),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_MISMATCH,
                                             techDetail = "verified id drifted: " +
@@ -1224,7 +1235,9 @@ class DualViewModel(
                                             now = now,
                                             source = PmOutputParser.buildListPackages(dualId),
                                             targetId = dualId,
-                                        ),
+                                            // 同上：列舉不可查，身份仍為本次
+                                            // listing-time 已驗證配對。
+                                        ).copy(targetSerial = dualSerial),
                                         diagnose = diagnoseEvent(
                                             DiagnoseCode.VERIFY_UNKNOWN,
                                             techDetail = "cannot list clones for user $dualId",
@@ -1257,6 +1270,7 @@ class DualViewModel(
                                     inventory = InventorySnapshot(
                                         source = PmOutputParser.buildListPackages(dualId),
                                         targetId = dualId,
+                                        targetSerial = dualSerial,
                                         queryTimeMs = now,
                                         freshness = InventoryFreshness.FRESH,
                                         count = 0,
@@ -1293,6 +1307,7 @@ class DualViewModel(
                                     inventory = InventorySnapshot(
                                         source = PmOutputParser.buildListPackages(dualId),
                                         targetId = dualId,
+                                        targetSerial = dualSerial,
                                         queryTimeMs = now,
                                         freshness = InventoryFreshness.FRESH,
                                         count = groundTruth.size,
@@ -1330,7 +1345,9 @@ class DualViewModel(
                         // 必須在 opMutex 下呼叫 (refreshLocked 已持有)。
                         // VERIFY_MISMATCH/drift 分支 inventory 已帶新目標：
                         // 必須以 inventory 新目標恢復，listing-time 舊 id 已過期。
-                        restoreSelectionLocked(_state.value.inventory.targetId)
+                        // PR-37 Phase B #2：攜帶當下 verified serial 配對驗證。
+                        val invNow = _state.value.inventory
+                        restoreSelectionLocked(invNow.targetId, invNow.targetSerial)
                     }
                 }
             }
@@ -1715,6 +1732,38 @@ class DualViewModel(
                                         "for user ${res.dualId}: " +
                                         sanitizeForDisplay(res.detail),
                                     msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                        }
+                        is CloneOutcome.TargetMismatch -> {
+                            // 到達不能：單筆路徑走 repo.cloneVerified，永不回傳
+                            // TargetMismatch（僅 cloneVerifiedExpected 可產生）。
+                            // 穩健起見視為 UNKNOWN（目標漂移、install 未執行，
+                            // 需重查而非命令失敗），fail-closed：只設
+                            // diagnose+msg，不覆寫 lastOperation（與 NoDual/
+                            // ChannelError/InvalidPackage 寫前拒絕一致）。
+                            // 理由 (M3)：FRESH 經 toStaleOrUnknown 降為 STALE。
+                            val now = nowWallMs()
+                            _state.update { cur ->
+                                val degraded =
+                                    if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                                        cur.inventory.toStaleOrUnknown(
+                                            now = now,
+                                            source = cur.inventory.source,
+                                            targetId = cur.inventory.targetId,
+                                        )
+                                    } else {
+                                        cur.inventory
+                                    }
+                                cur.copy(
+                                    loading = false,
+                                    inventory = degraded,
+                                    diagnose = res.toDiagnoseEvent(),
+                                    msg = "clone verification mismatch: " +
+                                        "target ${res.actualId} != ${res.expectedId} " +
+                                        "(serial ${res.actualSerial ?: "?"}" +
+                                        " != ${res.expectedSerial ?: "?"})",
+                                    msgKind = MsgKind.VERIFY,
                                 )
                             }
                         }
@@ -3039,13 +3088,13 @@ class DualViewModel(
         // 不燒 marker，待驗證後由 refresh 路徑補觸。
         if (entries.isEmpty()) return
         if (_state.value.selectedKeys.isNotEmpty()) return
-        val invTarget = _state.value.inventory.targetId
-        if (invTarget <= NO_TARGET_ID) return
-        val target = invTarget
-        if (target <= 0) return
+        val inv = _state.value.inventory
+        if (inv.targetId <= NO_TARGET_ID) return
+        // PR-37 Phase B #2：補觸恢復攜帶當下 verified (id, serial) 配對。
+        val target = SelectionTarget(inv.targetId, inv.targetSerial)
         if (selectionRestoredForTarget == target) return
         viewModelScope.launch {
-            opMutex.withLock { restoreSelectionLocked(target) }
+            opMutex.withLock { restoreSelectionLocked(target.id, target.serial) }
         }
     }
 
@@ -3111,9 +3160,16 @@ class DualViewModel(
     // 保存內容為 AppKey 集合 ("serial:package",見 sourceAppKey)：只存仍在
     // 當前 catalog 的 key；catalog 已缺失的 key 直接捨去 (批次亦無法執行，
     // 見 cloneSelected 的 InvalidPackage 分流，計入 failed 非 unknown)。
-    // M9 stale-target 守衛：在 opMutex 內重讀 inventory.targetId，已知目標
+    // M9 stale-target 守衛：在 opMutex 內重讀 inventory (id, serial)，已知目標
     // (>0) 與傳入不一致即拒絕 (MsgKind.INVALID，明示目標已變更)，不寫入 store。
-    fun persistSelection(targetId: Int, source: String = SELECTION_SOURCE_CATALOG) {
+    // PR-37 Phase B #2：守衛比對 (id,serial) 配對——呼叫端可另傳 targetSerial
+    //（為空即沿用當下 verified serial）；寫入的 serial 一律取自當下已驗證
+    // inventory（權威來源，非呼叫端參數），serial 未知時寫 legacy 形狀。
+    fun persistSelection(
+        targetId: Int,
+        source: String = SELECTION_SOURCE_CATALOG,
+        targetSerial: Int? = null,
+    ) {
         viewModelScope.launch {
             opMutex.withLock {
                 val store = selectionStore
@@ -3129,11 +3185,24 @@ class DualViewModel(
                     }
                     return@withLock
                 }
-                val knownTarget = _state.value.inventory.targetId
-                if (knownTarget > 0 && knownTarget != targetId) {
+                val known = _state.value.inventory
+                if (known.targetId > 0 && known.targetId != targetId) {
                     _state.update {
                         it.copy(
-                            msg = "選取目標已變更（user $knownTarget ≠ $targetId），" +
+                            msg = "選取目標已變更（user ${known.targetId} ≠ $targetId），" +
+                                "請重新確認後再保存",
+                            msgKind = MsgKind.INVALID,
+                        )
+                    }
+                    return@withLock
+                }
+                val wantSerial = targetSerial ?: known.targetSerial
+                if (wantSerial != null && known.targetSerial != null &&
+                    known.targetSerial != wantSerial
+                ) {
+                    _state.update {
+                        it.copy(
+                            msg = "選取目標已變更（serial ${known.targetSerial} ≠ $wantSerial），" +
                                 "請重新確認後再保存",
                             msgKind = MsgKind.INVALID,
                         )
@@ -3145,7 +3214,7 @@ class DualViewModel(
                     .filterTo(mutableSetOf()) { it in catalogKeys }
                     .toSortedSet()
                 val ok = try {
-                    onIo { store.save(source, targetId, selected, nowMs()) }
+                    onIo { store.save(source, targetId, selected, nowWallMs(), known.targetSerial) }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     false
@@ -3205,29 +3274,42 @@ class DualViewModel(
     // - 恢復只打勾,永不自動執行 clone (恢复不重送寫入)。
     // - 同一目標只恢復一次 (selectionRestoredForTarget marker)；空結果
     //   (store 空/損壞/目標不符/交集空) 不置 marker 直接 return (M4)。
+    // - PR-37 Phase B #2：serial 綁定——調用端傳 id，本體以 inventory 的 serial
+    //   配對驗證（inventory id == targetId 才取其 serial，否則 null 嚴格比對，
+    //   外來 id 永不借用他目標的 serial）。
     fun restoreSelection(targetId: Int, availableKeys: Set<String>? = null) {
         viewModelScope.launch {
-            opMutex.withLock { restoreSelectionLocked(targetId, availableKeys) }
+            val inv = _state.value.inventory
+            val serial = if (inv.targetId == targetId) inv.targetSerial else null
+            opMutex.withLock { restoreSelectionLocked(targetId, serial, availableKeys) }
         }
     }
 
     // 恢復本體 (必須在 opMutex 下呼叫):refreshLocked 的 FRESH 分支共用。
     // suspend：store I/O 經 onIo 切至 IO dispatcher，不阻塞主執行緒。
-    private suspend fun restoreSelectionLocked(targetId: Int, availableKeys: Set<String>? = null) {
+    // PR-37 Phase B #2：targetSerial 為當下 verified serial（null=不可驗證）；
+    // 綁定 serial 取自存檔快照本身（v2 全、legacy 空），永不靜默提升 id-only
+    // 為 (id,serial) 完全體。
+    private suspend fun restoreSelectionLocked(
+        targetId: Int,
+        targetSerial: Int? = null,
+        availableKeys: Set<String>? = null,
+    ) {
         val store = selectionStore ?: return
         if (targetId <= NO_TARGET_ID) return
         // Phase B #1：inventory 未驗證直接返回，不燒 marker（待驗證後由 refresh 補觸）。
         if (_state.value.inventory.targetId <= NO_TARGET_ID) return
         val cur = _state.value
         if (cur.selectedKeys.isNotEmpty()) return
-        if (selectionRestoredForTarget == targetId) return
+        val current = SelectionTarget(targetId, targetSerial)
+        if (selectionRestoredForTarget == current) return
         // 空 catalog 不置 marker：尚未真正嘗試映射，待 catalog 就緒後
         // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
         if (cur.sourceCatalog.isEmpty()) return
         val byKey = cur.sourceCatalog.associateBy { it.appKey }
         val available = availableKeys ?: byKey.keys
         val restored = try {
-            onIo { store.loadSelected(targetId) }
+            onIo { store.loadSelected(targetId, targetSerial) }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             emptySet()
@@ -3243,9 +3325,17 @@ class DualViewModel(
             else byPackageFirst[saved.trim()]?.appKey
         }.filterTo(mutableSetOf()) { it in available }
         if (kept.isEmpty()) return
-        selectionRestoredForTarget = targetId
-        // Phase B #1：恢復成功即綁定到該目標。
-        selectionBoundTarget = targetId
+        // 綁定 serial 取自存檔快照本身：v2 快照綁完全體，legacy 快照綁 id-only
+        //（已於 loadSelected 驗證有效，此處同 mutex 下重讀必存在）。
+        val savedSerial = try {
+            onIo { store.loadSnapshot() }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            null
+        }?.knownTargetSerial
+        selectionRestoredForTarget = current
+        // Phase B #1：恢復成功即綁定到該目標（Phase B #2：serial 配對）。
+        selectionBoundTarget = SelectionTarget(targetId, savedSerial)
         _state.update { it.copy(selectedKeys = kept) }
     }
 
@@ -3253,14 +3343,18 @@ class DualViewModel(
     // 空集合一律解綁（無歸屬）。呼叫端為 toggle/setSelected/selectVisible
     //（Main 執行緒同步更新，不持 opMutex；與 refreshLocked 的清理解綁皆在
     // Main 或 mutex 下串行，JVM 測試 Unconfined 下同執行緒）。
+    // PR-37 Phase B #2：綁定 (id, serial) 配對；serial 未知時綁 id-only
+    //（殘留，批次拒絕靜默提升，見 cloneSelected 守衛）。
     private fun bindSelectionToVerifiedTargetLocked() {
         val cur = _state.value
         if (cur.selectedKeys.isEmpty()) {
             selectionBoundTarget = SELECTION_BOUND_NONE
             return
         }
-        val inv = cur.inventory.targetId
-        selectionBoundTarget = if (inv > NO_TARGET_ID) inv else SELECTION_BOUND_NONE
+        val inv = cur.inventory
+        selectionBoundTarget =
+            if (inv.targetId > NO_TARGET_ID) SelectionTarget(inv.targetId, inv.targetSerial)
+            else SELECTION_BOUND_NONE
     }
 
     // Phase B #1：refreshLocked 偵測到 verified target 變動（舊 bound≠新）時
@@ -3268,14 +3362,17 @@ class DualViewModel(
     //（MsgKind 用 INVALID：需使用者重新確認，與 persistSelection 的
     // stale-target 守衛同級；非 VERIFY/CHANNEL 通道語意）。
     // 必須在 opMutex 下呼叫（refreshLocked 已持有）。newTarget 取當下
-    // _state.inventory.targetId（各分支剛寫入的新值）。
+    // _state.inventory 的 (targetId, targetSerial)（各分支剛寫入的新值）。
+    // PR-37 Phase B #2：比較 (id, serial) 配對——同 id 重建（新 serial）
+    // 亦視為目標變更（舊勾選清空，舊持久選取已由 store 失效）。
     private fun handleSelectionTargetChangeLocked() {
-        val newTarget = _state.value.inventory.targetId
+        val inv = _state.value.inventory
+        val newTarget = SelectionTarget(inv.targetId, inv.targetSerial)
         val bound = selectionBoundTarget
         if (bound == SELECTION_BOUND_NONE) {
             // 未綁定（空集合或未驗證下產生）的勾選，首次見到已驗證目標即領養
             // 綁定，不清空（保留使用者剛打的勾）；空集合無事可做。
-            if (newTarget > NO_TARGET_ID && _state.value.selectedKeys.isNotEmpty()) {
+            if (newTarget.id > NO_TARGET_ID && _state.value.selectedKeys.isNotEmpty()) {
                 selectionBoundTarget = newTarget
             }
             return
@@ -3290,7 +3387,7 @@ class DualViewModel(
                 cur.copy(
                     selectedKeys = emptySet(),
                     batchReport = null,
-                    msg = "選取目標已變更（user $oldBound → $newTarget），" +
+                    msg = "選取目標已變更（user ${oldBound.display()} → ${newTarget.display()}），" +
                         "已清空舊勾選，請重新確認",
                     msgKind = MsgKind.INVALID,
                 )
@@ -3325,11 +3422,14 @@ class DualViewModel(
     //   inventory 標 STALE（保留 targetId 供追溯，不觸發 refresh）。
     //   Phase B #3：VerifyUnknown 可能=已寫入未驗證，故 STALE 條件放寬為
     //   (success>0 || unknown>0)，正常＋partial 兩處一致。
-    // - Phase B #2 pin 單一 target（VM 側守衛，不動 core）：鎖內起始抓一次
-    //   verified target（expectedTarget；起始無 target 即整批拒絕不碰裝置）；
-    //   逐項前重抓比對，切到不同有效 user 即停（不記假 outcome、不打裝置），
-    //   以已完成項發 partial（FAILED，detail 含「目標已變更」）。vanish 沿用
-    //   M13 NoDual 短路；core 無 cloneVerifiedExpected 故 VM 側 resolve。
+    // - Phase B #2 原子 pin（PR-37 P1 #2，不動 core 既有 API 之外的新 API）：
+    //   鎖內起始經 fetchDualTarget 抓一次 serial 綁定目標 expectedTarget
+    //   (id, serial)（起始無目標/serial 不可用即整批拒絕不碰裝置）；逐項走
+    //   新 core API repo.cloneVerifiedExpected(pkg, expectedId, expectedSerial)，
+    //   在同一流程內 snapshot＋resolve＋比對，漂移即回 TargetMismatch（零
+    //   install），VM 側不再另做 preflight resolve（TOCTOU 已消除）。
+    //   TargetMismatch 沿用 drift 收斂（partial＋VERIFY_MISMATCH＋停＋STALE，
+    //   新目標 serial 一併寫入 inventory）；vanish 沿用 M13 NoDual 短路。
     //   逐項 recordBatchItemUnknownOrFailed 僅為中途明細，最終必被覆寫。
     // - 批次中斷 (M3):catch 內以已累積 items 發 partial BatchReport
     //   (計數口徑與正常彙總一致),loading=false,lastOperation FAILED
@@ -3396,7 +3496,7 @@ class DualViewModel(
                         _state.update {
                             it.copy(
                                 loading = false,
-                                msg = "already in progress: ${sanitizeForDisplay(conflictingPkg)}",
+                                msg = "already in progress: ${sanitizeUserEcho(conflictingPkg)}",
                                 msgKind = MsgKind.INFO,
                             )
                         }
@@ -3404,21 +3504,27 @@ class DualViewModel(
                     }
                     batchPkgKeys.addAll(claimed)
                     _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
-                    // Phase B #2：鎖內起始 pin 單一 verified target。經 onIo resolve
-                    //（VM 側守衛，每項另有一次 resolve，多一次裝置呼叫可接受；
-                    // core 尚無 cloneVerifiedExpected，不動 core API）。
+                    // PR-37 Phase B #1/#2：鎖內起始 pin 單一 serial 綁定目標。
+                    // 經 onIo fetchDualTarget 一次取回 (id, serial)（三通道，
+                    // 與舊 resolve 同等裝置呼叫）；逐項走 core 原子
+                    // cloneVerifiedExpected（expected＝此處 pin），VM 側不再
+                    // 另做 preflight resolve——preflight→clone 間 TOCTOU 由 core
+                    // 內 snapshot＋resolve＋比對消除（P1 #2）。
                     // PR-37 P3 Phase A #6：起始 I/O（pin＋snapshot）納入 catch/finally
                     // 保護：一般 Exception → loading=false＋錯誤 msg＋釋放已認領 keys
                     //（外層 finally 釋放 batchPkgKeys，此處 return 即可）；取消透傳
                     //（僅復位 loading，如 Phase 1 模式）。
-                    val expectedTarget: Int
+                    // SerialUnavailable（id 已確認但 serial 不可得）：無法建立
+                    // 完全體 pin，整批拒絕、零裝置寫入（fail closed，與
+                    // requestRemove 的 serial 缺失口徑一致）。
+                    val pinned: DualTargetResult
                     try {
-                        expectedTarget = onIo { repo.resolveDualUserId() }
+                        pinned = onIo { repo.fetchDualTarget() }
                     } catch (e: CancellationException) {
                         _state.update { it.copy(loading = false) }
                         throw e
                     } catch (e: Exception) {
-                        val nowPinEx = nowMs()
+                        val nowPinEx = nowWallMs()
                         _state.update { cur ->
                             val degraded =
                                 if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -3444,9 +3550,27 @@ class DualViewModel(
                         }
                         return@withLock
                     }
-                    if (expectedTarget <= NO_TARGET_ID) {
-                        // 起始即無 verified target：整批拒絕，不碰裝置（除上行
-                        // resolve＋此處鑑別用 snapshot，無 install）。
+                    if (pinned is DualTargetResult.SerialUnavailable) {
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.CHANNEL_ERROR,
+                                    techDetail = "serial unavailable for verified target",
+                                ),
+                                msg = "無法驗證分身身分（serial 缺失），請重試",
+                                msgKind = MsgKind.NO_DUAL,
+                            )
+                        }
+                        return@withLock
+                    }
+                    val expectedTarget: SelectionTarget? =
+                        (pinned as? DualTargetResult.Confirmed)?.let {
+                            SelectionTarget(it.target.userId, it.target.serial)
+                        }
+                    if (expectedTarget == null) {
+                        // 起始即無 verified target（NoDual）：整批拒絕，不碰裝置
+                        //（除上行 pin＋此處鑑別用 snapshot，無 install）。
                         // #6：snapshot 亦納入保護（Cancellation 透傳僅復位 loading）。
                         val snapStart: ProfilesSnapshot
                         try {
@@ -3455,7 +3579,7 @@ class DualViewModel(
                             _state.update { it.copy(loading = false) }
                             throw e
                         } catch (e: Exception) {
-                            val nowSnapEx = nowMs()
+                            val nowSnapEx = nowWallMs()
                             _state.update { cur ->
                                 val degraded =
                                     if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -3485,7 +3609,7 @@ class DualViewModel(
                             (snapStart as? ProfilesSnapshot.Loaded)?.profiles.isNullOrEmpty() == true
                         val channelDetailStart =
                             (snapStart as? ProfilesSnapshot.ChannelError)?.detail
-                        val nowStart = nowMs()
+                        val nowStart = nowWallMs()
                         _state.update { cur ->
                             val degraded =
                                 if (cur.inventory.freshness == InventoryFreshness.FRESH) {
@@ -3528,10 +3652,12 @@ class DualViewModel(
                         }
                         return@withLock
                     }
-                    // PR-37 P3 Phase A #1：批次起始檢查選取綁定（防 95 勾選寫到 96）。
+                    // PR-37 P3 Phase A #1＋Phase B #2：批次起始檢查選取綁定
+                    //（防 95 勾選寫到 96；同 id 重建的新 serial 亦擋）。
                     // 鎖內、pin expectedTarget 之後、任何 install 之前：若 selectedKeys
                     // 非空且 selectionBoundTarget != expectedTarget（含 bound==NONE
-                    // 哨兵）→ 整批拒絕：清空 selectedKeys＋batchReport、重置恢復 marker
+                    // 哨兵與 id-only legacy 綁定——legacy 永不靜默提升為完全體）
+                    // → 整批拒絕：清空 selectedKeys＋batchReport、重置恢復 marker
                     //（允許新目標後續恢復自己的存檔）、msg 明示 INVALID、loading=false，
                     // 零裝置寫入。禁止自動重新領養舊選取（此處不清 store、不觸 restore，
                     // 下一次 refresh 對新目標仍可恢復一次）。
@@ -3547,7 +3673,7 @@ class DualViewModel(
                                 selectedKeys = emptySet(),
                                 batchReport = null,
                                 msg = "選取已綁定舊目標，已清空，請重新勾選確認" +
-                                    "（user $oldBound → $expectedTarget）",
+                                    "（user ${oldBound.display()} → ${expectedTarget.display()}）",
                                 msgKind = MsgKind.INVALID,
                             )
                         }
@@ -3559,73 +3685,6 @@ class DualViewModel(
                         // M13:首個 NoDual 後短路 (verified target 已消失)。
                         var noDualShort: CloneOutcome.NoDual? = null
                         for (appKey in ordered) {
-                            // Phase B #2：逐項前重抓當前 verified target，比對起始 pin。
-                            // 切到不同有效 user（同 id 重建的新 serial 屬 #1 殘留，見
-                            // selectionBoundTarget 註記，此處 id-only）即立即停止：
-                            // 剩餘項不執行、不記假 outcome、不打裝置，以已完成項發
-                            // partial。vanish（<=0）沿用 M13 短路（下行正常 NoDual
-                            // 路徑），不走 drift partial（既有語意保留）。
-                            val currentTarget = onIo { repo.resolveDualUserId() }
-                            if (currentTarget != expectedTarget &&
-                                currentTarget > NO_TARGET_ID
-                            ) {
-                                val successD =
-                                    items.count { it.outcome is CloneOutcome.Success }
-                                val unknownD =
-                                    items.count { it.outcome is CloneOutcome.VerifyUnknown }
-                                val failedD = items.size - successD - unknownD
-                                val partialDrift = BatchReport(
-                                    items = items.toList(),
-                                    successCount = successD,
-                                    failedCount = failedD,
-                                    unknownCount = unknownD,
-                                )
-                                val total = ordered.size
-                                val completed = items.size
-                                val driftDetail = "目標已變更（user $expectedTarget " +
-                                    "→ $currentTarget），批次停止：已完成 $completed/共 $total 項" +
-                                    "（成功 $successD/失敗 $failedD/未知 $unknownD）"
-                                // PR-37 P3 Phase A #4：drift 無條件 STALE（即使 0 項完成，
-                                // 含 UNKNOWN 起點亦升為 STALE，舊資料不謊稱新鮮）。
-                                // 採「更新為 live target＋視為一次目標變更」口徑，與
-                                // handleSelectionTargetChangeLocked 一致：inventory 更新為
-                                // 新目標 STALE（UI 可見新目標供追溯），清空選取＋重置恢復
-                                // marker（新目標後續仍可恢復自己的存檔，禁止自動重新領養舊
-                                // 選取）。與 handle 差異：partial 必須保留（審計已完成項），
-                                // 故 batchReport 保留 partial 不置 null；msgKind 維持 FAILED
-                                //（批次中斷優先，handle 的 INVALID 為純選取變更無批次失敗）。
-                                selectionBoundTarget = SELECTION_BOUND_NONE
-                                selectionRestoredForTarget = SELECTION_RESTORE_NONE
-                                _state.update { cur ->
-                                    cur.copy(
-                                        loading = false,
-                                        selectedKeys = emptySet(),
-                                        batchReport = partialDrift,
-                                        lastOperation = LastOperation(
-                                            opId = opKey,
-                                            appKey = "batch",
-                                            pinnedTarget = expectedTarget,
-                                            phase = OpPhase.FAILED,
-                                            timeMs = nowMs(),
-                                            detail = driftDetail,
-                                        ),
-                                        inventory = cur.inventory.copy(
-                                            freshness = InventoryFreshness.STALE,
-                                            targetId = currentTarget,
-                                        ),
-                                        diagnose = diagnoseEvent(
-                                            DiagnoseCode.VERIFY_MISMATCH,
-                                            techDetail = driftDetail.take(MAX_DIAG_DETAIL_CHARS),
-                                        ),
-                                        msg = "批次中斷：目標已變更（user $expectedTarget " +
-                                            "→ $currentTarget），已完成 $completed/共 $total 項" +
-                                            "（成功 $successD/失敗 $failedD/未知 $unknownD）" +
-                                            "；已清空舊勾選，請重新確認",
-                                        msgKind = MsgKind.FAILED,
-                                    )
-                                }
-                                return@withLock
-                            }
                             if (noDualShort != null) {
                                 // M13:短路前先本地校驗 catalog,缺失 key 按正常路徑記 InvalidPackage
                                 // (計入 failed；顯示用包名回退 appKey 去 serial 前綴)。
@@ -3656,8 +3715,15 @@ class DualViewModel(
                                 )
                                 continue
                             }
-                            // 單筆 pinned 流程 (與 clone(pkg) 相同契約)。
-                            when (val res = onIo { repo.cloneVerified(pkg) }) {
+                            // PR-37 Phase B #2 原子 pin：expected＝批次起始 pin 的
+                            // (id, serial)；core 在同一流程內 snapshot＋resolve＋
+                            // 比對，漂移即回 TargetMismatch（零 install），VM 側
+                            // 不再另做 preflight resolve（preflight→clone 間
+                            // TOCTOU 已消除；vanish 沿用 M13 NoDual 短路）。
+                            // 單筆 pinned 流程 (與 clone(pkg) 相同契約，唯 pin 來自批次)。
+                            when (val res = onIo {
+                                repo.cloneVerifiedExpected(pkg, expectedTarget.id, expectedTarget.serial)
+                            }) {
                                 is CloneOutcome.Success -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
                                     _state.update { cur ->
@@ -3673,7 +3739,7 @@ class DualViewModel(
                                                 appKey = pkg,
                                                 pinnedTarget = res.dualId,
                                                 phase = OpPhase.SUCCESS,
-                                                timeMs = nowMs(),
+                                                timeMs = nowWallMs(),
                                                 detail = "cloned: $pkg",
                                             ),
                                         )
@@ -3703,6 +3769,84 @@ class DualViewModel(
                                 is CloneOutcome.VerifyUnknown -> {
                                     items.add(BatchItemResult(appKey, pkg, res))
                                     recordBatchItemUnknownOrFailed(pkg, res)
+                                }
+                                is CloneOutcome.TargetMismatch -> {
+                                    // 批次中原子漂移：core pin 與批次 pin 不一致
+                                    //（id 或 serial 漂移，含同 id 重建的新 serial），
+                                    // 此項零 install。沿用既有 drift 收斂
+                                    //（partial＋VERIFY_MISMATCH＋停＋STALE）：
+                                    // 剩餘項不執行、不記假 outcome、不打裝置，
+                                    // 以已完成項發 partial。actualId/actualSerial
+                                    // 為 live 身份（id gate 未取 serial 時後者為
+                                    // null，見 core 註記）；vanish（無確認目標）
+                                    // 走下行 NoDual 短路，不進此分支。
+                                    val liveId =
+                                        if (res.actualId > NO_TARGET_ID) res.actualId
+                                        else expectedTarget.id
+                                    val successD =
+                                        items.count { it.outcome is CloneOutcome.Success }
+                                    val unknownD =
+                                        items.count { it.outcome is CloneOutcome.VerifyUnknown }
+                                    val failedD = items.size - successD - unknownD
+                                    val partialDrift = BatchReport(
+                                        items = items.toList(),
+                                        successCount = successD,
+                                        failedCount = failedD,
+                                        unknownCount = unknownD,
+                                    )
+                                    val total = ordered.size
+                                    val completed = items.size
+                                    val driftDetail = "目標已變更（user " +
+                                        "${expectedTarget.display()} → " +
+                                        "${SelectionTarget(liveId, res.actualSerial).display()}），" +
+                                        "批次停止：已完成 $completed/共 $total 項" +
+                                        "（成功 $successD/失敗 $failedD/未知 $unknownD）"
+                                    // PR-37 P3 Phase A #4：drift 無條件 STALE
+                                    //（即使 0 項完成，含 UNKNOWN 起點亦升為
+                                    // STALE，舊資料不謊稱新鮮）。採「更新為 live
+                                    // target＋視為一次目標變更」口徑，與
+                                    // handleSelectionTargetChangeLocked 一致：
+                                    // inventory 更新為新目標 STALE（UI 可見新目標
+                                    // 供追溯），清空選取＋重置恢復 marker（新目標
+                                    // 後續仍可恢復自己的存檔，禁止自動重新領養舊
+                                    // 選取）。與 handle 差異：partial 必須保留
+                                    //（審計已完成項），故 batchReport 保留 partial
+                                    // 不置 null；msgKind 維持 FAILED（批次中斷優先，
+                                    // handle 的 INVALID 為純選取變更無批次失敗）。
+                                    selectionBoundTarget = SELECTION_BOUND_NONE
+                                    selectionRestoredForTarget = SELECTION_RESTORE_NONE
+                                    _state.update { cur ->
+                                        cur.copy(
+                                            loading = false,
+                                            selectedKeys = emptySet(),
+                                            batchReport = partialDrift,
+                                            lastOperation = LastOperation(
+                                                opId = opKey,
+                                                appKey = "batch",
+                                                pinnedTarget = expectedTarget.id,
+                                                phase = OpPhase.FAILED,
+                                                timeMs = nowWallMs(),
+                                                detail = driftDetail,
+                                            ),
+                                            inventory = cur.inventory.copy(
+                                                freshness = InventoryFreshness.STALE,
+                                                targetId = liveId,
+                                                targetSerial = res.actualSerial,
+                                            ),
+                                            diagnose = diagnoseEvent(
+                                                DiagnoseCode.VERIFY_MISMATCH,
+                                                techDetail = driftDetail.take(MAX_DIAG_DETAIL_CHARS),
+                                            ),
+                                            msg = "批次中斷：目標已變更（user " +
+                                                "${expectedTarget.display()} → " +
+                                                "${SelectionTarget(liveId, res.actualSerial).display()}），" +
+                                                "已完成 $completed/共 $total 項" +
+                                                "（成功 $successD/失敗 $failedD/未知 $unknownD）" +
+                                                "；已清空舊勾選，請重新確認",
+                                            msgKind = MsgKind.FAILED,
+                                        )
+                                    }
+                                    return@withLock
                                 }
                             }
                         }
@@ -3763,7 +3907,7 @@ class DualViewModel(
                                     appKey = "batch",
                                     pinnedTarget = pinned,
                                     phase = batchPhase,
-                                    timeMs = nowMs(),
+                                    timeMs = nowWallMs(),
                                     detail = batchDetail,
                                 ),
                                 inventory = staleInventory,
@@ -3779,7 +3923,7 @@ class DualViewModel(
                             throw e
                         }
                         // M3:批次中斷不丟進度,以已累積 items 發 partial。
-                        val now = nowMs()
+                        val now = nowWallMs()
                         val success = items.count { it.outcome is CloneOutcome.Success }
                         val unknown = items.count { it.outcome is CloneOutcome.VerifyUnknown }
                         val failed = items.size - success - unknown
@@ -3830,6 +3974,8 @@ class DualViewModel(
     }
 
     // 批次逐項 detail:沿用單筆 clone 的 msg 語意 (InstallFailed 取通道原文)。
+    // TargetMismatch 到達不能（批次內 drift 直接走停止分支，不經此函數）；
+    // 穩健起見給出目標變更文案（fail closed，不記為成功/未知）。
     private fun batchOutcomeDetail(res: CloneOutcome): String = when (res) {
         is CloneOutcome.Success -> "cloned: ${res.dualId}"
         is CloneOutcome.NoDual -> "no dual profile"
@@ -3838,6 +3984,9 @@ class DualViewModel(
         is CloneOutcome.InstallFailed -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
         is CloneOutcome.VerifyFailed -> "not installed for user ${res.dualId}"
         is CloneOutcome.VerifyUnknown -> res.detail.take(MAX_DIAG_DETAIL_CHARS)
+        is CloneOutcome.TargetMismatch ->
+            "target changed: user ${res.expectedId} -> ${res.actualId} " +
+                "(serial ${res.expectedSerial ?: "?"} -> ${res.actualSerial ?: "?"})"
     }
 
     // 批次逐項非成功結果記帳 (中途明細):lastOperation 逐項覆寫
@@ -3850,7 +3999,7 @@ class DualViewModel(
         pkg: String,
         res: CloneOutcome,
     ) {
-        val now = nowMs()
+        val now = nowWallMs()
         val (phase, target) = when (res) {
             is CloneOutcome.NoDual -> OpPhase.UNKNOWN to -1
             is CloneOutcome.ChannelError -> OpPhase.UNKNOWN to -1
@@ -3858,6 +4007,9 @@ class DualViewModel(
             is CloneOutcome.InstallFailed -> OpPhase.FAILED to -1
             is CloneOutcome.VerifyFailed -> OpPhase.FAILED to res.dualId
             is CloneOutcome.VerifyUnknown -> OpPhase.UNKNOWN to res.dualId
+            // 到達不能（批次內 drift 直接走停止分支，不經此函數）；
+            // 穩健起見記 FAILED（目標漂移、寫入未執行，需重查）。
+            is CloneOutcome.TargetMismatch -> OpPhase.FAILED to res.expectedId
             else -> error("recordBatchItemUnknownOrFailed: unexpected Success")
         }
         _state.update { cur ->
@@ -5306,12 +5458,25 @@ fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
     routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
 
 // PR-7 P2 (issue #26):選取自動恢復 marker 初值 (從未恢復)。
-// 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 可作「從未恢復」哨兵。
-private const val SELECTION_RESTORE_NONE = -2
+// 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 = 「從未恢復」哨兵。
+// PR-37 Phase B #2：marker 與綁定皆為 (id, serial) 配對（見 SelectionTarget），
+// 哨兵 id 取 -2、serial 取 null。
+private const val SELECTION_RESTORE_ID_NONE = -2
+
+// 選取目標身份：verified dualId＋平台 serial 配對（PR-37 Phase B #2 serial 綁定）。
+// serial null＝id-only（legacy 快照恢復或 serial 不可用時的殘留）；與完全體
+// (id, serial) 永不相等，拒絕靜默提升（見 cloneSelected 起始守衛）。
+private data class SelectionTarget(val id: Int, val serial: Int?)
+
+private val SELECTION_RESTORE_NONE = SelectionTarget(SELECTION_RESTORE_ID_NONE, null)
 
 // PR-7 P2 Phase B #1：選取綁定目標初值（從未綁定）。同 -2 哨兵（與恢復 marker
 // 同值但語意獨立：bound 追蹤「當前勾選歸屬」，marker 追蹤「已自動恢復過」）。
-private const val SELECTION_BOUND_NONE = -2
+private val SELECTION_BOUND_NONE = SelectionTarget(SELECTION_RESTORE_ID_NONE, null)
+
+// 配對顯示：id 一律顯示；serial 已知才附加（legacy/id-only 只顯示 id）。
+private fun SelectionTarget.display(): String =
+    if (serial != null) "$id#$serial" else "$id"
 
 // Pure display mapping: applies a hook diagnosis to the UI state without
 // touching routing or readiness fields (channel/privilege/channelReady are
