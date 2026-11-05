@@ -25,10 +25,18 @@ package com.galaxydual.plus
 // factory-selected real gateway (su/Shizuku UserService) with NoOp fallback.
 // Probes verify each channel and channelReady gates writes; without a device
 // the exec round-trip is DEVICE-UNVERIFIED (see gateway file headers).
+//
+// PR-4 P1 (issue #23): Remove is two-phase. The Remove button only calls
+// vm.requestRemove() (no uninstall); the confirmation AlertDialog is driven
+// by UiState.pendingRemove (syncRemoveDialog): confirm calls
+// vm.confirmRemove(), cancel/back calls vm.cancelRemove(). Rotation re-shows
+// the same pending from the retained ViewModel with no re-send.
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
+import android.app.AlertDialog
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -77,6 +85,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var lsposedBtn: Button
     private lateinit var msgView: TextView
     private var defaultMsgColor: Int = Color.BLACK
+
+    // Two-phase remove dialog (PR-4 P1, issue #23): driven by
+    // UiState.pendingRemove, never by a click counter. Non-null pending shows
+    // the dialog; null dismisses it. Rotation re-shows from state (ViewModel
+    // retained, no re-send). shownPending tracks the instance already on
+    // screen so repeat renders do not rebuild the dialog.
+    private var removeConfirmDialog: AlertDialog? = null
+    private var shownPending: PendingRemove? = null
 
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
@@ -133,6 +149,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        try {
+            removeConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        removeConfirmDialog = null
+        shownPending = null
         try {
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
@@ -203,7 +226,10 @@ class MainActivity : ComponentActivity() {
         }
         removeBtn = Button(this).apply {
             text = "Remove"
-            setOnClickListener { vm.remove(pkgInput.text.toString()) }
+            // TalkBack: the first tap only opens the confirmation dialog, it
+            // never uninstalls; the description states the two-phase contract.
+            contentDescription = "移除分身（需二次確認，第一步僅開啟確認對話框）"
+            setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
         }
         refreshBtn = Button(this).apply {
             text = "Refresh"
@@ -232,7 +258,11 @@ class MainActivity : ComponentActivity() {
             text = "LSPosed"
             setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED) }
         }
-        msgView = TextView(this).apply { textSize = 15f }
+        // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
+        msgView = TextView(this).apply {
+            textSize = 15f
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
         defaultMsgColor = msgView.currentTextColor
 
         // Clone/remove share one row; refresh + permission share the next.
@@ -372,7 +402,91 @@ class MainActivity : ComponentActivity() {
         refreshBtn.isEnabled = !busy
         msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
+        // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
+        // A config rotation re-collects the same pendingRemove from the
+        // retained ViewModel and re-shows the dialog; no click is re-sent.
+        syncRemoveDialog(s.pendingRemove, s.loading)
     }
+
+    // State-driven confirmation dialog (PR-4 P1, issue #23). Null pending
+    // dismisses; a changed pending rebuilds with the fresh target. The first
+    // Remove tap only reaches requestRemove() (no uninstall); only the
+    // dialog's 確認移除 button calls confirmRemove(). TalkBack reads the
+    // title + message + both buttons (standard AlertDialog semantics); the
+    // Remove button itself carries a contentDescription stating the
+    // two-phase contract (see buildUi).
+    // 在途 loading 時對話框保留但按鈕禁用，靠 VM dedup + 按鈕禁用雙保險：
+    // 同一 pending 只更新按鈕 enabled（不重建）；confirm 點下後下一幀
+    // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
+    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean) {
+        if (isFinishing || isDestroyed) return
+        if (pending == null) {
+            try {
+                removeConfirmDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            removeConfirmDialog = null
+            shownPending = null
+            return
+        }
+        if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !loading
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
+            // 在途不可取消，關閉 cancel 窗的使用者路徑；程式化 cancel 由 repo isStillValid 兜底。
+            removeConfirmDialog?.setCancelable(!loading)
+            removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
+            return
+        }
+        try {
+            removeConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        shownPending = pending
+        val appLabel = resolveAppLabel(pending.pkg)
+        val message = "應用：$appLabel（${pending.pkg}）\n" +
+            "已驗證目標：user ${pending.dualId}（${pending.profileLabel}）\n" +
+            "警告：將刪除該分身的使用者資料且無法復原；" +
+            "僅影響分身（user ${pending.dualId}），不影響主 profile。"
+        try {
+            removeConfirmDialog = AlertDialog.Builder(this)
+                .setTitle("確認移除分身")
+                .setMessage(message)
+                // Builder 僅有 setCancelable（無 setCanceledOnTouchOutside），touch-outside 由 show 後 dialog 層再設。
+                .setCancelable(!loading)
+                .setPositiveButton("確認移除") { _, _ -> vm.confirmRemove() }
+                .setNegativeButton("取消") { _, _ -> vm.cancelRemove() }
+                .setOnCancelListener { vm.cancelRemove() }
+                .show()
+        } catch (_: Exception) {
+            removeConfirmDialog = null
+            shownPending = null
+            return
+        }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !loading
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
+        // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
+        removeConfirmDialog?.setCancelable(!loading)
+        removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
+    }
+
+    // Best-effort display name for the dialog: the PackageManager label when
+    // installed for the owner, else the raw package token. Never throws: a
+    // missing/unreadable package falls back to the token so the dialog always
+    // names the exact uninstall target.
+    private fun resolveAppLabel(pkg: String): String =
+        try {
+            val info = if (Build.VERSION.SDK_INT >= 33) {
+                packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getApplicationInfo(pkg, 0)
+            }
+            packageManager.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
+        } catch (_: Exception) {
+            pkg
+        }
 
     companion object {
         // Shizuku permission request code; matched in both the Shizuku result

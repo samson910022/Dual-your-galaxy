@@ -65,6 +65,16 @@ sealed interface RemoveOutcome {
     // Uninstall reported success but the re-check channel failed: unknown,
     // must NOT be dropped from the UI's cloned list (fail closed).
     data class VerifyUnknown(val dualId: Int, val detail: String = "") : RemoveOutcome
+
+    /**
+     * pinned 期望與當下 verified 不一致，零卸載，呼叫方應視為 INVALID 請重新確認。
+     */
+    data class TargetMoved(val expected: Int, val verified: Int) : RemoveOutcome
+
+    /**
+     * confirm 前被取消，零卸載，呼叫方只清 loading 不覆寫 msg。
+     */
+    data object Cancelled : RemoveOutcome
 }
 
 // Repository for dual-profile app lifecycle; all commands go through PmOutputParser.
@@ -390,6 +400,52 @@ class DualRepository(
             is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, state.detail)
+        }
+    }
+
+    /**
+     * Pinned remove with an expected id (PR-4 Stage 1, issue #23): pin-style
+     * execution for the two-phase confirm. The VM passes the request-time
+     * dualId; this call snapshots, re-fetches the verified target, and
+     * refuses (fail closed, no uninstall) when the verified target moved.
+     */
+    suspend fun removeVerifiedExpected(
+        pkg: String,
+        expectedDualId: Int,
+        isStillValid: () -> Boolean = { true },
+    ): RemoveOutcome {
+        val snap = profilesSnapshot()
+        if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
+        val profiles = (snap as ProfilesSnapshot.Loaded).profiles
+        val verified = fetchVerifiedDualId()
+        if (verified < 0 || expectedDualId < 0) return RemoveOutcome.NoDual
+        if (verified != expectedDualId) {
+            return RemoveOutcome.TargetMoved(expectedDualId, verified)
+        }
+        if (profiles.none { it.userId == expectedDualId }) return RemoveOutcome.NoDual
+        val clean = pkg.trim()
+        val uninstallCmd = try {
+            PmOutputParser.buildUninstall(clean, expectedDualId)
+        } catch (e: IllegalArgumentException) {
+            return RemoveOutcome.InvalidPackage(clean)
+        }
+        // 縮小 cancel 窗：uninstall 前再檢查一次 pending 是否仍有效，擋住
+        // confirm 與 cancel 交錯的程式化路徑。仍非原子（檢查與執行之間仍有
+        // 間隙），UI 層另用不可取消擋住使用者路徑（back/outside-tap）。
+        if (!isStillValid()) return RemoveOutcome.Cancelled
+        val res = try {
+            gateway.run(uninstallCmd)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return RemoveOutcome.VerifyUnknown(expectedDualId, e.message ?: e.javaClass.simpleName)
+        }
+        if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {
+            return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
+        }
+        return when (val state = verifyListProbe(clean, expectedDualId)) {
+            is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
+            is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
+            is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(expectedDualId, state.detail)
         }
     }
 
