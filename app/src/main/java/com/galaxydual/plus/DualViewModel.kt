@@ -1250,13 +1250,31 @@ class DualViewModel(
                         // onIo: the core retry settle wait must never run on Main.
                         when (val res = onIo { repo.cloneVerified(trimmed) }) {
                         is CloneOutcome.Success -> {
+                            // P1-1 target 重建：成功結果 dualId != inventory.targetId 時
+                            // 不能只附註警告。FRESH 快照聲稱舊目標可信，但寫入已釘在新目標：
+                            // 先降原 inventory 為 STALE（不清 cloned，只降新鮮度；跨目標合併
+                            // 結果 B 不得留在舊 target 清單——當次寫入包已排除在舊清單外，
+                            // 整單標 STALE 待重查），再對新 verified target 做全量 refresh
+                            //（已在 opMutex 內，直接調 refreshLocked，不重入加鎖）。
+                            // 觸發條件僅 FRESH mismatch（UNKNOWN/STALE 本已非新鮮，維持原
+                            // count 對齊待下次 refresh，避免冷啟動 UNKNOWN 覆寫成功提示）。
+                            // rebuiltNote 保留原邏輯不變（FRESH + 舊 id + 上次釘舊 id 才附註）。
+                            val newTarget = res.dualId
+                            val needRebuildRefresh =
+                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
+                                    _state.value.inventory.targetId != newTarget
                             _state.update { cur ->
                                 val current: List<String> =
-                                    if (cur.cloned.contains(trimmed)) cur.cloned
-                                    else cur.cloned + trimmed
+                                    if (needRebuildRefresh) {
+                                        cur.cloned.filterNot { p -> p == trimmed }
+                                    } else if (cur.cloned.contains(trimmed)) {
+                                        cur.cloned
+                                    } else {
+                                        cur.cloned + trimmed
+                                    }
                                 // 全量新鮮度只由 refresh 賦予：成功寫入僅對齊筆數
-                                // (count=當前筆數)，freshness/source/target/
-                                // queryTime 一律不動。
+                                // (count=當前筆數)；非重建時 freshness/source/target/
+                                // queryTime 一律不動，重建時先降 STALE 待下行 refresh 覆寫。
                                 // target 重建提示：FRESH 快照目標與本次 verified
                                 // 目標不一致、且上次操作釘在舊 id 上時，detail
                                 // 附加需重新查證提示。
@@ -1280,16 +1298,30 @@ class DualViewModel(
                                     detail = "cloned: ${sanitizeForDisplay(trimmed)}$rebuiltNote",
                                     diagnose = null,
                                 )
+                                val degradedInventory =
+                                    if (needRebuildRefresh &&
+                                        cur.inventory.freshness == InventoryFreshness.FRESH
+                                    ) {
+                                        cur.inventory.copy(
+                                            freshness = InventoryFreshness.STALE,
+                                            count = current.size,
+                                        )
+                                    } else {
+                                        cur.inventory.copy(count = current.size)
+                                    }
                                 cur.copy(
                                     loading = false,
                                     cloned = current,
-                                    inventory = cur.inventory.copy(count = current.size),
+                                    inventory = degradedInventory,
                                     lastOperation = op,
                                     diagnose = diag,
                                     // 理由 (m2)：顯示用 msg 回音消毒。
                                     msg = "cloned: ${sanitizeForDisplay(trimmed)}",
                                     msgKind = MsgKind.INFO,
                                 )
+                            }
+                            if (needRebuildRefresh) {
+                                refreshLocked()
                             }
                         }
                         is CloneOutcome.NoDual -> {
@@ -2171,12 +2203,23 @@ class DualViewModel(
                                     }
                                     when (val res = onIo { repo.removeVerifiedExpected(cur.pkg, cur.dualId, cur.dualSerial) { _state.value.pendingRemove == cur } }) {
                                         is RemoveOutcome.Success -> {
+                                            // P1-1 target 重建（同 clone 成功分支）：成功結果 dualId
+                                            // != inventory.targetId 時不能只附註警告。FRESH 快照聲稱
+                                            // 舊目標可信，但移除已釘在新目標執行：先降原 inventory
+                                            // 為 STALE（不清 cloned，只降新鮮度；remaining 已排除
+                                            // 當次包，跨目標結果不混入舊清單，整單標 STALE 待重查），
+                                            // 再對新 verified target 做全量 refresh（已在 opMutex
+                                            // 內，直接調 refreshLocked，不重入加鎖）。觸發條件僅
+                                            // FRESH mismatch；rebuiltNote 保留原邏輯不變。
+                                            val needRebuildRefresh =
+                                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
+                                                    _state.value.inventory.targetId != cur.dualId
                                             _state.update {
                                                 val remaining =
                                                     it.cloned.filterNot { p -> p == cur.pkg }
                                                 // 全量新鮮度只由 refresh 賦予：成功寫入僅對齊筆數
-                                                // (count=當前筆數)，freshness/source/target/
-                                                // queryTime 一律不動。
+                                                // (count=當前筆數)；非重建時 freshness/source/target/
+                                                // queryTime 一律不動，重建時先降 STALE 待下行 refresh 覆寫。
                                                 // target 重建提示：FRESH 快照目標與本次 verified
                                                 // 目標不一致、且上次操作釘在舊 id 上時，detail
                                                 // 附加需重新查證提示。
@@ -2202,11 +2245,22 @@ class DualViewModel(
                                                         rebuiltNote,
                                                     diagnose = null,
                                                 )
+                                                val degradedInventory =
+                                                    if (needRebuildRefresh &&
+                                                        it.inventory.freshness == InventoryFreshness.FRESH
+                                                    ) {
+                                                        it.inventory.copy(
+                                                            freshness = InventoryFreshness.STALE,
+                                                            count = remaining.size,
+                                                        )
+                                                    } else {
+                                                        it.inventory.copy(count = remaining.size)
+                                                    }
                                                 it.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     cloned = remaining,
-                                                    inventory = it.inventory.copy(count = remaining.size),
+                                                    inventory = degradedInventory,
                                                     pendingRemove = null,
                                                     lastOperation = op,
                                                     diagnose = diag,
@@ -2214,6 +2268,9 @@ class DualViewModel(
                                                     msg = "removed: ${sanitizeForDisplay(cur.pkg)}",
                                                     msgKind = MsgKind.INFO,
                                                 )
+                                            }
+                                            if (needRebuildRefresh) {
+                                                refreshLocked()
                                             }
                                         }
                                         is RemoveOutcome.NoDual -> {
@@ -3437,6 +3494,27 @@ class DualViewModel(
                     } else {
                         cur.inventory
                     }
+                // P1-3 正常 probe 失敗（非 throw）產生 diagnose（PROBE_FAILED）：
+                // 冷啟動無通道時若 diagnose 留 null，匯出會宣稱 OK。
+                // 優先順序規則：已有 sticky 歷史事件（lastOperation UNKNOWN 帶
+                // VERIFY_UNKNOWN，或現有 diagnose 非 null 且非 OK）時保留歷史；
+                // 僅當 diagnose==null（或 OK，即 null）才寫入新的失敗碼，
+                // 避免探測抖動洗掉待查證歷史。成功路徑（ready）不動 diagnose
+                //（沿 PR-6 P2：probe 成功不清 UNKNOWN）。
+                val probeDiagnose =
+                    if (!ready) {
+                        if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                            cur.diagnose
+                        } else {
+                            cur.diagnose ?: diagnoseEvent(
+                                DiagnoseCode.PROBE_FAILED,
+                                techDetail = "probe not ready: hasRoot=$hasRoot " +
+                                    "hasShizuku=$hasShizuku preference=$preference",
+                            )
+                        }
+                    } else {
+                        cur.diagnose
+                    }
                 val base = cur.withHookDiagnosis(hook, probeNow).copy(
                     // 鏈式呼叫 (keepLoadingOnExit) 保留 busy，下一段 refreshLocked
                     // 會接手；獨立呼叫則在此清除。
@@ -3452,6 +3530,7 @@ class DualViewModel(
                     pmReadable = if (!effectiveReady) null else cur.pmReadable,
                     degradeNote = degradeNoteForState,
                     inventory = staleInventory,
+                    diagnose = probeDiagnose,
                     msg = if (effectiveReady) readyMsg else notReadyMsg,
                     msgKind = if (effectiveReady) {
                         if (readyMsg.isNotEmpty()) MsgKind.INFO else MsgKind.NONE
@@ -3512,14 +3591,29 @@ class DualViewModel(
     // channel must not be mistaken for a working hook path.
     private fun isWritable(): Boolean {
         val cur = _state.value
+        // P1-3 write-guard 拒絕產生 diagnose（CHANNEL_ERROR）：
+        // 冷啟動無通道時若 diagnose 留 null，後續寫入拒絕只改 msg，
+        // 匯出仍宣稱 OK。優先順序規則同 probeChannels：已有 sticky
+        // 歷史事件（lastOperation UNKNOWN 帶 VERIFY_UNKNOWN，或現有
+        // diagnose 非 null 且非 OK）時保留歷史；僅當 diagnose==null
+        //（或 OK，即 null）才寫入 CHANNEL_ERROR。
         if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
             // Status-aware hook text (P1): unknown renders as 狀態未知, never
             // as 未偵測到 (the latter is reserved for positively-read absence).
             // PR-6 P4: 時間證據經 hookEvidence()+displayText 統一 (扁平欄位保留)。
             val hookDesc = cur.hookEvidence().displayText()
             _state.update {
+                val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
                     loading = false,
+                    diagnose = if (sticky) {
+                        it.diagnose
+                    } else {
+                        diagnoseEvent(
+                            DiagnoseCode.CHANNEL_ERROR,
+                            techDetail = "LSPosed placeholder (NoOp) cannot execute writes",
+                        )
+                    },
                     msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
                         "寫入已拒絕；Hook 狀態：$hookDesc；" +
                         "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
@@ -3541,8 +3635,18 @@ class DualViewModel(
                     "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
             }
             _state.update {
+                val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
                     loading = false,
+                    diagnose = if (sticky) {
+                        it.diagnose
+                    } else {
+                        diagnoseEvent(
+                            DiagnoseCode.CHANNEL_ERROR,
+                            techDetail = "selected channel not ready " +
+                                "(channel=${it.channel} privilege=$gatewayPrivilege)",
+                        )
+                    },
                     msg = reason,
                     msgKind = MsgKind.CHANNEL,
                 )
@@ -3571,8 +3675,17 @@ class DualViewModel(
             // non-NONE gateway, but kept as a fail-closed guard. 中文化以免
             // 使用者看到英文原文。
             _state.update {
+                val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
                     loading = false,
+                    diagnose = if (sticky) {
+                        it.diagnose
+                    } else {
+                        diagnoseEvent(
+                            DiagnoseCode.CHANNEL_ERROR,
+                            techDetail = "no privilege channel (read-only)",
+                        )
+                    },
                     msg = "唯讀：無可用權限通道，寫入已禁用；" +
                         "請檢查授權後點「重新連線並更新」",
                     msgKind = MsgKind.INVALID,

@@ -652,12 +652,17 @@ class MainActivity : ComponentActivity() {
         }
         shownPending = pending
         val appLabel = resolveAppLabel(pending.pkg)
-        // 理由 (m2 包名回音消毒)：對話框顯示用插值經 sanitizeForDisplay；
-        // 儲存的 pending.pkg/profileLabel 保持 raw (VM 狀態不動)。
-        val message = "應用：${sanitizeForDisplay(appLabel)}（${sanitizeForDisplay(pending.pkg)}）\n" +
-            "已驗證目標：user ${pending.dualId}（${sanitizeForDisplay(pending.profileLabel)}）\n" +
-            "警告：將刪除該分身的使用者資料且無法復原；" +
-            "僅影響分身（user ${pending.dualId}），不影響主 profile。"
+        // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
+        // 本地確認畫面必須顯示完整 package + label + user/serial，
+        // 不經 sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
+        // 診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
+        val message = buildRemoveConfirmMessage(
+            pkg = pending.pkg,
+            appLabel = appLabel,
+            profileLabel = pending.profileLabel,
+            dualId = pending.dualId,
+            serial = pending.dualSerial,
+        )
         try {
             removeConfirmDialog = AlertDialog.Builder(this)
                 .setTitle("確認移除分身")
@@ -810,6 +815,28 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
     val state = if (expanded) "已展開，點兩下收合" else "點兩下展開技術細節"
     return "診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}（$state）"
 }
+
+// 移除確認文案純函數（MainActivity 頂層 internal，JVM 可測）。
+// 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
+// 本地確認畫面顯示完整 package + label + user/serial，不經
+// sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
+// 診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
+// - pkg：待移除完整包名（raw，呼叫端傳 pending.pkg）。
+// - appLabel：PackageManager 解析顯示名；失敗時呼叫端回退傳 pkg
+//  （見 resolveAppLabel），兩種皆須含完整 pkg + user/serial。
+// - profileLabel：已驗證目標顯示名（raw，pending.profileLabel）。
+// - dualId/serial：已驗證目標 user/serial（數字身份可讀性）。
+internal fun buildRemoveConfirmMessage(
+    pkg: String,
+    appLabel: String,
+    profileLabel: String,
+    dualId: Int,
+    serial: Int,
+): String =
+    "應用：$appLabel（$pkg）\n" +
+        "已驗證目標：user $dualId（$profileLabel，serial $serial）\n" +
+        "警告：將刪除該分身的使用者資料且無法復原；" +
+        "僅影響分身（user $dualId），不影響主 profile。"
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
 // DEVICE-UNVERIFIED: selection/exec never ran on a device.
