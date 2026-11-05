@@ -55,6 +55,7 @@ import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -519,5 +520,124 @@ class DualViewModelTest {
             listOf(ChannelPreference.ROOT, ChannelPreference.SHIZUKU, ChannelPreference.ROOT),
             rig.persisted,
         )
+    }
+
+    // (i) P2-1 real blocking subprocess handover: the old ROOT select stuck in
+    // `id -u` on an actual `sleep` child (true waitFor block, non-cooperative
+    // -- coroutine cancel cannot interrupt it, only the poll+ensureActive
+    // checkpoint surfaces it) must not hold opMutex to its 10 s probe budget.
+    // Switching to SHIZUKU converges in bounded time (well under the probe
+    // budget, far under the 60 s exec deadline): latest-wins cancel ends the
+    // loser wait within one poll slice, the winner takes over at once, the
+    // loser never converges (no refresh listing), and nothing is resent.
+    @Test
+    fun selectChannel_blockingSuProbe_latestWinsHandsOverQuickly() {
+        val entered = CountDownLatch(1)
+        val blockingIdCalls = AtomicInteger(0)
+        val blockingListCalls = AtomicInteger(0)
+        val blockingWriteCalls = AtomicInteger(0)
+        // Real blocking child for the loser's `id -u`: `sleep 20` ignores
+        // coroutine cancel (worker owns it); the caller retreats via CE and
+        // destroys it best effort. Other commands return an instant child so
+        // a non-cancelled path would still probe deterministically (the loser
+        // never reaches them -- it is cancelled inside `id -u`).
+        val rootBlocking = SuCmdGateway { argv ->
+            val cmd = argv.lastOrNull() ?: ""
+            when {
+                cmd == "id -u" -> {
+                    blockingIdCalls.incrementAndGet()
+                    entered.countDown()
+                    ProcessBuilder("sh", "-c", "sleep 20").start()
+                }
+                cmd.startsWith("pm list packages") -> {
+                    blockingListCalls.incrementAndGet()
+                    ProcessBuilder("sh", "-c", "echo quick").start()
+                }
+                cmd.startsWith("pm install-existing") || cmd.startsWith("pm uninstall") -> {
+                    blockingWriteCalls.incrementAndGet()
+                    ProcessBuilder("sh", "-c", "echo quick").start()
+                }
+                else -> ProcessBuilder("sh", "-c", "echo quick").start()
+            }
+        }
+        val rootFake = FakeGateway(listPackagesOut = "")
+        val shizukuFake = FakeGateway(privilege = Privilege.SHELL, listPackagesOut = "")
+        val persisted = mutableListOf<ChannelPreference>()
+        val useBlocking = java.util.concurrent.atomic.AtomicBoolean(false)
+        val assemble: (
+            ChannelPreference,
+            Boolean,
+            Boolean,
+            String,
+        ) -> ChannelAssembly = { pref, _, _, _ ->
+            when (pref) {
+                ChannelPreference.ROOT ->
+                    if (useBlocking.get()) {
+                        ChannelAssembly(rootBlocking, rootBlocking, rootBlocking, ResolvedChannel.ROOT)
+                    } else {
+                        ChannelAssembly(rootFake, rootFake, rootFake, ResolvedChannel.ROOT)
+                    }
+                ChannelPreference.SHIZUKU ->
+                    ChannelAssembly(shizukuFake, shizukuFake, shizukuFake, ResolvedChannel.SHIZUKU)
+                ChannelPreference.LSPOSED ->
+                    ChannelAssembly(
+                        NoOpGateway(),
+                        NoOpGateway(),
+                        NoOpGateway(),
+                        ResolvedChannel.LSPOSED_PLACEHOLDER,
+                    )
+                ChannelPreference.AUTO ->
+                    ChannelAssembly(rootFake, rootFake, rootFake, ResolvedChannel.ROOT)
+            }
+        }
+        val vm = DualViewModel(
+            repo = DualRepository(rootFake),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(rootFake), ShizukuElevator(rootFake)),
+            preference = ChannelPreference.ROOT,
+            suGateway = rootFake,
+            shizukuGateway = rootFake,
+            activeGateway = rootFake,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            persistPreference = persisted::add,
+            assembleChannelFn = assemble,
+        )
+        pumpUntil { vm.state.value.channelReady }
+        // Arm the real block for the next ROOT select only (init stays clean).
+        useBlocking.set(true)
+        vm.selectChannel(ChannelPreference.ROOT)
+        // The select body runs on the Main test scheduler: drain it while the
+        // IO-parked `sleep` child starts, so the handover below races a
+        // genuinely in-flight probe (not a queued job).
+        pumpUntil(timeoutMs = 10_000) { entered.count == 0L }
+        assertTrue(vm.state.value.loading)
+        // Latest-wins: the new select cancels the hung probe mid-waitFor.
+        val handoverStartMs = System.currentTimeMillis()
+        vm.selectChannel(ChannelPreference.SHIZUKU)
+        pumpUntil { !vm.state.value.loading && vm.state.value.channel == ChannelPreference.SHIZUKU }
+        val handoverMs = System.currentTimeMillis() - handoverStartMs
+        assertTrue(
+            "winner must take over well under the 10 s probe budget, not the 60 s deadline (handover=${handoverMs}ms)",
+            handoverMs < 8_000L,
+        )
+        // The loser ran its probe entry exactly once but never converged: no
+        // refresh listing on its gateway. The winner ran a full round.
+        assertEquals(1, blockingIdCalls.get())
+        assertEquals(0, blockingListCalls.get())
+        assertTrue(
+            "winner must complete a refresh listing, got ${shizukuFake.listCalls.get()}",
+            shizukuFake.listCalls.get() >= 1,
+        )
+        assertEquals(ChannelPreference.SHIZUKU, vm.state.value.channel)
+        assertFalse(vm.state.value.loading)
+        assertTrue(vm.state.value.channelReady)
+        assertEquals(
+            listOf(ChannelPreference.ROOT, ChannelPreference.SHIZUKU),
+            persisted,
+        )
+        // Cancelled capture is never resent as a write on any gateway.
+        assertEquals(0, blockingWriteCalls.get() + rootFake.writeCalls.get() + shizukuFake.writeCalls.get())
     }
 }

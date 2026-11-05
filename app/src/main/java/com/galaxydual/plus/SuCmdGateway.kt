@@ -23,12 +23,36 @@ import com.galaxydual.core.TRUNCATION_MARKER
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 // Default wall-clock budget for one `su -c` invocation (pm commands are
 // normally sub-second; install-existing on a cold device can take longer).
 internal const val SU_EXEC_TIMEOUT_MS = 60_000L
+
+// Short budget for the ROOT probe (`id -u`, SuElevator.whoAmICmd): the probe
+// only checks uid 0 and never installs anything, so 10 s is ample while the
+// write path below keeps the full 60 s. Bounds selectChannel latest-wins
+// handover when su itself hangs (password prompt with no tty): the loser
+// probe expires in 10 s instead of pinning opMutex for 60 s even before
+// cancellation is considered.
+internal const val SU_PROBE_TIMEOUT_MS = 10_000L
+
+// Poll slice for the cancellable wait below: proc.waitFor(poll) blocks at
+// most this long, so coroutine cancellation surfaces within one slice
+// (~50 ms) instead of the full timeout. Winner takeover is therefore
+// bounded by the poll, not by SU_EXEC_TIMEOUT_MS.
+internal const val SU_WAIT_POLL_MS = 50L
+internal const val SU_DRAIN_POLL_MS = 50L
+
+// Maps a su command line to its wait budget: probe (`id -u`) uses the short
+// probe timeout, every other command (pm writes, list probes, identity
+// fetches) keeps the full exec timeout. Pure so JVM tests pin it.
+internal fun suTimeoutFor(cmd: String): Long =
+    if (cmd.trim() == "id -u") SU_PROBE_TIMEOUT_MS else SU_EXEC_TIMEOUT_MS
 
 // Cap per captured stream so a pathological `pm` output cannot OOM the app.
 // Dual-profile listings are kilobytes; the cap only bites on abuse.
@@ -46,6 +70,10 @@ fun suArgv(cmd: String): Array<String> = arrayOf("su", "-c", cmd)
 // Shizuku UserService side: same APK, same helper, privileged uid there).
 // Blocking: callers must dispatch to Dispatchers.IO (gateway) or already be
 // off the main thread (binder thread on the service side).
+// Binder-thread note (P2-1): GalaxyExecService.onTransact keeps calling THIS
+// blocking form -- the binder thread has no coroutine scope, so it cannot
+// run the cancellable suspend variant. The SuCmdGateway client path uses
+// captureProcessCancellable below (same contract, cancellable waits).
 internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEOUT_MS): CmdResult {
     val proc = try {
         Runtime.getRuntime().exec(argv)
@@ -133,6 +161,138 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
     // is the expiry signal. A still-alive drain means the capture may be
     // incomplete even when nothing hit the cap -- fail closed via truncated.
+    val joinExpired = drainOut.isAlive || drainErr.isAlive
+    return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
+}
+
+// Cancellable wait for process exit: polls waitFor(SU_WAIT_POLL_MS) and
+// checks coroutine cancellation between slices. Returns true when the
+// process exited before the deadline, false on timeout (caller maps false
+// to the existing timedOut path). Throws CancellationException at once on
+// coroutine cancel (selectChannel latest-wins) -- never converts cancel to
+// a result -- and InterruptedException on thread interrupt (caller maps to
+// the Phase A transportUnknown path, same as the blocking version).
+// Service side (GalaxyExecService binder thread, no coroutine scope) keeps
+// calling the blocking captureProcess above; only the SuCmdGateway client
+// path uses this helper.
+internal suspend fun cancellableAwaitExit(proc: Process, timeoutMs: Long): Boolean {
+    val deadlineMs = System.currentTimeMillis() + timeoutMs
+    while (true) {
+        // Queue-collapse checkpoint: a cancelled select job surfaces here
+        // within one poll slice, releasing opMutex for the winner. This is
+        // NOT remote preemption (see captureProcessCancellable header).
+        currentCoroutineContext().ensureActive()
+        val remaining = deadlineMs - System.currentTimeMillis()
+        if (remaining <= 0) {
+            // Final non-blocking check before declaring timeout.
+            return proc.waitFor(0, TimeUnit.MILLISECONDS)
+        }
+        val poll = minOf(SU_WAIT_POLL_MS, remaining)
+        if (proc.waitFor(poll, TimeUnit.MILLISECONDS)) return true
+    }
+}
+
+// Cancellable join for a drain thread: polls join(SU_DRAIN_POLL_MS) with the
+// same cancellation checkpoint. Returns when the thread dies OR when the
+// budget expires (caller re-checks isAlive for joinExpired, same as the
+// blocking path). Throws CancellationException on coroutine cancel (caller
+// destroys and rethrows) and InterruptedException on thread interrupt
+// (caller maps to transportUnknown).
+internal suspend fun cancellableJoin(t: Thread, budgetMs: Long) {
+    val deadlineMs = System.currentTimeMillis() + budgetMs
+    while (t.isAlive) {
+        currentCoroutineContext().ensureActive()
+        val remaining = deadlineMs - System.currentTimeMillis()
+        if (remaining <= 0) return
+        try {
+            t.join(minOf(SU_DRAIN_POLL_MS, remaining))
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw e
+        }
+    }
+}
+
+// Suspend (cancellable) variant of captureProcess for the SuCmdGateway
+// client path. Same spawn/drain/buildResult contract as the blocking
+// version above; only the waits are cancellable.
+//
+// Cancel semantics (P2-1, queue-collapse vs preemption):
+// - Queue-collapse: coroutine cancellation (selectChannel latest-wins
+//   cancelling the previous select while its su probe/write is in flight)
+//   ends the CLIENT WAIT at once (CancellationException within one
+//   SU_WAIT_POLL_MS slice, destroyForcibly, rethrow). opMutex is released
+//   immediately so the winner takes over in ~50 ms, not SU_EXEC_TIMEOUT_MS.
+//   The loser never converges (no refresh after cancel) because the
+//   exception aborts probeChannels before refreshLocked.
+// - NOT preemption: destroyForcibly only kills the local `su` child best
+//   effort; the remote pm may already have executed before the kill, so a
+//   cancelled post-spawn capture is unknown-after-send by construction.
+//   Coroutine-correctness requires CE to propagate (never synthesize a
+//   definite result on the cancel path); any result-form of this state
+//   (thread-interrupt paths below, service-side wire texts) carries
+//   transportUnknown=true (Phase A), never a definite failure. The Shizuku
+//   transact path (BoundedAwait) documents the same split: caller wait is
+//   bounded + cancellable, remote work is never force-stopped.
+internal suspend fun captureProcessCancellable(
+    argv: Array<String>,
+    timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
+    execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
+): CmdResult {
+    val proc = try {
+        execFn(argv)
+    } catch (e: Exception) {
+        return CmdResult(exit = 1, out = "", err = "spawn failed: ${(e.message ?: e.javaClass.simpleName)}")
+    }
+    val out = StringBuilder()
+    val err = StringBuilder()
+    val outStatus = AtomicReference(DrainStatus.READ_ERROR)
+    val errStatus = AtomicReference(DrainStatus.READ_ERROR)
+    val drainOut = thread(isDaemon = true, name = "capture-stdout") {
+        outStatus.set(drainCapped(proc.inputStream, out))
+    }
+    val drainErr = thread(isDaemon = true, name = "capture-stderr") {
+        errStatus.set(drainCapped(proc.errorStream, err))
+    }
+    val exited = try {
+        cancellableAwaitExit(proc, timeoutMs)
+    } catch (e: CancellationException) {
+        // Post-spawn unknown (Phase A): spawned, may have executed, reply
+        // lost to cancel. Destroy best effort and propagate CE so the
+        // winner takes over at once; never claim definite.
+        proc.destroyForcibly()
+        throw e
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        proc.destroyForcibly()
+        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
+    }
+    if (!exited) {
+        proc.destroyForcibly()
+        try {
+            cancellableJoin(drainOut, 2_000)
+            cancellableJoin(drainErr, 2_000)
+        } catch (e: CancellationException) {
+            // Timeout already abandoned the wait (timedOut below), but the
+            // cancel must still release the waiter at once for handover.
+            throw e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+        }
+        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
+    }
+    try {
+        cancellableJoin(drainOut, 5_000)
+        cancellableJoin(drainErr, 5_000)
+    } catch (e: CancellationException) {
+        proc.destroyForcibly()
+        throw e
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        proc.destroyForcibly()
+        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+    }
     val joinExpired = drainOut.isAlive || drainErr.isAlive
     return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
 }
@@ -231,13 +391,30 @@ internal fun capped(sink: StringBuilder, truncated: Boolean): String =
 // ROOT gateway: executes core-built pm commands via `su -c`.
 // DEVICE-UNVERIFIED: su presence/behavior varies by ROM; verified only by
 // compilation + JVM tests here, never on a rooted device.
-class SuCmdGateway : CmdGateway {
+//
+// Cancel contract (P2-1): run() is cancellable latest-wins. The su wait is
+// the cancellable captureProcessCancellable above (poll + ensureActive), so
+// a selectChannel latest-wins cancel ends the loser probe/write wait within
+// one SU_WAIT_POLL_MS slice and releases opMutex for the winner -- bounded
+// handover (<1 s), never the full SU_EXEC_TIMEOUT_MS. CancellationException
+// always propagates (never swallowed into a definite result): the loser
+// aborts before refreshLocked, so it never converges. destroyForcibly on
+// cancel is best-effort local kill only, NOT remote preemption -- a
+// post-spawn cancel stays unknown-after-send (Phase A transportUnknown
+// semantics); any result-form of that state carries transportUnknown=true.
+class SuCmdGateway(
+    // Injectable process spawn (P2-1 test seam): production spawns `su -c`
+    // via Runtime.exec; JVM tests inject a real blocking `sleep` subprocess
+    // (actual Process, non-cooperative waitFor) so latest-wins handover is
+    // proven against a true subprocess block, not a cancellable fake suspend.
+    private val execFn: (Array<String>) -> Process = { argv -> Runtime.getRuntime().exec(argv) },
+) : CmdGateway {
     override val privilege: Privilege = Privilege.ROOT
 
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
             try {
-                captureProcess(suArgv(cmd))
+                captureProcessCancellable(suArgv(cmd), suTimeoutFor(cmd), execFn)
             } catch (e: InterruptedException) {
                 // Post-spawn unknown (Phase A1): an interrupt escaping
                 // captureProcess means the spawn was attempted and the
@@ -247,7 +424,7 @@ class SuCmdGateway : CmdGateway {
                 Thread.currentThread().interrupt()
                 CmdResult(exit = 1, out = "", err = "interrupted: ${(e.message ?: "su interrupted")}", truncated = true, transportUnknown = true)
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 CmdResult(exit = 1, out = "", err = "su failed: ${(e.message ?: e.javaClass.simpleName)}")
             }
         }
