@@ -33,6 +33,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class AutoDegradeTest {
@@ -72,6 +75,11 @@ class AutoDegradeTest {
         // makes `cat <marker path>` return parseable marker text so a cached
         // verified ROOT channel can diagnose ACTIVE without new `id -u` probes.
         var markerContent: String? = null
+        // N1 Phase 1: `cat` obeys the auth gate. Null (default) preserves the
+        // legacy coupling (cat follows rootOk); setting catOk=false with
+        // rootOk=true models a `cat`-only denial, and rootOk=false always
+        // denies `cat` (parked-revoke: retained `cat` must fail closed).
+        var catOk: Boolean? = null
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -128,10 +136,17 @@ class AutoDegradeTest {
                 // Phase A P2: serve marker content for hook diagnosis; null
                 // keeps the legacy "ok" (no scopes). `cat` never touches
                 // idUCalls/listUsersCalls, so zero-probe assertions stay valid.
+                // N1 Phase 1: `cat` obeys rootOk/catOk -- a revoked su must
+                // fail `cat` (fail closed, maps to UNKNOWN via diagnosis).
                 catCalls++
-                val content = markerContent
-                if (content != null) CmdResult(exit = 0, out = content, err = "")
-                else CmdResult(exit = 0, out = "ok", err = "")
+                val catAllowed = catOk ?: rootOk
+                if (!catAllowed) {
+                    CmdResult(exit = 1, out = "", err = "denied: su revoked")
+                } else {
+                    val content = markerContent
+                    if (content != null) CmdResult(exit = 0, out = content, err = "")
+                    else CmdResult(exit = 0, out = "ok", err = "")
+                }
             }
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
@@ -1082,7 +1097,7 @@ class AutoDegradeTest {
         assertTrue("precondition: old instance must have served `cat`", oldCatBefore > 0)
         val oldIdUBefore = suOld.idUCalls
 
-        vm.selectChannel(ChannelPreference.LSPOSED)
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
             !vm.state.value.loading &&
                 vm.state.value.channel == ChannelPreference.LSPOSED &&
@@ -1115,18 +1130,51 @@ class AutoDegradeTest {
         )
         assertEquals("switch must not run new `su -c id -u` probes", oldIdUBefore, suOld.idUCalls)
 
-        // LSPOSED recheck: still ACTIVE, still zero probes (no `id -u`
-        // anywhere, no `cat` on the fresh instance).
+        // N1 Phase 1: LSPOSED AUTO recheck stays direct-only -- no retained
+        // `cat`, no `id -u` anywhere, no `cat` on the fresh instance. The
+        // retained instance diagnosed ACTIVE on the manual select above, but
+        // the auto recheck must not re-exec it (fresh `su -c` process, auth
+        // risk): hook falls back to UNKNOWN with writeReady false.
         val totalIdUBefore = suOld.idUCalls + newSu.idUCalls
+        val retainedCatBeforeAuto = suOld.catCalls
         vm.recheckPrivilege()
         await { !vm.state.value.loading }
         Thread.sleep(300)
         await { !vm.state.value.loading }
+        assertTrue(
+            "LSPOSED auto recheck must stay UNKNOWN (direct-only), got: ${vm.state.value.hookStatus}",
+            vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse(vm.state.value.writeReady)
+        assertFalse(vm.state.value.channelReady)
+        assertEquals("LSPOSED auto recheck must run zero probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
+        assertEquals(
+            "LSPOSED auto recheck must not `cat` the retained instance",
+            retainedCatBeforeAuto,
+            suOld.catCalls,
+        )
+        assertEquals("fresh instance stays untouched across auto recheck", 0, newSu.idUCalls)
+        assertEquals("fresh instance stays un-`cat`ed across auto recheck", 0, newSu.catCalls)
+        // Manual opt-in restores ACTIVE through the retained instance (one
+        // `cat`, still zero probes on the fresh instance, writeReady stays
+        // false: diagnosis never raises readiness).
+        vm.requestHookRedDiagnosis()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
         assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
         assertFalse(vm.state.value.writeReady)
-        assertEquals("LSPOSED recheck must run zero probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
-        assertEquals("fresh instance stays untouched across recheck", 0, newSu.idUCalls)
-        assertEquals("fresh instance stays un-`cat`ed across recheck", 0, newSu.catCalls)
+        assertTrue(
+            "manual diagnosis must ride the retained old instance",
+            suOld.catCalls > retainedCatBeforeAuto,
+        )
+        assertEquals("manual diagnosis still runs zero `id -u` probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
+        assertEquals("fresh instance stays untouched across manual diagnosis", 0, newSu.idUCalls)
+        assertEquals("fresh instance stays un-`cat`ed across manual diagnosis", 0, newSu.catCalls)
     }
 
     // Phase A P2 (match branch) + B1 (retained slot): explicit ROOT writes
@@ -1168,7 +1216,7 @@ class AutoDegradeTest {
         await { vm.state.value.hookStatus == HookStatus.ACTIVE }
         val idUBefore = suFake.idUCalls
 
-        vm.selectChannel(ChannelPreference.LSPOSED)
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
             !vm.state.value.loading &&
                 vm.state.value.channel == ChannelPreference.LSPOSED &&
@@ -1189,13 +1237,38 @@ class AutoDegradeTest {
         assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
         assertFalse("LSPOSED probes none", s.anyProbePassed)
         assertEquals("LSPOSED must not run `su -c id -u`", idUBefore, suFake.idUCalls)
-        // Hook diagnosis never raises writeReady: locked above + recheck keeps it.
+        // N1 Phase 1: auto recheck stays direct-only (UNKNOWN, no `cat`);
+        // manual opt-in restores ACTIVE. Diagnosis never raises writeReady.
+        val catAfterSelect = suFake.catCalls
         vm.recheckPrivilege()
         await { !vm.state.value.loading }
         Thread.sleep(300)
         await { !vm.state.value.loading }
+        assertTrue(
+            "LSPOSED auto recheck must stay UNKNOWN (direct-only), got: ${vm.state.value.hookStatus}",
+            vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse(vm.state.value.writeReady)
+        assertFalse(vm.state.value.channelReady)
+        assertEquals(
+            "LSPOSED auto recheck must not `cat` the retained instance",
+            catAfterSelect,
+            suFake.catCalls,
+        )
+        assertEquals("LSPOSED auto recheck must not run `su -c id -u`", idUBefore, suFake.idUCalls)
+        vm.requestHookRedDiagnosis()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
         assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
         assertFalse(vm.state.value.writeReady)
+        assertFalse(vm.state.value.channelReady)
+        assertTrue("manual diagnosis must `cat` once", suFake.catCalls > catAfterSelect)
+        assertEquals("manual diagnosis still runs zero `id -u` probes", idUBefore, suFake.idUCalls)
     }
 
     // Phase A P2 (revocation): ROOT proven then auth revoked (rootOk true ->
@@ -1243,7 +1316,7 @@ class AutoDegradeTest {
         await { !vm.state.value.loading }
         assertFalse("revoked ROOT must not be writable", vm.state.value.writeReady)
 
-        vm.selectChannel(ChannelPreference.LSPOSED)
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
         await {
             !vm.state.value.loading &&
                 vm.state.value.channel == ChannelPreference.LSPOSED
@@ -1575,6 +1648,554 @@ class AutoDegradeTest {
             "id-ok/pm-fail must never render 已就緒, got: \"${s.readyMark()}\"",
             s.readyMark() == "已就緒",
         )
+    }
+
+    // N1 Phase 1: AUTO -> LSPOSED (ACTIVE via manual select) -> revoke while
+    // parked on LSPOSED (rootOk=false) -> auto recheckPrivilege() must not
+    // execute any retained su `cat` (fresh `su -c` process, no session
+    // persistence: auto exec risks an auth prompt or a 60 s stall). Asserts
+    // su exec counters frozen, hook UNKNOWN_*, writeReady false (diagnosis
+    // never raises readiness).
+    @Test
+    fun lsposed_retained_revokedWhileParked_noAutoExec() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        // Rebuild factory (production behavior): every swap mints fresh
+        // instances, so candidates TRACK rebuilds (hookDiagnosticGateways =
+        // null) and the revoked-while-parked instance can only survive in
+        // the retained slot -- nothing current may serve `cat`.
+        val createdSu = mutableListOf<FakeSu>()
+        val createdShizuku = mutableListOf<FakeShizuku>()
+        val rebuildFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val newSu = FakeSu(rootOk = true)
+            newSu.markerContent = marker
+            val newShizuku = FakeShizuku(shizukuOk = false)
+            createdSu.add(newSu)
+            createdShizuku.add(newShizuku)
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> newSu
+                ResolvedChannel.SHIZUKU -> newShizuku
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, newSu, newShizuku, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = rebuildFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        // Manual switch to LSPOSED (picker tap): retained instance diagnoses
+        // ACTIVE (one `cat`, zero new probes, writeReady stays false).
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
+        assertFalse(vm.state.value.writeReady)
+        assertFalse(vm.state.value.channelReady)
+
+        // Revoke while parked (no probing channel selected): the retained
+        // `cat` would now fail -- auto must not discover this by executing.
+        suFake.rootOk = false
+        val catBefore = suFake.catCalls
+        val idUBefore = suFake.idUCalls
+        val listBefore = suFake.listUsersCalls
+        val shizukuListBefore = shizukuFake.listUsersCalls
+        val shizukuCatBefore = shizukuFake.catCalls
+
+        vm.recheckPrivilege()
+        await {
+            !vm.state.value.loading &&
+                (vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                    vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE)
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertTrue(
+            "parked revoke + auto recheck must stay UNKNOWN_*, got: ${s.hookStatus}",
+            s.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                s.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse("diagnosis must never raise writeReady", s.writeReady)
+        assertFalse(s.channelReady)
+        assertFalse("LSPOSED probes none", s.anyProbePassed)
+        assertEquals(
+            "auto recheck must not execute retained su `cat`",
+            catBefore,
+            suFake.catCalls,
+        )
+        assertEquals(
+            "auto recheck must not run `su -c id -u` (LSPOSED probes none)",
+            idUBefore,
+            suFake.idUCalls,
+        )
+        assertEquals(
+            "auto recheck must not run `pm list users` via su",
+            listBefore,
+            suFake.listUsersCalls,
+        )
+        assertEquals(
+            "auto recheck must not probe Shizuku",
+            shizukuListBefore,
+            shizukuFake.listUsersCalls,
+        )
+        assertEquals(
+            "auto recheck must not `cat` via Shizuku",
+            shizukuCatBefore,
+            shizukuFake.catCalls,
+        )
+        // Fresh post-swap instances are never verified under LSPOSED (no
+        // probes), so they must stay fully untouched -- diagnosis rode only
+        // the retained old instance (or nothing, when auto).
+        val newSu = createdSu.single()
+        val newShizuku = createdShizuku.single()
+        assertEquals("fresh instance must never run `su -c id -u`", 0, newSu.idUCalls)
+        assertEquals("fresh instance must never be `cat`ed", 0, newSu.catCalls)
+        assertEquals("fresh Shizuku must never be probed", 0, newShizuku.listUsersCalls)
+        assertEquals("fresh Shizuku must never be `cat`ed", 0, newShizuku.catCalls)
+    }
+
+    // N1 Phase 1: manual opt-in still reads (manual entry triggers `cat` and
+    // recovers ACTIVE while authorized). Guards the other half of the split:
+    // auto stays silent, manual stays capable.
+    @Test
+    fun lsposed_manualDiagnosis_stillReadable() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        // Rebuild factory (production behavior): every swap mints fresh
+        // instances, so the manual `cat` below provably rides the retained
+        // OLD instance, never a fresh one.
+        val createdSu = mutableListOf<FakeSu>()
+        val rebuildFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val newSu = FakeSu(rootOk = true)
+            newSu.markerContent = marker
+            val newShizuku = FakeShizuku(shizukuOk = false)
+            createdSu.add(newSu)
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> newSu
+                ResolvedChannel.SHIZUKU -> newShizuku
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, newSu, newShizuku, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = rebuildFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        // Auto stays UNKNOWN (direct-only) even while authorized...
+        vm.recheckPrivilege()
+        await {
+            !vm.state.value.loading &&
+                (vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                    vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE)
+        }
+        Thread.sleep(200)
+        await { !vm.state.value.loading }
+        val catAfterAuto = suFake.catCalls
+        assertFalse(vm.state.value.writeReady)
+
+        // ...but the manual entry re-reads the marker through the retained
+        // instance (one `cat`, no new `id -u`, writeReady stays false).
+        vm.requestHookRedDiagnosis()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val s = vm.state.value
+        assertEquals(HookStatus.ACTIVE, s.hookStatus)
+        assertTrue(s.hookActive)
+        assertTrue(
+            "marker scopes must be visible, got: ${s.hookScopes}",
+            s.hookScopes.contains(HookMarker.SCOPE_SYSTEM_SERVER),
+        )
+        assertFalse("diagnosis must never raise writeReady", s.writeReady)
+        assertFalse(s.channelReady)
+        assertTrue(
+            "manual diagnosis must execute retained `cat`",
+            suFake.catCalls > catAfterAuto,
+        )
+        assertEquals(
+            "fresh instance stays un-`cat`ed: diagnosis rode the retained old one",
+            0,
+            createdSu.single().catCalls,
+        )
+    }
+
+    // N1 Phase 1: a manual privileged read that proves the retained channel
+    // dead (parked revoke) clears the retained slot, so the NEXT auto/manual
+    // round performs no new root exec (no retry storm, no prompt). Also locks
+    // that non-user operations never trigger new root commands after the
+    // clear (fake counters frozen).
+    @Test
+    fun lsposed_manualDiagnosis_revokedClearsRetained_noFurtherExec() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        // Rebuild factory (production behavior): every swap mints fresh
+        // instances, so the proving `cat` and the post-clear silence both
+        // involve only the retained OLD instance -- with a rebuild, a
+        // retained-clear regression turns red (a fresh instance could never
+        // silently substitute, and the stale same-instance evidence path is
+        // gone). The reuse-factory current-match path stays covered by
+        // explicitRootToLsposed_sameInstance_diagnosesActiveWithoutRaisingWriteReady.
+        val createdSu = mutableListOf<FakeSu>()
+        val rebuildFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val newSu = FakeSu(rootOk = true)
+            newSu.markerContent = marker
+            val newShizuku = FakeShizuku(shizukuOk = false)
+            createdSu.add(newSu)
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> newSu
+                ResolvedChannel.SHIZUKU -> newShizuku
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, newSu, newShizuku, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = rebuildFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        // Revoke while parked, then prove death via ONE manual exec.
+        suFake.rootOk = false
+        val catBeforeManual = suFake.catCalls
+        vm.requestHookRedDiagnosis()
+        await {
+            !vm.state.value.loading &&
+                (vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                    vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE)
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertTrue(
+            "manual diagnosis must attempt exactly the proving `cat`",
+            suFake.catCalls > catBeforeManual,
+        )
+        assertFalse(vm.state.value.writeReady)
+        val catAfterProving = suFake.catCalls
+        val idUAfterProving = suFake.idUCalls
+
+        // After the clear, further auto AND manual rounds must not exec.
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cleared slot: auto must not re-exec root",
+            catAfterProving,
+            suFake.catCalls,
+        )
+        assertEquals(idUAfterProving, suFake.idUCalls)
+
+        vm.requestHookRedDiagnosis()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertTrue(
+            "cleared slot stays UNKNOWN_*, got: ${vm.state.value.hookStatus}",
+            vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertEquals(
+            "cleared slot: second manual must not re-exec root",
+            catAfterProving,
+            suFake.catCalls,
+        )
+        assertEquals(idUAfterProving, suFake.idUCalls)
+        assertFalse(vm.state.value.writeReady)
+        assertFalse(vm.state.value.channelReady)
+    }
+
+    // N1 Phase 1 (sticky-manual): drainCoalesced consumes the manual flag
+    // per round (same shape as the recheck loop), so a trailing auto round
+    // after a manual round never inherits manual privilege. Leading auto +
+    // queued manual + auto arriving during the manual trailing round: the
+    // second trailing round must run auto (zero new `cat`), proving the
+    // manual flag did not leak across rounds. A gated direct-read seam holds
+    // each diagnosis round so the three rounds sequence deterministically.
+    @Test
+    fun reconnectDrain_manualFlagNotStickyAcrossRounds() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val entered = AtomicInteger(0)
+        val gate = Semaphore(0)
+        val gating = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = {
+                entered.incrementAndGet()
+                if (gating.get()) {
+                    // Hold this diagnosis round until the test releases it; a
+                    // 5 s timeout fails safe (round completes ungated) so a
+                    // sequencing bug turns red instead of hanging.
+                    gate.tryAcquire(5, TimeUnit.SECONDS)
+                }
+                listOf(MarkerRead.Denied, MarkerRead.Denied)
+            },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        // Park on LSPOSED via a manual picker tap: retained ACTIVE.
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        gating.set(true)
+        val roundsBase = entered.get()
+        val catBase = suFake.catCalls
+
+        // Leading auto round, held inside direct reads.
+        vm.reconnectAndRefresh(userInitiated = false)
+        await { entered.get() >= roundsBase + 1 }
+        // Manual queued behind the leading auto (pending + manual flag).
+        vm.reconnectAndRefresh(userInitiated = true)
+        // Leading completes; trailing round 1 (manual) starts and blocks.
+        gate.release()
+        await { entered.get() >= roundsBase + 2 }
+        // Auto arrives during the manual trailing round.
+        vm.reconnectAndRefresh(userInitiated = false)
+        // Trailing round 1 (manual) runs: retained `cat`, back to ACTIVE.
+        gate.release()
+        await { entered.get() >= roundsBase + 3 }
+        val catAfterManual = suFake.catCalls
+        assertTrue(
+            "manual trailing round must `cat` the retained instance",
+            catAfterManual > catBase,
+        )
+        // Trailing round 2 must be auto: no new `cat`, back to UNKNOWN_*.
+        gate.release()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(
+            "second trailing round must not inherit manual (no new `cat`)",
+            catAfterManual,
+            suFake.catCalls,
+        )
+        assertTrue(
+            "auto trailing round stays UNKNOWN_*, got: ${vm.state.value.hookStatus}",
+            vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse(vm.state.value.writeReady)
+    }
+
+    // N1 Phase 1 (cat-only denial): `id -u` proves ROOT but `cat` is refused
+    // (rootOk=true, catOk=false). Readiness follows the probe (writeReady
+    // stays true); diagnosis fails closed (UNKNOWN_*, never a fake
+    // ACTIVE/INACTIVE) after actually attempting the `cat`.
+    @Test
+    fun rootProbeOk_catDenied_unknownButReady() {
+        val suFake = FakeSu(rootOk = true)
+        suFake.catOk = false
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+
+        val s = vm.state.value
+        assertEquals(ResolvedChannel.ROOT, s.resolvedGateway)
+        assertTrue("probe-proven ROOT stays writable", s.writeReady)
+        assertTrue("probe-proven ROOT stays channelReady", s.channelReady)
+        // The diagnostic `cat` was attempted and refused: UNKNOWN (a gateway
+        // path existed), never a fake ACTIVE/INACTIVE.
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, s.hookStatus)
+        assertFalse(s.hookActive)
+        assertTrue("denied `cat` must still have been attempted", suFake.catCalls > 0)
+    }
+
+    // N1 Phase 1 (re-verify recovery): after a manual proving `cat` clears
+    // the retained slot, leaving LSPOSED and re-proving ROOT restores the
+    // retained instance, so a later manual LSPOSED diagnosis is ACTIVE again
+    // (one revoked round never permanently loses diagnosis).
+    @Test
+    fun lsposed_clearedRetained_reverifyRestores_manualActiveAgain() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        // Revoke while parked; one manual round proves death and clears.
+        suFake.rootOk = false
+        vm.requestHookRedDiagnosis()
+        await {
+            !vm.state.value.loading &&
+                (vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                    vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE)
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val catAfterClear = suFake.catCalls
+        assertTrue(
+            "proving round stays UNKNOWN_*, got: ${vm.state.value.hookStatus}",
+            vm.state.value.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                vm.state.value.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse(vm.state.value.writeReady)
+
+        // Re-verify: auth restored, back to ROOT; the probe passes again and
+        // the retained slot is re-pinned (diagnosis ACTIVE via current).
+        suFake.rootOk = true
+        vm.selectChannel(ChannelPreference.ROOT, userInitiated = true)
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val restored = vm.state.value
+        assertEquals(ChannelPreference.ROOT, restored.channel)
+        assertTrue("re-proven ROOT is writable again", restored.writeReady)
+        assertEquals(HookStatus.ACTIVE, restored.hookStatus)
+
+        // Park on LSPOSED again: manual diagnosis rides the RESTORED
+        // retained instance back to ACTIVE (zero new probes, not writable).
+        val idUBefore = suFake.idUCalls
+        vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        val s = vm.state.value
+        assertEquals(HookStatus.ACTIVE, s.hookStatus)
+        assertFalse("diagnosis must never raise writeReady", s.writeReady)
+        assertFalse(s.channelReady)
+        assertTrue(
+            "restored retained instance must serve `cat` again",
+            suFake.catCalls > catAfterClear,
+        )
+        assertEquals("re-park still runs zero `id -u` probes", idUBefore, suFake.idUCalls)
     }
 
     // Phase 2 P3: dual-condition matrix for readyMark.

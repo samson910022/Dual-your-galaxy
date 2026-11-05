@@ -85,6 +85,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var rootBtn: Button
     private lateinit var shizukuBtn: Button
     private lateinit var lsposedBtn: Button
+    // N1 Phase 1: manual opt-in privileged hook re-diagnosis (retained `cat`).
+    // Auto lifecycle (onResume/binder) never executes privileged `cat`; only
+    // this tap (and the manual reconnect/picker taps) passes userInitiated.
+    private lateinit var hookDiagBtn: Button
+    // Row holding the manual hook-diagnosis button: visible only in LSPOSED
+    // mode (same condition as hookView) so the opt-in entry never suggests
+    // itself on a true channel. Enable still follows the shared busy gate.
+    private lateinit var hookRow: LinearLayout
     private lateinit var msgView: TextView
     private var defaultMsgColor: Int = Color.BLACK
 
@@ -146,7 +154,9 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // Re-probe privilege on every foreground return: the user may have
         // granted/revoked Shizuku (or started/stopped its service) while away.
-        vm.recheckPrivilege()
+        // N1 Phase 1: auto path -- never executes privileged `cat` (LSPOSED
+        // stays direct-only, UNKNOWN_* when unreadable).
+        vm.recheckPrivilege(userInitiated = false)
         updateShizukuLine()
     }
 
@@ -193,7 +203,10 @@ class MainActivity : ComponentActivity() {
     // degrade + refresh); the dead-binder path only re-probes (a refresh
     // right now could only fail).
     private fun onShizukuChanged(reread: Boolean) {
-        if (reread) vm.reconnectAndRefresh() else vm.recheckPrivilege()
+        // N1 Phase 1: binder/permission callbacks are auto lifecycle, not user
+        // taps -- privileged `cat` stays off (false) even on the reread path.
+        // Manual Refresh taps call reconnectAndRefresh(true) directly.
+        if (reread) vm.reconnectAndRefresh(userInitiated = false) else vm.recheckPrivilege(userInitiated = false)
         updateShizukuLine()
     }
 
@@ -237,8 +250,9 @@ class MainActivity : ComponentActivity() {
         }
         refreshBtn = Button(this).apply {
             // P25 single entry: probe (with Auto degrade) + refresh in one tap.
+            // N1 Phase 1: manual tap -- privileged diagnosis allowed.
             text = "重新連線並更新"
-            setOnClickListener { vm.reconnectAndRefresh() }
+            setOnClickListener { vm.reconnectAndRefresh(userInitiated = true) }
         }
         permBtn = Button(this).apply {
             text = "請求 Shizuku 授權"
@@ -249,19 +263,25 @@ class MainActivity : ComponentActivity() {
         // in the existing style; labels stay short for one horizontal row.
         autoBtn = Button(this).apply {
             text = "Auto"
-            setOnClickListener { vm.selectChannel(ChannelPreference.AUTO) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, userInitiated = true) }
         }
         rootBtn = Button(this).apply {
             text = "Root"
-            setOnClickListener { vm.selectChannel(ChannelPreference.ROOT) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, userInitiated = true) }
         }
         shizukuBtn = Button(this).apply {
             text = "Shizuku"
-            setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, userInitiated = true) }
         }
         lsposedBtn = Button(this).apply {
             text = "LSPosed"
-            setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED) }
+            setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, userInitiated = true) }
+        }
+        // N1 Phase 1: manual opt-in privileged hook re-diagnosis. Auto
+        // lifecycle never `cat`s; only this tap may use the retained channel.
+        hookDiagBtn = Button(this).apply {
+            text = "手動診斷 Hook"
+            setOnClickListener { vm.requestHookRedDiagnosis() }
         }
         // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
         msgView = TextView(this).apply {
@@ -280,6 +300,10 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             addView(refreshBtn, rowParams())
             addView(permBtn, rowParams())
+        }
+        hookRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(hookDiagBtn, rowParams())
         }
         // Picker row 1: Auto + Root; row 2: Shizuku + LSPosed (two rows keep
         // labels legible on narrow screens, same weight style as above).
@@ -305,6 +329,7 @@ class MainActivity : ComponentActivity() {
         root.addView(pkgInput)
         root.addView(writeRow)
         root.addView(readRow)
+        root.addView(hookRow)
         root.addView(msgView)
         setContentView(ScrollView(this).apply { addView(root) })
     }
@@ -320,14 +345,15 @@ class MainActivity : ComponentActivity() {
     private fun requestShizukuPermission() {
         try {
             if (!Shizuku.pingBinder()) {
-                vm.reconnectAndRefresh()
+                // User tapped the permission button: manual.
+                vm.reconnectAndRefresh(userInitiated = true)
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                vm.reconnectAndRefresh()
+                vm.reconnectAndRefresh(userInitiated = true)
             } else {
                 Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
             }
         } catch (e: Exception) {
-            vm.recheckPrivilege()
+            vm.recheckPrivilege(userInitiated = true)
         }
         updateShizukuLine()
     }
@@ -419,6 +445,11 @@ class MainActivity : ComponentActivity() {
         // channel.
         if (s.channel == ChannelPreference.LSPOSED) {
             hookView.visibility = View.VISIBLE
+            try {
+                hookRow.visibility = View.VISIBLE
+            } catch (_: Exception) {
+                // Best effort: render may run before buildUi in tests.
+            }
             // ACTIVE is historical existence+scope evidence only (the marker
             // survives reboots; S24 evidence shows it predating boot by ~5.5h
             // with no boot-identity/freshness check): the text names that
@@ -438,6 +469,11 @@ class MainActivity : ComponentActivity() {
                 "待 whitelist 政策分支，寫入已禁用"
         } else {
             hookView.visibility = View.GONE
+            try {
+                hookRow.visibility = View.GONE
+            } catch (_: Exception) {
+                // Best effort: render may run before buildUi in tests.
+            }
         }
         profilesView.text = if (s.profiles.isEmpty()) {
             "Profiles：—"
@@ -463,6 +499,12 @@ class MainActivity : ComponentActivity() {
         rootBtn.isEnabled = !busy
         shizukuBtn.isEnabled = !busy
         lsposedBtn.isEnabled = !busy
+        // N1 Phase 1: manual diagnosis shares the same mutex gate.
+        try {
+            hookDiagBtn.isEnabled = !busy
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
         msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
