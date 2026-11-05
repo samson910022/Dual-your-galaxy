@@ -60,6 +60,11 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.hook.HookMarker
 import java.io.File
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.nio.file.AccessDeniedException
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 
 // Snapshot of the hook-enable signal for one UI render.
 data class HookState(
@@ -210,22 +215,55 @@ sealed interface MarkerRead {
     object Denied : MarkerRead
 }
 
-// IO: one direct attempt at a marker file. Missing files map to
-// Readable(null) (positive absence); only failing reads map to Denied. Never
-// throws.
-fun readDirectMarker(file: File): MarkerRead {
+// Default content reader for direct marker attempts: NIO newInputStream
+// gives a precise NoSuchFileException vs AccessDeniedException split.
+// (Files.readString would need Java 11 / core-library-desugaring, which this
+// module does not enable; newInputStream has existed since API 26 and minSdk
+// is 29, so no version branch is required.)
+private fun readMarkerTextNio(file: File): String =
+    Files.newInputStream(file.toPath()).use { it.readBytes().toString(Charsets.UTF_8) }
+
+// IO: one direct attempt at a marker file. Read-first, never `isFile()`:
+// `File.isFile()` returns false for genuinely missing files AND for
+// EACCES/SELinux stat denial (un-traversable parent, denied stat), so it
+// cannot prove absence -- the old `if (!file.isFile) Readable(null)` turned
+// denial into "positively absent" and produced a false INACTIVE. Only
+// NoSuchFileException proves absence -> Readable(null); AccessDenied /
+// Security / other IO failures are unknown -> Denied (conservative). The
+// `reader` seam (default: real NIO) lets JVM tests inject on-device denial
+// without chmod, which same-uid CI and root would both ignore. `reader`
+// implementations based on File.readText spell denial as
+// FileNotFoundException("Permission denied"), indistinguishable from its
+// missing spelling, so FileNotFoundException stays Denied. Never throws.
+fun readDirectMarker(
+    file: File,
+    reader: (File) -> String = ::readMarkerTextNio,
+): MarkerRead {
     return try {
-        if (!file.isFile) MarkerRead.Readable(null) else MarkerRead.Readable(file.readText())
+        MarkerRead.Readable(reader(file))
+    } catch (_: NoSuchFileException) {
+        MarkerRead.Readable(null)
+    } catch (_: FileNotFoundException) {
+        MarkerRead.Denied
+    } catch (_: AccessDeniedException) {
+        MarkerRead.Denied
+    } catch (_: SecurityException) {
+        MarkerRead.Denied
+    } catch (_: IOException) {
+        MarkerRead.Denied
     } catch (_: Exception) {
         MarkerRead.Denied
     }
 }
 
-// Production direct reads of BOTH marker paths (primary then fallback).
-fun defaultDirectMarkerReads(): List<MarkerRead> =
+// Production direct reads of BOTH marker paths (primary then fallback). The
+// `reader` seam is threaded through for tests; production uses the default.
+fun defaultDirectMarkerReads(
+    reader: (File) -> String = ::readMarkerTextNio,
+): List<MarkerRead> =
     listOf(
-        readDirectMarker(File(HookMarker.MARKER_PATH)),
-        readDirectMarker(File(HookMarker.LEGACY_MARKER_PATH)),
+        readDirectMarker(File(HookMarker.MARKER_PATH), reader),
+        readDirectMarker(File(HookMarker.LEGACY_MARKER_PATH), reader),
     )
 
 // IO, suspend: full diagnostic read -- direct reads first, then `cat` over
@@ -282,13 +320,15 @@ suspend fun diagnoseHookState(
     return HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
 }
 
-// IO overload reading the real marker files for the direct stage.
+// IO overload reading the real marker files for the direct stage. The
+// `reader` seam is threaded through for tests; production uses the default.
 suspend fun diagnoseHookState(
     markerFile: File = File(HookMarker.MARKER_PATH),
     fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
     diagnosticGateways: List<CmdGateway> = emptyList(),
+    reader: (File) -> String = ::readMarkerTextNio,
 ): HookDiagnosis = diagnoseHookState(
-    listOf(readDirectMarker(markerFile), readDirectMarker(fallbackFile)),
+    listOf(readDirectMarker(markerFile, reader), readDirectMarker(fallbackFile, reader)),
     diagnosticGateways,
 )
 
