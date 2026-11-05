@@ -985,7 +985,7 @@ class DualViewModel(
                             if (groundTruth == null) onIo { repo.resolveDualUserId() } else null
                         _state.update { cur ->
                             val now = nowMs()
-                            if (groundTruth == null) {
+                            val next = if (groundTruth == null) {
                                 // 未知：保留舊 cloned，inventory 舊資料標 STALE
                                 // (FRESH->STALE；否則 UNKNOWN，傳入的 targetId
                                 // 不再丟棄)，供上層重查。
@@ -2133,6 +2133,7 @@ class DualViewModel(
                                                     msgKind = MsgKind.CHANNEL,
                                                 )
                                             }
+                                        }
                                         is RemoveOutcome.TargetMoved -> {
                                             val now = nowMs()
                                             _state.update {

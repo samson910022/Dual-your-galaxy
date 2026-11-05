@@ -51,6 +51,13 @@ class DiagnoseFreshnessPhase5Test {
         var throwAll: Boolean = false,
         var driftAfterListUsers: Int = Int.MAX_VALUE,
         var driftId: Int = 96,
+        // P2 安裝門檻適配 (新 base requestRemove/confirmRemove 經 verifyState
+        // 查已安裝才開 dialog)：已卸载集合供 uninstall 成功後排除，
+        // post-verify 即見 NotInstalled；failListAfterUninstall 供
+        // confirm 寫後查證失敗 (VerifyUnknown) 場景。
+        val uninstalledPkgs: MutableSet<String> = mutableSetOf(),
+        var failListAfterUninstall: Boolean = false,
+        var sawUninstall: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         var listUsersCalls = 0
@@ -127,15 +134,23 @@ class DiagnoseFreshnessPhase5Test {
                 cmd.startsWith("pm install-existing") ->
                     CmdResult(exit = 0, out = "Success", err = "")
                 cmd.startsWith("pm uninstall") ->
-                    CmdResult(exit = 0, out = "Success", err = "")
+                    CmdResult(exit = 0, out = "Success", err = "").also {
+                        sawUninstall = true
+                        val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                        uninstalledPkgs.add(pkg)
+                    }
                 cmd.startsWith("pm list packages") ->
-                    if (failListPackages) CmdResult(exit = 0, out = "Failure [list failed]", err = "")
-                    else CmdResult(
-                        exit = 0,
-                        out = (listOf("package:com.example.chat") + listExtra.map { "package:$it" })
-                            .joinToString("\n"),
-                        err = "",
-                    )
+                    if (failListPackages || (failListAfterUninstall && sawUninstall)) {
+                        CmdResult(exit = 0, out = "Failure [list failed]", err = "")
+                    } else {
+                        CmdResult(
+                            exit = 0,
+                            out = (listOf("package:com.example.chat") + listExtra.map { "package:$it" })
+                                .filterNot { it.removePrefix("package:") in uninstalledPkgs }
+                                .joinToString("\n"),
+                            err = "",
+                        )
+                    }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
         }
@@ -340,7 +355,10 @@ class DiagnoseFreshnessPhase5Test {
 
     @Test
     fun removeSuccess_clearsDiagnoseAndRecordsSuccess() {
-        val gw = FakeRepo()
+        // 新 base P2 安裝門檻：requestRemove 經 verifyState 查已安裝才開
+        // dialog，故待移除包須先列入 fake 清單；卸載後 fake 即排除，
+        // post-verify 見 NotInstalled -> Success。
+        val gw = FakeRepo(listExtra = listOf("com.example.other"))
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
@@ -353,11 +371,15 @@ class DiagnoseFreshnessPhase5Test {
         vm.confirmRemove()
         await {
             !vm.state.value.loading &&
-                vm.state.value.lastOperation?.opId == "remove:com.example.other"
+                (vm.state.value.lastOperation?.opId
+                    ?.startsWith("remove:com.example.other@95#15#") == true)
         }
         val last = vm.state.value.lastOperation!!
         assertEquals(OpPhase.SUCCESS, last.phase)
-        assertEquals("remove:com.example.other", last.opId)
+        assertTrue(
+            "remove opId 沿用新 base serial 世代格式，got ${last.opId}",
+            last.opId.startsWith("remove:com.example.other@95#15#"),
+        )
         assertEquals("com.example.other", last.appKey)
         assertEquals(95, last.pinnedTarget)
         assertNull("remove Success must clear diagnose", vm.state.value.diagnose)
@@ -366,12 +388,16 @@ class DiagnoseFreshnessPhase5Test {
 
     @Test
     fun removeUnknown_survivesProbe() {
-        val gw = FakeRepo(failListPackages = true)
+        // request 時已安裝 (開 dialog)，confirm 寫後查證失敗 -> UNKNOWN：
+        // failListAfterUninstall 只讓 uninstall 之後的 list 失敗，
+        // confirm 前 verifyState 仍見 Installed。
+        val gw = FakeRepo(listExtra = listOf("com.example.other"))
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
         vm.requestRemove("com.example.other")
         await { vm.state.value.pendingRemove != null }
+        gw.failListAfterUninstall = true
         vm.confirmRemove()
         await { vm.state.value.lastOperation?.phase == OpPhase.UNKNOWN }
         val base = vm.state.value.lastOperation!!
@@ -905,11 +931,12 @@ class DiagnoseFreshnessPhase5Test {
 
     @Test
     fun phase3_longRemoveInput_pendingBounded256() {
-        val gw = FakeRepo()
+        val longPkg = "com.example." + "x".repeat(500)
+        // 新 base P2 安裝門檻：截斷後 (256) 的包須在 fake 清單內才開 dialog。
+        val gw = FakeRepo(listExtra = listOf(longPkg.take(256)))
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
-        val longPkg = "com.example." + "x".repeat(500)
         vm.requestRemove(longPkg)
         await { vm.state.value.pendingRemove != null }
         val pending = vm.state.value.pendingRemove!!
