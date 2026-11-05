@@ -39,6 +39,11 @@ class AutoDegradeTest {
     // (exit 0 / non-zero uid, i.e. "su exists but refused"). Mutable so a
     // test can flip the probe outcome mid-flight (degrade path).
     private class FakeSu(var rootOk: Boolean, var dualId: Int = 95) : CmdGateway {
+        // P25 Item 4: split `id -u` (auth) from `pm list users` (readability).
+        // Null (default) preserves the legacy coupling (pm follows rootOk);
+        // setting pmListOk=false with rootOk=true models counter-example A:
+        // `id -u == 0` proves the probe while PM stays unreadable.
+        var pmListOk: Boolean? = null
         override val privilege: Privilege = Privilege.ROOT
 
         // Counts `id -u` (su auth-risk probe) vs `pm list users` separately so
@@ -92,7 +97,8 @@ class AutoDegradeTest {
             }
             cmd == DualRepository.CMD_LIST_USERS -> {
                 listUsersCalls++
-                if (rootOk) CmdResult(exit = 0, out = usersOut(), err = "")
+                val pmOk = pmListOk ?: rootOk
+                if (pmOk) CmdResult(exit = 0, out = usersOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied: su refused")
             }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
@@ -294,7 +300,7 @@ class AutoDegradeTest {
         assertEquals(Privilege.SHELL, s.execIdentity)
         assertTrue("degraded SHIZUKU must be writable", s.writeReady)
         assertTrue("degraded SHIZUKU must keep channelReady for compat", s.channelReady)
-        assertTrue("device proved a channel", s.readCap)
+        assertTrue("device proved a channel", s.anyProbePassed)
         assertTrue("degrade note must record the reason, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
     }
 
@@ -318,7 +324,7 @@ class AutoDegradeTest {
         assertEquals(Privilege.NONE, s.execIdentity)
         assertFalse("NOOP must never be writable", s.writeReady)
         assertFalse("NOOP must never be channelReady", s.channelReady)
-        assertFalse("no proven channel", s.readCap)
+        assertFalse("no proven channel", s.anyProbePassed)
         assertTrue("read-only note expected, got: \"${s.degradeNote}\"", s.degradeNote.contains("唯讀"))
     }
 
@@ -341,7 +347,7 @@ class AutoDegradeTest {
         assertEquals(ResolvedChannel.ROOT, s.resolvedGateway)
         assertEquals(Privilege.ROOT, s.execIdentity)
         assertTrue(s.writeReady)
-        assertTrue(s.readCap)
+        assertTrue(s.anyProbePassed)
         assertTrue("no degrade when ROOT is proven, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
     }
 
@@ -450,7 +456,7 @@ class AutoDegradeTest {
     // Phase 2 (mirror of explicit_shizukuNeverCrossesToRoot): explicit ROOT +
     // only Shizuku proven -> stays ROOT, fail closed, never crosses to SHIZUKU.
     // P25 Item 3: explicit ROOT probes only su, so the proven-but-unprobed
-    // Shizuku is intentionally invisible (readCap false, routed NONE).
+    // Shizuku is intentionally invisible (anyProbePassed false, routed NONE).
     @Test
     fun explicit_rootNeverCrossesToShizuku() {
         val suFake = FakeSu(rootOk = false)
@@ -475,8 +481,8 @@ class AutoDegradeTest {
         assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         // P25 Item 3: Shizuku was intentionally never probed (explicit ROOT
-        // probes su only), so readCap reflects the probed subset only.
-        assertFalse("unprobed Shizuku must not count toward readCap", s.readCap)
+        // probes su only), so anyProbePassed reflects the probed subset only.
+        assertFalse("unprobed Shizuku must not count toward anyProbePassed", s.anyProbePassed)
         assertEquals(Privilege.NONE, s.privilege)
         assertEquals("explicit ROOT must not probe Shizuku", 0, shizukuFake.listUsersCalls)
     }
@@ -509,7 +515,7 @@ class AutoDegradeTest {
         assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertEquals(Privilege.NONE, s.privilege)
-        assertFalse("unprobed su must not count toward readCap", s.readCap)
+        assertFalse("unprobed su must not count toward anyProbePassed", s.anyProbePassed)
         assertEquals("explicit SHIZUKU must never run `su -c id -u`", 0, suFake.idUCalls)
     }
 
@@ -855,5 +861,90 @@ class AutoDegradeTest {
         assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
         assertFalse("NoOp placeholder is never writable", vm.state.value.writeReady)
         assertFalse("NoOp placeholder is never channelReady", vm.state.value.channelReady)
+        assertFalse("LSPOSED probes none, so no probe passes", vm.state.value.anyProbePassed)
+    }
+
+    // P25 Item 4 (counter-example A): `id -u == 0` proves the su probe while
+    // `pm list users` still fails. anyProbePassed is true (probe signal) but
+    // the PM list is unreadable: refresh must report ChannelError. The flag
+    // therefore never claims PM readability; readability is decided by
+    // refresh (profilesSnapshot) and writeReady is only the probe gate.
+    @Test
+    fun anyProbePassed_rootIdOkPmFail_doesNotImplyReadable() {
+        val suFake = FakeSu(rootOk = true)
+        suFake.pmListOk = false
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+
+        val probed = vm.state.value
+        assertTrue("su `id -u == 0` proves the probe", probed.anyProbePassed)
+        // Probe gate only: `id -u` passed, so the selected channel counts as
+        // proven even though `pm list users` is unreadable. This true value
+        // must not be read as "PM readable".
+        assertTrue("probe gate passes on `id -u == 0`", probed.writeReady)
+        assertEquals(Privilege.ROOT, probed.privilege)
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertTrue("probe flag stays true while PM is unreadable", s.anyProbePassed)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue("PM unreadable must surface as channel error, got: \"${s.msg}\"", s.msg.contains("channel error"))
+        assertTrue("unreadable PM lists no profiles", s.profiles.isEmpty())
+    }
+
+    // P25 Item 4 (counter-example B): the environment holds capabilities
+    // (both su and Shizuku would prove) but explicit LSPOSED probes none, so
+    // anyProbePassed stays false and the NoOp repo stays unreadable. The flag
+    // reflects only the selected subset, never the unprobed environment; PM
+    // readability is decided by refresh (ChannelError here).
+    @Test
+    fun anyProbePassed_explicitLsposedEnvCapable_staysFalseAndUnreadable() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            initialGateway = NoOpGateway(),
+            preference = ChannelPreference.LSPOSED,
+        )
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        val probed = vm.state.value
+        assertFalse("LSPOSED probes none, so no probe passes despite env capability", probed.anyProbePassed)
+        assertFalse("NoOp placeholder is never writable", probed.writeReady)
+        assertEquals(Privilege.NONE, probed.privilege)
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertFalse("probe flag stays false for the unprobed subset", s.anyProbePassed)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue("placeholder repo is unreadable, got: \"${s.msg}\"", s.msg.contains("channel error"))
     }
 }

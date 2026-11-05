@@ -384,9 +384,9 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         val readyMark = if (s.writeReady) "已就緒" else "未就緒（唯讀）"
-        val readMark = if (s.readCap) "可用" else "不可用"
+        val probeMark = if (s.anyProbePassed) "探測通過" else "探測未通過"
         privilegeView.text = "權限：${s.execIdentity}（實際通道 ${s.resolvedGateway}" +
-            "・$readyMark；裝置路由 ${s.privilege}・讀取$readMark）"
+            "・$readyMark；裝置路由 ${s.privilege}・$probeMark）"
         // Title mirrors the actual execution identity (not the routed
         // summary) for quick manual verification.
         title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
