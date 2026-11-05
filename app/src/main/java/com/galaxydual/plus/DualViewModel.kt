@@ -154,7 +154,7 @@ data class PendingRemove(
 
 // PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
 //
-// 階段 1 仍走既有單筆 cloneVerified (逐包呼叫,見 cloneSelected),不引入
+// 批次走 `cloneVerifiedExpected` 原子 pin 逐項 (見 cloneSelected)，不引入
 // 新的批次寫入通道 (留待 #21/#22/#23/#24/#27 完備後的後續階段)。
 // - outcome 直接沿用 CloneOutcome (成功/部分成功/unknown 分流與單筆一致)。
 // - appKey 為勾選時的來源身分鍵 (serial:package);pkg 為實際寫入包名。

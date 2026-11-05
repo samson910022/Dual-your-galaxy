@@ -105,7 +105,7 @@ class MainActivity : ComponentActivity() {
     // PR-7 P2 (#26, 階段 1):個人來源唯讀 catalog + 勾選。
     // searchInput/系統開關只改 UiState 搜尋狀態；清單列為 CheckBox (唯讀展示
     // + 勾選,取消勾選 ≠ 卸載)；batchBtn 顯示「建立 N 個分身」,走
-    // vm.cloneSelected (既有單筆 cloneVerified 逐項,見 DualViewModel)。
+    // vm.cloneSelected (cloneVerifiedExpected 原子 pin 逐項,見 DualViewModel)。
     private lateinit var searchInput: EditText
     private lateinit var systemToggleBtn: Button
     private lateinit var selectAllBtn: Button
@@ -436,8 +436,8 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showDiagnosticExport() }
         }
         // PR-7 P2 (#26, 階段 1):個人來源 catalog 搜尋/勾選區。
-        // 唯讀展示 + 勾選；batchBtn 顯示「建立 N 個分身」,走既有單筆
-        // cloneVerified 逐項 (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
+        // 唯讀展示 + 勾選；batchBtn 顯示「建立 N 個分身」,走
+        // cloneVerifiedExpected 原子 pin 逐項 (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
         searchInput = EditText(this).apply {
             hint = "搜尋應用名稱 / 包名"
             layoutParams = LinearLayout.LayoutParams(

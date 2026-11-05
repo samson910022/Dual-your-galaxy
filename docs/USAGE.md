@@ -211,10 +211,13 @@ adb shell pm uninstall --user <dualId> com.example.chat
   來源清單載入失敗時保留舊列表（不清空），並顯示獨立錯誤行（與「尚未載入」區分），「重新連線並更新」按鈕會同步重試 catalog 載入；「系統應用」開關的無障礙描述隨顯示中／已隱藏狀態同步更新。
 - 批次按鈕計數與部分成功解讀：按鈕顯示「建立 N 個分身」（N＝目前勾選數，無勾選時禁用；
   批次執行中勾選區與相關按鈕一律禁用，不可中途改勾選）。
-  執行走既有單筆 `cloneVerified` 逐項（包名升冪確定順序），結果分成功／失敗／未知三類：
-  成功才加入 `cloned`，失敗（含 catalog 缺失的 `InvalidPackage`）與未知（需重查）分開列出，
+  執行走 `cloneVerifiedExpected(pkg, expectedId, expectedSerial)` 原子 pin 逐項（包名升冪確定順序），結果分成功／失敗／未知三類：
+  成功才加入 `cloned`，失敗（含 catalog 缺失的 `InvalidPackage`）與未知（需重查）分開列出；
+  批次起始先檢查選取綁定目標與裝置當前目標一致（`selectionBoundTarget == expectedTarget`，含未綁定哨兵與 legacy id-only），
+  不一致則整批拒絕並清空選取（`INVALID`「選取已綁定舊目標，已清空，請重新勾選確認」，零寫入）；
+  逐項 pin 發現目標漂移時立即停止（漂移本身不記為條目，已完成項保留為 partial，診斷為 `VERIFY_MISMATCH`），
   部分成功如實呈現（例「成功 1 / 失敗 1 / 未知 0」）；全成功清診斷事件，否則留彙總診斷；
-  只要有 ≥1 成功即把清單標 STALE（保留 targetId 供追溯，不自動重查）。
+  成功或未知（可能已寫入未驗證）即把清單標 STALE；目標漂移時無條件 STALE 並更新為 live target、清空選取（同目標變更處理）。
   唯讀／佔位通道整批拒絕（不產生報告）；勾選變更後舊報告即清（stale 報告不保留）。
 - 重啟恢復行為：重啟後新 ViewModel＋同一持久化，恢復只打勾（永不自動執行 clone），
   只恢復仍在目前 catalog 的 key（已卸載的包自動捨去），且同一目標只恢復一次；
