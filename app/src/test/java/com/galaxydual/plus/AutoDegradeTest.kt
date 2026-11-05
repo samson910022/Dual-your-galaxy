@@ -43,6 +43,17 @@ class AutoDegradeTest {
 
         // Counts `pm list users` calls so tests can prove a re-probe ran.
         @Volatile var listUsersCalls = 0
+        @Volatile var uninstallCalls = 0
+        var uninstallOut = "Success"
+        var uninstallExit = 0
+        // Stateful installed set (mirrors RemoveConfirmTest FakeRepoGateway):
+        // verifyState reads `pm list packages` ground truth. Default contains
+        // the chat pkg used by the pending tests.
+        val installedPkgs = mutableSetOf("com.example.chat")
+        // Agreed platform serial for the dual profile on both verbose
+        // channels (serial binding); noSerial omits both serial lines.
+        var serial: Int = 15
+        var noSerial: Boolean = false
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -54,7 +65,7 @@ class AutoDegradeTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: 15\n" +
+                (if (noSerial) "" else "    Serial: $serial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -62,9 +73,12 @@ class AutoDegradeTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$dualId:DualApp:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
+
+        private fun listPackagesOut(): String =
+            installedPkgs.map { "package:$it" }.joinToString("\n")
 
         override suspend fun run(cmd: String): CmdResult = when {
             cmd.trim() == "id -u" ->
@@ -81,8 +95,14 @@ class AutoDegradeTest {
                 CmdResult(exit = 0, out = dumpsysOut(), err = "")
             cmd == DualRepository.CMD_GETPROP_DUAL ->
                 CmdResult(exit = 0, out = "$dualId\n", err = "")
+            cmd.startsWith("pm uninstall") -> {
+                uninstallCalls++
+                val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                if (uninstallExit == 0) installedPkgs.remove(pkg)
+                CmdResult(exit = uninstallExit, out = uninstallOut, err = "")
+            }
             cmd.startsWith("pm list packages") ->
-                CmdResult(exit = 0, out = "", err = "")
+                CmdResult(exit = 0, out = listPackagesOut(), err = "")
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
     }
@@ -93,6 +113,16 @@ class AutoDegradeTest {
 
         // Counts `pm list users` calls so tests can prove a re-probe ran.
         @Volatile var listUsersCalls = 0
+        @Volatile var uninstallCalls = 0
+        var uninstallOut = "Success"
+        var uninstallExit = 0
+        // Stateful installed set (mirrors RemoveConfirmTest FakeRepoGateway):
+        // verifyState reads `pm list packages` ground truth.
+        val installedPkgs = mutableSetOf("com.example.chat")
+        // Agreed platform serial for the dual profile on both verbose
+        // channels (serial binding); noSerial omits both serial lines.
+        var serial: Int = 15
+        var noSerial: Boolean = false
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -104,7 +134,7 @@ class AutoDegradeTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: 15\n" +
+                (if (noSerial) "" else "    Serial: $serial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -112,9 +142,12 @@ class AutoDegradeTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$dualId:DualApp:400}" + (if (noSerial) "" else " serialNo=$serial") + ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
+
+        private fun listPackagesOut(): String =
+            installedPkgs.map { "package:$it" }.joinToString("\n")
 
         override suspend fun run(cmd: String): CmdResult = when {
             cmd == DualRepository.CMD_LIST_USERS -> {
@@ -131,8 +164,17 @@ class AutoDegradeTest {
             cmd == DualRepository.CMD_GETPROP_DUAL ->
                 if (shizukuOk) CmdResult(exit = 0, out = "$dualId\n", err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
+            cmd.startsWith("pm uninstall") -> {
+                if (!shizukuOk) CmdResult(exit = 1, out = "", err = "denied")
+                else {
+                    uninstallCalls++
+                    val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                    if (uninstallExit == 0) installedPkgs.remove(pkg)
+                    CmdResult(exit = uninstallExit, out = uninstallOut, err = "")
+                }
+            }
             cmd.startsWith("pm list packages") ->
-                if (shizukuOk) CmdResult(exit = 0, out = "", err = "")
+                if (shizukuOk) CmdResult(exit = 0, out = listPackagesOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
             else -> if (shizukuOk) CmdResult(exit = 0, out = "ok", err = "")
             else CmdResult(exit = 1, out = "", err = "denied")
@@ -459,6 +501,9 @@ class AutoDegradeTest {
     fun auto_repoFollowsDegrade() {
         val suFake = FakeSu(rootOk = false)
         val shizukuFake = FakeShizuku(shizukuOk = true)
+        // This fixture wants the empty-listing branch; the fakes default to
+        // installed (for the requestRemove pending tests), so clear here.
+        shizukuFake.installedPkgs.clear()
         val vm = makeAutoVm(
             suFake = suFake,
             shizukuFake = shizukuFake,
