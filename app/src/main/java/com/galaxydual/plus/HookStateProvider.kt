@@ -19,7 +19,7 @@
 // BOTH paths (unioned): a scope recorded via either write path is honored,
 // and the fixed order is primary-then-fallback everywhere.
 //
-// Read strategy (both readHookState and readHookStateWithGateway):
+// Read strategy (readHookState / readHookStateWithGateway, legacy two-state):
 //  1. direct File reads of both paths (most likely SELinux-denied for the app
 //     uid; denial reads as absent, never as active);
 //  2. only in readHookStateWithGateway, and only when `gateway` is non-null
@@ -30,6 +30,19 @@
 //     garbage output, throwing gateway, NONE privilege) maps to "not
 //     detected", never to active, never throws.
 //
+// P1 diagnostic split (issue #6, 沿襲 #19, 配合 #27): the legacy functions
+// above conflate "unreadable" with "absent" (both inactive), which makes an
+// explicit-LSPosed selection -- whose NoOp gateway can never `cat` --
+// permanently display "not detected" even when system_server wrote the
+// marker (false negative: the only hook signal loses observability). The new
+// diagnoseHookState below separates DIAGNOSTIC reading from WRITE-gateway
+// readiness: it takes direct reads plus INDEPENDENT diagnostic gateways
+// (probe-verified real channels; DualViewModel filters by hasRoot/hasShizuku
+// so an LSPosed/NoOp SELECTION never blocks diagnosis) and returns a
+// four-state HookDiagnosis -- ACTIVE / INACTIVE / UNKNOWN_UNREADABLE /
+// UNKNOWN_NO_DIAGNOSTIC. Unknown is never displayed as "not detected".
+// Diagnosis never feeds routing (hasLsposed stays false) or channelReady.
+//
 // Honesty (DEVICE-UNVERIFIED, pending real-device validation):
 // - staleness: the marker survives reboots, so a stale file can read active
 //   after the module was disabled until a hook process rewrites it. The UI
@@ -37,8 +50,10 @@
 //   live hook; a boot-time comparison stays future work (see HookMarker).
 // - SELinux: the app uid may be unable to directly read either path on some
 //   ROMs, and the gateway-`cat` round-trip has never run on a device either.
-//   Unreadable/missing/garbage reads as inactive ("not detected"), never as
-//   active. The LSPosed gateway stays the NoOp placeholder either way.
+//   Legacy two-state reads map unreadable/missing/garbage to inactive ("not
+//   detected"), never to active; diagnoseHookState instead reports
+//   unreadable/no-path as UNKNOWN (never "not detected"). The LSPosed
+//   gateway stays the NoOp placeholder either way.
 package com.galaxydual.plus
 
 import com.galaxydual.core.CmdGateway
@@ -154,3 +169,134 @@ fun HookState.displayText(): String =
     } else {
         "未偵測到"
     }
+
+// P1 hook diagnosis state (issue #6, 配合 #27): ACTIVE needs a readable
+// marker with a non-empty scope set; INACTIVE needs POSITIVE readable
+// evidence of absence (every examined path positively checked, no scopes);
+// UNKNOWN_UNREADABLE means a diagnostic path existed but could not be read
+// (EACCES-style denial, failed `cat`); UNKNOWN_NO_DIAGNOSTIC means no usable
+// diagnostic path existed at all (direct reads denied/missing AND no
+// probe-verified real gateway to `cat` through). At minimum unknown is kept
+// distinct from inactive so the UI never reports "not detected" for a signal
+// it could not observe.
+enum class HookStatus {
+    ACTIVE,
+    INACTIVE,
+    UNKNOWN_UNREADABLE,
+    UNKNOWN_NO_DIAGNOSTIC,
+}
+
+// Diagnosis snapshot for one UI render. `active` mirrors status == ACTIVE so
+// legacy hookActive consumers keep working; `viaGateway` records whether the
+// verdict came from a privileged `cat` (diagnostics only). Carries no
+// Privilege and no readiness flag by construction: diagnosis output cannot
+// grant privilege (hook-neutral, #19).
+data class HookDiagnosis(
+    val status: HookStatus,
+    val scopes: Set<String> = emptySet(),
+    val raw: String? = null,
+    val viaGateway: Boolean = false,
+) {
+    val active: Boolean get() = status == HookStatus.ACTIVE
+}
+
+// One direct-read attempt: Readable(raw) means the check itself succeeded
+// (raw == null: file positively absent; non-null: content as read, even
+// blank/garbage which then parses to no scopes); Denied means the check
+// failed (EACCES/SELinux denial included) so absence cannot be claimed. The
+// injectable seam lets JVM tests simulate on-device denial without chmod.
+sealed interface MarkerRead {
+    data class Readable(val raw: String?) : MarkerRead
+    object Denied : MarkerRead
+}
+
+// IO: one direct attempt at a marker file. Missing files map to
+// Readable(null) (positive absence); only failing reads map to Denied. Never
+// throws.
+fun readDirectMarker(file: File): MarkerRead {
+    return try {
+        if (!file.isFile) MarkerRead.Readable(null) else MarkerRead.Readable(file.readText())
+    } catch (_: Exception) {
+        MarkerRead.Denied
+    }
+}
+
+// Production direct reads of BOTH marker paths (primary then fallback).
+fun defaultDirectMarkerReads(): List<MarkerRead> =
+    listOf(
+        readDirectMarker(File(HookMarker.MARKER_PATH)),
+        readDirectMarker(File(HookMarker.LEGACY_MARKER_PATH)),
+    )
+
+// IO, suspend: full diagnostic read -- direct reads first, then `cat` over
+// each SHELL/ROOT-privilege diagnostic gateway (NONE gateways are never
+// executed, mirroring the legacy contract). Diagnostic gateways are
+// INDEPENDENT of the selected write channel: DualViewModel passes
+// probe-verified real gateways even when LSPosed/NoOp is selected, so an
+// explicit-LSPosed choice still diagnoses via any available true channel.
+// Never throws: every failure mode maps to an UNKNOWN state, never to a
+// fake active or a fake inactive.
+//
+// Decision order:
+//  1. direct (or gateway) scopes non-empty -> ACTIVE (direct wins, no exec);
+//  2. a privileged gateway positively read BOTH paths with no scopes, or
+//     every direct path was positively checked with no scopes -> INACTIVE;
+//  3. a gateway was attempted but nothing positively read -> UNKNOWN_UNREADABLE;
+//  4. otherwise (direct denied/missing, no usable gateway) -> UNKNOWN_NO_DIAGNOSTIC.
+suspend fun diagnoseHookState(
+    directReads: List<MarkerRead>,
+    diagnosticGateways: List<CmdGateway> = emptyList(),
+): HookDiagnosis {
+    val directScopes = directReads
+        .filterIsInstance<MarkerRead.Readable>()
+        .fold(emptySet<String>()) { acc, read -> acc + HookMarker.parseScopes(read.raw) }
+    if (directScopes.isNotEmpty()) {
+        val raw = directReads.filterIsInstance<MarkerRead.Readable>().firstOrNull { HookMarker.parseScopes(it.raw).isNotEmpty() }?.raw
+        return HookDiagnosis(HookStatus.ACTIVE, directScopes, raw, viaGateway = false)
+    }
+    val directComplete = directReads.isNotEmpty() && directReads.all { it is MarkerRead.Readable }
+    var attemptedGateway = false
+    var gatewayFullyEmpty = false
+    for (gateway in diagnosticGateways) {
+        if (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT) continue
+        attemptedGateway = true
+        val primaryRaw = catOrNull(gateway, HookMarker.MARKER_PATH)
+        val fallbackRaw = catOrNull(gateway, HookMarker.LEGACY_MARKER_PATH)
+        if (primaryRaw != null || fallbackRaw != null) {
+            val scopes = HookMarker.parseScopes(primaryRaw) + HookMarker.parseScopes(fallbackRaw)
+            if (scopes.isNotEmpty()) {
+                return HookDiagnosis(HookStatus.ACTIVE, scopes, primaryRaw ?: fallbackRaw, viaGateway = true)
+            }
+            if (primaryRaw != null && fallbackRaw != null) {
+                gatewayFullyEmpty = true
+            }
+        }
+    }
+    // A partial gateway read (only one path readable, no scopes) proves
+    // nothing about the other path: stay unknown, never claim inactive.
+    if (gatewayFullyEmpty) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
+    // Positive direct evidence stands even when a gateway attempt failed: a
+    // failed privileged retry cannot erase a completed direct check.
+    if (directComplete) return HookDiagnosis(HookStatus.INACTIVE)
+    if (attemptedGateway) return HookDiagnosis(HookStatus.UNKNOWN_UNREADABLE, viaGateway = true)
+    return HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
+}
+
+// IO overload reading the real marker files for the direct stage.
+suspend fun diagnoseHookState(
+    markerFile: File = File(HookMarker.MARKER_PATH),
+    fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
+    diagnosticGateways: List<CmdGateway> = emptyList(),
+): HookDiagnosis = diagnoseHookState(
+    listOf(readDirectMarker(markerFile), readDirectMarker(fallbackFile)),
+    diagnosticGateways,
+)
+
+// Pure UI text for a diagnosis. Unknown states NEVER render as "未偵測到"
+// (reserved for positively-read absence); they name the limitation instead.
+fun HookDiagnosis.displayText(): String = when (status) {
+    HookStatus.ACTIVE -> "已啟用（${scopes.sorted().joinToString(", ")}）"
+    HookStatus.INACTIVE -> "未偵測到"
+    HookStatus.UNKNOWN_UNREADABLE -> "狀態未知（無權限讀取）"
+    HookStatus.UNKNOWN_NO_DIAGNOSTIC -> "狀態未知（無可用診斷通道）"
+}
