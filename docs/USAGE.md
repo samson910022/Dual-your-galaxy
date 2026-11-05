@@ -82,19 +82,22 @@ Clone／Remove／Refresh／請求 Shizuku 授權按鈕＋四通道選擇按鈕�
 adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh
 ```
 
-## 3. 複製 / 移除流程（需雙源驗證，`--user <dualId>` 僅為格式佔位）
+## 3. 複製 / 移除 / 驗證 / 列表流程（需雙源驗證，`--user <dualId>` 僅為格式佔位）
 
 以下 `<dualId>` 僅為命令格式佔位，不是推薦目標，更不是「任意非零即雙開」。
 寫入前必須先完成雙源驗證：`cmd user list -v` 與 `dumpsys user` 兩個獨立通道
-在同一非零 id 上同時給出 `profile.CLONE` 型別（含 parent/serial 一致），
+在同一非零 id 上同時給出 `profile.CLONE` 型別（parent/serial 僅解析留證、
+不參與判定：serial != id 屬正常，parent 跨通道不一致目前不拒寫，待 #21 後續），
 且系統 property（`getprop sys.dualapp.profile_id`，若可讀）不與之矛盾；
 任一通道缺失、未知、衝突或歧義（多 CLONE／型別打架／property 打架）一律拒寫、
 拒讀，不猜「第一個非 0 的 id」、不認 label、不固定 95/150、不比整組 flags。
-App 內 `DualRepository`／雙 Elevator 探測即执行此契約（[已支援] PR-1 階段2）：
+App 內 `DualRepository`／雙 Elevator 探測即執行此契約（命令字串與 adapter 共用，fetch 經 `VerifiedIdentity.kt` 共用 fetch，[已支援] PR-1 階段2）：
 `resolveDualUserIdVerified(userListVerbose, dumpsysUser, propertyId)` 僅在
 `SamsungProfileAdapter.resolveDual() == Confirmed(HIGH)` 時回 id，否則 -1；
-explicit id 即使存在於 `pm list users`，只要不是當下 Confirmed 目標，
-clone/remove/verify/list 一律 `refused:`／`Unknown`／`null` fail-closed。
+explicit id 即使存在於 `pm list users`，只要不是當下 Confirmed 目標一律
+fail-closed：`clone`／`remove` 回 `refused:` `CmdResult(1)`、
+`verifyState` 回 `Unknown`、`verify` Boolean 回 `false`（已 `@Deprecated`）、
+`listClonedPackages` 回 `null`，不探測不寫入。
 `pm list users` 的名稱僅供顯示，永不進入授權判定；user 0 永遠不可作為寫入目標。
 此次 S24 的 95 為 Dual、150 為 Secure Folder，這不是其他機型的固定對照。
 
@@ -102,8 +105,9 @@ clone/remove/verify/list 一律 `refused:`／`Unknown`／`null` fail-closed。
 # 1. 雙源驗證（缺一不可；任一失敗即停手，不寫入不探測目標）：
 adb shell cmd user list -v
 #   每個 UserInfo{<id>:<label>:<flags>} 塊內找 User type 行：
-#   目標 id 的兩通道都必須是 android.os.usertype.profile.CLONE（大小寫/分隔符容忍），
-#   且 parentId 一致；label 含不含 DUAL 都不看，serial != id 屬正常。
+#   目標 id 的兩通道都必須是 android.os.usertype.profile.CLONE（大小寫/分隔符容忍）；
+#   parent/serial 僅解析留證、不參與判定（serial != id 屬正常；parent 跨通道
+#   不一致目前不拒寫，待 #21 後續）；label 含不含 DUAL 都不看。
 adb shell dumpsys user
 #   同一 id 在此通道同樣必須是 profile.CLONE；若此處是 SYSTEM/MANAGED/SECONDARY
 #   或無型別行，即與上一通道矛盾或證據不足 -> 拒寫。
@@ -127,7 +131,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - `install-existing` 僅對已存在於主 profile 的 package 有效；全新 APK 請先在主 profile 正常安裝一次。
 - 重啟注意（S24 OneUI 9 兩次觀察，假說待對照實驗）：`pm install-existing --user <dualId>` 建立的雙開連結在硬重啟、軟重啟後各消失一次（user 0 主包與完整安裝的雙開包不受影響）；疑為開機時 DualAppManager 對非白名單條目做對帳清理，恰為本 hook 要放寬的對象。重啟後請以 `pm list packages --user <dualId>` 複驗，消失即重裝。
 - 指令失敗時請看 `msg` 欄（`Failure` / `Unknown package` / `not installed` 皆視為失敗）。
-- 本 App 的 `DualRepository.clone/verify` 即為上述指令的程式化封裝（[已支援]：`core` 層＋單元測試＋JVM 組裝測試；App 真 gateway 與 readiness gating 已接線：`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed；目標解析為 PR-1 階段2雙源驗證＋失敗拒寫，label-only 舊路徑已 `@Deprecated`，`verify(pkg,dualId)` Boolean 已 `@Deprecated` 請改用 `verifyState`）。寫後確認以相同已驗證目標的 package listing 為準，不再只用 `pm path`（`pm path` 僅輔助診斷，不能當主驗證），錯誤／截斷判定仍待 #22。[S24 已驗證]僅限 App ROOT 一鍵、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、`su -c` 重裝、uninstall 回滾，詳見 §0 與 [S24 調查](UX_REVIEW_S24.md) §5；App ROOT 之外的完整 binder／授權矩陣、App 內 Shizuku 未授權路徑／首次選路、marker gateway-`cat` 顯示及當前 source 可追溯部署仍 [待實機驗證]。
+- 本 App 的 `DualRepository.clone/remove/verifyState/list` 即為上述指令的程式化封裝（[已支援]：`core` 層＋單元測試＋JVM 組裝測試；App 真 gateway 與 readiness gating 已接線：`SuCmdGateway` 經 `su -c`／`ShizukuCmdGateway` 經 UserService＋`channelReady` 探測 gating＋選不到回 `NoOp` fail-closed；目標解析為 PR-1 階段2雙源驗證＋失敗拒寫，label-only 舊路徑已 `@Deprecated`，`verify(pkg,dualId)` Boolean 已 `@Deprecated` 請改用 `verifyState`）。寫後確認（`cloneVerified`／`removeVerified`）以相同已驗證目標的 package listing 為準，不再只用 `pm path`（`pm path` 僅輔助診斷，不能當主驗證；plain `clone()`／`remove()` 無內建 re-check），錯誤／截斷判定仍待 #22。[S24 已驗證]僅限 App ROOT 一鍵、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、`su -c` 重裝、uninstall 回滾，詳見 §0 與 [S24 調查](UX_REVIEW_S24.md) §5；App ROOT 之外的完整 binder／授權矩陣、App 內 Shizuku 未授權路徑／首次選路、marker gateway-`cat` 顯示及當前 source 可追溯部署仍 [待實機驗證]。
 
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 

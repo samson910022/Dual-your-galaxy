@@ -63,6 +63,8 @@ UI 調查只開啟本 App、喚醒／收合系統遮罩及捲動；未輸入憑�
 
 `dumpsys` 的顯示 label 與 `pm list users` 不同，不能互換格式後依名稱授權。當前 `PmOutputParser.resolveDualUserId()` 仍只用非零 ID＋label contains DUAL；explicit-ID guard 又只要求存在。
 
+> 註（2026-11-05，PR-1 stage 2 後）：上段描述的是 b3d4843（PR 前）基準，現已改為雙源 CLONE 驗證＋ explicit verified guard（見 USAGE §3）：label-only 路徑已 `@Deprecated`，explicit id 須為當下 Confirmed 目標否則 fail-closed。原文保留作歷史對照。
+
 本機這次正常快照會選對目標，**沒有實機選錯／誤刪的證據**。待修的是接受條件與負向邊界。不能只換成固定95／150、整組 flags、CLONE 型別或單一 property。root XML 只作診斷佐證，不應成為一般 Shizuku 使用的必要依賴。
 
 ### 4.2 `pm` 的乾淨空結果與錯誤要分開

@@ -123,9 +123,9 @@ object PmOutputParser {
     private val ALREADY_EXISTS =
         Regex("install_failed_already_exists", RegexOption.IGNORE_CASE)
 
-    // Shared dual-profile safety boundary (Phase C1, issue #2, P0).
-    // Single source of truth used by DualRepository.resolveDualUserId() and both
-    // Elevator probes; previously each had its own copy with an unsafe fallback.
+    // Legacy dual-profile safety boundary (Phase C1, issue #2, P0; historical).
+    // Superseded by resolveDualUserIdVerified() below (PR-1 stage 2): the
+    // single source of truth is now the shared fetch in VerifiedIdentity.kt,
     // Policy (refuse writes rather than guess the target):
     // - Only an explicit DUAL label hit counts; there is NO "first non-zero user"
     //   fallback (that could pick a Work profile or any unrelated user).
