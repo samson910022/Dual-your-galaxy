@@ -5,9 +5,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// PR-2 stage 1 (issue #22): trusted tri-state parse for `pm list packages`.
-// Additive only: covers parsePackagesTrusted without touching the existing
-// parsePackages/isSuccess/verify behavior. Pure Kotlin, no device required.
+// PR-2 (issue #22): trusted tri-state parse for `pm list packages`.
+// Covers parsePackagesTrusted (consumed since stage 2 by
+// verifyListProbe/listProbe); parsePackages/isSuccess keep exact behavior.
+// Pure Kotlin, no device required.
 class ParseTrustedTest {
     // exit 0 + dirty out text -> Unknown (not TrustedEmpty).
     @Test
@@ -103,7 +104,7 @@ class ParseTrustedTest {
     }
 
     // Truncated capture -> Unknown even when the visible slice looks clean.
-    // Covers both the explicit flag and the legacy "[truncated]" marker text
+    // Covers both the explicit flag and the legacy TRUNCATION_MARKER text
     // (callers that still build CmdResult without the flag).
     @Test
     fun truncated_isUnknown() {
@@ -124,7 +125,7 @@ class ParseTrustedTest {
         assertTrue("expected Unknown, got $flaggedEmpty", flaggedEmpty is TrustedList.Unknown)
 
         val marker = PmOutputParser.parsePackagesTrusted(
-            out = "package:com.example.chat\n[truncated]",
+            out = "package:com.example.chat\n$TRUNCATION_MARKER",
             err = "",
             exit = 0,
             truncated = false,
@@ -214,7 +215,7 @@ class ParseTrustedTest {
 
     // P22 fix M1 err side: a non-blank err stream with zero packages is a
     // dirty channel -> Unknown (fail closed), even when no error keyword
-    // matches. Also covers the err-side [truncated] marker.
+    // matches. Also covers the err-side TRUNCATION_MARKER.
     @Test
     fun dirtyErrWithoutErrorKeyword_isUnknown() {
         val res = PmOutputParser.parsePackagesTrusted(
@@ -231,7 +232,7 @@ class ParseTrustedTest {
 
         val marker = PmOutputParser.parsePackagesTrusted(
             out = "",
-            err = "partial output\n[truncated]",
+            err = "partial output\n$TRUNCATION_MARKER",
             exit = 0,
             truncated = false,
         )
@@ -255,6 +256,10 @@ class ParseTrustedTest {
         assertTrue(
             "truncated must win, got: \"${(res as TrustedList.Unknown).reason}\"",
             res.reason.startsWith("truncated"),
+        )
+        assertTrue(
+            "truncated + non-zero must keep exit, got: \"${(res as TrustedList.Unknown).reason}\"",
+            res.reason.contains("exit=1"),
         )
     }
 

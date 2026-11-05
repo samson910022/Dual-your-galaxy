@@ -19,6 +19,7 @@ package com.galaxydual.plus
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
+import com.galaxydual.core.TRUNCATION_MARKER
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
@@ -67,18 +68,28 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = isCapped(out))
+        // Honest flag: the process was killed mid-stream, so the capture is
+        // incomplete by construction even when nothing hit the cap. exit=1,
+        // so parser outcomes are unchanged (Unknown either way).
+        return CmdResult(exit = 1, out = capped(out), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true)
     }
     if (!exited) {
         proc.destroyForcibly()
         drainOut.join(2_000)
         drainErr.join(2_000)
-        return CmdResult(exit = 1, out = capped(out), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = isCapped(out))
+        // Same honest-flag reasoning as the interrupt path above: killed
+        // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
+        return CmdResult(exit = 1, out = capped(out), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true)
     }
     drainOut.join(5_000)
     drainErr.join(5_000)
-    return CmdResult(exit = proc.exitValue(), out = capped(out), err = capped(err), truncated = isCapped(out) || isCapped(err))
+    return result(proc.exitValue(), out, err)
 }
+
+// Single construction point for the steady-state path: truncated is derived
+// from the same cap test as capped() so flag and marker can never disagree.
+private fun result(exit: Int, out: StringBuilder, err: StringBuilder): CmdResult =
+    CmdResult(exit = exit, out = capped(out), err = capped(err), truncated = isCapped(out) || isCapped(err))
 
 // Reads all of input into sink up to MAX_CAPTURE_CHARS; closes the stream.
 // Truncation marker included so callers can tell capped output apart.
@@ -101,11 +112,16 @@ private fun drainCapped(input: java.io.InputStream, sink: StringBuilder) {
 }
 
 private fun capped(sink: StringBuilder): String =
-    if (isCapped(sink)) sink.toString() + "\n[truncated]" else sink.toString()
+    if (isCapped(sink)) sink.toString() + "\n$TRUNCATION_MARKER" else sink.toString()
 
-// PR-2 stage 1 (issue #22, additive only): mirrors the capped() cap test so
-// captureProcess can set CmdResult.truncated without sniffing text. True iff
-// this stream hit MAX_CAPTURE_CHARS and capped() appended "[truncated]".
+// Mirrors the capped() cap test so captureProcess/result() can set
+// CmdResult.truncated without sniffing text (PR-2, issue #22; consumed since
+// stage 2 via PmOutputParser.parsePackagesTrusted). True iff this stream hit
+// MAX_CAPTURE_CHARS and capped() appended the marker.
+// Off-by-one note (deliberate, fail closed): drainCapped() stops AT the cap,
+// so a stream can only reach length == MAX, never exceed it; treating the
+// exact-equality case as capped may flag a stream that ended precisely on the
+// boundary without loss, but never misses a real cut. cap test unchanged (interrupt/timeout flag intentionally true).
 private fun isCapped(sink: StringBuilder): Boolean =
     sink.length >= MAX_CAPTURE_CHARS
 

@@ -1,20 +1,28 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
+// Capture-truncation marker appended by capture helpers when the per-stream
+// cap bites (PR-2, issue #22). Single source of truth: gateways append
+// "\n$TRUNCATION_MARKER" via capped() and parsers sniff it via
+// PmOutputParser.parsePackagesTrusted (legacy text fallback for callers that
+// still build CmdResult without the flag). Changing this string requires both
+// sides to change together.
+const val TRUNCATION_MARKER = "[truncated]"
+
 // Result of a single command execution via a gateway.
 // exit is the process exit code (0 means success on shell/ROOT channels).
 data class CmdResult(
     val exit: Int,
     val out: String,
     val err: String,
-    // Capture-truncation flag (PR-2 stage 1, issue #22, additive only).
+    // Capture-truncation flag (PR-2, issue #22).
     // Contract: capture helpers cap each stream at MAX_CAPTURE_CHARS and
-    // append a "\n[truncated]" marker when the cap bites; whenever the marker
+    // capped() appends newline + TRUNCATION_MARKER when the cap bites; whenever the marker
     // is appended the producer must also set truncated=true so parsers can
     // tell "clean empty" apart from "output was cut off" without sniffing
     // text. Defaults to false so every existing CmdResult(...) call site
-    // keeps compiling and keeps its old meaning; no caller behavior changes
-    // in this stage (verify/list still ignore the flag until stage 2).
+    // keeps compiling and keeps its old meaning. Consumed since stage 2:
+    // verify/list judge the flag via PmOutputParser.parsePackagesTrusted.
     val truncated: Boolean = false,
 ) {
     // Backward-compatible aliases for the older field names.

@@ -36,6 +36,7 @@ import android.os.Parcel
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
+import com.galaxydual.core.TRUNCATION_MARKER
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -52,11 +53,13 @@ import rikka.shizuku.Shizuku
 // Reply layout (no exception header on purpose): int exit, String stdout,
 // String stderr. The client must NOT call reply.readException(): a non-zero
 // exit word would be misread as an exception code.
-// PR-2 stage 1 (issue #22, additive only): the reply does NOT carry
-// CmdResult.truncated explicitly (layout frozen); the client re-derives it
-// from TRUNCATION_MARKER below. Service-side captureProcess already sets the
-// flag, but only the marker survives the parcel.
-internal const val TRUNCATION_MARKER = "[truncated]"
+// The reply does NOT carry CmdResult.truncated explicitly (layout frozen);
+// the client re-derives it from the core TRUNCATION_MARKER.
+// Service-side captureProcess already sets the flag, but only the marker
+// text survives the parcel. Cross-reference: the marker text is produced by
+// capped() in SuCmdGateway.kt from the same core constant -- single import,
+// so the change is atomic; old wire payloads stay compatible (test literals
+// were unified to the constant for style).
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
@@ -67,6 +70,8 @@ object ShizukuExecProtocol {
 // Pure error mapping for every Shizuku-side failure: binder dead, missing
 // authorization, bind failure, remote failure, timeout. All exit != 0 with an
 // explicit message; pure Kotlin so GatewayAssemblyTest covers it on the JVM.
+// No truncated flag needed here: every case is exit != 0, which the trusted
+// parser already maps to Unknown without consulting the flag.
 object ShizukuExecErrors {
     fun noBinder(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: binder not connected (install/start Shizuku first)")
@@ -241,12 +246,13 @@ class ShizukuCmdGateway(
                         // No readException(): the service writes a raw int exit
                         // first, which readException would misread as an
                         // exception code on any non-zero exit.
-                        // PR-2 stage 1 (issue #22, additive only): the service
-                        // side caps via captureProcess and appends the
-                        // "\n[truncated]" marker, but the wire layout only
-                        // carries (exit, stdout, stderr). Mirror the marker
-                        // into CmdResult.truncated so parsers can tell "clean
-                        // empty" from "cut off" without changing any caller.
+                        // The service side caps via captureProcess and appends the
+                        // "\n[truncated]" marker (core TRUNCATION_MARKER, see
+                        // capped() in SuCmdGateway.kt), but the wire layout
+                        // only carries (exit, stdout, stderr). Mirror the
+                        // marker into CmdResult.truncated so parsers can tell
+                        // "clean empty" from "cut off" without changing any
+                        // caller.
                         val execExit = reply.readInt()
                         val execOut = reply.readString() ?: ""
                         val execErr = reply.readString() ?: ""
