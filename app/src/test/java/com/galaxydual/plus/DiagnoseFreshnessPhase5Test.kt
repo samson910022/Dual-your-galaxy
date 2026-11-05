@@ -60,6 +60,10 @@ class DiagnoseFreshnessPhase5Test {
         var sawUninstall: Boolean = false,
         // P2-8：超長輸入拒絕不斷言 install/uninstall 用。
         var sawInstall: Boolean = false,
+        // M2 pm 否決測試用：divergentPmExtra=true 時 pm 快照 {0,10,95}，
+        // typed 雙通道 {0,10} OTHER（乾淨無 clone），prop 乾淨空聲明。
+        // 無否決會誤判 Absent→NO_DUAL 清空；有否決須 Unknown→CHANNEL_ERROR 不清空。
+        var divergentPmExtra: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         var listUsersCalls = 0
@@ -72,6 +76,31 @@ class DiagnoseFreshnessPhase5Test {
 
         private fun ownerUsersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n"
+
+        // M2 分歧 pm 快照：{0,10,95}（typed 漏掉 95）。
+        private fun extraUsersOut(): String =
+            "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                "\tUserInfo{10:Work profile:30} running\n" +
+                "\tUserInfo{95:DualApp:400} running\n"
+
+        // M2 分歧 typed：{0,10} OTHER（乾淨無 clone，與 core NODUAL 同形）。
+        private fun nodualVerboseOut(): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} running:\n" +
+                "    Serial: 11\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.MANAGED\n"
+
+        private fun nodualDumpsysOut(): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{10:Work profile:30} serialNo=11:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.MANAGED\n"
 
         private fun verboseOut(id: Int): String =
             "Users:\n" +
@@ -114,6 +143,7 @@ class DiagnoseFreshnessPhase5Test {
                         failListUsers ->
                             CmdResult(exit = 0, out = "Failure [users failed]", err = "")
                         emptyUsers -> CmdResult(exit = 0, out = "Users:\n", err = "")
+                        divergentPmExtra -> CmdResult(exit = 0, out = extraUsersOut(), err = "")
                         ownerOnlyUsers -> CmdResult(exit = 0, out = ownerUsersOut(), err = "")
                         else -> CmdResult(exit = 0, out = usersOut(effId()), err = "")
                     }
@@ -121,17 +151,18 @@ class DiagnoseFreshnessPhase5Test {
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
                     CmdResult(
                         exit = 0,
-                        out = if (ownerOnlyTyped) ownerVerboseOut() else verboseOut(effId()),
+                        out = if (divergentPmExtra) nodualVerboseOut() else if (ownerOnlyTyped) ownerVerboseOut() else verboseOut(effId()),
                         err = "",
                     )
                 cmd == DualRepository.CMD_DUMPSYS_USER ->
                     CmdResult(
                         exit = 0,
-                        out = if (ownerOnlyTyped) ownerDumpsysOut() else dumpsysOut(effId()),
+                        out = if (divergentPmExtra) nodualDumpsysOut() else if (ownerOnlyTyped) ownerDumpsysOut() else dumpsysOut(effId()),
                         err = "",
                     )
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
-                    if (ownerOnlyTyped) CmdResult(exit = 0, out = "", err = "")
+                    if (divergentPmExtra) CmdResult(exit = 0, out = "", err = "")
+                    else if (ownerOnlyTyped) CmdResult(exit = 0, out = "", err = "")
                     else CmdResult(exit = 0, out = "${effId()}\n", err = "")
                 cmd.startsWith("pm install-existing") ->
                     CmdResult(exit = 0, out = "Success", err = "").also { sawInstall = true }
@@ -676,6 +707,16 @@ class DiagnoseFreshnessPhase5Test {
         assertEquals("格式化時間須原樣通過", timeFmt, redactPaths(timeFmt))
     }
 
+    // m4 regex 殘留鎖定（採 (a) 不改 regex）："/sdcard/a*b" 止於 *，殘留 "*b"，
+    // 但前段大部已遮（不得殘留 "/sdcard/a"）；不斷言裸 / 被遮（非敏感）。
+    @Test
+    fun redactPaths_globTail_residual() {
+        val r = redactPaths("denied /sdcard/a*b 結尾")
+        assertFalse("前段大部須遮，got: $r", r.contains("/sdcard/a"))
+        assertTrue("遮蔽標記須出現，got: $r", r.contains("<path>"))
+        assertTrue("星號尾巴殘留可接受並鎖定，got: $r", r.contains("*b"))
+    }
+
     // P2-4 匯出端到端：含空白/Unicode/引號路徑的技術細節經匯出不得洩 raw，
     // 且標題須含誠實文案「分享前請人工確認」（遮蔽非全面保證）。
     @Test
@@ -779,6 +820,24 @@ class DiagnoseFreshnessPhase5Test {
             InventoryFreshness.UNKNOWN,
             vm.state.value.inventory.freshness,
         )
+    }
+
+    @Test
+    fun refresh_pmExtraId_vetoesAbsent_keepsCloned() {
+        // M2 pm 否決：先在 95 世界 refresh 建立 cloned，再切分歧世界
+        //（verbose/dumpsys {0,10} OTHER＋prop 空，pm {0,10,95}）→須
+        // CHANNEL_ERROR 且不清空 cloned（無否決會誤報 NO_DUAL 清空）。
+        val gw = FakeRepo()
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertTrue("前置 refresh 須建立 cloned", vm.state.value.cloned.isNotEmpty())
+        gw.divergentPmExtra = true
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        assertTrue("pm 漏戶不得清空 cloned", vm.state.value.cloned.isNotEmpty())
     }
 
     @Test

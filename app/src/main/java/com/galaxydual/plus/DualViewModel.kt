@@ -926,7 +926,9 @@ class DualViewModel(
                     // 快照可用才報 NO_DUAL 並清空；其餘（Unknown 全域，含舊
                     // -1；或 Absent 但快照為空不可信）一律保留舊 cloned、報
                     // CHANNEL_ERROR，不謊稱無 dual。
-                    val idRes = onIo { repo.resolveDualUserIdTyped() }
+                    // M2 pm 否決：Absent 前 repo 另收 pm 戶集合否決 typed 漏戶
+                    //（null 表無快照不否決；此處快照可用故傳 profiles id 集合）。
+                    val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = profiles.map { it.userId }.toSet()) }
                     val dualId = (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
                     if (dualId <= NO_TARGET_ID) {
                         val now = nowWallMs()
@@ -1394,8 +1396,10 @@ class DualViewModel(
                             // 但空快照：快照本身已證通道有問題)。
                             // 理由 (M3 寫前拒絕誠實新鮮度)：FRESH 經 toStaleOrUnknown
                             // 降為 STALE (不清 cloned/lastOperation，只降新鮮度)。
+                            // M2 pm 否決：Absent 前傳 pm 戶集合（無快照傳 null 不否決）。
                             val snap = onIo { repo.profilesSnapshot() }
-                            val idRes = onIo { repo.resolveDualUserIdTyped() }
+                            val pmIds = (snap as? ProfilesSnapshot.Loaded)?.profiles?.map { it.userId }?.toSet()
+                            val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = pmIds) }
                             val snapshotUsable =
                                 (snap as? ProfilesSnapshot.Loaded)?.profiles?.isNotEmpty() == true
                             val confirmedAbsent =
@@ -1736,8 +1740,9 @@ class DualViewModel(
                                         // Loaded 空快照 (連 owner 都列不出，快照不可信)
                                         // ->CHANNEL_ERROR 且不清 cloned。
                                         // 理由 (M3)：寫前拒絕時 FRESH 降 STALE (不清 cloned/lastOperation)。
+                                        // M2 pm 否決：Absent 前傳 pm 戶集合否決 typed 漏戶。
                                         val snapshotUsable = snap.profiles.isNotEmpty()
-                                        val idRes = onIo { repo.resolveDualUserIdTyped() }
+                                        val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = snap.profiles.map { it.userId }.toSet()) }
                                         val confirmedAbsent =
                                             idRes is DualIdResolution.Absent && snapshotUsable
                                         val typedDetail =
@@ -2097,11 +2102,14 @@ class DualViewModel(
                         // M1 typed 鑑別：僅 Absent+快照可用才報 NO_DUAL；
                         // Unknown 一律 CHANNEL_ERROR + cannot confirm，
                         // msg/kind 與 diagnose 對齊 (不再自矛盾)。
-                        val idRes = onIo { repo.resolveDualUserIdTyped() }
+                        // M2 pm 否決：先取快照再鑑別，Absent 前傳 pm 戶集合
+                        //（無快照傳 null 不否決；兩次 IO 皆唯讀，順序不影響語意）。
+                        val snapForId = onIo { repo.profilesSnapshot() }
+                        val pmIdsForId = (snapForId as? ProfilesSnapshot.Loaded)?.profiles?.map { it.userId }?.toSet()
+                        val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = pmIdsForId) }
                         val freshId =
                             (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
                         if (freshId < 0) {
-                            val snapForId = onIo { repo.profilesSnapshot() }
                             val snapshotUsable =
                                 (snapForId as? ProfilesSnapshot.Loaded)
                                     ?.profiles?.isNotEmpty() == true
@@ -3807,15 +3815,24 @@ class DualViewModel(
         // phase1: 探測異常只在無 sticky 事件時才設 PROBE_FAILED (既有 diagnose
         // 如 VERIFY_UNKNOWN 等待重新查證者優先保留，避免探測抖動洗掉歷史)。
         // phase2: 鏈式呼叫保留 busy 交給 refreshLocked；獨立呼叫在此清除。
+        // m2 與正常路徑同形：sticky UNKNOWN lastOperation 時一律保留
+        // cur.diagnose（即使為 null 亦不寫 PROBE_FAILED，待 pinned verify
+        // 重查）；其餘才在 diagnose==null 時寫 PROBE_FAILED。
         if (e is CancellationException) throw e
         _state.update { cur ->
+            val probeDiagnose =
+                if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                    cur.diagnose
+                } else {
+                    cur.diagnose ?: diagnoseEvent(
+                        DiagnoseCode.PROBE_FAILED,
+                        techDetail = sanitizeForDisplay(e.message ?: "probe failed"),
+                    )
+                }
             val next = cur.copy(
                 loading = keepLoadingOnExit,
                 pmReadable = null,
-                diagnose = cur.diagnose ?: diagnoseEvent(
-                    DiagnoseCode.PROBE_FAILED,
-                    techDetail = sanitizeForDisplay(e.message ?: "probe failed"),
-                ),
+                diagnose = probeDiagnose,
                 msg = "probe failed: ${sanitizeForDisplay(e.message ?: "probe failed")}",
                 msgKind = MsgKind.FAILED,
             )

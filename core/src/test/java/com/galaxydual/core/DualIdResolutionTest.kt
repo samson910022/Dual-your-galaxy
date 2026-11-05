@@ -25,6 +25,7 @@ class DualIdResolutionTest {
         var propExit: Int = 0,
         var propErr: String = "",
         var propTruncated: Boolean = false,
+        var propThrows: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
 
@@ -33,8 +34,10 @@ class DualIdResolutionTest {
                 CmdResult(exit = verboseExit, out = verboseOut, err = verboseErr, truncated = verboseTruncated)
             DualRepository.CMD_DUMPSYS_USER ->
                 CmdResult(exit = dumpsysExit, out = dumpsysOut, err = dumpsysErr, truncated = dumpsysTruncated)
-            DualRepository.CMD_GETPROP_DUAL ->
+            DualRepository.CMD_GETPROP_DUAL -> {
+                if (propThrows) throw java.io.IOException("boom: $cmd")
                 CmdResult(exit = propExit, out = propOut, err = propErr, truncated = propTruncated)
+            }
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
     }
@@ -181,6 +184,65 @@ class DualIdResolutionTest {
         val res = runSuspend { repo.resolveDualUserIdTyped() }
         assertTrue("ALREADY_EXISTS identity body must be Unknown, got: $res", res is DualIdResolution.Unknown)
         assertEquals("canonical must agree (-1)", -1, runSuspend { repo.resolveDualUserId() })
+    }
+
+    @Test
+    fun propThrows_cleanTypedChannels_unknownNotAbsent() {
+        // M1 拋出 vs 乾淨空值區分：verbose/dumpsys 乾淨 NODUAL，但
+        // run(GETPROP) 拋（gateway 無回應）→直接 Unknown，不得與乾淨空輸出
+        //（prop="" 解析為 null 的無聲明）混同放行 Absent。
+        val repo = DualRepository(
+            FakeGateway(
+                verboseOut = NODUAL_VERBOSE,
+                dumpsysOut = NODUAL_DUMPSYS,
+                propThrows = true,
+            ),
+        )
+        val res = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("prop throw must be Unknown, got: $res", res is DualIdResolution.Unknown)
+        assertEquals("canonical Int must agree (-1)", -1, runSuspend { repo.resolveDualUserId() })
+    }
+
+    @Test
+    fun propZero_unknownNotAbsent() {
+        // m1 註解 vs 實作對齊 (a)：Absent 僅當 property 無具體指向，
+        // 「無具體指向」指解析為 null；任何非 null 含 0 但無 Confirmed
+        // 即為仍可能存在的 clone，一律 Unknown。
+        val repo = DualRepository(
+            FakeGateway(
+                verboseOut = NODUAL_VERBOSE,
+                dumpsysOut = NODUAL_DUMPSYS,
+                propOut = "0\n",
+            ),
+        )
+        val res = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("prop 0 must be Unknown, got: $res", res is DualIdResolution.Unknown)
+    }
+
+    @Test
+    fun pmExtraId_vetoesAbsent() {
+        // M2 pm 否決：verbose/dumpsys 皆 {0,10} OTHER 且集合一致，
+        // 但 pm 快照 {0,10,95} 多出 95（typed 漏戶）→Unknown，不得 Absent。
+        val repo = DualRepository(
+            FakeGateway(
+                verboseOut = NODUAL_VERBOSE,
+                dumpsysOut = NODUAL_DUMPSYS,
+                propOut = "",
+            ),
+        )
+        val vetoed = runSuspend { repo.resolveDualUserIdTyped(pmIds = setOf(0, 10, 95)) }
+        assertTrue("pm extra id must veto Absent, got: $vetoed", vetoed is DualIdResolution.Unknown)
+        // 對照：無快照（null）不否決，仍為 Absent；子集亦不否決。
+        assertEquals(
+            "null pm snapshot must not veto",
+            DualIdResolution.Absent,
+            runSuspend { repo.resolveDualUserIdTyped(pmIds = null) },
+        )
+        assertEquals(
+            "subset pm snapshot must not veto",
+            DualIdResolution.Absent,
+            runSuspend { repo.resolveDualUserIdTyped(pmIds = setOf(0, 10)) },
+        )
     }
 
     companion object {
