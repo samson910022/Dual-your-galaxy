@@ -873,4 +873,155 @@ class Round2PhaseBTest {
             vm.state.value.cloned.contains("com.example.chat"),
         )
     }
+
+    // ---- 階段J J1a：onForeground burst 收斂 + queued 等待中 busy（特徵測試） ----
+    // 防退化特徵測試，非 leading-busy/trailing-handoff 間隙的孤立回歸測試：
+    // 在 Unconfined 調度下 leader 的 leading busy 與 foregroundJob 指派同步執行，
+    // 第二個 tap 無法排在 leader 置 busy 之前（結構上不允許），且其自身入口亦置
+    // busy，故等待中讀 busy 含第二 tap 自身 leading 置位的貢獻。真正的 trailing
+    // handoff 間隙（leader 清位後、trailing 取鎖前）在此形狀下不可觀測，覆蓋靠
+    // J1b（swap 懸掛窗口）+ 程式碼審查鎖定 trailing 預置 busy；此測試鎖定 burst
+    // 收斂為 leader + 至多一次 trailing（2 輪 package-list）與等待中不斷 busy。
+    @Test
+    fun j1_foregroundBurst_coalescesAndHoldsBusyWhileQueued() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo(priv = Privilege.SHELL)
+        val vm = makeVm(suGw, shGw, JumpClock(), shizukuGw = shGw)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+
+        // 常駐 STALE 使每次前景皆走全量 refresh（package-list 可閘控）。
+        suGw.failListPackages = true
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.STALE }
+
+        suGw.packageListCalls = 0
+        shGw.packageListCalls = 0
+        suGw.packageListGate = CompletableDeferred()
+
+        vm.onForeground()
+        await { suGw.packageListCalls >= 1 }
+        await { vm.state.value.loading }
+        // 第二 tap 排在 leader 已 busy 之後（結構限制，見函數頭註解）：此斷言為
+        // 特徵鎖定（queued 等待中不斷 busy），不孤立證明 trailing handoff 預置。
+        vm.onForeground()
+        Thread.sleep(100)
+        assertTrue(
+            "queued onForeground must read loading=true while waiting on opMutex, " +
+                "got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+
+        suGw.packageListGate?.complete(Unit)
+        suGw.packageListGate = null
+        await { !vm.state.value.loading && (suGw.packageListCalls + shGw.packageListCalls) >= 2 }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        assertEquals(
+            "foreground leader + trailing must run 2 rounds, got " +
+                "${suGw.packageListCalls + shGw.packageListCalls}",
+            2,
+            suGw.packageListCalls + shGw.packageListCalls,
+        )
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- 階段J J1b：swapAutoLocked 懸掛窗口 loading 維持 true ----
+    // 閘 su 首個 `id -u`（swap 探測阻塞於 gate，比照 b3_cancelledRefresh 手法）：
+    // 無 early-busy 時此窗口 loading=false（舊值）且按鈕啟用；修後維持 true。
+    @Test
+    fun j1_foregroundSwapBlocked_holdsBusy() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo(priv = Privilege.SHELL)
+        val vm = makeVm(suGw, shGw, JumpClock(), shizukuGw = shGw)
+        await { vm.state.value.channelReady }
+
+        // 重置計數後閘控下一次 probe（swap 首個 `id -u` 阻塞於 gate）。
+        suGw.idUCalls = 0
+        suGw.idUGate = CompletableDeferred()
+
+        vm.onForeground()
+        await { suGw.idUCalls >= 1 }
+        await { vm.state.value.loading }
+        assertTrue(
+            "onForeground must hold loading=true while swapAutoLocked id -u is gated",
+            vm.state.value.loading,
+        )
+        // 持續 busy 採樣：整個阻塞窗口按鈕保持禁用（防中途閃斷）。
+        val busyDeadline = System.currentTimeMillis() + 200
+        while (System.currentTimeMillis() < busyDeadline) {
+            assertTrue(
+                "foreground swap block must keep loading=true, state=${vm.state.value}",
+                vm.state.value.loading,
+            )
+            Thread.sleep(10)
+        }
+
+        suGw.idUGate?.complete(Unit)
+        suGw.idUGate = null
+        await(timeoutMs = 10_000L) { !vm.state.value.loading }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- 階段J J2：probeChannels 外層 catch（時鐘/拷貝類非預期拋錯）降 inventory ----
+    // 此處以一次性 nowWallMs 拋錯模擬時鐘/拷貝類非預期 throw（外層 catch 覆蓋範圍）：
+    // probeOnce 內 elevator/hook 拋錯已就地吞掉走 !ready 正常路徑（CHANNEL），
+    // binder dead 等通道失敗歸正常路徑，不進此外層 catch。
+    // J3c 意圖鎖定：外層非預期拋錯 -> FAILED；正常 !ready（預期未就緒）-> CHANNEL。
+    @Test
+    fun j2_probeThrow_downgradesFreshToStale() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val clock = JumpClock()
+        var bombArmed = false
+        val vm = DualViewModel(
+            repo = DualRepository(suGw),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suGw), ShizukuElevator(shGw)),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = suGw,
+            shizukuGateway = shGw,
+            activeGateway = suGw,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = {
+                if (bombArmed) {
+                    bombArmed = false
+                    throw RuntimeException("binder dead")
+                }
+                clock.now()
+            },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+
+        // 引爆 probeNow（probeChannels 內取時拋錯 → 外層 catch；一次性，catch 內
+        // throwNow 取時已恢復）。時鐘/拷貝類非預期 throw 後 FRESH 不得續留。
+        bombArmed = true
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertEquals(
+            "probe throw must downgrade FRESH to STALE",
+            InventoryFreshness.STALE,
+            s.inventory.freshness,
+        )
+        assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
+        assertEquals("throw path msgKind must be FAILED (unexpected throw)", MsgKind.FAILED, s.msgKind)
+        assertEquals(DiagnoseCode.PROBE_FAILED, s.diagnose?.code)
+        assertNull("probe throw expires pmReadable", s.pmReadable)
+        assertTrue("probe throw keeps old cloned entries", s.cloned.contains("com.example.chat"))
+    }
 }
