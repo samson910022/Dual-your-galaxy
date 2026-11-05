@@ -22,6 +22,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.io.IOException
+import java.nio.file.AccessDeniedException
 
 class HookDiagnosisTest {
     private class FakeCatGateway(
@@ -147,6 +150,76 @@ class HookDiagnosisTest {
         assertEquals(HookStatus.ACTIVE, diagnosis.status)
         assertFalse(diagnosis.viaGateway)
         assertEquals(0, gateway.calls)
+    }
+
+    // P1 regression (PR #20): the production readDirectMarker path must not
+    // treat denial as absence. On-device EACCES surfaces as
+    // AccessDeniedException under the NIO reader; it is injected here
+    // because same-uid CI (and root, which ignores permission bits) cannot
+    // reproduce an un-traversable parent dir with chmod, so a chmod-based
+    // test would be flaky by construction.
+    @Test fun readDirectMarker_accessDeniedReaderMapsToDenied() {
+        val file = File("/data/system/galaxydual_hook.active")
+        val read = readDirectMarker(file) { throw AccessDeniedException(it.path) }
+        assertEquals(MarkerRead.Denied, read)
+    }
+
+    // Other denial spellings (SecurityManager/SELinux, generic EIO) are
+    // likewise unknown, never positive absence.
+    @Test fun readDirectMarker_denialVariantsMapToDenied() {
+        val file = File("/data/system/galaxydual_hook.active")
+        assertEquals(MarkerRead.Denied, readDirectMarker(file) { throw SecurityException("SELinux") })
+        assertEquals(MarkerRead.Denied, readDirectMarker(file) { throw IOException("EIO") })
+    }
+
+    // Denied direct reads through the PRODUCTION overload (real
+    // readDirectMarker calls with an injected denying reader, no usable
+    // gateway) must stay UNKNOWN -- never INACTIVE, never "未偵測到".
+    @Test fun diagnosis_productionOverloadDeniedWithoutGatewayIsUnknown() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            File("/data/system/galaxydual_hook.active"),
+            File("/data/local/tmp/galaxydual_hook.active"),
+            emptyList(),
+            reader = { throw AccessDeniedException(it.path) },
+        )
+        assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, diagnosis.status)
+        assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertFalse(diagnosis.active)
+        assertFalse(diagnosis.displayText().contains("未偵測到"))
+    }
+
+    // Positive-absence semantics are preserved: a TRULY missing file goes
+    // through the default NIO reader (NoSuchFileException) to Readable(null).
+    @Test fun readDirectMarker_trulyMissingFileIsReadableNull() {
+        val missing = File.createTempFile("galaxydual-marker-missing", ".active")
+        assertTrue(missing.delete())
+        assertEquals(MarkerRead.Readable(null), readDirectMarker(missing))
+    }
+
+    // ... and two truly-missing files through the production overload still
+    // diagnose INACTIVE (positive absence, legacy "not detected" text).
+    @Test fun diagnosis_productionOverloadMissingBothIsInactive() = runBlocking {
+        fun missingTemp(): File {
+            val f = File.createTempFile("galaxydual-marker-missing", ".active")
+            assertTrue(f.delete())
+            return f
+        }
+        val diagnosis = diagnoseHookState(missingTemp(), missingTemp(), emptyList())
+        assertEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertEquals("未偵測到", diagnosis.displayText())
+    }
+
+    // Success path through the production reader: an existing readable file
+    // yields its content.
+    @Test fun readDirectMarker_existingFileReadsContent() {
+        val content = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 7L)
+        val file = File.createTempFile("galaxydual-marker-present", ".active")
+        try {
+            file.writeText(content)
+            assertEquals(MarkerRead.Readable(content), readDirectMarker(file))
+        } finally {
+            file.delete()
+        }
     }
 
     // (d) Hook-neutral lock: for every probe combination and every hook
