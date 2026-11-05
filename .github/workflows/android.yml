@@ -1,4 +1,4 @@
-# CI: build, test, and lint on every push/PR.
+# CI: build, test, and lint (push main / all PR bases / merge_group / manual).
 name: Android CI
 
 on:
