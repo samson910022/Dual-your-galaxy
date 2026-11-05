@@ -111,6 +111,24 @@ object PmOutputParser {
     // parsePackages() itself stays tolerant for compatibility.
     private val PACKAGE_PAYLOAD = Regex("^[A-Za-z0-9._-]+$")
 
+    // Line-level error scan shared by isSuccess() and parsePackagesTrusted()
+    // (PR-2 Phase 2 dedup): skips blank lines and caller-chosen exempt lines,
+    // then returns the first line matching ERROR_LINE, or null when clean.
+    // The exempt set differs per path -- isSuccess() passes the full
+    // EXEMPT_LINE (install-only "installed for user" echo included) and keeps
+    // its ALREADY_EXISTS early-out; the trusted listing path passes
+    // TRUSTED_EXEMPT_LINE and has NO ALREADY_EXISTS exception (any Failure
+    // line in a listing is untrusted). Pure scan, no exit-code logic.
+    private fun firstErrorLine(combined: String, exempt: List<Regex>): String? {
+        for (raw in combined.lines()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (exempt.any { it.containsMatchIn(line) }) continue
+            if (ERROR_LINE.any { it.containsMatchIn(line) }) return line
+        }
+        return null
+    }
+
     // True pm error signals (all case-insensitive unless noted). Each must be
     // error-semantic on its own line: Failure [...] lines, Error: lines,
     // Exception headers/stack lines, unknown-package/not-installed statements,
@@ -298,9 +316,13 @@ object PmOutputParser {
     // #22; stage 1 was additive-only, stage 2 now consumes it in
     // verifyListProbe/listProbe -- parsePackages/isSuccess keep exact behavior).
     // Rules, in order:
-    // 1. truncated flag (or a "[truncated]" marker surviving from a caller
-    //    that still builds CmdResult without the flag) -> Unknown: the
-    //    listing may have been cut off, so "no package: line" proves nothing.
+    // 1. truncated flag (or a TRUNCATION_MARKER surviving from a caller
+    //    that still builds CmdResult without the flag -- legacy text
+    //    fallback, TODO: drop the sniff once all producers set the flag) ->
+    //    Unknown: the listing may have been cut off, so "no package: line"
+    //    proves nothing.
+    // TRUNCATION_MARKER itself lives in CmdGateway.kt (same package, core
+    // single source of truth shared with the app gateways).
     // 2. exit != 0 -> Unknown (detail keeps the code plus the first
     //    stderr (else stdout) line for diagnosis; retry/backoff policy
     //    belongs to the upper layer, never to this pure parser).
@@ -325,7 +347,19 @@ object PmOutputParser {
         exit: Int,
         truncated: Boolean = false,
     ): TrustedList {
-        if (truncated || out.contains("[truncated]") || err.contains("[truncated]")) {
+        if (truncated || out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER)) {
+            // Preserve exit/hint on the truncated path (interrupt/timeout are
+            // exit!=0 + truncated): exit==0 keeps the bare string.
+            if (exit != 0) {
+                val src = if (err.isBlank()) out else err
+                val hint = src.lineSequence().firstOrNull { it.isNotBlank() }
+                    ?.trim()?.take(200)
+                return if (hint != null) {
+                    TrustedList.Unknown("truncated: listing may be incomplete (exit=$exit): $hint")
+                } else {
+                    TrustedList.Unknown("truncated: listing may be incomplete (exit=$exit)")
+                }
+            }
             return TrustedList.Unknown("truncated: listing may be incomplete")
         }
         if (exit != 0) {
@@ -338,13 +372,11 @@ object PmOutputParser {
                 TrustedList.Unknown("verify failed (exit=$exit)")
             }
         }
-        for (raw in (out + "\n" + err).lines()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            if (TRUSTED_EXEMPT_LINE.any { it.containsMatchIn(line) }) continue
-            if (ERROR_LINE.any { it.containsMatchIn(line) }) {
-                return TrustedList.Unknown("error-semantic output: $line")
-            }
+        // Shared line scan (see firstErrorLine): trusted exempt subset only,
+        // no ALREADY_EXISTS exception -- any Failure line here is untrusted.
+        val errorLine = firstErrorLine(out + "\n" + err, TRUSTED_EXEMPT_LINE)
+        if (errorLine != null) {
+            return TrustedList.Unknown("error-semantic output: $errorLine")
         }
         // M2: validate each package: payload on the trusted path only.
         // Prefix match is case-insensitive for consistency with
@@ -449,13 +481,9 @@ object PmOutputParser {
     fun isSuccess(output: String, exit: Int): Boolean {
         if (ALREADY_EXISTS.containsMatchIn(output)) return true
         if (exit != 0) return false
-        for (raw in output.lines()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            if (EXEMPT_LINE.any { it.containsMatchIn(line) }) continue
-            if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
-        }
-        return true
+        // Shared line scan (see firstErrorLine): full EXEMPT_LINE, with the
+        // ALREADY_EXISTS idempotent-success early-out above intact.
+        return firstErrorLine(output, EXEMPT_LINE) == null
     }
 
     // Identity-channel gate (Phase 2, issue #21; P2-1 header strip, issue #21).

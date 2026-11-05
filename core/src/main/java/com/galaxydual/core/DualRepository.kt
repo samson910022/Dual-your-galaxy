@@ -534,12 +534,11 @@ class DualRepository(
     // channels keep isSuccess; only this list probe and the refresh listing
     // use the trusted rule.
     //
-    // Retry (retained): a non-zero list probe is retried at most twice with
-    // a 1500 ms settle wait before the trusted parse, covering transient
-    // binder/timeout blips. gateway.run is a blocking suspend with no
-    // dispatcher assumption, hence Thread.sleep (core has no
-    // kotlinx-coroutines dependency for delay). Only three consecutive
-    // non-zero exits reach the trusted parse as Unknown.
+    // Retry (frozen, PR-3 owns any change -- same policy as listProbe below):
+    // a non-zero list probe is retried at most twice with a 1500 ms settle
+    // wait before the trusted parse, covering transient binder/timeout blips.
+    // gateway.run is a blocking suspend with no dispatcher assumption, hence
+    // Thread.sleep (core has no kotlinx-coroutines dependency for delay).
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -616,13 +615,9 @@ class DualRepository(
         // non-zero after the retries above, or error-semantic text such as
         // "Unknown package"/SecurityException/Failure with exit 0) is
         // Unknown. Membership stays an exact set lookup (superstrings never
-        // hit). Retry/sleep policy is unchanged (PR-3 owns it).
-        return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
-            is TrustedList.TrustedFull ->
-                if (clean in trusted.packages) VerifyState.Installed else VerifyState.NotInstalled
-            is TrustedList.TrustedEmpty -> VerifyState.NotInstalled
-            is TrustedList.Unknown -> VerifyState.Unknown(trusted.detail)
-        }
+        // hit). Retry/sleep policy is frozen (PR-3 owns it; same policy as
+        // the verifyOnProfiles note above).
+        return PmOutputParser.parsePackagesTrusted(res).toVerify(clean)
     }
 
     // Runs `pm list packages --user <dualId>` for an already-pinned snapshot.
@@ -649,6 +644,9 @@ class DualRepository(
     // (emptyList, authoritative), and Unknown (truncated / non-zero /
     // error-semantic) yields null -- never an authoritative empty list, so
     // refresh keeps the previous `cloned` instead of wiping it.
+    // No retry here by design (frozen, PR-3 owns any change -- same policy
+    // as verifyOnProfiles above): refresh maps null to "keep old value", so
+    // a transient blip costs one stale frame, not data loss.
     private suspend fun listProbe(dualId: Int): List<String>? {
         val cmd = try {
             PmOutputParser.buildListPackages(dualId)
@@ -656,11 +654,27 @@ class DualRepository(
             return null
         }
         val res = gateway.run(cmd)
-        return when (val trusted = PmOutputParser.parsePackagesTrusted(res)) {
-            is TrustedList.TrustedFull -> trusted.packages
-            is TrustedList.TrustedEmpty -> emptyList()
-            is TrustedList.Unknown -> null
-        }
+        return PmOutputParser.parsePackagesTrusted(res).toPackageList()
+    }
+
+    // Shared TrustedList mappings (PR-2 Phase 2 dedup): single place owning
+    // HOW a trusted parse becomes a probe result (#21 only changes WHO may be
+    // probed). Pure, no I/O, no retry/sleep policy.
+    // Trusted -> VerifyState: clean listing decides by exact membership
+    // (Installed) or confirmed absence (NotInstalled); untrusted is Unknown.
+    private fun TrustedList.toVerify(clean: String): VerifyState = when (this) {
+        is TrustedList.TrustedFull ->
+            if (clean in packages) VerifyState.Installed else VerifyState.NotInstalled
+        is TrustedList.TrustedEmpty -> VerifyState.NotInstalled
+        is TrustedList.Unknown -> VerifyState.Unknown(detail)
+    }
+
+    // Trusted -> authoritative list: clean listing yields its packages
+    // (possibly empty); untrusted yields null (unknown, never empty).
+    private fun TrustedList.toPackageList(): List<String>? = when (this) {
+        is TrustedList.TrustedFull -> packages
+        is TrustedList.TrustedEmpty -> emptyList()
+        is TrustedList.Unknown -> null
     }
 
     // Single-target refresh (Phase D P2-D, issue #21): exactly one

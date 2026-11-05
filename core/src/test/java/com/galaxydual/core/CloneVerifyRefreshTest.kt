@@ -605,7 +605,7 @@ class CloneVerifyRefreshTest {
     // direction -- truncated + package line present is NOT Installed, and
     // truncated + empty is NOT NotInstalled. Both are Unknown with a
     // truncation diagnostic. Covers the explicit flag and the legacy
-    // "[truncated]" marker text.
+    // TRUNCATION_MARKER text.
     @Test
     fun verifyState_truncatedListing_isUnknown() {
         val flaggedPresent = FakeGateway(
@@ -629,7 +629,7 @@ class CloneVerifyRefreshTest {
         assertTrue("truncated empty listing must be Unknown, got: $emptyState", emptyState is VerifyState.Unknown)
 
         val markerOnly = FakeGateway(
-            listPackagesOut = "package:com.example.chat\n[truncated]",
+            listPackagesOut = "package:com.example.chat\n$TRUNCATION_MARKER",
             listPackagesExit = 0,
         )
         val markerState = runSuspend { DualRepository(markerOnly).verifyState("com.example.chat", 95) }
