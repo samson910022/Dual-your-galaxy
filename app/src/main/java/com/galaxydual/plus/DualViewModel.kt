@@ -568,17 +568,20 @@ class DualViewModel(
     private suspend fun <T> onIo(block: suspend () -> T): T =
         withContext(Dispatchers.IO) { block() }
 
-    // Phase N2 Shizuku binding teardown (issue #34 re-review): ViewModel has
-    // no onCleared, so the retained + current Shizuku instances skipped by
-    // the swap guards (old !== retained) leaked their UserService bindings
-    // across Activity finish while the process lived on. This override
-    // snapshots every Shizuku-like slot (active/su/shizuku/retained, identity
-    // deduped) and releases each exactly once. abandon() is non-suspend
-    // (tryLock; contended -> give up, process-death 兜底) so onCleared -- which
-    // cannot suspend with viewModelScope already cancelled -- needs no
-    // independent closeScope. Idempotent via teardownOnce (dispose() twice is
-    // a no-op); diagnostic instances are NOT closed early -- only this
-    // cleared path closes them all.
+    // Phase N2 Shizuku binding teardown (issue #34 re-review), hardened by
+    // Phase B P2-2: ViewModel has no onCleared, so the retained + current
+    // Shizuku instances skipped by the swap guards (old !== retained) leaked
+    // their UserService bindings across Activity finish while the process
+    // lived on. This override snapshots every Shizuku-like slot (active/su/
+    // shizuku/retained, identity deduped) and releases each exactly once.
+    // abandon() is non-suspend (marks closed + inline drop when uncontended,
+    // deferred bounded-wait drop on the gateway-owned cleanup scope when
+    // contended -- never the already-cancelled viewModelScope), so onCleared
+    // -- which cannot suspend with viewModelScope already cancelled -- needs
+    // no independent closeScope. Idempotent via teardownOnce (dispose() twice
+    // is a no-op, and abandon()/close() themselves release at most once, so a
+    // repeated dispose never double-unbinds); diagnostic instances are NOT
+    // closed early -- only this cleared path closes them all.
     private val teardownOnce = AtomicBoolean(false)
 
     private fun isShizukuLike(gw: CmdGateway): Boolean =
