@@ -339,15 +339,18 @@ class DualRepository(
     // Pinned clone (Phase C3, issue #9; Phase D target pinning): captures the
     // verified target BEFORE the write, then re-fetches AFTER the write and
     // requires same id plus both-present-equal serial/parentId before the
-    // `pm list packages` re-check. A null/drifted after-target maps to
+    // `pm list packages` re-check. A pre-write fresh-vs-before re-check narrows
+    // the before-to-write reuse window (a residual fresh-to-write micro-window
+    // remains, fail closed): drift returns VerifyUnknown without
+    // emitting any write command (fail closed). A null/drifted after-target maps to
     // VerifyUnknown("identity-changed ...") fail closed (never Success, never
     // counted as cloned). Success is reported only when the re-check then
     // confirms Installed; a clean-but-absent re-check is VerifyFailed
     // (fake success, issue #9), a failed re-check channel is VerifyUnknown.
     // Neither is added to cloned. Unknown/Refused identity maps to NoDual
     // (fail closed); the pinned re-check itself does not re-resolve identity
-    // beyond the before/after pin so the write and the check cannot drift to
-    // different users.
+    // beyond the before/fresh/after pin so a write can never be redirected to
+    // a different user (the after-to-probe window is read-only, see below).
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
@@ -356,6 +359,9 @@ class DualRepository(
         if (before == null) return CloneOutcome.NoDual
         val dualId = before.userId
         if (profiles.none { it.userId == dualId }) return CloneOutcome.NoDual
+        val fresh = fetchVerifiedTarget()
+        val preDrift = checkTargetDrift(before, fresh)
+        if (preDrift != null) return CloneOutcome.VerifyUnknown(dualId, preDrift)
         val clean = pkg.trim()
         val installCmd = try {
             PmOutputParser.buildInstallExisting(clean, dualId)
@@ -377,7 +383,11 @@ class DualRepository(
     }
 
     // Pinned remove (Phase C3, issue #9; Phase D target pinning): same
-    // before/after identity pin as cloneVerified. Only a post-uninstall
+    // before/fresh/after identity pin as cloneVerified. A pre-write fresh-vs-before
+    // re-check narrows the before-to-write reuse window (residual micro-window
+    // remains, fail closed): drift returns
+    // VerifyUnknown without emitting any write command (fail closed).
+    // Only a post-uninstall
     // re-check of NotInstalled counts as removed; still-present is
     // StillInstalled, an uncheckable channel or a drifted after-target is
     // VerifyUnknown (caller keeps the entry: fail closed). A failed uninstall
@@ -392,6 +402,9 @@ class DualRepository(
         if (before == null) return RemoveOutcome.NoDual
         val dualId = before.userId
         if (profiles.none { it.userId == dualId }) return RemoveOutcome.NoDual
+        val fresh = fetchVerifiedTarget()
+        val preDrift = checkTargetDrift(before, fresh)
+        if (preDrift != null) return RemoveOutcome.VerifyUnknown(dualId, preDrift)
         val clean = pkg.trim()
         val uninstallCmd = try {
             PmOutputParser.buildUninstall(clean, dualId)
@@ -502,8 +515,12 @@ class DualRepository(
     }
 
     // List-only re-check for an already-verified id (pinned flows): runs the
-    // `pm list packages --user <dualId>` probe WITHOUT re-resolving identity,
-    // so the write and the check share one verified target and cannot drift.
+    // `pm list packages --user <dualId>` probe WITHOUT re-resolving identity.
+    // The write is already pinned to the same id (before/fresh/after pin);
+    // the probe itself performs no resolve, so a residual after-to-probe
+    // window remains. It is read-only and fail-closed in the misread
+    // direction: a drifted target can only misreport presence/absence, never
+    // redirect a write to another user.
     // All tri-state/exit-only/retry semantics are identical to the explicit
     // path below (PR-2 owns that contract; stage 2 only changes WHO may be
     // probed, never HOW the probe is judged).
