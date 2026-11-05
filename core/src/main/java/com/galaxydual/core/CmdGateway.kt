@@ -7,6 +7,15 @@ data class CmdResult(
     val exit: Int,
     val out: String,
     val err: String,
+    // Capture-truncation flag (PR-2 stage 1, issue #22, additive only).
+    // Contract: capture helpers cap each stream at MAX_CAPTURE_CHARS and
+    // append a "\n[truncated]" marker when the cap bites; whenever the marker
+    // is appended the producer must also set truncated=true so parsers can
+    // tell "clean empty" apart from "output was cut off" without sniffing
+    // text. Defaults to false so every existing CmdResult(...) call site
+    // keeps compiling and keeps its old meaning; no caller behavior changes
+    // in this stage (verify/list still ignore the flag until stage 2).
+    val truncated: Boolean = false,
 ) {
     // Backward-compatible aliases for the older field names.
     val exitCode: Int get() = exit
