@@ -183,21 +183,21 @@ object PmOutputParser {
     }
 
     // Parses `getprop sys.dualapp.profile_id` output into a property claim.
-    // Returns the numeric id on a clean integer payload, null when the property
-    // is missing, empty, or in an unknown format (no claim, never throws).
-    // Negative values mean "no claim" and are normalized to null so callers
-    // never mistake them for a target.
+    // Strict single-line full match `^\s*(-?\d+)\s*$`: the whole payload
+    // must be one integer token (surrounding whitespace allowed). A payload
+    // with a second non-blank line, trailing tokens, or non-numeric text
+    // yields null (no claim, never throws). Negative values mean "no claim"
+    // and are normalized to null so callers never mistake them for a target.
     fun parseDualPropertyId(propOutput: String): Int? {
-        val token = propOutput.trim()
-        if (token.isEmpty()) return null
-        // getprop echoes a single line; take the first line only.
-        val first = token.lineSequence().first().trim()
-        val id = first.toIntOrNull() ?: return null
+        val m = Regex("""^\s*(-?\d+)\s*$""").matchEntire(propOutput) ?: return null
+        val id = m.groupValues[1].toIntOrNull() ?: return null
         return if (id >= 0) id else null
     }
 
     // Parses `pm list users` output into one entry per UserInfo{...} line.
-    // Returns all profiles found; resolve the dual one via resolveDualUserId().
+    // Returns all profiles found; resolve the dual one via
+    // resolveDualUserIdVerified() (the label-only resolveDualUserId() is
+    // Deprecated, issue #21, and must not authorize new writes).
     fun parseUsers(output: String): List<DualProfile> = parseUsersDetailed(output)
 
     // Full parse of `pm list users` output retaining the flag/type field of each

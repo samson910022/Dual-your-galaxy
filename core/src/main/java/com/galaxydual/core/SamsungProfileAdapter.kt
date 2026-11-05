@@ -7,11 +7,11 @@ package com.galaxydual.core
 // Unknown (insufficient evidence) are distinct so callers can log precisely.
 sealed interface DualResolution {
     // All agreeing sources point at one non-owner id: safe to target.
-    // `confidence` is always HIGH by construction.
-    data class Confirmed(
-        val userId: Int,
-        val confidence: IdentityConfidence = IdentityConfidence.HIGH,
-    ) : DualResolution
+    // `confidence` is always HIGH by construction (fixed getter, not a
+    // constructor parameter, so an illegal confidence is unrepresentable).
+    data class Confirmed(val userId: Int) : DualResolution {
+        val confidence: IdentityConfidence get() = IdentityConfidence.HIGH
+    }
 
     // Not enough agreeing evidence (no CLONE claim, or a single source only).
     data object Unknown : DualResolution
@@ -22,10 +22,11 @@ sealed interface DualResolution {
 }
 
 // Minimal platform identity parsers plus the cross-source resolver
-// (PR-1, issue #21, stage 1). All functions are pure (String in, data out;
-// no I/O, no Android dependency) and directly unit-testable. Stage 1 is
-// additive only: PmOutputParser/DualRepository/Elevators are untouched and
-// nothing here replaces resolveDualUserId(); stage 2 wires this in.
+// (PR-1, issue #21, stage 2 wired). All functions are pure (String in, data out;
+// no I/O, no Android dependency) and directly unit-testable. Stage 2 is
+// wired in: DualRepository/Elevators resolve via SamsungProfileAdapter
+// parsing (see PmOutputParser.resolveDualUserIdVerified); the label-only
+// resolveDualUserId() is Deprecated and must not authorize new writes.
 object SamsungProfileAdapter {
     // Header opening one per-user block in both `cmd user list -v` and
     // `dumpsys user` outputs. Same shape as PmOutputParser's UserInfo
@@ -35,27 +36,31 @@ object SamsungProfileAdapter {
     // A user-type token meaning Samsung/clone profile. Matches
     // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space) so
     // `android.os.usertype.profile.CLONE`, `profile_CLONE` and case
-    // variants all count. Case-insensitive by design.
-    private val CLONE_MARKER = Regex("profile[^A-Za-z0-9]{0,3}clone", RegexOption.IGNORE_CASE)
+    // variants all count. Case-insensitive by design. Right boundary
+    // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
+    private val CLONE_MARKER = Regex("(?<![A-Za-z0-9])profile[^A-Za-z0-9]{0,3}clone(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
 
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
     private val TYPE_LINE =
-        Regex("user[\\s_\\-]*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
 
     // Fallback keyword for separator-less ROM forms such as
     // `usertype profile.MANAGED` (no `:`/`=`). Any body line carrying the
-    // keyword counts as an explicit type statement.
+    // keyword counts as an explicit type statement. Left boundary guards
+    // against mid-token hits (PmOutputParser convention).
     private val TYPE_KEYWORD =
-        Regex("user[\\s_\\-]*type", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type", RegexOption.IGNORE_CASE)
 
     // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
-    private val PARENT_ID = Regex("parent(?:Id)?\\s*[:=]\\s*(-?\\d+)", RegexOption.IGNORE_CASE)
+    // Left boundary so `transparentId`/`grandparentId` never match.
+    private val PARENT_ID = Regex("(?<![A-Za-z0-9])parent(?:Id)?\\s*[:=]\\s*(-?\\d+)", RegexOption.IGNORE_CASE)
 
     // `serialNo=15`, `serial: 15`, `Serial number: 15`, ... Case-insensitive.
     // `serialNo` (no separator) is covered by the optional separator class.
+    // Left boundary so `personalSerialNo` never matches.
     private val SERIAL =
-        Regex("serial(?:No|\\s*number)?\\s*[:=]\\s*(\\d+)", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9])serial(?:No|\\s*number)?\\s*[:=]\\s*(\\d+)", RegexOption.IGNORE_CASE)
 
     // Parses `cmd user list -v` verbose output into one claim per
     // UserInfo{...} block. Tolerant: line order, letter case, `:` vs `=`
@@ -120,24 +125,35 @@ object SamsungProfileAdapter {
         )
     }
 
-    // Classifies a block body: CLONE when any type evidence names
-    // profile.CLONE (explicit `user type:` line OR a bare profile.CLONE
-    // token in the body, including separator-less `usertype profile.CLONE`
-    // ROM forms); OTHER when an explicit non-clone type line is present;
-    // UNKNOWN when no type statement exists at all. The header label is
-    // NOT searched (caller passes the body only), so renaming a profile to
-    // contain "DUAL" can never yield CLONE here.
+    // Classifies a block body: CLONE only when a TYPE line's value names
+    // profile.CLONE (explicit `user type:`/`userType=` line first, then the
+    // separator-less `usertype <token>` keyword fallback where the same
+    // line carries the CLONE token); OTHER when an explicit non-clone type
+    // statement is present; UNKNOWN when no type statement exists at all.
+    // Non-type lines (notes, Failure lines, `profileCloneable` tokens) can
+    // never yield CLONE. The header label is NOT searched (caller passes
+    // the body only), so renaming a profile to contain "DUAL" can never
+    // yield CLONE here. Empty type values are skipped (never OTHER).
     private fun classifyType(body: String): ProfileUserType {
-        // Bare/body-wide check first: covers both `userType=<...CLONE>` and
-        // separator-less `usertype profile.CLONE` lines. Body-only, so the
-        // header label is excluded by construction.
-        if (CLONE_MARKER.containsMatchIn(body)) return ProfileUserType.CLONE
+        // Step 1: explicit `user type :/= value` lines only.
         val typeValues = body.lines().mapNotNull { line ->
             val m = TYPE_LINE.find(line) ?: return@mapNotNull null
             m.groupValues[1].trim().takeIf { it.isNotEmpty() }
         }
+        if (typeValues.any { CLONE_MARKER.containsMatchIn(it) }) return ProfileUserType.CLONE
         if (typeValues.isNotEmpty()) return ProfileUserType.OTHER
-        if (body.lines().any { TYPE_KEYWORD.containsMatchIn(it) }) return ProfileUserType.OTHER
+        // Step 2: separator-less fallback (`usertype <token>` with no :/=).
+        // Any body line NOT matched by TYPE_LINE but carrying the type
+        // keyword counts; CLONE wins there too. Lines with an explicit
+        // `user type :/=` declaration but an empty value (TYPE_LINE matched
+        // nothing) are skipped via explicitSep, so an empty `User type:`
+        // stays UNKNOWN, never OTHER. Trailing `:`/`=` elsewhere in the
+        // line (e.g. `parentId=0`, `flags: 0x400`) no longer excludes it.
+        val explicitSep = Regex("(?<![A-Za-z0-9])user[\\s_\\-]*type\\s*[:=]", RegexOption.IGNORE_CASE)
+        val fallback = body.lines().filter { TYPE_LINE.find(it) == null }
+        if (fallback.any { TYPE_KEYWORD.containsMatchIn(it) && CLONE_MARKER.containsMatchIn(it) && !explicitSep.containsMatchIn(it) }) return ProfileUserType.CLONE
+        val bareKeyword = fallback.filter { TYPE_KEYWORD.containsMatchIn(it) && !explicitSep.containsMatchIn(it) }
+        if (bareKeyword.isNotEmpty()) return ProfileUserType.OTHER
         return ProfileUserType.UNKNOWN
     }
 
@@ -153,9 +169,14 @@ object SamsungProfileAdapter {
     // DUAL-containing label proves nothing).
     //
     // @param candidates parsed claims from any sources (PROP entries act as
-    //   property claims when present).
+    //   property claims when present; PM_LIST/XML_DIAG entries never count
+    //   as type evidence).
     // @param propertyId optional property-derived dual id; when non-null and
     //   non-negative it must equal the agreed id (negative/null = no claim).
+    //   Production callers pass ONLY this argument
+    //   (PmOutputParser.resolveDualUserIdVerified forwards the parsed
+    //   `getprop sys.dualapp.profile_id` value here); the PROP-sourced
+    //   candidate path is retained for tests/diagnostics only.
     fun resolveDual(
         candidates: Collection<ProfileIdentity>,
         propertyId: Int? = null,
@@ -180,9 +201,13 @@ object SamsungProfileAdapter {
             else -> propFromCandidates
         }
 
-        // Type evidence by user id (PROP entries are constraints, not type
-        // evidence, and never count toward the two-channel rule).
-        val typed = candidates.filter { it.source != IdentitySource.PROP }
+        // Type evidence by user id: ONLY the two verified verbose channels
+        // count (USER_LIST_V + DUMPSYS). PROP entries are property
+        // constraints, PM_LIST/XML_DIAG are display/diagnostic sources; none
+        // of them may join the two-channel rule or veto via CLONE/OTHER.
+        val typed = candidates.filter {
+            it.source == IdentitySource.USER_LIST_V || it.source == IdentitySource.DUMPSYS
+        }
         val cloneIds = typed.filter { it.userType == ProfileUserType.CLONE }.map { it.userId }.toSet()
         if (cloneIds.isEmpty()) return DualResolution.Unknown
         if (cloneIds.size > 1) {
@@ -190,8 +215,8 @@ object SamsungProfileAdapter {
         }
         val id = cloneIds.single()
         // Owner profile is off-limits even when explicitly typed CLONE.
+        // HEADER only matches \d+, so id is never negative here.
         if (id == 0) return DualResolution.Refused("owner profile (0) is off-limits")
-        if (id < 0) return DualResolution.Refused("invalid user id ($id)")
 
         // Same-id contradiction: another channel explicitly typed this id
         // non-clone (e.g. userList says CLONE, dumpsys says SYSTEM).

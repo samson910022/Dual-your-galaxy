@@ -338,4 +338,187 @@ class ProfileIdentityTest {
             SamsungProfileAdapter.resolveDual(emptyList(), propertyId = 95),
         )
     }
+
+    // ---- Phase 1 hardening (locked) ----
+
+    @Test
+    fun nonTypeLinesWithCloneTokenNeverYieldClone() {
+        // `profileCloneable` lacks the right boundary; `Failure: profile
+        // clone` lives on a non-type line. Neither may yield CLONE.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                note=profileCloneable
+                Failure: profile clone not found
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+        assertTrue(parsed[0].userType != ProfileUserType.CLONE)
+    }
+
+    @Test
+    fun bareUsertypeWithoutSeparatorYieldsOther() {
+        val text = """
+            Users:
+              UserInfo{10:Work:1030} running:
+                usertype profile.MANAGED
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.OTHER, parsed[0].userType)
+    }
+
+    @Test
+    fun sameBlockDualToken_clonePriorityOverManagedInTypeLine() {
+        // Both tokens in one explicit type line: CLONE wins over MANAGED.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type: android.os.usertype.profile.MANAGED, android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+    }
+
+    @Test
+    fun emptyTypeValueYieldsUnknown() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                User type:
+                Serial: 15
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+        assertEquals(IdentityConfidence.LOW, parsed[0].confidence)
+    }
+
+    @Test
+    fun pmListSourcedCloneDoesNotAuthorize() {
+        // PM_LIST CLONE + single true-channel CLONE must stay Unknown:
+        // display/diagnostic sources never join the two-channel rule.
+        val singlePlusPm = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
+            claim(95, ProfileUserType.CLONE, IdentitySource.PM_LIST),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(singlePlusPm))
+        val singlePlusXml = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
+            claim(95, ProfileUserType.CLONE, IdentitySource.XML_DIAG),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(singlePlusXml))
+        // Even with both true channels, a PM_LIST OTHER must not veto.
+        val withPmOther = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
+            claim(95, ProfileUserType.OTHER, IdentitySource.PM_LIST),
+        )
+        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(withPmOther))
+    }
+
+    @Test
+    fun parseDualPropertyId_strictSingleLine() {
+        assertEquals(95, PmOutputParser.parseDualPropertyId("95"))
+        assertEquals(95, PmOutputParser.parseDualPropertyId("  95  "))
+        assertEquals(95, PmOutputParser.parseDualPropertyId("95\n"))
+        assertEquals(95, PmOutputParser.parseDualPropertyId("95\r"))
+        assertEquals(95, PmOutputParser.parseDualPropertyId("95\r\n"))
+        assertEquals(0, PmOutputParser.parseDualPropertyId("0"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId(""))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("   "))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("95\n96"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("95\n96\n"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("-1"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("-5"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("unknown"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("unknown\n"))
+        assertEquals(null, PmOutputParser.parseDualPropertyId("95abc"))
+    }
+
+    @Test
+    fun misleadingIdsDoNotMisparseParentOrSerial() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                transparentId=99
+                grandparentId=98
+                personalSerialNo=77
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(null, parsed[0].parentId)
+        assertEquals(null, parsed[0].serial)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+
+        val withReal = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                transparentId=99
+                parentId=0
+                personalSerialNo=77
+                Serial: 15
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val parsed2 = SamsungProfileAdapter.parseUserListVerbose(withReal)
+        assertEquals(1, parsed2.size)
+        assertEquals(0, parsed2[0].parentId)
+        assertEquals(15, parsed2[0].serial)
+    }
+
+    @Test
+    fun separatorLessCloneWithTrailingParentIdYieldsClone() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                usertype profile.CLONE parentId=0
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+    }
+
+    @Test
+    fun separatorLessManagedWithTrailingFlagsYieldsOther() {
+        val text = """
+            Users:
+              UserInfo{10:Work:1030} running:
+                usertype profile.MANAGED (flags: 0x400)
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.OTHER, parsed[0].userType)
+    }
+
+    @Test
+    fun embeddedSuperuserTypeDoesNotYieldClone() {
+        // `superuser type:` must not match TYPE_LINE's left boundary.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                note=superuser type: profile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+        assertTrue(parsed[0].userType != ProfileUserType.CLONE)
+    }
+
+    @Test
+    fun gluedProfileCloneWithoutSeparatorIsNotClone() {
+        // `myprofile.CLONE` has no separator before CLONE: the CLONE_MARKER
+        // left boundary must reject it (line still carries the type keyword,
+        // so the verdict is OTHER, never CLONE).
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                usertype myprofile.CLONE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.OTHER, parsed[0].userType)
+    }
 }

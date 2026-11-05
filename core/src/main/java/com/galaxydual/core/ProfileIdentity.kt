@@ -1,13 +1,15 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.core
 
-// Provenance of one platform profile identity claim (PR-1, issue #21, stage 1).
+// Provenance of one platform profile identity claim (PR-1, issue #21, stage 2 wired).
 // Each value names the exact command/channel the claim was parsed from:
 // - PM_LIST: `pm list users` (UserInfo{id:label:flags} lines only, no type info).
+//   reserved, no production parser yet
 // - USER_LIST_V: `cmd user list -v` verbose per-user blocks.
 // - DUMPSYS: `dumpsys user` per-user blocks.
-// - PROP: system-property derived id (e.g. fw.max_users-adjacent dual id prop).
-// - XML_DIAG: diagnostic user XML (reserved for stage 2, no parser yet).
+// - PROP: system-property derived id (e.g. `getprop sys.dualapp.profile_id`).
+// - XML_DIAG: diagnostic user XML.
+//   reserved, no production parser yet
 enum class IdentitySource {
     PM_LIST,
     USER_LIST_V,
@@ -33,9 +35,10 @@ enum class ProfileUserType {
     UNKNOWN,
 }
 
-// One platform-level profile identity claim (PR-1, issue #21, stage 1).
-// Additive model: nothing here replaces DualProfile or the existing
-// PmOutputParser.resolveDualUserId() boundary; stage 2 wires it in.
+// One platform-level profile identity claim (PR-1, issue #21, stage 2 wired).
+// DualRepository/Elevators resolve via SamsungProfileAdapter parsing
+// (see PmOutputParser.resolveDualUserIdVerified); the label-only
+// PmOutputParser.resolveDualUserId() is Deprecated and must not authorize writes.
 //
 // DISPLAY-ONLY LABEL RULE: `label` is a human-readable name kept for logs
 // and UI display. It MUST NOT participate in any authorization decision.
