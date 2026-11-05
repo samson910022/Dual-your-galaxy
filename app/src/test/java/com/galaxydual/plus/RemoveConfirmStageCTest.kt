@@ -1,8 +1,10 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
 // PR-27 Stage C (P1 一致性/種類錯位)：request SerialUnavailable 種類、C2 第二段
-// id-drift 漏碼、C5 confirm-NoDual typed 回退。Harness 沿用 RemoveConfirmTest
-// (Unconfined Main + IO poll)，identity 通道加計數以支援確定性 mid-confirm 漂移。
+// id-drift 漏碼、C5a confirm-NoDual typed 回退見漂移、C5b 查詢內矛盾回退拒絕。
+// Harness 沿用 RemoveConfirmTest (Unconfined Main + IO poll)；C1/C2 沿用
+// identity 通道計數 DriftGateway，C5a/C5b 改用呼叫順序腳本 ScriptedGateway
+// (單調 R+N 閾值無法讓 repo 期快照與前一 typed 查詢末次呼叫取不同 effId)。
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope
@@ -107,6 +109,80 @@ class RemoveConfirmStageCTest {
         }
     }
 
+    // ScriptedGateway：C5a/C5b 確定性夾具 (取代舊 C5 的全域 R+N 閾值)。
+    // 舊 fake 以 listUsers 不計數的 effId(identityCalls) 同時驅動快照與
+    // typed，導致 repo 期快照 (讀當下計數) 與前一 typed 查詢末次呼叫同值、
+    // 卻需不同 effId——單調閾值無解。改為呼叫順序腳本：每個 listUsers 呼叫
+    // 依序消耗 snapScript，每個身份呼叫 (verbose/dumpsys/prop 各計一次)
+    // 依序消耗 identScript；耗盡後重複末值 (fail-safe，不掩蓋斷言)。
+    // id<0 表 owner-only (全通道一致無聲明)；其餘為該次呼叫所見 effId。
+    private class ScriptedGateway(
+        snapScript: ArrayDeque<Int>,
+        identScript: ArrayDeque<Int>,
+    ) : CmdGateway {
+        override val privilege: Privilege = Privilege.ROOT
+        var uninstallCalls = 0
+        var listPackagesOut = ""
+        val installedPkgs = mutableSetOf("com.example.chat")
+        var serial: Int = 15
+        private val snaps = snapScript
+        private val idents = identScript
+
+        private fun nextSnap(): Int = if (snaps.size > 1) snaps.removeFirst() else snaps.first()
+        private fun nextIdent(): Int = if (idents.size > 1) idents.removeFirst() else idents.first()
+
+        private fun usersOut(id: Int): String =
+            "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                (if (id < 0) "" else "\tUserInfo{$id:DualApp:400} running\n")
+
+        private fun verboseOut(id: Int): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                (if (id < 0) "" else "  UserInfo{$id:DualApp:400} running:\n" +
+                    "    Serial: $serial\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n")
+
+        private fun dumpsysOut(id: Int): String =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                (if (id < 0) "" else "  UserInfo{$id:DualApp:400} serialNo=$serial:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n")
+
+        override suspend fun run(cmd: String): CmdResult = when {
+            cmd.trim() == "id -u" -> CmdResult(exit = 0, out = "0\n", err = "")
+            cmd == DualRepository.CMD_LIST_USERS -> {
+                CmdResult(exit = 0, out = usersOut(nextSnap()), err = "")
+            }
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                CmdResult(exit = 0, out = verboseOut(nextIdent()), err = "")
+            }
+            cmd == DualRepository.CMD_DUMPSYS_USER -> {
+                CmdResult(exit = 0, out = dumpsysOut(nextIdent()), err = "")
+            }
+            cmd == DualRepository.CMD_GETPROP_DUAL -> {
+                val id = nextIdent()
+                CmdResult(exit = 0, out = if (id < 0) "" else "$id\n", err = "")
+            }
+            cmd.startsWith("pm uninstall") -> {
+                uninstallCalls++
+                val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                installedPkgs.remove(pkg)
+                CmdResult(exit = 0, out = "Success", err = "")
+            }
+            cmd.startsWith("pm list packages") -> {
+                val base = installedPkgs.map { "package:$it" }.joinToString("\n")
+                val out = if (base.isEmpty()) listPackagesOut else if (listPackagesOut.isEmpty()) base else "$base\n$listPackagesOut"
+                CmdResult(exit = 0, out = out, err = "")
+            }
+            else -> CmdResult(exit = 0, out = "ok", err = "")
+        }
+    }
+
     private val vms = mutableListOf<DualViewModel>()
 
     @Before
@@ -126,7 +202,7 @@ class RemoveConfirmStageCTest {
         Dispatchers.resetMain()
     }
 
-    private fun makeVm(gw: DriftGateway): DualViewModel {
+    private fun makeVm(gw: CmdGateway): DualViewModel {
         val vm = DualViewModel(
             repo = DualRepository(gw),
             gatewayPrivilege = Privilege.ROOT,
@@ -202,24 +278,22 @@ class RemoveConfirmStageCTest {
         )
     }
 
-    // C5：confirm-NoDual 後備分支先走 typed 入口；Confirmed(otherId) → MISMATCH，
-    // 不落入 targetListed 啟發式。repo 內 verified 先見 owner-only 而回 NoDual，
-    // 後備 typed 再見 drift 96 即判 MISMATCH。
+    // C5a：confirm-NoDual 後備分支先走 typed 入口；Confirmed(otherId) 即目標
+    // 已變更 → MISMATCH，不落入 targetListed 啟發式。腳本 (呼叫順序)：
+    // init 1 快照+3 身份、request 2 快照+6 身份、confirm 預檢 3 快照+9 身份
+    // (含 verifyState 內快照) 全見 95；repo 內 verified 期快照與 typed 同見 owner-only (pmIds={0}，
+    // 無 pm 否決) → repo 回 NoDual；VM 後備期新鮮快照與 typed 同見 96 →
+    // Confirmed(96)!=95 → VERIFY_MISMATCH。零卸載。
     @Test
-    fun confirmNoDualButTypedDrift_mapsMismatch() {
-        val gw = DriftGateway(baseId = 95).apply { driftId = 96 }
+    fun confirmNoDualFallbackTypedDrift_mapsMismatch() {
+        val gw = ScriptedGateway(
+            snapScript = ArrayDeque(listOf(95, 95, 95, 95, 95, 95, -1, 96)),
+            identScript = ArrayDeque(List(18) { 95 } + List(3) { -1 } + List(3) { 96 }),
+        )
         val vm = makeVm(gw)
         awaitVm(vm) { vm.state.value.channelReady }
         vm.requestRemove("com.example.chat")
         awaitVm(vm) { vm.state.value.pendingRemove != null }
-        // R 為 request 後計數；首段 (R+1..R+3) 與第二段 (R+4..R+6) 見 base 95
-        // (預檢通過)；verifyState 重驗 (R+7..R+9) 見 base (通過)；repo 內
-        // verified (R+10..R+12) 見 owner-only 而回 NoDual；後備新鮮快照見
-        // owner-only {0} (pmIds 子集免否決)，後備 typed (R+13..) 見 drift 96
-        // → MISMATCH。
-        val r = gw.identityCalls
-        gw.ownerOnlyFrom = r + 10
-        gw.driftFrom = r + 13
         vm.confirmRemove()
         awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
         assertEquals("drifted NoDual fallback must not uninstall", 0, gw.uninstallCalls)
@@ -383,5 +457,26 @@ class RemoveConfirmStageCTest {
             "techDetail must name the absent snapshot, got: ${vm.state.value.diagnose?.techDetail}",
             (vm.state.value.diagnose?.techDetail ?: "").startsWith("verified id 95 absent"),
         )
+    }
+
+    // C5b：一次 typed 查詢內矛盾 → CHANNEL_ERROR (與 C5a 分離夾具)。
+    // request+confirm 預檢全見 95 (通過)；repo 期快照見 {0,95}，typed 查詢內
+    // verbose 見 owner-only 而 dumpsys/getprop 見 96 → 身份不一致 Unknown →
+    // repo 回 ChannelError (絕不當 NoDual) → VM CHANNEL_ERROR。零卸載。
+    @Test
+    fun confirmRepoTypedConflict_mapsChannelError() {
+        val gw = ScriptedGateway(
+            snapScript = ArrayDeque(List(7) { 95 }),
+            identScript = ArrayDeque(List(18) { 95 } + listOf(-1, 96, 96)),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+        assertEquals("conflicted typed query must not uninstall", 0, gw.uninstallCalls)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, vm.state.value.diagnose?.code)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
 }
