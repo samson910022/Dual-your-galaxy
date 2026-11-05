@@ -921,7 +921,11 @@ class DualRepository(
         // counts it as unknown, never "no dual"). The legacy Int fetch above
         // folds both to -1 and must not be used here.
         if (expectedDualId < 0) return CloneOutcome.NoDual
-        when (val idRes = resolveDualUserIdTyped()) {
+        // M2 pm 反證守衛：Absent 另須 pm 快照無 typed 漏戶（null 不否決；
+        // 此處快照可用故傳 profiles id 集合，與 refreshLocked/clone-NoDual/
+        // requestRemove-NoDual 一致）。僅 Absent↔Unknown 受影響，Confirmed
+        // 路徑不變；Absent 仍 NoDual、Unknown 仍 ChannelError。
+        when (val idRes = resolveDualUserIdTyped(pmIds = profiles.map { it.userId }.toSet())) {
             is DualIdResolution.Absent -> return CloneOutcome.NoDual
             is DualIdResolution.Unknown ->
                 return CloneOutcome.ChannelError(

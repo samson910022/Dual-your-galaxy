@@ -82,6 +82,10 @@ class InventorySelectionTest {
         // -1 停用）。typed 解析走 Unknown → core 回 ChannelError（非 NoDual），
         // 批次應計入 unknown、不短路、不宣稱 no dual。
         var failIdentityAfterInstalls: Int = -1,
+        // PR-37 Stage 1（gh review #3）負向測試鉤子：僅翻 verbose/dumpsys
+        //（owner-only），getprop 與 pm 快照仍指向 dualId（矛盾證據 → typed
+        // Unknown → 第二項 ChannelError，不短路）。-1 停用。
+        var partialVanishAfterInstalls: Int = -1,
         // PR-37 Phase B #1 原子 pin 測試鉤子：當 CMD_LIST_USERS 呼叫次數超過此
         // 閾值後，身份通道整體切到 switchDualIdTo（-1 停用）。批次 pin
         //（fetchDualTarget：verbose/dumpsys/prop）不經此通道，故 pin 仍見舊
@@ -93,6 +97,14 @@ class InventorySelectionTest {
         val uninstallCalls = mutableListOf<String>()
         var verboseCalls: Int = 0
         var listUsersCalls: Int = 0
+
+        private fun vanishActive(): Boolean =
+            vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls
+
+        private fun partialVanishActive(): Boolean =
+            partialVanishAfterInstalls >= 0 && installCalls.size >= partialVanishAfterInstalls
+
+        private fun noCloneChannels(): Boolean = vanishActive() || partialVanishActive()
 
         private fun effectiveDualId(): Int {
             if (switchDualIdAfterListUsers >= 0 && listUsersCalls > switchDualIdAfterListUsers) {
@@ -108,6 +120,11 @@ class InventorySelectionTest {
         }
 
         private fun usersOut(): String {
+            // vanish 生效時 pm 快照亦乾淨（owner-only，無 95），與 typed
+            // Absent 一致；partial vanish 刻意保留 95（pm 反證 → Unknown）。
+            if (vanishActive()) {
+                return "Users:\n\tUserInfo{0:Owner:13} running\n"
+            }
             val id = effectiveDualId()
             return "Users:\n\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{$id:DualApp:400} running\n"
@@ -115,7 +132,7 @@ class InventorySelectionTest {
 
         private fun verboseOut(): String {
             val id = effectiveDualId()
-            if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
+            if (noCloneChannels()) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} running:\n" +
                     "    Serial number: 0\n" +
@@ -133,7 +150,7 @@ class InventorySelectionTest {
 
         private fun dumpsysOut(): String {
             val id = effectiveDualId()
-            if (vanishDualAfterInstalls >= 0 && installCalls.size >= vanishDualAfterInstalls) {
+            if (noCloneChannels()) {
                 return "Users:\n" +
                     "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                     "    userType=android.os.usertype.full.SYSTEM\n"
@@ -170,7 +187,10 @@ class InventorySelectionTest {
                     CmdResult(exit = 0, out = dumpsysOut(), err = "")
                 }
             cmd == DualRepository.CMD_GETPROP_DUAL ->
-                CmdResult(exit = 0, out = "${effectiveDualId()}\n", err = "")
+                // vanish 生效時 property 無聲明（空字串，typed Absent 前提）；
+                // partial vanish 刻意仍指向 dualId（property 反證 → Unknown）。
+                if (vanishActive()) CmdResult(exit = 0, out = "", err = "")
+                else CmdResult(exit = 0, out = "${effectiveDualId()}\n", err = "")
             cmd.startsWith("pm install-existing") -> {
                 val pkg = cmd.trim().split(" ").last()
                 installCalls.add(pkg)
@@ -846,6 +866,51 @@ class InventorySelectionTest {
         assertEquals(1, report.successCount)
         assertEquals(2, report.failedCount)
         assertEquals(0, report.unknownCount)
+    }
+
+    // PR-37 Stage 1 (gh review #3)：部分消失——僅翻 verbose/dumpsys
+    //（owner-only），getprop/pm 仍指向 95（矛盾證據）→ 第二項為
+    // ChannelError（unknown、不短路、不宣稱 NoDual）。首項成功後每項仍打
+    // 裝置（無 M13 短路），最終 1 成功＋2 未知。
+    @Test
+    fun batch_partialVanish_reportsChannelErrorWithoutShortCircuit() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        // 首個 install 完成後僅 typed 通道消失（getprop/pm 仍指 95）：矛盾。
+        gw.partialVanishAfterInstalls = 1
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a1", "A1", 0, false),
+                SourceAppEntry("com.example.a2", "A2", 0, false),
+                SourceAppEntry("com.example.a3", "A3", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a3")
+        vm.toggleSelection("0:com.example.a2")
+        vm.toggleSelection("0:com.example.a1")
+        vm.cloneSelected()
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val report = vm.state.value.batchReport!!
+        assertEquals(3, report.items.size)
+        assertTrue(report.items[0].outcome is CloneOutcome.Success)
+        assertTrue(
+            "partial vanish must be ChannelError (unknown), never NoDual, got: " +
+                report.items[1].outcome,
+            report.items[1].outcome is CloneOutcome.ChannelError,
+        )
+        assertTrue(
+            "no M13 short-circuit on unknown: third item must also run, got: " +
+                report.items[2].outcome,
+            report.items[2].outcome is CloneOutcome.ChannelError,
+        )
+        assertEquals(1, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(2, report.unknownCount)
     }
 
     // (d/B2) 併發第二批：慢批次持有 batch:clone 期間，第二批整批拒絕。
