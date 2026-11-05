@@ -160,16 +160,22 @@ object SamsungProfileAdapter {
         return ProfileUserType.UNKNOWN
     }
 
-    // Cross-source resolver (PR-1, issue #21). Returns Confirmed(HIGH) ONLY
-    // when every agreeing source points at one identical non-owner userId:
+    // Cross-source resolver (PR-1, issue #21; Phase C P2-2 property required).
+    // Returns Confirmed(HIGH) ONLY when every agreeing source points at one
+    // identical non-owner userId:
     // - USER_LIST_V claim AND DUMPSYS claim BOTH type that same id as
     //   userType CLONE (two independent CLONE claims; CLONE on one channel
     //   plus UNKNOWN on the other is Unknown, never Confirmed), and
-    // - when a property id is known (explicit argument OR PROP-sourced
-    //   candidates), it equals that same id (triple agreement).
+    // - a property id MUST be known (explicit argument OR PROP-sourced
+    //   candidates) and equal that same id (triple agreement). Phase C P2-2:
+    //   property is required corroboration, not optional. effectiveProp ==
+    //   null (missing/empty/unparseable, no PROP candidate) -> Unknown
+    //   (insufficient evidence), never a two-channel Confirm; mismatch
+    //   stays Refused. A version that cannot read the property refuses
+    //   explicitly as an unsupported version (#21: property missing/format
+    //   unknown -> Unknown/Refused; unknown explicitly refuses writes).
     // Phase B adds two gates after the id/type/property checks, before
-    // Confirmed (parent first, serial second; property-missing semantics
-    // and the header gate are unchanged):
+    // Confirmed (parent first, serial second):
     // - parent: the id's parentId on BOTH verbose channels must be present,
     //   equal, and == 0. Either side missing -> Unknown (insufficient
     //   evidence); values differ -> Refused("conflicting parent ...");
@@ -191,9 +197,10 @@ object SamsungProfileAdapter {
     // @param candidates parsed claims from any sources (PROP entries act as
     //   property claims when present; PM_LIST/XML_DIAG entries never count
     //   as type evidence).
-    // @param propertyId optional property-derived dual id; when non-null and
-    //   non-negative it must equal the agreed id (negative/null = no claim).
-    //   Production callers pass ONLY this argument
+    // @param propertyId property-derived dual id; must be non-null and
+    //   non-negative and equal the agreed id, else Unknown (null/negative =
+    //   no claim -> Unknown: property required). Production callers pass
+    //   ONLY this argument
     //   (PmOutputParser.resolveDualUserIdVerified forwards the parsed
     //   `getprop sys.dualapp.profile_id` value here); the PROP-sourced
     //   candidate path is retained for tests/diagnostics only.
@@ -252,6 +259,12 @@ object SamsungProfileAdapter {
         if (effectiveProp != null && effectiveProp != id) {
             return DualResolution.Refused("property id $effectiveProp disagrees with clone user $id")
         }
+
+        // Phase C P2-2: property is required corroboration, not optional.
+        // Missing/empty/unparseable (effectiveProp == null, no PROP
+        // candidate) means insufficient evidence -> Unknown, never a
+        // two-channel Confirm. Mismatch stays Refused above.
+        if (effectiveProp == null) return DualResolution.Unknown
 
         val cloneSources = typed.filter { it.userId == id && it.userType == ProfileUserType.CLONE }.map { it.source }.toSet()
         val twoChannel = IdentitySource.USER_LIST_V in cloneSources && IdentitySource.DUMPSYS in cloneSources

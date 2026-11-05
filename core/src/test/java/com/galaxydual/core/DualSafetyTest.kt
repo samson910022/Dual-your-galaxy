@@ -572,12 +572,13 @@ class DualSafetyTest {
         assertEquals(listOf("com.example.chat"), runSuspend { repo.listClonedPackages() })
     }
 
-    // Stage-2 G2: property contradictions refuse; a missing/garbage property
-    // is "no claim" (two channels may still confirm, a single channel never
-    // does). All Refused/Unknown map fail-closed (NoDual/Unknown/null, never
-    // a write or a probe of the wrong user).
+    // Stage-2 G2 + Phase C P2-2: property contradictions refuse; a
+    // missing/garbage property is "no claim" (null) and now yields Unknown
+    // (property required, two channels alone never confirm; a single channel
+    // never does either). All Refused/Unknown map fail-closed
+    // (NoDual/Unknown/null, never a write or a probe of the wrong user).
     @Test
-    fun propertyMismatch_isRefused_propertyMissingNeedsTwoChannels() {
+    fun propertyMismatch_isRefused_propertyMissingIsUnknown() {
         // Mismatch: both channels agree on 95, property says 96 -> Refused.
         val mismatch = FakeGateway(propOutput = "96\n")
         val mismatchRepo = DualRepository(mismatch)
@@ -599,14 +600,33 @@ class DualSafetyTest {
         val ghost = FakeGateway(propOutput = "150\n")
         assertEquals(-1, runSuspend { DualRepository(ghost).resolveDualUserId() })
 
-        // Missing property: two agreeing CLONE channels still confirm (serial
-        // 15 != 95 proves serial is not mistaken for the id).
+        // Phase C P2-2: property is required corroboration. Missing property
+        // (serial 15 != 95 proves serial is not mistaken for the id) is
+        // Unknown -> -1, cloneVerified NoDual, zero target commands.
         val missing = FakeGateway(propOutput = "")
-        assertEquals(95, runSuspend { DualRepository(missing).resolveDualUserId() })
+        assertEquals(-1, runSuspend { DualRepository(missing).resolveDualUserId() })
+        assertTrue(runSuspend { DualRepository(missing).cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "missing property must not target user 95, got: ${missing.commands}",
+            missing.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "missing property must run zero target commands, got: ${missing.writeCommands()}",
+            missing.writeCommands().isEmpty(),
+        )
 
-        // Garbage property format is treated as missing (no claim), same rule.
+        // Garbage property format is treated as missing (no claim): Unknown.
         val garbage = FakeGateway(propOutput = "unknown\n")
-        assertEquals(95, runSuspend { DualRepository(garbage).resolveDualUserId() })
+        assertEquals(-1, runSuspend { DualRepository(garbage).resolveDualUserId() })
+        assertTrue(runSuspend { DualRepository(garbage).cloneVerified("com.example.chat") } is CloneOutcome.NoDual)
+        assertTrue(
+            "garbage property must not target user 95, got: ${garbage.commands}",
+            garbage.targetCommandsFor(95).isEmpty(),
+        )
+        assertTrue(
+            "garbage property must run zero target commands, got: ${garbage.writeCommands()}",
+            garbage.writeCommands().isEmpty(),
+        )
 
         // Property alone (single CLONE channel + prop) never authorizes:
         // drop the 95 block from dumpsys entirely -> only one source knows 95
@@ -625,7 +645,7 @@ class DualSafetyTest {
         val verbose95 = FakeGateway.DEFAULT_VERBOSE_95
         val dumpsys95 = FakeGateway.DEFAULT_DUMPSYS_95
         assertEquals(95, PmOutputParser.resolveDualUserIdVerified(verbose95, dumpsys95, 95))
-        assertEquals(95, PmOutputParser.resolveDualUserIdVerified(verbose95, dumpsys95, null))
+        assertEquals(-1, PmOutputParser.resolveDualUserIdVerified(verbose95, dumpsys95, null))
         assertEquals(-1, PmOutputParser.resolveDualUserIdVerified(verbose95, dumpsys95, 96))
         assertEquals(null, PmOutputParser.parseDualPropertyId(""))
         assertEquals(null, PmOutputParser.parseDualPropertyId("unknown\n"))

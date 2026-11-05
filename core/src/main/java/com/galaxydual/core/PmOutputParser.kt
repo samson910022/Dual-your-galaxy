@@ -155,18 +155,23 @@ object PmOutputParser {
         return if (candidates.size == 1) candidates[0].userId else -1
     }
 
-    // Verified dual-profile resolution (PR-1 stage 2, issue #21).
-    // Parses both verbose channels and requires cross-source CLONE agreement
-    // via SamsungProfileAdapter.resolveDual: Confirmed(HIGH) maps to its userId,
-    // Unknown/Refused both map to -1 (fail closed, never guess a target).
-    // The pm-list label is never read here (display-only by contract).
+    // Verified dual-profile resolution (PR-1 stage 2, issue #21; P2-2 property
+    // required, issue #21). Parses both verbose channels and requires
+    // cross-source CLONE agreement via SamsungProfileAdapter.resolveDual:
+    // Confirmed(HIGH) maps to its userId, Unknown/Refused both map to -1
+    // (fail closed, never guess a target). The pm-list label is never read
+    // here (display-only by contract).
     //
     // @param userListVerbose raw `cmd user list -v` output.
     // @param dumpsysUser raw `dumpsys user` output.
-    // @param propertyId optional system-property dual id (e.g. parsed from
-    //   `getprop sys.dualapp.profile_id` via parseDualPropertyId); null means
-    //   "no property claim" (missing/unreadable), which still allows a
-    //   two-channel agreement to confirm (single-source never confirms).
+    // @param propertyId nullable system-property dual id (e.g. parsed from
+    //   `getprop sys.dualapp.profile_id` via parseDualPropertyId). Phase C
+    //   P2-2: property is required corroboration, not optional. null (missing/
+    //   empty/unparseable, no PROP candidate) yields Unknown (fail closed),
+    //   never a two-channel Confirm; a mismatched property yields Refused.
+    //   A version that cannot read the property refuses explicitly as an
+    //   unsupported version (#21 acceptance: "property missing/format unknown
+    //   ... Unknown/Refused" and "unknown explicitly refuses writes").
     fun resolveDualUserIdVerified(
         userListVerbose: String,
         dumpsysUser: String,
@@ -303,11 +308,11 @@ object PmOutputParser {
         return true
     }
 
-    // Identity-channel gate (Phase 2, issue #21): strict variant of isSuccess
-    // for the verified-identity channels (`cmd user list -v`, `dumpsys user`,
-    // `getprop sys.dualapp.profile_id`). Differences from isSuccess (which
-    // stays the pm-channel rule used by profilesSnapshot and the pm-list
-    // probe gate):
+    // Identity-channel gate (Phase 2, issue #21; P2-1 header strip, issue #21).
+    // Strict variant of isSuccess for the verified-identity channels
+    // (`cmd user list -v`, `dumpsys user`, `getprop sys.dualapp.profile_id`).
+    // Differences from isSuccess (which stays the pm-channel rule used by
+    // profilesSnapshot and the pm-list probe gate):
     // - No INSTALL_FAILED_ALREADY_EXISTS exemption: idempotent-success is a
     //   pm install semantic; an identity dump carrying an install code (or
     //   any Failure line) is still error-semantic output and must fail the
@@ -315,12 +320,21 @@ object PmOutputParser {
     // - No EXEMPT_LINE filtering: package:/path echoes and "installed for
     //   user" success echoes are pm success payloads, never legitimate
     //   identity content; every non-blank line is tested against ERROR_LINE.
+    // - P2-1 header strip: all `UserInfo{...}` header substrings are removed
+    //   before scanning, so a renamed label carrying error keywords
+    //   (`UserInfo{95:Error:400}`, `{95:Failure:400}`, `{10:not found:30}`)
+    //   can never trigger ERROR_LINE. The label is display-only by contract
+    //   (renames do not change authorization); only body lines carry
+    //   error semantics. A genuine body `Failure [...]` line still fails.
     // exit != 0 is always failure here (unlike isSuccess, where the
     // ALREADY_EXISTS exemption is checked before exit and can still report
     // success on a non-zero exit).
+    private val IDENTITY_HEADER_STRIP = Regex("UserInfo\\{\\d+:[^}:\\r\\n]*:[^}\\r\\n]*\\}")
+
     fun isIdentityChannelOk(output: String, exit: Int): Boolean {
         if (exit != 0) return false
-        for (raw in output.lines()) {
+        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
+        for (raw in sanitized.lines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
             if (ERROR_LINE.any { it.containsMatchIn(line) }) return false

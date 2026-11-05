@@ -240,12 +240,14 @@ class ProfileIdentityTest {
     }
 
     @Test
-    fun resolveDual_twoChannelAgreementWithoutPropertyYieldsHigh() {
+    fun resolveDual_twoChannelAgreementWithoutPropertyIsUnknown() {
+        // Phase C P2-2: property is required corroboration; two CLONE channels
+        // without a property id is Unknown, never Confirmed.
         val candidates = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
         )
-        assertEquals(DualResolution.Confirmed(95, null, 0), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
     }
 
     @Test
@@ -412,12 +414,14 @@ class ProfileIdentityTest {
         )
         assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(singlePlusXml))
         // Even with both true channels, a PM_LIST OTHER must not veto.
+        // Phase C P2-2: without a property id the result is Unknown (property
+        // required); PM_LIST still neither authorizes nor vetoes.
         val withPmOther = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
             claim(95, ProfileUserType.OTHER, IdentitySource.PM_LIST),
         )
-        assertEquals(DualResolution.Confirmed(95, null, 0), SamsungProfileAdapter.resolveDual(withPmOther))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(withPmOther))
     }
 
     @Test
@@ -531,11 +535,12 @@ class ProfileIdentityTest {
     @Test
     fun resolveDual_cloneVerboseUnknownDumpsysIsUnknown() {
         // Owner repro: CLONE(VERBOSE) + UNKNOWN(DUMPSYS) on the same id.
+        // With-property too: single CLONE channel never confirms.
         val candidates = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
             claim(95, ProfileUserType.UNKNOWN, IdentitySource.DUMPSYS, serial = 15),
         )
-        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
     }
 
     @Test
@@ -545,18 +550,20 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 15),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
         )
-        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
     }
 
     @Test
-    fun resolveDual_cloneCloneStillConfirmed() {
-        // Regression guard: CLONE + CLONE on the same id still Confirms
+    fun resolveDual_cloneCloneWithoutPropertyIsUnknown() {
+        // Phase C P2-2: CLONE + CLONE on the same id without a property id is
+        // Unknown (property required), never Confirmed. The with-property
+        // Confirm path is locked by the P2-1 header tests below.
         // (fixture parentId=0/serial consistent via claim() defaults).
         val candidates = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
         )
-        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
     }
 
     // ---- Phase B P1-2 parent gate + P1-3 serial gate (issue #21) ----
@@ -569,7 +576,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 10),
         )
-        val res = SamsungProfileAdapter.resolveDual(candidates)
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
         assertTrue(res is DualResolution.Refused)
         assertTrue((res as DualResolution.Refused).reason.contains("conflicting parent"))
     }
@@ -580,7 +587,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 10),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 10),
         )
-        val res = SamsungProfileAdapter.resolveDual(candidates)
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
         assertTrue(res is DualResolution.Refused)
         assertTrue((res as DualResolution.Refused).reason.contains("non-owner parent"))
     }
@@ -591,16 +598,18 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = null),
         )
-        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
     }
 
     @Test
-    fun resolveDual_parentZeroOnBothChannelsConfirmed() {
+    fun resolveDual_parentZeroWithoutPropertyIsUnknown() {
+        // Phase C P2-2: parent 0+0 without a property id is Unknown (property
+        // required). The with-property Confirm path is locked by P2-1 tests.
         val candidates = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 0),
         )
-        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
     }
 
     @Test
@@ -609,17 +618,108 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 99, parentId = 0),
         )
-        val res = SamsungProfileAdapter.resolveDual(candidates)
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
         assertTrue(res is DualResolution.Refused)
         assertTrue((res as DualResolution.Refused).reason.contains("conflicting serial"))
     }
 
     @Test
-    fun resolveDual_serialMissingOnOneChannelStillConfirmed() {
+    fun resolveDual_serialMissingWithoutPropertyIsUnknown() {
+        // Phase C P2-2: serial-missing tolerance still needs a property id;
+        // without it the result is Unknown.
         val candidates = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = null, parentId = 0),
         )
-        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    // ---- Phase C P2-1 header-aware gate (issue #21) ----
+    // UserInfo{...} header labels are display-only: labels containing error
+    // keywords must not trip the identity gate, while a genuine body
+    // Failure line still fails.
+
+    @Test
+    fun identityGate_headerErrorLabelsDoNotFail() {
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Error:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:Failure:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        // Header labels alone must pass the gate.
+        assertTrue(PmOutputParser.isIdentityChannelOk(verbose, 0))
+        assertTrue(PmOutputParser.isIdentityChannelOk(dumpsys, 0))
+        // A third header variant with a not-found label.
+        val notFound = "Users:\n  UserInfo{10:not found:30} running:\n    User type: android.os.usertype.profile.MANAGED\n"
+        assertTrue(PmOutputParser.isIdentityChannelOk(notFound, 0))
+        // Contrast: a genuine body Failure line still fails the gate.
+        assertTrue(!PmOutputParser.isIdentityChannelOk(verbose + "\nFailure [INSTALL_FAILED_INVALID_APK: bad]", 0))
+        assertTrue(!PmOutputParser.isIdentityChannelOk(dumpsys + "\nFailure [INSTALL_FAILED_INVALID_APK: bad]", 0))
+    }
+
+    @Test
+    fun identityGate_malformedHeaderIsNotStripped() {
+        // Only well-formed `UserInfo{id:label:flags}` headers are stripped.
+        // A malformed header carrying an error keyword must still fail.
+        val malformed = "Users:\n  UserInfo{foo Failure}\n    User type: android.os.usertype.profile.CLONE\n"
+        assertTrue(!PmOutputParser.isIdentityChannelOk(malformed, 0))
+        val missingFlags = "Users:\n  UserInfo{95:Error}\n    User type: android.os.usertype.profile.CLONE\n"
+        assertTrue(!PmOutputParser.isIdentityChannelOk(missingFlags, 0))
+    }
+
+    @Test
+    fun identityGate_unclosedHeaderDoesNotSwallowFailure() {
+        // The strip pattern never spans lines: an unclosed header must not
+        // swallow a genuine Failure line below it (fail-open guard).
+        val truncated = "Users:\n  UserInfo{95:Broken:400 running:\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n"
+        assertTrue(!PmOutputParser.isIdentityChannelOk(truncated, 0))
+    }
+
+    @Test
+    fun resolveDual_headerErrorLabelsStillConfirmedWithProp() {
+        // End-to-end: error-keyword header labels + dual CLONE + parent 0 +
+        // serial consistent + prop 95 -> Confirmed(95,15,0).
+        val userList = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                User type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Error:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:Failure:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        // Gate passes despite the labels.
+        assertTrue(PmOutputParser.isIdentityChannelOk(userList, 0))
+        assertTrue(PmOutputParser.isIdentityChannelOk(dumpsys, 0))
+        val candidates = SamsungProfileAdapter.parseUserListVerbose(userList) +
+            SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        // Parser-level mapping agrees.
+        assertEquals(95, PmOutputParser.resolveDualUserIdVerified(userList, dumpsys, 95))
+        // Contrast: body Failure line fails the identity gate (Unknown/Refused path).
+        val badVerbose = userList + "\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n"
+        assertTrue(!PmOutputParser.isIdentityChannelOk(badVerbose, 0))
     }
 }
