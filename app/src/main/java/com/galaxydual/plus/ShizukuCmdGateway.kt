@@ -277,6 +277,22 @@ class ShizukuCmdGateway(
     // One exec round-trip with a bounded wait. Dead binder / RemoteException /
     // timeout all map to explicit CmdResult errors; the stale cache is dropped
     // so the next call rebinds instead of reusing a dead handle.
+    //
+    // Late-result isolation (PR-3 stage 1, issue #24): the wait above is
+    // withTimeoutOrNull, so after EXEC_TIMEOUT_MS the caller stops waiting and
+    // this returns timedOut() (exit != 0, "shizuku: exec timed out..."). That
+    // outcome is UNKNOWN by construction, never authoritative: the repository
+    // judges it through the trusted parse (#22 owns that rule -- a non-zero /
+    // error-semantic capture is Unknown, never a confirmed empty), refresh
+    // keeps the previous `cloned` instead of wiping it, and the bounded probe
+    // retry (at most 2 settle waits, core delayFn) is the ONLY resend -- this
+    // gateway itself never retries internally, so a timeout never triggers a
+    // blind immediate resend that would pile onto a still-running service call.
+    // The orphaned transact, if the binder thread is still blocked in it after
+    // cancellation, owns its Parcel pair (recycled in finally below); its late
+    // reply is discarded, never applied to state. dropBindingLocked() on the
+    // timeout path additionally guarantees the next run() rebinds fresh
+    // instead of reusing the timed-out handle.
     private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
         if (!binder.isBinderAlive) {
             bindMutex.withLock { dropBindingLocked() }

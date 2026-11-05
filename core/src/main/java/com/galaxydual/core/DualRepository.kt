@@ -99,6 +99,15 @@ sealed interface RefreshOutcome {
 class DualRepository(
     private val gateway: CmdGateway,
 ) {
+    // Retry settle wait (PR-3 stage 1, issue #24): the list-probe retry below
+    // waits VERIFY_RETRY_DELAY_MS between attempts. Core has no
+    // kotlinx-coroutines dependency, so this is a suspend function slot rather
+    // than delay(): the default blocks the CALLER thread via Thread.sleep and
+    // therefore callers must dispatch repository calls off the Main thread
+    // (DualViewModel runs every repo call under Dispatchers.IO). Tests replace
+    // it with a no-op/virtual delay to skip the real 1500 ms waits.
+    internal var delayFn: suspend (Long) -> Unit = { ms -> Thread.sleep(ms) }
+
     companion object {
         // Command used to enumerate profiles.
         const val CMD_LIST_USERS = "pm list users"
@@ -111,6 +120,11 @@ class DualRepository(
         const val CMD_USER_LIST_VERBOSE = "cmd user list -v"
         const val CMD_DUMPSYS_USER = "dumpsys user"
         const val CMD_GETPROP_DUAL = "getprop sys.dualapp.profile_id"
+
+        // Settle wait between list-probe retries (PR-3 stage 1, issue #24).
+        // Part of the retry policy (bounded: at most 2 waits per probe); the
+        // wait itself runs through delayFn so tests can go virtual.
+        const val VERIFY_RETRY_DELAY_MS = 1500L
     }
 
     // Lists all profiles from `pm list users`; empty when the channel fails.
@@ -621,18 +635,13 @@ class DualRepository(
     // channels keep isSuccess; only this list probe and the refresh listing
     // use the trusted rule.
     //
-    // Retry (frozen, PR-3 owns any change -- same policy as listProbe below):
-    // a non-zero list probe is retried at most twice with a 1500 ms settle
-    // wait before the trusted parse, covering transient binder/timeout blips.
-    // gateway.run is a blocking suspend with no dispatcher assumption, hence
-    // Thread.sleep is kept (frozen policy; core's coroutines dependency is
-    // only used for the CancellationException rethrow discipline, never for
-    // delay here). Thread.sleep blocks the calling thread itself
-    // (gateway-internal withContext(IO) does not move it), so the caller
-    // must already be off Main. Must NEVER be called on Main: the current
-    // DualViewModel launches repo calls on viewModelScope (Main dispatcher)
-    // without IO dispatch, so the call chain must guarantee non-Main before
-    // this path can rely on it (VM dispatch change out-of-scope here).
+    // Retry (PR-3 stage 1, issue #24 -- unfreezes the PR-2 frozen policy):
+    // a non-zero list probe is retried at most twice with a
+    // VERIFY_RETRY_DELAY_MS settle wait before the trusted parse, covering
+    // transient binder/timeout blips. The wait runs through delayFn
+    // (suspend slot: callers must dispatch repository calls off Main because
+    // the default delayFn blocks its caller thread; DualViewModel wraps every
+    // repo call in Dispatchers.IO).
     private suspend fun verifyOnProfiles(pkg: String, dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): VerifyState {
         if (dualId <= 0 || profiles.none { it.userId == dualId }) {
             return VerifyState.Unknown("refused: unknown dual profile id ($dualId)")
@@ -696,13 +705,14 @@ class DualRepository(
         // Gateway defense (PR-2 Phase 3, R5): a gateway that throws mid-probe
         // (initial call or any retry) maps to Unknown("channel error: ..."),
         // fail closed; CancellationException is rethrown to stay
-        // coroutine-correct. Retry/sleep policy frozen (PR-3 owns it; never
-        // on Main -- Thread.sleep blocks the calling thread).
+        // coroutine-correct. Settle wait runs through delayFn (PR-3 stage 1,
+        // issue #24) so tests can go virtual; never on Main -- the default
+        // delayFn blocks the calling thread.
         val res = try {
             var r = gateway.run(cmd)
             var attempts = 1
             while (r.exit != 0 && attempts < 3) {
-                Thread.sleep(1500)
+                delayFn(VERIFY_RETRY_DELAY_MS)
                 r = gateway.run(cmd)
                 attempts++
             }
@@ -728,8 +738,9 @@ class DualRepository(
         // "Unknown package"/SecurityException/Failure with exit 0, or any
         // unexpected-format stdout line / unexplained stderr residue per the
         // structural whitelist) is Unknown. Membership stays an exact set
-        // lookup (superstrings never hit). Retry/sleep policy is frozen
-        // (PR-3 owns it; same policy as the verifyOnProfiles note above).
+        // lookup (superstrings never hit). Retry/sleep policy is PR-3 owned
+        // (delayFn virtual wait, at most 2 retries; same policy as the
+        // verifyOnProfiles note above).
         return PmOutputParser.parsePackagesTrusted(res).toVerify(clean)
     }
 

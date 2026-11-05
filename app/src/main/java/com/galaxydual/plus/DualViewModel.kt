@@ -10,6 +10,7 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
+import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
 import com.galaxydual.core.ShizukuElevator
@@ -17,6 +18,7 @@ import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.routePrivilege
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -104,10 +106,20 @@ data class UiState(
 // Only a verify-confirmed install is added to `cloned`; only a
 // verify-confirmed removal drops it.
 //
-// Concurrency (core review finding): refresh/clone/remove are serialized
-// through opMutex so concurrent calls queue instead of racing
-// last-writer-wins on `cloned`/`loading`. Public entry points are plain
-// functions launching in viewModelScope; the Activity just calls them.
+// Concurrency (core review finding, PR-3 stage 1 issue #24): refresh/clone/
+// remove/probe are serialized through opMutex so concurrent calls queue
+// instead of racing last-writer-wins on `cloned`/`loading`. Two bounds keep
+// rapid UI taps from piling an unbounded queue on that mutex: refresh()
+// coalesces (at most one pending re-run behind the in-flight one) and
+// clone/remove dedup by operation key (a second identical write while the
+// first is in flight reports "already in progress" instead of queueing).
+// Every repository call runs under Dispatchers.IO (see onIo): the core retry
+// settle wait blocks its caller thread, so running it on Main would stall
+// the Main dispatcher heartbeat for up to ~3 s per probe. Public entry
+// points are plain functions launching in viewModelScope; the Activity just
+// calls them. All op state below (refreshJob/refreshPending/inFlightWrites)
+// is touched only from viewModelScope coroutines (Main-confined) so no extra
+// synchronization is needed.
 //
 // Phase F4b-P1 (issue #6): selectChannel(pref) swaps the gateway under the
 // same mutex (persist + rebuild via assembleChannel + re-probe + refresh),
@@ -189,6 +201,29 @@ class DualViewModel(
     // Serializes probe/refresh/clone/remove (see class doc).
     private val opMutex = Mutex()
 
+    // Refresh coalescing (PR-3 stage 1, issue #24): the in-flight refresh job
+    // plus at most one pending re-run. A tap while a refresh is active only
+    // flips refreshPending instead of queueing another mutex waiter, so rapid
+    // taps collapse into a single trailing refresh. Main-confined (see class
+    // doc); selectChannel's internal refreshLocked bypasses this gate and
+    // runs inline under its own mutex hold.
+    private var refreshJob: Job? = null
+    private var refreshPending = false
+
+    // In-flight write dedup keys ("clone:<pkg>" / "remove:<pkg>", PR-3 stage 1,
+    // issue #24). A duplicate op while the first is still running reports
+    // "already in progress" instead of queueing behind the mutex. Clone and
+    // remove use distinct keys so an intentional clone-then-remove sequence on
+    // the same package is never collapsed. Main-confined (see class doc).
+    private val inFlightWrites = mutableSetOf<String>()
+
+    // Runs a repository call off the Main thread (PR-3 stage 1, issue #24):
+    // gateway.run is a blocking suspend with no dispatcher guarantee and the
+    // core retry settle wait blocks its caller, so every repo call site goes
+    // through here to keep the Main dispatcher heartbeat unblocked.
+    private suspend fun <T> onIo(block: suspend () -> T): T =
+        withContext(Dispatchers.IO) { block() }
+
     init {
         // Probe elevation channels first; later ops queue behind this, so the
         // first refresh always sees the routed privilege, never a default.
@@ -210,72 +245,97 @@ class DualViewModel(
     // empty. Drift is eliminated inside this API (single target throughout);
     // the explicit-id residual remains only in the old entries.
     fun refresh() {
-        viewModelScope.launch {
+        // Coalesce rapid taps (PR-3 stage 1, issue #24): while a refresh is
+        // in flight (including waiting on opMutex behind init/probe), only
+        // record that one trailing re-run is wanted. The trailing run covers
+        // every intermediate tap, so the mutex queue never grows past one.
+        if (refreshJob?.isActive == true) {
+            refreshPending = true
+            return
+        }
+        refreshJob = viewModelScope.launch {
             opMutex.withLock { refreshLocked() }
+            while (refreshPending) {
+                refreshPending = false
+                opMutex.withLock { refreshLocked() }
+            }
         }
     }
 
     // Reload body shared by refresh() and selectChannel(). Must run under
     // opMutex: callers hold it, so this never launches or locks itself.
-    //
     // Phase D P2-D (single target fetch: snapshot 1 + target 3 cmds + list 1
-    // = 5): one repo.refreshVerified() pins snapshot, target, and listing to
-    // the same id, so resolve-to-list drift is inexpressible here (the old
-    // resolve-then-reverify path needed 9 commands and could drift between
-    // two fetches). Read-only throughout, fail closed; the explicit-id
-    // residual (same id recreated between check and write) remains only in
-    // the old explicit entries, never in this API.
+    // = 5): repo.refreshVerified() pins snapshot, target, and listing to the
+    // same id so resolve-to-list drift is inexpressible (preferred for new
+    // code). This VM still uses the resolve-then-reverify path below;
+    // migrating refreshLocked() to refreshVerified() is follow-up (same
+    // fail-closed mapping, fewer commands).
+    // Repository calls run via onIo (PR-3 stage 1, issue #24) so the retry
+    // settle wait never blocks Main; StateFlow updates stay thread-safe from
+    // any dispatcher.
     private suspend fun refreshLocked() {
         // Mark busy first so the UI can render a spinner.
         _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
         try {
-            when (val res = repo.refreshVerified()) {
-                is RefreshOutcome.ChannelError ->
+            when (val snap = onIo { repo.profilesSnapshot() }) {
+                is ProfilesSnapshot.ChannelError ->
                     _state.update {
                         it.copy(
                             loading = false,
                             profiles = emptyList(),
-                            msg = "channel error: ${res.detail}",
+                            msg = "channel error: ${snap.detail}",
                             msgKind = MsgKind.CHANNEL,
                         )
                     }
-                is RefreshOutcome.NoDual ->
-                    _state.update {
-                        it.copy(
-                            loading = false,
-                            profiles = res.profiles,
-                            cloned = emptyList(),
-                            msg = "no dual profile",
-                            msgKind = MsgKind.NO_DUAL,
-                        )
-                    }
-                is RefreshOutcome.GroundTruth -> {
-                    val cloned = res.cloned
-                    _state.update { cur ->
-                        if (cloned == null) {
-                            cur.copy(
+                is ProfilesSnapshot.Loaded -> {
+                    val profiles = snap.profiles
+                    // Verified identity only: the id comes from the repo's
+                    // cross-source resolver, never from the pm-list label
+                    // (display-only by contract), so the display layer makes
+                    // no label judgment. Two separate fetches under the hood
+                    // (resolve here plus re-verification inside
+                    // listClonedPackages(dualId)); drift between them returns
+                    // unknown (fail closed), never a write to the wrong user
+                    // (refresh itself is read-only).
+                    val dualId = onIo { repo.resolveDualUserId() }
+                    if (dualId < 0) {
+                        _state.update {
+                            it.copy(
                                 loading = false,
-                                profiles = res.profiles,
-                                msg = "refresh result unknown: " +
-                                    "cannot list clones for user ${res.target.userId}",
-                                msgKind = MsgKind.CHANNEL,
-                            )
-                        } else if (cloned.isEmpty()) {
-                            cur.copy(
-                                loading = false,
-                                profiles = res.profiles,
+                                profiles = profiles,
                                 cloned = emptyList(),
-                                msg = "no clones installed",
-                                msgKind = MsgKind.INFO,
+                                msg = "no dual profile",
+                                msgKind = MsgKind.NO_DUAL,
                             )
-                        } else {
-                            cur.copy(
-                                loading = false,
-                                profiles = res.profiles,
-                                cloned = cloned,
-                                msg = "",
-                                msgKind = MsgKind.NONE,
-                            )
+                        }
+                    } else {
+                        val groundTruth = onIo { repo.listClonedPackages(dualId) }
+                        _state.update { cur ->
+                            if (groundTruth == null) {
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    msg = "refresh result unknown: " +
+                                        "cannot list clones for user $dualId",
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            } else if (groundTruth.isEmpty()) {
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    cloned = emptyList(),
+                                    msg = "no clones installed",
+                                    msgKind = MsgKind.INFO,
+                                )
+                            } else {
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    cloned = groundTruth,
+                                    msg = "",
+                                    msgKind = MsgKind.NONE,
+                                )
+                            }
                         }
                     }
                 }
@@ -299,18 +359,32 @@ class DualViewModel(
     // is not ready or privilege is NONE (fail closed, read-only).
     fun clone(pkg: String) {
         viewModelScope.launch {
-            opMutex.withLock {
-                // Validate input early without touching the device.
-                if (pkg.isBlank()) {
-                    _state.update { it.copy(msg = "invalid package", msgKind = MsgKind.INVALID) }
-                    return@withLock
+            // Validate input early without touching the device.
+            if (pkg.isBlank()) {
+                _state.update { it.copy(msg = "invalid package", msgKind = MsgKind.INVALID) }
+                return@launch
+            }
+            val trimmed: String = pkg.trim()
+            // Write dedup (PR-3 stage 1, issue #24): a second identical clone
+            // while the first is still in flight reports "already in progress"
+            // instead of queueing another mutex waiter + device round-trip.
+            // Checked before the mutex hold (Main-confined add); released in
+            // finally so a cancelled/failed op never wedges the key.
+            val opKey = "clone:$trimmed"
+            if (!inFlightWrites.add(opKey)) {
+                _state.update {
+                    it.copy(msg = "already in progress: $trimmed", msgKind = MsgKind.INFO)
                 }
-                if (!isWritable()) return@withLock
-                val trimmed: String = pkg.trim()
-                _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
-                try {
-                    // Single-snapshot pinned flow inside the repository.
-                    when (val res = repo.cloneVerified(trimmed)) {
+                return@launch
+            }
+            try {
+                opMutex.withLock {
+                    if (!isWritable()) return@withLock
+                    _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+                    try {
+                        // Single-snapshot pinned flow inside the repository.
+                        // onIo: the core retry settle wait must never run on Main.
+                        when (val res = onIo { repo.cloneVerified(trimmed) }) {
                         is CloneOutcome.Success -> {
                             _state.update { cur ->
                                 val current: List<String> =
@@ -385,6 +459,9 @@ class DualViewModel(
                         )
                     }
                 }
+                }
+            } finally {
+                inFlightWrites.remove(opKey)
             }
         }
     }
@@ -395,18 +472,30 @@ class DualViewModel(
     // Refused while the channel is not ready or privilege is NONE.
     fun remove(pkg: String) {
         viewModelScope.launch {
-            opMutex.withLock {
-                // Validate input early without touching the device.
-                if (pkg.isBlank()) {
-                    _state.update { it.copy(msg = "invalid package", msgKind = MsgKind.INVALID) }
-                    return@withLock
+            // Validate input early without touching the device.
+            if (pkg.isBlank()) {
+                _state.update { it.copy(msg = "invalid package", msgKind = MsgKind.INVALID) }
+                return@launch
+            }
+            val trimmed: String = pkg.trim()
+            // Write dedup (PR-3 stage 1, issue #24): same contract as clone()
+            // above, keyed "remove:<pkg>" so an intentional clone-then-remove
+            // sequence on the same package is never collapsed.
+            val opKey = "remove:$trimmed"
+            if (!inFlightWrites.add(opKey)) {
+                _state.update {
+                    it.copy(msg = "already in progress: $trimmed", msgKind = MsgKind.INFO)
                 }
-                if (!isWritable()) return@withLock
-                val trimmed: String = pkg.trim()
-                _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
-                try {
-                    // Single-snapshot pinned flow inside the repository.
-                    when (val res = repo.removeVerified(trimmed)) {
+                return@launch
+            }
+            try {
+                opMutex.withLock {
+                    if (!isWritable()) return@withLock
+                    _state.update { it.copy(loading = true, msg = "", msgKind = MsgKind.NONE) }
+                    try {
+                        // Single-snapshot pinned flow inside the repository.
+                        // onIo: the core retry settle wait must never run on Main.
+                        when (val res = onIo { repo.removeVerified(trimmed) }) {
                         is RemoveOutcome.Success ->
                             _state.update { cur ->
                                 cur.copy(
@@ -478,6 +567,9 @@ class DualViewModel(
                         )
                     }
                 }
+                }
+            } finally {
+                inFlightWrites.remove(opKey)
             }
         }
     }
@@ -486,8 +578,8 @@ class DualViewModel(
     // (Phase F3, issue #6): called from MainActivity's Shizuku binder/permission
     // listeners and from onResume. Serialized through opMutex like every other
     // op, so a re-probe never races an in-flight refresh/clone/remove; the
-    // probe only rewrites privilege/channelReady/msg and leaves
-    // profiles/cloned to the next refresh.
+    // probe rewrites privilege/channelReady/msg (+loading while it runs, PR-3
+    // stage 1 issue #24) and leaves profiles/cloned to the next refresh.
     //
     // Phase F4b-P1: when the persisted choice is AUTO, the startup pick is
     // re-resolved first (the environment may have changed since process
@@ -590,69 +682,76 @@ class DualViewModel(
     // Shizuku/SHELL probe, NoOp repo never). A selected-but-unproven channel
     // stays read-only: fail closed, never a fake working channel.
     // DEVICE-UNVERIFIED: probe/exec round-trips never ran on a device.
+    // PR-3 stage 1 (issue #24): drives loading like every other op (entry sets
+    // busy, the single exit update below clears it, the catch path clears it
+    // too), and elevator probes run via onIo so a blocking gateway can never
+    // stall the Main dispatcher heartbeat.
     private suspend fun probeChannels() {
-        var hasRoot = false
-        var hasShizuku = false
-        for (elevator in elevators) {
-            try {
-                when (elevator.probe().level) {
-                    Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
-                    Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
-                    Privilege.NONE -> Unit
+        _state.update { it.copy(loading = true) }
+        try {
+            var hasRoot = false
+            var hasShizuku = false
+            for (elevator in elevators) {
+                try {
+                    when (onIo { elevator.probe() }.level) {
+                        Privilege.ROOT -> if (elevator is SuElevator) hasRoot = true
+                        Privilege.SHELL -> if (elevator is ShizukuElevator) hasShizuku = true
+                        Privilege.NONE -> Unit
+                    }
+                } catch (e: Exception) {
+                    // A throwing probe means no channel from this elevator.
                 }
-            } catch (e: Exception) {
-                // A throwing probe means no channel from this elevator.
             }
-        }
-        // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
-        // the router encodes that priority, probes only feed it.
-        // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
-        // ROUTING even though the marker now feeds the UI display below
-        // (see hookNeutralRoute). Rationale: the marker is existence+scope
-        // evidence from a file that survives reboots (see HookMarker), not
-        // proof of a live, effective hook, so it must never grant privilege.
-        // Detecting a truly effective hook needs a real device to verify.
-        val routed = hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku)
-        // H2/H4 pure gate (unit-tested by ChannelReadyTest): identical to
-        // the inline when it replaces. Hook signal stays display-only (#19).
-        val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku)
-        // Hook diagnostic signal for the LSPosed picker row (F4b-P2, P1
-        // split). Runs on EVERY probe -- including an explicit-LSPosed
-        // selection with an unproven/NoOp write channel -- and reads through
-        // INDEPENDENT diagnostic paths: direct MarkerReads first, then `cat`
-        // over probe-verified real gateways only (a declared-ROOT/SHELL
-        // gateway whose probe failed is not a usable path). Diagnosis never
-        // feeds `ready`/`routed` above (hook-neutral) and an unproven channel
-        // never executes anything except via a verified diagnostic gateway.
-        // No true channel + unreadable direct reads maps to
-        // UNKNOWN_NO_DIAGNOSTIC, never to inactive.
-        val hook: HookDiagnosis = try {
-            withContext(Dispatchers.IO) {
-                val direct = try {
-                    hookDirectReads()
-                } catch (_: Exception) {
-                    listOf(MarkerRead.Denied, MarkerRead.Denied)
+            // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
+            // the router encodes that priority, probes only feed it.
+            // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
+            // ROUTING even though the marker now feeds the UI display below
+            // (see hookNeutralRoute). Rationale: the marker is existence+scope
+            // evidence from a file that survives reboots (see HookMarker), not
+            // proof of a live, effective hook, so it must never grant privilege.
+            // Detecting a truly effective hook needs a real device to verify.
+            val routed = hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku)
+            // H2/H4 pure gate (unit-tested by ChannelReadyTest): identical to
+            // the inline when it replaces. Hook signal stays display-only (#19).
+            val ready = channelReadyFor(gatewayPrivilege, hasRoot, hasShizuku)
+            // Hook diagnostic signal for the LSPosed picker row (F4b-P2, P1
+            // split). Runs on EVERY probe -- including an explicit-LSPosed
+            // selection with an unproven/NoOp write channel -- and reads through
+            // INDEPENDENT diagnostic paths: direct MarkerReads first, then `cat`
+            // over probe-verified real gateways only (a declared-ROOT/SHELL
+            // gateway whose probe failed is not a usable path). Diagnosis never
+            // feeds `ready`/`routed` above (hook-neutral) and an unproven channel
+            // never executes anything except via a verified diagnostic gateway.
+            // No true channel + unreadable direct reads maps to
+            // UNKNOWN_NO_DIAGNOSTIC, never to inactive.
+            val hook: HookDiagnosis = try {
+                withContext(Dispatchers.IO) {
+                    val direct = try {
+                        hookDirectReads()
+                    } catch (_: Exception) {
+                        listOf(MarkerRead.Denied, MarkerRead.Denied)
+                    }
+                    val candidates = try {
+                        hookDiagnosticGateways()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val usable = candidates.filter {
+                        (it.privilege == Privilege.ROOT && hasRoot) ||
+                            (it.privilege == Privilege.SHELL && hasShizuku)
+                    }
+                    diagnoseHookState(direct, usable)
                 }
-                val candidates = try {
-                    hookDiagnosticGateways()
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                val usable = candidates.filter {
-                    (it.privilege == Privilege.ROOT && hasRoot) ||
-                        (it.privilege == Privilege.SHELL && hasShizuku)
-                }
-                diagnoseHookState(direct, usable)
+            } catch (_: Exception) {
+                HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
             }
-        } catch (_: Exception) {
-            HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
-        }
-        val hookDesc = hook.displayText()
-        _state.update {
-            it.withHookDiagnosis(hook).copy(
-                channel = preference,
-                privilege = routed,
-                channelReady = ready,
+            val hookDesc = hook.displayText()
+            _state.update {
+                it.withHookDiagnosis(hook).copy(
+                    loading = false,
+                    channel = preference,
+                    privilege = routed,
+                    channelReady = ready,
                 msg = if (ready) {
                     ""
                 } else if (currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER) {
@@ -669,8 +768,19 @@ class DualViewModel(
                     "通道未就緒：已選 ${gatewayPrivilege} 通道但探測未通過，寫入已禁用"
                 },
                 msgKind = if (ready) MsgKind.NONE else MsgKind.CHANNEL,
+                )
+            }
+    } catch (e: Exception) {
+        // Probes report via privilege/channelReady, but guard against
+        // unexpected throws so loading never wedges busy.
+        _state.update {
+            it.copy(
+                loading = false,
+                msg = "probe failed: ${e.message}",
+                msgKind = MsgKind.FAILED,
             )
         }
+    }
     }
 
     // Write guard: a real (non-NoOp) ready channel with SHELL or better.
