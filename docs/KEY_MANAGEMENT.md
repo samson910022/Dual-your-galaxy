@@ -28,7 +28,8 @@ CI / Release:
 - Fail-closed by design: if any secret is missing on a tag build, the
   signing step fails the job and nothing is published. There is no
   `unsigned` fallback asset — do not add one.
-- STATUS: SIGN_* secrets not yet configured in GitHub — any v* tag fails by design until then; green non-tag CI does not prove the release signing path; re-verify with one tag dry-run after configuring secrets.
+- STATUS: SIGN_* secrets configured; tag v0.0.0-dryrun passed end-to-end
+  (see #5 close comment). Formal v* tags follow the same path.
 - Local sign (complete — pass alias and both passwords explicitly):
 
   ```bash
