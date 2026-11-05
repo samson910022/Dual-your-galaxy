@@ -1349,6 +1349,61 @@ class VerifyRetryTest {
         assertTrue("failed write must not probe, got: $delays", delays.isEmpty())
     }
 
+    // Phase G1 P1: su client post-spawn transport loss ("su failed
+    // post-spawn: ..." with transportUnknown=true from
+    // captureProcessCancellable's outer guard / SuCmdGateway.run's
+    // conservative generic catch) walks all three write paths as
+    // VerifyUnknown -- never definite failure. Discrimination walks the
+    // in-process flag (isPostSpawnTransportText("su failed: boom") stays
+    // false by design); the text prefix is greppability only.
+    @Test
+    fun cloneVerified_suFailedPostSpawnText_probeAbsent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "su failed post-spawn: boom", truncated = true, transportUnknown = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerified_suFailedPostSpawnText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "su failed post-spawn: boom", truncated = true, transportUnknown = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerifiedExpected_suFailedPostSpawnText_probePresent_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "", err = "su failed post-spawn: boom", truncated = true, transportUnknown = true)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
     // Phase D coverage gap: an ordinary write failure (plain Failure[...] with
     // no timeout signal) on the expected-remove path stays a definite
     // RemoveFailed -- single write, zero list probes, zero settle waits.

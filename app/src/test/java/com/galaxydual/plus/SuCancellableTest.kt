@@ -19,7 +19,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -111,5 +115,114 @@ class SuCancellableTest {
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
         assertEquals("handover call must complete", "ok\n", res.out)
         assertTrue("handover must be immediate (elapsed=${elapsedMs}ms)", elapsedMs < 2_000L)
+    }
+
+    // Phase G1 P1: a rogue Process.waitFor throwing post-spawn (e.g. a fake
+    // or OEM Process impl throwing IllegalStateException) must NOT escape
+    // to SuCmdGateway.run's generic catch as definite -- spawn already
+    // succeeded, so the remote pm may have executed. Fail closed to
+    // transportUnknown via the in-process flag (text keeps the
+    // "su failed post-spawn: " prefix for greppability).
+    private class PostSpawnThrowingProcess : Process() {
+        var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = throw IllegalStateException("boom")
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = throw IllegalStateException("boom")
+        override fun exitValue(): Int = throw IllegalStateException("boom")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = true
+    }
+
+    @Test fun postSpawnWaitThrows_mapsToTransportUnknownNotDefinite() = runBlocking {
+        val fake = PostSpawnThrowingProcess()
+        val gw = SuCmdGateway { _ -> fake }
+        val res = gw.run("pm install-existing --user 95 com.example.app")
+        assertTrue("post-spawn throw must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("post-spawn throw must not carry timedOut (transport loss, not deadline), got: $res", res.timedOut)
+        assertTrue("post-spawn throw must be truncated (partial capture), got: $res", res.truncated)
+        assertTrue(
+            "post-spawn throw err must keep the post-spawn prefix, got: \"${res.err}\"",
+            res.err.startsWith("su failed post-spawn: "),
+        )
+        assertTrue("post-spawn throw err must keep the cause, got: \"${res.err}\"", res.err.contains("boom"))
+        assertTrue("post-spawn throw must not claim definite (exit trusted), got: $res", res.exit != 0)
+        assertTrue("post-spawn throw must destroy best effort", fake.destroyed)
+    }
+
+    // Phase G1 P1 (destroy variant): timeout already abandoned the wait, and
+    // the best-effort destroy itself throws post-spawn (rogue Process impl).
+    // Best-effort means the throw must not mask the timeout result: the
+    // reply stays timedOut=true (unknown-after-send, read-only reconcile),
+    // never definite, never an escape. Short budget keeps the JVM test fast.
+    private class DestroyThrowingProcess : Process() {
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
+        override fun exitValue(): Int = 0
+        override fun destroy() {}
+        override fun destroyForcibly(): Process = throw IllegalStateException("destroy boom")
+        override fun isAlive(): Boolean = false
+    }
+
+    @Test fun postSpawnDestroyThrows_doesNotMaskTimeout() = runBlocking {
+        val res = captureProcessCancellable(
+            arrayOf("su", "-c", "pm install-existing --user 95 com.example.app"),
+            timeoutMs = 200L,
+            execFn = { _ -> DestroyThrowingProcess() },
+        )
+        assertTrue("destroy throw must not mask the timeout, got: $res", res.timedOut)
+        assertTrue("timeout reply must not claim definite, got: $res", res.exit != 0)
+        assertTrue("timeout err must keep the deadline prefix, got: \"${res.err}\"", res.err.startsWith("timeout after "))
+    }
+
+    // Phase G1 P1 (exitValue variant): the wait reports exit but reading the
+    // code throws post-spawn (process vanished between wait and read).
+    // Unknown-after-send by construction -- the remote pm may have executed.
+    private class ExitValueThrowingProcess : Process() {
+        var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+        override fun exitValue(): Int = throw IllegalStateException("exit boom")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = false
+    }
+
+    @Test fun postSpawnExitValueThrows_mapsToTransportUnknownNotDefinite() = runBlocking {
+        val fake = ExitValueThrowingProcess()
+        val gw = SuCmdGateway { _ -> fake }
+        val res = gw.run("pm install-existing --user 95 com.example.app")
+        assertTrue("exitValue throw must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("exitValue throw must not carry timedOut, got: $res", res.timedOut)
+        assertTrue("exitValue throw must not claim definite, got: $res", res.exit != 0)
+        assertTrue("exitValue throw err must keep the cause, got: \"${res.err}\"", res.err.contains("exit boom"))
+        assertTrue("exitValue throw must destroy best effort", fake.destroyed)
+    }
+
+    // Phase G1 cancel-semantics lock: CE thrown by the spawn seam (or by the
+    // cancellable waits) must still propagate -- never swallowed into a
+    // CmdResult by the new post-spawn generic catch.
+    @Test fun postSpawn_cancellationStillPropagates() = runBlocking {
+        val gw = SuCmdGateway { _ -> throw CancellationException("cancel-seam") }
+        try {
+            gw.run("id -u")
+            fail("CancellationException from spawn must propagate, not map to a CmdResult")
+        } catch (e: CancellationException) {
+            assertEquals("cancel-seam", e.message)
+        }
     }
 }
