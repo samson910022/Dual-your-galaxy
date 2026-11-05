@@ -442,6 +442,10 @@ class ShizukuCmdGateway(
                 ShizukuExecErrors.timedOut()
             }
         } catch (e: CancellationException) {
+            // Intentionally no dropBindingLocked() on the cancel path: the
+            // orphan transact still owns the old handle but the driver serves
+            // concurrent transacts, so the next call reuses it and only a real
+            // failure rebuilds -- avoids rebind churn on latest-wins cancels.
             throw e
         } catch (e: InterruptedException) {
             // The block's own interrupt, unwrapped from the future by
