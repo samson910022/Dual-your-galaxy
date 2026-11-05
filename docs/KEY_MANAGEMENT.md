@@ -58,9 +58,11 @@ CI / Release:
   `~/.android-keys/Galaxy-Dual-app-Plus-release.properties`
   (`storeFile/storePassword/keyAlias/keyPassword`) is not read by
   `apksigner` directly; export its values as env vars first.
-- Signature versions: manual `apksigner sign` enables v1 (JAR signing) + v2 (APK
-  Signature Scheme v2) by default. Keep the default for sideload
-  installs (widest compatibility). Explicit form:
+- Signature versions: manual `apksigner sign` schemes depend on the APK
+  min/max SDK and options (`--v1-signing-enabled` / `--v2-signing-enabled`
+  defaults follow the official apksigner documentation, not always both on).
+  To explicitly require v1 (JAR signing) + v2 (APK Signature Scheme v2)
+  for widest sideload compatibility, pass
   `--v1-signing-enabled true --v2-signing-enabled true`. CI-built APK
   differs: run 41800791298 attempt 3 `apksigner verify --verbose`
   shows v1=false / v2=true as observed in that run (minSdk 29 per
