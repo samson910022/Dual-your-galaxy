@@ -1341,8 +1341,7 @@ class DualViewModel(
             _state.update { it.copy(loading = false) }
             throw e
         } catch (e: Exception) {
-            // Never swallow coroutine cancellation: rethrow so cancel stays
-            // cooperative and refresh() coalescing still drains correctly.
+            // 取消由上方專屬 catch 透傳；此處只處理真正異常。
             // Gateways report via CmdResult, but guard against unexpected throws.
             // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
             // PR-6 P2: 舊資料標 STALE，不謊稱新鮮；lastOperation 不動。
@@ -3771,7 +3770,7 @@ class DualViewModel(
                     timeMs = now,
                     detail = batchOutcomeDetail(res),
                 ),
-                diagnose = res.toDiagnoseEvent(),
+                diagnose = res.toDiagnoseEvent(pkg),
             )
         }
     }
