@@ -588,10 +588,12 @@ class DualViewModel(
     // remove use distinct keys so an intentional clone-then-remove sequence on
     // the same package is never collapsed. Main-confined (see class doc).
     //
-    // CE convention (F5): a cancelled job never clears loading itself --
-    // every catch rethrows CancellationException before touching state. The
-    // live successor's entry set (leading busy, F2) owns the flag; a terminal
-    // scope-cancel discards state with the ViewModel, so no wedge survives.
+    // CE convention (F5): a cancelled job clears loading before rethrowing --
+    // every catch clears loading=false then rethrows CancellationException
+    // (reconnect/refresh/recheck/probe/foreground 皆同，成功/失敗清位不變；
+    // 取消路徑補清）。唯 selectChannel 無 CE catch (latest-wins 靠
+    // successor 的 leading busy 覆寫)；terminal scope-cancel 隨 ViewModel
+    // 丟棄狀態，無殘留。
     private val inFlightWrites = mutableSetOf<String>()
 
     // Single constructor for in-flight write dedup keys; keeps the
@@ -709,7 +711,12 @@ class DualViewModel(
         // Probe elevation channels first; later ops queue behind this, so the
         // first refresh always sees the routed privilege, never a default.
         viewModelScope.launch {
-            opMutex.withLock { probeChannels(allowPrivilegedHookDiagnosis = false) }
+            opMutex.withLock {
+                probeChannels(
+                    allowPrivilegedHookDiagnosis = false,
+                    resolvedBeforeOp = null,
+                )
+            }
         }
     }
 
@@ -745,9 +752,8 @@ class DualViewModel(
         // F2/P3 leading busy: mark busy synchronously at launch (msg-preserving)
         // so a waiter queued behind opMutex never exposes loading=false before
         // its locked body re-sets it idempotently below. CE convention: a
-        // cancelled job never clears loading itself (see class doc); the live
-        // successor's entry set owns the flag, and a terminal scope-cancel
-        // discards state with the ViewModel.
+        // cancelled job clears loading before rethrowing (see class doc);
+        // selectChannel is the only path relying on the successor overwrite.
         viewModelScope.launch {
             _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
@@ -821,7 +827,7 @@ class DualViewModel(
             // returns the result for probeChannels to reuse (previously each
             // probed all elevators: double `su -c` cost + double auth-prompt risk).
             // Phase 2: 鏈式共用一次 loading (probe 保留 busy，refresh 結尾才清除)。
-            // P2-4: swap 前記錄 resolved，納入 probe 的 FRESH 失效判斷。
+            // P2-4（僅 AUTO 有效）: swap 前記錄 resolved，納入 probe 的 FRESH 失效判斷。
             val resolvedBeforeOp = currentChannel
             if (preference == ChannelPreference.AUTO) {
                 val probe = swapAutoLocked()
@@ -1161,9 +1167,7 @@ class DualViewModel(
                                     cur.degradeNote,
                                 )
                                 // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
-                                val clearFailed =
-                                    cur.lastOperation?.phase != OpPhase.UNKNOWN &&
-                                        cur.lastOperation?.phase == OpPhase.FAILED
+                                val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -1199,9 +1203,7 @@ class DualViewModel(
                                     cur.degradeNote,
                                 )
                                 // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
-                                val clearFailed =
-                                    cur.lastOperation?.phase != OpPhase.UNKNOWN &&
-                                        cur.lastOperation?.phase == OpPhase.FAILED
+                                val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -2960,7 +2962,7 @@ class DualViewModel(
             // P25 Item 3: one probe per round — see reconnectLocked.
             // P2-1: allowPrivilegedHookDiagnosis gates privileged diagnostic `cat`
             // (auto binder/onResume pass false: LSPOSED stays direct-only).
-            // P2-4 (同 reconnectLocked/foregroundLocked)：swap 前記錄 resolved，
+            // P2-4（僅 AUTO 有效；同 reconnectLocked/foregroundLocked）：swap 前記錄 resolved，
             // 納入 probe 的 FRESH 失效判斷 (resolved 改變即降 STALE；此處若沿用
             // swap 後的 currentChannel，degrade 會被誤判為無變化而續留 FRESH)。
             val resolvedBeforeOp = currentChannel
@@ -3611,10 +3613,11 @@ class DualViewModel(
     // Phase 2 (併發修復)：keepLoadingOnExit=true 時出口保留 loading=true，
     // 供同一次 mutex 持有內的 probe+refresh 鏈式呼叫共用一次 loading
     // (中間不閃斷)；獨立呼叫維持預設 false (語意不變)。
-    // P2-4：resolvedBeforeOp 為呼叫端在前置 swapAutoLocked 之前記錄的
-    // resolved（recheck/onForeground 會先 swap 再 probe；probe 內捕捉不到
-    // 那段變化，故由呼叫端傳入）。null 表無前置 swap，以 probe 入口的
-    // currentChannel 為準（selectChannel/reconnect 皆無前置 swap）。
+    // P2-4（僅 AUTO 有效）：resolvedBeforeOp 為呼叫端在前置 swapAutoLocked 之前記錄的
+    // resolved（AUTO recheck/reconnect/onForeground 會先 swap 再 probe；probe 內捕捉不到
+    // 那段變化，故由呼叫端傳入）。明選無前置 swap，傳入值即等於 currentChannel。
+    // null 表無前置 swap，以 probe 入口的 currentChannel 為準（init 與
+    // selectChannel 顯式傳 null——其後接 refresh 全量重查，結果良性）。
     // 最大持鎖估算 (不加 timeout，僅記錄)：probe 約 2×elevator(各 ≤3s settle)
     // + hook 診斷(cat ≤3s) ≈ ≤9s；後接 refresh 約 ≤4 round-trip(各 ≤3s)
     // ≈ ≤12s；鏈式合計最差約 ~20s，期間其他 op 在 mutex 排隊，
@@ -3976,9 +3979,16 @@ class DualViewModel(
         // report via privilege/channelReady, but guard against
         // unexpected throws so loading never wedges busy. pendingRemove 開著
         // 時新 kind == NONE/INFO 才保留，CHANNEL/FAILED 穿透，不保留。
-        // Phase 2: probe 拋錯（binder dead 等）同樣使 pmReadable 過期 -> null。
-        // PR-6 P2: 保留 lastOperation/inventory (probe 失敗不清除歷史)，
-        // 只記錄本次探測失敗的診斷事件。
+        // Phase 2: probe 外層拋錯（時鐘/拷貝類非預期拋錯）同樣使 pmReadable 過期 -> null。
+        // 注意：probeOnce 內 elevator/hook 拋錯已就地吞掉走 !ready 正常路徑
+        // （CHANNEL，見上）；binder dead 歸正常路徑，不進此 catch。
+        // PR-6 P2: 保留 lastOperation (probe 失敗不清除歷史)，
+        // 只記錄本次探測失敗的診斷事件；inventory 舊資料標 STALE/NOT-FRESH
+        // (FRESH->STALE，否則 UNKNOWN；比照 refreshLocked throw，保留 targetId，
+        // 時鐘/拷貝類非預期 throw 後 FRESH 不得續留）。
+        // msgKind 意圖 (J3c)：此外層 catch 為時鐘/拷貝類非預期拋錯 -> FAILED；
+        // 正常 !ready（預期未就緒，含 binder dead 等通道失敗）-> CHANNEL。
+        // 兩者現行值由測試鎖定，不得互換。
         // phase1: 探測異常只在無 sticky 事件時才設 PROBE_FAILED (既有 diagnose
         // 如 VERIFY_UNKNOWN 等待重新查證者優先保留，避免探測抖動洗掉歷史)。
         // phase2: 鏈式呼叫保留 busy 交給 refreshLocked；獨立呼叫在此清除。
@@ -3991,6 +4001,16 @@ class DualViewModel(
             _state.update { it.copy(loading = false) }
             throw e
         }
+        // 時鐘亦可能故障（如測試注入的 nowWallMs 拋錯）：此處再拋會逃出
+        // catch 使 loading 楔住 true，故兜底——FRESH 僅降 STALE（不碰
+        // queryTime），其餘不動；時鐘正常則走完整 toStaleOrUnknown。
+        val throwNow: Long? = try {
+            nowWallMs()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
         _state.update { cur ->
             val probeDiagnose =
                 if (preference == ChannelPreference.LSPOSED) {
@@ -4000,12 +4020,28 @@ class DualViewModel(
                 } else {
                     cur.diagnose ?: diagnoseEvent(
                         DiagnoseCode.PROBE_FAILED,
-                        techDetail = sanitizeForDisplay(e.message ?: "probe failed"),
+                        techDetail = sanitizeForDisplay(e.message ?: "probe failed") +
+                            // 時鐘兜底分支痕跡：throwNow 取時失敗即時鐘不可用，
+                            // 別靜默吞（FRESH 僅降 STALE 且 queryTime 未動）。
+                            if (throwNow == null) " [clock unavailable]" else "",
                     )
                 }
             val next = cur.copy(
                 loading = keepLoadingOnExit,
                 pmReadable = null,
+                inventory = if (throwNow == null) {
+                    if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                        cur.inventory.copy(freshness = InventoryFreshness.STALE)
+                    } else {
+                        cur.inventory
+                    }
+                } else {
+                    cur.inventory.toStaleOrUnknown(
+                        now = throwNow,
+                        source = "probe(exception)",
+                        targetId = cur.inventory.targetId,
+                    )
+                },
                 diagnose = probeDiagnose,
                 msg = "probe failed: ${sanitizeForDisplay(e.message ?: "probe failed")}",
                 msgKind = MsgKind.FAILED,
@@ -4110,6 +4146,8 @@ class DualViewModel(
         // repo re-verifies and fail-closes there; only a proven-false PM
         // refuses here.
         if (cur.pmReadable == false) {
+            // PM 不可讀拒寫不另寫 diagnose：靠前序 probe 殘留 PROBE_FAILED
+            // (ready=false 時 probe 已寫碼；sticky 歷史優先保留）。
             _state.update {
                 it.copy(
                     loading = false,
@@ -4159,7 +4197,10 @@ class DualViewModel(
         // 5 rapid taps collapse to leader + at most one trailing instead of
         // 5 mutex waiters each running probe (+ full refresh when stale).
         // Main-confined check-and-set/clear (same reasoning as refresh()).
+        // F2/P3 leading busy (msg-preserving, same as refresh()): queued
+        // behind opMutex still reads busy.
         viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
             if (foregroundJob?.isActive == true) {
                 foregroundPending = true
                 return@launch
@@ -4170,6 +4211,10 @@ class DualViewModel(
                 opMutex.withLock { foregroundLocked() }
                 while (foregroundPending) {
                     foregroundPending = false
+                    // Re-review #7 B2 (same as recheck loop): hold busy across
+                    // the mutex handoff so the trailing round never exposes
+                    // loading=false while it waits on opMutex behind another op.
+                    _state.update { it.copy(loading = true) }
                     opMutex.withLock { foregroundLocked() }
                 }
             } finally {
@@ -4179,45 +4224,51 @@ class DualViewModel(
     }
 
     // Foreground body: must run under opMutex (callers hold it).
+    // Phase D P2 busy (#24, same as reconnectLocked/recheckLocked): mark busy
+    // BEFORE any suspending swap/probe IO. swapAutoLocked() suspends on
+    // `su -c id -u` while probeChannels() used to be the first place setting
+    // loading -- without this early set the swap window exposes loading=false.
+    // 取消窗口 (同 reconnectLocked)：取消落在 swap 內 su -c 懸掛永不到 probe
+    // 的清除點 → 同殘 true；外層補取消清 loading 作保險 (僅取消路徑，
+    // 不改成功/失敗語意)。
     private suspend fun foregroundLocked() {
-        markStaleIfAgedLocked()
-        // 註：此路無 early-busy (loading 由 probeChannels 內首設)，swap 懸掛時
-        // 取消落在 loading=true 之前，舊值多為 false，無殘 true 窗口；生產 job
-        // 只隨 scope 清除被取消，無手動 cancel。外層仍補取消清 loading 作保險
-        // (僅取消路徑，不改成功/失敗語意)。
+        _state.update { it.copy(loading = true) }
         try {
-                // P2-6：probe 前記錄通道狀態 (resolved/ready)，供 probe 後
-                // 變化偵測（全量 refresh 只在 inventory 非 FRESH 或通道改變時）。
-                val resolvedBefore = currentChannel
-                val readyBefore = _state.value.writeReady
-                // P25 Item 3: one probe per round — swapAutoLocked probes once and
-                // returns the result for probeChannels to reuse.
-                // 全程共用一次 loading：probe 保留 busy，需重查則 refresh 接手
-                // (中間不閃斷)；輕探路徑 (免重查) 在此清除。
-                if (preference == ChannelPreference.AUTO) {
-                    val probe = swapAutoLocked()
-                    probeChannels(
-                        probe,
-                        keepLoadingOnExit = true,
-                        resolvedBeforeOp = resolvedBefore,
-                    )
-                } else {
-                    probeChannels(
-                        keepLoadingOnExit = true,
-                        resolvedBeforeOp = resolvedBefore,
-                    )
-                }
-                // stale-read 修正：probeChannels() 已改寫 state，必須重讀
-                // _state.value 再判斷 refresh (此前沿用 probe 前快照，FRESH
-                // 過期或 hook 轉未知會被漏判)。
-                val after = _state.value
-                val channelChanged =
-                    currentChannel != resolvedBefore || after.writeReady != readyBefore
-                if (after.inventory.freshness != InventoryFreshness.FRESH || channelChanged) {
-                    refreshLocked()
-                } else {
-                    _state.update { it.copy(loading = false) }
-                }
+            // 過期 FRESH 補 STALE 放 try 內：時鐘拋錯走取消/異常路徑清 loading，
+            // 不得卡 loading=true（此前在 try 外，時鐘拋錯直接逃出）。
+            markStaleIfAgedLocked()
+            // P2-6：probe 前記錄通道狀態 (resolved/ready)，供 probe 後
+            // 變化偵測（全量 refresh 只在 inventory 非 FRESH 或通道改變時）。
+            val resolvedBefore = currentChannel
+            val readyBefore = _state.value.writeReady
+            // P25 Item 3: one probe per round — swapAutoLocked probes once and
+            // returns the result for probeChannels to reuse.
+            // 全程共用一次 loading：probe 保留 busy，需重查則 refresh 接手
+            // (中間不閃斷)；輕探路徑 (免重查) 在此清除。
+            if (preference == ChannelPreference.AUTO) {
+                val probe = swapAutoLocked()
+                probeChannels(
+                    probe,
+                    keepLoadingOnExit = true,
+                    resolvedBeforeOp = resolvedBefore,
+                )
+            } else {
+                probeChannels(
+                    keepLoadingOnExit = true,
+                    resolvedBeforeOp = resolvedBefore,
+                )
+            }
+            // stale-read 修正：probeChannels() 已改寫 state，必須重讀
+            // _state.value 再判斷 refresh (此前沿用 probe 前快照，FRESH
+            // 過期或 hook 轉未知會被漏判)。
+            val after = _state.value
+            val channelChanged =
+                currentChannel != resolvedBefore || after.writeReady != readyBefore
+            if (after.inventory.freshness != InventoryFreshness.FRESH || channelChanged) {
+                refreshLocked()
+            } else {
+                _state.update { it.copy(loading = false) }
+            }
         } catch (e: CancellationException) {
             _state.update { it.copy(loading = false) }
             throw e
