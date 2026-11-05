@@ -37,7 +37,7 @@ object SamsungProfileAdapter {
     private val HEADER = Regex("UserInfo\\{(\\d+):([^:}]*):([^}]*)\\}")
 
     // A user-type token meaning Samsung/clone profile. Matches
-    // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space) so
+    // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space/Tab) so
     // `android.os.usertype.profile.CLONE`, `profile_CLONE` and case
     // variants all count. Case-insensitive by design. Right boundary
     // (?![A-Za-z0-9]) excludes `profileCloneable`-style longer tokens.
@@ -84,19 +84,26 @@ object SamsungProfileAdapter {
         Regex("^profile(?:\\.clone|[ _\\-\\t]{1,3}clone)$", RegexOption.IGNORE_CASE).matches(token)
 
     // Tainted CLONE tail (P1-R6 fail-closed): a CLONE token (dot form or
-    // enumerated separators) followed by optional whitespace + `/`, where
-    // the `/` does NOT open another `profile` token. `profile.CLONE/evil`,
-    // `profile.CLONE/` and `profile.CLONE / evil` match (tainted -> OTHER);
-    // `profile.MANAGED/profile.CLONE` does not match (the `/` opens another
+    // enumerated separators) followed on the same line by any `/` (with
+    // arbitrary gap words between CLONE and the slash), where the `/`
+    // does NOT open another `profile` token. `profile.CLONE/evil`,
+    // `profile.CLONE/`, `profile.CLONE / evil`, `profile.CLONE - /evil`,
+    // `profile.CLONE foo/evil` and `profile.CLONE (/evil)` match
+    // (tainted -> OTHER); `profile.MANAGED/profile.CLONE` and
+    // `profile.CLONE/profile.MANAGED` do not match (the `/` opens another
     // `profile` token, so the mention still goes through the normal
-    // two-token UNKNOWN rule). Relation to the `/` terminator: PROFILE_TOKEN
+    // two-token UNKNOWN rule). `profile.CLONE (default)` (no slash) stays
+    // CLONE. Note: a slash inside a parenthesized note (e.g.
+    // `profile.CLONE (a/b)`) conservatively degrades to OTHER (fail
+    // closed); real-device type lines carry no such shape. Relation to the
+    // `/` terminator: PROFILE_TOKEN
     // intentionally stops at `/`, which would otherwise let the trailing
     // word silently drop and leave a clean CLONE token; this guard re-adds
     // the trailing-slash signal so such mentions fail closed to OTHER
     // (single tainted CLONE) instead of CLONE. A mixed `CLONE, CLONE/evil`
     // mention is likewise OTHER (fail closed, never CLONE-by-priority).
     private val TAINTED_CLONE_TAIL =
-        Regex("profile(?:\\.|[ _\\-\\t]{1,3})clone\\s*/(?!\\s*profile)", RegexOption.IGNORE_CASE)
+        Regex("profile(?:\\.|[ _\\-\\t]{1,3})clone[^\\n/]*?/(?![ \\t]*profile)", RegexOption.IGNORE_CASE)
 
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
@@ -230,12 +237,16 @@ object SamsungProfileAdapter {
     //   contradiction -> UNKNOWN for the block (covers whitespace, `/`,
     //   `,`, `;` or any other separator, since tokens ignore separators).
     // - Tainted CLONE tail (P1-R6 fail-closed): within one mention, a CLONE
-    //   token followed by optional whitespace + `/` (not opening another
+    //   token followed on the same line by any `/` (arbitrary gap words
+    //   allowed between CLONE and the slash, not opening another
     //   `profile` token, see TAINTED_CLONE_TAIL) taints the mention: a
-    //   single `profile.CLONE/evil` (or trailing-slash) mention has
+    //   single `profile.CLONE/evil` (or trailing-slash, or gap-word forms
+    //   like `profile.CLONE - /evil` / `profile.CLONE foo/evil` /
+    //   `profile.CLONE (/evil)`) mention has
     //   segClone forced false and segOther forced true -> OTHER for the
-    //   block; `profile.MANAGED/profile.CLONE` is untainted (slash opens
-    //   another `profile` token) and stays on the two-token UNKNOWN rule;
+    //   block; `profile.MANAGED/profile.CLONE` and
+    //   `profile.CLONE/profile.MANAGED` are untainted (slash opens
+    //   another `profile` token) and stay on the two-token UNKNOWN rule;
     //   a mixed `CLONE, CLONE/evil` mention is OTHER (fail closed).
     // - Block verdict: any intra-mention contradiction -> UNKNOWN; else
     //   hasCloneSeg && hasOtherSeg (across mentions) -> UNKNOWN
