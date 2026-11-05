@@ -52,6 +52,11 @@ class RemoveConfirmTest {
         var uninstallExit = 0
         var listPackagesOut = ""
         var listPackagesExit = 0
+        // Stateful installed set (PR-33 R3, P2): verifyState reads
+        // `pm list packages` ground truth, so the fake tracks installs.
+        // Default contains the chat pkg used by most tests; the overwrite
+        // test adds its own pkgs in-fixture.
+        val installedPkgs = mutableSetOf("com.example.chat")
         // Backward-compatible label override: "change label, keep id" simulation.
         // Null (default) keeps the historic "DualApp" on every channel.
         var labelOverride: String? = null
@@ -101,10 +106,23 @@ class RemoveConfirmTest {
                     CmdResult(exit = 0, out = "$dualId\n", err = "")
                 cmd.startsWith("pm uninstall") -> {
                     uninstallCalls++
+                    // Stateful: last token is the pkg; a successful uninstall
+                    // removes it so the post-write re-check sees NotInstalled.
+                    val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                    if (uninstallExit == 0) installedPkgs.remove(pkg)
                     CmdResult(exit = uninstallExit, out = uninstallOut, err = "")
                 }
-                cmd.startsWith("pm list packages") ->
-                    CmdResult(exit = listPackagesExit, out = listPackagesOut, err = "")
+                cmd.startsWith("pm list packages") -> {
+                    val base = installedPkgs.map { "package:$it" }.joinToString("\n")
+                    val out = if (base.isEmpty()) {
+                        listPackagesOut
+                    } else if (listPackagesOut.isEmpty()) {
+                        base
+                    } else {
+                        base + "\n" + listPackagesOut
+                    }
+                    CmdResult(exit = listPackagesExit, out = out, err = "")
+                }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
         }
@@ -130,7 +148,7 @@ class RemoveConfirmTest {
         Dispatchers.resetMain()
     }
 
-    private fun makeVm(gw: FakeRepoGateway): DualViewModel {
+    private fun makeVm(gw: FakeRepoGateway, nowMs: () -> Long = System::currentTimeMillis): DualViewModel {
         val repo = DualRepository(gw)
         // Real SuElevator over the fake gateway: probeChannels only counts
         // hasRoot when the elevator IS a SuElevator (and hasShizuku for
@@ -151,6 +169,7 @@ class RemoveConfirmTest {
             currentChannel = ResolvedChannel.ROOT,
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
+            nowMs = nowMs,
         )
         vms.add(vm)
         return vm
@@ -389,6 +408,8 @@ class RemoveConfirmTest {
     @Test
     fun request_secondOverwritesFirst_lastWins() {
         val gw = FakeRepoGateway(dualId = 95)
+        gw.installedPkgs.add("com.example.a")
+        gw.installedPkgs.add("com.example.b")
         val vm = makeVm(gw)
         awaitReady(vm)
 
@@ -504,6 +525,10 @@ class RemoveConfirmTest {
             "rejection must ask for re-confirmation, got: \"${vm.state.value.msg}\"",
             vm.state.value.msg.contains("重新確認"),
         )
+        assertTrue(
+            "rejection must name the serial mismatch, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg.contains("serial"),
+        )
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
     }
 
@@ -523,5 +548,72 @@ class RemoveConfirmTest {
         assertNull(vm.state.value.pendingRemove)
         assertEquals("unverifiable target must not uninstall", 0, gw.uninstallCalls)
         assertEquals(MsgKind.NO_DUAL, vm.state.value.msgKind)
+    }
+
+    // P2 安裝狀態 (PR-33 R3): requesting a package that is not installed
+    // refuses with no pending and zero uninstalls (INFO 無需移除).
+    @Test
+    fun request_notInstalled_refusesWithoutPending() {
+        val gw = FakeRepoGateway(dualId = 95)
+        gw.installedPkgs.clear()
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.msg.contains("無需移除") }
+
+        assertNull(vm.state.value.pendingRemove)
+        assertEquals("absent package must not uninstall", 0, gw.uninstallCalls)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+    }
+
+    // P2 時效 (PR-33 R3): a stale consent older than REMOVE_CONFIRM_TTL_MS
+    // is refused with zero uninstalls (INVALID + 重新確認, must re-request).
+    @Test
+    fun confirm_stalePending_rejectsAndRequiresReconfirm() {
+        val gw = FakeRepoGateway(dualId = 95)
+        var now = System.currentTimeMillis()
+        val vm = makeVm(gw) { now }
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        now += DualViewModel.REMOVE_CONFIRM_TTL_MS + 1
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+
+        assertEquals("stale consent must not uninstall", 0, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
+        assertTrue(
+            "expiry must ask for re-confirmation, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg.contains("重新確認"),
+        )
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+    }
+
+    // P2 安裝重驗 (PR-33 R3): the package vanished between request and
+    // confirm (external uninstall) -- confirm clears without uninstalling
+    // (INFO 無需移除, cloned left for refresh to sync).
+    @Test
+    fun confirm_packageGoneBeforeConfirm_clearsPendingWithoutUninstall() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        gw.installedPkgs.clear()
+        vm.confirmRemove()
+        awaitVm(vm) { vm.state.value.pendingRemove == null && !vm.state.value.loading }
+
+        assertEquals("gone package must not uninstall", 0, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
+        assertTrue(
+            "gone package must report no-op, got: \"${vm.state.value.msg}\"",
+            vm.state.value.msg.contains("無需移除"),
+        )
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
     }
 }

@@ -13,6 +13,7 @@ import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RemoveOutcome
+import com.galaxydual.core.VerifyState
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
@@ -46,9 +47,10 @@ import kotlinx.coroutines.withContext
 //   together and refuses a serial mismatch without uninstalling.
 // - profileLabel: display label of that target at request time (second
 //   "selection unchanged" signal besides the id).
-// - requestedAtMs: wall-clock time of the request (diagnostics only; no
-//   expiry is enforced -- a stale dialog is rejected by the id/label/serial
-//   re-check, not by age).
+// - requestedAtMs: wall-clock time of the request (consent generation).
+//   confirmRemove rejects a stale consent older than REMOVE_CONFIRM_TTL_MS
+//   (fail closed, must request again); the serial/id/label re-check still
+//   guards a moved target regardless of age.
 //
 // Rotation policy (explicit choice, pinned by RemoveConfirmTest): pending
 // lives in UiState inside the ViewModel, so a config rotation (Activity
@@ -238,7 +240,17 @@ class DualViewModel(
     // regardless.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
+    // Wall-clock source for the remove-consent TTL (PR-33 R3, P2). Defaults
+    // to the real clock so production needs no wiring; tests inject a
+    // controllable fake. Constructor stays Android-free.
+    private val nowMs: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
+    companion object {
+        // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
+        // open longer than this must re-request; confirmRemove clears the
+        // stale pending with INVALID + 重新確認 and runs zero uninstalls.
+        const val REMOVE_CONFIRM_TTL_MS = 5 * 60 * 1000L
+    }
     private val _state = MutableStateFlow(
         UiState(
             channel = preference,
@@ -584,6 +596,10 @@ class DualViewModel(
     // confirmed but its serial cannot be established. A second request
     // overwrites the first (last wins); the confirm step re-validates, so a
     // stale overwrite cannot execute.
+    // PR-33 R3 (P2 安裝狀態 + 時效): stores nowMs() as the consent
+    // generation and refuses before storing when the package is not
+    // installed (NotInstalled -> INFO 無需移除, Unknown -> CHANNEL fail
+    // closed), so a no-op removal never opens a dialog.
     fun requestRemove(pkg: String) {
         viewModelScope.launch {
             // Validate input early without touching the device.
@@ -660,21 +676,52 @@ class DualViewModel(
                                                 )
                                             }
                                         } else {
-                                            val pending = PendingRemove(
-                                                pkg = trimmed,
-                                                dualId = dualId,
-                                                dualSerial = target.target.serial,
-                                                profileLabel = label,
-                                                requestedAtMs = System.currentTimeMillis(),
-                                            )
-                                            _state.update {
-                                                it.copy(
-                                                    loading = false,
-                                                    profiles = snap.profiles,
-                                                    pendingRemove = pending,
-                                                    msg = "等待確認移除：$trimmed（user $dualId）",
-                                                    msgKind = MsgKind.INFO,
-                                                )
+                                            // P2 安裝檢查 (PR-33 R3): only an
+                                            // Installed package opens a
+                                            // dialog; a confirmed-absent
+                                            // package is a no-op INFO, an
+                                            // uncheckable channel is CHANNEL
+                                            // fail closed (never a dialog).
+                                            when (val st = onIo { repo.verifyState(trimmed, dualId) }) {
+                                                is VerifyState.Installed -> {
+                                                    val pending = PendingRemove(
+                                                        pkg = trimmed,
+                                                        dualId = dualId,
+                                                        dualSerial = target.target.serial,
+                                                        profileLabel = label,
+                                                        requestedAtMs = nowMs(),
+                                                    )
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = pending,
+                                                            msg = "等待確認移除：$trimmed（user $dualId）",
+                                                            msgKind = MsgKind.INFO,
+                                                        )
+                                                    }
+                                                }
+                                                is VerifyState.NotInstalled ->
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = null,
+                                                            msg = "未安裝，無需移除：$trimmed",
+                                                            msgKind = MsgKind.INFO,
+                                                        )
+                                                    }
+                                                is VerifyState.Unknown ->
+                                                    _state.update {
+                                                        it.copy(
+                                                            loading = false,
+                                                            profiles = snap.profiles,
+                                                            pendingRemove = null,
+                                                            msg = "remove result unknown: " +
+                                                                "cannot verify $trimmed for user $dualId: ${st.detail}",
+                                                            msgKind = MsgKind.CHANNEL,
+                                                        )
+                                                    }
                                             }
                                         }
                                     }
@@ -737,6 +784,12 @@ class DualViewModel(
     // progress"). Drops the pending entry from cloned ONLY when the pinned
     // re-check confirms it absent (same fail-closed rule as the old direct
     // remove). 最終授權者是 repo pinned API，VM pre-check 只是 fail-fast.
+    // PR-33 R3 (P2 安裝狀態 + 時效): after the serial/label checks, a stale
+    // consent (nowMs() - requestedAtMs > REMOVE_CONFIRM_TTL_MS) is refused
+    // first (cheap, no IO), then the package is re-verified Installed via
+    // repo.verifyState (NotInstalled -> INFO 無需移除 without touching
+    // cloned, Unknown -> CHANNEL fail closed) -- only then runs
+    // removeVerifiedExpected.
     fun confirmRemove() {
         viewModelScope.launch {
             val pendingAtCall = _state.value.pendingRemove
@@ -882,6 +935,57 @@ class DualViewModel(
                                         )
                                     }
                                 } else {
+                                    // P2 時效 (PR-33 R3): no extra verify IO
+                                    // (TTL 判在既有 IO 之後). A stale consent
+                                    // is refused with zero uninstalls
+                                    // (INVALID + 重新確認).
+                                    if (nowMs() - cur.requestedAtMs > REMOVE_CONFIRM_TTL_MS) {
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                profiles = snap.profiles,
+                                                pendingRemove = null,
+                                                msg = "確認已過期，請重新確認移除",
+                                                msgKind = MsgKind.INVALID,
+                                            )
+                                        }
+                                        return@withLock
+                                    }
+                                    // P2 安裝重驗 (PR-33 R3): the package may
+                                    // be gone already (external uninstall).
+                                    // NotInstalled clears without uninstall
+                                    // (INFO 無需移除, cloned left for refresh
+                                    // to sync); Unknown clears CHANNEL fail
+                                    // closed. Only Installed proceeds.
+                                    when (val st = onIo { repo.verifyState(cur.pkg, cur.dualId) }) {
+                                        is VerifyState.Installed -> Unit
+                                        is VerifyState.NotInstalled -> {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "未安裝，無需移除：${cur.pkg}",
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
+                                            return@withLock
+                                        }
+                                        is VerifyState.Unknown -> {
+                                            _state.update {
+                                                it.copy(
+                                                    loading = false,
+                                                    profiles = snap.profiles,
+                                                    pendingRemove = null,
+                                                    msg = "remove result unknown: " +
+                                                        "cannot verify ${cur.pkg} " +
+                                                        "for user ${cur.dualId}: ${st.detail}",
+                                                    msgKind = MsgKind.CHANNEL,
+                                                )
+                                            }
+                                            return@withLock
+                                        }
+                                    }
                                     // Cancel-during-confirm race (B2): the IO above
                                     // (freshId + snapshot) may have interleaved a
                                     // cancelRemove(); re-check the pending is still

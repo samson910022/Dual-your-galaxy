@@ -455,8 +455,8 @@ class MainActivity : ComponentActivity() {
                 .setMessage(message)
                 // Builder 僅有 setCancelable（無 setCanceledOnTouchOutside），touch-outside 由 show 後 dialog 層再設。
                 .setCancelable(!loading)
-                .setPositiveButton("確認移除") { _, _ -> vm.confirmRemove() }
-                .setNegativeButton("取消") { _, _ -> vm.cancelRemove() }
+                .setPositiveButton("確認移除", null)
+                .setNegativeButton("取消", null)
                 .setOnCancelListener { vm.cancelRemove() }
                 .show()
         } catch (_: Exception) {
@@ -464,6 +464,12 @@ class MainActivity : ComponentActivity() {
             shownPending = null
             return
         }
+        // 擋自動 dismiss (PR-33 R3, P2): 傳 null listener + show 後掛手動 OnClick，
+        // 只調 VM 不 dismiss，對話框在 VM 結果回來前保持開啟；拒絕路徑 VM 清
+        // pendingRemove，dialog 隨狀態關閉（需重新請求）；僅 overwrite/race 的
+        // preserve 路徑（新 pending 保留）才不關。
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener { vm.confirmRemove() }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove() }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !loading
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
         // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
