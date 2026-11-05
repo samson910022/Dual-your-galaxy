@@ -134,7 +134,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
   - (a) 確認 TTL 5 分鐘走 monotonic 時鐘（`SystemClock.elapsedRealtime()`，免 wall-clock 回撥延長有效期；pending 不跨重啟，reboot 重置無影響；JVM 預設 `currentTimeMillis` 僅供測試注入）。
   - (b) 同名重裝限制：membership 僅保證確認時可見同名 package，不綁定安裝世代。
   - (c) shell 檢查→uninstall 非原子（裝置限制，repo 雙閘僅縮小窗口）。
-  - (d) S24 實機 destructive／negative acceptance 仍 [待實機驗證]（須用可拋棄包，勿用正式分身）。
+  - (d) S24 實機 destructive／negative acceptance [S24 已驗證]（2026-11-05，SM-S9210，ROOT 通道）：身分雙 CLONE＋serial 95＋prop 95 確認、`Cloned (35)` 真實列表；可拋棄 overlay（`com.android.settings.supervision.overlay`，owner 有／95 無，先 `install-existing` 進 95）經 App 兩階段確認移除→`removed:`＋95 內消失＋owner 副本完好＋總數回 35（淨零）；negative（取消鍵、back 鍵）皆零卸載並保留正確訊息，截圖存檔；未安裝拒絕以 JVM 測試為準（實機訊息僅截圖存檔）。殘留：旋轉重建、TalkBack 朗讀僅 JVM／靜態證據。
 
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
