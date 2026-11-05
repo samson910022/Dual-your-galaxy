@@ -1039,4 +1039,172 @@ class AutoDegradeTest {
         assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
         assertFalse(vm.state.value.writeReady)
     }
+
+    // Phase C P2: LSPOSED zero-probe renders 未探測, never 未通過. probeScope
+    // tracks the probed subset (NONE here); privilege/anyProbePassed reflect
+    // only that subset, never device total capability (env holds ROOT+SHELL
+    // but both stay unprobed). Probe never writes pmReadable (null until
+    // refresh); refresh through NoOp then proves PM unreadable (false) while
+    // the scope stays NONE.
+    @Test
+    fun phaseC_lsposed_zeroProbe_scopeNoneUnprobed() {
+        val suFake = FakeSu(rootOk = true)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            initialGateway = NoOpGateway(),
+            preference = ChannelPreference.LSPOSED,
+        )
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        val probed = vm.state.value
+        assertEquals(ProbeScope.NONE, probed.probeScope)
+        assertEquals("zero probe must render 未探測", "未探測", probed.probeResultMark())
+        assertTrue(
+            "status key must carry 未探測, got: \"${probed.probeStatusText()}\"",
+            probed.probeStatusText().contains("未探測"),
+        )
+        assertFalse(
+            "zero probe must never render 未通過, got: \"${probed.probeStatusText()}\"",
+            probed.probeStatusText().contains("未通過"),
+        )
+        assertFalse(probed.anyProbePassed)
+        assertEquals(Privilege.NONE, probed.privilege)
+        assertEquals("explicit LSPOSED must never run `su -c id -u`", 0, suFake.idUCalls)
+        assertEquals("explicit LSPOSED must never probe Shizuku", 0, shizukuFake.listUsersCalls)
+        assertNull("probe must never write pmReadable (still unknown)", probed.pmReadable)
+        assertEquals("PM unknown before refresh", "PM未知", probed.pmReadableText())
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertEquals(ProbeScope.NONE, s.probeScope)
+        assertEquals("未探測", s.probeResultMark())
+        assertEquals(false, s.pmReadable)
+        assertEquals("PM不可讀", s.pmReadableText())
+        assertFalse(s.anyProbePassed)
+        assertFalse(s.writeReady)
+    }
+
+    // Phase C P2: AUTO full probe sets FULL scope; refresh Loaded proves PM
+    // readable (true). Captures the pre-refresh null to lock probe/refresh
+    // separation (probe never writes pmReadable).
+    @Test
+    fun phaseC_pmReadable_loadedTrue() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = true)
+        shizukuFake.installedPkgs.clear()
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = true,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
+
+        val probed = vm.state.value
+        assertEquals(ProbeScope.FULL, probed.probeScope)
+        assertEquals("探測通過", probed.probeResultMark())
+        assertNull("probe must never write pmReadable", probed.pmReadable)
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msg.contains("no clones installed")
+        }
+
+        val s = vm.state.value
+        assertEquals(ProbeScope.FULL, s.probeScope)
+        assertEquals(true, s.pmReadable)
+        assertEquals("PM可讀", s.pmReadableText())
+        assertTrue("refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
+    }
+
+    // Phase C P2: AUTO full probe with both failing sets FULL + 未通過 (not
+    // 未探測 -- the subset was probed and failed); refresh ChannelError proves
+    // PM unreadable (false).
+    @Test
+    fun phaseC_pmReadable_channelErrorFalse() {
+        val suFake = FakeSu(rootOk = false)
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
+
+        val probed = vm.state.value
+        assertEquals(ProbeScope.FULL, probed.probeScope)
+        assertEquals("probed-but-failed must render 未通過", "探測未通過", probed.probeResultMark())
+        assertNull("probe must never write pmReadable", probed.pmReadable)
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertEquals(ProbeScope.FULL, s.probeScope)
+        assertEquals(false, s.pmReadable)
+        assertEquals("PM不可讀", s.pmReadableText())
+        assertTrue("PM unreadable must surface as channel error, got: \"${s.msg}\"", s.msg.contains("channel error"))
+    }
+
+    // Phase C P2 (Item 4 lock): id-ok/pm-fail keeps anyProbePassed + writeReady
+    // true (probe gate) while PM stays unreadable (false). True readability =
+    // (pmReadable == true) plus writeReady; never read the probe flags as PM
+    // readability.
+    @Test
+    fun phaseC_pmReadable_idOkPmFail_staysFalseDespiteProbePass() {
+        val suFake = FakeSu(rootOk = true)
+        suFake.pmListOk = false
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+        )
+        await { !vm.state.value.loading && vm.state.value.anyProbePassed }
+
+        val probed = vm.state.value
+        assertEquals(ProbeScope.FULL, probed.probeScope)
+        assertTrue(probed.anyProbePassed)
+        assertTrue(probed.writeReady)
+        assertNull("probe must never write pmReadable", probed.pmReadable)
+
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.msgKind == MsgKind.CHANNEL &&
+                vm.state.value.msg.contains("channel error")
+        }
+
+        val s = vm.state.value
+        assertTrue("probe flag stays true while PM is unreadable", s.anyProbePassed)
+        assertTrue("probe gate stays true on `id -u == 0`", s.writeReady)
+        assertEquals(false, s.pmReadable)
+        assertEquals("PM不可讀", s.pmReadableText())
+    }
 }

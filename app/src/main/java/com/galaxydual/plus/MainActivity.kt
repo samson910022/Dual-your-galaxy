@@ -384,9 +384,17 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         val readyMark = if (s.writeReady) "已就緒" else "未就緒（唯讀）"
-        val probeMark = if (s.anyProbePassed) "探測通過" else "探測未通過"
+        // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
+        // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
+        // 未探測，絕不顯示未通過；明選 SHIZUKU 成功不代表 ROOT 不存在。
+        // 真可讀 = (pmReadable == true) + writeReady：probe 身分
+        // (execIdentity/anyProbePassed) 與 PM 讀 (pmReadable) / 寫 (writeReady)
+        // 絕不混為一布林 (P25 Item 4)。
+        val probeMark = s.probeResultMark()
+        val scopeLabel = s.probeScope.displayLabel()
+        val pmMark = s.pmReadableText()
         privilegeView.text = "權限：${s.execIdentity}（實際通道 ${s.resolvedGateway}" +
-            "・$readyMark；裝置路由 ${s.privilege}・$probeMark）"
+            "・$readyMark；本次路由 ${s.privilege}・本次探測[$scopeLabel]$probeMark・$pmMark）"
         // Title mirrors the actual execution identity (not the routed
         // summary) for quick manual verification.
         title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
