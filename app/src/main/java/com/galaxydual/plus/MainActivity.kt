@@ -17,8 +17,10 @@ package com.galaxydual.plus
 // Shizuku.requestPermission plus an OnRequestPermissionResultListener, while
 // the Activity onRequestPermissionsResult override is kept as a defensive seam
 // (Shizuku delivers via its own listener; the override only reacts when our
-// code matches). onResume re-probes privilege. Every binder/permission event
-// routes into vm.reconnectAndRefresh() (reread path: probe with Auto degrade +
+// code matches). onResume routes into vm.onForeground(): 過期 FRESH 先補標
+// STALE，inventory/hook 任一 UNKNOWN/STALE 即自動重查 (probe+refresh)，
+// 否則只輕探 (PR-6 P2 #27 後半)。Every binder/permission event routes into
+// vm.reconnectAndRefresh() (reread path: probe with Auto degrade +
 // refresh) or vm.recheckPrivilege() (dead-binder path: probe only), so the
 // state always tracks the live binder.
 //
@@ -74,6 +76,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var shizukuView: TextView
     private lateinit var channelView: TextView
     private lateinit var hookView: TextView
+    // PR-6 P2 (#27 後半)：清單新鮮度行 + 診斷事件行 (穩定碼/摘要/下一步，可點開展開技術細節)。
+    private lateinit var inventoryView: TextView
+    private lateinit var diagView: TextView
+    private lateinit var exportBtn: Button
     private lateinit var profilesView: TextView
     private lateinit var clonedView: TextView
     private lateinit var pkgInput: EditText
@@ -115,6 +121,11 @@ class MainActivity : ComponentActivity() {
     // entry points are thread-safe anyway (viewModelScope), this only keeps
     // the shizuku status line update on the UI thread.
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // PR-6 P2 (#27 後半)：診斷技術細節展開開關 + 最近一次渲染狀態
+    // (點診斷行切換展開/收合，需重渲染同一狀態)。
+    private var diagExpanded: Boolean = false
+    private var lastState: UiState? = null
 
     // Binder attach (sticky: fires immediately when already connected).
     // The channel may be usable now: re-probe privilege, then reload lists.
@@ -159,11 +170,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Re-probe privilege on every foreground return: the user may have
-        // granted/revoked Shizuku (or started/stopped its service) while away.
-        // P2-1: auto path -- never executes privileged `cat` (LSPOSED
-        // stays direct-only, UNKNOWN_* when unreadable).
-        vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+        // PR-6 P2 (#27 後半)：前景不只 recheck。onForeground 先把過期
+        // FRESH 補標 STALE，inventory/hook 任一 UNKNOWN/STALE 即自動重查
+        // (probe+refresh)，否則只輕探 (內含 probe，覆蓋 recheck 語意)。
+        // P2-1 (base)：auto 路徑預設 allowPrivilegedHookDiagnosis=false，
+        // 不執行特權 cat，與直接調 recheckPrivilege(false) 同契約。
+        vm.onForeground()
         updateShizukuLine()
     }
 
@@ -309,6 +321,20 @@ class MainActivity : ComponentActivity() {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         defaultMsgColor = msgView.currentTextColor
+        // PR-6 P2 (#27 後半)：清單新鮮度行 + 診斷事件行 + 匯出按鈕。
+        // diagView 點一下展開/收合技術細節；匯出只顯示已遮蔽的本機預覽，
+        // 無自動上傳 (buildDiagnosticExport 為純字串，無網路呼叫)。
+        inventoryView = TextView(this)
+        diagView = TextView(this).apply {
+            setOnClickListener {
+                diagExpanded = !diagExpanded
+                lastState?.let { render(it) }
+            }
+        }
+        exportBtn = Button(this).apply {
+            text = "匯出診斷（已遮蔽）"
+            setOnClickListener { showDiagnosticExport() }
+        }
 
         // Clone/remove share one row; 重新連線並更新 + permission share the next.
         val writeRow = LinearLayout(this).apply {
@@ -346,13 +372,30 @@ class MainActivity : ComponentActivity() {
         root.addView(channelRow2)
         root.addView(profilesView)
         root.addView(clonedView)
+        root.addView(inventoryView)
         root.addView(pkgInput)
         root.addView(writeRow)
         root.addView(readRow)
         root.addView(hookRow)
         root.addView(hookDiagHint)
         root.addView(msgView)
+        root.addView(diagView)
+        root.addView(exportBtn)
         setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽的本機文字 (buildDiagnosticExport
+    // 先經 redactPii，大小受限)；只有使用者主動點按才顯示，無自動上傳、
+    // 無網路呼叫、無後台傳送。
+    private fun showDiagnosticExport() {
+        val state = lastState ?: vm.state.value
+        val preview = buildDiagnosticExport(state)
+        AlertDialog.Builder(this)
+            .setTitle("診斷匯出預覽（已遮蔽，無自動上傳）")
+            .setMessage(preview)
+            .setCancelable(true)
+            .setPositiveButton("關閉", null)
+            .show()
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
@@ -421,11 +464,16 @@ class MainActivity : ComponentActivity() {
     // channel backing the repo) with its exec identity, not just the routed
     // device summary + preference -- so an explicit SHIZUKU pick with ROOT
     // available reports SHELL/SHIZUKU, never "正在使用 ROOT".
+    // PR-6 P2 (#27 後半)：另渲染清單新鮮度行 (STALE/UNKNOWN 標示)、
+    // Hook scope/time 證據、診斷事件行 (穩定碼/摘要/下一步，可點開)，
+    // 以及匯出按鈕 (已遮蔽預覽，無自動上傳)。
     private fun render(s: UiState) {
         // P25: keep the Shizuku binder line in sync on every state render
         // (cheap live read inside updateShizukuLine, already try/catch
         // guarded for the pre-buildUi test path). Double-guarded here so a
         // Shizuku-less test harness calling render can never crash on it.
+        // PR-6 P2: 同時記住最近一次渲染狀態 (診斷展開/匯出共用)。
+        lastState = s
         try {
             updateShizukuLine()
         } catch (_: Exception) {
@@ -488,7 +536,12 @@ class MainActivity : ComponentActivity() {
                 HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
                     "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27，或點下方「手動診斷 Hook」單次診斷）"
             }
-            hookView.text = "LSPosed Hook：$status；寫入通道為佔位（NoOp），" +
+            val timeEvidence = buildString {
+                if (s.hookMarkerTimeMs != null) append("；marker timeMs=${s.hookMarkerTimeMs}") else append("；marker 時間未知")
+                if (s.hookQueriedAtMs > 0L) append("；查詢於 ${s.hookQueriedAtMs}")
+                if (s.hookViaGateway) append("（經真通道讀取）")
+            }
+            hookView.text = "LSPosed Hook：$status$timeEvidence；寫入通道為佔位（NoOp），" +
                 "待 whitelist 政策分支，寫入已禁用"
         } else {
             hookView.visibility = View.GONE
@@ -510,6 +563,35 @@ class MainActivity : ComponentActivity() {
         } else {
             "Cloned (${s.cloned.size})：\n" +
                 s.cloned.joinToString("\n") { "  $it" }
+        }
+        // PR-6 P2 (#27 後半)：清單新鮮度行。STALE/UNKNOWN 明確標示，
+        // FRESH 顯示目標/筆數/查詢時間；上次操作相位一併顯示 (成功/失敗/未知)。
+        inventoryView.text = buildString {
+            append("清單：${s.inventory.freshness}")
+            if (s.inventory.targetId >= 0) append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
+            if (s.inventory.queryTimeMs > 0L) append("・查詢於 ${s.inventory.queryTimeMs}")
+            if (s.inventory.freshness != InventoryFreshness.FRESH) append("（資料可能過期，已自動重查或請點「重新連線並更新」）")
+            val last = s.lastOperation
+            if (last != null) {
+                append("；上次操作 ${last.opId} 相位 ${last.phase}")
+            }
+        }
+        // PR-6 P2 (#27 後半)：診斷事件行。穩定碼 + 繁中摘要/下一步常顯；
+        // 點一下展開 exit/技術 detail (大小受限)。無事件時顯示就緒。
+        diagView.text = buildString {
+            val diag = s.diagnose
+            if (diag == null) {
+                append("診斷：就緒")
+            } else {
+                append("診斷［${diag.code.stableId}］${diag.summaryZh}；下一步：${diag.nextStepZh}")
+                if (diagExpanded) {
+                    if (diag.exit != null) append("\n  exit=${diag.exit}")
+                    if (diag.techDetail.isNotEmpty()) append("\n  細節：${diag.techDetail}（點此收合）")
+                    else append("（點此收合）")
+                } else {
+                    append("（點此展開技術細節）")
+                }
+            }
         }
         // Writes queue in the ViewModel anyway; disabling while busy keeps
         // the read-only placeholder visibly read-only. Channel switches go
