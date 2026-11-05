@@ -840,6 +840,9 @@ class DualViewModel(
                             inventory = cur.inventory.staleOrUnknownLocked(
                                 now = now,
                                 source = DualRepository.CMD_LIST_USERS,
+                                // UNKNOWN 分支回退保留舊身份：傳入已知 target，
+                                // UI 在未知中仍可見上次目標。
+                                targetId = cur.inventory.targetId,
                             ),
                             diagnose = snap.toDiagnoseEvent(),
                             msg = combinedMsg,
@@ -867,34 +870,72 @@ class DualViewModel(
                     val dualId = onIo { repo.resolveDualUserId() }
                     if (dualId < 0) {
                         val now = nowMs()
+                        // NO_DUAL/CHANNEL_ERROR 鑑別 (repo 簽名不動，僅用手頭
+                        // Loaded 快照)：快照為空 (連 owner 都列不出，快照不可信)
+                        // ->CHANNEL_ERROR 且不清 cloned (比照 listing-unknown
+                        // 分支保留舊值)；快照正常有戶但 verified -1 -> 真正確認
+                        // 無可用 dual -> NO_DUAL 並清空。
+                        // 限制：typed 身份通道 (verbose/dumpsys) 單獨失敗時仍
+                        // 可能誤判為 NO_DUAL；完整區分需 repo 攜帶失敗原因，
+                        // 刻意不動 repo 簽名。
+                        val snapshotUsable = profiles.isNotEmpty()
                         _state.update { cur ->
-                            val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                "no dual profile",
-                                MsgKind.NO_DUAL,
-                                cur.degradeNote,
-                            )
-                            val next = cur.copy(
-                                loading = false,
-                                profiles = profiles,
-                                cloned = emptyList(),
-                                // Phase C P2: profiles parsed (readable) but no
-                                // dual target -- still true (`pm list users`
-                                // succeeded).
-                                pmReadable = true,
-                                inventory = InventorySnapshot(
-                                    source = DualRepository.CMD_LIST_USERS,
-                                    targetId = -1,
-                                    queryTimeMs = now,
-                                    freshness = InventoryFreshness.UNKNOWN,
-                                    count = 0,
-                                ),
-                                diagnose = diagnoseEvent(
-                                    DiagnoseCode.NO_DUAL,
-                                    techDetail = "verified dual id unknown",
-                                ),
-                                msg = combinedMsg,
-                                msgKind = combinedKind,
-                            )
+                            val next = if (!snapshotUsable) {
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "refresh result unknown: " +
+                                        "cannot confirm dual profile",
+                                    MsgKind.CHANNEL,
+                                    cur.degradeNote,
+                                )
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    // Phase C P2: `pm list users` returned
+                                    // (Loaded, albeit empty) so readable;
+                                    // only the identity is unverifiable.
+                                    pmReadable = true,
+                                    inventory = cur.inventory.staleOrUnknownLocked(
+                                        now = now,
+                                        source = DualRepository.CMD_LIST_USERS,
+                                        targetId = cur.inventory.targetId,
+                                    ),
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.CHANNEL_ERROR,
+                                        techDetail = "verified dual id unknown " +
+                                            "and profiles snapshot empty",
+                                    ),
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
+                                )
+                            } else {
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "no dual profile",
+                                    MsgKind.NO_DUAL,
+                                    cur.degradeNote,
+                                )
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    cloned = emptyList(),
+                                    // Phase C P2: profiles parsed (readable)
+                                    // but no dual target -- still true
+                                    // (`pm list users` succeeded).
+                                    pmReadable = true,
+                                    inventory = InventorySnapshot(
+                                        source = DualRepository.CMD_LIST_USERS,
+                                        targetId = -1,
+                                        queryTimeMs = now,
+                                        freshness = InventoryFreshness.UNKNOWN,
+                                        count = 0,
+                                    ),
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.NO_DUAL,
+                                        techDetail = "verified dual id unknown",
+                                    ),
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
+                                )
+                            }
                             if (cur.pendingRemove != null &&
                                 (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
                             ) {
@@ -905,45 +946,116 @@ class DualViewModel(
                         }
                     } else {
                         val groundTruth = onIo { repo.listClonedPackages(dualId) }
+                        // listClonedPackages==null 原因鑑別：只在 null 路徑加跑
+                        // 唯讀的 profilesSnapshot + resolveDualUserId (成功路徑
+                        // 零額外開銷)。通道失敗->CHANNEL_ERROR (techDetail 寫明)；
+                        // verified 漂移->VERIFY_MISMATCH (detail 攜新舊 targetId，
+                        // inventory 帶新目標，UI 可見新目標)；其餘維持 VERIFY_UNKNOWN。
+                        val nullSnap: ProfilesSnapshot? =
+                            if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
+                        val nullVerified: Int? =
+                            if (groundTruth == null) onIo { repo.resolveDualUserId() } else null
                         _state.update { cur ->
                             val now = nowMs()
-                            val (baseMsg, baseKind) = if (groundTruth == null) {
-                                "refresh result unknown: " +
-                                    "cannot list clones for user $dualId" to MsgKind.CHANNEL
-                            } else if (groundTruth.isEmpty()) {
-                                "no clones installed" to MsgKind.INFO
-                            } else {
-                                "" to MsgKind.NONE
-                            }
-                            val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                baseMsg,
-                                baseKind,
-                                cur.degradeNote,
-                            )
-                            val next = if (groundTruth == null) {
+                            if (groundTruth == null) {
                                 // 未知：保留舊 cloned，inventory 舊資料標 STALE
-                                // (FRESH->STALE；否則 UNKNOWN)，供上層重查。
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    // Phase C P2: profilesSnapshot Loaded proves
-                                    // `pm list users` readable even when the
-                                    // clone list itself is unknowable (separate
-                                    // `pm list packages` failure).
-                                    pmReadable = true,
-                                    inventory = cur.inventory.staleOrUnknownLocked(
-                                        now = now,
-                                        source = PmOutputParser.buildListPackages(dualId),
-                                        targetId = dualId,
-                                    ),
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.VERIFY_UNKNOWN,
-                                        techDetail = "cannot list clones for user $dualId",
-                                    ),
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
+                                // (FRESH->STALE；否則 UNKNOWN，傳入的 targetId
+                                // 不再丟棄)，供上層重查。
+                                // Phase C P2: pmReadable 由本次 null 鑑別重查決定
+                                // (ChannelError->false，未漂移 Loaded->true)，
+                                // 非一律 true。
+                                val snapErr = (nullSnap as? ProfilesSnapshot.ChannelError)?.detail
+                                val freshProfiles =
+                                    (nullSnap as? ProfilesSnapshot.Loaded)?.profiles ?: profiles
+                                if (snapErr != null) {
+                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                        "refresh result unknown: " +
+                                            "channel error: $snapErr",
+                                        MsgKind.CHANNEL,
+                                        cur.degradeNote,
+                                    )
+                                    cur.copy(
+                                        loading = false,
+                                        profiles = freshProfiles,
+                                        // Phase C P2: 重查連 `pm list users`
+                                        // 都失敗 -> 不可讀。
+                                        pmReadable = false,
+                                        inventory = cur.inventory.staleOrUnknownLocked(
+                                            now = now,
+                                            source = PmOutputParser.buildListPackages(dualId),
+                                            targetId = dualId,
+                                        ),
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.CHANNEL_ERROR,
+                                            techDetail = "profiles snapshot " +
+                                                "channel failed: $snapErr",
+                                        ),
+                                        msg = combinedMsg,
+                                        msgKind = combinedKind,
+                                    )
+                                } else if (nullVerified != null && nullVerified != dualId) {
+                                    val newTarget = if (nullVerified >= 0) nullVerified else dualId
+                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                        "refresh verification mismatch: " +
+                                            "target $dualId -> $nullVerified",
+                                        MsgKind.VERIFY,
+                                        cur.degradeNote,
+                                    )
+                                    cur.copy(
+                                        loading = false,
+                                        profiles = freshProfiles,
+                                        // Phase C P2: 重查 Loaded 證明 `pm list
+                                        // users` 可讀 (僅 clone 清單未知)。
+                                        pmReadable = true,
+                                        inventory = cur.inventory.staleOrUnknownLocked(
+                                            now = now,
+                                            source = PmOutputParser.buildListPackages(dualId),
+                                            targetId = newTarget,
+                                        ),
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.VERIFY_MISMATCH,
+                                            techDetail = "verified id drifted: " +
+                                                "listed $dualId but now $nullVerified",
+                                        ),
+                                        msg = combinedMsg,
+                                        msgKind = combinedKind,
+                                    )
+                                } else {
+                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                        "refresh result unknown: " +
+                                            "cannot list clones for user $dualId",
+                                        MsgKind.CHANNEL,
+                                        cur.degradeNote,
+                                    )
+                                    cur.copy(
+                                        loading = false,
+                                        profiles = freshProfiles,
+                                        // Phase C P2: 同上，重查 Loaded -> 可讀。
+                                        pmReadable = true,
+                                        inventory = cur.inventory.staleOrUnknownLocked(
+                                            now = now,
+                                            source = PmOutputParser.buildListPackages(dualId),
+                                            targetId = dualId,
+                                        ),
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.VERIFY_UNKNOWN,
+                                            techDetail = "cannot list clones for user $dualId",
+                                        ),
+                                        msg = combinedMsg,
+                                        msgKind = combinedKind,
+                                    )
+                                }
                             } else if (groundTruth.isEmpty()) {
+                                // 契約：FRESH 成功只在無待查證歷史操作時清
+                                // diagnose；lastOperation.phase==UNKNOWN
+                                // (寫後未查證) 時保留原 diagnose，普通
+                                // refresh 不得清除 (需下一次 pinned verify
+                                // 才覆寫)。
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "no clones installed",
+                                    MsgKind.INFO,
+                                    cur.degradeNote,
+                                )
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -956,11 +1068,22 @@ class DualViewModel(
                                         freshness = InventoryFreshness.FRESH,
                                         count = 0,
                                     ),
-                                    diagnose = null,
+                                    diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                                        cur.diagnose
+                                    } else {
+                                        null
+                                    },
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
                                 )
                             } else {
+                                // 契約同上：UNKNOWN 歷史操作未查證前保留原
+                                // diagnose，不因清單新鮮而清除。
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "",
+                                    MsgKind.NONE,
+                                    cur.degradeNote,
+                                )
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
@@ -973,7 +1096,11 @@ class DualViewModel(
                                         freshness = InventoryFreshness.FRESH,
                                         count = groundTruth.size,
                                     ),
-                                    diagnose = null,
+                                    diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                                        cur.diagnose
+                                    } else {
+                                        null
+                                    },
                                     msg = combinedMsg,
                                     msgKind = combinedKind,
                                 )
@@ -996,6 +1123,7 @@ class DualViewModel(
             // Gateways report via CmdResult, but guard against unexpected throws.
             // pendingRemove 開著時只保留非錯誤提示（NONE/INFO），CHANNEL/FAILED 穿透。
             // PR-6 P2: 舊資料標 STALE，不謊稱新鮮；lastOperation 不動。
+            // UNKNOWN 分支回退保留舊身份：傳入已知 target，UI 仍可見上次目標。
             val now = nowMs()
             _state.update { cur ->
                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
@@ -1011,6 +1139,7 @@ class DualViewModel(
                     inventory = cur.inventory.staleOrUnknownLocked(
                         now = now,
                         source = "refresh",
+                        targetId = cur.inventory.targetId,
                     ),
                     diagnose = diagnoseEvent(
                         DiagnoseCode.OP_FAILED,
@@ -1079,16 +1208,33 @@ class DualViewModel(
                                 val current: List<String> =
                                     if (cur.cloned.contains(trimmed)) cur.cloned
                                     else cur.cloned + trimmed
+                                // 全量新鮮度只由 refresh 賦予：成功寫入僅對齊筆數
+                                // (count=當前筆數)，freshness/source/target/
+                                // queryTime 一律不動。
+                                // target 重建提示：FRESH 快照目標與本次 verified
+                                // 目標不一致、且上次操作釘在舊 id 上時，detail
+                                // 附加需重新查證提示。
+                                val oldTarget = cur.inventory.targetId
+                                val rebuiltNote =
+                                    if (cur.inventory.freshness == InventoryFreshness.FRESH &&
+                                        oldTarget != res.dualId &&
+                                        cur.lastOperation?.pinnedTarget == oldTarget
+                                    ) {
+                                        " (target 已重建，需重新查證)"
+                                    } else {
+                                        ""
+                                    }
                                 cur.copy(
                                     loading = false,
                                     cloned = current,
+                                    inventory = cur.inventory.copy(count = current.size),
                                     lastOperation = LastOperation(
                                         opId = key,
                                         appKey = trimmed,
                                         pinnedTarget = res.dualId,
                                         phase = OpPhase.SUCCESS,
                                         timeMs = now,
-                                        detail = "cloned: $trimmed",
+                                        detail = "cloned: $trimmed$rebuiltNote",
                                     ),
                                     diagnose = null,
                                     msg = "cloned: $trimmed",
@@ -1097,37 +1243,54 @@ class DualViewModel(
                             }
                         }
                         is CloneOutcome.NoDual -> {
-                            val now = nowMs()
+                            // 寫前拒絕 (install 未執行)：只設 diagnose+msg，
+                            // 不覆寫 lastOperation (與空白輸入分支一致)。
+                            // NO_DUAL/CHANNEL_ERROR 鑑別用現有 snapshot API
+                            // (repo 簽名不動)：通道失敗或空快照 (連 owner 都無)
+                            // ->CHANNEL_ERROR 且不清 cloned；快照正常有戶
+                            // ->真正確認無 profile->NO_DUAL。
+                            val snap = onIo { repo.profilesSnapshot() }
+                            val channelBad = snap is ProfilesSnapshot.ChannelError ||
+                                (snap as? ProfilesSnapshot.Loaded)?.profiles.isNullOrEmpty() == true
+                            val channelDetail = (snap as? ProfilesSnapshot.ChannelError)?.detail
                             _state.update {
-                                it.copy(
-                                    loading = false,
-                                    lastOperation = LastOperation(
-                                        opId = key,
-                                        appKey = trimmed,
-                                        pinnedTarget = -1,
-                                        phase = OpPhase.UNKNOWN,
-                                        timeMs = now,
-                                        detail = "no dual profile",
-                                    ),
-                                    diagnose = res.toDiagnoseEvent(),
-                                    msg = "no dual profile",
-                                    msgKind = MsgKind.NO_DUAL,
-                                )
+                                if (channelBad) {
+                                    it.copy(
+                                        loading = false,
+                                        diagnose = diagnoseEvent(
+                                            DiagnoseCode.CHANNEL_ERROR,
+                                            techDetail = if (channelDetail != null) {
+                                                "verified dual id unknown: $channelDetail"
+                                            } else {
+                                                "verified dual id unknown " +
+                                                    "and profiles snapshot empty"
+                                            },
+                                        ),
+                                        msg = if (channelDetail != null) {
+                                            "clone result unknown: " +
+                                                "channel error: $channelDetail"
+                                        } else {
+                                            "clone result unknown: " +
+                                                "cannot confirm dual profile"
+                                        },
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                } else {
+                                    it.copy(
+                                        loading = false,
+                                        diagnose = res.toDiagnoseEvent(),
+                                        msg = "no dual profile",
+                                        msgKind = MsgKind.NO_DUAL,
+                                    )
+                                }
                             }
                         }
                         is CloneOutcome.ChannelError -> {
-                            val now = nowMs()
+                            // 寫前拒絕 (install 未執行)：只設 diagnose+msg，
+                            // 不覆寫 lastOperation。
                             _state.update {
                                 it.copy(
                                     loading = false,
-                                    lastOperation = LastOperation(
-                                        opId = key,
-                                        appKey = trimmed,
-                                        pinnedTarget = -1,
-                                        phase = OpPhase.UNKNOWN,
-                                        timeMs = now,
-                                        detail = res.detail.take(MAX_DIAG_DETAIL_CHARS),
-                                    ),
                                     diagnose = res.toDiagnoseEvent(),
                                     msg = "clone result unknown: " +
                                         "channel error: ${res.detail}",
@@ -1136,18 +1299,12 @@ class DualViewModel(
                             }
                         }
                         is CloneOutcome.InvalidPackage -> {
-                            val now = nowMs()
+                            // 寫前拒絕 (install 未執行)：只設 diagnose+msg，
+                            // 不覆寫 lastOperation (remove InvalidPackage 同，
+                            // 見統一規則：install/uninstall 未執行者不碰歷史)。
                             _state.update {
                                 it.copy(
                                     loading = false,
-                                    lastOperation = LastOperation(
-                                        opId = key,
-                                        appKey = trimmed,
-                                        pinnedTarget = -1,
-                                        phase = OpPhase.FAILED,
-                                        timeMs = now,
-                                        detail = "invalid package",
-                                    ),
                                     diagnose = res.toDiagnoseEvent(),
                                     msg = "invalid package",
                                     msgKind = MsgKind.INVALID,
@@ -1186,7 +1343,7 @@ class DualViewModel(
                                         timeMs = now,
                                         detail = "not installed for user ${res.dualId}",
                                     ),
-                                    diagnose = res.toDiagnoseEvent(),
+                                    diagnose = res.toDiagnoseEvent(trimmed),
                                     msg = "clone verification failed: " +
                                         "$trimmed not installed for user ${res.dualId}",
                                     msgKind = MsgKind.VERIFY,
@@ -1217,6 +1374,11 @@ class DualViewModel(
                 } catch (e: Exception) {
                     // Never swallow coroutine cancellation (see refreshLocked).
                     if (e is CancellationException) throw e
+                    // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
+                    // pinnedTarget 保留當次已知 dualId (取自 inventory，無則 -1)，
+                    // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
+                    // 非 OP_FAILED)。
+                    val knownTarget = _state.value.inventory.targetId.takeIf { it >= 0 } ?: -1
                     val now = nowMs()
                     _state.update {
                         it.copy(
@@ -1224,13 +1386,13 @@ class DualViewModel(
                             lastOperation = LastOperation(
                                 opId = key,
                                 appKey = trimmed,
-                                pinnedTarget = -1,
-                                phase = OpPhase.FAILED,
+                                pinnedTarget = knownTarget,
+                                phase = OpPhase.UNKNOWN,
                                 timeMs = now,
                                 detail = (e.message ?: "clone failed").take(MAX_DIAG_DETAIL_CHARS),
                             ),
                             diagnose = diagnoseEvent(
-                                DiagnoseCode.OP_FAILED,
+                                DiagnoseCode.VERIFY_UNKNOWN,
                                 techDetail = (e.message ?: "clone failed").take(MAX_DIAG_DETAIL_CHARS),
                             ),
                             msg = "clone failed: ${e.message ?: e.javaClass.simpleName}",
@@ -1699,10 +1861,29 @@ class DualViewModel(
                                         is RemoveOutcome.Success -> {
                                             val now = nowMs()
                                             _state.update {
+                                                val remaining =
+                                                    it.cloned.filterNot { p -> p == cur.pkg }
+                                                // 全量新鮮度只由 refresh 賦予：成功寫入僅對齊筆數
+                                                // (count=當前筆數)，freshness/source/target/
+                                                // queryTime 一律不動。
+                                                // target 重建提示：FRESH 快照目標與本次 verified
+                                                // 目標不一致、且上次操作釘在舊 id 上時，detail
+                                                // 附加需重新查證提示。
+                                                val oldTarget = it.inventory.targetId
+                                                val rebuiltNote =
+                                                    if (it.inventory.freshness == InventoryFreshness.FRESH &&
+                                                        oldTarget != cur.dualId &&
+                                                        it.lastOperation?.pinnedTarget == oldTarget
+                                                    ) {
+                                                        " (target 已重建，需重新查證)"
+                                                    } else {
+                                                        ""
+                                                    }
                                                 it.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
-                                                    cloned = it.cloned.filterNot { p -> p == cur.pkg },
+                                                    cloned = remaining,
+                                                    inventory = it.inventory.copy(count = remaining.size),
                                                     pendingRemove = null,
                                                     lastOperation = LastOperation(
                                                         opId = key,
@@ -1710,7 +1891,7 @@ class DualViewModel(
                                                         pinnedTarget = cur.dualId,
                                                         phase = OpPhase.SUCCESS,
                                                         timeMs = now,
-                                                        detail = "removed: ${cur.pkg}",
+                                                        detail = "removed: ${cur.pkg}$rebuiltNote",
                                                     ),
                                                     diagnose = null,
                                                     msg = "removed: ${cur.pkg}",
@@ -1719,41 +1900,48 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.NoDual -> {
-                                            val now = nowMs()
+                                            // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
+                                            // 不覆寫 lastOperation。鑑別沿用本次已持有的
+                                            // profilesSnapshot：仍列有目標 id -> typed 身份
+                                            // 通道抖動 -> CHANNEL_ERROR；否則真正無 profile
+                                            // -> NO_DUAL。兩者皆不碰 cloned (移除未執行)。
+                                            val targetListed =
+                                                snap.profiles.any { it.userId == cur.dualId }
                                             _state.update {
-                                                it.copy(
-                                                    loading = false,
-                                                    profiles = snap.profiles,
-                                                    pendingRemove = null,
-                                                    lastOperation = LastOperation(
-                                                        opId = key,
-                                                        appKey = cur.pkg,
-                                                        pinnedTarget = -1,
-                                                        phase = OpPhase.UNKNOWN,
-                                                        timeMs = now,
-                                                        detail = "no dual profile",
-                                                    ),
-                                                    diagnose = res.toDiagnoseEvent(),
-                                                    msg = "no dual profile",
-                                                    msgKind = MsgKind.NO_DUAL,
-                                                )
+                                                if (targetListed) {
+                                                    it.copy(
+                                                        loading = false,
+                                                        profiles = snap.profiles,
+                                                        pendingRemove = null,
+                                                        diagnose = diagnoseEvent(
+                                                            DiagnoseCode.CHANNEL_ERROR,
+                                                            techDetail = "verified dual id unknown " +
+                                                                "for listed target ${cur.dualId}",
+                                                        ),
+                                                        msg = "remove result unknown: " +
+                                                            "channel error for user ${cur.dualId}",
+                                                        msgKind = MsgKind.CHANNEL,
+                                                    )
+                                                } else {
+                                                    it.copy(
+                                                        loading = false,
+                                                        profiles = snap.profiles,
+                                                        pendingRemove = null,
+                                                        diagnose = res.toDiagnoseEvent(),
+                                                        msg = "no dual profile",
+                                                        msgKind = MsgKind.NO_DUAL,
+                                                    )
+                                                }
                                             }
                                         }
                                         is RemoveOutcome.ChannelError -> {
-                                            val now = nowMs()
+                                            // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
+                                            // 不覆寫 lastOperation。
                                             _state.update {
                                                 it.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
-                                                    lastOperation = LastOperation(
-                                                        opId = key,
-                                                        appKey = cur.pkg,
-                                                        pinnedTarget = cur.dualId,
-                                                        phase = OpPhase.UNKNOWN,
-                                                        timeMs = now,
-                                                        detail = res.detail.take(MAX_DIAG_DETAIL_CHARS),
-                                                    ),
                                                     diagnose = res.toDiagnoseEvent(),
                                                     msg = "remove result unknown: " +
                                                         "channel error: ${res.detail}",
@@ -1762,20 +1950,13 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.InvalidPackage -> {
-                                            val now = nowMs()
+                                            // 寫前拒絕 (uninstall 未執行)：只設 diagnose+msg，
+                                            // 不覆寫 lastOperation (msgKind 維持 INVALID)。
                                             _state.update {
                                                 it.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
-                                                    lastOperation = LastOperation(
-                                                        opId = key,
-                                                        appKey = cur.pkg,
-                                                        pinnedTarget = -1,
-                                                        phase = OpPhase.FAILED,
-                                                        timeMs = now,
-                                                        detail = "invalid package",
-                                                    ),
                                                     diagnose = res.toDiagnoseEvent(),
                                                     msg = "invalid package",
                                                     msgKind = MsgKind.INVALID,
@@ -1818,7 +1999,7 @@ class DualViewModel(
                                                         timeMs = now,
                                                         detail = "still installed for user ${res.dualId}",
                                                     ),
-                                                    diagnose = res.toDiagnoseEvent(),
+                                                    diagnose = res.toDiagnoseEvent(cur.pkg),
                                                     msg = "remove failed: ${cur.pkg} " +
                                                         "still installed for user ${res.dualId}",
                                                     msgKind = MsgKind.VERIFY,
@@ -1903,7 +2084,12 @@ class DualViewModel(
                             }
                         }
                     } catch (e: Exception) {
+                        // Never swallow coroutine cancellation (see refreshLocked).
                         if (e is CancellationException) throw e
+                        // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
+                        // pinnedTarget 保留當次已知 dualId (pending 目標)，
+                        // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
+                        // 非 OP_FAILED)。
                         val now = nowMs()
                         _state.update {
                             it.copy(
@@ -1913,12 +2099,12 @@ class DualViewModel(
                                     opId = key,
                                     appKey = pendingAtCall.pkg,
                                     pinnedTarget = pendingAtCall.dualId,
-                                    phase = OpPhase.FAILED,
+                                    phase = OpPhase.UNKNOWN,
                                     timeMs = now,
                                     detail = (e.message ?: "remove failed").take(MAX_DIAG_DETAIL_CHARS),
                                 ),
                                 diagnose = diagnoseEvent(
-                                    DiagnoseCode.OP_FAILED,
+                                    DiagnoseCode.VERIFY_UNKNOWN,
                                     techDetail = (e.message ?: "remove failed").take(MAX_DIAG_DETAIL_CHARS),
                                 ),
                                 msg = "remove failed: ${e.message ?: e.javaClass.simpleName}",
@@ -2849,8 +3035,9 @@ class DualViewModel(
             // degrade note as INFO so the reason is visible even though writes
             // work; otherwise ready means silent.
             // PR-6 P2 (#27 後半): 普通 probe 永不清除 lastOperation/diagnose
-            // (probe 成功不清 UNKNOWN，需下一次 pinned verify 才覆寫)；只在
-            // 通道全失 (!anyProbePassed) 時把 FRESH inventory 標 STALE (舊資料不謊稱新鮮)。
+            // (probe 成功不清 UNKNOWN，需下一次 pinned verify 才覆寫)；FRESH
+            // 且 (通道全失 或 已過 maxAge) 才把 inventory 補標 STALE
+            // (年齡檢查與 markStaleIfAgedLocked 共用 needsRefresh，舊資料不謊稱新鮮)。
             val readyMsg = degradeNoteForState
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
             // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
@@ -2864,7 +3051,9 @@ class DualViewModel(
             val probeNow = nowMs()
             _state.update { cur ->
                 val staleInventory =
-                    if (!anyProbePassed && cur.inventory.freshness == InventoryFreshness.FRESH) {
+                    if (cur.inventory.freshness == InventoryFreshness.FRESH &&
+                        (!anyProbePassed || cur.inventory.needsRefresh(probeNow))
+                    ) {
                         cur.inventory.copy(freshness = InventoryFreshness.STALE)
                     } else {
                         cur.inventory
@@ -2905,12 +3094,14 @@ class DualViewModel(
         // Phase 2: probe 拋錯（binder dead 等）同樣使 pmReadable 過期 -> null。
         // PR-6 P2: 保留 lastOperation/inventory (probe 失敗不清除歷史)，
         // 只記錄本次探測失敗的診斷事件。
+        // phase1: 探測異常只在無 sticky 事件時才設 PROBE_FAILED (既有 diagnose
+        // 如 VERIFY_UNKNOWN 等待重新查證者優先保留，避免探測抖動洗掉歷史)。
         if (e is CancellationException) throw e
         _state.update { cur ->
             val next = cur.copy(
                 loading = false,
                 pmReadable = null,
-                diagnose = diagnoseEvent(
+                diagnose = cur.diagnose ?: diagnoseEvent(
                     DiagnoseCode.PROBE_FAILED,
                     techDetail = (e.message ?: "probe failed").take(MAX_DIAG_DETAIL_CHARS),
                 ),
@@ -3024,12 +3215,21 @@ class DualViewModel(
         viewModelScope.launch {
             opMutex.withLock {
                 markStaleIfAgedLocked()
-                val cur = _state.value
-                val hookUnknown = cur.hookStatus == HookStatus.UNKNOWN_UNREADABLE ||
-                    cur.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC
-                if (preference == ChannelPreference.AUTO) swapAutoLocked()
-                probeChannels()
-                if (cur.inventory.freshness != InventoryFreshness.FRESH || hookUnknown) {
+                // P25 Item 3: one probe per round — swapAutoLocked probes once and
+                // returns the result for probeChannels to reuse.
+                if (preference == ChannelPreference.AUTO) {
+                    val probe = swapAutoLocked()
+                    probeChannels(probe)
+                } else {
+                    probeChannels()
+                }
+                // stale-read 修正：probeChannels() 已改寫 state，必須重讀
+                // _state.value 再判斷 refresh (此前沿用 probe 前快照，FRESH
+                // 過期或 hook 轉未知會被漏判)。
+                val after = _state.value
+                val hookUnknownAfter = after.hookStatus == HookStatus.UNKNOWN_UNREADABLE ||
+                    after.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC
+                if (after.inventory.freshness != InventoryFreshness.FRESH || hookUnknownAfter) {
                     refreshLocked()
                 }
             }
@@ -3071,7 +3271,7 @@ fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long = 0L):
     hookActive = diagnosis.active,
     hookScopes = diagnosis.scopes,
     hookQueriedAtMs = queriedAtMs,
-    hookMarkerTimeMs = HookMarker.parseTimeMs(diagnosis.raw),
+    hookMarkerTimeMs = HookMarker.parseTimeMs(diagnosis.raw)?.takeIf { it > 0 },
     hookViaGateway = diagnosis.viaGateway,
 )
 

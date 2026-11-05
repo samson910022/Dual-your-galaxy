@@ -14,6 +14,9 @@
 // - DiagnoseEvent: 穩定錯誤碼 + 繁中摘要/下一步 + 可展開 exit/技術 detail
 //   (大小受限，純顯示)。匯出經 redactPii 遮蔽個資 (包名等 dotted token)，
 //   僅使用者預覽/主動匯出，無自動上傳 (本檔案無任何網路呼叫)。
+// - 時間一律 wall-clock (System.currentTimeMillis)：有回撥/偽造風險，僅為
+//   存在性證據，絕不作授權依據。needsRefresh 把未來時間戳 (now < queryTime)
+//   視為需重查；marker 時間遠舊於查詢時間者顯示加註舊資料提醒。
 package com.galaxydual.plus
 
 import com.galaxydual.core.CloneOutcome
@@ -54,11 +57,17 @@ fun InventorySnapshot.needsRefresh(nowMs: Long, maxAgeMs: Long = INVENTORY_STALE
     when (freshness) {
         InventoryFreshness.UNKNOWN -> true
         InventoryFreshness.STALE -> true
-        InventoryFreshness.FRESH -> (nowMs - queryTimeMs) > maxAgeMs || queryTimeMs <= 0L
+        // FRESH 仍受零時間/時鐘偏移/过期三重保護：從未查詢、未來時間戳
+        // (wall-clock 回撥或偽造，見檔頭限制)、或存活達 maxAgeMs 者皆需重查。
+        InventoryFreshness.FRESH -> queryTimeMs <= 0L || nowMs < queryTimeMs ||
+            (nowMs - queryTimeMs) >= maxAgeMs
     }
 
 // 舊資料標 STALE (FRESH->STALE，原 target/queryTime 保留供追溯)；
-// 否則新建 UNKNOWN (記錄這次查詢的 source/target，不謊稱新鮮)。
+// 否則新建 UNKNOWN (記錄這次查詢的 source，不謊稱新鮮)。
+// UNKNOWN 分支保留舊身份/筆數供追溯：呼叫端傳入有效 target (>=0) 才覆寫
+// (傳 -1 表未知，回退保留 this.targetId，傳入的 targetId 不再丟棄)；
+// count 一律保留舊筆數，與 FRESH->STALE 一致 (舊資料不謊稱新鮮亦不丟失)。
 // DualViewModel.refreshLocked 各失敗分支共用。
 fun InventorySnapshot.staleOrUnknownLocked(
     now: Long,
@@ -70,10 +79,10 @@ fun InventorySnapshot.staleOrUnknownLocked(
     } else {
         InventorySnapshot(
             source = source,
-            targetId = targetId,
+            targetId = if (targetId >= 0) targetId else this.targetId,
             queryTimeMs = now,
             freshness = InventoryFreshness.UNKNOWN,
-            count = 0,
+            count = this.count,
         )
     }
 
@@ -97,7 +106,7 @@ data class LastOperation(
 
 // Hook 時間證據 (沿用 HookStateProvider 四態 + scope)：
 // - queriedAtMs: App 何時跑的診斷 (wall-clock)。
-// - markerTimeMs: marker 內 timeMs 行 (HookMarker.parseTimeMs(raw))，null=無/不可解析。
+// - markerTimeMs: marker 內 timeMs 行 (HookMarker.parseTimeMs(raw))，null=無/不可解析，<=0 視為未知。
 // - viaGateway: 是否走 privileged `cat` (診斷用)。
 data class HookEvidence(
     val status: HookStatus = HookStatus.UNKNOWN_NO_DIAGNOSTIC,
@@ -108,20 +117,30 @@ data class HookEvidence(
 )
 
 // HookDiagnosis -> HookEvidence (scope/time 證據沿用 HookStateProvider/HookMarker)。
+// markerTimeMs<=0 拒收 (視為無/不可解析，回 null 時間，避免 0/負值污染顯示)。
 fun HookDiagnosis.toEvidence(queriedAtMs: Long): HookEvidence = HookEvidence(
     status = status,
     scopes = scopes,
     queriedAtMs = queriedAtMs,
-    markerTimeMs = HookMarker.parseTimeMs(raw),
+    markerTimeMs = HookMarker.parseTimeMs(raw)?.takeIf { it > 0 },
     viaGateway = viaGateway,
 )
 
 // Hook 時間證據純文字 (歷史 marker 語意不變，另加時間行)。
+// marker 遠舊於查詢時間 (差值超過清單过期閾值) 多半是重啟前舊資料：
+// 附加提醒，僅存在性證據，不代表本次開機生效。
 fun HookEvidence.displayText(): String {
     val base = HookDiagnosis(status, scopes).displayText()
     val timePart = if (markerTimeMs != null) "；marker timeMs=$markerTimeMs" else "；marker 時間未知"
     val qPart = if (queriedAtMs > 0L) "；查詢於 $queriedAtMs" else ""
-    return base + timePart + qPart
+    val stalePart = if (markerTimeMs != null && markerTimeMs > 0L && queriedAtMs > 0L &&
+        (queriedAtMs - markerTimeMs) > INVENTORY_STALE_AFTER_MS
+    ) {
+        "（可能為重啟前舊資料，僅存在性證據）"
+    } else {
+        ""
+    }
+    return base + timePart + qPart + stalePart
 }
 
 // 診斷穩定錯誤碼：一旦發布永不改名/重用 (字串即契約，UI/匯出/測試皆以此為準)。
@@ -202,33 +221,42 @@ fun RemoveOutcome.toDiagnoseCode(): DiagnoseCode = when (this) {
 }
 
 // CloneOutcome -> DiagnoseEvent (exit/techDetail 可展開，大小受限)。
-fun CloneOutcome.toDiagnoseEvent(): DiagnoseEvent? {
+// 契約：outcome 若攜帶 exit 經 exit 參數透傳 (現行 outcome 尚無 exit 欄位，
+// 呼叫端有結構化 exit 時傳入，預設 null 不斷舊呼叫端)；VerifyFailed 的 tech
+// 改用 redactPackage() 後包名+dualId (包名由呼叫端經 pkg 傳入，缺省空字串
+// 時沿用舊泛稱)。
+fun CloneOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
     val code = toDiagnoseCode()
     if (code == DiagnoseCode.OK) return null
     val tech = when (this) {
         is CloneOutcome.ChannelError -> detail
         is CloneOutcome.InstallFailed -> detail
-        is CloneOutcome.VerifyFailed -> "pkg not installed for user $dualId"
+        is CloneOutcome.VerifyFailed ->
+            if (pkg.isBlank()) "pkg not installed for user $dualId"
+            else "${redactPackage(pkg)} not installed for user $dualId"
         is CloneOutcome.VerifyUnknown -> detail
         else -> ""
     }
-    return diagnoseEvent(code, techDetail = tech)
+    return diagnoseEvent(code, exit = exit, techDetail = tech)
 }
 
-// RemoveOutcome -> DiagnoseEvent。
-fun RemoveOutcome.toDiagnoseEvent(): DiagnoseEvent? {
+// RemoveOutcome -> DiagnoseEvent (契約同上；StillInstalled 的 tech 改用
+// redactPackage() 後包名+dualId)。
+fun RemoveOutcome.toDiagnoseEvent(pkg: String = "", exit: Int? = null): DiagnoseEvent? {
     val code = toDiagnoseCode()
     if (code == DiagnoseCode.OK) return null
     val tech = when (this) {
         is RemoveOutcome.ChannelError -> detail
         is RemoveOutcome.RemoveFailed -> detail
-        is RemoveOutcome.StillInstalled -> "pkg still installed for user $dualId"
+        is RemoveOutcome.StillInstalled ->
+            if (pkg.isBlank()) "pkg still installed for user $dualId"
+            else "${redactPackage(pkg)} still installed for user $dualId"
         is RemoveOutcome.VerifyUnknown -> detail
         is RemoveOutcome.TargetMoved -> "verified id $verified != expected $expected"
         is RemoveOutcome.SerialMismatch -> "serial ${actual ?: "?"} != expected ${expected ?: "?"}"
         else -> ""
     }
-    return diagnoseEvent(code, techDetail = tech)
+    return diagnoseEvent(code, exit = exit, techDetail = tech)
 }
 
 // profilesSnapshot 失敗 -> DiagnoseEvent (refresh 第一跳)。
