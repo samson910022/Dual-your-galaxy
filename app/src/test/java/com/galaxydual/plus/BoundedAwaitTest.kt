@@ -22,6 +22,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -185,9 +186,8 @@ class BoundedAwaitTest {
     // P2: repeated hung calls must not accumulate one blocked thread per
     // call (the old per-call single-thread executor did exactly that:
     // 12 hung calls left 12 live "shizuku-transact-N" threads). The shared
-    // pool caps live transact threads at TRANSACT_MAX_THREADS, and
-    // cancelled/timeout tasks leave a no-op shell in the queue (supplier
-    // never runs) until a worker dequeues and discards it.
+    // pool caps live transact threads at TRANSACT_MAX_THREADS; timeout/cancel
+    // removes the queued runner via remove(), so the queue stays 0.
     @Test fun repeatedHungCalls_poolStaysBounded() = runBlocking {
         repeat(12) {
             val res = awaitBounded(100L) { hungBlock(hangMs = 300L) }
@@ -304,5 +304,84 @@ class BoundedAwaitTest {
             TRANSACT_MAX_THREADS,
             transactPermits.availablePermits,
         )
+    }
+
+    // P2-2 (queue-bound fix): sequential short-timeout hung calls against
+    // pinned workers must leave NO queued shells. Uses an isolated pool so
+    // the 5s hung blocks never pin the process-global pool. Pre-fix
+    // (supplyAsync without remove) each queued timeout left one AsyncSupply
+    // shell behind, so K=8 sequential calls left ~K-4 shells; post-fix every
+    // timeout removes its runner and the queue stays 0.
+    @Test fun sequentialTimeoutsOnPinnedPool_leaveNoQueuedShells() = runBlocking {
+        val exec = newIsolatedTransactExecutor()
+        val permits = Semaphore(TRANSACT_MAX_THREADS)
+        try {
+            repeat(8) {
+                val res = awaitBounded(100L, exec, permits) { hungBlock(hangMs = 5_000L) }
+                assertNull("hung call must time out, got: $res", res)
+            }
+            assertEquals(
+                "timed-out queued runners must be removed, not piled",
+                0,
+                exec.queue.size,
+            )
+            assertEquals(
+                "permits must be fully released after sequential timeouts",
+                TRANSACT_MAX_THREADS,
+                permits.availablePermits,
+            )
+            assertTrue(
+                "pool must never exceed its cap (poolSize=${exec.poolSize})",
+                exec.poolSize <= TRANSACT_MAX_THREADS,
+            )
+        } finally {
+            exec.shutdownNow()
+        }
+    }
+
+    // P2-2 (queue-bound fix): burst of concurrent hung callers against pinned
+    // workers -- half timeout, half externally cancelled -- must all settle
+    // with permits fully recovered and no queued shells. Isolated pool so the
+    // 5s hung blocks never pollute the global pool.
+    @Test fun cancelBurstWithPinnedWorkers_permitsRecoverAndQueueBounded() = runBlocking {
+        val exec = newIsolatedTransactExecutor()
+        val permits = Semaphore(TRANSACT_MAX_THREADS)
+        try {
+            val jobs = (1..20).map {
+                async(Dispatchers.Default) {
+                    awaitBounded(400L, exec, permits) { hungBlock(hangMs = 5_000L) }
+                }
+            }
+            delay(100L)
+            jobs.take(10).forEach { it.cancel() }
+            var cancelled = 0
+            var timedOut = 0
+            jobs.forEach {
+                try {
+                    val res = it.await()
+                    assertNull("hung burst call must time out, got: $res", res)
+                    timedOut++
+                } catch (_: CancellationException) {
+                    cancelled++
+                }
+            }
+            assertEquals("half the burst must end by external cancel", 10, cancelled)
+            assertEquals("half the burst must end by timeout", 10, timedOut)
+            val deadlineMs = System.currentTimeMillis() + 5_000L
+            while ((exec.queue.isNotEmpty() ||
+                permits.availablePermits != TRANSACT_MAX_THREADS) &&
+                System.currentTimeMillis() < deadlineMs
+            ) {
+                delay(10L)
+            }
+            assertEquals(
+                "all permits must be released after burst",
+                TRANSACT_MAX_THREADS,
+                permits.availablePermits,
+            )
+            assertEquals("queue must stay bounded after burst", 0, exec.queue.size)
+        } finally {
+            exec.shutdownNow()
+        }
     }
 }
