@@ -354,15 +354,28 @@ private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
 
 fun redactPii(text: String): String = PKG_TOKEN.replace(text, "<pkg>")
 
-// 路徑遮蔽 (純函數，第二道)：把含 / 的路徑 token 換成 <path>。
-// 只匹配含 / 的 token (Regex "/[\w./-]+"，\w 含 [A-Za-z0-9_])，
-// 故 "exit=0" 這類無斜線內容不受影響；與 redactPii 順序固定為先包名後路徑。
-// 已知取捨 (保留現狀，僅文件化，不改 regex)：
-// - "a/b" 類正常文案會被誤傷為 <path> (fail-closed，可接受：
-//   遮蔽過度只損可讀性，不洩個資；白名單本身即外洩面，刻意不做)。
-// - 反斜線 (C:\...) 與含空格路徑超出 Android 威脅模型，不處理
-//   (裝置路徑皆為正斜線、無空格；桌面風格路徑不進本機顯示/匯出)。
-private val PATH_TOKEN = Regex("/[\\w./-]+")
+// 路徑遮蔽 (純函數，第二道)：把含 / 的完整路徑延展換成 <path>。
+// 保守遮蔽（fail-closed，寧可過度遮蔽不洩漏）：由前斜線起延展，含空白
+// （裝置路徑可含空格，如 /sdcard/My Wedding/Photo 001.png，舊 Regex
+// "/[\w./-]+" 遇空格即斷裂殘留 "My Wedding/Photo 001.png"，故延展須含
+// 空白），遇換行/控制字元/引號（"'`）/特定分隔（<>|*?）才止；未列入止集
+// 者一律吞入（含空格與標點，同一行尾隨文案可能被連帶遮蔽，可接受）。
+// Unicode 支援：延展採否定字元集（未排除者全收），自然含 \p{L}（CJK 中文
+// 如 /sdcard/照片/婚禮照 001.png 全遮）；\w（[A-Za-z0-9_]，Kotlin Regex
+// \w 不含中文）已棄用，刻意不用白名單（白名單本身即外洩面）。
+// 心智驗證："/sdcard/My Wedding/Photo 001.png" 全遮；Unicode 路徑全遮；
+// 引號路徑（"/sdcard/a b.png"）止於引號、內部全遮；日期 "2026-11-05 12:34"
+// 無斜線不受影響；純中文文案無斜線不受影響；"exit=0" 無斜線不受影響。
+// 與 redactPii 順序固定為先包名後路徑。
+// 已知取捨（保留現狀，僅文件化）：
+// - "a/b" 類正常文案會被誤傷為 <path>（fail-closed，可接受：
+//   遮蔽過度只損可讀性，不洩個資；白名單本身即外洩面，刻意不做）。
+// - 反斜線（C:\...）仍超出 Android 威脅模型，不處理
+//   （裝置路徑皆為正斜線；桌面風格路徑不進本機顯示/匯出）。
+// - 同行尾隨文案（如 "denied /sdcard/a.png 殘留" 的 " 殘留"）會被連帶
+//   遮蔽為 <path>（fail-closed，可接受，不謊稱精確）。
+// - 遮蔽仍非全面保證（見匯出文案「分享前請人工確認」），不得宣稱絕對乾淨。
+private val PATH_TOKEN = Regex("/\\S[^\n\r\u0000-\u001F\u007F\"'`<>|*?]*")
 
 internal fun redactPaths(text: String): String = PATH_TOKEN.replace(text, "<path>")
 
@@ -395,7 +408,8 @@ fun redactPackage(pkg: String): String {
     return if ("." in pkg.trim()) "$head.***" else "***"
 }
 
-// 診斷匯出 (使用者預覽/主動匯出用，已遮蔽、大小受限、無自動上傳)。
+// 診斷匯出 (使用者預覽/主動匯出用，已遮蔽可辨識資料、大小受限、無自動上傳)。
+// 誠實文案：遮蔽仍非全面保證，標題明示「分享前請人工確認」，不得宣稱絕對乾淨。
 // 輸入 UiState，輸出多行繁中文字；呼叫端 (MainActivity 匯出按鈕) 只負責顯示，
 // 不做任何網路上傳 (契約見檔頭與 MainActivity 註解)。
 fun buildDiagnosticExport(state: UiState): String {
@@ -405,7 +419,7 @@ fun buildDiagnosticExport(state: UiState): String {
     // (appendLine 自身) 保留，只壓欄位內換行，避免偽造匯出行。
     fun clean(s: String): String = s.replace(CONTROL_CHARS, " ")
     val sb = StringBuilder()
-    sb.appendLine("【診斷匯出（已遮蔽，僅本機預覽）】")
+    sb.appendLine("【診斷匯出（已遮蔽可辨識資料，分享前請人工確認，僅本機預覽）】")
     val diag = state.diagnose
     if (diag != null) {
         sb.appendLine("錯誤碼：${diag.code.stableId}")

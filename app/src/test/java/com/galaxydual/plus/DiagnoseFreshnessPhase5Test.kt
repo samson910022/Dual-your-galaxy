@@ -629,6 +629,92 @@ class DiagnoseFreshnessPhase5Test {
         assertEquals("***", redactPackage(""))
     }
 
+    // P2-4 空白/Unicode/引號路徑全遮：舊 "/[\w./-]+" 遇空格即斷裂
+    // （denied /sdcard/My Wedding/Photo 001.png 殘留 "My Wedding..."），
+    // 新延展由前斜線起含空白、遇換行/引號/特定分隔止（fail-closed）。
+    // 另：日期/純中文無斜線須原樣通過；"a/b" 誤傷可接受故不斷言其保留。
+    @Test
+    fun redactPaths_spaceUnicodeQuote_fullyMasked() {
+        val spaced = "denied /sdcard/My Wedding/Photo 001.png 殘留"
+        val r1 = redactPaths(spaced)
+        assertFalse("空白路徑前段不得殘留，got: $r1", r1.contains("/sdcard/"))
+        assertFalse("空白路徑中段不得殘留，got: $r1", r1.contains("My Wedding"))
+        assertFalse("空白路徑檔名不得殘留，got: $r1", r1.contains("Photo 001.png"))
+        assertTrue("遮蔽標記須出現，got: $r1", r1.contains("<path>"))
+        assertFalse("斜線本體不得殘留，got: $r1", r1.contains("/sdcard/My"))
+
+        val uni = "denied /sdcard/照片/婚禮照 001.png 結尾"
+        val r2 = redactPaths(uni)
+        assertFalse("Unicode 路徑前段不得殘留，got: $r2", r2.contains("/sdcard/"))
+        assertFalse("Unicode 路徑中文段不得殘留，got: $r2", r2.contains("照片"))
+        assertFalse("Unicode 路徑中文段不得殘留，got: $r2", r2.contains("婚禮照"))
+        assertTrue("遮蔽標記須出現，got: $r2", r2.contains("<path>"))
+
+        val quoted = "denied \"/sdcard/My Wedding/Photo 001.png\""
+        val r3 = redactPaths(quoted)
+        assertFalse("引號內路徑不得殘留，got: $r3", r3.contains("/sdcard/"))
+        assertFalse("引號內空白段不得殘留，got: $r3", r3.contains("My Wedding"))
+        assertTrue("遮蔽標記須出現，got: $r3", r3.contains("<path>"))
+
+        val singleQuoted = "denied '/sdcard/照片 001.png'"
+        val r4 = redactPaths(singleQuoted)
+        assertFalse("單引號內路徑不得殘留，got: $r4", r4.contains("/sdcard/"))
+        assertTrue("遮蔽標記須出現，got: $r4", r4.contains("<path>"))
+    }
+
+    // P2-4 日期/中文不斷裂誤傷：無斜線內容須原樣通過。
+    // 注意：不斷言 "a/b" 的保留位置（fail-closed 誤傷可接受，見註解）。
+    @Test
+    fun redactPaths_dateAndChinese_passthrough() {
+        val date = "2026-11-05 12:34"
+        assertEquals("日期無斜線須原樣通過", date, redactPaths(date))
+        val zh = "分享前請人工確認"
+        assertEquals("純中文無斜線須原樣通過", zh, redactPaths(zh))
+        val plain = "exit=0 user 95"
+        assertEquals("無斜線診斷文案須原樣通過", plain, redactPaths(plain))
+        val timeFmt = formatTimeMs(123456789L)
+        assertEquals("格式化時間須原樣通過", timeFmt, redactPaths(timeFmt))
+    }
+
+    // P2-4 匯出端到端：含空白/Unicode/引號路徑的技術細節經匯出不得洩 raw，
+    // 且標題須含誠實文案「分享前請人工確認」（遮蔽非全面保證）。
+    @Test
+    fun export_spaceUnicodePaths_noRawLeak() {
+        val rawSpaced = "/sdcard/My Wedding/Photo 001.png"
+        val rawUni = "/sdcard/照片/婚禮照 001.png"
+        val state = UiState(
+            inventory = InventorySnapshot(
+                source = "pm list packages --user 95",
+                targetId = 95,
+                queryTimeMs = 123456789L,
+                freshness = InventoryFreshness.FRESH,
+                count = 1,
+            ),
+            lastOperation = LastOperation(
+                opId = "clone:com.example.secretchat",
+                appKey = "com.example.secretchat",
+                pinnedTarget = 95,
+                phase = OpPhase.UNKNOWN,
+                timeMs = 123456789L,
+                detail = "denied \"$rawSpaced\" for user 95",
+            ),
+            diagnose = diagnoseEvent(
+                DiagnoseCode.VERIFY_UNKNOWN,
+                techDetail = "denied $rawSpaced and $rawUni for user 95",
+            ),
+        )
+        val text = buildDiagnosticExport(state)
+        assertFalse("匯出不得洩空白路徑 raw，got: $text", text.contains(rawSpaced))
+        assertFalse("匯出不得洩空白片段，got: $text", text.contains("My Wedding"))
+        assertFalse("匯出不得洩 Unicode 路徑 raw，got: $text", text.contains(rawUni))
+        assertFalse("匯出不得洩 Unicode 片段，got: $text", text.contains("婚禮照"))
+        assertTrue("匯出須含路徑遮蔽標記，got: $text", text.contains("<path>"))
+        assertTrue(
+            "匯出標題須含誠實文案，got: $text",
+            text.contains("分享前請人工確認"),
+        )
+    }
+
     // ---- 9. staleOrUnknown + refresh 失敗分支 ----
 
     @Test
