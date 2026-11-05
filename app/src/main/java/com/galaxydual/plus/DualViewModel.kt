@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 // Pending two-phase remove confirmation (PR-4 P1, issue #23).
 //
@@ -465,6 +466,14 @@ class DualViewModel(
     // JVM tests need no Android runtime; tests inject a controllable fake.
     // Constructor stays Android-free; the factory wires elapsedRealtime.
     private val nowMs: () -> Long = System::currentTimeMillis,
+    // Phase N2 (issue #34 re-review): injectable Shizuku teardown observer.
+    // Production default null (real ShizukuCmdGateway.abandon() runs inline);
+    // tests inject a counting lambda so FakeShizuku (SHELL privilege, not a
+    // ShizukuCmdGateway) closings are observable without touching Shizuku
+    // statics. Invoked for every Shizuku-like target (see isShizukuLike):
+    // displaced-idle closes in swap paths plus the final cleared snapshot.
+    // Never throws (guarded); never drives readiness/diagnosis.
+    private val gatewayTeardown: ((CmdGateway) -> Unit)? = null,
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -546,6 +555,71 @@ class DualViewModel(
     // unblocked.
     private suspend fun <T> onIo(block: suspend () -> T): T =
         withContext(Dispatchers.IO) { block() }
+
+    // Phase N2 Shizuku binding teardown (issue #34 re-review): ViewModel has
+    // no onCleared, so the retained + current Shizuku instances skipped by
+    // the swap guards (old !== retained) leaked their UserService bindings
+    // across Activity finish while the process lived on. This override
+    // snapshots every Shizuku-like slot (active/su/shizuku/retained, identity
+    // deduped) and releases each exactly once. abandon() is non-suspend
+    // (tryLock; contended -> give up, process-death 兜底) so onCleared -- which
+    // cannot suspend with viewModelScope already cancelled -- needs no
+    // independent closeScope. Idempotent via teardownOnce (dispose() twice is
+    // a no-op); diagnostic instances are NOT closed early -- only this
+    // cleared path closes them all.
+    private val teardownOnce = AtomicBoolean(false)
+
+    private fun isShizukuLike(gw: CmdGateway): Boolean =
+        gw is ShizukuCmdGateway || gw.privilege == Privilege.SHELL
+
+    private fun collectTeardownTargets(): List<CmdGateway> {
+        val all = listOfNotNull(
+            activeGateway,
+            suGateway,
+            shizukuGateway,
+            retainedSuDiagnostic,
+            retainedShizukuDiagnostic,
+        )
+        val distinct = mutableListOf<CmdGateway>()
+        for (gw in all) {
+            if (distinct.none { it === gw }) distinct.add(gw)
+        }
+        return distinct.filter { isShizukuLike(it) }
+    }
+
+    private fun teardownOne(gw: CmdGateway) {
+        try {
+            if (gw is ShizukuCmdGateway) gw.abandon()
+        } catch (_: Exception) {
+            // Best effort: the stale binding dies with the process anyway.
+        }
+        try {
+            gatewayTeardown?.invoke(gw)
+        } catch (_: Exception) {
+            // Best effort: observer must never break teardown.
+        }
+    }
+
+    private fun teardownShizukuBindings() {
+        if (!teardownOnce.compareAndSet(false, true)) return
+        val targets = try {
+            collectTeardownTargets()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        for (gw in targets) teardownOne(gw)
+    }
+
+    // Test-visible entry: onCleared is protected, so JVM tests drive disposal
+    // through here (same idempotent body).
+    fun dispose() {
+        teardownShizukuBindings()
+    }
+
+    override fun onCleared() {
+        teardownShizukuBindings()
+        super.onCleared()
+    }
 
     init {
         // Probe elevation channels first; later ops queue behind this, so the
@@ -1859,6 +1933,17 @@ class DualViewModel(
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
+        // Phase N2 observer: count SHELL fakes too (production seam null =
+        // no-op). Same displaced guard as the real close above; retained
+        // instances are NOT closed early -- only the cleared snapshot does.
+        if (old !== newGateway && isShizukuLike(old) &&
+            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
+        ) {
+            try {
+                gatewayTeardown?.invoke(old)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     // Rebuilds repo/gatewayPrivilege/elevators for pref via the shared
@@ -1948,6 +2033,16 @@ class DualViewModel(
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
+        // Phase N2 observer (same guard): SHELL fakes counted, real already
+        // closed above (seam extra, null in production). Retained not closed.
+        if (old !== activeGateway && isShizukuLike(old) &&
+            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
+        ) {
+            try {
+                gatewayTeardown?.invoke(old)
+            } catch (_: Exception) {
+            }
+        }
         // Release displaced idle Shizuku instances (assembleChannel builds
         // fresh ones every swap; the unpicked idle instance is otherwise
         // dropped without closing). Never the newly installed instances;
@@ -1963,6 +2058,15 @@ class DualViewModel(
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
+        if (oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
+            oldShizuku !== activeGateway && isShizukuLike(oldShizuku) &&
+            oldShizuku !== retainedSuDiagnostic && oldShizuku !== retainedShizukuDiagnostic
+        ) {
+            try {
+                gatewayTeardown?.invoke(oldShizuku)
+            } catch (_: Exception) {
+            }
+        }
         // Defensive: suGateway is a SuCmdGateway by construction, but tests
         // may inject any CmdGateway -- never leak a Shizuku hiding there.
         if (oldSu !== suGateway && oldSu !== shizukuGateway &&
@@ -1974,6 +2078,15 @@ class DualViewModel(
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 // Best effort: the stale binding dies with the process anyway.
+            }
+        }
+        if (oldSu !== suGateway && oldSu !== shizukuGateway &&
+            oldSu !== activeGateway && isShizukuLike(oldSu) &&
+            oldSu !== retainedSuDiagnostic && oldSu !== retainedShizukuDiagnostic
+        ) {
+            try {
+                gatewayTeardown?.invoke(oldSu)
+            } catch (_: Exception) {
             }
         }
     }
@@ -2059,16 +2172,23 @@ class DualViewModel(
     // Closes a displaced SHIZUKU diagnostic binding only when nothing
     // references it anymore (mirrors the swap close policy: only
     // ShizukuCmdGateway holds a cached binding, su gateways are stateless).
-    // Must run under opMutex.
+    // Must run under opMutex. Phase N2: also notifies the injectable seam for
+    // SHELL fakes (null in production).
     private suspend fun closeRetainedIfDisplaced(gateway: CmdGateway?) {
-        if (gateway == null || gateway !is ShizukuCmdGateway) return
+        if (gateway == null || !isShizukuLike(gateway)) return
         if (gateway === suGateway || gateway === shizukuGateway || gateway === activeGateway) return
         if (gateway === retainedSuDiagnostic || gateway === retainedShizukuDiagnostic) return
+        if (gateway is ShizukuCmdGateway) {
+            try {
+                gateway.close()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                // Best effort: the stale binding dies with the process anyway.
+            }
+        }
         try {
-            gateway.close()
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            // Best effort: the stale binding dies with the process anyway.
+            gatewayTeardown?.invoke(gateway)
+        } catch (_: Exception) {
         }
     }
 
