@@ -53,6 +53,9 @@ class AutoDegradeTest {
         @Volatile var idUCalls = 0
         // Counts `pm list users` calls so tests can prove a re-probe ran.
         @Volatile var listUsersCalls = 0
+        // Counts diagnostic `cat` (hook marker) so tests prove a (non-)use
+        // of a gateway for diagnosis without conflating with idU probes.
+        @Volatile var catCalls = 0
         @Volatile var uninstallCalls = 0
         var uninstallOut = "Success"
         var uninstallExit = 0
@@ -125,6 +128,7 @@ class AutoDegradeTest {
                 // Phase A P2: serve marker content for hook diagnosis; null
                 // keeps the legacy "ok" (no scopes). `cat` never touches
                 // idUCalls/listUsersCalls, so zero-probe assertions stay valid.
+                catCalls++
                 val content = markerContent
                 if (content != null) CmdResult(exit = 0, out = content, err = "")
                 else CmdResult(exit = 0, out = "ok", err = "")
@@ -134,11 +138,16 @@ class AutoDegradeTest {
     }
 
     // Fake Shizuku gateway: shizukuOk=true proves SHELL via `pm list users`.
-    private class FakeShizuku(val shizukuOk: Boolean, var dualId: Int = 95) : CmdGateway {
+    private class FakeShizuku(var shizukuOk: Boolean, var dualId: Int = 95) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
 
         // Counts `pm list users` calls so tests can prove a re-probe ran.
         @Volatile var listUsersCalls = 0
+        // Counts diagnostic `cat` so tests prove a (non-)use for diagnosis.
+        // Mutable shizukuOk models binder dead/rebind (revocation): flipping
+        // to false makes the next probe fail, which must rewrite the
+        // shizuku evidence entry to false on the same instance.
+        @Volatile var catCalls = 0
         @Volatile var uninstallCalls = 0
         var uninstallOut = "Success"
         var uninstallExit = 0
@@ -202,9 +211,19 @@ class AutoDegradeTest {
             cmd.startsWith("pm list packages") ->
                 if (shizukuOk) CmdResult(exit = 0, out = listPackagesOut(), err = "")
                 else CmdResult(exit = 1, out = "", err = "denied")
+            cmd.startsWith("cat ") -> {
+                catCalls++
+                if (shizukuOk) CmdResult(exit = 0, out = markerContentForTest(), err = "")
+                else CmdResult(exit = 1, out = "", err = "denied")
+            }
             else -> if (shizukuOk) CmdResult(exit = 0, out = "ok", err = "")
             else CmdResult(exit = 1, out = "", err = "denied")
         }
+
+        // Marker served via `cat` for hook-diagnosis tests. Null keeps the
+        // legacy "ok" (no scopes); set to parseable content for ACTIVE.
+        var markerContent: String? = null
+        private fun markerContentForTest(): String = markerContent ?: "ok"
     }
 
     private val vms = mutableListOf<DualViewModel>()
@@ -236,28 +255,56 @@ class AutoDegradeTest {
         preference: ChannelPreference = ChannelPreference.AUTO,
         hookDirectReads: () -> List<MarkerRead> =
             { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
-        hookDiagnosticGateways: () -> List<CmdGateway> = { emptyList() },
-        lastVerifiedHasRoot: Boolean = false,
-        lastVerifiedHasShizuku: Boolean = false,
+        // Null = use the ViewModel default { listOf(suGateway, shizukuGateway) }
+        // so candidates TRACK rebuilds (production behavior for the new
+        // instance-bound tests). Non-null keeps a fixed list (legacy tests).
+        hookDiagnosticGateways: (() -> List<CmdGateway>)? = { emptyList() },
+        assembleChannelFn: (
+            ChannelPreference,
+            Boolean,
+            Boolean,
+            String,
+        ) -> ChannelAssembly = ::assembleChannel,
     ): DualViewModel {
-        val vm = DualViewModel(
-            repo = DualRepository(initialGateway),
-            gatewayPrivilege = initialGateway.privilege,
-            elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
-            preference = preference,
-            appPackageName = "com.example.test",
-            persistPreference = null,
-            suPresentCheck = { suPresent },
-            shizukuAuthCheck = { shizukuAuth },
-            suGateway = suFake,
-            shizukuGateway = shizukuFake,
-            activeGateway = initialGateway,
-            currentChannel = initialChannel,
-            lastVerifiedHasRoot = lastVerifiedHasRoot,
-            lastVerifiedHasShizuku = lastVerifiedHasShizuku,
-            hookDirectReads = hookDirectReads,
-            hookDiagnosticGateways = hookDiagnosticGateways,
-        )
+        // Null hookDiagnosticGateways = use the ViewModel default
+        // { listOf(suGateway, shizukuGateway) } so candidates TRACK rebuilds
+        // (production behavior). An explicit lambda keeps a fixed list.
+        val vm = if (hookDiagnosticGateways == null) {
+            DualViewModel(
+                repo = DualRepository(initialGateway),
+                gatewayPrivilege = initialGateway.privilege,
+                elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+                preference = preference,
+                appPackageName = "com.example.test",
+                persistPreference = null,
+                suPresentCheck = { suPresent },
+                shizukuAuthCheck = { shizukuAuth },
+                suGateway = suFake,
+                shizukuGateway = shizukuFake,
+                activeGateway = initialGateway,
+                currentChannel = initialChannel,
+                assembleChannelFn = assembleChannelFn,
+                hookDirectReads = hookDirectReads,
+            )
+        } else {
+            DualViewModel(
+                repo = DualRepository(initialGateway),
+                gatewayPrivilege = initialGateway.privilege,
+                elevators = listOf(SuElevator(suFake), ShizukuElevator(shizukuFake)),
+                preference = preference,
+                appPackageName = "com.example.test",
+                persistPreference = null,
+                suPresentCheck = { suPresent },
+                shizukuAuthCheck = { shizukuAuth },
+                suGateway = suFake,
+                shizukuGateway = shizukuFake,
+                activeGateway = initialGateway,
+                currentChannel = initialChannel,
+                assembleChannelFn = assembleChannelFn,
+                hookDirectReads = hookDirectReads,
+                hookDiagnosticGateways = hookDiagnosticGateways,
+            )
+        }
         vms.add(vm)
         return vm
     }
@@ -986,58 +1033,216 @@ class AutoDegradeTest {
         assertTrue("placeholder repo is unreadable, got: \"${s.msg}\"", s.msg.contains("channel error"))
     }
 
-    // Phase A P2 regression: LSPOSED diagnosis reuses the AUTO-verified cache
-    // without new probes. Simulates "AUTO全成功後切LSPOSED": direct reads are
-    // denied (app-uid EACCES), but the cache holds proven ROOT (injected here
-    // to stand in for the prior AUTO full success without rebuilding real
-    // gateways via selectChannel), and the cached ROOT channel serves the
-    // marker via `cat`. LSPOSED must then diagnose ACTIVE while write-readiness
-    // stays refused and no new `su -c id -u` probe runs. Cold-start LSPOSED
-    // (empty cache) stays UNKNOWN -- see HookDiagnosisTest direct-denied case.
+    // Phase A P2 (instance-bound evidence): AUTO -> LSPOSED via REAL
+    // selectChannel + rebuild (new instances). Old evidence binds to the OLD
+    // su instance, so after the rebuild the new instance is naturally
+    // mismatched (identity + generation) and excluded: LSPOSED stays
+    // UNKNOWN (direct denied, no usable gateway) and the new instance is
+    // never `cat`ed before verification (path A closed: no `su -c cat` auth
+    // on the fresh instance). Counts prove it: newSu.idU/cat stay 0 and the
+    // old instance is not reused after the swap.
     @Test
-    fun explicit_lsposed_usesVerifiedCacheForDiagnosisWithoutNewProbe() {
+    fun autoToLsposed_rebuildInvalidatesOldEvidence_noCatOnNewInstance() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suOld = FakeSu(rootOk = true)
+        suOld.markerContent = marker
+        val shizukuOld = FakeShizuku(shizukuOk = false)
+        val createdSu = mutableListOf<FakeSu>()
+        // Fresh instances every swap (production behavior): new identity.
+        val rebuildFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val newSu = FakeSu(rootOk = true)
+            newSu.markerContent = marker
+            val newShizuku = FakeShizuku(shizukuOk = false)
+            createdSu.add(newSu)
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> newSu
+                ResolvedChannel.SHIZUKU -> newShizuku
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, newSu, newShizuku, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suOld,
+            shizukuFake = shizukuOld,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suOld,
+            preference = ChannelPreference.AUTO,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            // Null = tracking (production): candidates follow rebuilds.
+            hookDiagnosticGateways = null,
+            assembleChannelFn = rebuildFactory,
+        )
+        // Initial AUTO proves the OLD instance (writable + ACTIVE via its cat).
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+        val oldCatBefore = suOld.catCalls
+        assertTrue("precondition: old instance must have served `cat`", oldCatBefore > 0)
+
+        vm.selectChannel(ChannelPreference.LSPOSED)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                createdSu.isNotEmpty()
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertEquals(ChannelPreference.LSPOSED, s.channel)
+        assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
+        // Old evidence (old instance) must not authorize the NEW instance:
+        // direct denied + no usable gateway -> UNKNOWN, never ACTIVE.
+        assertTrue(
+            "rebuilt instance must be UNKNOWN until verified, got: ${s.hookStatus}",
+            s.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                s.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse("NoOp placeholder is never writable", s.writeReady)
+        assertFalse("NoOp placeholder is never channelReady", s.channelReady)
+        assertFalse("LSPOSED probes none", s.anyProbePassed)
+        val newSu = createdSu.first()
+        assertEquals("new instance must never run `su -c id -u` before verification", 0, newSu.idUCalls)
+        assertEquals("new instance must never be `cat`ed before verification (path A)", 0, newSu.catCalls)
+        assertEquals("old instance must not be reused after rebuild", oldCatBefore, suOld.catCalls)
+    }
+
+    // Phase A P2 (match branch): explicit ROOT writes su evidence for the
+    // CURRENT instance via a real probe; switching to LSPOSED with the SAME
+    // instances (factory reuses fakes) keeps identity+generation equal, so
+    // LSPOSED diagnoses ACTIVE via that verified `cat` while writeReady stays
+    // false (hook diagnosis never raises writeReady). No new `id -u` runs on
+    // the LSPOSED path.
+    @Test
+    fun explicitRootToLsposed_sameInstance_diagnosesActiveWithoutRaisingWriteReady() {
         val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
         val suFake = FakeSu(rootOk = true)
         suFake.markerContent = marker
         val shizukuFake = FakeShizuku(shizukuOk = false)
+        // Reuse the same fakes across swaps (exercises the match branch).
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
         val vm = makeAutoVm(
             suFake = suFake,
             shizukuFake = shizukuFake,
             suPresent = true,
             shizukuAuth = false,
-            initialChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
-            initialGateway = NoOpGateway(),
-            preference = ChannelPreference.LSPOSED,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.ROOT,
             hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
-            hookDiagnosticGateways = { listOf(suFake, shizukuFake) },
-            // Manual cache: stands in for a prior AUTO full success that proved ROOT.
-            lastVerifiedHasRoot = true,
-            lastVerifiedHasShizuku = false,
+            hookDiagnosticGateways = null,
+            assembleChannelFn = reuseFactory,
         )
-        await { !vm.state.value.loading && vm.state.value.hookStatus == HookStatus.ACTIVE }
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+        val idUBefore = suFake.idUCalls
+
+        vm.selectChannel(ChannelPreference.LSPOSED)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED &&
+                vm.state.value.hookStatus == HookStatus.ACTIVE
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
 
         val s = vm.state.value
-        assertEquals("cached ROOT must diagnose ACTIVE via `cat`", HookStatus.ACTIVE, s.hookStatus)
-        assertTrue("ACTIVE diagnosis must set hookActive", s.hookActive)
+        assertEquals("verified ROOT must diagnose ACTIVE under LSPOSED", HookStatus.ACTIVE, s.hookStatus)
+        assertTrue(s.hookActive)
         assertTrue(
-            "marker history must be visible, got: ${s.hookScopes}",
+            "marker scopes must be visible, got: ${s.hookScopes}",
             s.hookScopes.contains(HookMarker.SCOPE_SYSTEM_SERVER),
         )
-        assertFalse("NoOp placeholder is never writable, even with cached diagnosis", s.writeReady)
-        assertFalse("NoOp placeholder is never channelReady", s.channelReady)
+        assertFalse("NoOp placeholder is never writable, even with ACTIVE diagnosis", s.writeReady)
+        assertFalse(s.channelReady)
         assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
-        assertFalse("LSPOSED probes none, so no probe passes even with cache", s.anyProbePassed)
-        assertEquals("LSPOSED diagnosis must not run `su -c id -u`", 0, suFake.idUCalls)
-        assertEquals("LSPOSED diagnosis must not probe Shizuku", 0, shizukuFake.listUsersCalls)
-
-        // A re-probe must not start new `su -c` auth either, and must keep ACTIVE.
+        assertFalse("LSPOSED probes none", s.anyProbePassed)
+        assertEquals("LSPOSED must not run `su -c id -u`", idUBefore, suFake.idUCalls)
+        // Hook diagnosis never raises writeReady: locked above + recheck keeps it.
         vm.recheckPrivilege()
         await { !vm.state.value.loading }
         Thread.sleep(300)
         await { !vm.state.value.loading }
-        assertEquals("LSPOSED recheck must not run `su -c id -u`", 0, suFake.idUCalls)
         assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
         assertFalse(vm.state.value.writeReady)
+    }
+
+    // Phase A P2 (revocation): ROOT proven then auth revoked (rootOk true ->
+    // false) rewrites the SAME-instance entry to false on the next probe, so
+    // a later LSPOSED round is UNKNOWN (no stale ACTIVE). Models Shizuku
+    // binder dead/rebind the same way: a dead binding fails the next probe
+    // and disables that entry until a passing probe re-enables it.
+    @Test
+    fun explicitRoot_revoked_clearsEvidence_lsposedUnknown() {
+        val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
+        val suFake = FakeSu(rootOk = true)
+        suFake.markerContent = marker
+        val shizukuFake = FakeShizuku(shizukuOk = false)
+        val reuseFactory = { pref: ChannelPreference, suPresent: Boolean, shizukuAuth: Boolean, pkg: String ->
+            val channel = pref.resolveChannel(suPresent, shizukuAuth)
+            val gateway: CmdGateway = when (channel) {
+                ResolvedChannel.ROOT -> suFake
+                ResolvedChannel.SHIZUKU -> shizukuFake
+                else -> NoOpGateway()
+            }
+            ChannelAssembly(gateway, suFake, shizukuFake, channel)
+        }
+        val vm = makeAutoVm(
+            suFake = suFake,
+            shizukuFake = shizukuFake,
+            suPresent = true,
+            shizukuAuth = false,
+            initialChannel = ResolvedChannel.ROOT,
+            initialGateway = suFake,
+            preference = ChannelPreference.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = null,
+            assembleChannelFn = reuseFactory,
+        )
+        await { !vm.state.value.loading && vm.state.value.writeReady }
+        await { vm.state.value.hookStatus == HookStatus.ACTIVE }
+        val catBeforeRevoke = suFake.catCalls
+        assertTrue(catBeforeRevoke > 0)
+
+        // Revoke: next probe on the SAME instance fails and clears evidence.
+        suFake.rootOk = false
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && !vm.state.value.writeReady }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertFalse("revoked ROOT must not be writable", vm.state.value.writeReady)
+
+        vm.selectChannel(ChannelPreference.LSPOSED)
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.channel == ChannelPreference.LSPOSED
+        }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertTrue(
+            "revoked evidence must yield UNKNOWN, got: ${s.hookStatus}",
+            s.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
+                s.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+        )
+        assertFalse(s.writeReady)
+        assertFalse(s.channelReady)
+        assertEquals(
+            "revoked instance must not serve new `cat` for LSPOSED",
+            catBeforeRevoke,
+            suFake.catCalls,
+        )
     }
 
     // Phase C P2: LSPOSED zero-probe renders 未探測, never 未通過. probeScope

@@ -59,6 +59,43 @@ import kotlinx.coroutines.withContext
 // recreate, ViewModel retained) KEEPS the pending and the dialog re-shows
 // from state with no re-send. A ViewModel recreation (process death) starts
 // with pendingRemove == null (fail closed): the user must request again.
+// Phase A P2 fix (issue #25 review): instance-bound diagnostic evidence.
+//
+// The old boolean cache (lastVerifiedHasRoot/Shizuku) recorded only "a
+// channel once proved" and survived gateway rebuilds, so an LSPOSED round
+// could drive `cat` through a FRESH, never-verified su/Shizuku instance
+// (SuCmdGateway.run = `su -c cat` may pop an auth prompt on the new
+// instance). The evidence now binds to the verified instance + generation:
+// usable only when evidence.gateway === current su/shizukuGateway AND
+// evidence.generation == evidenceGeneration AND hasCapability true.
+//
+// - generation increments when swapToLocked installs DIFFERENT su/shizuku
+//   instances (production rebuilds fresh every time, so every production
+//   swap bumps; a test factory reusing the same fake keeps the generation,
+//   which exercises the match branch). swapToResolvedLocked reuses the same
+//   instances (AUTO degrade) and bumps as well so a stale pre-degrade entry
+//   can never leak across (probeChannels rewrites both entries right after
+//   with the new generation).
+// - explicit single-channel success updates ONLY its own entry with the
+//   CURRENT gateway (ROOT_ONLY -> su entry, SHIZUKU_ONLY -> shizuku entry;
+//   the other entry is left unknown, never cleared); failure writes
+//   hasCapability=false on the same instance. AUTO full probes rewrite both.
+// - LSPOSED probes none and writes nothing; its diagnosis uses ONLY matched
+//   evidence, otherwise UNKNOWN (never auto-triggers a fresh `su -c` probe:
+//   needing a new su must NOT pop auth, stay UNKNOWN until that instance is
+//   verified by an explicit/AUTO round).
+// - Shizuku binder dead/rebind: a dead UserService binding makes the next
+//   Shizuku probe (`pm list users` via ShizukuCmdGateway) fail (exit != 0),
+//   so hasShizuku=false rewrites shizukuEvidence.hasCapability=false on the
+//   SAME instance/same generation; diagnosis immediately stops using it. A
+//   successful rebind only re-enables diagnosis after the next passing probe
+//   rewrites true (fail closed, no optimistic reuse of a dead handle).
+// Diagnostic-only: never feeds routing/readiness (hook-neutral, #19).
+data class DiagnosticEvidence(
+    val gateway: CmdGateway? = null,
+    val hasCapability: Boolean = false,
+    val generation: Long = 0L,
+)
 // Single probe result reused by swap + probeChannels (P25 Item 3, issue #25):
 // hasRoot/hasShizuku reflect ONLY the probed subset: AUTO probes all
 // elevators, explicit probes only its own channel (ROOT -> su only,
@@ -366,21 +403,33 @@ class DualViewModel(
     // probe when preference==AUTO (see degradeAutoLocked); cleared on
     // explicit selection. Copied into UiState.degradeNote by probeChannels.
     private var autoDegradeNote: String = "",
-    // Phase A P2 regression fix: verified diagnostic capability cache.
-    // AUTO full probes (which probe all elevators) record the proven channels
-    // here; an explicit-LSPOSED round probes none, so its diagnosis filters
-    // hookDiagnosticGateways() by this cache instead of the current (empty)
-    // probe result -- restoring the pre-P25-Item-3 behavior where a true
-    // channel diagnosed the marker even under the NoOp selection, without
-    // re-introducing `su -c id -u` probes on the LSPOSED path (no new su auth
-    // prompt). Diagnostic-only: never feeds routing/readiness (hook-neutral,
-    // #19). Cold-start LSPOSED (empty cache) diagnoses via direct reads only,
-    // so UNKNOWN_NO_DIAGNOSTIC there is correct, not a bug. Mutable: updated
-    // on AUTO probes only (explicit single-channel probes are partial and
-    // LSPOSED probes none, so neither may wipe it); survives selectChannel
-    // swaps. Test seam: constructor injection allows manual cache setup.
-    private var lastVerifiedHasRoot: Boolean = false,
-    private var lastVerifiedHasShizuku: Boolean = false,
+    // Instance-bound diagnostic evidence (Phase A P2 fix, see
+    // DiagnosticEvidence header): su/shizuku each bind to the verified
+    // gateway instance + generation. Cold-start = empty (gateway null) so
+    // LSPOSED diagnoses via direct reads only (UNKNOWN_NO_DIAGNOSTIC there
+    // is correct). Survives swaps as stale (mismatched) entries -- never
+    // cleared eagerly; the identity/generation gate in probeChannels treats
+    // a rebuilt instance as UNKNOWN until that instance itself is verified.
+    private var suEvidence: DiagnosticEvidence = DiagnosticEvidence(),
+    private var shizukuEvidence: DiagnosticEvidence = DiagnosticEvidence(),
+    // Evidence generation: bumped when swapToLocked installs different
+    // su/shizuku instances (production rebuilds fresh every swap) and on
+    // every swapToResolvedLocked (AUTO degrade reuses instances but still
+    // bumps so a pre-degrade entry cannot leak; probeChannels rewrites both
+    // entries right after with the new generation). A test factory reusing
+    // the same fake keeps the generation, exercising the match branch.
+    private var evidenceGeneration: Long = 0L,
+    // Channel assembly seam: production passes real assembleChannel (fresh
+    // SuCmdGateway/ShizukuCmdGateway every swap); tests inject a fake
+    // factory returning countable CmdGateway fakes (same vs new instances
+    // per test) so selectChannel + rebuild runs for real instead of
+    // constructor-injecting booleans. Signature mirrors assembleChannel.
+    private val assembleChannelFn: (
+        ChannelPreference,
+        Boolean,
+        Boolean,
+        String,
+    ) -> ChannelAssembly = ::assembleChannel,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -388,10 +437,10 @@ class DualViewModel(
     // real-channel gateways INDEPENDENT of the selected write channel, so an
     // explicit-LSPosed (NoOp) selection still diagnoses through any
     // probe-verified ROOT/SHIZUKU channel; probeChannels further gates that
-    // list by hasRoot/hasShizuku for non-LSPOSED, and by the
-    // lastVerifiedHasRoot/Shizuku AUTO cache for LSPOSED (an unproven gateway
-    // is not a diagnostic path). Never throws by contract; probeChannels
-    // guards with try/catch regardless.
+    // list by hasRoot/hasShizuku for non-LSPOSED, and by the matched
+    // su/shizukuEvidence for LSPOSED (an unproven or rebuilt gateway is not
+    // a diagnostic path -- needs-new-su must NOT auto-trigger a probe).
+    // Never throws by contract; probeChannels guards with try/catch.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
     // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
@@ -1689,6 +1738,11 @@ class DualViewModel(
         repo = DualRepository(newGateway)
         gatewayPrivilege = newGateway.privilege
         currentChannel = desired
+        // Evidence generation bump (Phase A P2): same instances are reused
+        // here, but the resolved channel moved, so a pre-degrade entry must
+        // not leak across -- probeChannels rewrites both su/shizuku entries
+        // right after with this new generation (AUTO full probe).
+        evidenceGeneration++
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
         // 由使用者重新 request（與 swapToLocked 一致；confirm 仍有重驗雙保險）。
@@ -1751,11 +1805,18 @@ class DualViewModel(
         preference = pref
         currentChannel = asm.channel
         if (pref != ChannelPreference.AUTO) autoDegradeNote = ""
-        // Phase A P2: lastVerifiedHasRoot/Shizuku deliberately SURVIVES here
-        // (unlike autoDegradeNote): it records environment capability proven
-        // by the last AUTO full probe, so a later explicit-LSPOSED selection
-        // can still diagnose via those already-authorized channels without
-        // new probes.
+        // Phase A P2: instance-bound evidence deliberately SURVIVES here as
+        // STALE entries (unlike autoDegradeNote which clears on explicit):
+        // suEvidence/shizukuEvidence keep pointing at the OLD instances with
+        // the OLD generation, so the identity+generation gate below treats a
+        // rebuilt (fresh, never-verified) gateway as UNKNOWN until THAT
+        // instance itself passes a probe. A test factory reusing the same
+        // fake keeps identity+generation equal and exercises the match branch.
+        // Only bump when the su/shizuku instances actually changed (production
+        // always rebuilds fresh, so every production swap bumps).
+        if (suGateway !== oldSu || shizukuGateway !== oldShizuku) {
+            evidenceGeneration++
+        }
         // repo/gateway 已換，快照即失效，fail closed：舊 pending 的 dualId/
         // label 是換通道前的驗證結果，繼續保留會讓 confirm 誤判，必須清掉，
         // 由使用者重新 request。
@@ -1836,6 +1897,22 @@ class DualViewModel(
     // busy, the single exit update below clears it, the catch path clears it
     // too), and elevator probes run via onIo so a blocking gateway can never
     // stall the Main dispatcher heartbeat.
+    // Instance-bound evidence gate (Phase A P2): a diagnostic `cat` may run
+    // ONLY through the exact gateway instance that proved the capability in
+    // the same generation. A rebuilt (fresh, never-verified) su/shizukuGateway
+    // is naturally !== evidence.gateway (or older generation) and is excluded
+    // until THAT instance passes its own probe -- this closes path A where the
+    // old boolean cache drove `su -c cat` on a new instance (auth prompt).
+    private fun isSuEvidenceUsable(): Boolean =
+        suEvidence.hasCapability &&
+            suEvidence.gateway === suGateway &&
+            suEvidence.generation == evidenceGeneration
+
+    private fun isShizukuEvidenceUsable(): Boolean =
+        shizukuEvidence.hasCapability &&
+            shizukuEvidence.gateway === shizukuGateway &&
+            shizukuEvidence.generation == evidenceGeneration
+
     private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null) {
         _state.update { it.copy(loading = true) }
         try {
@@ -1844,15 +1921,27 @@ class DualViewModel(
             val probe = reusedProbe ?: probeOnce()
             val hasRoot = probe.hasRoot
             val hasShizuku = probe.hasShizuku
-            // Phase A P2 regression fix: record AUTO-verified capability for
-            // later LSPOSED diagnosis. AUTO probes all elevators, so its
-            // result is the diagnostic ground truth. Explicit rounds must NOT
-            // touch the cache: LSPOSED probes none (would wipe to false) and
-            // explicit single-channel probes are partial (would misrepresent
-            // the environment). Diagnostic-only: never feeds routing/readiness.
-            if (preference == ChannelPreference.AUTO) {
-                lastVerifiedHasRoot = hasRoot
-                lastVerifiedHasShizuku = hasShizuku
+            // Phase A P2: per-channel independent evidence (diagnostic-only,
+            // never feeds routing/readiness). AUTO full probes rewrite BOTH
+            // entries with the CURRENT gateways + generation; explicit
+            // single-channel rounds rewrite ONLY their own entry (the other
+            // stays unknown, never cleared) with the CURRENT gateway; LSPOSED
+            // probes none and writes nothing. Failure writes
+            // hasCapability=false on the same instance (so a Shizuku binder
+            // death, which fails the next `pm list users` probe, immediately
+            // disables that entry until a later passing probe re-enables it).
+            when (preference) {
+                ChannelPreference.AUTO -> {
+                    suEvidence = DiagnosticEvidence(suGateway, hasRoot, evidenceGeneration)
+                    shizukuEvidence = DiagnosticEvidence(shizukuGateway, hasShizuku, evidenceGeneration)
+                }
+                ChannelPreference.ROOT -> {
+                    suEvidence = DiagnosticEvidence(suGateway, hasRoot, evidenceGeneration)
+                }
+                ChannelPreference.SHIZUKU -> {
+                    shizukuEvidence = DiagnosticEvidence(shizukuGateway, hasShizuku, evidenceGeneration)
+                }
+                ChannelPreference.LSPOSED -> Unit
             }
             // P25: AUTO follows live probes, not the startup file heuristic.
             // Only the entry without a prior swap (init / selectChannel-AUTO)
@@ -1881,13 +1970,17 @@ class DualViewModel(
             // selection with an unproven/NoOp write channel -- and reads through
             // INDEPENDENT diagnostic paths: direct MarkerReads first, then `cat`
             // over probe-verified real gateways only (a declared-ROOT/SHELL
-            // gateway whose probe failed is not a usable path). Phase A P2 fix:
-            // LSPOSED probes none, so the current hasRoot/hasShizuku are always
-            // false here; filter by the AUTO-verified cache instead (no new
+            // gateway whose probe failed is not a usable path). LSPOSED probes
+            // none, so the current hasRoot/hasShizuku are always false here;
+            // filter by the matched instance-bound evidence instead (no new
             // `su -c id -u` probe, no new su auth prompt -- the `cat` itself
             // reuses already-authorized channels per the #27 contract).
-            // Cold-start LSPOSED (empty cache) yields empty usable, so diagnosis
-            // is direct-only and UNKNOWN_NO_DIAGNOSTIC there is correct.
+            // A rebuilt instance is naturally mismatched (identity/generation)
+            // and excluded until THAT instance is verified: needing a new su
+            // must NOT auto-trigger a probe here, stay UNKNOWN (+ comment in
+            // the UNKNOWN_NO_DIAGNOSTIC text). Cold-start LSPOSED (empty
+            // evidence) yields empty usable, so diagnosis is direct-only and
+            // UNKNOWN_NO_DIAGNOSTIC there is correct.
             // Diagnosis never feeds `ready`/`routed` above (hook-neutral) and
             // an unproven channel never executes anything except via a verified
             // diagnostic gateway. No true channel + unreadable direct reads maps
@@ -1906,10 +1999,17 @@ class DualViewModel(
                         if (e is CancellationException) throw e
                         emptyList()
                     }
+                    // LSPOSED: candidate must BE the currently-installed
+                    // gateway AND that gateway's evidence must be usable
+                    // (same instance, same generation, proven). This rejects
+                    // both stale pre-rebuild instances and fresh post-rebuild
+                    // instances that have not yet been verified (path A).
+                    val suUsable = isSuEvidenceUsable()
+                    val shizukuUsable = isShizukuEvidenceUsable()
                     val usable = when (preference) {
                         ChannelPreference.LSPOSED -> candidates.filter {
-                            (it.privilege == Privilege.ROOT && lastVerifiedHasRoot) ||
-                                (it.privilege == Privilege.SHELL && lastVerifiedHasShizuku)
+                            (it === suGateway && suUsable) ||
+                                (it === shizukuGateway && shizukuUsable)
                         }
                         else -> candidates.filter {
                             (it.privilege == Privilege.ROOT && hasRoot) ||
