@@ -47,10 +47,11 @@ import kotlinx.coroutines.withContext
 //   together and refuses a serial mismatch without uninstalling.
 // - profileLabel: display label of that target at request time (second
 //   "selection unchanged" signal besides the id).
-// - requestedAtMs: wall-clock time of the request (consent generation).
-//   confirmRemove rejects a stale consent older than REMOVE_CONFIRM_TTL_MS
-//   (fail closed, must request again); the serial/id/label re-check still
-//   guards a moved target regardless of age.
+// - requestedAtMs: clock reading at request time (consent generation,
+//   same clock source as the TTL check). confirmRemove rejects a stale
+//   consent older than REMOVE_CONFIRM_TTL_MS (fail closed, must request
+//   again); the serial/id/label re-check still guards a moved target
+//   regardless of age.
 //
 // Rotation policy (explicit choice, pinned by RemoveConfirmTest): pending
 // lives in UiState inside the ViewModel, so a config rotation (Activity
@@ -240,9 +241,10 @@ class DualViewModel(
     // regardless.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
-    // Wall-clock source for the remove-consent TTL (PR-33 R3, P2). Defaults
-    // to the real clock so production needs no wiring; tests inject a
-    // controllable fake. Constructor stays Android-free.
+    // Clock source for the remove-consent TTL (PR-33 R3, P2; S3 uses a
+    // monotonic clock in production). Defaults to the real wall clock so
+    // JVM tests need no Android runtime; tests inject a controllable fake.
+    // Constructor stays Android-free; the factory wires elapsedRealtime.
     private val nowMs: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
     companion object {

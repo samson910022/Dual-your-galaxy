@@ -39,6 +39,7 @@ import android.app.AlertDialog
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -571,6 +572,10 @@ private class DualViewModelFactory(
                 shizukuAuthCheck = { shizukuAuthorizedNow() },
                 activeGateway = asm.gateway,
                 currentChannel = asm.channel,
+                // PR-33 S3: TTL 用 monotonic（boot 起算），免 wall-clock 回撥延長
+                // 有效期；pending 不跨重啟（process death 清除），reboot 重置無影響。
+                // JVM 預設（currentTimeMillis）保留給測試注入。
+                nowMs = { SystemClock.elapsedRealtime() },
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
