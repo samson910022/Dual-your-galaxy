@@ -3994,13 +3994,28 @@ class DualViewModel(
             // Status-aware hook text (P1): unknown renders as 狀態未知, never
             // as 未偵測到 (the latter is reserved for positively-read absence).
             // PR-6 P4: 時間證據經 hookEvidence()+displayText 統一 (扁平欄位保留)。
-            // Phase B P0 (B1)：LSPOSED 零探測永不寫 diagnose（CHANNEL_ERROR 亦不寫），
-            // 保留 cur.diagnose；scope NONE=未探測，絕不報未通過。
+            // Phase B P0 (B1)：LSPOSED 零探測 (probeChannels) 永不寫 diagnose
+            //（含 PROBE_FAILED/CHANNEL_ERROR 亦不寫），保留 cur.diagnose；
+            // scope NONE=未探測，絕不報未通過。此規則僅限探測路徑。
+            // 階段F：使用者明確嘗試寫入 (clone/remove 經此共用入口，含
+            // confirmRemove) 而遭 NoOp/LSPOSED 政策拒絕時，若無 sticky
+            // 歷史（diagnose==null 且 lastOperation.phase != UNKNOWN），
+            // 記 CHANNEL_ERROR，techDetail 標註佔位/政策拒寫（明確不是
+            // probe failure）；已有診斷（含 sticky UNKNOWN）則保留原值。
             val hookDesc = cur.hookEvidence().displayText()
             _state.update {
+                val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
                     loading = false,
-                    diagnose = it.diagnose,
+                    diagnose = if (sticky) {
+                        it.diagnose
+                    } else {
+                        diagnoseEvent(
+                            DiagnoseCode.CHANNEL_ERROR,
+                            techDetail = "LSPOSED placeholder / writes unsupported " +
+                                "(explicit write refused by policy, not a probe failure)",
+                        )
+                    },
                     msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
                         "寫入已拒絕；Hook 狀態：$hookDesc；" +
                         "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",

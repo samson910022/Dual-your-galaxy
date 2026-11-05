@@ -225,6 +225,9 @@ internal fun HookEvidence.timeEvidenceText(): String {
 //   (refresh 首跳 Absent 但快照空)；
 // - "profiles snapshot channel failed: <detail>"
 //   (listCloned null 鑑別重查通道失敗)；
+// - "LSPOSED placeholder / writes unsupported ..."
+//   (使用者明確寫入遭 NoOp/LSPOSED 政策拒絕，非探測失敗；僅
+//   isWritable 寫入拒絕路徑使用，零探測 probeChannels 永不寫此碼)；
 // - gateway 原始 detail (ProfilesSnapshot.ChannelError / CloneOutcome.ChannelError /
 //   RemoveOutcome.ChannelError 經 toDiagnoseEvent 透傳，無統一前綴)。
 // 非 CHANNEL 桶辨析 (免誤歸)：

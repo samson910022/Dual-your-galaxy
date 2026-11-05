@@ -2,7 +2,8 @@
 //
 // Round 2 Phase A P1-3 回歸測試：正常 probe 失敗（非 throw）與 write-guard
 // 拒絕產生 diagnose；冷啟動無通道時匯出不得宣稱 OK；sticky VERIFY_UNKNOWN
-// 不被 probe 失敗洗掉。
+// 不被 probe 失敗洗掉。階段F 例外：LSPOSED 佔位寫入拒絕在無 sticky 歷史時
+// 記 CHANNEL_ERROR（政策拒寫，非探測失敗），零探測本身仍永不寫 E_PROBE。
 //
 // Harness 沿用 DiagnoseFreshnessPhase5Test。
 package com.galaxydual.plus
@@ -316,7 +317,9 @@ class ProbeDiagnoseTest {
             DiagnoseCode.CHANNEL_ERROR,
             s.diagnose?.code,
         )
-        // isWritable 同理：佔位拒絕寫入亦不得補寫 diagnose。
+        // isWritable：佔位拒絕寫入不得寫 PROBE_FAILED（零探測規則僅限
+        // 探測路徑）；階段F 起，使用者明確寫入遭政策拒絕時，若無 sticky
+        // 歷史則記 CHANNEL_ERROR（政策拒寫，非探測失敗），以免匯出宣稱 OK。
         vm.clone("com.example.chat")
         await { !vm.state.value.loading }
         assertNotEquals(
@@ -324,10 +327,14 @@ class ProbeDiagnoseTest {
             DiagnoseCode.PROBE_FAILED,
             vm.state.value.diagnose?.code,
         )
-        assertNotEquals(
-            "LSPOSED 寫入拒絕亦不得寫 CHANNEL_ERROR，got: ${vm.state.value.diagnose}",
+        assertEquals(
+            "LSPOSED 明確寫入遭政策拒絕須記 CHANNEL_ERROR（非 PROBE），got: ${vm.state.value.diagnose}",
             DiagnoseCode.CHANNEL_ERROR,
             vm.state.value.diagnose?.code,
+        )
+        assertTrue(
+            "CHANNEL_ERROR techDetail 須標註佔位/政策拒寫，got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("LSPOSED placeholder / writes unsupported"),
         )
         assertTrue(
             "LSPOSED 仍須顯示未探測，got: ${vm.state.value.probeResultMark()}",
@@ -450,5 +457,255 @@ class ProbeDiagnoseTest {
             vm.state.value.diagnose?.code,
         )
         assertEquals(false, vm.state.value.loading)
+    }
+
+    private fun makeLsposedNoopVm(clock: JumpClock): DualViewModel {
+        val suFake = FakeRepo(rootOk = true)
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = listOf(SuElevator(suFake), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.LSPOSED,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            suGateway = suFake,
+            shizukuGateway = NoOpGateway(),
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.LSPOSED_PLACEHOLDER,
+            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        return vm
+    }
+
+    // 階段F：冷啟動 LSPOSED/NoOp、無先行 refresh（diagnose==null）、探測完成後，
+    // 使用者明確 clone 遭政策拒絕 → 記 CHANNEL_ERROR（非 PROBE），匯出非 OK。
+    @Test
+    fun lsposedExplicitClone_refusedWritesChannelError() {
+        val clock = JumpClock()
+        val vm = makeLsposedNoopVm(clock)
+        // 探測完成：冷啟動 probe 跑完（loading 收斂），零探測 scope=NONE，
+        // diagnose 仍 null（探測路徑永不寫碼）。
+        await { !vm.state.value.loading && vm.state.value.probeScope == ProbeScope.NONE }
+        assertNull(
+            "前置：探測完成後 diagnose 須仍為 null，got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose,
+        )
+        assertNull("前置：冷啟動無操作歷史", vm.state.value.lastOperation)
+
+        vm.clone("com.example.chat")
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        // 拒寫：零安裝（cloned 未動、無 lastOperation），msg 明確拒寫。
+        assertTrue(
+            "拒寫後 cloned 須為空（零 install），got: ${vm.state.value.cloned}",
+            vm.state.value.cloned.isEmpty(),
+        )
+        assertNull(
+            "拒寫不得建立 lastOperation，got: ${vm.state.value.lastOperation}",
+            vm.state.value.lastOperation,
+        )
+        assertTrue(
+            "拒寫 msg 須明確拒寫，got: ${vm.state.value.msg}",
+            vm.state.value.msg.contains("寫入已拒絕"),
+        )
+        // 診斷碼真實性：CHANNEL_ERROR，非 PROBE；techDetail 明確佔位/政策拒寫。
+        assertEquals(
+            "明確寫入遭拒須記 CHANNEL_ERROR，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+        assertNotEquals(
+            "政策拒寫絕非探測失敗，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertTrue(
+            "techDetail 須標註佔位/政策拒寫，got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("LSPOSED placeholder / writes unsupported"),
+        )
+        assertTrue(
+            "techDetail 須明確非探測失敗，got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("not a probe failure"),
+        )
+        // 零探測顯示不變：仍顯示未探測。
+        assertTrue(
+            "拒寫後仍須顯示未探測，got: ${vm.state.value.probeResultMark()}",
+            vm.state.value.probeResultMark().contains("未探測"),
+        )
+        // 匯出一致性：非 OK，攜帶 CHANNEL 穩定碼（或佔位 techDetail）。
+        val export = buildDiagnosticExport(vm.state.value)
+        assertFalse(
+            "拒寫後匯出不得宣稱 OK，got: $export",
+            export.contains("OK（無異常）"),
+        )
+        assertTrue(
+            "拒寫後匯出須攜帶 CHANNEL 穩定碼，got: $export",
+            export.contains(DiagnoseCode.CHANNEL_ERROR.stableId),
+        )
+    }
+
+    // 階段F remove 路徑：requestRemove 遭政策拒絕 → diagnose 非 null、匯出非 OK。
+    @Test
+    fun lsposedExplicitRemove_refusedWritesChannelError() {
+        val clock = JumpClock()
+        val vm = makeLsposedNoopVm(clock)
+        await { !vm.state.value.loading && vm.state.value.probeScope == ProbeScope.NONE }
+        assertNull(
+            "前置：探測完成後 diagnose 須仍為 null，got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose,
+        )
+
+        vm.requestRemove("com.example.chat")
+        await { !vm.state.value.loading && vm.state.value.diagnose != null }
+
+        assertEquals(
+            "remove 拒寫須記 CHANNEL_ERROR（非 PROBE），got: ${vm.state.value.diagnose}",
+            DiagnoseCode.CHANNEL_ERROR,
+            vm.state.value.diagnose?.code,
+        )
+        assertNotEquals(
+            "remove 政策拒寫絕非探測失敗，got: ${vm.state.value.diagnose}",
+            DiagnoseCode.PROBE_FAILED,
+            vm.state.value.diagnose?.code,
+        )
+        assertTrue(
+            "remove 拒寫 techDetail 須標註佔位/政策拒寫，got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").contains("LSPOSED placeholder / writes unsupported"),
+        )
+        assertTrue(
+            "remove 拒寫後 pendingRemove 須為 null（未建確認），got: ${vm.state.value.pendingRemove}",
+            vm.state.value.pendingRemove == null,
+        )
+        val export = buildDiagnosticExport(vm.state.value)
+        assertFalse(
+            "remove 拒寫後匯出不得宣稱 OK，got: $export",
+            export.contains("OK（無異常）"),
+        )
+        assertTrue(
+            "remove 拒寫後匯出須攜帶 CHANNEL 穩定碼，got: $export",
+            export.contains(DiagnoseCode.CHANNEL_ERROR.stableId),
+        )
+    }
+
+    // 階段F review 補測：LSPOSED 已有 sticky 診斷時，佔位 clone 拒絕須保留原值，
+    // 不得被佔位 CHANNEL_ERROR 覆寫（同值，非新事件）。
+    @Test
+    fun lsposedCloneRefused_retainsStickyChannelError() {
+        val clock = JumpClock()
+        val vm = makeLsposedNoopVm(clock)
+        await { !vm.state.value.loading && vm.state.value.probeScope == ProbeScope.NONE }
+        assertNull(
+            "前置：探測完成後 diagnose 須仍為 null，got: ${vm.state.value.diagnose}",
+            vm.state.value.diagnose,
+        )
+
+        // 先製造既有診斷：NoOp repo 的 refresh 必走 ChannelError。
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        val base = vm.state.value.diagnose!!
+        // refresh 經 NoOp 快照失敗，detail 來自 gateway，不含佔位拒寫字串。
+        assertFalse(
+            "前置：refresh 預置的 CHANNEL_ERROR 不得已含佔位字串，got: ${base.techDetail}",
+            base.techDetail.contains("LSPOSED placeholder / writes unsupported"),
+        )
+
+        // 佔位 clone 遭政策拒絕：須保留原值（同值），msg 仍報拒寫。
+        vm.clone("com.example.chat")
+        await { !vm.state.value.loading && vm.state.value.msg.contains("寫入已拒絕") }
+
+        val after = vm.state.value.diagnose
+        assertNotNull("sticky 保留後 diagnose 不得為 null", after)
+        assertEquals(
+            "LSPOSED 拒寫須保留原診斷（同值），got: $after, want: $base",
+            base,
+            after,
+        )
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, after!!.code)
+        assertFalse(
+            "保留原值時不得被佔位 techDetail 覆寫，got: ${after.techDetail}",
+            after.techDetail.contains("LSPOSED placeholder / writes unsupported"),
+        )
+        assertTrue(
+            "拒寫後 cloned 須仍為空，got: ${vm.state.value.cloned}",
+            vm.state.value.cloned.isEmpty(),
+        )
+        assertNull(
+            "拒寫不得建立 lastOperation，got: ${vm.state.value.lastOperation}",
+            vm.state.value.lastOperation,
+        )
+        assertEquals("拒寫後 scope 仍為 NONE", ProbeScope.NONE, vm.state.value.probeScope)
+    }
+
+    // 階段F review 補測：lastOperation==UNKNOWN sticky 下，write-guard 拒寫
+    //（通道未就緒）須保留 VERIFY_UNKNOWN 與原 lastOperation，不寫新碼。
+    @Test
+    fun writeGuardRefused_retainsStickyVerifyUnknown() {
+        val gw = FakeRepo(failListPackages = true, rootOk = true)
+        val clock = JumpClock()
+        // 明選 ROOT（非 AUTO）：拒寫理由為「所選模式…寫入已禁用」，與輕探
+        // 失敗訊息不同，拒寫可觀測；AUTO 全失時兩者皆為 degradeNote 會無變化。
+        val vm = DualViewModel(
+            repo = DualRepository(gw),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(gw), ShizukuElevator(NoOpGateway())),
+            preference = ChannelPreference.ROOT,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = gw,
+            shizukuGateway = ShizukuCmdGateway("com.example.test"),
+            activeGateway = gw,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = { clock.now() },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { vm.state.value.channelReady }
+
+        // 既有 UNKNOWN 製造手法：clone 後 verify 查無 → UNKNOWN。
+        vm.clone("com.example.chat")
+        await { vm.state.value.lastOperation?.phase == OpPhase.UNKNOWN }
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+        val baseOp = vm.state.value.lastOperation!!
+        val baseDiag = vm.state.value.diagnose!!
+
+        // 通道全失，輕探保留 sticky（與既有用例同），再觸發 write-guard 拒寫。
+        gw.rootOk = false
+        gw.failListPackages = false
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading && !vm.state.value.channelReady }
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+
+        // 第二次 clone 走 !channelReady 拒寫分支（非 LSPOSED），須保留 sticky。
+        // 明選 ROOT 拒寫理由含「寫入已禁用」，與輕探失敗訊息可區分。
+        vm.clone("com.example.other")
+        await { !vm.state.value.loading && vm.state.value.msg.contains("寫入已禁用") }
+
+        assertTrue(
+            "write-guard 拒寫 msg 須明確拒寫，got: ${vm.state.value.msg}",
+            vm.state.value.msg.contains("寫入已禁用"),
+        )
+        assertEquals(
+            "write-guard 拒寫不得覆寫 sticky VERIFY_UNKNOWN",
+            DiagnoseCode.VERIFY_UNKNOWN,
+            vm.state.value.diagnose?.code,
+        )
+        assertEquals(
+            "write-guard 拒寫須保留原診斷同值，got: ${vm.state.value.diagnose}, want: $baseDiag",
+            baseDiag,
+            vm.state.value.diagnose,
+        )
+        assertEquals("拒寫不得改寫 lastOperation", baseOp.opId, vm.state.value.lastOperation?.opId)
+        assertEquals(baseOp.timeMs, vm.state.value.lastOperation?.timeMs)
+        assertEquals(OpPhase.UNKNOWN, vm.state.value.lastOperation?.phase)
     }
 }
