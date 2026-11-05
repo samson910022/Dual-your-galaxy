@@ -33,6 +33,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -629,5 +630,32 @@ class RemoveConfirmTest {
             vm.state.value.msg.contains("無需移除"),
         )
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+    }
+
+    // Cancel-during-confirm (B2): cancelRemove() interleaved while
+    // confirmRemove() is suspended on its first onIo must abort the confirm
+    // with zero uninstalls.
+    //
+    // 確定性原理：Unconfined 下 vm.confirmRemove() 同步執行到首個 onIo 即掛起
+    // （此時 confirm 已持 opMutex 停在 IO）；cancelRemove() 是同步的
+    // _state.update，不拿 mutex，故可在 confirm 的 IO 區間確定性交錯、清掉
+    // pending；confirm 的 post-IO 重驗（pendingRemove != cur）abort，只清
+    // loading（保留 cancel 訊息 / 新 request 的 pending）。
+    @Test
+    fun confirm_cancelDuringConfirm_abortsWithoutUninstall() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null }
+
+        vm.confirmRemove()
+        vm.cancelRemove()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.pendingRemove == null }
+
+        assertEquals("cancel-during-confirm must not uninstall", 0, gw.uninstallCalls)
+        assertNull(vm.state.value.pendingRemove)
+        assertFalse(vm.state.value.loading)
     }
 }

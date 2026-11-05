@@ -529,6 +529,8 @@ class DualRepository(
         if (expectedSerial == null || actualSerial != expectedSerial) {
             return RemoveOutcome.SerialMismatch(expectedSerial, actualSerial)
         }
+        // 第二道閘：縮小 serial-gate→uninstall 的 check-to-use 窗；仍非原子，UI 不可取消覆蓋使用者路徑。
+        if (!isStillValid()) return RemoveOutcome.Cancelled
         val res = try {
             gateway.run(uninstallCmd)
         } catch (e: Exception) {

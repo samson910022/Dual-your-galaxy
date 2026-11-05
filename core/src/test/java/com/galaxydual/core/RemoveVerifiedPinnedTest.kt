@@ -156,6 +156,33 @@ class RemoveVerifiedPinnedTest {
         )
     }
 
+    // Second gate: first isStillValid passes, second (after the serial
+    // gate, before uninstall) refuses -> Cancelled with zero uninstalls.
+    // No state flip: serial 15 stays pinned, so only the second gate can
+    // refuse. Proves the serial-gate -> uninstall check-to-use window is
+    // narrowed (still non-atomic; the user path is covered by the UI
+    // non-cancellable guard).
+    @Test
+    fun secondGate_cancelBetweenGates_returnsCancelled() {
+        val gateway = FakeGateway()
+        var calls = 0
+        val gate = { ++calls == 1 }
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected(
+                "com.example.chat",
+                95,
+                15,
+                isStillValid = gate,
+            )
+        }
+        assertTrue("expected Cancelled, got: $outcome", outcome is RemoveOutcome.Cancelled)
+        assertEquals(0, gateway.uninstallRuns)
+        assertTrue(
+            "no uninstall may run after second-gate cancel, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm uninstall") },
+        )
+    }
+
     // Wrong pinned serial is refused without running uninstall.
     @Test
     fun wrongExpectedSerial_refuses() {
