@@ -423,6 +423,26 @@ class DualViewModel(
     // entries right after with the new generation). A test factory reusing
     // the same fake keeps the generation, exercising the match branch.
     private var evidenceGeneration: Long = 0L,
+    // Retained diagnostic instances (Phase B1, issue #34 re-review #7 B1):
+    // swap drops the current su/shizukuGateway objects (production rebuilds
+    // fresh every swap), which orphans the instance-bound evidence above and
+    // used to leave LSPOSED (zero probe) with direct-reads only. To keep an
+    // already-authorized channel usable for DIAGNOSIS across a swap,
+    // swapToLocked/swapToResolvedLocked move each still-usable evidence
+    // instance here (su/shizuku one slot each) before the swap; probeChannels
+    // moves a newly verified current instance here on hasCapability=true and
+    // clears the slot on hasCapability=false (revocation fail-closed, so a
+    // later LSPOSED round never `cat`s through a revoked instance). A
+    // retained instance is DIAGNOSTIC-ONLY: it never feeds routing/readiness
+    // (writeReady stays false under LSPOSED), never authorizes a fresh
+    // instance (no old evidence is ever applied to a new gateway), and never
+    // triggers a fresh `su` probe (LSPOSED probeOnce stays empty). A retained
+    // instance may be expired (auth revoked while on LSPOSED, where no
+    // re-probe runs): a failing/denied retained `cat` then maps to UNKNOWN
+    // via diagnoseHookState (fail closed, no retry, no upgrade) -- never to
+    // a fake ACTIVE or INACTIVE.
+    private var retainedSuDiagnostic: CmdGateway? = null,
+    private var retainedShizukuDiagnostic: CmdGateway? = null,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
     // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
@@ -433,6 +453,10 @@ class DualViewModel(
     // list by hasRoot/hasShizuku for non-LSPOSED, and by the matched
     // su/shizukuEvidence for LSPOSED (an unproven or rebuilt gateway is not
     // a diagnostic path -- needs-new-su must NOT auto-trigger a probe).
+    // Phase B1 adds the retained verified instances for the LSPOSED branch
+    // below (the retained slot survives rebuilds that this list does not
+    // track). Non-LSPOSED keeps the existing current-only filter untouched,
+    // so an explicit empty list still means "no gateway diagnosis".
     // Never throws by contract; probeChannels guards with try/catch.
     private val hookDirectReads: () -> List<MarkerRead> = { defaultDirectMarkerReads() },
     private val hookDiagnosticGateways: () -> List<CmdGateway> = { listOf(suGateway, shizukuGateway) },
@@ -1731,6 +1755,13 @@ class DualViewModel(
         repo = DualRepository(newGateway)
         gatewayPrivilege = newGateway.privilege
         currentChannel = desired
+        // Phase B1: instances are reused here, so pin the still-usable ones
+        // as retained BEFORE the generation bump orphans the evidence below
+        // (probeChannels rewrites both entries right after on the
+        // recheck/reconnect path; the init path rewrites nothing after the
+        // bump, so without this pin the diagnosis would lose its gateway).
+        if (isSuEvidenceUsable()) setRetainedSuDiagnostic(suGateway)
+        if (isShizukuEvidenceUsable()) setRetainedShizukuDiagnostic(shizukuGateway)
         // Evidence generation bump (Phase A P2): same instances are reused
         // here, but the resolved channel moved, so a pre-degrade entry must
         // not leak across -- probeChannels rewrites both su/shizuku entries
@@ -1752,7 +1783,9 @@ class DualViewModel(
                 pmReadable = null,
             )
         }
-        if (old !== newGateway && old is ShizukuCmdGateway) {
+        if (old !== newGateway && old is ShizukuCmdGateway &&
+            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
+        ) {
             try {
                 old.close()
             } catch (e: Exception) {
@@ -1794,6 +1827,14 @@ class DualViewModel(
         }
         val asm = assembleChannelFn(pref, suPresent, shizukuAuth, appPackageName)
         val old = activeGateway
+        // Phase B1: retain still-usable diagnostic instances BEFORE the
+        // rebuild orphans them. Only an entry usable right now (same
+        // instance, same generation, proven) moves to the retained slot; a
+        // stale/failed entry is left to the existing close path below. The
+        // retained instance keeps serving diagnostic `cat` after the swap
+        // (LSPOSED included) without ever authorizing the fresh instance.
+        if (isSuEvidenceUsable()) setRetainedSuDiagnostic(oldSu)
+        if (isShizukuEvidenceUsable()) setRetainedShizukuDiagnostic(oldShizuku)
         activeGateway = asm.gateway
         repo = DualRepository(asm.gateway)
         gatewayPrivilege = asm.gateway.privilege
@@ -1831,7 +1872,9 @@ class DualViewModel(
                 pmReadable = null,
             )
         }
-        if (old !== activeGateway && old is ShizukuCmdGateway) {
+        if (old !== activeGateway && old is ShizukuCmdGateway &&
+            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
+        ) {
             try {
                 old.close()
             } catch (e: Exception) {
@@ -1844,7 +1887,8 @@ class DualViewModel(
         // dropped without closing). Never the newly installed instances;
         // double-close with the block above is safe (close is idempotent).
         if (oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
-            oldShizuku !== activeGateway && oldShizuku is ShizukuCmdGateway
+            oldShizuku !== activeGateway && oldShizuku is ShizukuCmdGateway &&
+            oldShizuku !== retainedSuDiagnostic && oldShizuku !== retainedShizukuDiagnostic
         ) {
             try {
                 oldShizuku.close()
@@ -1856,7 +1900,8 @@ class DualViewModel(
         // Defensive: suGateway is a SuCmdGateway by construction, but tests
         // may inject any CmdGateway -- never leak a Shizuku hiding there.
         if (oldSu !== suGateway && oldSu !== shizukuGateway &&
-            oldSu !== activeGateway && oldSu is ShizukuCmdGateway
+            oldSu !== activeGateway && oldSu is ShizukuCmdGateway &&
+            oldSu !== retainedSuDiagnostic && oldSu !== retainedShizukuDiagnostic
         ) {
             try {
                 oldSu.close()
@@ -1915,6 +1960,52 @@ class DualViewModel(
             shizukuEvidence.gateway === shizukuGateway &&
             shizukuEvidence.generation == evidenceGeneration
 
+    // Retains a verified diagnostic instance, closing the displaced slot
+    // occupant when nothing references it anymore. Same-instance (factory
+    // reuse) is a pure no-op: the guards inside closeRetainedIfDisplaced see
+    // the still-referenced instance and close nothing.
+    private suspend fun setRetainedSuDiagnostic(instance: CmdGateway) {
+        val old = retainedSuDiagnostic
+        if (old === instance) return
+        retainedSuDiagnostic = instance
+        closeRetainedIfDisplaced(old)
+    }
+
+    private suspend fun setRetainedShizukuDiagnostic(instance: CmdGateway) {
+        val old = retainedShizukuDiagnostic
+        if (old === instance) return
+        retainedShizukuDiagnostic = instance
+        closeRetainedIfDisplaced(old)
+    }
+
+    private suspend fun clearRetainedSuDiagnostic() {
+        val old = retainedSuDiagnostic
+        retainedSuDiagnostic = null
+        closeRetainedIfDisplaced(old)
+    }
+
+    private suspend fun clearRetainedShizukuDiagnostic() {
+        val old = retainedShizukuDiagnostic
+        retainedShizukuDiagnostic = null
+        closeRetainedIfDisplaced(old)
+    }
+
+    // Closes a displaced SHIZUKU diagnostic binding only when nothing
+    // references it anymore (mirrors the swap close policy: only
+    // ShizukuCmdGateway holds a cached binding, su gateways are stateless).
+    // Must run under opMutex.
+    private suspend fun closeRetainedIfDisplaced(gateway: CmdGateway?) {
+        if (gateway == null || gateway !is ShizukuCmdGateway) return
+        if (gateway === suGateway || gateway === shizukuGateway || gateway === activeGateway) return
+        if (gateway === retainedSuDiagnostic || gateway === retainedShizukuDiagnostic) return
+        try {
+            gateway.close()
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // Best effort: the stale binding dies with the process anyway.
+        }
+    }
+
     private suspend fun probeChannels(reusedProbe: ProbeOutcome? = null) {
         _state.update { it.copy(loading = true) }
         try {
@@ -1936,12 +2027,21 @@ class DualViewModel(
                 ChannelPreference.AUTO -> {
                     suEvidence = DiagnosticEvidence(suGateway, hasRoot, evidenceGeneration)
                     shizukuEvidence = DiagnosticEvidence(shizukuGateway, hasShizuku, evidenceGeneration)
+                    // Phase B1: a newly verified current instance becomes the
+                    // retained diagnostic instance (same instance -> no-op);
+                    // a failed channel clears its slot (revocation
+                    // fail-closed: a later LSPOSED round must not `cat`
+                    // through a revoked instance).
+                    if (hasRoot) setRetainedSuDiagnostic(suGateway) else clearRetainedSuDiagnostic()
+                    if (hasShizuku) setRetainedShizukuDiagnostic(shizukuGateway) else clearRetainedShizukuDiagnostic()
                 }
                 ChannelPreference.ROOT -> {
                     suEvidence = DiagnosticEvidence(suGateway, hasRoot, evidenceGeneration)
+                    if (hasRoot) setRetainedSuDiagnostic(suGateway) else clearRetainedSuDiagnostic()
                 }
                 ChannelPreference.SHIZUKU -> {
                     shizukuEvidence = DiagnosticEvidence(shizukuGateway, hasShizuku, evidenceGeneration)
+                    if (hasShizuku) setRetainedShizukuDiagnostic(shizukuGateway) else clearRetainedShizukuDiagnostic()
                 }
                 ChannelPreference.LSPOSED -> Unit
             }
@@ -1979,10 +2079,11 @@ class DualViewModel(
             // reuses already-authorized channels per the #27 contract).
             // A rebuilt instance is naturally mismatched (identity/generation)
             // and excluded until THAT instance is verified: needing a new su
-            // must NOT auto-trigger a probe here, stay UNKNOWN (+ comment in
+            // must NOT auto-trigger a probe here (a fresh instance with no
+            // usable evidence and no retained slot stays UNKNOWN, + comment in
             // the UNKNOWN_NO_DIAGNOSTIC text). Cold-start LSPOSED (empty
-            // evidence) yields empty usable, so diagnosis is direct-only and
-            // UNKNOWN_NO_DIAGNOSTIC there is correct.
+            // evidence, empty retained) yields empty usable, so diagnosis is
+            // direct-only and UNKNOWN_NO_DIAGNOSTIC there is correct.
             // Diagnosis never feeds `ready`/`routed` above (hook-neutral) and
             // an unproven channel never executes anything except via a verified
             // diagnostic gateway. No true channel + unreadable direct reads maps
@@ -2006,13 +2107,27 @@ class DualViewModel(
                     // (same instance, same generation, proven). This rejects
                     // both stale pre-rebuild instances and fresh post-rebuild
                     // instances that have not yet been verified (path A).
+                    // Phase B1 diagnostic lifecycle split: LSPOSED additionally
+                    // uses the retained verified instances (kept across the
+                    // swap, never a fresh probe; same-instance case deduped to
+                    // one `cat`), so LSPOSED still initiates zero probes.
+                    // Non-LSPOSED keeps the existing current-only filter
+                    // untouched: an explicit empty hookDiagnosticGateways list
+                    // still means "no gateway diagnosis" (and never executes
+                    // a gateway the caller did not list). A retained instance
+                    // may be expired (revoked while no probing channel was
+                    // selected): its failing `cat` maps to UNKNOWN below
+                    // (fail closed, no retry, no upgrade).
                     val suUsable = isSuEvidenceUsable()
                     val shizukuUsable = isShizukuEvidenceUsable()
                     val usable = when (preference) {
-                        ChannelPreference.LSPOSED -> candidates.filter {
+                        ChannelPreference.LSPOSED -> (candidates.filter {
                             (it === suGateway && suUsable) ||
                                 (it === shizukuGateway && shizukuUsable)
-                        }
+                        } + listOfNotNull(
+                            retainedSuDiagnostic,
+                            retainedShizukuDiagnostic,
+                        )).distinct()
                         else -> candidates.filter {
                             (it.privilege == Privilege.ROOT && hasRoot) ||
                                 (it.privilege == Privilege.SHELL && hasShizuku)

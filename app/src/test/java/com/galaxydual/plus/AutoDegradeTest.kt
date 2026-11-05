@@ -1033,16 +1033,16 @@ class AutoDegradeTest {
         assertTrue("placeholder repo is unreadable, got: \"${s.msg}\"", s.msg.contains("channel error"))
     }
 
-    // Phase A P2 (instance-bound evidence): AUTO -> LSPOSED via REAL
-    // selectChannel + rebuild (new instances). Old evidence binds to the OLD
-    // su instance, so after the rebuild the new instance is naturally
-    // mismatched (identity + generation) and excluded: LSPOSED stays
-    // UNKNOWN (direct denied, no usable gateway) and the new instance is
-    // never `cat`ed before verification (path A closed: no `su -c cat` auth
-    // on the fresh instance). Counts prove it: newSu.idU/cat stay 0 and the
-    // old instance is not reused after the swap.
+    // Phase B1 (diagnostic lifecycle split): AUTO -> LSPOSED via REAL
+    // selectChannel + rebuild (new instances, production behavior). The swap
+    // retains the still-usable OLD su instance as the diagnostic instance, so
+    // LSPOSED diagnoses ACTIVE through the retained `cat` while writeReady
+    // stays false (hook diagnosis never raises writeReady). The FRESH
+    // instance is never probed or `cat`ed (no new `su -c` auth risk on the
+    // new object); only the already-authorized retained instance serves
+    // diagnosis. A later LSPOSED recheck keeps ACTIVE with zero probes.
     @Test
-    fun autoToLsposed_rebuildInvalidatesOldEvidence_noCatOnNewInstance() {
+    fun autoToLsposed_rebuildRetainsVerifiedDiagnostic_activeWithoutProbingNewInstance() {
         val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
         val suOld = FakeSu(rootOk = true)
         suOld.markerContent = marker
@@ -1080,6 +1080,7 @@ class AutoDegradeTest {
         await { vm.state.value.hookStatus == HookStatus.ACTIVE }
         val oldCatBefore = suOld.catCalls
         assertTrue("precondition: old instance must have served `cat`", oldCatBefore > 0)
+        val oldIdUBefore = suOld.idUCalls
 
         vm.selectChannel(ChannelPreference.LSPOSED)
         await {
@@ -1093,28 +1094,48 @@ class AutoDegradeTest {
         val s = vm.state.value
         assertEquals(ChannelPreference.LSPOSED, s.channel)
         assertEquals(ResolvedChannel.LSPOSED_PLACEHOLDER, s.resolvedGateway)
-        // Old evidence (old instance) must not authorize the NEW instance:
-        // direct denied + no usable gateway -> UNKNOWN, never ACTIVE.
+        // The retained (already-authorized) instance keeps diagnosis alive:
+        // direct denied + no usable current gateway, yet ACTIVE via the
+        // retained `cat` -- never UNKNOWN, never a probe of the new instance.
+        assertEquals("retained instance must diagnose ACTIVE under LSPOSED", HookStatus.ACTIVE, s.hookStatus)
+        assertTrue(s.hookActive)
         assertTrue(
-            "rebuilt instance must be UNKNOWN until verified, got: ${s.hookStatus}",
-            s.hookStatus == HookStatus.UNKNOWN_NO_DIAGNOSTIC ||
-                s.hookStatus == HookStatus.UNKNOWN_UNREADABLE,
+            "marker scopes must be visible, got: ${s.hookScopes}",
+            s.hookScopes.contains(HookMarker.SCOPE_SYSTEM_SERVER),
         )
         assertFalse("NoOp placeholder is never writable", s.writeReady)
         assertFalse("NoOp placeholder is never channelReady", s.channelReady)
         assertFalse("LSPOSED probes none", s.anyProbePassed)
         val newSu = createdSu.first()
         assertEquals("new instance must never run `su -c id -u` before verification", 0, newSu.idUCalls)
-        assertEquals("new instance must never be `cat`ed before verification (path A)", 0, newSu.catCalls)
-        assertEquals("old instance must not be reused after rebuild", oldCatBefore, suOld.catCalls)
+        assertEquals("new instance must never be `cat`ed before verification", 0, newSu.catCalls)
+        assertTrue(
+            "diagnosis must ride the retained old instance, got ${suOld.catCalls} vs $oldCatBefore",
+            suOld.catCalls > oldCatBefore,
+        )
+        assertEquals("switch must not run new `su -c id -u` probes", oldIdUBefore, suOld.idUCalls)
+
+        // LSPOSED recheck: still ACTIVE, still zero probes (no `id -u`
+        // anywhere, no `cat` on the fresh instance).
+        val totalIdUBefore = suOld.idUCalls + newSu.idUCalls
+        vm.recheckPrivilege()
+        await { !vm.state.value.loading }
+        Thread.sleep(300)
+        await { !vm.state.value.loading }
+        assertEquals(HookStatus.ACTIVE, vm.state.value.hookStatus)
+        assertFalse(vm.state.value.writeReady)
+        assertEquals("LSPOSED recheck must run zero probes", totalIdUBefore, suOld.idUCalls + newSu.idUCalls)
+        assertEquals("fresh instance stays untouched across recheck", 0, newSu.idUCalls)
+        assertEquals("fresh instance stays un-`cat`ed across recheck", 0, newSu.catCalls)
     }
 
-    // Phase A P2 (match branch): explicit ROOT writes su evidence for the
-    // CURRENT instance via a real probe; switching to LSPOSED with the SAME
-    // instances (factory reuses fakes) keeps identity+generation equal, so
-    // LSPOSED diagnoses ACTIVE via that verified `cat` while writeReady stays
-    // false (hook diagnosis never raises writeReady). No new `id -u` runs on
-    // the LSPOSED path.
+    // Phase A P2 (match branch) + B1 (retained slot): explicit ROOT writes
+    // su evidence for the CURRENT instance via a real probe; switching to
+    // LSPOSED with the SAME instances (factory reuses fakes) keeps
+    // identity+generation equal, so LSPOSED diagnoses ACTIVE via that
+    // verified `cat` (current match and retained slot agree, deduped to one
+    // `cat`) while writeReady stays false (hook diagnosis never raises
+    // writeReady). No new `id -u` runs on the LSPOSED path.
     @Test
     fun explicitRootToLsposed_sameInstance_diagnosesActiveWithoutRaisingWriteReady() {
         val marker = HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L)
