@@ -885,12 +885,21 @@ class DualRepository(
      * ([expectedDualId], [expectedSerial]); this call snapshots, re-resolves
      * the verified id AND the serial-bound target, and refuses (fail closed,
      * zero installs) when either no longer matches the expectation:
-     * id mismatch (or an unresolvable id) maps to [CloneOutcome.NoDual] when
-     * nothing is confirmed, otherwise to [CloneOutcome.TargetMismatch];
+     * a confirmed Absent (clean identity channels agree no dual exists)
+     * maps to [CloneOutcome.NoDual]; an unconfirmable identity (failed or
+     * noisy identity channel, contradiction, or too-thin evidence) maps to
+     * [CloneOutcome.ChannelError] (never "no dual", never short-circuited);
+     * a confirmed id that disagrees with [expectedDualId] maps to
+     * [CloneOutcome.TargetMismatch];
      * serial mismatch -- including a null [expectedSerial] (the caller cannot
      * verify at all) or an unavailable live serial -- maps to
      * [CloneOutcome.TargetMismatch]. Only a full (id, serial) match runs the
      * original install + verify flow on [expectedDualId].
+     *
+     * PR-37 Phase C (review R4 #5): the id gate uses the typed identity
+     * ([resolveDualUserIdTyped]) instead of the legacy Int fetch, so Absent
+     * and Unknown no longer fold into one NoDual. Callers must not treat
+     * ChannelError here as "no dual" (batch counts it as unknown).
      *
      * Additive only: [cloneVerified] is untouched and keeps its exact
      * behavior; single callers keep using it.
@@ -903,17 +912,34 @@ class DualRepository(
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val verified = fetchVerifiedDualId()
-        if (verified < 0 || expectedDualId < 0) return CloneOutcome.NoDual
-        if (verified != expectedDualId) {
-            return CloneOutcome.TargetMismatch(
-                expectedId = expectedDualId,
-                actualId = verified,
-                expectedSerial = expectedSerial,
-                // Id gate fires before the serial re-fetch below, so the
-                // live serial is not yet known here (null, documented).
-                actualSerial = null,
-            )
+        // PR-37 Phase C (review R4 #5): typed identity separates a confirmed
+        // Absent (genuinely no dual: clean channels parsed to real user
+        // blocks on both sources yet claim no dual) from Unknown (the channel
+        // cannot decide right now: exit != 0, noisy error-semantic output,
+        // or a throw). Absent stays NoDual (M13 short-circuit unchanged);
+        // Unknown is ChannelError (fail closed, zero installs; the batch
+        // counts it as unknown, never "no dual"). The legacy Int fetch above
+        // folds both to -1 and must not be used here.
+        if (expectedDualId < 0) return CloneOutcome.NoDual
+        when (val idRes = resolveDualUserIdTyped()) {
+            is DualIdResolution.Absent -> return CloneOutcome.NoDual
+            is DualIdResolution.Unknown ->
+                return CloneOutcome.ChannelError(
+                    "verified dual id unknown" +
+                        (idRes.detail.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""),
+                )
+            is DualIdResolution.Confirmed -> {
+                if (idRes.userId != expectedDualId) {
+                    return CloneOutcome.TargetMismatch(
+                        expectedId = expectedDualId,
+                        actualId = idRes.userId,
+                        expectedSerial = expectedSerial,
+                        // Id gate fires before the serial re-fetch below, so the
+                        // live serial is not yet known here (null, documented).
+                        actualSerial = null,
+                    )
+                }
+            }
         }
         if (profiles.none { it.userId == expectedDualId }) return CloneOutcome.NoDual
         // Serial gate AFTER the id gate, BEFORE any install (mirrors

@@ -20,6 +20,16 @@ class CloneVerifiedExpectedTest {
         // no serial line (id confirms, serial does not -> SerialUnavailable).
         var omitSerial: Boolean = false,
         var listUsersExit: Int = 0,
+        // PR-37 Phase C (review R4 #5) hooks: identity-channel failure modes.
+        // verboseExit/dumpsysExit != 0 -> Unknown (command failure);
+        // verboseNoisy -> exit-0 plus an error-semantic body line -> Unknown;
+        // throwOnIdentity -> run() throws on the verbose channel -> Unknown;
+        // absentIdentity -> owner-only blocks on both channels -> Absent.
+        var verboseExit: Int = 0,
+        var dumpsysExit: Int = 0,
+        var verboseNoisy: Boolean = false,
+        var throwOnIdentity: Boolean = false,
+        var absentIdentity: Boolean = false,
         var installOut: String = "Package com.example.chat installed for user: 95",
         var installExit: Int = 0,
         var listPackagesOut: String = "package:com.example.chat\n",
@@ -28,8 +38,17 @@ class CloneVerifiedExpectedTest {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
 
-        private fun verboseOut(): String =
-            "Users:\n" +
+        private fun verboseOut(): String {
+            if (absentIdentity) {
+                return "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n"
+            }
+            // verboseNoisy keeps the confirming blocks but appends an
+            // error-semantic body line (exit stays 0): the typed gate must
+            // refuse (Unknown), never confirm from noisy evidence.
+            return "Users:\n" +
                 "  UserInfo{0:Owner:13} running:\n" +
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
@@ -38,9 +57,16 @@ class CloneVerifiedExpectedTest {
                 // serial line (id confirms, serial does not).
                 (if (omitSerial) "" else "    Serial: $serial\n") +
                 "    parentId=0\n" +
-                "    User type: android.os.usertype.profile.CLONE\n"
+                "    User type: android.os.usertype.profile.CLONE\n" +
+                (if (verboseNoisy) "Failure [cannot list users]\n" else "")
+        }
 
         private fun dumpsysOut(): String {
+            if (absentIdentity) {
+                return "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n"
+            }
             // omitSerial keeps the header + CLONE type but drops the serialNo
             // (id confirms, serial does not).
             val header95 = if (omitSerial) "  UserInfo{$dualId:DualApp:400}:\n"
@@ -64,10 +90,20 @@ class CloneVerifiedExpectedTest {
                 cmd == DualRepository.CMD_LIST_USERS ->
                     if (listUsersExit != 0) CmdResult(exit = listUsersExit, out = "", err = "denied")
                     else CmdResult(exit = 0, out = listUsersOut(), err = "")
-                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
-                    CmdResult(exit = 0, out = verboseOut(), err = "")
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                    if (throwOnIdentity) throw RuntimeException("boom identity")
+                    CmdResult(
+                        exit = verboseExit,
+                        out = verboseOut(),
+                        err = if (verboseExit != 0) "denied" else "",
+                    )
+                }
                 cmd == DualRepository.CMD_DUMPSYS_USER ->
-                    CmdResult(exit = 0, out = dumpsysOut(), err = "")
+                    CmdResult(
+                        exit = dumpsysExit,
+                        out = dumpsysOut(),
+                        err = if (dumpsysExit != 0) "denied" else "",
+                    )
                 cmd == DualRepository.CMD_GETPROP_DUAL ->
                     CmdResult(exit = 0, out = "$dualId\n", err = "")
                 cmd.startsWith("pm install-existing") ->
@@ -209,6 +245,86 @@ class CloneVerifiedExpectedTest {
         assertTrue("expected InvalidPackage, got: $outcome", outcome is CloneOutcome.InvalidPackage)
         assertTrue(
             "no install may run for an invalid package, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // PR-37 Phase C (review R4 #5): identity channel command failure
+    // (verbose exit != 0) is Unknown, not Absent -> ChannelError (never
+    // NoDual), zero installs.
+    @Test
+    fun identityExitFailure_returnsChannelErrorWithZeroInstall() {
+        val gateway = FakeGateway(verboseExit = 1)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        val detail = (outcome as CloneOutcome.ChannelError).detail
+        assertTrue(
+            "detail must name the unknown identity, got: $detail",
+            detail.contains("unknown", ignoreCase = true),
+        )
+        assertTrue(
+            "detail must never claim no dual, got: $detail",
+            !detail.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "no install may run on an unconfirmable identity, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // PR-37 Phase C (review R4 #5): error-semantic output at exit 0 (noisy
+    // channel) is Unknown, not Absent -> ChannelError, zero installs.
+    @Test
+    fun identityNoisyOutput_returnsChannelErrorWithZeroInstall() {
+        val gateway = FakeGateway(verboseNoisy = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        val detail = (outcome as CloneOutcome.ChannelError).detail
+        assertTrue(
+            "detail must name the unknown identity, got: $detail",
+            detail.contains("unknown", ignoreCase = true),
+        )
+        assertTrue(
+            "detail must never claim no dual, got: $detail",
+            !detail.contains("no dual", ignoreCase = true),
+        )
+        assertTrue(
+            "no install may run on noisy identity evidence, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // PR-37 Phase C (review R4 #5): throwing identity channel is Unknown ->
+    // ChannelError, zero installs.
+    @Test
+    fun identityThrow_returnsChannelErrorWithZeroInstall() {
+        val gateway = FakeGateway(throwOnIdentity = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        assertTrue(
+            "no install may run when the identity channel throws, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm install-existing") },
+        )
+    }
+
+    // PR-37 Phase C (review R4 #5): genuinely absent dual (clean channels,
+    // real user blocks on both sources, no clone claim) stays NoDual --
+    // the confirmed-absent basis for the M13 batch short-circuit.
+    @Test
+    fun absentIdentity_returnsNoDualWithZeroInstall() {
+        val gateway = FakeGateway(absentIdentity = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected NoDual, got: $outcome", outcome is CloneOutcome.NoDual)
+        assertTrue(
+            "no install may run without a dual target, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm install-existing") },
         )
     }
