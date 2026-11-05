@@ -48,16 +48,25 @@ enum class ProfileUserType {
 // Likewise `serial` is a distinct namespace from `userId` (serial != id is
 // normal); resolution keys on userId only and never equates the two, so a
 // reused userId with a new serial cannot be confused by construction.
+// Phase B policy (enforced in resolveDual, not in the parser): parentId
+// must be present on BOTH verbose channels, equal, and == 0 (missing ->
+// Unknown; conflict or non-zero -> Refused); serial conflicts (both
+// present and unequal) -> Refused, while a missing serial is tolerated and
+// still confirms (agreed serial recorded on Confirmed).
 data class ProfileIdentity(
     // Android user id, e.g. 0 for owner, 95 for a dual/clone profile.
     val userId: Int,
     // Platform serial number for the user, distinct from userId; null when
-    // the source block carries no serial line.
+    // the source block carries no serial line. Phase B: both channels
+    // present but unequal -> resolveDual Refused; either side missing is
+    // tolerated (still Confirmed with the deduplicated value or null).
     val serial: Int? = null,
     // CLONE only when an explicit type token says profile.CLONE; OTHER when
     // an explicit non-clone type is present; UNKNOWN when no type line.
     val userType: ProfileUserType = ProfileUserType.UNKNOWN,
     // Parent user id from parentId=/parent= lines; null when absent.
+    // Phase B: resolveDual requires it present on BOTH verbose channels,
+    // equal, and == 0 (missing -> Unknown; conflict or non-zero -> Refused).
     val parentId: Int? = null,
     // Which channel this claim was parsed from.
     val source: IdentitySource,
