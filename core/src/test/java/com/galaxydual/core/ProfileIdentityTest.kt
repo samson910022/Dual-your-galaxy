@@ -216,12 +216,13 @@ class ProfileIdentityTest {
         userType: ProfileUserType,
         source: IdentitySource,
         serial: Int? = null,
+        parentId: Int? = if (userId == 0) null else 0,
         label: String = "",
     ) = ProfileIdentity(
         userId = userId,
         serial = serial,
         userType = userType,
-        parentId = if (userId == 0) null else 0,
+        parentId = parentId,
         source = source,
         confidence = IdentityConfidence.MED,
         label = label,
@@ -234,7 +235,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
         )
         val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
-        assertEquals(DualResolution.Confirmed(95), res)
+        assertEquals(DualResolution.Confirmed(95, 15, 0), res)
         assertEquals(IdentityConfidence.HIGH, (res as DualResolution.Confirmed).confidence)
     }
 
@@ -244,7 +245,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
         )
-        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Confirmed(95, null, 0), SamsungProfileAdapter.resolveDual(candidates))
     }
 
     @Test
@@ -288,7 +289,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
             claim(95, ProfileUserType.UNKNOWN, IdentitySource.PROP),
         )
-        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(agree))
+        assertEquals(DualResolution.Confirmed(95, null, 0), SamsungProfileAdapter.resolveDual(agree))
         val disagree = listOf(
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
@@ -416,7 +417,7 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS),
             claim(95, ProfileUserType.OTHER, IdentitySource.PM_LIST),
         )
-        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(withPmOther))
+        assertEquals(DualResolution.Confirmed(95, null, 0), SamsungProfileAdapter.resolveDual(withPmOther))
     }
 
     @Test
@@ -555,6 +556,70 @@ class ProfileIdentityTest {
             claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
             claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
         )
-        assertEquals(DualResolution.Confirmed(95), SamsungProfileAdapter.resolveDual(candidates))
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    // ---- Phase B P1-2 parent gate + P1-3 serial gate (issue #21) ----
+    // Parent must be present on BOTH channels, equal, and == 0; serial
+    // conflicts refuse while a missing serial is tolerated.
+
+    @Test
+    fun resolveDual_parentConflictAcrossChannelsRefused() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 10),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates)
+        assertTrue(res is DualResolution.Refused)
+        assertTrue((res as DualResolution.Refused).reason.contains("conflicting parent"))
+    }
+
+    @Test
+    fun resolveDual_parentNonZeroOnBothChannelsRefused() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 10),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 10),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates)
+        assertTrue(res is DualResolution.Refused)
+        assertTrue((res as DualResolution.Refused).reason.contains("non-owner parent"))
+    }
+
+    @Test
+    fun resolveDual_parentMissingOnOneChannelIsUnknown() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = null),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    @Test
+    fun resolveDual_parentZeroOnBothChannelsConfirmed() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15, parentId = 0),
+        )
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
+    }
+
+    @Test
+    fun resolveDual_serialConflictRefused() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 99, parentId = 0),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates)
+        assertTrue(res is DualResolution.Refused)
+        assertTrue((res as DualResolution.Refused).reason.contains("conflicting serial"))
+    }
+
+    @Test
+    fun resolveDual_serialMissingOnOneChannelStillConfirmed() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15, parentId = 0),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = null, parentId = 0),
+        )
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates))
     }
 }

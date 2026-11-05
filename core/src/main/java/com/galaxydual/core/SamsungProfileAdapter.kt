@@ -9,7 +9,10 @@ sealed interface DualResolution {
     // All agreeing sources point at one non-owner id: safe to target.
     // `confidence` is always HIGH by construction (fixed getter, not a
     // constructor parameter, so an illegal confidence is unrepresentable).
-    data class Confirmed(val userId: Int) : DualResolution {
+    // Phase B (P1-2/P1-3): `serial`/`parentId` carry the cross-channel
+    // agreed values (null when the passing policy tolerates absence; parent
+    // is always 0 on the confirm path because non-zero never confirms).
+    data class Confirmed(val userId: Int, val serial: Int? = null, val parentId: Int? = null) : DualResolution {
         val confidence: IdentityConfidence get() = IdentityConfidence.HIGH
     }
 
@@ -164,10 +167,26 @@ object SamsungProfileAdapter {
     //   plus UNKNOWN on the other is Unknown, never Confirmed), and
     // - when a property id is known (explicit argument OR PROP-sourced
     //   candidates), it equals that same id (triple agreement).
+    // Phase B adds two gates after the id/type/property checks, before
+    // Confirmed (parent first, serial second; property-missing semantics
+    // and the header gate are unchanged):
+    // - parent: the id's parentId on BOTH verbose channels must be present,
+    //   equal, and == 0. Either side missing -> Unknown (insufficient
+    //   evidence); values differ -> Refused("conflicting parent ...");
+    //   equal but != 0 -> Refused("non-owner parent ... policy ...").
+    //   Only dual-channel-agreed parentId 0 passes (single-device S24
+    //   evidence parentId=0, issue #21; other models unverified -- a
+    //   non-zero parent fails closed to Unknown/Refused, never confirms).
+    // - serial: when BOTH channels carry a serial for the id and they
+    //   differ -> Refused("conflicting serial ..."). A missing serial on
+    //   either side is tolerated (verbose dumps do not always carry serial,
+    //   so absence must not regress availability); the agreed value is the
+    //   deduplicated single serial or null.
     // Everything else is Unknown (insufficient evidence) or Refused
-    // (contradiction/ambiguity/policy). NEVER label-based: .label and
-    // .serial are not read here at all (serial != userId is normal and a
-    // DUAL-containing label proves nothing).
+    // (contradiction/ambiguity/policy). NEVER label-based: .label is never
+    // read (a DUAL-containing label proves nothing); .serial is only a
+    // conflict signal (both present and unequal -> Refused) and is never
+    // the identity key (serial != userId is normal).
     //
     // @param candidates parsed claims from any sources (PROP entries act as
     //   property claims when present; PM_LIST/XML_DIAG entries never count
@@ -237,6 +256,47 @@ object SamsungProfileAdapter {
         val cloneSources = typed.filter { it.userId == id && it.userType == ProfileUserType.CLONE }.map { it.source }.toSet()
         val twoChannel = IdentitySource.USER_LIST_V in cloneSources && IdentitySource.DUMPSYS in cloneSources
         if (!twoChannel) return DualResolution.Unknown
-        return DualResolution.Confirmed(id)
+
+        // Phase B P1-2 parent gate (before serial): both verbose channels
+        // must state a parentId for this id, and they must agree on 0.
+        // Either side missing (no claim or null parentId) is insufficient
+        // evidence -> Unknown (fail closed); disagreement or a non-zero
+        // agreed parent is a policy refusal, never a target.
+        val verboseParents = typed.filter {
+            it.source == IdentitySource.USER_LIST_V && it.userId == id
+        }.map { it.parentId }.toSet()
+        val dumpsysParents = typed.filter {
+            it.source == IdentitySource.DUMPSYS && it.userId == id
+        }.map { it.parentId }.toSet()
+        if (verboseParents.isEmpty() || dumpsysParents.isEmpty()) return DualResolution.Unknown
+        if (verboseParents.any { it == null } || dumpsysParents.any { it == null }) {
+            return DualResolution.Unknown
+        }
+        val agreedParents = (verboseParents + dumpsysParents).filterNotNull().toSet()
+        if (agreedParents.size > 1) {
+            return DualResolution.Refused(
+                "conflicting parent for user $id: verbose=$verboseParents vs dumpsys=$dumpsysParents",
+            )
+        }
+        val agreedParent = agreedParents.single()
+        if (agreedParent != 0) {
+            return DualResolution.Refused(
+                "non-owner parent $agreedParent for user $id: policy requires parentId 0",
+            )
+        }
+
+        // Phase B P1-3 serial gate: conflict only when BOTH channels carry
+        // a serial and they disagree. A missing serial on either side is
+        // tolerated (S24 verbose evidence does not guarantee serial); the
+        // agreed value is the deduplicated single serial or null.
+        val serials = typed.filter {
+            it.userId == id && it.userType == ProfileUserType.CLONE
+        }.mapNotNull { it.serial }.toSet()
+        if (serials.size > 1) {
+            return DualResolution.Refused("conflicting serial for user $id: $serials")
+        }
+        val agreedSerial = serials.singleOrNull()
+
+        return DualResolution.Confirmed(id, agreedSerial, agreedParent)
     }
 }
