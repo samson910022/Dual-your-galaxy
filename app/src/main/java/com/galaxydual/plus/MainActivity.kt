@@ -748,8 +748,10 @@ class MainActivity : ComponentActivity() {
     private fun radioParams(): RadioGroup.LayoutParams =
         RadioGroup.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
-    // p28-1 訊息語意色（亮/暗 values 資源，白底/深底皆至少 4.5:1；完整主題為
-    // p28-3 範圍）。NONE 回預設文字色。實例方法：需 Context 解析夜間資源。
+    // p28-1 訊息語意色（亮/暗 values 資源；數值僅為對假設背景
+    // #FFFFFF/#121212 的數學檢查（目標 4.5:1），不聲稱實際主題對比。
+    // Manifest 未宣告 android:theme，實際 surface 未鎖定（完整主題為 p28-3 範圍）。
+    // NONE 回預設文字色。實例方法：需 Context 解析夜間資源。
     private fun msgColorFor(kind: MsgKind): Int = when (kind) {
         MsgKind.NONE -> defaultMsgColor
         MsgKind.INFO -> getColor(R.color.msg_info)
