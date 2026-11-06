@@ -55,6 +55,10 @@
     <string name="dialog_cancel">取消</string>
     <string name="remove_confirm_title">確認移除分身</string>
     <string name="remove_confirm_positive">確認移除</string>
+    <string name="remove_confirm_message">警告：將刪除該分身的使用者資料且無法復原；僅影響分身（user %3$s），不影響主 profile。\nPackage：%2$s\n已驗證目標：user %3$s，serial %5$s\n應用：%1$s\nProfile：%4$s  [truncated] 表示標籤已截斷。</string>
+    <string name="remove_confirm_view_labels">標籤詳情</string>
+    <string name="remove_confirm_labels">每個標籤最多顯示 256 個字元及 512 個顯示單位；[truncated] 表示已截斷；原文的 [ 會跳脫為 \\[。\n應用：%1$s\nProfile：%2$s</string>
+    <string name="remove_confirm_acknowledge">我已閱讀警告，並核對上方完整 package、user 和 serial。</string>
     <string name="shizuku_state_no_binder">Shizuku：binder 未連線（需安裝並啟動 Shizuku）</string>
     <string name="shizuku_state_ok">Shizuku：已連線・已授權</string>
     <string name="shizuku_state_unauth">Shizuku：已連線・未授權（請點下方授權）</string>

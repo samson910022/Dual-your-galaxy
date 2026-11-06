@@ -147,12 +147,15 @@ fun ProbeScope.displayLabel(): String = when (this) {
     ProbeScope.NONE -> "未探測"
 }
 
+private val removeGeneration = java.util.concurrent.atomic.AtomicLong()
+
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
     val dualSerial: Int,
     val profileLabel: String,
     val requestedAtMs: Long,
+    val generation: Long = removeGeneration.incrementAndGet(),
 )
 
 // PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
@@ -2367,8 +2370,13 @@ class DualViewModel(
     // leaves loading untouched so an in-flight confirm/refresh spinner is
     // never overwritten by the cancel.
     fun cancelRemove() {
+        _state.value.pendingRemove?.let { cancelRemove(it) }
+    }
+
+    fun cancelRemove(expected: PendingRemove) {
         _state.update { cur ->
             val pending = cur.pendingRemove ?: return@update cur
+            if (pending != expected) return@update cur
             cur.copy(
                 pendingRemove = null,
                 // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
@@ -2399,24 +2407,28 @@ class DualViewModel(
     // cloned, Unknown -> CHANNEL fail closed) -- only then runs
     // removeVerifiedExpected.
     fun confirmRemove() {
-        viewModelScope.launch {
-            val pendingAtCall = _state.value.pendingRemove
-            if (pendingAtCall == null) {
-                // 終態成功不被遲到/重複 confirm 覆寫（結果釘住）；其餘才報無待確認。
-                _state.update { cur ->
-                    if (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: ")) cur
-                    else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
-                }
-                return@launch
+        val pending = _state.value.pendingRemove
+        if (pending != null) confirmRemove(pending) else {
+            _state.update { cur ->
+                if (cur.pendingRemove != null || (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: "))) cur
+                else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
             }
+        }
+    }
+
+    fun confirmRemove(expected: PendingRemove) {
+        viewModelScope.launch {
+            val pendingAtCall = expected
+            if (_state.value.pendingRemove != pendingAtCall) return@launch
             // Write dedup 按世代 (PR-4 P23 stage 2, PR-33 R2 加 serial): key 綁定
-            // pending 世代 (pkg@dualId#serial#requestedAtMs)，避免 v1 卡鎖時 v2
+            // pending 世代 (pkg@dualId#serial#requestedAtMs#generation)，避免 v1 卡鎖時 v2
             // 合法確認被誤殺；a second concurrent confirm of the SAME
             // generation reports instead of queueing a second uninstall.
             val key = "remove:${pendingAtCall.pkg}@${pendingAtCall.dualId}" +
-                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}"
+                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}#${pendingAtCall.generation}"
             if (!inFlightWrites.add(key)) {
                 _state.update {
+                    if (it.pendingRemove != pendingAtCall) return@update it
                     it.copy(
                         // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
                         // sanitizeUserEcho (保原文、去換行，不 redact)；
@@ -2436,11 +2448,9 @@ class DualViewModel(
                     if (cur == null) return@withLock
                     // Full-equality guard (full-equality 含 pkg/timestamp，覆寫即拒):
                     // any overwrite means a newer request replaced ours. 舊 confirm
-                    // abort，保留新 pending，由使用者確認新目標：只清 loading，不動
-                    // pendingRemove 與 msg（保留新 request 的 pending 與「等待確認」訊息），
+                    // abort，保留新 pending 與所有狀態，由使用者確認新目標，
                     // 與 post-IO 一致（preserve 式）。
                     if (cur != pendingAtCall) {
-                        _state.update { it.copy(loading = false) }
                         return@withLock
                     }
                     if (!isWritable()) {

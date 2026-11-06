@@ -50,6 +50,10 @@
     <string name="dialog_cancel">Cancel</string>
     <string name="remove_confirm_title">Confirm clone removal</string>
     <string name="remove_confirm_positive">Remove</string>
+    <string name="remove_confirm_message">Warning: This will delete the clone’s user data and cannot be undone; only the clone (user %3$s) is affected, not the main profile.\nPackage: %2$s\nVerified target: user %3$s, serial %5$s\nApp: %1$s\nProfile: %4$s  [truncated] means the label was shortened.</string>
+    <string name="remove_confirm_view_labels">Label details</string>
+    <string name="remove_confirm_labels">Labels are limited to 256 characters and 512 display units each; [truncated] means shortened; a literal [ is escaped as \\[.\nApp: %1$s\nProfile: %2$s</string>
+    <string name="remove_confirm_acknowledge">I have read the warning and verified the full package, user and serial above.</string>
     <string name="shizuku_state_no_binder">Shizuku: binder not connected (install and start Shizuku first)</string>
     <string name="shizuku_state_ok">Shizuku: connected and authorized</string>
     <string name="shizuku_state_unauth">Shizuku: connected, not authorized (tap the permission button below)</string>
