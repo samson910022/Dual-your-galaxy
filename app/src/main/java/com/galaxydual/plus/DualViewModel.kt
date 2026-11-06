@@ -1170,16 +1170,14 @@ class DualViewModel(
                         // 語意仍為未知，不清空。
                         val nullSnap: ProfilesSnapshot? =
                             if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
-// Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
-                        // M2 pm 反證守衛一致性：null 路徑僅已確認-不同-id 觸發
-                        // drift，其餘（Absent/Unknown）同走 VERIFY_UNKNOWN，故傳
-                        // pmIds 無行為差；此處以重查快照（Loaded）為準、回退原快照。
+                        // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
+                        // 本路徑 Unknown/Absent 一律收斂 VERIFY_UNKNOWN（僅
+                        // 已確認-不同-id 觸發 drift；snapshot 通道失敗另走
+                        // CHANNEL_ERROR，不屬本收斂），故不傳 pm 快照作 pmIds
+                        // 否決；以重查快照（Loaded）為準、回退原快照。
                         val nullVerified: DualTargetResolution? =
                             if (groundTruth == null) {
-                                val pmIds =
-                                    ((nullSnap as? ProfilesSnapshot.Loaded)?.profiles ?: profiles)
-                                        .map { it.userId }.toSet()
-                                onIo { repo.resolveDualTargetTyped(pmIds = pmIds) }
+                                onIo { repo.resolveDualTargetTyped(pmIds = null) }
                             } else {
                                 null
                             }
@@ -3701,8 +3699,9 @@ class DualViewModel(
                         // PR-37 P3 Phase A #3：serial 不可用即無完全體 pin，
                         // 整批拒絕、零裝置寫入（fail closed）；舊資料不得殘留
                         // FRESH（FRESH 即降 STALE 待重查，保留原 target/
-                        // queryTime 供追溯）；diagnose/msgKind 皆走 CHANNEL
-                        //（身份未完全驗證，非 NO_DUAL 語意）。
+                        // queryTime 供追溯）；與 request SerialUnavailable 口徑
+                        // 一致走 VERIFY_MISMATCH + INVALID（身份不可驗證，
+                        // 非通道錯誤亦非 NO_DUAL）。
                         val nowSerialBad = nowWallMs()
                         _state.update { cur ->
                             val degraded =
@@ -3719,11 +3718,11 @@ class DualViewModel(
                                 loading = false,
                                 inventory = degraded,
                                 diagnose = diagnoseEvent(
-                                    DiagnoseCode.CHANNEL_ERROR,
+                                    DiagnoseCode.VERIFY_MISMATCH,
                                     techDetail = "serial unavailable for verified target",
                                 ),
                                 msg = "無法驗證分身身分（serial 缺失），請重試",
-                                msgKind = MsgKind.CHANNEL,
+                                msgKind = MsgKind.INVALID,
                             )
                         }
                         return@withLock
