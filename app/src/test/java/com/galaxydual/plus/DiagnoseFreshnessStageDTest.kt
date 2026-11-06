@@ -183,6 +183,62 @@ class DiagnoseFreshnessStageDTest {
         assertTrue("export must carry ip marker, got: $text", text.contains("<ip>"))
     }
 
+    // O：未壓縮 IPv4-embedded IPv6 須整段遮蔽 (無 `::`，恰 6 群+IPv4 尾的分支出現在
+    // 純 IPv4 與一般冒號分支之前；否則含字母分支在 `.` 止吃掉 `0:…:ffff:192` 殘留 `<ip>.168.1.25`)。
+    // 只查全址不在輸出中不足以排除後綴洩漏：舊實作全址字串已不在輸出中，仍洩漏 `.168.1.25`
+    // 後綴，故須另斷言不含 `.168.1.25` 尾。
+    @Test
+    fun o_uncompressedEmbeddedIpv6_maskedWhole() {
+        val raws = listOf(
+            "0:0:0:0:0:ffff:192.168.1.25",
+            "0:0:0:0:0:FFFF:192.168.1.25",
+            "2001:db8:0:0:0:ffff:192.168.1.25",
+        )
+        for (raw in raws) {
+            assertEquals("uncompressed embedded must mask whole: $raw", "<ip>", redactIp(raw))
+            assertEquals("pii pipeline must mask whole: $raw", "<ip>", redactPii(raw))
+            val framed = redactIp("addr $raw end")
+            assertEquals("framed must mask whole: $raw", "addr <ip> end", framed)
+            assertFalse("must not leak ipv4 tail, got: $framed", framed.contains(".168.1.25"))
+            val viaPii = redactPii("addr $raw end")
+            assertFalse("pii must not leak ipv4 tail, got: $viaPii", viaPii.contains(".168.1.25"))
+        }
+        // 既有全保留：embedded 含`::`/NAT64/壓縮/完整8段/含字母仍遮；短冒號/版本/數字仍原樣。
+        assertEquals("<ip>", redactIp("::ffff:192.168.1.25"))
+        assertEquals("<ip>", redactIp("::192.168.1.25"))
+        assertEquals("<ip>", redactIp("64:ff9b::192.168.1.25"))
+        assertEquals("loop <ip> end", redactIp("loop ::1 end"))
+        assertEquals("addr <ip> end", redactIp("addr 2001:db8::1 end"))
+        assertEquals("<ip>", redactIp("2001:0:0:0:0:0:0:1"))
+        assertEquals("<ip>", redactIp("1:2:3:4:5:6:7:8"))
+        assertEquals("addr <ip> end", redactIp("addr ab:cd:ef end"))
+        assertEquals("12:34:56", redactIp("12:34:56"))
+        assertEquals("12:34", redactIp("12:34"))
+        assertEquals("v1.2.3", redactIp("v1.2.3"))
+        assertEquals("user 95", redactIp("user 95"))
+        assertEquals("ip <ip> port 5555", redactIp("ip 192.168.0.5 port 5555"))
+    }
+
+    // O 匯出端到端：含未壓縮 embedded 的 techDetail 不洩 raw。
+    // 只查全址不在輸出中不足以排除後綴洩漏：另斷言不含 `.168.1.25` 尾。
+    @Test
+    fun o_export_uncompressedEmbeddedIpv6Tech_noRawLeak() {
+        val raws = listOf(
+            "0:0:0:0:0:ffff:192.168.1.25",
+            "0:0:0:0:0:FFFF:192.168.1.25",
+            "2001:db8:0:0:0:ffff:192.168.1.25",
+        )
+        for (raw in raws) {
+            val state = UiState(
+                diagnose = diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = "ip $raw port 5555"),
+            )
+            val text = buildDiagnosticExport(state)
+            assertFalse("export must not leak raw uncompressed embedded, got: $text", text.contains(raw))
+            assertFalse("export must not leak ipv4 tail, got: $text", text.contains(".168.1.25"))
+            assertTrue("export must carry ip marker, got: $text", text.contains("<ip>"))
+        }
+    }
+
     // D3 匯出 IPv4 不洩 raw。
     @Test
     fun d3_export_ipTech_noRawLeak() {
