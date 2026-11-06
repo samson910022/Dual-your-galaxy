@@ -11,6 +11,7 @@ package com.galaxydual.plus
 
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
+import androidx.test.espresso.Espresso
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
@@ -74,6 +75,7 @@ class BackgroundReturnTest {
     fun activity_backgroundReturn_renders() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withText("Clone")).check(matches(isDisplayed()))
+            Espresso.onIdle()
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
             onView(withText("Clone")).check(matches(isDisplayed()))

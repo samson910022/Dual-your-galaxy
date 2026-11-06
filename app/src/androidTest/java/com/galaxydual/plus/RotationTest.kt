@@ -11,12 +11,16 @@
 package com.galaxydual.plus
 
 import androidx.test.core.app.ActivityScenario
+import androidx.test.espresso.Espresso
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.replaceText
 import androidx.test.espresso.assertion.ViewAssertions.matches
+import android.widget.EditText
+import androidx.test.espresso.matcher.ViewMatchers.isAssignableFrom
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.withHint
 import androidx.test.espresso.matcher.ViewMatchers.withText
+import org.hamcrest.Matchers.allOf
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -109,8 +113,10 @@ class RotationTest {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
             onView(withHint("搜尋應用名稱 / 包名")).perform(replaceText("chat"))
+            Espresso.onIdle()
             scenario.recreate()
             // retained ViewModel 回填：旋轉後同一 query 仍顯示。
+            onView(allOf(isAssignableFrom(EditText::class.java), withText("chat"))).check(matches(isDisplayed()))
             onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
             onView(withText("Clone")).check(matches(isDisplayed()))
             onView(withText("Remove")).check(matches(isDisplayed()))
