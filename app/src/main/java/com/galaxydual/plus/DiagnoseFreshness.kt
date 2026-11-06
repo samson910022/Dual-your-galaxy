@@ -380,11 +380,13 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 //   (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
 // - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>) + IPv6 五分支
 //   (順序 embedded 含`::`優先 → 未壓縮 embedded → IPv4 → 壓縮`::` → 完整8段 → 含字母；JVM java.util.regex 合法)：
-//   embedded [0-9A-Fa-f:.]*::(?i:ffff:)?(?:\d{1,3}\.){3}\d{1,3} 須置最前——否則純 IPv4
+//   embedded [0-9A-Fa-f:.]*::(?:[0-9A-Fa-f]{1,4}:){0,6}(?:\d{1,3}\.){3}\d{1,3} 須置最前——否則純 IPv4
 //   分支先吃掉尾段留下 `::ffff:<ip>` (或壓縮分支在 `.` 止殘留 `<ip>.168.1.25`)；
 //   覆蓋 ::ffff:192.168.1.25/::192.168.1.25/2001:db8::ffff:192.168.1.25
-//   (::FFFF: 大寫經 (?i:ffff:)? 整段吞入；其餘十六進 [0-9A-Fa-f] 已大小寫無關)
-//   (前綴+`::`+可選`ffff:`+IPv4)；未壓縮 embedded (?:[0-9A-Fa-f]{1,4}:){6}(?:\d{1,3}\.){3}\d{1,3}
+//   /::ffff:0:192.168.1.25/2001:db8::abcd:192.168.1.25/2001:db8::1:2:192.168.1.25
+//   (前綴+`::`+0–6 個 hex 群+IPv4；舊 `(?i:ffff:)?` 已併入 middle 通式——ffff/FFFF 僅為
+//   middle 的一例 ([0-9A-Fa-f] 已大小寫無關)，故刪除原子串不另保留；middle 含 ffff/0/abcd/1:2)；
+//   總群組數有界 (middle {0,6} 每群 {1,4}，前綴短字串) 防回溯；未壓縮 embedded (?:[0-9A-Fa-f]{1,4}:){6}(?:\d{1,3}\.){3}\d{1,3}
 //   置於純 IPv4 與一般冒號分支之前——覆蓋 0:0:0:0:0:ffff:192.168.1.25/
 //   2001:db8:0:0:0:ffff:192.168.1.25 (無 `::`，恰 6 個冒號分隔群+IPv4 尾；否則含字母分支
 //   先在 `.` 止吃掉 `0:…:ffff:192` 殘留 `<ip>.168.1.25`，純 IPv4 分支亦先吃尾段)；
@@ -401,7 +403,7 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 // 無自動上傳 (本模組無網路呼叫)。
 private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
 private val EMAIL_TOKEN = Regex("[\\w.+-]+@[\\w.-]+")
-private val IP_TOKEN = Regex("[0-9A-Fa-f:.]*::(?i:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){6}(?:\\d{1,3}\\.){3}\\d{1,3}|(?:\\d{1,3}\\.){3}\\d{1,3}|(?=[0-9A-Fa-f:.]*::)(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?=[0-9A-Fa-f:.]*[A-Fa-f])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
+private val IP_TOKEN = Regex("[0-9A-Fa-f:.]*::(?:[0-9A-Fa-f]{1,4}:){0,6}(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9A-Fa-f]{1,4}:){6}(?:\\d{1,3}\\.){3}\\d{1,3}|(?:\\d{1,3}\\.){3}\\d{1,3}|(?=[0-9A-Fa-f:.]*::)(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?=[0-9A-Fa-f:.]*[A-Fa-f])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
 
 internal fun redactEmail(text: String): String = EMAIL_TOKEN.replace(text, "<email>")
 
