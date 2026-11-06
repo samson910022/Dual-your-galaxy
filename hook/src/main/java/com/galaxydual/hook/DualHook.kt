@@ -196,40 +196,17 @@ class DualHook : XposedModule() {
     // info we can only deoptimize the hooked callee itself (best-effort);
     // callers that already inlined it are NOT touched, so a short method
     // inlined before this runs may still bypass the hook. The anti-inline
-    // effect is unverified on-device (no Samsung test unit); the return value
-    // is logged so a no-op is visible instead of silently swallowed.
-    private fun hookWithDeoptimize(method: Method, hookId: String): Boolean {
-        try {
-            try {
-                val deoptimized = deoptimize(method)
-                if (deoptimized) {
-                    logi("deoptimized ${method.declaringClass.name}#${method.name}")
-                } else {
-                    logi(
-                        "deoptimize no-op ${method.declaringClass.name}#${method.name} " +
-                            "(already interpreted or unsupported; hook proceeds, effect unverified)",
-                    )
-                }
-            } catch (t: Throwable) {
-                // Non-fatal: hooking still works when the target is not inlined.
-                logi(
-                    "deoptimize failed ${method.declaringClass.name}#${method.name}: " +
-                        "${t.message}; hook proceeds, effect unverified",
-                )
-            }
-            hook(method)
+    // effect is unverified on-device; the return value is logged without
+    // inferring why the framework returned it.
+    private fun hookWithDeoptimize(method: Method, hookId: String): Boolean =
+        HookInstaller.install(method, hookId, ::deoptimize, { target, id ->
+            hook(target)
                 // PROTECTIVE placeholder: hooker bugs are logged and skipped
                 // instead of crashing system_server / daagent.
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                .setId(hookId)
+                .setId(id)
                 .intercept { chain -> interceptWhitelistCall(chain) }
-            logi("hooked ${method.declaringClass.name}#${method.name}")
-            return true
-        } catch (t: Throwable) {
-            logi("hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
-            return false
-        }
-    }
+        }, ::logi)
 
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown signatures
