@@ -1666,7 +1666,7 @@ class MainActivity : ComponentActivity() {
         // (zero device writes) without changing production defaults. Null in
         // production.
         @Volatile
-        var testViewModel: DualViewModel? = null
+        internal var testViewModel: DualViewModel? = null
 
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
