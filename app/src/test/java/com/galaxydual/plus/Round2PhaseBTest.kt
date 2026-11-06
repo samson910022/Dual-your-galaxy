@@ -1090,12 +1090,13 @@ class Round2PhaseBTest {
         assertTrue(vm.state.value.cloned.contains("com.example.chat"))
     }
 
-    // ---- 階段K K2：launch 預取 (opMutex 外層等待) 取消窗口不得殘 loading ----
+    // ---- 階段K K2 + 階段L：launch 預取 (opMutex 外層等待) 取消不得搶清 holder 的 busy ----
     // clone 持有 mutex 阻塞於 installGate 時，refresh waiter 在外層等待被取消：
-    // CE 在進入 refreshLocked 體前拋出，內層清位覆蓋不到；外層補清 loading。
-    // 沿 b3 手法 (gate 阻塞 mutex + cancel + 斷言 loading=false)。
+    // CE 在進入 refreshLocked 體前拋出；階段L sibling-check：holder 仍 active 須維持
+    // busy（loading==true，UI 續轉 spinner/按鈕禁用），不得清為 false；clone 放行完成後才 false。
+    // 沿 b3 手法 (gate 阻塞 mutex + cancel)，斷言翻轉為維持 busy。
     @Test
-    fun k2_cancelledMutexWaiter_clearsLoading() {
+    fun k2_cancelledMutexWaiter_preservesBusy() {
         val suGw = FakeRepo()
         val shGw = FakeRepo()
         val vm = makeVm(suGw, shGw, JumpClock())
@@ -1116,13 +1117,138 @@ class Round2PhaseBTest {
         val waiter = (scopeJob.children.toList() - before).firstOrNull { it.isActive }
         assertTrue("refresh must be waiting on opMutex while clone holds it", waiter != null)
 
-        // 取消 waiter：即使 gate 仍阻塞，loading 須即清。
+        // 取消 waiter：holder 仍持 mutex 阻塞於 gate，busy 所有權歸 holder，須維持 true。
         waiter!!.cancel()
         await { waiter.isCompleted }
-        await { !vm.state.value.loading }
-        assertEquals(
-            "cancelled pre-acquire waiter must clear loading, got ${vm.state.value.loading}",
-            false,
+        assertTrue(
+            "cancelled waiter must preserve busy while clone holds opMutex, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+        // 穩定窗口採樣：取消後 gate 仍阻塞期間不得閃斷為 false（UI 續禁用）。
+        Thread.sleep(100)
+        assertTrue(
+            "busy must hold while clone gate still blocked, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+        assertTrue(
+            "clone holder must still own opMutex",
+            scopeJob.children.any { it.isActive },
+        )
+
+        suGw.installGate?.complete(Unit)
+        suGw.installGate = null
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- 階段L：recheck waiter 被取消時 holder 續持 busy ----
+    @Test
+    fun l_cancelledRecheckWaiter_preservesBusy() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        suGw.installCalls = 0
+        suGw.installGate = CompletableDeferred()
+
+        vm.clone("com.example.chat")
+        await { suGw.installCalls >= 1 }
+        await { vm.state.value.loading }
+
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val before = scopeJob.children.toList()
+        vm.recheckPrivilege()
+        await { (scopeJob.children.toList() - before).any { it.isActive } }
+        val waiter = (scopeJob.children.toList() - before).firstOrNull { it.isActive }
+        assertTrue("recheck must be waiting on opMutex while clone holds it", waiter != null)
+
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+        assertTrue(
+            "cancelled recheck waiter must preserve busy, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+        Thread.sleep(100)
+        assertTrue(
+            "busy must hold while clone gate still blocked, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+
+        suGw.installGate?.complete(Unit)
+        suGw.installGate = null
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- 階段L：reconnect waiter 被取消時 holder 續持 busy ----
+    @Test
+    fun l_cancelledReconnectWaiter_preservesBusy() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        suGw.installCalls = 0
+        suGw.installGate = CompletableDeferred()
+
+        vm.clone("com.example.chat")
+        await { suGw.installCalls >= 1 }
+        await { vm.state.value.loading }
+
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val before = scopeJob.children.toList()
+        vm.reconnectAndRefresh()
+        await { (scopeJob.children.toList() - before).any { it.isActive } }
+        val waiter = (scopeJob.children.toList() - before).firstOrNull { it.isActive }
+        assertTrue("reconnect must be waiting on opMutex while clone holds it", waiter != null)
+
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+        assertTrue(
+            "cancelled reconnect waiter must preserve busy, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+        Thread.sleep(100)
+        assertTrue(
+            "busy must hold while clone gate still blocked, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+
+        suGw.installGate?.complete(Unit)
+        suGw.installGate = null
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        assertEquals(false, vm.state.value.loading)
+    }
+
+    // ---- 階段L：foreground waiter 被取消時 holder 續持 busy ----
+    @Test
+    fun l_cancelledForegroundWaiter_preservesBusy() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        suGw.installCalls = 0
+        suGw.installGate = CompletableDeferred()
+
+        vm.clone("com.example.chat")
+        await { suGw.installCalls >= 1 }
+        await { vm.state.value.loading }
+
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val before = scopeJob.children.toList()
+        vm.onForeground()
+        await { (scopeJob.children.toList() - before).any { it.isActive } }
+        val waiter = (scopeJob.children.toList() - before).firstOrNull { it.isActive }
+        assertTrue("foreground must be waiting on opMutex while clone holds it", waiter != null)
+
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+        assertTrue(
+            "cancelled foreground waiter must preserve busy, got ${vm.state.value}",
+            vm.state.value.loading,
+        )
+        Thread.sleep(100)
+        assertTrue(
+            "busy must hold while clone gate still blocked, got ${vm.state.value}",
             vm.state.value.loading,
         )
 
