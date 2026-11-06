@@ -130,12 +130,15 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
 // SuElevator over FakeHarnessGateway proves ROOT through the real path, same
 // as the JVM tests); diagnosis paths are stubbed to direct reads only so no
 // real gateway is ever executed.
-fun newHarnessViewModel(gw: FakeHarnessGateway): DualViewModel =
+fun newHarnessViewModel(
+    gw: FakeHarnessGateway,
+    preference: ChannelPreference = ChannelPreference.AUTO,
+): DualViewModel =
     DualViewModel(
         repo = DualRepository(gw),
         gatewayPrivilege = Privilege.ROOT,
         elevators = listOf(SuElevator(gw), ShizukuElevator(NoOpGateway())),
-        preference = ChannelPreference.AUTO,
+        preference = preference,
         appPackageName = "com.galaxydual.plus.debug.test",
         persistPreference = null,
         suPresentCheck = { true },

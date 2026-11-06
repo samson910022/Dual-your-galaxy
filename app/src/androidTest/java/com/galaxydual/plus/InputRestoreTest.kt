@@ -93,6 +93,27 @@ class InputRestoreTest {
         }
     }
 
+    // Activity：非預設通道偏好在 recreate 後仍顯示（注入 fake-backed VM）。
+    @Test
+    fun activity_recreate_retainsNonDefaultChannelPreference() {
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw, preference = ChannelPreference.SHIZUKU)
+        try {
+            awaitHarnessReady(vm)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                onView(withText(containsString("SHIZUKU"))).check(matches(isDisplayed()))
+                scenario.recreate()
+                onView(withText(containsString("SHIZUKU"))).check(matches(isDisplayed()))
+                assertEquals(0, gw.uninstallCalls)
+                assertEquals(0, gw.writeCalls)
+            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
+        }
+    }
+
     // Activity：搜尋輸入 + 通道行在 recreate 後仍渲染（無寫入）。
     @Test
     fun activity_recreate_restoresInputAndChannelRow() {
