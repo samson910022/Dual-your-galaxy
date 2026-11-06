@@ -1024,4 +1024,111 @@ class Round2PhaseBTest {
         assertNull("probe throw expires pmReadable", s.pmReadable)
         assertTrue("probe throw keeps old cloned entries", s.cloned.contains("com.example.chat"))
     }
+
+    // ---- 階段K K1：前景前置 nowWallMs 非取消拋錯不得卡 loading；下次前景可恢復 ----
+    // markStaleIfAgedLocked 內一次性時鐘炸彈 (RuntimeException)：非取消例外須走
+    // 新增 catch (loading=false + 舊資料保留 + FRESH→STALE + FAILED)，
+    // 不得逃出 coroutine 致 loading 楔住；炸彈解除後下次 onForeground 照常執行。
+    @Test
+    fun k1_foregroundClockThrow_clearsLoadingAndRecovers() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val clock = JumpClock()
+        var bombArmed = false
+        val vm = DualViewModel(
+            repo = DualRepository(suGw),
+            gatewayPrivilege = Privilege.ROOT,
+            elevators = listOf(SuElevator(suGw), ShizukuElevator(shGw)),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { true },
+            shizukuAuthCheck = { false },
+            suGateway = suGw,
+            shizukuGateway = shGw,
+            activeGateway = suGw,
+            currentChannel = ResolvedChannel.ROOT,
+            hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            nowWallMs = {
+                if (bombArmed) {
+                    bombArmed = false
+                    throw RuntimeException("clock unavailable")
+                }
+                clock.now()
+            },
+            nowMonoMs = { clock.now() },
+        )
+        vms.add(vm)
+        await { vm.state.value.channelReady }
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+
+        // 引爆前置時鐘炸彈：markStaleIfAgedLocked 內拋非取消例外。
+        bombArmed = true
+        vm.onForeground()
+        await { !vm.state.value.loading }
+
+        val s = vm.state.value
+        assertEquals("clock throw must clear loading, got ${s.loading}", false, s.loading)
+        assertEquals(
+            "clock throw must degrade FRESH to STALE",
+            InventoryFreshness.STALE,
+            s.inventory.freshness,
+        )
+        assertEquals("STALE keeps the old target identity", 95, s.inventory.targetId)
+        assertTrue("old cloned entries are kept", s.cloned.contains("com.example.chat"))
+        assertEquals("throw path msgKind must be FAILED (unexpected throw)", MsgKind.FAILED, s.msgKind)
+        assertTrue("msg must carry the failure reason, got: ${s.msg}", s.msg.contains("clock unavailable"))
+
+        // 下次前景 (時鐘已恢復) 仍可執行並回到 FRESH。
+        vm.onForeground()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(false, vm.state.value.loading)
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+    }
+
+    // ---- 階段K K2：launch 預取 (opMutex 外層等待) 取消窗口不得殘 loading ----
+    // clone 持有 mutex 阻塞於 installGate 時，refresh waiter 在外層等待被取消：
+    // CE 在進入 refreshLocked 體前拋出，內層清位覆蓋不到；外層補清 loading。
+    // 沿 b3 手法 (gate 阻塞 mutex + cancel + 斷言 loading=false)。
+    @Test
+    fun k2_cancelledMutexWaiter_clearsLoading() {
+        val suGw = FakeRepo()
+        val shGw = FakeRepo()
+        val vm = makeVm(suGw, shGw, JumpClock())
+        await { vm.state.value.channelReady }
+        // clone 持有 mutex (首個 install 阻塞於 gate)。
+        suGw.installCalls = 0
+        suGw.installGate = CompletableDeferred()
+
+        vm.clone("com.example.chat")
+        await { suGw.installCalls >= 1 }
+        await { vm.state.value.loading }
+
+        // refresh 在外層等待 mutex (預取窗口，尚未進入 refreshLocked 體)。
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]!!
+        val before = scopeJob.children.toList()
+        vm.refresh()
+        await { (scopeJob.children.toList() - before).any { it.isActive } }
+        val waiter = (scopeJob.children.toList() - before).firstOrNull { it.isActive }
+        assertTrue("refresh must be waiting on opMutex while clone holds it", waiter != null)
+
+        // 取消 waiter：即使 gate 仍阻塞，loading 須即清。
+        waiter!!.cancel()
+        await { waiter.isCompleted }
+        await { !vm.state.value.loading }
+        assertEquals(
+            "cancelled pre-acquire waiter must clear loading, got ${vm.state.value.loading}",
+            false,
+            vm.state.value.loading,
+        )
+
+        suGw.installGate?.complete(Unit)
+        suGw.installGate = null
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        assertEquals(false, vm.state.value.loading)
+    }
 }

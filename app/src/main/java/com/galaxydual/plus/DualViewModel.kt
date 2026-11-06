@@ -765,6 +765,12 @@ class DualViewModel(
             try {
                 opMutex.withLock { refreshLocked() }
                 drainCoalesced()
+            } catch (e: CancellationException) {
+                // K2：opMutex 外層等待被取消時 CE 在進入 refreshLocked 體前拋出，
+                // 內層清位覆蓋不到；此補清 loading 後重拋 (僅取消路徑，
+                // 成功/失敗語意不動)。
+                _state.update { it.copy(loading = false) }
+                throw e
             } finally {
                 if (refreshJob === myJob) refreshJob = null
             }
@@ -3031,6 +3037,10 @@ class DualViewModel(
                     _state.update { it.copy(loading = true) }
                     opMutex.withLock { recheckLocked(allowPrivilegedHookDiagnosis = trailingPrivileged) }
                 }
+            } catch (e: CancellationException) {
+                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋)。
+                _state.update { it.copy(loading = false) }
+                throw e
             } finally {
                 if (recheckJob === myJob) recheckJob = null
             }
@@ -3083,6 +3093,10 @@ class DualViewModel(
             try {
                 opMutex.withLock { reconnectLocked(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis) }
                 drainCoalesced()
+            } catch (e: CancellationException) {
+                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋)。
+                _state.update { it.copy(loading = false) }
+                throw e
             } finally {
                 if (refreshJob === myJob) refreshJob = null
             }
@@ -4217,6 +4231,11 @@ class DualViewModel(
                     _state.update { it.copy(loading = true) }
                     opMutex.withLock { foregroundLocked() }
                 }
+            } catch (e: CancellationException) {
+                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋；
+                // 體內取消已由 foregroundLocked 內層 catch 清位，此為保險)。
+                _state.update { it.copy(loading = false) }
+                throw e
             } finally {
                 if (foregroundJob === myJob) foregroundJob = null
             }
@@ -4272,6 +4291,52 @@ class DualViewModel(
         } catch (e: CancellationException) {
             _state.update { it.copy(loading = false) }
             throw e
+        } catch (e: Exception) {
+            // K1 (第九輪 P3)：markStaleIfAgedLocked 的 nowWallMs 非取消拋錯
+            // (如時鐘不可用) 不得逃出致 loading 楔住 true。CE 已在上分支重拋，
+            // 此處僅收非取消路徑：舊資料保留、不可信快照降 STALE/UNKNOWN、
+            // msg 帶失敗原因 (FAILED，同 refreshLocked/probeChannels 外層慣例)。
+            if (e is CancellationException) throw e
+            // 時鐘亦可能故障：此處再拋會逃出 catch 使 loading 楔住，故兜底——
+            // FRESH 僅降 STALE (不碰 queryTime)，其餘不動；時鐘正常則走完整
+            // toStaleOrUnknown (同 probeChannels 外層 catch 形狀)。
+            val throwNow: Long? = try {
+                nowWallMs()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            _state.update { cur ->
+                val reason = sanitizeForDisplay(e.message ?: "foreground failed")
+                cur.copy(
+                    loading = false,
+                    pmReadable = null,
+                    inventory = if (throwNow == null) {
+                        if (cur.inventory.freshness == InventoryFreshness.FRESH) {
+                            cur.inventory.copy(freshness = InventoryFreshness.STALE)
+                        } else {
+                            cur.inventory
+                        }
+                    } else {
+                        cur.inventory.toStaleOrUnknown(
+                            now = throwNow,
+                            source = "foreground(exception)",
+                            targetId = cur.inventory.targetId,
+                        )
+                    },
+                    diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                        cur.diagnose
+                    } else {
+                        cur.diagnose ?: diagnoseEvent(
+                            DiagnoseCode.OP_FAILED,
+                            techDetail = reason,
+                        )
+                    },
+                    msg = "foreground failed: $reason",
+                    msgKind = MsgKind.FAILED,
+                )
+            }
         }
     }
 
