@@ -156,6 +156,14 @@ class MainActivity : ComponentActivity() {
     // p28-1 禁用原因行：主操作（建立/移除分身）因通道不可寫被禁用時顯示
     // VM 拒絕理由（writeBlockReason 資源鍵經 Context 解析，與點按拒絕同文）；可寫或忙碌時隱藏。
     private lateinit var writeBlockView: TextView
+    // P2-1 去重播報：上次已顯示的禁用原因文字。相同原因在無關 render
+    // 不重設 text（避免 POLITE 重播）；僅文字變化時更新。msgView 恆為
+    // POLITE 主播報者，writeBlockView 在與 s.msg 同文時降為 NONE。
+    // 去重鍵去時間（見 stripWriteBlockTimeParams）：可見文字保留完整時間資訊。
+    private var lastWriteBlockText: String? = null
+    // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
+    // 與 writeBlockView 同式：快取 + View 實際文字雙重比對，旋轉重建以 View 為準。
+    private var lastMsgText: String? = null
 
     // Two-phase remove dialog (PR-4 P1, issue #23): driven by
     // UiState.pendingRemove, never by a click counter. Non-null pending shows
@@ -221,7 +229,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
+        // B1：lastWriteBlockText/lastMsgText 隨存活（View 重建為空時以 View 實際文字為準補寫，見 render）。
         diagExpanded = savedInstanceState?.getBoolean(KEY_DIAG_EXPANDED) ?: false
+        lastWriteBlockText = savedInstanceState?.getString(KEY_WRITE_BLOCK_TEXT)
+        lastMsgText = savedInstanceState?.getString(KEY_MSG_TEXT)
         buildUi()
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
         // manager (or an unexpected API failure) never crashes the UI.
@@ -262,12 +273,26 @@ class MainActivity : ComponentActivity() {
         updateShizukuLine()
         // PR-7 P2 (#26):前景重載來源 catalog (安裝/卸載後保持新鮮)。
         reloadCatalog()
+        // B1 旋轉恢復：pkgInput 由 View 系統恢復（id=pkg_input）在 onRestoreInstanceState
+        // 之後，render 可能已用空輸入跑過一次而卡 disabled；此處以後恢復文字重算一次。
+        refreshManualEnablement()
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        // B1 旋轉恢復：View 系統剛回填 pkgInput 文字，顯式重算 enablement，
+        // 避免 render 用恢復前空輸入卡 disabled（VM 守衛仍為縱深）。
+        refreshManualEnablement()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         // 旋轉保留診斷展開開關 (純 UI 狀態，不經 ViewModel)。
         outState.putBoolean(KEY_DIAG_EXPANDED, diagExpanded)
+        // B1：去重快取隨存活；新 View 重建為空時 render 以 View 實際文字為準補寫，
+        // 故恢復值僅作去重參考，不會導致空 View 跳過首寫。
+        if (lastWriteBlockText != null) outState.putString(KEY_WRITE_BLOCK_TEXT, lastWriteBlockText)
+        if (lastMsgText != null) outState.putString(KEY_MSG_TEXT, lastMsgText)
     }
 
     override fun onDestroy() {
@@ -372,6 +397,10 @@ class MainActivity : ComponentActivity() {
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun afterTextChanged(s: Editable?) {
                     error = packageInputError(s?.toString().orEmpty())?.let { resolvePackageInputError(it) }
+                    // P2-2：手動輸入門控即時反映到 clone/remove enablement
+                    //（render 讀同一 manualInputActionable；此處輕量只更新按鈕，
+                    // 不做全量 render，避免每鍵重建列表）。
+                    refreshManualEnablement()
                 }
             })
             setOnEditorActionListener { v, actionId, event ->
@@ -910,6 +939,11 @@ class MainActivity : ComponentActivity() {
         // p28-1 enabled 反映可寫能力：clone/remove/batch 另須可寫
         // (writeBlockReason == null)；禁用原因由 writeBlockView 顯示
         // （VM 拒絕理由 single source，VM guard 保留在 isWritable 內）。
+        // P2-2：clone/remove 另須手動輸入可用（非空且就地驗證通過，
+        // 見 manualInputActionable；VM 空白/超長/非法仍 fail-closed 拒絕，
+        // 此處只做 UI 層即時門控）；batch 另須目前 verified target 可用
+        // （inventory.targetId 有效，與 cloneSelected 起始 pin fail-closed
+        // 一致；VM 側 fetchDualTarget 守衛保留為縱深）。
         val busy = s.loading
         // p28-1 互斥單選同步：checked 即選擇狀態（視覺 + TalkBack）。
         autoBtn.isChecked = (s.channel == ChannelPreference.AUTO)
@@ -917,8 +951,14 @@ class MainActivity : ComponentActivity() {
         shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
         lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
         val blockReason = if (busy) null else writeBlockReason(s)?.let { resolveBlockReason(it) }
-        cloneBtn.isEnabled = !busy && blockReason == null
-        removeBtn.isEnabled = !busy && blockReason == null
+        // P2-2 輕量讀取：buildUi 前 render（測試路徑）視為不可用（fail-closed）。
+        val manualActionable = try {
+            if (!::pkgInput.isInitialized) false else manualInputActionable(pkgInput.text?.toString().orEmpty())
+        } catch (_: Exception) {
+            false
+        }
+        cloneBtn.isEnabled = cloneRemoveEnabled(s, manualActionable)
+        removeBtn.isEnabled = cloneRemoveEnabled(s, manualActionable)
         refreshBtn.isEnabled = !busy
         autoBtn.isEnabled = !busy
         rootBtn.isEnabled = !busy
@@ -935,30 +975,124 @@ class MainActivity : ComponentActivity() {
         clearSelBtn.isEnabled = !busy
         saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
         cancelSaveBtn.isEnabled = !busy
-        batchBtn.isEnabled = !busy && s.selectedKeys.isNotEmpty() && blockReason == null
+        batchBtn.isEnabled = batchEnabled(s)
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
         searchInput.isEnabled = !busy
         // p28-1 禁用原因行：只在非 busy 且不可寫時顯示 VM 拒絕理由。
+        // P2-1 去重播報：可見文字保留完整時間資訊，但同一拒絕理由只由單一節點播報
+        // （傾向 msgView）。s.msg 與 blockReason 同文時 writeBlockView 降為
+        // NONE；原因未變時不重設 text（避免無關 render 重播）。
+        // B1：同文判定去時間（見 isWriteBlockDuplicate/stripWriteBlockTimeParams），
+        // 解決 LSPosed displayText 時間戳漂移導致恆 false；可見文字不去時間。
+        val duplicate = isWriteBlockDuplicate(blockReason, s.msg, busy)
+        try {
+            writeBlockView.accessibilityLiveRegion =
+                if (duplicate) View.ACCESSIBILITY_LIVE_REGION_NONE
+                else View.ACCESSIBILITY_LIVE_REGION_POLITE
+        } catch (_: Exception) {
+            // Best effort: 無障礙屬性失敗不影響顯示。
+        }
         if (blockReason != null) {
             writeBlockView.visibility = View.VISIBLE
-            writeBlockView.text = blockReason
+            // B1：快取 + View 實際文字雙重比對；旋轉重建 View 為空時以 View 為準補寫。
+            val writeViewCurrent = try {
+                writeBlockView.text.toString()
+            } catch (_: Exception) {
+                null
+            }
+            if (shouldUpdateWriteBlockText(lastWriteBlockText, blockReason) || writeViewCurrent != blockReason) {
+                if (writeViewCurrent != blockReason) {
+                    try {
+                        writeBlockView.text = blockReason
+                    } catch (_: Exception) {
+                        // Best effort: render may run before buildUi in tests.
+                    }
+                }
+                lastWriteBlockText = blockReason
+            }
         } else {
-            writeBlockView.visibility = View.GONE
-            writeBlockView.text = ""
+            if (lastWriteBlockText != null) {
+                writeBlockView.visibility = View.GONE
+                writeBlockView.text = ""
+                lastWriteBlockText = null
+            } else {
+                writeBlockView.visibility = View.GONE
+                try {
+                    if (writeBlockView.text.toString() != "") writeBlockView.text = ""
+                } catch (_: Exception) {
+                    // Best effort: render may run before buildUi in tests.
+                }
+            }
         }
         // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
         // PR-37 P3 差量：列表只在指紋變化時全量重建；其餘文字區各自更新。
         renderSourceList(s)
-        msgView.text = if (busy) {
+        // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
+        // 快取 + View 實際文字雙重比對；旋轉重建以 View 為準補寫。
+        val newMsgText = if (busy) {
             getString(R.string.status_loading)
         } else {
             s.msg.ifEmpty { getString(R.string.status_ready) }
+        }
+        val msgViewCurrent = try {
+            msgView.text.toString()
+        } catch (_: Exception) {
+            null
+        }
+        if (shouldUpdateMsgText(lastMsgText, newMsgText) || msgViewCurrent != newMsgText) {
+            if (msgViewCurrent != newMsgText) {
+                try {
+                    msgView.text = newMsgText
+                } catch (_: Exception) {
+                    // Best effort: render may run before buildUi in tests.
+                }
+            }
+            lastMsgText = newMsgText
+        } else {
+            lastMsgText = newMsgText
         }
         msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else msgColorFor(s.msgKind))
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
         syncRemoveDialog(s.pendingRemove, s.loading)
+    }
+
+    // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
+    // batch 的 enabled，不做全量 render（避免每鍵重建列表）。判定走同一純函數
+    // cloneRemoveEnabled/batchEnabled（見檔案尾），與 render 一致；
+    // VM 空白/超長/非法仍 fail-closed 拒絕，此處只做 UI 層即時禁用。
+    // B1：讀 vm.state.value 最新狀態（不用 stale lastState）；busy 一律禁用三鈕，
+    // 打字競態不得繞過 busy。
+    private fun refreshManualEnablement() {
+        try {
+            if (!::cloneBtn.isInitialized || !::removeBtn.isInitialized ||
+                !::batchBtn.isInitialized || !::pkgInput.isInitialized
+            ) {
+                return
+            }
+            val s = try {
+                vm.state.value
+            } catch (_: Exception) {
+                return
+            }
+            if (s.loading) {
+                cloneBtn.isEnabled = false
+                removeBtn.isEnabled = false
+                batchBtn.isEnabled = false
+                return
+            }
+            val manual = try {
+                manualInputActionable(pkgInput.text?.toString().orEmpty())
+            } catch (_: Exception) {
+                false
+            }
+            cloneBtn.isEnabled = cloneRemoveEnabled(s, manual)
+            removeBtn.isEnabled = cloneRemoveEnabled(s, manual)
+            batchBtn.isEnabled = batchEnabled(s)
+        } catch (_: Exception) {
+            // Best effort: 輸入門控失敗不影響驗證顯示。
+        }
     }
 
     // State-driven confirmation dialog (PR-4 P1, issue #23). Null pending
@@ -1325,6 +1459,10 @@ class MainActivity : ComponentActivity() {
 
         // 旋轉保留鍵：診斷技術細節展開開關。
         private const val KEY_DIAG_EXPANDED = "diagExpanded"
+        // B1 旋轉保留鍵：去重快取（僅去重參考；新 View 重建為空時 render 以 View
+        // 實際文字為準補寫，不會因快取命中而跳過首寫）。
+        private const val KEY_WRITE_BLOCK_TEXT = "writeBlockText"
+        private const val KEY_MSG_TEXT = "msgText"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -1378,6 +1516,84 @@ internal fun Context.resolvePackageInputError(problem: PackageInputProblem): Str
     PackageInputProblem.TOO_LONG -> getString(problem.stringRes(), MAX_PACKAGE_INPUT_CHARS)
     PackageInputProblem.INVALID -> getString(problem.stringRes())
 }
+
+// P2-2 手動輸入可用性（純函數，JVM 可測；clone/remove enablement 共用）。
+// 非空（trim 後）且就地驗證通過（packageInputError == null）才可用。
+// 空白不打擾（就地不報錯）但按鈕禁用；VM 空白/超長/非法仍 fail-closed 拒絕，
+// 此處只做 UI 層即時門控，不取代 VM 守衛。
+internal fun manualInputActionable(raw: String): Boolean {
+    if (raw.trim().isEmpty()) return false
+    return packageInputError(raw) == null
+}
+
+// P2-2 目前 verified target 可用性（純函數，JVM 可測；batch enablement 用）。
+// UI 層近似門控：targetId > 0 視為可用（0 永不可寫；-1=NO_TARGET_ID 表未知）。
+// 權威判定以 VM 起始 pin 為準（fetchDualTarget Confirmed 才執行，否則整批拒絕；
+// serial 缺失/無目標時 VM 側仍拒絕為縱深），此處只做 UI 層即時門控。
+internal fun verifiedTargetAvailable(s: UiState): Boolean =
+    s.inventory.targetId > 0
+
+// P2-2 clone/remove enablement（純函數，JVM 可測；render + TextWatcher 共用）。
+// 三條件：非 busy、可寫（writeBlockReason == null）、手動輸入可用。
+// VM isWritable/空白/超長守衛保留為縱深（點按仍 fail-closed）。
+internal fun cloneRemoveEnabled(s: UiState, manualActionable: Boolean): Boolean =
+    !s.loading && writeBlockReason(s) == null && manualActionable
+
+// P2-2 batch enablement（純函數，JVM 可測；render + TextWatcher 共用）。
+// 四條件：非 busy、有勾選、可寫、目前 verified target 可用。
+// VM 側 isWritable + 起始 pin（SerialUnavailable/NoDual 拒絕）保留為縱深。
+internal fun batchEnabled(s: UiState): Boolean =
+    !s.loading && s.selectedKeys.isNotEmpty() &&
+        writeBlockReason(s) == null && verifiedTargetAvailable(s)
+
+// B1 去重鍵去時間（純函數，JVM 可測）：可見文字保留完整時間資訊，
+// 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
+// 剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、重啟舊資料 stale 提示
+// （時間衍生，隨 queriedAt 漂移出現/消失）；marker/查詢前綴與經真通道標記保留
+// （結構穩定，不同模板去重後仍不同文）。
+internal fun stripWriteBlockTimeParams(text: String): String {
+    var k = text.replace(Regex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}"), "")
+    k = k.replace("從未查詢", "")
+    k = k.replace("（可能為重啟前舊資料，僅存在性證據）", "")
+    return k
+}
+
+// B1 去重鍵（純函數，JVM 可測；WriteBlockKind 比對）：Keyed 以 kind + 去時間穩定參數
+// 為鍵（LSPOSED 的 args[0] 為 Hook 證據含時間戳，去時間後只留狀態/範圍）；
+// Verbatim（AUTO 降級註記）逐字為鍵。factory blockText 與 Activity resolveBlockReason
+// 經同一 WriteBlock.stringRes() 解析（見下），此鍵鎖定 single source。
+internal fun writeBlockDedupKey(reason: BlockReason?): String? = when (reason) {
+    null -> null
+    is BlockReason.Verbatim -> "V:${stripWriteBlockTimeParams(reason.text)}"
+    is BlockReason.Keyed -> when (reason.block.kind) {
+        WriteBlockKind.LSPOSED_PLACEHOLDER ->
+            "K:${reason.block.kind.name}:${stripWriteBlockTimeParams(reason.block.args.getOrElse(0) { "" })}"
+        else -> "K:${reason.block.kind.name}:${reason.block.args.joinToString("|")}"
+    }
+}
+
+// P2-1 同文去重判定（純函數，JVM 可測；render 決定 writeBlockView live 用）。
+// 非 busy 且禁用原因文字非空且與 s.msg 同文（去時間後相等亦算同文）時回傳 true
+//（呼叫端將 writeBlockView 降為 NONE，只留 msgView POLITE 播報，避免同一拒絕理由
+// 雙節點重複播報）。可寫/忙碌/空訊息/異文一律 false（各播各的）。
+// B1：保留可見文字完整時間資訊，僅去重鍵去時間（stripWriteBlockTimeParams），
+// 解決 LSPosed displayText 時間戳漂移（msg 寫入時與 render 時 queriedAt 不同）恆 false。
+internal fun isWriteBlockDuplicate(blockReasonText: String?, msg: String, busy: Boolean): Boolean {
+    if (busy) return false
+    if (blockReasonText == null) return false
+    if (msg.isEmpty()) return false
+    if (blockReasonText == msg) return true
+    return stripWriteBlockTimeParams(blockReasonText) == stripWriteBlockTimeParams(msg)
+}
+
+// P2-1 文字更新守衛（純函數，JVM 可測；render 決定是否重設 text 用）。
+// 原因未變時回傳 false（呼叫端不碰 text，避免無關 render 重播）。
+internal fun shouldUpdateWriteBlockText(old: String?, new: String?): Boolean = old != new
+
+// B1 msg 更新守衛（純函數，JVM 可測；render 決定是否重設 msgView.text 用）。
+// 與 shouldUpdateWriteBlockText 同式（old != new）；render 另以 View 實際文字
+// 雙重比對（旋轉重建 View 為空時補寫）。
+internal fun shouldUpdateMsgText(old: String?, new: String?): Boolean = old != new
 
 // 寫入拒絕理由鍵 -> string 資源（JVM 可測；Activity/factory 以此解析）。
 internal fun WriteBlock.stringRes(): Int = when (kind) {
