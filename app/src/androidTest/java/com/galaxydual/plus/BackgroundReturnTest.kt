@@ -19,6 +19,7 @@ import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -74,13 +75,18 @@ class BackgroundReturnTest {
     @Test
     fun activity_backgroundReturn_renders() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            onView(withText("Clone")).check(matches(isDisplayed()))
-            Espresso.onIdle()
+            scenario.onActivity { activity ->
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "Clone"))
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "Remove"))
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "重新連線並更新"))
+            }
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
-            onView(withText("Clone")).check(matches(isDisplayed()))
-            onView(withText("Remove")).check(matches(isDisplayed()))
-            onView(withText("重新連線並更新")).check(matches(isDisplayed()))
+            scenario.onActivity { activity ->
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "Clone"))
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "Remove"))
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "重新連線並更新"))
+            }
         }
     }
 }

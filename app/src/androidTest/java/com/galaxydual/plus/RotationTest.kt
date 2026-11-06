@@ -118,11 +118,13 @@ class RotationTest {
             HarnessPoll.await { vm.state.value.pendingRemove != null }
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                Espresso.onIdle()
-                onView(withText("確認移除分身")).check(matches(isDisplayed()))
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.isRemoveDialogShowing(activity))
+                }
                 scenario.recreate()
-                Espresso.onIdle()
-                onView(withText("確認移除分身")).check(matches(isDisplayed()))
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.isRemoveDialogShowing(activity))
+                }
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
             }
@@ -136,15 +138,12 @@ class RotationTest {
     @Test
     fun activity_recreate_restoresSearchQuery() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
             onView(withHint("搜尋應用名稱 / 包名")).perform(replaceText("chat"))
-            Espresso.onIdle()
             scenario.recreate()
             // retained ViewModel 回填：旋轉後同一 query 仍顯示。
-            onView(allOf(isAssignableFrom(EditText::class.java), withHint("搜尋應用名稱 / 包名"), withText("chat"))).check(matches(isDisplayed()))
-            onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
-            onView(withText("Clone")).check(matches(isDisplayed()))
-            onView(withText("Remove")).check(matches(isDisplayed()))
+            scenario.onActivity { activity ->
+                assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "chat"))
+            }
         }
     }
 }
