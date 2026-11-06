@@ -16,6 +16,7 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
+import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.VerifyState
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
@@ -1153,8 +1154,25 @@ class DualViewModel(
                         // 即清空舊勾選（防 95 勾選殘留到 96 前的空窗）。
                         handleSelectionTargetChangeLocked()
                     } else {
-                        val groundTruth = onIo { repo.listClonedPackages(dualId) }
-                        // listClonedPackages==null 原因鑑別：只在 null 路徑加跑
+                        // PR-37 P26 Stage 1 (GH #1): explicit listing carries the
+                        // resolve-time pair so a same-id rebuild (fresh serial
+                        // missing/unequal) surfaces as SerialBreach BEFORE any
+                        // `pm list packages` probe. SerialBreach maps to
+                        // VERIFY_MISMATCH + STALE with the live fresh target
+                        // (never FRESH, old cloned kept, zero writes); Unknown
+                        // keeps the existing null-path discrimination below.
+                        // Reuses the listing-internal fetchVerifiedTarget only;
+                        // no new gateway triple is added here.
+                        val listing = onIo {
+                            repo.listClonedPackages(
+                                dualId,
+                                VerifiedTarget(dualId, dualSerial, parentId = null),
+                            )
+                        }
+                        val serialBreach = listing as? DualRepository.ListClonedResult.SerialBreach
+                        val groundTruth = (listing as? DualRepository.ListClonedResult.Ok)?.packages
+                        val isUnknown = listing is DualRepository.ListClonedResult.Unknown
+                        // listClonedPackages==Unknown 原因鑑別：只在 Unknown 路徑加跑
                         // 唯讀的 profilesSnapshot + resolveDualTargetTyped
                         // (成功路徑零額外開銷)。通道失敗->CHANNEL_ERROR
                         // (techDetail 寫明)；只有正值且不同的新 verified ID
@@ -1169,14 +1187,14 @@ class DualViewModel(
                         // + typed 乾淨，見 refresh 首跳)；null 僅省一次快照傳參，
                         // 語意仍為未知，不清空。
                         val nullSnap: ProfilesSnapshot? =
-                            if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
+                            if (isUnknown) onIo { repo.profilesSnapshot() } else null
                         // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
                         // 本路徑 Unknown/Absent 一律收斂 VERIFY_UNKNOWN（僅
                         // 已確認-不同-id 觸發 drift；snapshot 通道失敗另走
                         // CHANNEL_ERROR，不屬本收斂），故不傳 pm 快照作 pmIds
                         // 否決；以重查快照（Loaded）為準、回退原快照。
                         val nullVerified: DualTargetResolution? =
-                            if (groundTruth == null) {
+                            if (isUnknown) {
                                 onIo { repo.resolveDualTargetTyped(pmIds = null) }
                             } else {
                                 null
@@ -1193,7 +1211,51 @@ class DualViewModel(
                         }
                         _state.update { cur ->
                             val now = nowWallMs()
-                            val next = if (groundTruth == null) {
+                            val next = if (serialBreach != null) {
+                                // Same-id rebuild: the listing-time fresh target
+                                // names the same id with a missing/unequal serial
+                                // (or parent mismatch). Fail closed: VERIFY_MISMATCH
+                                // + STALE with the live fresh target, old cloned
+                                // kept, zero writes. Mirrors the id-drift branch
+                                // below (STALE + live target + selection clearing
+                                // via handleSelectionTargetChangeLocked).
+                                val fresh = serialBreach.fresh
+                                val liveId = fresh?.userId ?: dualId
+                                val liveSerial = fresh?.serial
+                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                    "refresh verification mismatch: " +
+                                        "target $dualId#${dualSerial ?: "?"} -> " +
+                                        "$liveId#${liveSerial ?: "?"}",
+                                    MsgKind.VERIFY,
+                                    cur.degradeNote,
+                                )
+                                cur.copy(
+                                    loading = false,
+                                    profiles = profiles,
+                                    // Listing snapshot was Loaded (otherwise
+                                    // Unknown, not breach), so `pm list users`
+                                    // stays readable.
+                                    pmReadable = true,
+                                    inventory = cur.inventory.toStaleOrUnknown(
+                                        now = now,
+                                        source = PmOutputParser.buildListPackages(dualId),
+                                        targetId = liveId,
+                                        // Live incarnation: new serial (or null
+                                        // on continuity-lost), never the stale
+                                        // resolve-time serial.
+                                        targetSerial = liveSerial,
+                                    ),
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.VERIFY_MISMATCH,
+                                        techDetail = "verified serial drifted: " +
+                                            "listed $dualId#${dualSerial ?: "?"} but now " +
+                                            "$liveId#${liveSerial ?: "?"} " +
+                                            "(${serialBreach.reason.ifEmpty { "reuse suspected" }})",
+                                    ),
+                                    msg = combinedMsg,
+                                    msgKind = combinedKind,
+                                )
+                            } else if (isUnknown) {
                                 // 未知：保留舊 cloned，inventory 舊資料標 STALE
                                 // (FRESH->STALE；否則 UNKNOWN，傳入的 targetId
                                 // 不再丟棄)，供上層重查。
@@ -1299,7 +1361,7 @@ class DualViewModel(
                                         msgKind = combinedKind,
                                     )
                                 }
-                            } else if (groundTruth.isEmpty()) {
+                            } else if (groundTruth.orEmpty().isEmpty()) {
                                 // 契約 (Stage C C4，選 (c))：FRESH 成功清碼時同步
                                 // 歸檔 FAILED 歷史——diagnose 將清 null (phase !=
                                 // UNKNOWN) 且 phase==FAILED 時 lastOperation 同步
@@ -1355,7 +1417,7 @@ class DualViewModel(
                                 cur.copy(
                                     loading = false,
                                     profiles = profiles,
-                                    cloned = groundTruth,
+                                    cloned = groundTruth.orEmpty(),
                                     pmReadable = true,
                                     inventory = InventorySnapshot(
                                         source = PmOutputParser.buildListPackages(dualId),
@@ -1363,7 +1425,7 @@ class DualViewModel(
                                         targetSerial = dualSerial,
                                         queryTimeMs = now,
                                         freshness = InventoryFreshness.FRESH,
-                                        count = groundTruth.size,
+                                        count = groundTruth.orEmpty().size,
                                     ),
                                     lastOperation = if (clearFailed) {
                                         null
