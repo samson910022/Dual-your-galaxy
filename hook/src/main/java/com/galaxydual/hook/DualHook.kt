@@ -179,7 +179,7 @@ class DualHook : XposedModule() {
         // Hook any *hitelist* query methods (e.g. isWhitelisted) if they exist.
         // Deliberately fuzzy: without on-device evidence the exact Samsung
         // method names are unknown, so narrowing the match could miss the real
-        // query. Every install is logged, and signatures the shared policy
+        // query. Install logging is best-effort, and signatures the shared policy
         // does not understand stay observe-only (see WhitelistPolicy.apply).
         target.declaredMethods
             .filter { it.name.contains("hitelist", ignoreCase = true) }
@@ -187,53 +187,32 @@ class DualHook : XposedModule() {
         return installed
     }
 
-    // Installs one hook with best-effort inlining protection and fail-safe
-    // exception mode. Returns true only when the hook installed (the P2
+    // Installs one hook with best-effort inlining protection and a request for
+    // framework exception protection. Returns true only when the hook installed (the P2
     // active marker counts these; a failed install keeps the module honestly
     // "not detected" instead of claiming enable state it never earned).
     //
     // Honesty note: deoptimize(Executable) exists, but without caller identity
     // info we can only deoptimize the hooked callee itself (best-effort);
-    // callers that already inlined it are NOT touched, so a short method
+    // this does not guarantee an effect on callers that already inlined it, so a short method
     // inlined before this runs may still bypass the hook. The anti-inline
-    // effect is unverified on-device (no Samsung test unit); the return value
-    // is logged so a no-op is visible instead of silently swallowed.
-    private fun hookWithDeoptimize(method: Method, hookId: String): Boolean {
-        try {
-            try {
-                val deoptimized = deoptimize(method)
-                if (deoptimized) {
-                    logi("deoptimized ${method.declaringClass.name}#${method.name}")
-                } else {
-                    logi(
-                        "deoptimize no-op ${method.declaringClass.name}#${method.name} " +
-                            "(already interpreted or unsupported; hook proceeds, effect unverified)",
-                    )
-                }
-            } catch (t: Throwable) {
-                // Non-fatal: hooking still works when the target is not inlined.
-                logi(
-                    "deoptimize failed ${method.declaringClass.name}#${method.name}: " +
-                        "${t.message}; hook proceeds, effect unverified",
-                )
-            }
-            hook(method)
-                // PROTECTIVE placeholder: hooker bugs are logged and skipped
-                // instead of crashing system_server / daagent.
+    // effect is unverified on-device; the return value is logged best-effort without
+    // inferring why the framework returned it.
+    private fun hookWithDeoptimize(method: Method, hookId: String): Boolean =
+        HookInstaller.install(method, hookId, ::deoptimize, { target, id ->
+            hook(target)
+                // Request framework protection for hook exceptions; this does not
+                // guarantee system_server / daagent cannot crash in every case.
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                .setId(hookId)
+                .setId(id)
                 .intercept { chain -> interceptWhitelistCall(chain) }
-            logi("hooked ${method.declaringClass.name}#${method.name}")
-            return true
-        } catch (t: Throwable) {
-            logi("hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
-            return false
-        }
-    }
+        }, ::logi)
 
     // Thin interceptor: runs the original, then applies the shared
-    // extend-only policy (WhitelistPolicy, unit-tested). Unknown signatures
-    // stay observe-only with a log line; nothing is ever narrowed here.
+    // extend-only policy (WhitelistPolicy, unit-tested). Unknown shapes stay
+    // unchanged; non-Boolean results return early without unknown-shape logging
+    // when the policy is empty. Boolean true returns immediately; unexpected
+    // arguments for Boolean false are logged best-effort even with empty policy.
     // H2: the effective set is PolicySource.effective(seed + remote). No remote
     // source is wired, so behavior today is identical to the static seed
     // (observe-only when empty).
@@ -271,7 +250,7 @@ class DualHook : XposedModule() {
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
     // BOTH candidate fields are attempted (the ROM may read the _FOR_CHINA
     // field per region/sales code, so first-wins would silently miss region
-    // devices); every per-field outcome is logged (locatable diagnostics).
+    // devices); per-field outcomes are logged best-effort for diagnostics.
     // The original whitelist is never shrunk.
     //
     // Empty policy today (STATIC_SEED and the remote snapshot are both
