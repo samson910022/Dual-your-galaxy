@@ -54,6 +54,7 @@ class CancelZeroWriteTest {
             vm.cancelRemove()
             HarnessPoll.await { vm.state.value.pendingRemove == null }
             assertNull(vm.state.value.pendingRemove)
+            assertEquals("已取消移除：com.example.chat", vm.state.value.msg)
             assertEquals("cancel must not uninstall", 0, gw.uninstallCalls)
             assertEquals("cancel must not write", 0, gw.writeCalls)
         } finally {
