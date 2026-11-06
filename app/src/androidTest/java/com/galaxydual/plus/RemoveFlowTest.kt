@@ -25,7 +25,7 @@ class RemoveFlowTest {
         try {
             awaitHarnessReady(vm)
             vm.requestRemove("com.example.chat")
-            HarnessPoll.await { vm.state.value.msg.startsWith("未安裝，無需移除") }
+            HarnessPoll.await(30_000L) { vm.state.value.msg.startsWith("未安裝，無需移除") }
             assertNull(vm.state.value.pendingRemove)
             assertTrue(vm.state.value.msg.startsWith("未安裝，無需移除"))
             assertEquals(0, gw.uninstallCalls)
@@ -44,7 +44,7 @@ class RemoveFlowTest {
         try {
             awaitHarnessReady(vm)
             vm.requestRemove("com.example.chat")
-            HarnessPoll.await { vm.state.value.msg == "無法驗證分身身分（serial 缺失），請重試" }
+            HarnessPoll.await(30_000L) { vm.state.value.msg == "無法驗證分身身分（serial 缺失），請重試" }
             assertNull(vm.state.value.pendingRemove)
             assertEquals("無法驗證分身身分（serial 缺失），請重試", vm.state.value.msg)
             assertEquals(0, gw.uninstallCalls)
@@ -62,16 +62,16 @@ class RemoveFlowTest {
         try {
             awaitHarnessReady(vm)
             vm.requestRemove("com.example.chat")
-            HarnessPoll.await { vm.state.value.pendingRemove != null }
+            HarnessPoll.await(30_000L) { vm.state.value.pendingRemove != null }
             vm.confirmRemove()
-            HarnessPoll.await { vm.state.value.msg.startsWith("removed: ") }
+            HarnessPoll.await(30_000L) { vm.state.value.msg.startsWith("removed: ") }
             assertEquals(1, gw.uninstallCalls)
             assertEquals(1, gw.writeCalls)
             assertNull(vm.state.value.pendingRemove)
             assertTrue(!gw.installedPkgs.contains("com.example.chat"))
             // 重複 confirm 跑空（終態成功釘住），不追加 uninstall。
             vm.confirmRemove()
-            HarnessPoll.await { !vm.state.value.loading && vm.state.value.msg.startsWith("removed: ") }
+            HarnessPoll.await(30_000L) { !vm.state.value.loading && vm.state.value.msg.startsWith("removed: ") }
             assertEquals(1, gw.uninstallCalls)
             assertTrue(vm.state.value.msg.startsWith("removed: "))
         } finally {

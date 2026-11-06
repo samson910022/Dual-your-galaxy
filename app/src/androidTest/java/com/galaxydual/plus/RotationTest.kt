@@ -137,13 +137,25 @@ class RotationTest {
     // Activity 旋轉：搜尋輸入恢復顯示且不崩潰（無寫入：全程不點 Clone/Remove 確認）。
     @Test
     fun activity_recreate_restoresSearchQuery() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            onView(withHint("搜尋應用名稱 / 包名")).perform(replaceText("chat"))
-            scenario.recreate()
-            // retained ViewModel 回填：旋轉後同一 query 仍顯示。
-            scenario.onActivity { activity ->
-                assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "chat"))
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            vm.setSourceQuery("chat")
+            HarnessPoll.await { vm.state.value.sourceQuery == "chat" }
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.recreate()
+                // retained ViewModel 回填：旋轉後同一 query 仍顯示。
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "chat"))
+                }
+                assertEquals(0, gw.uninstallCalls)
+                assertEquals(0, gw.writeCalls)
             }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
         }
     }
 }
