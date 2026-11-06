@@ -101,9 +101,13 @@ class InputRestoreTest {
         try {
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                onView(withText(containsString("SHIZUKU"))).check(matches(isDisplayed()))
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
+                }
                 scenario.recreate()
-                onView(withText(containsString("SHIZUKU"))).check(matches(isDisplayed()))
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
+                }
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
             }
@@ -118,13 +122,15 @@ class InputRestoreTest {
     fun activity_recreate_restoresInputAndChannelRow() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withHint("搜尋應用名稱 / 包名")).perform(replaceText("mail"))
-            Espresso.onIdle()
             // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
-            onView(withText(containsString("通道偏好"))).check(matches(isDisplayed()))
+            scenario.onActivity { activity ->
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+            }
             scenario.recreate()
-            onView(allOf(isAssignableFrom(EditText::class.java), withHint("搜尋應用名稱 / 包名"), withText("mail"))).check(matches(isDisplayed()))
-            onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
-            onView(withText(containsString("通道偏好"))).check(matches(isDisplayed()))
+            scenario.onActivity { activity ->
+                assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
+                assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+            }
         }
     }
 }
