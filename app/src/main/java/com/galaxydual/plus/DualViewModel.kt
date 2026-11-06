@@ -1930,6 +1930,22 @@ class DualViewModel(
         }
     }
 
+    // Phase C P1 (issue #34 review #11 P1): still-referenced guard for the
+    // swap close policy. Instances held by suGateway/shizukuGateway (AUTO
+    // reuses them across degrades, and their elevators probe through them)
+    // or by the retained diagnostic slots must NEVER be terminal-closed:
+    // close()/abandon() set closed=true permanently, so a SHIZUKU -> NOOP
+    // degrade that closed the reused shizukuGateway would poison every later
+    // probe (boundBinder throws "closed") and pin the VM in NOOP until a
+    // picker rebuild. Still-referenced instances get at most a soft
+    // releaseBinding() (drops the idle UserService binding, stays reusable);
+    // only truly displaced instances (no slot references them anymore) get
+    // terminal close() + teardown observer. onCleared/dispose keeps terminal
+    // semantics (VM death never reuses).
+    private fun isStillReferenced(gw: CmdGateway): Boolean =
+        gw === suGateway || gw === shizukuGateway ||
+            gw === retainedSuDiagnostic || gw === retainedShizukuDiagnostic
+
     // Switches the repo gateway to an already-decided ResolvedChannel while
     // keeping preference==AUTO (P25 degrade path). Reuses the existing
     // suGateway/shizukuGateway (and their elevators) so probes keep verifying
@@ -1984,25 +2000,39 @@ class DualViewModel(
                 pmReadable = null,
             )
         }
-        if (old !== newGateway && old is ShizukuCmdGateway &&
-            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
-        ) {
-            try {
-                old.close()
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                // Best effort: the stale binding dies with the process anyway.
-            }
-        }
-        // Phase N2 observer: count SHELL fakes too (production seam null =
-        // no-op). Same displaced guard as the real close above; retained
-        // instances are NOT closed early -- only the cleared snapshot does.
-        if (old !== newGateway && isShizukuLike(old) &&
-            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
-        ) {
-            try {
-                gatewayTeardown?.invoke(old)
-            } catch (_: Exception) {
+        if (old !== newGateway) {
+            if (isStillReferenced(old)) {
+                // Phase C P1 soft path: AUTO still holds this instance for
+                // future probes (e.g. SHIZUKU -> NOOP keeps shizukuGateway).
+                // Soft-unbind the idle binding but stay reusable; never mark
+                // terminal-closed and never notify the teardown observer.
+                if (old is ShizukuCmdGateway) {
+                    try {
+                        old.releaseBinding()
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // Best effort: the stale binding dies with the process anyway.
+                    }
+                }
+            } else {
+                if (old is ShizukuCmdGateway) {
+                    try {
+                        old.close()
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // Best effort: the stale binding dies with the process anyway.
+                    }
+                }
+                // Phase N2 observer: count SHELL fakes too (production seam null =
+                // no-op). Only truly displaced instances reach here; retained /
+                // still-referenced instances are NOT closed early -- only the
+                // cleared snapshot does.
+                if (isShizukuLike(old)) {
+                    try {
+                        gatewayTeardown?.invoke(old)
+                    } catch (_: Exception) {
+                    }
+                }
             }
         }
     }
@@ -2084,31 +2114,46 @@ class DualViewModel(
                 pmReadable = null,
             )
         }
-        if (old !== activeGateway && old is ShizukuCmdGateway &&
-            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
-        ) {
-            try {
-                old.close()
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                // Best effort: the stale binding dies with the process anyway.
-            }
-        }
-        // Phase N2 observer (same guard): SHELL fakes counted, real already
-        // closed above (seam extra, null in production). Retained not closed.
-        if (old !== activeGateway && isShizukuLike(old) &&
-            old !== retainedSuDiagnostic && old !== retainedShizukuDiagnostic
-        ) {
-            try {
-                gatewayTeardown?.invoke(old)
-            } catch (_: Exception) {
+        if (old !== activeGateway) {
+            if (isStillReferenced(old)) {
+                // Phase C P1 soft path (reuse factory / same-instance swap):
+                // the previous active instance is still the probed/diagnostic
+                // slot, so only soft-unbind, never terminal-close.
+                if (old is ShizukuCmdGateway) {
+                    try {
+                        old.releaseBinding()
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // Best effort: the stale binding dies with the process anyway.
+                    }
+                }
+            } else {
+                if (old is ShizukuCmdGateway) {
+                    try {
+                        old.close()
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // Best effort: the stale binding dies with the process anyway.
+                    }
+                }
+                // Phase N2 observer (same guard): SHELL fakes counted, real already
+                // closed above (seam extra, null in production). Retained /
+                // still-referenced not closed.
+                if (isShizukuLike(old)) {
+                    try {
+                        gatewayTeardown?.invoke(old)
+                    } catch (_: Exception) {
+                    }
+                }
             }
         }
         // Release displaced idle Shizuku instances (assembleChannel builds
         // fresh ones every swap; the unpicked idle instance is otherwise
         // dropped without closing). Never the newly installed instances;
-        // double-close with the block above is safe (close is idempotent).
-        if (oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
+        // double-close with the block above is safe (close is idempotent, and
+        // the !== old guard below keeps the teardown observer exactly-once
+        // when the previous active and the idle slot are the same instance).
+        if (oldShizuku !== old && oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
             oldShizuku !== activeGateway && oldShizuku is ShizukuCmdGateway &&
             oldShizuku !== retainedSuDiagnostic && oldShizuku !== retainedShizukuDiagnostic
         ) {
@@ -2119,7 +2164,7 @@ class DualViewModel(
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
-        if (oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
+        if (oldShizuku !== old && oldShizuku !== suGateway && oldShizuku !== shizukuGateway &&
             oldShizuku !== activeGateway && isShizukuLike(oldShizuku) &&
             oldShizuku !== retainedSuDiagnostic && oldShizuku !== retainedShizukuDiagnostic
         ) {
@@ -2130,7 +2175,9 @@ class DualViewModel(
         }
         // Defensive: suGateway is a SuCmdGateway by construction, but tests
         // may inject any CmdGateway -- never leak a Shizuku hiding there.
-        if (oldSu !== suGateway && oldSu !== shizukuGateway &&
+        // Same !== old dedup as above (previous active may equal the idle
+        // slot when it was the unpicked channel).
+        if (oldSu !== old && oldSu !== suGateway && oldSu !== shizukuGateway &&
             oldSu !== activeGateway && oldSu is ShizukuCmdGateway &&
             oldSu !== retainedSuDiagnostic && oldSu !== retainedShizukuDiagnostic
         ) {
@@ -2141,7 +2188,7 @@ class DualViewModel(
                 // Best effort: the stale binding dies with the process anyway.
             }
         }
-        if (oldSu !== suGateway && oldSu !== shizukuGateway &&
+        if (oldSu !== old && oldSu !== suGateway && oldSu !== shizukuGateway &&
             oldSu !== activeGateway && isShizukuLike(oldSu) &&
             oldSu !== retainedSuDiagnostic && oldSu !== retainedShizukuDiagnostic
         ) {
