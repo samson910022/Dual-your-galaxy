@@ -46,7 +46,7 @@
 
 ## 5. Harness 對照（免裝置可跑）
 
-Harness 共 20 個自動化測試（`app/src/androidTest`，6 個 test class）。
+Harness 共 20 個自動化測試（`app/src/androidTest`，5 個 test class）。
 
 | 人工列 | 對應 androidTest | 寫入保證 / 備註 |
 | --- | --- | --- |
