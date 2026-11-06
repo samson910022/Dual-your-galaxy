@@ -1074,6 +1074,12 @@ class DualRepository(
      * and Unknown no longer fold into one NoDual. Callers must not treat
      * ChannelError here as "no dual" (batch counts it as unknown).
      *
+     * 寬嚴分裂註記：pin 入口 ([fetchDualTarget]) 的 property 拋出視為無聲明
+     * （null，沿用 canonical 寬容行為），而 typed 入口
+     * ([resolveDualTargetTyped]/[resolveDualUserIdTyped]) 同拋出判 Unknown
+     * （嚴格，fail closed）。Absent 推論只可用 typed 鑑別（含 pmIds 否決），
+     * 勿用 pin 結果做 Absent 推論。
+     *
      * Additive only: [cloneVerified] is untouched and keeps its exact
      * behavior; single callers keep using it.
      */
@@ -1123,6 +1129,11 @@ class DualRepository(
             // 快照——快照與身分矛盾（stale/partial 快照或重建空窗），絕非「無
             // dual」。計 ChannelError（unknown，不短路、不宣稱 no dual），
             // 與 after-pin Unknown 口徑一致；零 install。
+            // 批次逐項 unknown 不短路是刻意（M13 僅 NoDual 短路，unknown 計入
+            // unknown+1/STALE 繼續下一項）；單筆 remove 同矛盾經
+            // RemoveOutcome.ChannelError 落為 CHANNEL，VM 的 MISMATCH/INVALID
+            // 臂是 NoDual+drift 與 TargetMoved/SerialMismatch（不同矛盾），
+            // 此處行為不動。
             return CloneOutcome.ChannelError(
                 "snapshot/identity mismatch: verified id $expectedDualId " +
                     "absent from profiles snapshot",
@@ -1159,12 +1170,19 @@ class DualRepository(
         // remove:1122-1127): a throwing gateway (spawn failure,
         // SecurityException, binder death) maps to ChannelError (fail closed),
         // never a crash; CancellationException is rethrown to stay
-        // coroutine-correct. Keeps a batch M3 partial from escaping as
+        // coroutine-correct. InterruptedException restores the flag then maps
+        // to ChannelError (flag handling same as fetchDualTarget/VerifiedIdentity;
+        // mapping differs: write-side maps to ChannelError, they map to
+        // NoDual/null).
+        // Keeps a batch M3 partial from escaping as
         // OP_FAILED -- per-item ChannelError counts as unknown+1/STALE.
         val res = try {
             gateway.run(installCmd)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         } catch (e: Exception) {
             return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
@@ -1385,6 +1403,10 @@ class DualRepository(
         if (profiles.none { it.userId == expectedDualId }) {
             // typed 已 Confirmed 卻不在 pm 快照——快照與身分矛盾，絕非無 dual。
             // 計 ChannelError（unknown，零 uninstall），與 clone 側一致。
+            // 批次逐項 unknown 不短路是刻意（M13 僅 NoDual 短路）；單筆 remove
+            // 同矛盾經 RemoveOutcome.ChannelError 落為 CHANNEL，VM 的
+            // MISMATCH/INVALID 臂是 NoDual+drift 與 TargetMoved/SerialMismatch
+            //（不同矛盾），此處行為不動。
             return RemoveOutcome.ChannelError(
                 "snapshot/identity mismatch: verified id $expectedDualId " +
                     "absent from profiles snapshot",

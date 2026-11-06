@@ -91,6 +91,9 @@ class InventorySelectionTest {
         //（fetchDualTarget：verbose/dumpsys/prop）不經此通道，故 pin 仍見舊
         // 目標、首項 snapshot 即見新目標（零 install，斷言 drift partial）。
         var switchDualIdAfterListUsers: Int = -1,
+        // Stage 2 batch SerialUnavailable 測試鉤子：verbose/dumpsys 保留 CLONE
+        // 類型但省略 serial 行（id 確認、serial 缺失 → pin 為 SerialUnavailable）。
+        var omitSerial: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
         val installCalls = mutableListOf<String>()
@@ -143,7 +146,7 @@ class InventorySelectionTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$id:DualApp:400} running:\n" +
-                "    Serial: $dualSerial\n" +
+                (if (omitSerial) "" else "    Serial: $dualSerial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
         }
@@ -158,7 +161,7 @@ class InventorySelectionTest {
             return "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$id:DualApp:400} serialNo=$dualSerial:\n" +
+                "  UserInfo{$id:DualApp:400}" + (if (omitSerial) ":\n" else " serialNo=$dualSerial:\n") +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
         }
@@ -1943,6 +1946,38 @@ class InventorySelectionTest {
         // STALE 語意：FRESH 不得殘留（UNKNOWN 起點保持非 FRESH）。
         assertTrue(
             "identity-unknown start must not leave inventory FRESH",
+            st.inventory.freshness != InventoryFreshness.FRESH,
+        )
+    }
+
+    // Stage 2 同區一致性：批次起始 SerialUnavailable（id 確認但 serial 缺失）
+    // 與 request 同情境一致走 VERIFY_MISMATCH + INVALID（非 CHANNEL），零
+    // install、FRESH 降 STALE、不產 batchReport。
+    @Test
+    fun batch_startSerialUnavailable_mapsVerifyMismatch() {
+        val backend = MapBackend()
+        val gw = FakeRepo(omitSerial = true)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.toggleSelection("0:com.example.good")
+        vm.cloneSelected()
+        await { !vm.state.value.loading && vm.state.value.msg.isNotEmpty() }
+        val st = vm.state.value
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
+        assertEquals(MsgKind.INVALID, st.msgKind)
+        assertTrue(
+            "techDetail must carry the serial prefix, got: ${st.diagnose?.techDetail}",
+            (st.diagnose?.techDetail ?: "").startsWith("serial unavailable"),
+        )
+        assertTrue(
+            "serial-unavailable must never reach install, got: ${gw.installCalls}",
+            gw.installCalls.isEmpty(),
+        )
+        assertNull("serial-unavailable start must not produce a batch report", st.batchReport)
+        assertTrue(
+            "serial-unavailable start must not leave inventory FRESH",
             st.inventory.freshness != InventoryFreshness.FRESH,
         )
     }

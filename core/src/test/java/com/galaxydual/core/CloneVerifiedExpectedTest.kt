@@ -45,6 +45,7 @@ class CloneVerifiedExpectedTest {
         var installTransportUnknown: Boolean = false,
         var throwOnInstall: Boolean = false,
         var throwInstallMessage: String = "boom install",
+        var throwInterruptOnInstall: Boolean = false,
         var serialAfterWrite: Int? = null,
         var listPackagesOut: String = "package:com.example.chat\n",
         var listPackagesExit: Int = 0,
@@ -142,6 +143,7 @@ class CloneVerifiedExpectedTest {
                     if (absentIdentity) CmdResult(exit = 0, out = "", err = "")
                     else CmdResult(exit = 0, out = "$dualId\n", err = "")
                 cmd.startsWith("pm install-existing") -> {
+                    if (throwInterruptOnInstall) throw InterruptedException("install interrupted")
                     if (throwOnInstall) throw RuntimeException(throwInstallMessage)
                     CmdResult(
                         exit = installExit,
@@ -487,6 +489,28 @@ class CloneVerifiedExpectedTest {
         assertEquals("throwing install must be attempted once, got: ${gateway.commands}", 1, gateway.installRuns())
         assertTrue(
             "no probe may run after a throwing install, got: ${gateway.commands}",
+            gateway.commands.none { it.startsWith("pm list packages") },
+        )
+    }
+
+    // Stage 2 同區收斂：install 拋 InterruptedException → 中斷旗標保留 +
+    // ChannelError（與 fetchDualTarget/VerifiedIdentity 一致，fail closed）。
+    @Test
+    fun installInterrupted_mapsChannelErrorAndPreservesFlag() {
+        val gateway = FakeGateway(throwInterruptOnInstall = true)
+        Thread.interrupted()
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected ChannelError, got: $outcome", outcome is CloneOutcome.ChannelError)
+        assertTrue(
+            "interrupted install must preserve the interrupt flag",
+            Thread.currentThread().isInterrupted,
+        )
+        Thread.interrupted()
+        assertEquals(1, gateway.installRuns())
+        assertTrue(
+            "no probe may run after an interrupted install, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm list packages") },
         )
     }
