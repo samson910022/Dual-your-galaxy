@@ -1,0 +1,931 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+//
+// P2-1 (issue #24 Phase B): JVM tests for the cancellable su capture path.
+// The old blocking captureProcess held proc.waitFor(timeoutMs) without a
+// cancellation checkpoint, so a selectChannel latest-wins cancel while a su
+// probe/write was in flight kept the loser on opMutex until the full
+// SU_EXEC_TIMEOUT_MS (60 s) expired -- the winner could not take over. The
+// new captureProcessCancellable polls waitFor(SU_WAIT_POLL_MS) with
+// ensureActive() between slices, so cancel ends the client wait within one
+// poll (~50 ms) with CancellationException (queue-collapse), while
+// destroyForcibly stays best-effort local kill only (NOT remote preemption:
+// post-spawn cancel is unknown-after-send, never definite -- Phase A
+// transportUnknown semantics preserved by CE propagation aborting the loser
+// before refresh).
+package com.galaxydual.plus
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import com.galaxydual.core.TRUNCATION_MARKER
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
+import org.junit.Test
+
+class SuCancellableTest {
+    // Probe (`id -u`) uses the short probe budget; writes keep the full 60 s.
+    @Test fun suTimeoutFor_probeVsWrite() {
+        assertEquals(SU_PROBE_TIMEOUT_MS, suTimeoutFor("id -u"))
+        assertEquals(SU_PROBE_TIMEOUT_MS, suTimeoutFor("  id -u  "))
+        assertEquals(SU_EXEC_TIMEOUT_MS, suTimeoutFor("pm list users"))
+        assertEquals(
+            SU_EXEC_TIMEOUT_MS,
+            suTimeoutFor("pm install-existing --user 95 com.example.app"),
+        )
+        assertEquals(SU_EXEC_TIMEOUT_MS, suTimeoutFor("pm uninstall --user 95 com.example.app"))
+    }
+
+    // Steady path unchanged: fast command still succeeds via the cancellable helper.
+    @Test fun cancellable_echoSucceeds() = runBlocking {
+        val res = captureProcessCancellable(arrayOf("sh", "-c", "echo hello-dual"), timeoutMs = 5_000L)
+        assertEquals(0, res.exit)
+        assertEquals("hello-dual\n", res.out)
+    }
+
+    // Timeout path unchanged: abandoning the wait still maps to timedOut
+    // (unknown-after-send, read-only verify) -- never a definite failure.
+    @Test fun cancellable_timeoutCarriesTimedOutFlag() = runBlocking {
+        val res = captureProcessCancellable(arrayOf("sh", "-c", "sleep 5"), timeoutMs = 200L)
+        assertTrue("timeout reply must carry timedOut, got: $res", res.timedOut)
+        assertTrue(
+            "timeout err must hit the isServiceTimeoutText backstop, got: \"${res.err}\"",
+            res.err.startsWith("timeout after "),
+        )
+    }
+
+    // Latest-wins handover at the su layer: cancelling a hung su wait ends
+    // the CALLER at once with CancellationException instead of holding it
+    // to the 30 s deadline. The 2 s bound is deliberately loose to avoid
+    // flakiness on slow CI; it still falsifies the old blocking design where
+    // the same cancel would have wedged the caller for the full timeout
+    // (UncancellableBlockingFake对照: old proc.waitFor(60_000) ignored
+    // coroutine cancel, so the winner waited out the deadline on opMutex).
+    // Cancel is post-spawn unknown by construction (spawn already succeeded,
+    // remote pm may have executed): the helper destroys best effort and
+    // rethrows CE so the loser aborts before refresh -- never synthesized
+    // into a definite result. Thread-interrupt result-forms keep Phase A
+    // transportUnknown (see captureProcess + SuCmdGateway.run catch).
+    @Test fun cancellable_cancelThrowsAtOnceWithDestroy() = runBlocking {
+        // Dispatchers.Default: the waiter must run off the runBlocking event
+        // loop, which is about to block in delay() below.
+        val job = async(Dispatchers.Default) {
+            captureProcessCancellable(arrayOf("sh", "-c", "sleep 30"), timeoutMs = 30_000L)
+        }
+        // Spawn is synchronous inside the helper (exec returns before the
+        // first poll), so a short settle guarantees the wait is in flight.
+        delay(300L)
+        val startNs = System.nanoTime()
+        job.cancel()
+        try {
+            job.await()
+            fail("cancelled su wait must throw CancellationException")
+        } catch (_: CancellationException) {
+            // Expected: caller stops waiting at once; the local proc is
+            // destroyed best effort, the remote side is untouched.
+        }
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertTrue(
+            "cancelled su wait must end at once, not at the deadline (elapsed=${elapsedMs}ms)",
+            elapsedMs < 2_000L,
+        )
+    }
+
+    // Handover: after the old hung wait is cancelled, a fresh call proceeds
+    // immediately instead of wedging behind it -- the selectChannel
+    // latest-wins winner takes over without waiting out the deadline.
+    @Test fun cancellable_cancelThenFastCall_handsOverQuickly() = runBlocking {
+        val hung = async(Dispatchers.Default) {
+            captureProcessCancellable(arrayOf("sh", "-c", "sleep 30"), timeoutMs = 30_000L)
+        }
+        delay(300L)
+        hung.cancel()
+        try {
+            hung.await()
+        } catch (_: CancellationException) {
+            // Expected: the old wait is gone.
+        }
+        val startNs = System.nanoTime()
+        val res = captureProcessCancellable(arrayOf("sh", "-c", "echo ok"), timeoutMs = 5_000L)
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertEquals("handover call must complete", "ok\n", res.out)
+        assertTrue("handover must be immediate (elapsed=${elapsedMs}ms)", elapsedMs < 2_000L)
+    }
+
+    // Phase G1 P1: a rogue Process.waitFor throwing post-spawn (e.g. a fake
+    // or OEM Process impl throwing IllegalStateException) must NOT escape
+    // to SuCmdGateway.run's generic catch as definite -- spawn already
+    // succeeded, so the remote pm may have executed. Fail closed to
+    // transportUnknown via the in-process flag (text keeps the
+    // "su failed post-spawn: " prefix for greppability).
+    private class PostSpawnThrowingProcess : Process() {
+        var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = throw IllegalStateException("boom")
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = throw IllegalStateException("boom")
+        override fun exitValue(): Int = throw IllegalStateException("boom")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = true
+    }
+
+    @Test fun postSpawnWaitThrows_mapsToTransportUnknownNotDefinite() = runBlocking {
+        val fake = PostSpawnThrowingProcess()
+        val gw = SuCmdGateway { _ -> fake }
+        val res = gw.run("pm install-existing --user 95 com.example.app")
+        assertTrue("post-spawn throw must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("post-spawn throw must not carry timedOut (transport loss, not deadline), got: $res", res.timedOut)
+        assertTrue("post-spawn throw must be truncated (partial capture), got: $res", res.truncated)
+        assertTrue(
+            "post-spawn throw err must keep the post-spawn prefix, got: \"${res.err}\"",
+            res.err.startsWith("su failed post-spawn: "),
+        )
+        assertTrue("post-spawn throw err must keep the cause, got: \"${res.err}\"", res.err.contains("boom"))
+        assertTrue("post-spawn throw must not claim definite (exit trusted), got: $res", res.exit != 0)
+        assertTrue("post-spawn throw must destroy best effort", fake.destroyed)
+    }
+
+    // Phase G1 P1 (destroy variant): timeout already abandoned the wait, and
+    // the best-effort destroy itself throws post-spawn (rogue Process impl).
+    // Best-effort means the throw must not mask the timeout result: the
+    // reply stays timedOut=true (unknown-after-send, read-only reconcile),
+    // never definite, never an escape. Short budget keeps the JVM test fast.
+    private class DestroyThrowingProcess : Process() {
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = false
+        override fun exitValue(): Int = 0
+        override fun destroy() {}
+        override fun destroyForcibly(): Process = throw IllegalStateException("destroy boom")
+        override fun isAlive(): Boolean = false
+    }
+
+    @Test fun postSpawnDestroyThrows_doesNotMaskTimeout() = runBlocking {
+        val res = captureProcessCancellable(
+            arrayOf("su", "-c", "pm install-existing --user 95 com.example.app"),
+            timeoutMs = 200L,
+            execFn = { _ -> DestroyThrowingProcess() },
+        )
+        assertTrue("destroy throw must not mask the timeout, got: $res", res.timedOut)
+        assertTrue("timeout reply must not claim definite, got: $res", res.exit != 0)
+        assertTrue("timeout err must keep the deadline prefix, got: \"${res.err}\"", res.err.startsWith("timeout after "))
+    }
+
+    // Phase G1 P1 (exitValue variant): the wait reports exit but reading the
+    // code throws post-spawn (process vanished between wait and read).
+    // Unknown-after-send by construction -- the remote pm may have executed.
+    private class ExitValueThrowingProcess : Process() {
+        var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = 0
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = true
+        override fun exitValue(): Int = throw IllegalStateException("exit boom")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = false
+    }
+
+    @Test fun postSpawnExitValueThrows_mapsToTransportUnknownNotDefinite() = runBlocking {
+        val fake = ExitValueThrowingProcess()
+        val gw = SuCmdGateway { _ -> fake }
+        val res = gw.run("pm install-existing --user 95 com.example.app")
+        assertTrue("exitValue throw must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("exitValue throw must not carry timedOut, got: $res", res.timedOut)
+        assertTrue("exitValue throw must not claim definite, got: $res", res.exit != 0)
+        assertTrue("exitValue throw err must keep the cause, got: \"${res.err}\"", res.err.contains("exit boom"))
+        assertTrue("exitValue throw must destroy best effort", fake.destroyed)
+    }
+
+    // Phase G1 cancel-semantics lock: CE thrown by the spawn seam (or by the
+    // cancellable waits) must still propagate -- never swallowed into a
+    // CmdResult by the new post-spawn generic catch.
+    @Test fun postSpawn_cancellationStillPropagates() = runBlocking {
+        val gw = SuCmdGateway { _ -> throw CancellationException("cancel-seam") }
+        try {
+            gw.run("id -u")
+            fail("CancellationException from spawn must propagate, not map to a CmdResult")
+        } catch (e: CancellationException) {
+            assertEquals("cancel-seam", e.message)
+        }
+    }
+
+    // Phase A2 P2-1 (PR #40 Re-review): child holds stdout/stderr FDs while
+    // the wrapper is already dead. destroyForcibly only kills the local `su`
+    // wrapper; a `su -c`-spawned child (e.g. pm) inheriting the pipe FDs keeps
+    // the pipes open, so without explicit close() the two daemon drains block
+    // in read() forever waiting for an EOF that never comes (2 leaked threads
+    // per cancel). Cleanup must close the local pipe ends (促使 read 返回/EOF)
+    // and bound the drain wait (SU_CANCEL_DRAIN_MS, cancellable, never wedging
+    // handover), so repeated cancels converge instead of accumulating.
+    // Fault injection: fake Process whose wait reports wrapper exit after
+    // destroy but whose streams never EOF on their own (simulated child-held
+    // pipes that only release on local close()).
+    // Scope note: this fake verifies reclaim wiring (cleanup calls close on
+    // both local pipe ends + bounded join), NOT OS-level close wake-up
+    // semantics (a real FileInputStream stuck in native read is not guaranteed
+    // to wake on close; HangingInputStream here is a close-pollable model that
+    // returns EOF once closed).
+    private class HangingInputStream : java.io.InputStream() {
+        @Volatile private var closed = false
+        val isClosed: Boolean get() = closed
+        override fun read(): Int {
+            while (!closed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw java.io.InterruptedIOException("interrupted")
+                }
+            }
+            return -1
+        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (closed) return -1
+            while (!closed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw java.io.InterruptedIOException("interrupted")
+                }
+            }
+            return -1
+        }
+        override fun close() {
+            closed = true
+        }
+    }
+
+    private class ChildHoldsPipeProcess : Process() {
+        val stdout = HangingInputStream()
+        val stderr = HangingInputStream()
+        @Volatile var destroyed = false
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream(): java.io.InputStream = stdout
+        override fun getErrorStream(): java.io.InputStream = stderr
+        override fun waitFor(): Int {
+            while (!destroyed) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+            return 0
+        }
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            val deadlineMs = System.currentTimeMillis() + unit.toMillis(timeout)
+            while (System.currentTimeMillis() < deadlineMs) {
+                if (destroyed) return true
+                try {
+                    Thread.sleep(5)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+            return destroyed
+        }
+        override fun exitValue(): Int {
+            if (!destroyed) throw IllegalThreadStateException("not exited")
+            return 1
+        }
+        override fun destroy() {}
+        override fun destroyForcibly(): Process {
+            // Only the wrapper dies; the simulated child keeps the pipe FDs
+            // open (streams stay hanging until cleanup closes them).
+            destroyed = true
+            return this
+        }
+        override fun isAlive(): Boolean = !destroyed
+    }
+
+    private fun aliveCaptureDrains(): Int =
+        Thread.getAllStackTraces().keys.count { t ->
+            t.isAlive && t.isDaemon && (t.name == "capture-stdout" || t.name == "capture-stderr")
+        }
+
+    @Test fun cancelWithChildHoldingPipe_doesNotAccumulateDrainThreads() = runBlocking {
+        // Settle leftovers from earlier tests so the final count belongs to
+        // this fault injection, not to prior real-process drains.
+        var spins = 0
+        while (aliveCaptureDrains() > 0 && spins < 50) {
+            delay(100L)
+            spins++
+        }
+        // Repeated cancels: each spawns 2 drains blocked on child-held pipes.
+        // Keep every fake so we can prove cleanup closed its pipes directly
+        // (deterministic) in addition to the global thread-count convergence
+        // below (which tolerates one foreign lingering drain under full-suite
+        // load, hence <= 4 rather than <= 2 -- old code leaves ~16 here).
+        // Thread safety: execFn runs on the Dispatchers.Default waiter while
+        // the test body reads after each join; CopyOnWriteArrayList removes the
+        // cross-thread data race a plain mutableListOf would have here.
+        val fakes = CopyOnWriteArrayList<ChildHoldsPipeProcess>()
+        var maxElapsed = 0L
+        repeat(8) { idx ->
+            val job = async(Dispatchers.Default) {
+                captureProcessCancellable(
+                    arrayOf("su", "-c", "pm install-existing --user 95 com.example.app"),
+                    timeoutMs = 30_000L,
+                    execFn = { _ -> ChildHoldsPipeProcess().also { fakes += it } },
+                )
+            }
+            // Let spawn + drains start and the wait go in flight.
+            delay(200L)
+            val startNs = System.nanoTime()
+            job.cancel()
+            try {
+                job.await()
+                fail("cancelled capture must throw CE (iter $idx)")
+            } catch (_: CancellationException) {
+                // Expected: caller released at once, wrapper destroyed best
+                // effort, remote child untouched (unknown-after-send).
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            if (elapsedMs > maxElapsed) maxElapsed = elapsedMs
+            assertTrue(
+                "cancel handover must stay fast with child-held pipes (iter $idx elapsed=${elapsedMs}ms)",
+                elapsedMs < 2_000L,
+            )
+        }
+        // Cancel-path joins abort at once (already cancelled; 600 ms is the
+        // non-cancel cap), so 1 s is generous margin for scheduling jitter.
+        assertTrue(
+            "worst cancel return must stay under 1 s with child-held pipes (maxElapsed=${maxElapsed}ms)",
+            maxElapsed < 1_000L,
+        )
+        // Deterministic: every cancel must have closed both local pipe ends,
+        // otherwise a surviving child holding the FDs pins the drains forever.
+        assertEquals("every child-holds-pipe fake must be observed", 8, fakes.size)
+        fakes.forEachIndexed { idx, fake ->
+            assertTrue("cancel must close stdout pipe (iter $idx)", fake.stdout.isClosed)
+            assertTrue("cancel must close stderr pipe (iter $idx)", fake.stderr.isClosed)
+        }
+        // Bounded convergence: close() above lets the blocked reads
+        // return/EOF so drains die async instead of accumulating 2 per cancel
+        // (old code would leave ~16 alive here).
+        // Primary verdict is the deterministic isClosed check above; the
+        // thread count below stays a weak backstop (tolerates foreign drains
+        // under full-suite load, hence <= 4 rather than <= 2).
+        val deadlineMs = System.currentTimeMillis() + 5_000L
+        var alive = aliveCaptureDrains()
+        while (alive > 4 && System.currentTimeMillis() < deadlineMs) {
+            delay(100L)
+            alive = aliveCaptureDrains()
+        }
+        assertTrue(
+            "daemon drain threads must converge after child-holds-pipe cancels (alive=$alive, expected<=4 not 16)",
+            alive <= 4,
+        )
+        // Post-reclaim health: a fresh call right after the 8 child-held
+        // cancels must still succeed fast (later calls unaffected).
+        val nextStartNs = System.nanoTime()
+        val next = captureProcessCancellable(arrayOf("sh", "-c", "echo ok"), timeoutMs = 5_000L)
+        val nextElapsedMs = (System.nanoTime() - nextStartNs) / 1_000_000L
+        assertEquals("call after child-held cancels must succeed", "ok\n", next.out)
+        assertTrue(
+            "call after child-held cancels must be fast (elapsed=${nextElapsedMs}ms)",
+            nextElapsedMs < 2_000L,
+        )
+    }
+
+    // H2 (P2 verification core): real ProcessBuilder + inherited-pipe live-child fault injection.
+    // Background: the HangingInputStream fake above is close-pollable (close lets the blocked
+    // read return EOF), but the reviewer proved real OS semantics differ: close() does NOT
+    // guarantee waking a native read blocked on a child-held pipe (Java 21 probe:
+    // ProcessPipeInputStream drains stay stuck 3-10 s after close, only exiting when the
+    // sleep child is killed). This test therefore uses TRUE OS semantics and must NOT expect
+    // convergence -- stuck threads/slots while the child lives are EXPECTED (this is exactly
+    // why the H1 drain budget exists). What it verifies instead is bound + handover +
+    // subsequent availability:
+    //   (a) every cancel handover stays < 2 s (this also covers the reviewer side-note:
+    //       close() itself runs synchronously on the cancel caller with no deadline, so a
+    //       blocking close would fail this bound);
+    //   (b) activeDrainCount stays <= MAX_ACTIVE_DRAINS throughout and reader threads stay
+    //       bounded (<= MAX + small margin) -- non-zero is allowed (real stuck is expected),
+    //       divergence is not. Contrast with the fake test's `<= 4` convergence assertion:
+    //       the fake CAN converge because its reads are close-pollable; the real child-held
+    //       pipe CANNOT until the child dies, so only an upper bound is asserted here.
+    //   (c) a normal `echo ok` still returns fast afterwards (new operations stay
+    //       usable; truncated=true accepted as degraded fail-closed).
+    // Setup: wrapper `bash -c "exec -a H2TAG_<uuid> sleep 25 & wait"` -- the
+    // direct child (bash) dies on destroyForcibly while the background sleep
+    // inherits stdout/stderr pipes and survives the whole test (25 s >> test
+    // elapsed ~5 s, by construction). `exec -a` sets the sleep child's argv[0]
+    // to a per-test UUID tag (`wait` keeps wrapper-alive semantics unchanged),
+    // so the finally pkill below (`pkill -9 -f 'H2TAG_<uuid>'`) only reaps
+    // this test's children -- the old `sleep 25` pattern would match foreign
+    // same-name processes (5th-round P3). Host-JVM-only (needs bash/sleep/pkill,
+    // same host assumption as the existing sh/sleep usage in this file).
+    // execFn ignores the su argv (same idea as the ChildHoldsPipeProcess fake) and spawns
+    // the real wrapper. Android unit-test compile uses android.jar stubs (no Java 9
+    // ProcessHandle/pid/toHandle), so child liveness is NOT asserted via pid -- it follows
+    // from the 25 s duration plus the stuck-drain/count observation below (wrapper dead
+    // yet drains/count still held => a survivor holds the pipes; close-wakeup is racy so
+    // no lower-bound is asserted -- either stuck or early-EOF is real OS semantics).
+    // Iterations: 6 x 2 = 12 slots < 16, so the normal path is verified without triggering
+    // degrade (the exhausted-degrade path is already covered by drainBudgetExhausted).
+    // Pollution control: stuck slots would otherwise linger 25 s; finally pkill -9s the
+    // sleep 25 survivors so drains EOF and slots release (existing drain-loop pattern).
+    @Test fun childHeldPipeRepeatedCancels_staysBoundedAndHandsOver() = runBlocking {
+        // Host-JVM-only premise: bash must exist. assumeTrue aborts (not
+        // vacuously passes) when bash is missing, instead of silently running
+        // with a broken wrapper setup.
+        assumeTrue(
+            "H2 needs bash (host-JVM only)",
+            java.io.File("/bin/bash").exists() || java.io.File("/usr/bin/bash").exists(),
+        )
+        // Per-test UUID tag for the sleep child's argv[0]; the finally pkill
+        // below matches only this tag (never foreign `sleep` processes).
+        val h2Tag = "H2TAG_" + java.util.UUID.randomUUID().toString().replace("-", "")
+        delay(500L)
+        val baseCount = activeDrainCount.get()
+        val baseThreads = aliveCaptureDrains()
+        assertTrue("drain count must never exceed cap at start (base=$baseCount)", baseCount <= MAX_ACTIVE_DRAINS)
+        val procs = CopyOnWriteArrayList<Process>()
+        val gw = SuCmdGateway(
+            execFn = { _ -> ProcessBuilder("bash", "-c", "exec -a $h2Tag sleep 25 & wait").start().also { procs += it } },
+            monoMs = ::defaultMonoMs,
+        )
+        val iterations = 6
+        val elapsedList = mutableListOf<Long>()
+        var maxElapsed = 0L
+        var maxCount = baseCount
+        try {
+            repeat(iterations) { idx ->
+                val job = async(Dispatchers.Default) { gw.run("pm list users") }
+                // Let spawn + drains start and the wait go in flight. Poll for the proc
+                // to appear (exec runs on Dispatchers.IO inside the gateway).
+                var spins = 0
+                while (procs.size <= idx && spins < 50) {
+                    delay(100L)
+                    spins++
+                }
+                assertTrue("wrapper proc must spawn (iter $idx)", procs.size > idx)
+                val proc = procs[idx]
+                // Give `sleep 25 &` a moment to start and inherit the pipes (probe:
+                // child present after ~300 ms; wrapper must still be alive here
+                // or the setup itself is broken).
+                delay(300L)
+                assertTrue("wrapper must be alive before cancel (iter $idx)", proc.isAlive)
+                val startNs = System.nanoTime()
+                job.cancel()
+                try {
+                    job.await()
+                    fail("cancelled capture must throw CE (iter $idx)")
+                } catch (_: CancellationException) {
+                    // Expected: caller released at once, wrapper destroyed best
+                    // effort, remote child untouched (unknown-after-send).
+                }
+                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                elapsedList += elapsedMs
+                if (elapsedMs > maxElapsed) maxElapsed = elapsedMs
+                assertTrue(
+                    "cancel handover must stay fast with real child-held pipe (iter $idx elapsed=${elapsedMs}ms)",
+                    elapsedMs < 2_000L,
+                )
+                val cur = activeDrainCount.get()
+                if (cur > maxCount) maxCount = cur
+                assertTrue(
+                    "drain count must never exceed cap (iter $idx count=$cur)",
+                    cur <= MAX_ACTIVE_DRAINS,
+                )
+                // Wrapper must die quickly (destroyForcibly SIGKILLs sh).
+                var wspins = 0
+                while (proc.isAlive && wspins < 50) {
+                    delay(100L)
+                    wspins++
+                }
+                assertFalse("wrapper must die after cancel (iter $idx)", proc.isAlive)
+                // No available()/read-based stream-closed assert here (android.jar
+                // has no ProcessHandle, and JDK 21 probe showed
+                // ProcessPipeInputStream.available() blocks ~24 s behind a stuck
+                // concurrent read -- asserting via it would wedge the test for the
+                // full sleep duration instead of verifying production). Close
+                // determinism is covered by the fake above (isClosed); here the
+                // < 2 s handover bound IS the close-blocking verification: close()
+                // itself runs synchronously on the cancel path with no deadline,
+                // so a blocking close would fail the elapsed bound (reviewer note).
+                // No direct child-pid assert either: child survival follows from
+                // `sleep 25` duration (whole test ~5 s when fast) plus
+                // wrapper-dead-yet-count-held -- a survivor must still hold the
+                // write ends whenever drains stay stuck (early-EOF via a racy
+                // close-wakeup is also real semantics, so no lower bound).
+                // Thread bound per iteration: at most 2 new stuck drains per cancel
+                // plus base plus small scheduling margin (drains start synchronously
+                // before the wait, so no startup race beyond 4).
+                val alive = aliveCaptureDrains()
+                assertTrue(
+                    "reader threads must stay bounded (iter $idx alive=$alive base=$baseThreads)",
+                    alive <= baseThreads + (idx + 1) * 2 + 4,
+                )
+            }
+            assertTrue(
+                "worst cancel handover must stay under 2 s with real child-held pipes (maxElapsed=${maxElapsed}ms per-iter=$elapsedList)",
+                maxElapsed < 2_000L,
+            )
+            assertTrue("drain count must never exceed cap (maxCount=$maxCount)", maxCount <= MAX_ACTIVE_DRAINS)
+            // Fault-injection premise: at least one drain must have stayed stuck
+            // (count rose above base) while the tagged sleep child held the pipes.
+            // If `exec -a` were unsupported the child would exit at once, drains
+            // would EOF immediately and this fails loudly instead of passing
+            // vacuously with no pressure applied.
+            assertTrue(
+                "H2 premise: at least one drain must stay stuck while the tagged child lives (base=$baseCount maxCount=$maxCount)",
+                maxCount > baseCount,
+            )
+            // Absolute bound (vs fake `<= 4` convergence): real stuck is expected so
+            // non-zero is fine, but it must never diverge past the budget + margin
+            // for foreign lingering drains under full-suite load.
+            val finalAlive = aliveCaptureDrains()
+            assertTrue(
+                "reader threads must stay bounded with real child-held pipes (alive=$finalAlive base=$baseThreads, expected<=${MAX_ACTIVE_DRAINS + 4} not unbounded)",
+                finalAlive <= MAX_ACTIVE_DRAINS + 4,
+            )
+            println("H2 handover elapsed ms per iter=$elapsedList max=${maxElapsed}ms maxCount=$maxCount finalCount=${activeDrainCount.get()} finalThreads=$finalAlive baseCount=$baseCount baseThreads=$baseThreads")
+            // Post-pressure health while stuck slots are still held (12 < 16 leaves
+            // room): a fresh call must still return fast (later calls unaffected).
+            val nextStartNs = System.nanoTime()
+            val next = withTimeoutOrNull(10_000L) {
+                captureProcessCancellable(arrayOf("sh", "-c", "echo ok"), timeoutMs = 5_000L)
+            }
+            assertTrue("call after real child-held cancels must still return (not wedged)", next != null)
+            val nextElapsedMs = (System.nanoTime() - nextStartNs) / 1_000_000L
+            // Fast return is asserted unconditionally (mid-storm new operations
+            // stay usable); the truncated/out state is degrade-tolerant below.
+            assertTrue(
+                "call after real child-held cancels must be fast (elapsed=${nextElapsedMs}ms)",
+                nextElapsedMs < 2_000L,
+            )
+            if (next!!.truncated) {
+                // Accepted as degraded fail-closed: under full-suite load foreign
+                // lingering drains may already fill the slots, so fail-closed
+                // (truncated=true, no wait) is the expected slots-full behavior,
+                // not a regression -- availability (fast return) is what matters.
+            } else {
+                assertEquals("call after real child-held cancels must succeed", "ok\n", next.out)
+            }
+        } finally {
+            // Do not pollute the suite: the tagged 25 s sleeps would otherwise pin
+            // slots for the rest of the run. pkill -9s only this test's survivors
+            // via the per-test UUID tag (H2TAG_<uuid>), so drains EOF and release
+            // (foreign same-name processes are never matched -- 5th-round P3).
+            // Best-effort only (never masks the main verdict); leftovers expire
+            // naturally with the 25 s sleep and the next tests tolerate a
+            // non-zero base (drainBudgetExhausted fills remaining).
+            // Best-effort detail: if pkill is missing or its -f semantics differ,
+            // `; true` + the catch swallow it silently; leftovers expire naturally
+            // with the 25 s sleep and later tests tolerate a non-zero base.
+            // Host-JVM unit-test only (not device/proxybox).
+            try {
+                ProcessBuilder("sh", "-c", "pkill -9 -f '$h2Tag'; true").start().waitFor(5, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+            }
+            for (p in procs) {
+                try {
+                    p.destroyForcibly()
+                } catch (_: Exception) {
+                }
+            }
+            for (p in procs) {
+                try {
+                    p.waitFor(2, TimeUnit.SECONDS)
+                } catch (_: Exception) {
+                }
+                try {
+                    p.inputStream.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    p.errorStream.close()
+                } catch (_: Exception) {
+                }
+            }
+            var spins = 0
+            while (activeDrainCount.get() > baseCount && spins < 100) {
+                delay(100L)
+                spins++
+            }
+        }
+    }
+
+    // Phase A3 P2-2 (PR #40 Re-review): fake whose timed waitFor slices block
+    // like a real hung `su` (sleeps the requested slice, reports not-exited)
+    // while the zero-time poll reports the truth without blocking. Lets the
+    // tests below drive the injected monotonic clock while real time only
+    // paces the poll slices.
+    private class NeverExitingProcess : Process() {
+        override fun getOutputStream() = ByteArrayOutputStream()
+        override fun getInputStream() = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int = throw UnsupportedOperationException("no-arg waitFor unused")
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            if (timeout <= 0) return false
+            try {
+                Thread.sleep(minOf(unit.toMillis(timeout), SU_WAIT_POLL_MS))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw e
+            }
+            return false
+        }
+        override fun exitValue(): Int = throw IllegalThreadStateException("not exited")
+        override fun destroy() {}
+        override fun destroyForcibly(): Process = this
+        override fun isAlive(): Boolean = true
+    }
+
+    // Phase A3 P2-2 regression (falsifiable): the helpers measure elapsed
+    // time on the injectable monotonic clock only (mono-only design, never a
+    // System.currentTimeMillis wall deadline). A previous version of these
+    // tests moved a fakeWallMs variable that production never reads (decoy:
+    // helpers only take a monoMs parameter), so a wall-clock implementation
+    // passed vacuously -- the decoy is therefore removed, not moved.
+    // Falsifiability instead comes from freezing mono while REAL time runs
+    // past the budget: a wall-clock implementation (`deadline =
+    // currentTimeMillis + timeout`) would expire after ~300 ms of real time
+    // regardless of the frozen mono, failing the still-waiting assertion
+    // below; the mono implementation stays waiting until mono advances.
+    // Margin is deliberately loose (1 s real vs 300 ms budget, >3x) so CI
+    // jitter cannot flip the verdict; the 5 s withTimeoutOrNull ceiling only
+    // bounds hangs.
+    @Test fun awaitExitFrozenMonoDoesNotExpire_monoAdvanceExpiresImmediately() = runBlocking {
+        val monoMs = AtomicLong(0L) // frozen: never advances until the second phase
+        val proc = NeverExitingProcess()
+        val done = async(Dispatchers.Default) {
+            cancellableAwaitExit(proc, timeoutMs = 300L, monoMs = { monoMs.get() })
+        }
+        // Real time (1 s) runs well past the 300 ms budget while mono stays 0.
+        // A wall-clock implementation would have timed out at ~300 ms real;
+        // the mono implementation must still be waiting.
+        delay(1_000L)
+        assertFalse(
+            "frozen mono must not expire even after 1 s real > 300 ms budget (wall impl would fail here)",
+            done.isCompleted,
+        )
+        // Advance mono past the budget: expiry must now be immediate (one
+        // poll slice, well under the loose 2 s bound / 5 s ceiling).
+        monoMs.set(300L)
+        val startNs = System.nanoTime()
+        val finished = withTimeoutOrNull(5_000L) { done.await(); true } ?: false
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertTrue("mono advance past budget must expire the wait", finished)
+        assertTrue(
+            "mono expiry must be immediate (elapsed=${elapsedMs}ms)",
+            elapsedMs < 2_000L,
+        )
+        assertFalse("hung proc reports timeout (false), not exit", done.await())
+    }
+
+    // Same frozen-mono falsifiability for the drain-join budget: the join
+    // returns once monotonic elapsed reaches the budget, not after real time
+    // passes it. A wall-clock join would return at ~300 ms real despite the
+    // frozen mono and fail the still-waiting assertion; the mono join stays
+    // until mono advances.
+    @Test fun joinFrozenMonoDoesNotExpire_monoAdvanceExpiresImmediately() = runBlocking {
+        val monoMs = AtomicLong(0L) // frozen: never advances until the second phase
+        val sleeper = thread(isDaemon = true, name = "p22-fake-drain") {
+            try {
+                Thread.sleep(30_000L)
+            } catch (_: InterruptedException) {
+                // Expected on cleanup below.
+            }
+        }
+        try {
+            val job = async(Dispatchers.Default) {
+                cancellableJoin(sleeper, budgetMs = 300L, monoMs = { monoMs.get() })
+            }
+            // Real time (1 s) runs well past the 300 ms budget while mono stays 0.
+            delay(1_000L)
+            assertFalse(
+                "frozen mono must not expire the join even after 1 s real > 300 ms budget (wall impl would fail here)",
+                job.isCompleted,
+            )
+            // Advance mono past the budget: the join must return at once
+            // while the thread is still alive (caller re-checks isAlive).
+            monoMs.set(300L)
+            val startNs = System.nanoTime()
+            val finished = withTimeoutOrNull(5_000L) { job.await(); true } ?: false
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("mono advance past budget must expire the join", finished)
+            assertTrue(
+                "mono join expiry must be immediate (elapsed=${elapsedMs}ms)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "budget expiry returns while the thread is alive (caller re-checks isAlive)",
+                sleeper.isAlive,
+            )
+        } finally {
+            sleeper.interrupt()
+        }
+    }
+
+    // H1 drain budget (P2 backpressure) + I1 pair reservation (5th-round P2):
+    // 16 slots = 8 stuck captures. Reserve→spawn→drain: a capture holds both
+    // slots BEFORE spawn, so when exhausted the command never starts (fast
+    // definite resource-exhausted, never-sent, no timeout wait); after release,
+    // normal drains recover (echo, truncated=false).
+    @Test fun drainBudgetExhausted_failClosedWithoutWedging_thenRecovers() = runBlocking {
+        // Base may be non-zero: earlier tests can park stuck drains on
+        // child-held pipes (close does not unblock a native read held by a
+        // surviving `sleep` child) -- that is exactly why the H1 cap exists.
+        // So fill only the REMAINING slots instead of assuming a zero start.
+        // Brief settle for async releases, then record the base.
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        val needed = MAX_ACTIVE_DRAINS - base
+        repeat(needed) { idx ->
+            assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+        }
+        try {
+            assertEquals(MAX_ACTIVE_DRAINS, activeDrainCount.get())
+            assertFalse("extra acquire must fail when budget exhausted", tryAcquireDrainSlot())
+            assertFalse("pair reserve must fail when budget exhausted", tryReserveDrainPair())
+            // One capture while exhausted: must still return fast, fail closed
+            // as definite resource-exhausted (I1: never spawned, no resend).
+            val startNs = System.nanoTime()
+            val degraded = withTimeoutOrNull(10_000L) {
+                captureProcessCancellable(arrayOf("sh", "-c", "echo hi"), timeoutMs = 5_000L)
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("exhausted capture must still return (not wedged)", degraded != null)
+            val res = degraded!!
+            assertTrue("exhausted capture must be truncated (fail closed), got: $res", res.truncated)
+            // I1 definite: never-sent (exit 1, no flags, never timeout text).
+            assertEquals("exhausted capture must be definite exit 1, got: $res", 1, res.exit)
+            assertEquals("exhausted capture must carry empty out, got: $res", "", res.out)
+            assertTrue("exhausted err must name the drain budget, got: \"${res.err}\"", res.err.contains("resource exhausted") && res.err.contains("no drain slots"))
+            assertFalse("resource-exhausted must not carry timedOut (definite, never sent), got: $res", res.timedOut)
+            assertFalse("resource-exhausted must not carry transportUnknown (definite, never sent), got: $res", res.transportUnknown)
+            assertTrue(
+                "exhausted capture must be fast (elapsed=${elapsedMs}ms, not the 5 s timeout)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+        } finally {
+            repeat(needed) { releaseDrainSlot() }
+        }
+        assertEquals(base, activeDrainCount.get())
+        // Recovered: normal drain succeeds with clean EOF, truncated=false.
+        val ok = withTimeoutOrNull(10_000L) {
+            captureProcessCancellable(arrayOf("sh", "-c", "echo hi"), timeoutMs = 5_000L)
+        }
+        assertTrue("recovered capture must return", ok != null)
+        assertEquals(0, ok!!.exit)
+        assertEquals("hi\n", ok.out)
+        assertFalse("recovered capture must not be truncated, got: $ok", ok.truncated)
+        assertEquals(base, activeDrainCount.get())
+    }
+
+    // I1-①: 16/16 full + large output (>64 KB pipe buffer) must fail fast
+    // WITHOUT spawning (execFn call count == 0 is the never-sent decisive
+    // proof). Without the pair reservation the child would block in pipe
+    // write() with no drains and drag to the 10 s timeout; with it the reply
+    // is definite resource-exhausted in << timeout with no flags (writes
+    // never resend, lists fail closed via exit != 0).
+    @Test fun drainPairFull_largeOutputFailsFastWithoutSpawn() = runBlocking {
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        val needed = MAX_ACTIVE_DRAINS - base
+        repeat(needed) { idx ->
+            assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+        }
+        try {
+            assertEquals(MAX_ACTIVE_DRAINS, activeDrainCount.get())
+            val execCalls = AtomicInteger(0)
+            val startNs = System.nanoTime()
+            val res = withTimeoutOrNull(15_000L) {
+                captureProcessCancellable(
+                    arrayOf("sh", "-c", "head -c 1048576 /dev/zero"),
+                    timeoutMs = 10_000L,
+                    execFn = { argv ->
+                        execCalls.incrementAndGet()
+                        Runtime.getRuntime().exec(argv)
+                    },
+                )
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("full-budget large-output capture must return (not wedged)", res != null)
+            val r = res!!
+            assertEquals("full-budget must be definite exit 1, got: $r", 1, r.exit)
+            assertEquals("full-budget must carry empty out, got: $r", "", r.out)
+            assertTrue("full-budget err must name the drain budget, got: \"${r.err}\"", r.err.contains("resource exhausted") && r.err.contains("no drain slots"))
+            assertTrue("full-budget must be truncated (fail closed), got: $r", r.truncated)
+            assertFalse("full-budget must not carry timedOut (definite, never sent), got: $r", r.timedOut)
+            assertFalse("full-budget must not carry transportUnknown (definite, never sent), got: $r", r.transportUnknown)
+            // Wire-text backstops must not hit: definite must not look like
+            // unknown-after-send.
+            assertFalse("resource-exhausted must not hit timeout backstop, got: \"${r.err}\"", r.err.startsWith("timeout after ") || r.err.startsWith("shizuku: exec timed out after "))
+            assertFalse("resource-exhausted must not hit post-spawn backstop, got: \"${r.err}\"", r.err.startsWith("interrupted: ") || r.err.startsWith("service exec failed: "))
+            assertEquals("full-budget must never spawn (never-sent), got calls=${execCalls.get()}", 0, execCalls.get())
+            assertTrue(
+                "full-budget large-output must fail fast (elapsed=${elapsedMs}ms, far below 10 s timeout)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+            println("I1 full-budget: elapsed=${elapsedMs}ms execCalls=${execCalls.get()} count=${activeDrainCount.get()}")
+        } finally {
+            repeat(needed) { releaseDrainSlot() }
+        }
+        assertEquals(base, activeDrainCount.get())
+    }
+
+    // I1-②: only 1 slot free (15/16 held) + large output must still fail fast
+    // without spawning -- proves the reservation is atomic-pair (count<=14),
+    // not single-slot.
+    @Test fun drainPairSingleSlot_largeOutputStillFailsFastWithoutSpawn() = runBlocking {
+        delay(500L)
+        val base = activeDrainCount.get()
+        assertTrue("drain count must never exceed cap at start (base=$base)", base <= MAX_ACTIVE_DRAINS)
+        // Fill to exactly MAX-1 = 15 held, 1 free. If base already > 15 (stuck
+        // storm residue), no fill is needed -- the pair still cannot fit, so
+        // the same fast-definite verdict applies.
+        val target = MAX_ACTIVE_DRAINS - 1
+        val needed = target - base
+        if (needed > 0) {
+            repeat(needed) { idx ->
+                assertTrue("slot $idx must acquire when budget free", tryAcquireDrainSlot())
+            }
+        }
+        try {
+            val cur = activeDrainCount.get()
+            assertTrue("single-slot setup must hold >=15 (cur=$cur)", cur >= target)
+            assertTrue("single-slot setup must never exceed cap (cur=$cur)", cur <= MAX_ACTIVE_DRAINS)
+            assertFalse("pair reserve must fail with only 1 slot free (cur=$cur)", tryReserveDrainPair())
+            // tryReserveDrainPair failure must not leak: count unchanged.
+            assertEquals(cur, activeDrainCount.get())
+            val execCalls = AtomicInteger(0)
+            val startNs = System.nanoTime()
+            val res = withTimeoutOrNull(15_000L) {
+                captureProcessCancellable(
+                    arrayOf("sh", "-c", "head -c 1048576 /dev/zero"),
+                    timeoutMs = 10_000L,
+                    execFn = { argv ->
+                        execCalls.incrementAndGet()
+                        Runtime.getRuntime().exec(argv)
+                    },
+                )
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("single-slot large-output capture must return (not wedged)", res != null)
+            val r = res!!
+            assertEquals("single-slot must be definite exit 1, got: $r", 1, r.exit)
+            assertEquals("single-slot must carry empty out, got: $r", "", r.out)
+            assertTrue("single-slot err must name the drain budget, got: \"${r.err}\"", r.err.contains("resource exhausted") && r.err.contains("no drain slots"))
+            assertTrue("single-slot must be truncated (fail closed), got: $r", r.truncated)
+            assertFalse("single-slot must not carry timedOut, got: $r", r.timedOut)
+            assertFalse("single-slot must not carry transportUnknown, got: $r", r.transportUnknown)
+            assertFalse("resource-exhausted must not hit timeout backstop, got: \"${r.err}\"", r.err.startsWith("timeout after ") || r.err.startsWith("shizuku: exec timed out after "))
+            assertFalse("resource-exhausted must not hit post-spawn backstop, got: \"${r.err}\"", r.err.startsWith("interrupted: ") || r.err.startsWith("service exec failed: "))
+            assertEquals("single-slot must never spawn (non-pair never starts), got calls=${execCalls.get()}", 0, execCalls.get())
+            assertTrue(
+                "single-slot large-output must fail fast (elapsed=${elapsedMs}ms, far below 10 s timeout)",
+                elapsedMs < 2_000L,
+            )
+            assertTrue(
+                "drain count must never exceed cap (count=${activeDrainCount.get()})",
+                activeDrainCount.get() <= MAX_ACTIVE_DRAINS,
+            )
+            println("I1 single-slot: elapsed=${elapsedMs}ms execCalls=${execCalls.get()} count=${activeDrainCount.get()} curSetup=$cur")
+        } finally {
+            if (needed > 0) {
+                repeat(needed) { releaseDrainSlot() }
+            }
+        }
+    }
+}

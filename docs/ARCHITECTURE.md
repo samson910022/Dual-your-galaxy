@@ -77,7 +77,10 @@ val privilege: Privilege = when {
 
 - Parses `pm list packages`, `dumpsys`, and Samsung dual-app service output.
 - Returns structured `DualAppInfo(packageName, userId, dualEnabled)` list.
-- Tolerant parser: ignores unknown lines, trims whitespace, handles empty output.
+- `parsePackagesTrusted(out/err/exit/truncated)` is the fail-closed whitelist judge (`PmOutputParser.kt:386-459`): `TrustedFull(packages)` = clean listing containing these exact packages; `TrustedEmpty` = clean listing with zero `package:` lines (confirmed empty); `Unknown(reason)` = uncheckable (truncated / non-zero exit / error-semantic / unexpected format / stderr residue, `detail` aliases `reason`).
+- Whitelist rule: every non-blank stdout line must be a legal `package:` line (case-insensitive, same as `TRUSTED_EXEMPT_LINE`) with payload `^[A-Za-z0-9._-]+$` (`PACKAGE_PAYLOAD`, trusted-path only), and stderr must be fully blank; `unexpected listing format` / `malformed package line` / `unexpected stderr` never count as empty (fail closed).
+- `installed for user` echo is not exempt on the trusted path (only `package:` / `Success` lines skip the error scan); any `Failure` line (`ALREADY_EXISTS` included) makes the listing `Unknown`.
+- `parsePackages()` itself stays tolerant for compatibility (ignores unknown lines, trims whitespace) and never authorizes writes; trusted decisions always go through `parsePackagesTrusted` (`verifyListProbe` / `listProbe`).
 - Unit-testable with static golden strings, no device required.
 
 ## Data Flow
@@ -87,6 +90,19 @@ val privilege: Privilege = when {
 3. Gateway runs `pm` / `dumpsys` commands.
 4. Raw stdout goes through `PmOutputParser` into UI state.
 5. Hook path (ROOT) may bypass shell by calling the dual-app service directly.
+6. Concurrency boundary (#24; busy = `UiState.loading`, merge = coalesce):
+   `opMutex` serializes probe/refresh/clone/remove; rapid refresh taps coalesce
+   into one trailing run, clone/request-remove/confirm dedup by op key (`already in progress`,
+   three namespaces `clone:<pkg>` / `request-remove:<pkg>` / `remove:<pkg>@<id>#<serial>#<ts>` generation-bound by serial);
+   every repo call runs via `onIo` on `Dispatchers.IO`.
+   Write replies `timedOut ‖ transportUnknown ‖ isPostSpawnTransportText ‖ isServiceTimeoutText` go verify-first (single bounded read-only `verifyListProbe`, never resend the write).
+   Reverse observations are always Unknown (present-after-remove / absent-after-clone never claim StillInstalled/VerifyFailed); before/after pin drift → `VerifyUnknown` (identity-changed).
+   `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
+   註：`DualViewModel.refreshLocked()` 目前仍走 9 命令 resolve-then-reverify 舊路徑（`DualViewModel.kt:399-490`），遷移到 `refreshVerified()` 5 命令為 follow-up；兩者同為 fail-closed，僅命令數差異。
+
+   測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
+   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24；`app/src/androidTest` 尚不存在，本 PR 不新建）。
+   本 PR 只保證 JVM 語意 + CI 綠燈。
 
 ## Non-Goals
 
