@@ -118,8 +118,10 @@ class RotationTest {
             HarnessPoll.await { vm.state.value.pendingRemove != null }
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                Espresso.onIdle()
                 onView(withText("確認移除分身")).check(matches(isDisplayed()))
                 scenario.recreate()
+                Espresso.onIdle()
                 onView(withText("確認移除分身")).check(matches(isDisplayed()))
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
