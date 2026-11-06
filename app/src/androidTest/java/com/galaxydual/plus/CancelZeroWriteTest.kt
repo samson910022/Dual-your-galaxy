@@ -35,6 +35,7 @@ class CancelZeroWriteTest {
             HarnessPoll.await { vm.state.value.pendingRemove != null }
             assertNotNull(vm.state.value.pendingRemove)
             assertEquals("request must not uninstall", 0, gw.uninstallCalls)
+            assertEquals("request must not write", 0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
@@ -54,6 +55,7 @@ class CancelZeroWriteTest {
             HarnessPoll.await { vm.state.value.pendingRemove == null }
             assertNull(vm.state.value.pendingRemove)
             assertEquals("cancel must not uninstall", 0, gw.uninstallCalls)
+            assertEquals("cancel must not write", 0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
@@ -73,6 +75,7 @@ class CancelZeroWriteTest {
             vm.confirmRemove()
             HarnessPoll.await { vm.state.value.msg.contains("沒有待確認") }
             assertEquals("confirm after cancel must not uninstall", 0, gw.uninstallCalls)
+            assertEquals("confirm after cancel must not write", 0, gw.writeCalls)
             assertNull(vm.state.value.pendingRemove)
         } finally {
             vm.dispose()
@@ -86,9 +89,6 @@ class CancelZeroWriteTest {
             onView(withText("Clone")).check(matches(isDisplayed()))
             onView(withText("Remove")).check(matches(isDisplayed()))
             onView(withText("重新連線並更新")).check(matches(isDisplayed()))
-            scenario.onActivity { activity ->
-                activity.title?.toString() ?: ""
-            }
         }
     }
 }

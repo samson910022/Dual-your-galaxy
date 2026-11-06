@@ -37,6 +37,7 @@ class InputRestoreTest {
             assertEquals("mail", vm.state.value.sourceQuery)
             assertEquals(0, gw.uninstallCalls)
             assertEquals(0, gw.installCalls)
+            assertEquals(0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
@@ -63,6 +64,7 @@ class InputRestoreTest {
             HarnessPoll.await { vm.state.value.selectedKeys.isEmpty() }
             assertTrue(vm.state.value.selectedKeys.isEmpty())
             assertEquals("toggle/clear must never uninstall", 0, gw.uninstallCalls)
+            assertEquals("toggle/clear must never write", 0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
@@ -79,6 +81,7 @@ class InputRestoreTest {
             // 旋轉語義 = 同實例：偏好不變（預設 AUTO）。
             assertEquals(pref, vm.state.value.channel)
             assertEquals(0, gw.uninstallCalls)
+            assertEquals(0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
