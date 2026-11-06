@@ -275,6 +275,16 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleDebugAndroidTest --no-daemon
+      - name: Upload APK artifacts (debug + androidTest)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 14
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
@@ -324,7 +334,10 @@ jobs:
           api-level: 34
           target: default
           arch: x86_64
-          script: ./gradlew :app:connectedDebugAndroidTest --no-daemon
+          disable-animations: true
+          script: |
+            chmod +x ./gradlew
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Upload instrumentation reports
         if: always()
         uses: actions/upload-artifact@v4
