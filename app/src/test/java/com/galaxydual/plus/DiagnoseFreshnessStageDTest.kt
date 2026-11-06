@@ -119,6 +119,32 @@ class DiagnoseFreshnessStageDTest {
         assertTrue("ipv6 full form must still mask, got: $full", full.contains("<ip>"))
     }
 
+    // M：純數字完整 8 段 IPv6 不得穿透；短冒號/版本/數字仍保留可讀性。
+    @Test
+    fun m_pureNumericFullIpv6_masked_shortColonsKept() {
+        assertEquals("<ip>", redactIp("2001:0:0:0:0:0:0:1"))
+        assertEquals("<ip>", redactIp("1:2:3:4:5:6:7:8"))
+        assertEquals("addr <ip> end", redactIp("addr 2001:0:0:0:0:0:0:1 end"))
+        assertEquals("addr <ip> end", redactIp("addr 1:2:3:4:5:6:7:8 end"))
+
+        assertEquals("12:34:56", redactIp("12:34:56"))
+        assertEquals("12:34", redactIp("12:34"))
+        assertEquals("v1.2.3", redactIp("v1.2.3"))
+        assertEquals("user 95", redactIp("user 95"))
+    }
+
+    // M 匯出端到端：含純數字完整 8 段 IPv6 的 techDetail 不洩 raw。
+    @Test
+    fun m_export_pureNumericIpv6Tech_noRawLeak() {
+        val raw = "2001:0:0:0:0:0:0:1"
+        val state = UiState(
+            diagnose = diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = "ip $raw port 5555"),
+        )
+        val text = buildDiagnosticExport(state)
+        assertFalse("export must not leak pure-numeric ipv6, got: $text", text.contains(raw))
+        assertTrue("export must carry ip marker, got: $text", text.contains("<ip>"))
+    }
+
     // D3 匯出 IPv4 不洩 raw。
     @Test
     fun d3_export_ipTech_noRawLeak() {
