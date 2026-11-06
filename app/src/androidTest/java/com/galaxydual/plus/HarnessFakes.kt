@@ -28,9 +28,9 @@ import com.galaxydual.core.SuElevator
 // block on it; call from the test thread only).
 object HarnessPoll {
     fun await(timeoutMs: Long = 10_000L, cond: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
         while (!cond()) {
-            if (System.currentTimeMillis() > deadline) {
+            if (System.nanoTime() > deadline) {
                 throw AssertionError("harness timeout waiting for condition")
             }
             Thread.sleep(50)
@@ -46,6 +46,8 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
     override val privilege: Privilege = Privilege.ROOT
     var uninstallCalls = 0
     var installCalls = 0
+    var writeCalls = 0
+    val commandLog = mutableListOf<String>()
     var serial: Int = 15
     val installedPkgs = mutableSetOf("com.example.chat")
 
@@ -72,6 +74,14 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
                 "    userType=android.os.usertype.profile.CLONE\n")
 
     override suspend fun run(cmd: String): CmdResult {
+        commandLog.add(cmd)
+        // Read-only commands (pm list, cmd user list -v, dumpsys, id) are
+        // NOT counted; only known write verbs are.
+        if (cmd.startsWith("pm uninstall") || cmd.startsWith("pm install") ||
+            cmd.startsWith("pm grant") || cmd.startsWith("am ") ||
+            (cmd.startsWith("cmd ") && !cmd.startsWith("cmd user list"))) {
+            writeCalls++
+        }
         return when {
             cmd.trim() == "id -u" ->
                 CmdResult(exit = 0, out = "0\n", err = "")
@@ -85,12 +95,24 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
                 CmdResult(exit = 0, out = "$dualId\n", err = "")
             cmd.startsWith("pm uninstall") -> {
                 uninstallCalls++
-                val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
+                val tokens = cmd.trim().split("\\s+".toRegex())
+                val pkg = run {
+                    val idx = tokens.indexOf("--user")
+                    if (idx >= 0 && idx + 2 < tokens.size) tokens[idx + 2]
+                    else tokens.lastOrNull() ?: ""
+                }
                 installedPkgs.remove(pkg)
                 CmdResult(exit = 0, out = "Success", err = "")
             }
             cmd.startsWith("pm install-existing") -> {
                 installCalls++
+                val tokens = cmd.trim().split("\\s+".toRegex())
+                val pkg = run {
+                    val idx = tokens.indexOf("--user")
+                    if (idx >= 0 && idx + 2 < tokens.size) tokens[idx + 2]
+                    else tokens.lastOrNull() ?: ""
+                }
+                if (pkg.isNotBlank()) installedPkgs.add(pkg)
                 CmdResult(exit = 0, out = "Success", err = "")
             }
             cmd.startsWith("pm list packages") -> {
@@ -116,8 +138,9 @@ fun newHarnessViewModel(gw: FakeHarnessGateway): DualViewModel =
         persistPreference = null,
         suPresentCheck = { true },
         shizukuAuthCheck = { false },
-        suGateway = SuCmdGateway(),
-        shizukuGateway = ShizukuCmdGateway("com.galaxydual.plus.debug.test"),
+        suGateway = NoOpGateway(),
+        shizukuGateway = NoOpGateway(),
+        gatewayTeardown = { _ -> },
         activeGateway = gw,
         currentChannel = ResolvedChannel.ROOT,
         hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },

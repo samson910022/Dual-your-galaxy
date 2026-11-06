@@ -43,6 +43,7 @@ class RotationTest {
                 vm.state.value.pendingRemove,
             )
             assertEquals(0, gw.uninstallCalls)
+            assertEquals(0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
@@ -69,6 +70,7 @@ class RotationTest {
             awaitHarnessReady(vm2)
             assertNull(vm2.state.value.pendingRemove)
             assertEquals(0, gw.uninstallCalls)
+            assertEquals(0, gw.writeCalls)
         } finally {
             vm2.dispose()
         }
@@ -95,6 +97,7 @@ class RotationTest {
             assertTrue(vm.state.value.selectedKeys.contains(sourceAppKey(0, "com.example.chat")))
             assertEquals(0, gw.uninstallCalls)
             assertEquals(0, gw.installCalls)
+            assertEquals(0, gw.writeCalls)
         } finally {
             vm.dispose()
         }
