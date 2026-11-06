@@ -603,11 +603,34 @@ class ShizukuCmdGateway(
     internal suspend fun hasCachedBindingForTest(): Boolean =
         bindMutex.withLock { cachedBinder != null }
 
-    // Releases the cached binding (e.g. from process teardown). The gateways
-    // are otherwise process-lifetime objects owned by the ViewModel factory;
-    // not calling close() before process death is fine. Marks the gateway
-    // closed first so no later bind reuses or repopulates the cache; every
-    // lock holder observes closed and drops instead of promoting.
+    // Test seam: reports the terminal-closed flag (Phase C P1). Soft
+    // releaseBinding() leaves this false (reusable); close()/abandon() set
+    // it true permanently (fail closed, never rebinds).
+    internal fun isClosedForTest(): Boolean = closed.get()
+
+    // Soft release (Phase C P1, AUTO soft-degrade): drops the cached
+    // UserService binding but leaves the gateway REUSABLE (closed stays
+    // false), so a later probe may rebind the same instance. Swap paths call
+    // this for instances still referenced by suGateway/shizukuGateway/
+    // retained slots (AUTO holds the Shizuku instance across a SHIZUKU ->
+    // NOOP degrade and must recover on the next reconnect without a picker
+    // rebuild). Contrast with close()/abandon() below, which are TERMINAL:
+    // they mark closed=true first so no later bind ever repopulates the
+    // cache (ViewModel cleared / truly displaced instances only).
+    // Idempotent: dropBindingLocked nulls the cache, so a second call
+    // releases nothing.
+    suspend fun releaseBinding() {
+        bindMutex.withLock { dropBindingLocked() }
+    }
+
+    // TERMINAL release (e.g. from process teardown or a truly displaced
+    // instance). The gateways are otherwise process-lifetime objects owned by
+    // the ViewModel factory; not calling close() before process death is
+    // fine. Marks the gateway closed first so no later bind reuses or
+    // repopulates the cache; every lock holder observes closed and drops
+    // instead of promoting. Never call this for an instance still referenced
+    // by suGateway/shizukuGateway/retained slots -- use releaseBinding()
+    // above so the next probe can rebind.
     suspend fun close() {
         closed.set(true)
         bindMutex.withLock { dropBindingLocked() }

@@ -91,6 +91,11 @@ class MainActivity : ComponentActivity() {
     // taps, reconnect taps, onResume/binder auto paths) passes false: a mode
     // switch / reconnect is NOT consent for privileged diagnosis.
     private lateinit var hookDiagBtn: Button
+    // Phase C P1 P3: visible pre-tap explanation for sighted users. The button
+    // contentDescription already states the privileged exec for TalkBack, but
+    // visual users never hear it -- this line shows the same consent copy
+    // ("will run ROOT/Shizuku diagnostic commands") next to the button.
+    private lateinit var hookDiagHint: TextView
     // Row holding the manual hook-diagnosis button: visible only in LSPOSED
     // mode (same condition as hookView) so the opt-in entry never suggests
     // itself on a true channel. Enable still follows the shared busy gate.
@@ -292,6 +297,12 @@ class MainActivity : ComponentActivity() {
             contentDescription = "手動診斷 Hook（需要執行 ROOT/Shizuku 診斷指令，僅在此按鈕觸發）"
             setOnClickListener { vm.requestHookRedDiagnosis() }
         }
+        // Phase C P1 P3: visible copy of the same consent (sighted users never
+        // hear contentDescription). Shown only in LSPOSED mode with the button.
+        hookDiagHint = TextView(this).apply {
+            text = "說明：點按將執行 ROOT／Shizuku 特權診斷指令（單次，僅此按鈕觸發）"
+            textSize = 12f
+        }
         // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
         msgView = TextView(this).apply {
             textSize = 15f
@@ -339,6 +350,7 @@ class MainActivity : ComponentActivity() {
         root.addView(writeRow)
         root.addView(readRow)
         root.addView(hookRow)
+        root.addView(hookDiagHint)
         root.addView(msgView)
         setContentView(ScrollView(this).apply { addView(root) })
     }
@@ -457,6 +469,7 @@ class MainActivity : ComponentActivity() {
             hookView.visibility = View.VISIBLE
             try {
                 hookRow.visibility = View.VISIBLE
+                hookDiagHint.visibility = View.VISIBLE
             } catch (_: Exception) {
                 // Best effort: render may run before buildUi in tests.
             }
@@ -481,6 +494,7 @@ class MainActivity : ComponentActivity() {
             hookView.visibility = View.GONE
             try {
                 hookRow.visibility = View.GONE
+                hookDiagHint.visibility = View.GONE
             } catch (_: Exception) {
                 // Best effort: render may run before buildUi in tests.
             }
