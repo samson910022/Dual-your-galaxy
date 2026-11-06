@@ -107,6 +107,29 @@ class RotationTest {
         }
     }
 
+    // Activity 旋轉保留 pending 對話框（注入 fake-backed VM，零寫入）。
+    @Test
+    fun activity_recreate_retainsPendingDialog() {
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            vm.requestRemove("com.example.chat")
+            HarnessPoll.await { vm.state.value.pendingRemove != null }
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                onView(withText("確認移除分身")).check(matches(isDisplayed()))
+                scenario.recreate()
+                onView(withText("確認移除分身")).check(matches(isDisplayed()))
+                assertEquals(0, gw.uninstallCalls)
+                assertEquals(0, gw.writeCalls)
+            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
+        }
+    }
+
     // Activity 旋轉：搜尋輸入恢復顯示且不崩潰（無寫入：全程不點 Clone/Remove 確認）。
     @Test
     fun activity_recreate_restoresSearchQuery() {
