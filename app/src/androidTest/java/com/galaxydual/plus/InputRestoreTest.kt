@@ -102,7 +102,7 @@ class InputRestoreTest {
             // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
             onView(withText(containsString("通道偏好"))).check(matches(isDisplayed()))
             scenario.recreate()
-            onView(allOf(isAssignableFrom(EditText::class.java), withText("mail"))).check(matches(isDisplayed()))
+            onView(allOf(isAssignableFrom(EditText::class.java), withHint("搜尋應用名稱 / 包名"), withText("mail"))).check(matches(isDisplayed()))
             onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
             onView(withText(containsString("通道偏好"))).check(matches(isDisplayed()))
         }

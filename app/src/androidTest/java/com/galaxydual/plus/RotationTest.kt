@@ -116,7 +116,7 @@ class RotationTest {
             Espresso.onIdle()
             scenario.recreate()
             // retained ViewModel 回填：旋轉後同一 query 仍顯示。
-            onView(allOf(isAssignableFrom(EditText::class.java), withText("chat"))).check(matches(isDisplayed()))
+            onView(allOf(isAssignableFrom(EditText::class.java), withHint("搜尋應用名稱 / 包名"), withText("chat"))).check(matches(isDisplayed()))
             onView(withHint("搜尋應用名稱 / 包名")).check(matches(isDisplayed()))
             onView(withText("Clone")).check(matches(isDisplayed()))
             onView(withText("Remove")).check(matches(isDisplayed()))

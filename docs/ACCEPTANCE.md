@@ -3,7 +3,7 @@
 > 定位：harness（`app/src/androidTest` + `instrumentation-manual` job）只保證
 > **編譯通過 + 零真機寫入**；真正的裝置驗收一律走本文件的人工矩陣記錄。
 > PR CI 無 device/emulator，只跑 `:app:assembleDebugAndroidTest`（編譯）；
-> `connectedCheck` 僅在 `workflow_dispatch` 手動觸發 + emulator 下執行。
+> `connectedDebugAndroidTest` 僅在 `workflow_dispatch` 手動觸發 + emulator 下執行。
 
 ## 1. 版本錨定（每次驗收必填）
 
