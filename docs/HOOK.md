@@ -3,6 +3,7 @@
 
 > LSPosed 模組：擴展三星 Dual 白名單查詢，絕不觸碰 Secure Folder（Knox）。
 > 全部自創 MIT 程式碼，僅思路參考第三方（見 `docs/CREDITS.md`），無抄襲 OnePlus / GPL hook 碼。
+> 本文件所述 log 均為 best-effort：記錄可能失敗或不可取得，缺少日誌不等於事件未發生。
 
 ## 1. Hook 原理
 
@@ -61,14 +62,41 @@ services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 | `com.android.server.dual.DualAppManagerService` | （同上，取決於版本存在的方法簽名） |
 
 每個方法 hook 前先呼叫 **`deoptimize(method)`**（best-effort）：`deoptimize(Executable)`
-機制存在，但缺 caller 身份資訊，故只能對被 hook 的 callee 本體做 best-effort
-去最佳化，**已經內聯進呼叫者（caller）的副本不受影響**；短方法若在 hook 前
+機制存在，但缺 caller 身份資訊，因此只明確請求對被 hook 的 callee 本體做 best-effort
+去最佳化，**不保證影響已內聯進呼叫者（caller）的副本**；短方法若在 hook 前
 已被內聯，仍可能收不到回調。
-**反內聯效果未驗證**（無三星實機）：`deoptimize()` 回傳值（成功／no-op）與
-失敗都會記 log（`GalaxyDualHook` tag），不再全吞；hook 本體不受影響、照常安裝。
+**反內聯效果尚未經實機驗證**：`deoptimize()` 回傳 `true`、`false` 或拋出
+例外都會嘗試記 log（`GalaxyDualHook` tag）；`false` 只表示框架回傳了 `false`，
+不推斷是 no-op 或其他原因。無論回傳值或例外，仍嘗試安裝 hook；安裝本身
+也可能失敗，會另行嘗試記錄。
+JVM 的 `DeoptimizeContractTest` 使用 fake 操作，只驗證無框架依賴的
+`HookInstaller` 編排（順序、同一方法、結果及錯誤處理），**不驗證**
+`DualHook` 的 framework adapter、LSPosed 執行行為或 ART 內聯效果。
+caller-inline fixture 尚未建立，相關裝置驗證尚未完成；驗收待辦見下。
 Hook Builder 統一使用
-**`ExceptionMode.PROTECTIVE`**（佔位保護）：hook 自身出錯只記 log 並跳過，
-絕不拖垮 `system_server`。
+**`ExceptionMode.PROTECTIVE`**（佔位保護）：請求 framework 保護 hook 例外處理，
+不保證所有情況下 `system_server` 或 daagent 都不會崩潰。
+
+#### 反內聯驗收待辦（尚未完成）
+
+1. 建立可重現的測試 fixture：包含短 callee、直接呼叫與可預熱的 caller，
+   能分別計數原方法與 hook callback；記錄建置版本與操作步驟。這是待辦，
+   目前沒有現成的 caller-inline fixture。
+2. 在支援 LSPosed 的測試裝置，以各自隔離的全新進程／重啟及相同初始條件
+   分組，避免先前 hook、deopt 或編譯狀態污染：未掛 hook 基線、hook-only、
+   hook＋callee deopt、hook＋caller deopt（若 API 支援）；必要時另測
+   hook＋callee／caller 均 deopt。各組分別測未預熱及預熱後安裝，並比較
+   直接呼叫與 caller 呼叫。記錄呼叫和 callback 次數、各 deopt 回傳值或
+   例外、hook 安裝結果與可取得的原始日誌；確認基線原行為。另以實際
+   `DualHook` adapter 驗證 framework 串接，而非以 JVM fake 替代。
+3. 收集裝置型號、ROM／Android／ART 與 LSPosed 版本、模組及 fixture 版本、
+   隔離與預熱方式、重現步驟，並以可取得的 ART 診斷證據確認各組測試時
+   caller 是否真的已內聯。在 hook 安裝成功的組別，直接呼叫預期命中 callback；安裝失敗須單獨記為
+   安裝失敗，不能拿來判定反內聯效果。若安裝狀態、內聯證據或必要對照
+   不足，結果標為 inconclusive（不確定），不能僅憑 callback 次數或缺失
+   的 log 宣稱成功或失敗。已確認內聯的 caller 若繞過 callback，記錄該組
+   觀察及限制，不推廣為所有環境的必然行為。實際結果與未通過項目待執行後
+   附證據記錄，現有 S24 註冊日誌不構成此驗收。
 
 ### 1.3 daagent：`WhiteListApps` [S24 OneUI 9 部分已驗證]
 
@@ -117,8 +145,10 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：
   無實機證據前縮窄正則可能漏掉真正的查詢方法；簽名守衛兜底——
   Boolean 結果只接受單一 `String` 參數查詢，集合按原類型重建
- （`Set` 不再降級為 `List`，其餘 `Collection`／未知回傳一律只觀察不改並打 log）。
-  命中未知方法時僅多一條 log，不改變行為。
+ （`Set` 不再降級為 `List`，其餘 `Collection`／未知回傳只觀察不改）。
+  非 Boolean 結果在政策為空時提前返回，不記未知回傳的 log；政策非空時才嘗試
+  記錄不支援的集合或未知回傳。Boolean 為 `true` 時直接返回；為 `false` 且參數
+  不符合預期時，無論政策是否為空都嘗試記 log，並保持原結果。
 
 ### 1.4 非目標進程：`detach()`（H4：自報 scope 已退場，見下）
 
@@ -197,10 +227,10 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - **首次啟用／改動作用域後必須重啟**：`system_server` 注入只在開機時發生，
   不重啟等於沒 hook。建議直接完整重啟手機（軟重啟若管理器支援亦可）。
 - 僅更新模組 APK（未改 scope）：API 102 支援 hot reload，但系統進程建議仍重啟一次確認。
-- 驗證 hook 安裝：重啟後 `adb logcat | grep GalaxyDualHook` 應看到
+- 驗證 hook 安裝：重啟後 `adb logcat | grep GalaxyDualHook` 可能看到
   `hooked ...#getAllWhitelistedPackages` 等行＋
-  `marker wrote scope=...` 行；看不到＝類名／方法名與目前
-  One UI 版本對不上，回報時請附上 `service list` 與版本號。
+  `marker wrote scope=...` 行；看不到可能是記錄不可取得、安裝失敗或
+  類名／方法名不匹配，不能單憑缺日誌判定，回報時請附上 `service list` 與版本號。
 - 驗證 marker 檔案（需 ROOT／shell 讀權限；App 直接讀不到即顯示「狀態未知」，
   屬正常 fail-closed，不代表 hook 沒裝；僅確定可讀但缺失才顯示「未偵測到」）：
   ```bash
