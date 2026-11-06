@@ -365,6 +365,7 @@ class UiSemanticsP28P2Test {
     }
 
     // ---- B1：factory blockText 與 resolveBlockReason 同資源 ----
+    // P2-3：AUTO 降級亦為 Keyed 同資源（主路徑無 Verbatim）。
 
     @Test
     fun factoryAndActivity_shareSameBlockResource() {
@@ -375,9 +376,13 @@ class UiSemanticsP28P2Test {
         assertEquals(R.string.write_block_explicit, WriteBlock(WriteBlockKind.EXPLICIT_FAILURE, listOf("A", "B")).stringRes())
         assertEquals(R.string.write_block_pm, WriteBlock(WriteBlockKind.PM_UNREADABLE).stringRes())
         assertEquals(R.string.write_block_readonly, WriteBlock(WriteBlockKind.NO_PRIVILEGE).stringRes())
-        // Keyed 兩側同 fake 解析同文；Verbatim 兩側逐字沿用。
+        assertEquals(R.string.auto_degrade_su_to_shizuku, WriteBlock(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU).stringRes())
+        assertEquals(R.string.auto_degrade_both_failed, WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED).stringRes())
+        assertEquals(R.string.auto_degrade_no_channel, WriteBlock(WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL).stringRes())
+        // Keyed 兩側同 fake 解析同文（含 AUTO 降級 Keyed）。
         val block = WriteBlock(WriteBlockKind.EXPLICIT_FAILURE, listOf("ROOT", "ROOT"))
         assertEquals(zhTestBlockText()(block), resolveZhTest(BlockReason.Keyed(block)))
-        assertEquals("Auto 已依實測降級", resolveZhTest(BlockReason.Verbatim("Auto 已依實測降級")))
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU)
+        assertEquals(zhTestBlockText()(degrade), resolveZhTest(BlockReason.Keyed(degrade)))
     }
 }

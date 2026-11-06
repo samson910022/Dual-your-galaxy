@@ -82,6 +82,10 @@
     <string name="write_block_explicit">Selected mode %1$s (%2$s channel) failed probing; writes are disabled (an explicit mode never crosses channels). Switch to Auto, or tap Reconnect and refresh to retry.</string>
     <string name="write_block_pm">Probing passed but PM is not readable (pm list users failed); writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
     <string name="write_block_readonly">Read-only: no privileged channel available; writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
+    <!-- P2-3 Auto degrade typed reasons (probe产物, resolved via resources; no Verbatim on the main path). No args. -->
+    <string name="auto_degrade_su_to_shizuku">Auto degraded based on probing: su was detected but its probe was denied (id -u failed), switched to Shizuku; to restore ROOT, check su authorization then tap Reconnect and refresh.</string>
+    <string name="auto_degrade_both_failed">Auto probing found both channels failed (su present but denied and Shizuku not passed), currently read-only; check authorization then tap Reconnect and refresh.</string>
+    <string name="auto_degrade_no_channel">Auto probing found no usable channel (no su and Shizuku not passed), currently read-only; authorize Shizuku or gain ROOT then tap Reconnect and refresh.</string>
     <!-- p28-1 review: manual package-name inline validation (was mixed Chinese/English
          in MainActivity.packageInputError). %1$d=max chars (MAX_PACKAGE_INPUT_CHARS). -->
     <!-- %1$d 恆為固定上限（MAX_PACKAGE_INPUT_CHARS），非可變計數，不適用 plurals。 -->
