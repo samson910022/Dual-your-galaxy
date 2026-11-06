@@ -337,6 +337,10 @@ jobs:
           disable-animations: true
           script: |
             chmod +x ./gradlew
+            adb shell input keyevent 82 || true
+            adb shell input keyevent 224 || true
+            adb shell wm dismiss-keyguard || true
+            sleep 2
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Record tested APK provenance
         if: always()
