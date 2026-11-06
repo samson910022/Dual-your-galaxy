@@ -338,6 +338,33 @@ jobs:
           script: |
             chmod +x ./gradlew
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
+      - name: Record tested APK provenance
+        if: always()
+        run: |
+          set -e
+          APP_APK=app/build/outputs/apk/debug/app-debug.apk
+          TEST_APK=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          test -f "$APP_APK"
+          test -f "$TEST_APK"
+          APP_SHA=$(sha256sum "$APP_APK" | awk '{print $1}')
+          TEST_SHA=$(sha256sum "$TEST_APK" | awk '{print $1}')
+          mkdir -p app/build
+          {
+            echo "GITHUB_SHA=$GITHUB_SHA"
+            echo "APP_APK=$APP_APK"
+            echo "APP_SHA256=$APP_SHA"
+            echo "TEST_APK=$TEST_APK"
+            echo "TEST_SHA256=$TEST_SHA"
+            echo "EMULATOR_API=34"
+            echo "EMULATOR_TARGET=default"
+            echo "EMULATOR_ARCH=x86_64"
+            echo "COMMAND=./gradlew :app:connectedDebugAndroidTest"
+            echo "RESULT=${{ job.status }}"
+          } > app/build/tested-apk-provenance.txt
+          echo "=== tested-apk-provenance.txt ==="
+          cat app/build/tested-apk-provenance.txt
+          echo "=== sha256sum (both APKs) ==="
+          sha256sum "$APP_APK" "$TEST_APK"
       - name: Upload instrumentation reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -346,5 +373,16 @@ jobs:
           path: |
             **/build/reports/androidTests/
             **/build/outputs/androidTest-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload tested APKs + provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-apk-provenance
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            app/build/tested-apk-provenance.txt
           if-no-files-found: warn
           retention-days: 14
