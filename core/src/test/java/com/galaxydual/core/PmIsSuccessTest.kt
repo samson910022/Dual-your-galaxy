@@ -17,22 +17,56 @@ import org.junit.Test
 class PmIsSuccessTest {
     // In-memory gateway serving canned outputs per command prefix, with stderr
     // support so listProfiles()-with-Failure-on-stderr can be reproduced.
+    // Verified-identity channels default to a Confirmed 95 dual target.
     private class FakeGateway(
-        var listUsersOut: String = "",
+        var listUsersOut: String = DEFAULT_USERS_95,
         var listUsersErr: String = "",
         var listUsersExit: Int = 0,
+        var userListVerboseOut: String = DEFAULT_VERBOSE_95,
+        var dumpsysOut: String = DEFAULT_DUMPSYS_95,
+        var propOut: String = DEFAULT_PROP_95,
         var listPackagesOutput: String = "package:com.example.chat",
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
 
         override suspend fun run(cmd: String): CmdResult =
-            if (cmd == DualRepository.CMD_LIST_USERS) {
-                CmdResult(exit = listUsersExit, out = listUsersOut, err = listUsersErr)
-            } else if (cmd.startsWith("pm list packages")) {
-                CmdResult(exit = 0, out = listPackagesOutput, err = "")
-            } else {
-                CmdResult(exit = 0, out = "ok", err = "")
+            when {
+                cmd == DualRepository.CMD_LIST_USERS ->
+                    CmdResult(exit = listUsersExit, out = listUsersOut, err = listUsersErr)
+                cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
+                    CmdResult(exit = 0, out = userListVerboseOut, err = "")
+                cmd == DualRepository.CMD_DUMPSYS_USER ->
+                    CmdResult(exit = 0, out = dumpsysOut, err = "")
+                cmd == DualRepository.CMD_GETPROP_DUAL ->
+                    CmdResult(exit = 0, out = propOut, err = "")
+                cmd.startsWith("pm list packages") ->
+                    CmdResult(exit = 0, out = listPackagesOutput, err = "")
+                else -> CmdResult(exit = 0, out = "ok", err = "")
             }
+
+        companion object {
+            const val DEFAULT_USERS_95 =
+                "Users:\n" +
+                    "\tUserInfo{0:Owner:13} running\n" +
+                    "\tUserInfo{95:DUAL_APP:400} running\n"
+            const val DEFAULT_VERBOSE_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 15\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_DUMPSYS_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            const val DEFAULT_PROP_95 = "95\n"
+        }
     }
 
     private fun <T> runSuspend(block: suspend () -> T): T {
@@ -282,5 +316,97 @@ class PmIsSuccessTest {
         val repo = DualRepository(gateway)
         // No package:com.example.chat line, so confirmed absent.
         assertFalse(runSuspend { repo.verify("com.example.chat", 95) })
+    }
+
+    // Phase C P2-C (pm-list label neutrality): UserInfo headers carrying
+    // error keywords are display-only and never fail the pm-list gate.
+    @Test
+    fun isListUsersOutputOk_errorLabelledHeader_isOk() {
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Error:400} running\n",
+                0,
+            ),
+        )
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Failure:400} running\n",
+                0,
+            ),
+        )
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{10:not found:30} running\n",
+                0,
+            ),
+        )
+    }
+
+    // Phase C P2-C: a genuine body Failure line (stdout or stderr) still fails
+    // the pm-list gate, as does any non-zero exit.
+    @Test
+    fun isListUsersOutputOk_trueFailureOrNonZeroExit_isNotOk() {
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n",
+                0,
+            ),
+        )
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:DUAL_APP:400} running\n" +
+                    "\nFailure [INSTALL_FAILED_INVALID_APK: bad]",
+                0,
+            ),
+        )
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Error:400} running\n",
+                1,
+            ),
+        )
+        assertFalse(PmOutputParser.isListUsersOutputOk("", 1))
+    }
+
+    // Phase B P1-2 (owner re-review R3 blocking): INSTALL_FAILED_ALREADY_EXISTS
+    // is an install-channel idempotent-success semantic and must never pass
+    // the `pm list users` strict gate. Old code inherited the isSuccess
+    // exemption (checked before exit) so `exit=1 + Failure
+    // [INSTALL_FAILED_ALREADY_EXISTS]` wrongly returned true (snapshot fake
+    // Loaded, guard bypassable); the same marker at exit 0 was likewise
+    // misjudged success. The strict gate is exit-first with no
+    // ALREADY_EXISTS exemption and no EXEMPT_LINE filtering.
+    @Test
+    fun isListUsersOutputOk_alreadyExistsMarker_isNotOk() {
+        val ownerCounterexample =
+            "Users:\n\tUserInfo{95:DUAL_APP:400} running\n" +
+                "Failure [INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install " +
+                "com.example.chat without first uninstalling.]"
+        // Owner original counterexample: exit 1 -> false.
+        assertFalse(PmOutputParser.isListUsersOutputOk(ownerCounterexample, 1))
+        // Same payload at exit 0 -> still false (no exemption).
+        assertFalse(PmOutputParser.isListUsersOutputOk(ownerCounterexample, 0))
+        // Marker carried on stderr (callers concatenate out + "\n" + err) -> false.
+        val combinedStdoutStderr =
+            "Users:\n\tUserInfo{0:Owner:13} running\n" +
+                "\tUserInfo{95:DUAL_APP:400} running\n" +
+                "\nFailure [INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install " +
+                "com.example.chat without first uninstalling.]"
+        assertFalse(PmOutputParser.isListUsersOutputOk(combinedStdoutStderr, 0))
+        assertFalse(PmOutputParser.isListUsersOutputOk(combinedStdoutStderr, 1))
+        // Contrast: Error-labelled header stays display-only -> true.
+        assertTrue(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:Error:400} running\n",
+                0,
+            ),
+        )
+        // Contrast: genuine body Failure line -> false.
+        assertFalse(
+            PmOutputParser.isListUsersOutputOk(
+                "Users:\n\tUserInfo{0:Owner:13} running\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n",
+                0,
+            ),
+        )
     }
 }

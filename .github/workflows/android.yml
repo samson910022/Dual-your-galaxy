@@ -191,7 +191,9 @@ jobs:
         run: |
           set -e
           echo "== Knox/Secure Folder must only appear in policy docs =="
-          # Allowed only in policy declarations (docs + manifest description);
+          # Scope is *.kt-only under */src/main (docs + manifest description
+          # may name these systems to declare them out of scope; unit tests
+          # asserting the gates themselves are excluded by-design);
           # never in hook/core/app executable sources.
           # \b is a GNU grep extension (runner is ubuntu-latest); it keeps
           # short tokens (edm/mdm/persona) from false-positive on words like

@@ -1,22 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
 <!-- App manifest: launcher activity plus Shizuku provider and dual-app permissions. -->
-<!-- MANAGE_EXTERNAL_STORAGE is for GitHub sideload builds only; no Play release, so no Play policy filing. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.galaxydual.plus">
 
-    <!-- Needed to enumerate installed packages for clone source picking. -->
+    <!-- PR-7 P2 (#26) 權限審計結論 (見 docs/USAGE.md「權限」節): -->
+    <!-- - QUERY_ALL_PACKAGES:保留。個人來源 catalog (SourceInventory.loadSourceApps 經 -->
+    <!--   PackageManager.getInstalledApplications) 在 API 30+ 需此權限才能看到完整授權 -->
+    <!--   可見列表；本 App 核心功能即列舉/管理已安裝套件。本專案經 GitHub sideload 發佈、 -->
+    <!--   不上架 Play，不受 Play 該政策限制 (lint.xml 將 QueryAllPackagesPermission 降級)。 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-    <!-- Needed to trigger package install flows into the dual profile. -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <!-- GitHub sideload builds only: stage APKs on shared storage. Not uploaded to Play. -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- - REQUEST_INSTALL_PACKAGES:已移除。程式碼庫無 PackageInstaller session / -->
+    <!--   ACTION_INSTALL_PACKAGE / canRequestPackageInstalls 呼叫鏈；clone 路徑為 shell -->
+    <!--   通道 `pm install-existing` (su/Shizuku)，不走安裝器會話，不諮詢此權限。 -->
+    <!-- - MANAGE_EXTERNAL_STORAGE:已移除。無共享儲存暫存：APK 不落地、無 -->
+    <!--   getExternalStorage/MediaStore/DownloadManager 呼叫；寫入通道僅經 shell 命令。 -->
     <!-- Shizuku shell fallback channel (downgrade path when LSPosed is absent). -->
     <uses-permission android:name="moe.shizuku.manager.permission.APIV2" />
 
+    <!-- allowBackup=false：無備份需求，排除 dual_selection (SharedPreferences) 上雲；
+         選取僅本機持久化，重裝即失效符合 fail-closed。 -->
     <application
         android:label="Galaxy Dual Plus"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true">

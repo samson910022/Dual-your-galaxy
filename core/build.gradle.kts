@@ -25,7 +25,10 @@ android {
     }
 }
 
-// No external dependencies for the skeleton core, except JUnit for unit tests.
+// Core depends only on kotlinx-coroutines-core (CancellationException
+// rethrow discipline in DualRepository gateway defense, PR-2 Phase 3) plus
+// JUnit for unit tests.
 dependencies {
+    implementation(libs.coroutines.core)
     testImplementation("junit:junit:4.13.2")
 }
