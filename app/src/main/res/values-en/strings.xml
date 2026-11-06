@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- p28-1 English strings. Channel names stay identical (identifiers). -->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <string name="pkg_input_hint">Package name (e.g. com.example.app)</string>
+    <string name="action_clone">Clone</string>
+    <string name="action_remove">Remove</string>
+    <string name="remove_cd">Remove clone (requires confirmation; the first tap only opens the dialog)</string>
+    <string name="action_reconnect">Reconnect and refresh</string>
+    <string name="action_request_shizuku">Request Shizuku permission</string>
+    <string name="action_check_shizuku">Check Shizuku and refresh</string>
+    <string name="channel_auto">Auto</string>
+    <string name="channel_root">Root</string>
+    <string name="channel_shizuku">Shizuku</string>
+    <string name="channel_lsposed">LSPosed</string>
+    <string name="action_diagnose_hook">Diagnose Hook manually</string>
+    <string name="diagnose_hook_cd">Diagnose Hook manually (runs ROOT/Shizuku diagnostic commands; only this button triggers them)</string>
+    <string name="hook_diag_hint">Note: tapping runs one-shot privileged ROOT/Shizuku diagnostic commands (only this button triggers them)</string>
+    <string name="diag_loading_cd">Diagnosis: loading</string>
+    <string name="action_export_diagnosis">Export diagnosis (identifiers redacted; review before sharing)</string>
+    <string name="diagnostic_export_title">Diagnosis export preview (identifiers redacted; review before sharing; no upload)</string>
+    <string name="search_hint">Search app name / package</string>
+    <string name="system_apps_hidden">System apps: hidden</string>
+    <string name="system_apps_shown">System apps: shown</string>
+    <string name="system_toggle_cd_hidden">System apps are hidden; double-tap to show (display only, never uninstalls)</string>
+    <string name="system_toggle_cd_shown">System apps are shown; double-tap to hide (display only, never uninstalls)</string>
+    <string name="action_select_visible">Select visible</string>
+    <plurals name="select_visible_cd">
+        <item quantity="one">Select the first %d visible row (checks only, never writes; narrow with search if truncated)</item>
+        <item quantity="other">Select the first %d visible rows (checks only, never writes; narrow with search if truncated)</item>
+    </plurals>
+    <string name="action_clear_selection">Clear selection</string>
+    <string name="clear_selection_cd">Clear checks (never uninstalls anything)</string>
+    <string name="action_save_selection">Save selection</string>
+    <string name="save_selection_cd">Save current checks (checks only, never writes clones)</string>
+    <string name="action_unsave_selection">Unsave selection</string>
+    <string name="unsave_selection_cd">Drop the saved selection (never uninstalls, keeps current checks)</string>
+    <plurals name="batch_create">
+        <item quantity="one">Create %d clone</item>
+        <item quantity="other">Create %d clones</item>
+    </plurals>
+    <plurals name="batch_create_cd">
+        <item quantity="one">Batch create %d clone (runs per checked app; checking alone never uninstalls)</item>
+        <item quantity="other">Batch create %d clones (runs per checked app; checking alone never uninstalls)</item>
+    </plurals>
+    <string name="catalog_load_failed">Source list failed to load; kept the old list (tap Reconnect and refresh to retry)</string>
+    <string name="shizuku_listener_failed">Shizuku listener registration failed: %1$s</string>
+    <string name="copy_failed">Copy failed: %1$s</string>
+    <string name="dialog_close">Close</string>
+    <string name="dialog_cancel">Cancel</string>
+    <string name="remove_confirm_title">Confirm clone removal</string>
+    <string name="remove_confirm_positive">Remove</string>
+    <string name="shizuku_state_no_binder">Shizuku: binder not connected (install and start Shizuku first)</string>
+    <string name="shizuku_state_ok">Shizuku: connected and authorized</string>
+    <string name="shizuku_state_unauth">Shizuku: connected, not authorized (tap the permission button below)</string>
+    <string name="shizuku_state_unknown">Shizuku: unknown state (%1$s)</string>
+    <string name="source_empty_loading">App list: not loaded yet</string>
+    <string name="source_empty_nomatch">App list: no matches</string>
+    <string name="source_row">%1$s\n%2$s</string>
+    <plurals name="source_truncated">
+        <item quantity="one">… %1$d row total, showing the first %2$d; select-visible also covers only the first %2$d (narrow with search)</item>
+        <item quantity="other">… %1$d rows total, showing the first %2$d; select-visible also covers only the first %2$d (narrow with search)</item>
+    </plurals>
+    <string name="privilege_line">Privilege: %1$s (actual channel %2$s, %3$s; this round routes %4$s, probed [%5$s]%6$s, %7$s)</string>
+    <string name="channel_line">Channel: %1$s, actual: %2$s (choice persists across restarts)</string>
+    <string name="channel_line_degraded">Channel: %1$s, actual: %2$s (choice persists across restarts); degraded from Auto, see status</string>
+    <string name="profiles_empty">Profiles: none</string>
+    <string name="profiles_filled">Profiles (%1$d):\n%2$s</string>
+    <string name="cloned_empty">Cloned: none</string>
+    <string name="cloned_filled">Cloned (%1$d):\n%2$s</string>
+    <string name="status_loading">Loading…</string>
+    <string name="status_ready">Ready</string>
+    <!-- p28-1 review: user-visible write-block reasons (were hardcoded Traditional
+         Chinese in DualViewModel.writeBlockReason). %1$s=hook state; explicit
+         branch %1$s=mode %2$s=channel identity. -->
+    <string name="write_block_lsposed">LSPosed channel is a placeholder (NoOp): whitelist policy branch pending, writes are refused. Hook state: %1$s. To write, switch to Auto/Root/Shizuku, then tap Reconnect and refresh.</string>
+    <string name="write_block_noop">Channel not ready: a real channel is connected but not selected (NoOp fallback); currently read-only and writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
+    <string name="write_block_explicit">Selected mode %1$s (%2$s channel) failed probing; writes are disabled (an explicit mode never crosses channels). Switch to Auto, or tap Reconnect and refresh to retry.</string>
+    <string name="write_block_pm">Probing passed but PM is not readable (pm list users failed); writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
+    <string name="write_block_readonly">Read-only: no privileged channel available; writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
+    <!-- p28-1 review: manual package-name inline validation (was mixed Chinese/English
+         in MainActivity.packageInputError). %1$d=max chars (MAX_PACKAGE_INPUT_CHARS). -->
+    <!-- %1$d 恆為固定上限（MAX_PACKAGE_INPUT_CHARS），非可變計數，不適用 plurals。 -->
+    <string name="input_too_long" tools:ignore="PluralsCandidate">Input too long (over %1$d characters), rejected</string>
+    <string name="invalid_package">invalid package</string>
+    <!-- p28-1 review: channel group semantic label (announced after the HorizontalScrollView wrap). -->
+    <string name="channel_group_cd">Channel picker (mutually exclusive): Auto, Root, Shizuku, LSPosed</string>
+</resources>

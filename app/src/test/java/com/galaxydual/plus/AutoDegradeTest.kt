@@ -348,6 +348,7 @@ class AutoDegradeTest {
                 currentChannel = initialChannel,
                 assembleChannelFn = assembleChannelFn,
                 hookDirectReads = hookDirectReads,
+                blockText = zhTestBlockText(),
             )
         } else {
             DualViewModel(
@@ -366,6 +367,7 @@ class AutoDegradeTest {
                 assembleChannelFn = assembleChannelFn,
                 hookDirectReads = hookDirectReads,
                 hookDiagnosticGateways = hookDiagnosticGateways,
+                blockText = zhTestBlockText(),
             )
         }
         vms.add(vm)
@@ -2216,6 +2218,7 @@ class AutoDegradeTest {
                 currentChannel = ResolvedChannel.NOOP,
                 hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
                 hookDiagnosticGateways = { emptyList() },
+                blockText = zhTestBlockText(),
             )
             vms.add(vm)
             await { !vm.state.value.loading && vm.state.value.msgKind == MsgKind.CHANNEL }
