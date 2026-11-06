@@ -49,6 +49,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
     var writeCalls = 0
     val commandLog = mutableListOf<String>()
     var serial: Int = 15
+    var serialAvailable: Boolean = true
     val installedPkgs = mutableSetOf("com.example.chat")
 
     private fun usersOut(): String =
@@ -61,7 +62,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
             "    Serial number: 0\n" +
             "    User type: android.os.usertype.full.SYSTEM\n" +
             (if (dualId < 0) "" else "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: $serial\n" +
+                (if (serialAvailable) "    Serial: $serial\n" else "") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n")
 
@@ -69,7 +70,8 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
         "Users:\n" +
             "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
             "    userType=android.os.usertype.full.SYSTEM\n" +
-            (if (dualId < 0) "" else "  UserInfo{$dualId:DualApp:400} serialNo=$serial:\n" +
+            (if (dualId < 0) "" else "  UserInfo{$dualId:DualApp:400}" +
+                (if (serialAvailable) " serialNo=$serial" else "") + ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n")
 
