@@ -21,6 +21,36 @@ sealed interface DualTargetResult {
     data object SerialUnavailable : DualTargetResult
 }
 
+// Serial-bound typed dual-target resolution (PR-37 P26 Stage 1, GH #1 + #2):
+// single-triple counterpart of resolveDualUserIdTyped below. One gateway
+// triple (verbose/dumpsys/getprop) maps to exactly one of:
+// - Confirmed(target): dual-CLONE consensus on one id (same gates as the
+//   typed id entry) PLUS property corroboration PLUS one agreed serial.
+// - SerialUnavailable(userId): the id is confirmed but no single agreed
+//   serial exists for it (both sides missing, or disagreeing).
+// - Absent: clean channels agree no dual exists (same Absent convergence as
+//   the typed id entry: all-OTHER claims on both sources, identical user
+//   sets, clean no-claim property, pmIds veto passed).
+// - Unknown: everything else (truncated/exit/identity-channel failure,
+//   malformed property, whitelist-external, pm veto, contradiction).
+// Callers that need an (id, serial) pair from one evidence set must use
+// this; calling resolveDualUserIdTyped + fetchDualTarget separately splices
+// two independent triples into a possibly-fictional pair. Never throws
+// except on coroutine cancellation.
+sealed interface DualTargetResolution {
+    // Both verbose channels agree on the id AND on one non-null serial.
+    data class Confirmed(val target: VerifiedDualTarget) : DualTargetResolution
+
+    // The id is confirmed but no single agreed serial exists for it.
+    data class SerialUnavailable(val userId: Int) : DualTargetResolution
+
+    // Clean typed channels parsed fine but claim no dual profile.
+    data object Absent : DualTargetResolution
+
+    // The identity cannot be established; fail closed, never "no dual".
+    data class Unknown(val detail: String = "") : DualTargetResolution
+}
+
 // Typed dual-id resolution (Round 2 Phase B P2-5): tells "confirmed" apart
 // from "confirmed absent" and from "unconfirmable", so callers never mistake
 // a failed typed channel for a missing profile. The legacy Int entry below
@@ -444,6 +474,143 @@ class DualRepository(
                     return DualIdResolution.Unknown("pm snapshot contains ids missing from typed channels")
                 }
                 DualIdResolution.Absent
+            }
+        }
+    }
+
+    // Single-triple serial-bound typed resolution (PR-37 P26 Stage 1,
+    // GH #1 + #2): same three gateway runs and the same strict fail-closed
+    // channel checks as resolveDualUserIdTyped above (truncated refusal,
+    // exit-first, isIdentityChannelOk identity gate on all three channels,
+    // property-throw is Unknown, malformed property is Unknown, pmIds veto),
+    // plus the serial agreement signal. The id half reuses
+    // SamsungProfileAdapter.resolveDual; the serial half reuses
+    // SamsungProfileAdapter.resolveDualTarget (same brick as
+    // PmOutputParser.resolveDualTargetVerified, but on the already-parsed
+    // candidates so the id and the serial come from one evidence set and can
+    // never splice two independent triples into a fictional pair):
+    // - Confirmed(target): id confirmed AND one agreed serial.
+    // - SerialUnavailable(id): id confirmed but no agreed serial.
+    // - Absent: same convergence as the typed id entry (clean all-OTHER on
+    //   both sources, identical user sets, clean no-claim property, pm veto
+    //   passed).
+    // - Unknown: everything else (Refused reason, thin evidence, pm veto).
+    // Never throws except on coroutine cancellation (CancellationException
+    // rethrown; InterruptedException restores the flag and maps to Unknown).
+    // The legacy resolveDualUserIdTyped / fetchDualTarget entries are
+    // untouched; refreshLocked is the first caller (batch/requestRemove/
+    // confirmRemove fallback triples stay as-is this round).
+    // @param pmIds pm 快照戶集合（VM 傳 profiles id 集合；null 表無快照不否決）：
+    //   Absent 須另滿足 pmIds==null 或 pmIds 為 verboseIds 子集。
+    suspend fun resolveDualTargetTyped(pmIds: Set<Int>? = null): DualTargetResolution {
+        val verboseRes = try {
+            gateway.run(CMD_USER_LIST_VERBOSE)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualTargetResolution.Unknown("typed channel interrupted: ${e.message ?: e.javaClass.simpleName}")
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualTargetResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
+        }
+        val dumpsysRes = try {
+            gateway.run(CMD_DUMPSYS_USER)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualTargetResolution.Unknown("typed channel interrupted: ${e.message ?: e.javaClass.simpleName}")
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return DualTargetResolution.Unknown("typed channel threw: ${e.message ?: e.javaClass.simpleName}")
+        }
+        // Same strict gates as resolveDualUserIdTyped (P1-2): truncated
+        // refused, exit-first, then the identity gate (never the
+        // install-command isSuccess exemption).
+        if (verboseRes.truncated || dumpsysRes.truncated) {
+            return DualTargetResolution.Unknown("typed channel truncated identity evidence")
+        }
+        if (verboseRes.exit != 0 || dumpsysRes.exit != 0) {
+            return DualTargetResolution.Unknown(
+                "typed channel exit (verbose=${verboseRes.exit} dumpsys=${dumpsysRes.exit})",
+            )
+        }
+        if (!PmOutputParser.isIdentityChannelOk(verboseRes.out + "\n" + verboseRes.err, verboseRes.exit)) {
+            return DualTargetResolution.Unknown("typed verbose channel reports failure")
+        }
+        if (!PmOutputParser.isIdentityChannelOk(dumpsysRes.out + "\n" + dumpsysRes.err, dumpsysRes.exit)) {
+            return DualTargetResolution.Unknown("typed dumpsys channel reports failure")
+        }
+        val propRes = try {
+            gateway.run(CMD_GETPROP_DUAL)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return DualTargetResolution.Unknown("typed property channel interrupted: ${e.message ?: e.javaClass.simpleName}")
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // Same strictness as the typed id entry: a throwing property
+            // channel (no response) is not a clean no-claim, fail closed.
+            return DualTargetResolution.Unknown("typed property channel threw: ${e.message ?: e.javaClass.simpleName}")
+        }
+        if (propRes.truncated) {
+            return DualTargetResolution.Unknown("typed property channel truncated identity evidence")
+        }
+        if (!PmOutputParser.isIdentityChannelOk(propRes.out + "\n" + propRes.err, propRes.exit)) {
+            return DualTargetResolution.Unknown("typed property channel reports failure")
+        }
+        // Same whitelist ternion as the typed id entry: Blank/Sentinel are
+        // clean no-claim (Absent-eligible), Value carries a claim, everything
+        // else is malformed and blocks Absent.
+        val propertyId = PmOutputParser.parseDualPropertyId(propRes.out)
+        if (propertyId == null) {
+            val propOutBlank = propRes.out.isBlank()
+            val propErrBlank = propRes.err.isBlank()
+            val isNegativeSentinel = propRes.out.trim().toIntOrNull()?.let { it < 0 } == true
+            val cleanNoClaim = (propOutBlank && propErrBlank) || (isNegativeSentinel && propErrBlank)
+            if (!cleanNoClaim) {
+                val raw = if (!propOutBlank) propRes.out.trim() else propRes.err.trim()
+                return DualTargetResolution.Unknown("typed property channel malformed: ${raw.take(200)}")
+            }
+        }
+        val verboseClaims = SamsungProfileAdapter.parseUserListVerbose(verboseRes.out)
+        val dumpsysClaims = SamsungProfileAdapter.parseDumpsysUser(dumpsysRes.out)
+        val candidates = verboseClaims + dumpsysClaims
+        return when (val resolution = SamsungProfileAdapter.resolveDual(candidates, propertyId)) {
+            is DualResolution.Confirmed -> {
+                // Serial half on the SAME candidates: exactly one agreed
+                // non-null serial (one side may omit it); both-missing or
+                // disagreeing means the id is confirmed but the incarnation
+                // cannot be pinned.
+                val target = SamsungProfileAdapter.resolveDualTarget(candidates, propertyId)
+                if (target != null) DualTargetResolution.Confirmed(target)
+                else DualTargetResolution.SerialUnavailable(resolution.userId)
+            }
+            is DualResolution.Refused -> DualTargetResolution.Unknown(resolution.reason)
+            is DualResolution.Unknown -> {
+                // Same Absent convergence as the typed id entry: no CLONE
+                // anywhere, both sources non-empty, every claim explicitly
+                // OTHER, identical user sets, no property claim, pm veto
+                // passed. Everything else stays Unknown.
+                if (candidates.any { it.userType == ProfileUserType.CLONE }) {
+                    return DualTargetResolution.Unknown("insufficient identity evidence")
+                }
+                if (verboseClaims.isEmpty() || dumpsysClaims.isEmpty()) {
+                    return DualTargetResolution.Unknown("insufficient identity evidence")
+                }
+                if (verboseClaims.any { it.userType != ProfileUserType.OTHER } ||
+                    dumpsysClaims.any { it.userType != ProfileUserType.OTHER }
+                ) {
+                    return DualTargetResolution.Unknown("insufficient identity evidence")
+                }
+                val verboseIds = verboseClaims.map { it.userId }.toSet()
+                val dumpsysIds = dumpsysClaims.map { it.userId }.toSet()
+                if (verboseIds != dumpsysIds) {
+                    return DualTargetResolution.Unknown("insufficient identity evidence")
+                }
+                if (propertyId != null) {
+                    return DualTargetResolution.Unknown("insufficient identity evidence")
+                }
+                if (pmIds != null && !verboseIds.containsAll(pmIds)) {
+                    return DualTargetResolution.Unknown("pm snapshot contains ids missing from typed channels")
+                }
+                DualTargetResolution.Absent
             }
         }
     }
