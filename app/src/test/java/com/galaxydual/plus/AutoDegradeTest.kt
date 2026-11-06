@@ -2106,10 +2106,11 @@ class AutoDegradeTest {
         assertEquals("已就緒", vm.state.value.readyMark())
     }
 
-    // Phase 4 C3: refresh runs the old 9-command resolve-then-reverify path
+    // Phase 4 C3: refresh runs the single-shot resolve-then-reverify path
     // (DualViewModel.refreshLocked, not refreshVerified 5): snapshot(1) +
-    // target(3) + snapshot(1) + target(3) + list(1). Assert exact per-command
-    // deltas on the SHIZUKU fake (repo lives there after degrade).
+    // typed-target(3) + snapshot(1) + listing-reverify-target(3) + list(1).
+    // Assert exact per-command deltas on the SHIZUKU fake (repo lives there
+    // after degrade).
     @Test
     fun phase4_refresh_commandCounts() {
         val suFake = FakeSu(rootOk = false)

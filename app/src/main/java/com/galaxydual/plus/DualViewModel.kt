@@ -8,6 +8,7 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualIdResolution
 import com.galaxydual.core.DualRepository
+import com.galaxydual.core.DualTargetResolution
 import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
@@ -669,7 +670,7 @@ class DualViewModel(
     // - refreshLocked 偵測到 verified target 變動（bound 舊≠新）時清空
     //   selectedKeys＋batchReport、重置恢復 marker，msg 明示目標變更。
     // - Serial 綁定（PR-37 Phase B #2）：綁定為 (id, serial) 配對，由當下
-    //   已驗證 inventory 取得（refresh 以 fetchDualTarget 一次取回 id＋serial，
+    //   已驗證 inventory 取得（refresh 以 resolveDualTargetTyped 一次取回 id＋serial，
     //   與舊 resolveDualUserId 同為三通道、同等裝置呼叫，零額外開銷）。
     //   殘留風險如實揭露：inventory serial 未知（SerialUnavailable 罕見路徑）
     //   或 legacy 快照恢復時綁定為 id-only (serial null)；id-only 綁定永不
@@ -1050,14 +1051,23 @@ class DualViewModel(
                     // CHANNEL_ERROR，不謊稱無 dual。
                     // M2 pm 否決：Absent 前 repo 另收 pm 戶集合否決 typed 漏戶
                     //（null 表無快照不否決；此處快照可用故傳 profiles id 集合）。
-                    // Serial (PR-37 Phase B #3) 來自 fetchDualTarget（同三通道，
-                    // 零額外呼叫由 pin/refresh 共用除外）；SerialUnavailable
-                    // 時 serial 為 null 走 id-only，id 路徑不受影響。
-                    val idRes = onIo { repo.resolveDualUserIdTyped(pmIds = profiles.map { it.userId }.toSet()) }
-                    val dualId = (idRes as? DualIdResolution.Confirmed)?.userId ?: NO_TARGET_ID
-                    val dualTarget = onIo { repo.fetchDualTarget() }
+                    // PR-37 P26 Stage 1 (GH #1 + #2)：單次 triple 取 (id,serial)
+                    // 配對——resolveDualTargetTyped 一次 gateway triple 同時確認
+                    // id 與 serial，FRESH/STALE 寫入的 (targetId,targetSerial)
+                    // 即來自同一次證據，不可能再出現 FRESH(95,41) 虛構配對
+                    //（舊雙呼叫：typed 取 id + fetchDualTarget 另取 serial，
+                    // 兩次 triple 間重建即拼接）。SerialUnavailable 保留
+                    // id-only（serial null，id 路徑不受影響）。
+                    val targetRes =
+                        onIo { repo.resolveDualTargetTyped(pmIds = profiles.map { it.userId }.toSet()) }
+                    val dualId = when (targetRes) {
+                        is DualTargetResolution.Confirmed -> targetRes.target.userId
+                        is DualTargetResolution.SerialUnavailable -> targetRes.userId
+                        is DualTargetResolution.Absent,
+                        is DualTargetResolution.Unknown -> NO_TARGET_ID
+                    }
                     val dualSerial =
-                        (dualTarget as? DualTargetResult.Confirmed)?.target?.serial
+                        (targetRes as? DualTargetResolution.Confirmed)?.target?.serial
                     if (dualId <= NO_TARGET_ID) {
                         val now = nowWallMs()
                         // 真正確認無 dual 的唯一條件：typed 稱 Absent 且快照
@@ -1065,7 +1075,7 @@ class DualViewModel(
                         // 空快照（連 owner 都列不出，快照不可信）時即使 typed
                         // 稱 Absent 也不得報 NO_DUAL（快照本身已證通道有問題）。
                         val confirmedAbsent =
-                            idRes is DualIdResolution.Absent && profiles.isNotEmpty()
+                            targetRes is DualTargetResolution.Absent && profiles.isNotEmpty()
                         _state.update { cur ->
                             val next = if (confirmedAbsent) {
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
@@ -1117,11 +1127,11 @@ class DualViewModel(
                                     diagnose = diagnoseEvent(
                                         DiagnoseCode.CHANNEL_ERROR,
                                         techDetail = when {
-                                            idRes is DualIdResolution.Unknown &&
-                                                idRes.detail.isNotBlank() ->
+                                            targetRes is DualTargetResolution.Unknown &&
+                                                targetRes.detail.isNotBlank() ->
                                                 "verified dual id unknown: " +
-                                                    idRes.detail
-                                            idRes is DualIdResolution.Absent ->
+                                                    targetRes.detail
+                                            targetRes is DualTargetResolution.Absent ->
                                                 "profiles snapshot empty " +
                                                     "despite typed absent"
                                             else -> "verified dual id unknown"
@@ -1145,14 +1155,15 @@ class DualViewModel(
                     } else {
                         val groundTruth = onIo { repo.listClonedPackages(dualId) }
                         // listClonedPackages==null 原因鑑別：只在 null 路徑加跑
-                        // 唯讀的 profilesSnapshot + resolveDualUserIdTyped
+                        // 唯讀的 profilesSnapshot + resolveDualTargetTyped
                         // (成功路徑零額外開銷)。通道失敗->CHANNEL_ERROR
                         // (techDetail 寫明)；只有正值且不同的新 verified ID
-                        // (Confirmed 且 != dualId) 才報 drift
+                        // (Confirmed/SerialUnavailable 且 != dualId) 才報 drift
                         // (VERIFY_MISMATCH，detail 攜新舊 targetId，inventory
                         // 帶新目標，UI 可見新目標)；複查 Unknown/Absent
                         // (P2-5：舊 Int -1 走此路) 與 id 一致者一律維持
-                        // VERIFY_UNKNOWN，不誤報 MISMATCH。
+                        // VERIFY_UNKNOWN，不誤報 MISMATCH。單次 triple 取 id，
+                        // 與首跳同一 API，不拼接。
                         // Stage C C6：此處複查刻意傳 pmIds=null——本路徑 Unknown/Absent
                         // 一律 VERIFY_UNKNOWN，不授權 Absent 清單 (Absent 需快照可用
                         // + typed 乾淨，見 refresh 首跳)；null 僅省一次快照傳參，
@@ -1160,18 +1171,28 @@ class DualViewModel(
                         val nullSnap: ProfilesSnapshot? =
                             if (groundTruth == null) onIo { repo.profilesSnapshot() } else null
 // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
-                        // M2 pm 反證守衛一致性：null 路徑僅 Confirmed-不同-id 觸發
+                        // M2 pm 反證守衛一致性：null 路徑僅已確認-不同-id 觸發
                         // drift，其餘（Absent/Unknown）同走 VERIFY_UNKNOWN，故傳
                         // pmIds 無行為差；此處以重查快照（Loaded）為準、回退原快照。
-                        val nullVerified: DualIdResolution? =
+                        val nullVerified: DualTargetResolution? =
                             if (groundTruth == null) {
                                 val pmIds =
                                     ((nullSnap as? ProfilesSnapshot.Loaded)?.profiles ?: profiles)
                                         .map { it.userId }.toSet()
-                                onIo { repo.resolveDualUserIdTyped(pmIds = pmIds) }
+                                onIo { repo.resolveDualTargetTyped(pmIds = pmIds) }
                             } else {
                                 null
                             }
+                        // 單次證據 id：Confirmed 取 target.userId，
+                        // SerialUnavailable 取 userId（id-only 仍可判漂移），
+                        // 其餘 null（未知，不報 drift）。
+                        val nullVerifiedId: Int? = when (nullVerified) {
+                            is DualTargetResolution.Confirmed -> nullVerified.target.userId
+                            is DualTargetResolution.SerialUnavailable -> nullVerified.userId
+                            is DualTargetResolution.Absent,
+                            is DualTargetResolution.Unknown,
+                            null -> null
+                        }
                         _state.update { cur ->
                             val now = nowWallMs()
                             val next = if (groundTruth == null) {
@@ -1215,12 +1236,13 @@ class DualViewModel(
                                         msg = combinedMsg,
                                         msgKind = combinedKind,
                                     )
-                                } else if (nullVerified is DualIdResolution.Confirmed &&
-                                    nullVerified.userId != dualId
+                                } else if (nullVerifiedId != null &&
+                                    nullVerifiedId != dualId
                                 ) {
-                                    // Confirmed 保證正值（repo 拒收 0/負值），
-                                    // 故此分支即「正值且不同」的新身份。
-                                    val newTarget = nullVerified.userId
+                                    // Confirmed/SerialUnavailable 皆保證正值
+                                    //（repo 拒收 0/負值），故此分支即「正值且
+                                    // 不同」的新身份。
+                                    val newTarget = nullVerifiedId
                                     val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                         "refresh verification mismatch: " +
                                             "target $dualId -> $newTarget",
