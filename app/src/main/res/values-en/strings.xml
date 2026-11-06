@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
-<!-- p28-1 English strings. Channel names stay identical (identifiers). -->
+<!-- p28-1 English strings. Channel names stay identical (identifiers).
+     Scope honesty: only short user-visible prompts (write-block reasons, input
+     validation, diagnostic copy button/success) are bilingual (en+zh+Hant);
+     renderInventory/renderLastOp/renderHook/renderDiagnose/formatBatchReport/
+     DiagnoseStrings status lines stay Traditional Chinese (scope-limited). -->
 <resources xmlns:tools="http://schemas.android.com/tools">
     <string name="pkg_input_hint">Package name (e.g. com.example.app)</string>
     <string name="action_clone">Clone</string>
@@ -93,4 +97,7 @@
     <string name="invalid_package">invalid package</string>
     <!-- p28-1 review: channel group semantic label (announced after the HorizontalScrollView wrap). -->
     <string name="channel_group_cd">Channel picker (mutually exclusive): Auto, Root, Shizuku, LSPosed</string>
+    <!-- p28-1 review: diagnostic copy button/success (user-visible, localized; zh+en+Hant). -->
+    <string name="diagnostic_copy_button">Copy redacted content (review before sharing)</string>
+    <string name="diagnostic_copy_success">Copied redacted diagnosis (local clipboard only, no upload; review before sharing, clear clipboard after use)</string>
 </resources>

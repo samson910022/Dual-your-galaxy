@@ -5,9 +5,12 @@
 //   實際拒絕同 key（single source，經測試假值解析比對）。
 // - packageInputError：空白/超長/字元集/有效輸入（資源鍵斷言）。
 // - 資源鎖定：繁中預設 + 英文 values-en 同鍵、Clone/Remove 統一字面、
-//   寫入拒絕/輸入驗證鍵雙語齊備（含格式佔位）、
+//   寫入拒絕/輸入驗證/診斷複製鍵雙語齊備（含格式佔位）、三繁中檔（values/
+//   b+zh+Hant/zh-rTW）鎖一致；
 //   語意色亮/暗對假設背景 #FFFFFF/#121212 的數學檢查皆至少 4.5:1
 //   （非實際主題聲稱；Manifest 未宣告 theme，實際 surface 未驗證；#B26A00 已移除）。
+//   雙語範圍誠實化：僅上述短句為中英雙語；render*/DiagnoseStrings 狀態行保留
+//   繁中（scope-limited，非全量雙語）。
 package com.galaxydual.plus
 
 import com.galaxydual.core.CmdGateway
@@ -286,9 +289,10 @@ class UiSemanticsP28Test {
         assertEquals(zh.keys + pluralNames(resFile("values/strings.xml")), en.keys + pluralNames(resFile("values-en/strings.xml")))
     }
 
-    // 資源：寫入拒絕理由 + 包名驗證鍵雙語齊備（key/雙語斷言，不鎖死字面以外的文案）。
+    // 資源：寫入拒絕理由 + 包名驗證 + 診斷複製鍵範圍雙語齊備（scope-limited 雙語，
+    // 非全量雙語；key/雙語斷言，不鎖死字面以外的文案）。
     @Test
-    fun strings_blockAndInputKeys_bilingual() {
+    fun strings_blockAndInputKeys_scopedBilingual() {
         val zh = stringMap(resFile("values/strings.xml"))
         val en = stringMap(resFile("values-en/strings.xml"))
         val keys = listOf(
@@ -303,6 +307,8 @@ class UiSemanticsP28Test {
             "input_too_long",
             "invalid_package",
             "channel_group_cd",
+            "diagnostic_copy_button",
+            "diagnostic_copy_success",
         )
         for (k in keys) {
             assertTrue("zh missing/empty $k", !zh[k].isNullOrEmpty())
@@ -356,6 +362,51 @@ class UiSemanticsP28Test {
         // 包名無效：zh 已中文化（不再沿用英文原文），en 維持 invalid package。
         assertEquals("包名無效", zh.getValue("invalid_package"))
         assertEquals("invalid package", en.getValue("invalid_package"))
+        // 診斷複製：zh 須含分享前請人工確認/僅本機剪貼簿/用後請清除剪貼簿，
+        // en 須含 review before sharing/local clipboard only/clear clipboard。
+        assertTrue(
+            "zh copy button must name 分享前請人工確認",
+            zh.getValue("diagnostic_copy_button").contains("分享前請人工確認"),
+        )
+        assertTrue(
+            "zh copy success must name 僅本機剪貼簿/用後請清除剪貼簿",
+            zh.getValue("diagnostic_copy_success").contains("僅本機剪貼簿") &&
+                zh.getValue("diagnostic_copy_success").contains("用後請清除剪貼簿") &&
+                zh.getValue("diagnostic_copy_success").contains("分享前請人工確認"),
+        )
+        assertTrue(
+            "en copy must name review before sharing",
+            en.getValue("diagnostic_copy_button").contains("review before sharing") &&
+                en.getValue("diagnostic_copy_success").contains("review before sharing"),
+        )
+        assertTrue(
+            "en copy success must name local clipboard/clear clipboard",
+            en.getValue("diagnostic_copy_success").contains("local clipboard") &&
+                en.getValue("diagnostic_copy_success").contains("clear clipboard"),
+        )
+        // JVM 常數與 zh 資源同字（UI 以資源為準，const 僅為測試 seam）。
+        assertEquals(zh.getValue("diagnostic_copy_button"), DIAGNOSTIC_COPY_BUTTON_TEXT)
+        assertEquals(zh.getValue("diagnostic_copy_success"), DIAGNOSTIC_COPY_SUCCESS_TEXT)
+    }
+
+    // 資源：三繁中檔（values/b+zh+Hant/zh-rTW）鎖一致（key 集＋逐值相等；
+    // minSdk 29，b+zh+Hant 在 API24+ 覆蓋 zh-TW，預設亦為繁中故 instrumentation
+    // zh-TW 回退仍為繁中；此處鎖語意一致，RemoveConfirmMessageTest 另鎖位元一致）。
+    @Test
+    fun strings_zhVariants_consistent() {
+        val def = stringMap(resFile("values/strings.xml"))
+        val hant = stringMap(resFile("values-b+zh+Hant/strings.xml"))
+        val rtw = stringMap(resFile("values-zh-rTW/strings.xml"))
+        assertEquals(def.keys, hant.keys)
+        assertEquals(def.keys, rtw.keys)
+        for (k in def.keys) {
+            assertEquals("Hant mismatch $k", def.getValue(k), hant.getValue(k))
+            assertEquals("rTW mismatch $k", def.getValue(k), rtw.getValue(k))
+        }
+        assertEquals(
+            def.keys + pluralNames(resFile("values/strings.xml")),
+            hant.keys + pluralNames(resFile("values-b+zh+Hant/strings.xml")),
+        )
     }
 
     // 資源：語意色亮/暗對假設背景的數學檢查皆至少 4.5:1（非實際主題聲稱），

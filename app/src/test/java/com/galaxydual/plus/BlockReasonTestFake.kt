@@ -3,7 +3,7 @@
 // p28-1 review（en 殘留）：JVM 測試用繁中假解析——逐字鏡像 values/strings.xml 的
 // 寫入拒絕理由模板（生產由 Application Context 解析資源，見
 // MainActivity.resolveBlockReason 與 DualViewModelFactory 的 blockText）。
-// 模板漂移由 UiSemanticsP28Test.strings_blockAndInputKeys_bilingual 鎖定
+// 模板漂移由 UiSemanticsP28Test.strings_blockAndInputKeys_scopedBilingual 鎖定
 // （關鍵字雙語斷言）；此 fake 只供既有 VM msg 斷言沿用，不新增語意。
 package com.galaxydual.plus
 
