@@ -6,7 +6,8 @@
 // - packageInputError：空白/超長/字元集/有效輸入（資源鍵斷言）。
 // - 資源鎖定：繁中預設 + 英文 values-en 同鍵、Clone/Remove 統一字面、
 //   寫入拒絕/輸入驗證鍵雙語齊備（含格式佔位）、
-//   語意色亮/暗皆至少 4.5:1（#B26A00 已移除）。
+//   語意色亮/暗對假設背景 #FFFFFF/#121212 的數學檢查皆至少 4.5:1
+//   （非實際主題聲稱；Manifest 未宣告 theme，實際 surface 未驗證；#B26A00 已移除）。
 package com.galaxydual.plus
 
 import com.galaxydual.core.CmdGateway
@@ -357,20 +358,23 @@ class UiSemanticsP28Test {
         assertEquals("invalid package", en.getValue("invalid_package"))
     }
 
-    // 資源：語意色亮/暗皆至少 4.5:1，且舊 #B26A00 已移除。
+    // 資源：語意色亮/暗對假設背景的數學檢查皆至少 4.5:1（非實際主題聲稱），
+    // 且舊 #B26A00 已移除。假設背景 #FFFFFF（淺）/#121212（深）僅為數學常數：
+    // Manifest 未宣告 android:theme，Activity 為程式化建構、預設視窗背景
+    // （隨裝置/系統而異），實際 surface 對比未驗證；完整主題綁定為 p28-3 範圍。
     @Test
-    fun msgColors_contrastAtLeast45_bothThemes() {
+    fun msgColors_contrastAtLeast45_assumedBackgrounds() {
         val light = colorMap(resFile("values/colors.xml"))
         val dark = colorMap(resFile("values-night/colors.xml"))
         val keys = listOf("msg_info", "msg_invalid", "msg_no_dual", "msg_verify", "msg_failed", "msg_channel")
         for (k in keys) {
             assertTrue("light $k missing", light.containsKey(k))
             assertTrue("dark $k missing", dark.containsKey(k))
-            assertTrue("light $k contrast < 4.5:1 (${light[k]})", contrast(light[k]!!, "#FFFFFF") >= 4.5)
-            assertTrue("dark $k contrast < 4.5:1 (${dark[k]})", contrast(dark[k]!!, "#121212") >= 4.5)
+            assertTrue("light $k vs assumed #FFFFFF contrast < 4.5:1 (${light[k]})", contrast(light[k]!!, "#FFFFFF") >= 4.5)
+            assertTrue("dark $k vs assumed #121212 contrast < 4.5:1 (${dark[k]})", contrast(dark[k]!!, "#121212") >= 4.5)
         }
         val raw = resFile("values/colors.xml").readText() + resFile("values-night/colors.xml").readText()
-        assertTrue("舊 #B26A00 未達 4.5:1，須移除", !raw.contains("B26A00", ignoreCase = true))
+        assertTrue("舊 #B26A00 對假設白底未達 4.5:1，須移除", !raw.contains("B26A00", ignoreCase = true))
     }
 
     // ---- 資源讀取/對比小工具（測試專用，不進生產） ----
