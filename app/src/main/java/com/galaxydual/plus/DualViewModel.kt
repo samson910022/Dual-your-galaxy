@@ -588,13 +588,25 @@ class DualViewModel(
     // remove use distinct keys so an intentional clone-then-remove sequence on
     // the same package is never collapsed. Main-confined (see class doc).
     //
-    // CE convention (F5): a cancelled job clears loading before rethrowing --
-    // every catch clears loading=false then rethrows CancellationException
-    // (reconnect/refresh/recheck/probe/foreground 皆同，成功/失敗清位不變；
-    // 取消路徑補清）。唯 selectChannel 無 CE catch (latest-wins 靠
+    // CE convention (F5 + 階段L): a cancelled job clears loading before rethrowing
+    // ONLY when no active sibling still owns busy -- the four coalesced entries
+    // check hasActiveSibling(myJob) first (holder 續持 busy 時維持 true)，無 sibling
+    // 才 loading=false，一律 rethrow (reconnect/refresh/recheck/probe/foreground
+    // 皆同，成功/失敗清位不變；取消路徑補清）。唯 selectChannel 無 CE catch (latest-wins 靠
     // successor 的 leading busy 覆寫)；terminal scope-cancel 隨 ViewModel
     // 丟棄狀態，無殘留。
     private val inFlightWrites = mutableSetOf<String>()
+
+    // Busy ownership (階段L P2): a cancelled waiter must not clear loading
+    // while a sibling holder still owns the mutex. All four coalesced entries
+    // (refresh/recheck/reconnect/foreground) are direct viewModelScope children
+    // (clone/write 同為直屬 children，故可見)；外層 CE catch 清位前先檢查除自己外
+    // 是否還有 active sibling：有 → 維持 busy（不清除），無 → 才 loading=false。
+    // 一律 rethrow CE。selectChannel 不動 (successor 覆寫)。
+    private fun hasActiveSibling(excluding: Job?): Boolean {
+        val scopeJob = viewModelScope.coroutineContext[Job] ?: return false
+        return scopeJob.children.any { it !== excluding && it.isActive }
+    }
 
     // Single constructor for in-flight write dedup keys; keeps the
     // "clone:<pkg>" / "request-remove:<pkg>" namespaces consistent.
@@ -766,10 +778,10 @@ class DualViewModel(
                 opMutex.withLock { refreshLocked() }
                 drainCoalesced()
             } catch (e: CancellationException) {
-                // K2：opMutex 外層等待被取消時 CE 在進入 refreshLocked 體前拋出，
-                // 內層清位覆蓋不到；此補清 loading 後重拋 (僅取消路徑，
-                // 成功/失敗語意不動)。
-                _state.update { it.copy(loading = false) }
+                // K2 + 階段L：opMutex 外層等待被取消時 CE 在進入 refreshLocked 體前拋出，
+                // 內層清位覆蓋不到；僅無 active sibling 時補清 loading（有 holder 續持
+                // busy 時維持 true，免 spinner 消失/按鈕重啟），一律重拋。
+                if (!hasActiveSibling(myJob)) _state.update { it.copy(loading = false) }
                 throw e
             } finally {
                 if (refreshJob === myJob) refreshJob = null
@@ -3038,8 +3050,8 @@ class DualViewModel(
                     opMutex.withLock { recheckLocked(allowPrivilegedHookDiagnosis = trailingPrivileged) }
                 }
             } catch (e: CancellationException) {
-                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋)。
-                _state.update { it.copy(loading = false) }
+                // K2 + 階段L：同 refresh（預取等待取消窗口；有 active sibling 續持 busy）。
+                if (!hasActiveSibling(myJob)) _state.update { it.copy(loading = false) }
                 throw e
             } finally {
                 if (recheckJob === myJob) recheckJob = null
@@ -3094,8 +3106,8 @@ class DualViewModel(
                 opMutex.withLock { reconnectLocked(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis) }
                 drainCoalesced()
             } catch (e: CancellationException) {
-                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋)。
-                _state.update { it.copy(loading = false) }
+                // K2 + 階段L：同 refresh（預取等待取消窗口；有 active sibling 續持 busy）。
+                if (!hasActiveSibling(myJob)) _state.update { it.copy(loading = false) }
                 throw e
             } finally {
                 if (refreshJob === myJob) refreshJob = null
@@ -4232,9 +4244,9 @@ class DualViewModel(
                     opMutex.withLock { foregroundLocked() }
                 }
             } catch (e: CancellationException) {
-                // K2：同 refresh (預取等待取消窗口補清 loading 後重拋；
+                // K2 + 階段L：同 refresh (預取等待取消窗口；有 active sibling 續持 busy；
                 // 體內取消已由 foregroundLocked 內層 catch 清位，此為保險)。
-                _state.update { it.copy(loading = false) }
+                if (!hasActiveSibling(myJob)) _state.update { it.copy(loading = false) }
                 throw e
             } finally {
                 if (foregroundJob === myJob) foregroundJob = null
