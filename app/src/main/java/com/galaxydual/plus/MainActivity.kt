@@ -469,21 +469,26 @@ class MainActivity : ComponentActivity() {
         autoBtn = RadioButton(this).apply {
             id = R.id.channel_auto
             text = getString(R.string.channel_auto)
+            // 窄螢幕可點按：WRAP_CONTENT＋最小寬（64dp），不靠 weight。
+            minimumWidth = (64 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, allowPrivilegedHookDiagnosis = false) }
         }
         rootBtn = RadioButton(this).apply {
             id = R.id.channel_root
             text = getString(R.string.channel_root)
+            minimumWidth = (64 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, allowPrivilegedHookDiagnosis = false) }
         }
         shizukuBtn = RadioButton(this).apply {
             id = R.id.channel_shizuku
             text = getString(R.string.channel_shizuku)
+            minimumWidth = (64 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, allowPrivilegedHookDiagnosis = false) }
         }
         lsposedBtn = RadioButton(this).apply {
             id = R.id.channel_lsposed
             text = getString(R.string.channel_lsposed)
+            minimumWidth = (64 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, allowPrivilegedHookDiagnosis = false) }
         }
         channelGroup.addView(autoBtn, radioParams())
@@ -706,7 +711,8 @@ class MainActivity : ComponentActivity() {
     // 主動點按才顯示，無自動上傳、無網路呼叫、無後台傳送。
     // P2-4 誠實文案：遮蔽仍非全面保證，標題與按鈕須明示「分享前請人工確認」，
     // 不得只寫「已遮蔽」使人誤信絕對乾淨。
-    // P2-7：對話框另附「複製已遮蔽內容」按鈕（見 DIAGNOSTIC_COPY_BUTTON_TEXT）：
+    // P2-7：對話框另附複製已遮蔽內容按鈕（資源 R.string.diagnostic_copy_button，
+    // 中英＋繁中；JVM 常數 DIAGNOSTIC_COPY_BUTTON_TEXT 僅為測試 seam，文案以資源為準）：
     // 使用者主動觸發才經 ClipboardManager 複製已遮蔽文本到本機剪貼簿；複製內容
     // 與預覽同字串 (diagnosticExportCopyText)，不做自動傳輸/share。
     private fun showDiagnosticExport() {
@@ -721,7 +727,7 @@ class MainActivity : ComponentActivity() {
             .setTitle(getString(R.string.diagnostic_export_title))
             .setMessage(preview)
             .setCancelable(true)
-            .setNeutralButton(DIAGNOSTIC_COPY_BUTTON_TEXT) { _, _ ->
+            .setNeutralButton(getString(R.string.diagnostic_copy_button)) { _, _ ->
                 try {
                     val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     cm.setPrimaryClip(
@@ -730,7 +736,7 @@ class MainActivity : ComponentActivity() {
                             diagnosticExportCopyText(state),
                         ),
                     )
-                    msgView.text = DIAGNOSTIC_COPY_SUCCESS_TEXT
+                    msgView.text = getString(R.string.diagnostic_copy_success)
                     msgView.setTextColor(msgColorFor(MsgKind.INFO))
                 } catch (e: Exception) {
                     msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
@@ -744,9 +750,21 @@ class MainActivity : ComponentActivity() {
     private fun rowParams(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
-    // p28-1 通道 RadioButton 權重（單列四顆，與其他列同式）。
+    // p28-1 通道 RadioButton 佈局（窄螢幕安全）：HorizontalScrollView 量測為
+    // UNSPECIFIED，weight 權重（0 寬）在橫滑容器內會塌陷為零寬；此處改
+    // WRAP_CONTENT＋dp margins（不使用 weight），互斥語意不變（RadioGroup
+    // 仍為滑動區唯一直屬子，四鈕仍為群組直屬；切換走 selectChannel，busy
+    // 僅禁點按，恢復路徑不變）。
     private fun radioParams(): RadioGroup.LayoutParams =
-        RadioGroup.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        RadioGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            val d = resources.displayMetrics.density
+            val m = (8 * d).toInt()
+            leftMargin = m
+            rightMargin = m
+        }
 
     // p28-1 訊息語意色（亮/暗 values 資源；數值僅為對假設背景
     // #FFFFFF/#121212 的數學檢查（目標 4.5:1），不聲稱實際主題對比。
@@ -1154,7 +1172,15 @@ class MainActivity : ComponentActivity() {
         )
         val acknowledgement = CheckBox(this).apply {
             setText(R.string.remove_confirm_acknowledge)
-            setPadding(24, 0, 24, 0)
+            // 窄螢幕可見可操作：24px 改 dp 換算＋WRAP_CONTENT＋最小觸控高 48dp。
+            val d = resources.displayMetrics.density
+            val hPad = (24 * d).toInt()
+            setPadding(hPad, 0, hPad, 0)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            minimumHeight = (48 * d).toInt()
         }
         try {
             removeConfirmDialog = AlertDialog.Builder(this)
@@ -1622,6 +1648,9 @@ internal fun Context.resolveBlockReason(reason: BlockReason): String = when (rea
 // - 上次操作相位由清單行尾移至 renderLastOpText 獨立行 (理由：行職責單一/可讀性，無操作顯示「無」與匯出同詞)；
 // - hook 時間證據經 hookEvidence()+timeEvidenceText 統一 (狀態文案維持本頁提示，不動；理由：單一來源免分叉)。
 
+// 雙語範圍誠實化：以下 render*/formatBatchReport 皆保留繁中（scope-limited，
+// 非全量雙語；僅寫入拒絕/輸入驗證/診斷複製短句已資源化中英＋繁中）。未來在地化
+// 再抽資源，穩定碼/測試鎖定繁中字面不受影響。
 // 清單新鮮度行：STALE/UNKNOWN 明確標示，FRESH 顯示目標/筆數/查詢時間。
 internal fun renderInventoryText(s: UiState): String = buildString {
     append("清單：${s.inventory.freshness}")
@@ -1675,7 +1704,7 @@ internal fun renderHookText(s: UiState): String? {
         "待 whitelist 政策分支，寫入已禁用"
 }
 
-// 診斷事件行：穩定碼 + 繁中摘要/下一步常顯；展開時加 exit/技術 detail。
+// 診斷事件行：穩定碼 + 繁中摘要/下一步常顯（scope-limited 繁中，非雙語）；展開時加 exit/技術 detail。
 internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildString {
     val diag = s.diagnose
     if (diag == null) {
@@ -1697,12 +1726,15 @@ internal fun renderDiagnoseText(s: UiState, expanded: Boolean): String = buildSt
 }
 
 // P2-7 匯出複製按鈕文案（頂層 const，JVM 可測；測試鎖定繁中字面）。
-// P2-4 誠實文案：遮蔽仍非全面保證，須附「分享前請人工確認」，不得只寫已遮蔽。
-// 使用者主動觸發才複製，不做自動傳輸/share。
+// 生產 UI 以資源 R.string.diagnostic_copy_button 為準（中英＋繁中），此 const
+// 僅為 JVM seam（與 zh 資源同字）；P2-4 誠實文案：遮蔽仍非全面保證，須附
+// 「分享前請人工確認」，不得只寫已遮蔽。使用者主動觸發才複製，不做自動傳輸/share。
 const val DIAGNOSTIC_COPY_BUTTON_TEXT = "複製已遮蔽內容（分享前請人工確認）"
 
-// StageD D4 剪貼簿複製成功訊息（頂層 const，JVM 可測）：維持使用者主動觸發+
-// 警示，補「用後請清除剪貼簿」並保留「僅本機剪貼簿」（不做自動傳輸/share）。
+// StageD D4 剪貼簿複製成功訊息（頂層 const，JVM 可測）：生產 UI 以資源
+// R.string.diagnostic_copy_success 為準（中英＋繁中），此 const 僅為 JVM seam
+// （與 zh 資源同字）；維持使用者主動觸發+警示，補「用後請清除剪貼簿」並保留
+// 「僅本機剪貼簿」（不做自動傳輸/share）。
 const val DIAGNOSTIC_COPY_SUCCESS_TEXT =
     "已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳，分享前請人工確認，用後請清除剪貼簿）"
 
@@ -1718,7 +1750,7 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 // 「…等 M 項」收尾（與來源清單 MAX_SOURCE_ROWS 同式截斷提示）。
 const val BATCH_REPORT_MAX_ROWS = 50
 
-// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派)。
+// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派；保留繁中 scope-limited，非雙語)。
 // - 未知口徑與 DualViewModel.isBatchUnknownOutcome 一致：VerifyUnknown 與
 //   ChannelError（身份暫時無法判定、零寫入，需重查）皆計未知；NoDual 計失敗
 //   （真 Absent＋M13 短路語意），其餘非 Success 皆計失敗。彙總計數由呼叫端
