@@ -145,6 +145,44 @@ class DiagnoseFreshnessStageDTest {
         assertTrue("export must carry ip marker, got: $text", text.contains("<ip>"))
     }
 
+    // P2：IPv4-embedded IPv6 須整段遮蔽 (embedded 分支優先於純 IPv4/壓縮分支，
+    // 否則純 IPv4 先吃尾段留 `::ffff:<ip>`，或壓縮分支在 `.` 止殘留 `<ip>.168.1.25`)。
+    @Test
+    fun p2_ipv4EmbeddedIpv6_maskedWhole() {
+        assertEquals("<ip>", redactIp("::ffff:192.168.1.25"))
+        assertEquals("<ip>", redactIp("2001:db8::ffff:192.168.1.25"))
+        assertEquals("<ip>", redactIp("::192.168.1.25"))
+        // 大寫 FFFF 須整段吞入 (embedded (?i:ffff:)?)，否則殘留 `.168.1.25`。
+        assertEquals("<ip>", redactIp("::FFFF:192.168.1.25"))
+        assertEquals("<ip>", redactIp("2001:db8::FFFF:192.168.1.25"))
+        // NAT64 鎖定 (前綴+`::`+IPv4，不經 ffff 分支；大小寫皆整段吞入)。
+        assertEquals("<ip>", redactIp("64:ff9b::192.168.1.25"))
+        assertEquals("<ip>", redactIp("64:FF9B::192.168.1.25"))
+        assertEquals("addr <ip> end", redactIp("addr ::ffff:192.168.1.25 end"))
+        // 純 IPv4 不含 `::`，不受 embedded 分支影響。
+        assertEquals("ip <ip> port 5555", redactIp("ip 192.168.0.5 port 5555"))
+        // 既有形仍遮；時間/版本/短冒號仍原樣。
+        assertEquals("loop <ip> end", redactIp("loop ::1 end"))
+        assertEquals("addr <ip> end", redactIp("addr 2001:db8::1 end"))
+        assertEquals("time 12:34", redactIp("time 12:34"))
+        assertEquals("12:34:56", redactIp("12:34:56"))
+        assertEquals("v1.2.3", redactIp("v1.2.3"))
+        assertEquals("user 95", redactIp("user 95"))
+    }
+
+    // P2 匯出端到端：含 IPv4-embedded IPv6 的 techDetail 不洩 raw。
+    @Test
+    fun p2_export_embeddedIpv6Tech_noRawLeak() {
+        val raw = "::ffff:192.168.1.25"
+        val state = UiState(
+            diagnose = diagnoseEvent(DiagnoseCode.CHANNEL_ERROR, techDetail = "ip $raw port 5555"),
+        )
+        val text = buildDiagnosticExport(state)
+        assertFalse("export must not leak embedded ipv6, got: $text", text.contains(raw))
+        assertFalse("export must not leak ipv4 tail, got: $text", text.contains("192.168.1.25"))
+        assertTrue("export must carry ip marker, got: $text", text.contains("<ip>"))
+    }
+
     // D3 匯出 IPv4 不洩 raw。
     @Test
     fun d3_export_ipTech_noRawLeak() {

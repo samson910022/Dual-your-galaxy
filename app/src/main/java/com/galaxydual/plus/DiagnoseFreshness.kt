@@ -378,8 +378,13 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 //   郵件亦須遮 (PATH_TOKEN 不處理無斜線郵件)。
 // - redactPii：dotted 包名 token → <pkg>，數字 uid/serial/exit 不動
 //   (exit code 與 userId 皆為小整數，混淆數字會破壞可讀性；包名才是個資)。
-// - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>) + IPv6 三分支
-//   (順序 IPv4 → 壓縮`::` → 完整8段 → 含字母；JVM java.util.regex 合法)：
+// - redactIp：IPv4 ((?:\d{1,3}\.){3}\d{1,3} → <ip>) + IPv6 四分支
+//   (順序 embedded 優先 → IPv4 → 壓縮`::` → 完整8段 → 含字母；JVM java.util.regex 合法)：
+//   embedded [0-9A-Fa-f:.]*::(?i:ffff:)?(?:\d{1,3}\.){3}\d{1,3} 須置最前——否則純 IPv4
+//   分支先吃掉尾段留下 `::ffff:<ip>` (或壓縮分支在 `.` 止殘留 `<ip>.168.1.25`)；
+//   覆蓋 ::ffff:192.168.1.25/::192.168.1.25/2001:db8::ffff:192.168.1.25
+//   (::FFFF: 大寫經 (?i:ffff:)? 整段吞入；其餘十六進 [0-9A-Fa-f] 已大小寫無關)
+//   (前綴+`::`+可選`ffff:`+IPv4)；純 IPv4 不含 `::`，不受 embedded 分支影響；
 //   壓縮形 (?=[0-9A-Fa-f:.]*::)(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}
 //   覆蓋 ::1/fe80::1/2001:db8::1；完整8段 (?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}
 //   (恰 7 個冒號，全數字 2001:0:0:0:0:0:0:1 與 1:2:3:4:5:6:7:8 命中，
@@ -390,7 +395,7 @@ fun ProfilesSnapshot.toDiagnoseEvent(): DiagnoseEvent? = when (this) {
 // 無自動上傳 (本模組無網路呼叫)。
 private val PKG_TOKEN = Regex("\\b[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+\\b")
 private val EMAIL_TOKEN = Regex("[\\w.+-]+@[\\w.-]+")
-private val IP_TOKEN = Regex("(?:\\d{1,3}\\.){3}\\d{1,3}|(?=[0-9A-Fa-f:.]*::)(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?=[0-9A-Fa-f:.]*[A-Fa-f])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
+private val IP_TOKEN = Regex("[0-9A-Fa-f:.]*::(?i:ffff:)?(?:\\d{1,3}\\.){3}\\d{1,3}|(?:\\d{1,3}\\.){3}\\d{1,3}|(?=[0-9A-Fa-f:.]*::)(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?=[0-9A-Fa-f:.]*[A-Fa-f])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}")
 
 internal fun redactEmail(text: String): String = EMAIL_TOKEN.replace(text, "<email>")
 
