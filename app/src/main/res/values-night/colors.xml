@@ -2,6 +2,8 @@
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
 <!-- p28-1 語意色（深色，假設背景 #121212 的數學驗證，非實際主題聲稱）：
      Manifest 未宣告 android:theme，實際 surface 未鎖定，故此處不聲稱實際主題對比。
+     錯配風險：實際視窗背景隨裝置/系統而異，若偏離假設 #121212，上述比值不代表實際可讀性；
+     實際 surface 對比驗證與主題綁定為 p28-3 範圍，本檔不新增實際對比聲稱。
      淺色前景色在假設深底對比不足
     （INFO 3.87、VERIFY/FAILED 2.87、CHANNEL 2.24，皆未達 4.5:1），故另給亮色（以下比值僅為對假設背景的數學檢查）：
      - msg_info #81C784（9.31:1）

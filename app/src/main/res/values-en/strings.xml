@@ -48,13 +48,15 @@
         <item quantity="other">Batch create %d clones (runs per checked app; checking alone never uninstalls)</item>
     </plurals>
     <string name="catalog_load_failed">Source list failed to load; kept the old list (tap Reconnect and refresh to retry)</string>
+    <!-- A: visible reason when writable but the batch target is unverified (targetSerial null/UNKNOWN); UI-only hint, VM guards untouched. -->
+    <string name="batch_target_unavailable">Batch target unverified (user/serial unknown or serial missing); batch is disabled. Tap Reconnect and refresh to re-query, then retry.</string>
     <string name="shizuku_listener_failed">Shizuku listener registration failed: %1$s</string>
     <string name="copy_failed">Copy failed: %1$s</string>
     <string name="dialog_close">Close</string>
     <string name="dialog_cancel">Cancel</string>
     <string name="remove_confirm_title">Confirm clone removal</string>
     <string name="remove_confirm_positive">Remove</string>
-    <string name="remove_confirm_message">Warning: This will delete the clone’s user data and cannot be undone; only the clone (user %3$s) is affected, not the main profile.\nPackage: %2$s\nVerified target: user %3$s, serial %5$s\nApp: %1$s\nProfile: %4$s  [truncated] means the label was shortened.</string>
+    <string name="remove_confirm_message">Warning: This will delete the clone’s user data and cannot be undone; only the clone (user %3$s) is affected, not the main profile.\nPackage: %2$s\nVerified target: user %3$s, serial %5$s\nApp: %1$s\nProfile: %4$s  [truncated] means the label was shortened.\nYou must check the confirmation box below to enable Remove.</string>
     <string name="remove_confirm_view_labels">Label details</string>
     <string name="remove_confirm_labels">Labels are limited to 256 characters and 512 display units each; [truncated] means shortened; a literal [ is escaped as \\[.\nApp: %1$s\nProfile: %2$s</string>
     <string name="remove_confirm_acknowledge">I have read the warning and verified the full package, user and serial above.</string>

@@ -84,6 +84,8 @@ class RemoveConfirmMessageTest {
         assertTrue(lines[2].contains("user 95, serial 15"))
         assertTrue(lines[3].contains("😀 [truncated]"))
         assertTrue(!lines[3].contains("end"))
+        assertEquals(6, lines.size)
+        assertTrue(lines[5].contains("check the confirmation box below"))
         val full = buildRemoveLabelsMessage("%1\$s | %2\$s", label, label)
         assertTrue(full.contains(label))
         assertTrue(!full.contains(" [truncated]"))
@@ -131,12 +133,20 @@ class RemoveConfirmMessageTest {
         for (directory in listOf("values", "values-en", "values-b+zh+Hant", "values-zh-rTW")) {
             val msg = buildRemoveConfirmMessage(template(directory), pkg, "App\nforged", "אב\u202Eforged", dualId, serial)
             val lines = msg.split("\n")
-            assertEquals(directory, 5, lines.size)
+            assertEquals(directory, 6, lines.size)
             assertTrue(lines[1].contains(pkg))
             assertTrue(lines[2].contains("user 95"))
             assertTrue(lines[2].contains("serial 15"))
             assertTrue(lines[3].contains("App\\u{000A}forged"))
             assertTrue(lines[4].contains("\\u{202E}forged"))
+            // D 操作指示：末行須提示需勾選下方確認框才啟用移除（中英＋繁中同步）。
+            if (directory == "values-en") {
+                assertTrue(lines[5].contains("check the confirmation box below"))
+                assertTrue(lines[5].contains("enable Remove"))
+            } else {
+                assertTrue(lines[5].contains("勾選下方確認框"))
+                assertTrue(lines[5].contains("確認移除"))
+            }
         }
     }
 

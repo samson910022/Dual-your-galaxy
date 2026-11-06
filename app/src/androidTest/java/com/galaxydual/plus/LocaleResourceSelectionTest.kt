@@ -21,13 +21,18 @@ class LocaleResourceSelectionTest : InstrumentationTestCase() {
             "Profile\u2029forged\u2066evil", 95, 15,
         )
         val lines = msg.split("\n")
-        assertEquals(5, lines.size)
+        assertEquals(6, lines.size)
         assertTrue(lines[0].contains(if (english) "cannot be undone" else "無法復原"))
         assertTrue(lines[1].contains("com.example.chat"))
         assertTrue(lines[2].contains("user 95"))
         assertTrue(lines[2].contains("serial 15"))
         assertTrue(lines[3].contains("\\u{2028}forged\\u{202E}evil"))
         assertTrue(lines[4].contains("\\u{2029}forged\\u{2066}evil"))
+        if (english) {
+            assertTrue(lines[5].contains("check the confirmation box below"))
+        } else {
+            assertTrue(lines[5].contains("勾選下方確認框"))
+        }
 
     }
 
@@ -55,7 +60,7 @@ class LocaleResourceSelectionTest : InstrumentationTestCase() {
             "com.example.chat", label, label, 95, 15,
         )
         val lines = message.split("\n")
-        assertEquals(5, lines.size)
+        assertEquals(6, lines.size)
         assertTrue(lines[1].contains("com.example.chat"))
         assertTrue(lines[2].contains("serial 15"))
         assertTrue(lines[3].contains("😀 [truncated]\u2069"))
