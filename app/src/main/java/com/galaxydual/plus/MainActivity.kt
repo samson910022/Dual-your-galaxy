@@ -163,6 +163,8 @@ class MainActivity : ComponentActivity() {
     // retained, no re-send). shownPending tracks the instance already on
     // screen so repeat renders do not rebuild the dialog.
     private var removeConfirmDialog: AlertDialog? = null
+    private var removeLabelsDialog: AlertDialog? = null
+    private var removeAcknowledged = false
     private var shownPending: PendingRemove? = null
 
     // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
@@ -270,10 +272,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         try {
+            removeLabelsDialog?.dismiss()
             removeConfirmDialog?.dismiss()
         } catch (_: Exception) {
             // Best effort: the window is going away anyway.
         }
+        removeLabelsDialog = null
         removeConfirmDialog = null
         shownPending = null
         try {
@@ -970,6 +974,8 @@ class MainActivity : ComponentActivity() {
     private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean) {
         if (isFinishing || isDestroyed) return
         if (pending == null) {
+            removeLabelsDialog?.dismiss()
+            removeLabelsDialog = null
             try {
                 removeConfirmDialog?.dismiss()
             } catch (_: Exception) {
@@ -980,40 +986,51 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !loading
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
             // 在途不可取消，關閉 cancel 窗的使用者路徑；程式化 cancel 由 repo isStillValid 兜底。
             removeConfirmDialog?.setCancelable(!loading)
             removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
             return
         }
         try {
+            removeLabelsDialog?.dismiss()
+            removeLabelsDialog = null
             removeConfirmDialog?.dismiss()
         } catch (_: Exception) {
             // Best effort.
         }
         shownPending = pending
+        removeAcknowledged = false
         val appLabel = resolveAppLabel(pending.pkg)
         // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
-        // 本地確認畫面必須顯示完整 package + label + user/serial，
+        // 本地確認畫面顯示完整 package + user/serial，標籤則有明示的上限，
         // 不經 sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
         // 診斷匯出/日誌仍經四道遮蔽（見 buildDiagnosticExport）。
         val message = buildRemoveConfirmMessage(
+            template = getString(R.string.remove_confirm_message),
             pkg = pending.pkg,
             appLabel = appLabel,
             profileLabel = pending.profileLabel,
             dualId = pending.dualId,
             serial = pending.dualSerial,
         )
+        val acknowledgement = CheckBox(this).apply {
+            setText(R.string.remove_confirm_acknowledge)
+            setPadding(24, 0, 24, 0)
+        }
         try {
             removeConfirmDialog = AlertDialog.Builder(this)
                 .setTitle(getString(R.string.remove_confirm_title))
                 .setMessage(message)
+                .setView(acknowledgement)
                 // Builder 僅有 setCancelable（無 setCanceledOnTouchOutside），touch-outside 由 show 後 dialog 層再設。
                 .setCancelable(!loading)
                 .setPositiveButton(getString(R.string.remove_confirm_positive), null)
                 .setNegativeButton(getString(R.string.dialog_cancel), null)
-                .setOnCancelListener { vm.cancelRemove() }
+                .setNeutralButton(getString(R.string.remove_confirm_view_labels), null)
+                .setOnCancelListener { vm.cancelRemove(pending) }
                 .show()
         } catch (_: Exception) {
             removeConfirmDialog = null
@@ -1024,10 +1041,24 @@ class MainActivity : ComponentActivity() {
         // 只調 VM 不 dismiss，對話框在 VM 結果回來前保持開啟；拒絕路徑 VM 清
         // pendingRemove，dialog 隨狀態關閉（需重新請求）；僅 overwrite/race 的
         // preserve 路徑（新 pending 保留）才不關。
-        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener { vm.confirmRemove() }
-        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove() }
-        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !loading
+        acknowledgement.setOnCheckedChangeListener { _, checked ->
+            removeAcknowledged = checked
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(vm.state.value.loading, checked)
+        }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            if (canConfirmRemove(vm.state.value.loading, removeAcknowledged)) vm.confirmRemove(pending)
+        }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove(pending) }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            removeLabelsDialog = AlertDialog.Builder(this)
+                .setTitle(R.string.remove_confirm_view_labels)
+                .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), appLabel, pending.profileLabel))
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
+        }
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
         // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
         removeConfirmDialog?.setCancelable(!loading)
         removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
@@ -1500,27 +1531,70 @@ internal fun formatBatchReportText(report: BatchReport?): String {
 
 // 移除確認文案純函數（MainActivity 頂層 internal，JVM 可測）。
 // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
-// 本地確認畫面顯示完整 package + label + user/serial，不經
+// 本地確認畫面顯示完整 package + user/serial，不經
 // sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
-// m3 行注入防護：pkg/appLabel/profileLabel 先過 sanitizeUserEcho
-// (保原文、去換行，不 redact)，結構換行保留，欄位內換行壓空白；
+// 控制字元明確跳脫並隔離欄位；摘要與標籤詳情均有明示的長度上限。
+// package 不截斷，以便核對完整身分。
 // 診斷匯出/日誌仍經四道遮蔽（見 buildDiagnosticExport）。
 // - pkg：待移除完整包名（raw，呼叫端傳 pending.pkg）。
 // - appLabel：PackageManager 解析顯示名；失敗時呼叫端回退傳 pkg
 //  （見 resolveAppLabel），兩種皆須含完整 pkg + user/serial。
 // - profileLabel：已驗證目標顯示名（raw，pending.profileLabel）。
 // - dualId/serial：已驗證目標 user/serial（數字身份可讀性）。
+// Escape backslashes too, so an actual control cannot be confused with literal text.
+// Trusted isolates keep normal RTL text from reordering the surrounding identity.
+internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean = !loading && acknowledged
+
+internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
+    require(maxOutput >= TRUNCATION_MARKER.length + 2)
+    val out = StringBuilder("\u2068")
+    var i = 0
+    var count = 0
+    var markerSafeLength = out.length
+    while (i < raw.length && (maxCodePoints == null || count < maxCodePoints)) {
+        val cp = raw.codePointAt(i)
+        val escaped = when {
+            cp == 0x5c -> "\\\\"
+            cp == 0x5b -> "\\["
+            Character.getType(cp) == Character.CONTROL.toInt() ||
+                (Character.getType(cp) == Character.FORMAT.toInt() && cp != 0x200C && cp != 0x200D) ||
+                Character.getType(cp) == Character.LINE_SEPARATOR.toInt() ||
+                Character.getType(cp) == Character.PARAGRAPH_SEPARATOR.toInt() ||
+                Character.getType(cp) == Character.SURROGATE.toInt() ->
+                "\\u{" + cp.toString(16).uppercase(java.util.Locale.ROOT).padStart(4, '0') + "}"
+            else -> String(Character.toChars(cp))
+        }
+        // First allow the complete escaped value to use the entire budget.
+        if (out.length.toLong() + escaped.length + 1 > maxOutput) break
+        out.append(escaped)
+        if (out.length.toLong() + TRUNCATION_MARKER.length + 1 <= maxOutput) markerSafeLength = out.length
+        i += Character.charCount(cp)
+        count++
+    }
+    if (i < raw.length) {
+        out.setLength(markerSafeLength)
+        out.append(TRUNCATION_MARKER)
+    }
+    return out.append('\u2069').toString()
+}
+
+private const val TRUNCATION_MARKER = " [truncated]"
+
+internal fun buildRemoveLabelsMessage(template: String, appLabel: String, profileLabel: String): String =
+    String.format(java.util.Locale.ROOT, template, sanitizeRemoveConfirmField(appLabel, 256, 512), sanitizeRemoveConfirmField(profileLabel, 256, 512))
+
 internal fun buildRemoveConfirmMessage(
+    template: String,
     pkg: String,
     appLabel: String,
     profileLabel: String,
     dualId: Int,
     serial: Int,
-): String =
-    "應用：${sanitizeUserEcho(appLabel)}（${sanitizeUserEcho(pkg)}）\n" +
-        "已驗證目標：user $dualId（${sanitizeUserEcho(profileLabel)}，serial $serial）\n" +
-        "警告：將刪除該分身的使用者資料且無法復原；" +
-        "僅影響分身（user $dualId），不影響主 profile。"
+): String = String.format(
+    java.util.Locale.ROOT, template,
+    sanitizeRemoveConfirmField(appLabel, 32, 96), sanitizeRemoveConfirmField(pkg), dualId.toString(),
+    sanitizeRemoveConfirmField(profileLabel, 32, 96), serial.toString(),
+)
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
 // DEVICE-UNVERIFIED: selection/exec never ran on a device.
