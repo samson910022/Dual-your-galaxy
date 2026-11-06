@@ -26,11 +26,19 @@ internal fun zhTestBlockText(): (WriteBlock) -> String = { block ->
         WriteBlockKind.NO_PRIVILEGE ->
             "唯讀：無可用權限通道，寫入已禁用；" +
                 "請檢查授權後點「重新連線並更新」"
+        WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU ->
+            "Auto 已依實測降級：偵測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；" +
+                "如需恢復 ROOT 請檢查 su 授權後點「重新連線並更新」"
+        WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED ->
+            "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；" +
+                "請檢查授權後點「重新連線並更新」"
+        WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL ->
+            "Auto 實測無可用通道（su 不存在且 Shizuku 未通過），目前唯讀；" +
+                "授權 Shizuku 或取得 ROOT 後點「重新連線並更新」"
     }
 }
 
-// 測試側 single-source 解析：Keyed 走繁中假值，Verbatim（AUTO 降級註記）逐字沿用。
+// 測試側 single-source 解析：Keyed 走繁中假值（P2-3 AUTO 降級亦為 Keyed，主路徑無 Verbatim）。
 internal fun resolveZhTest(reason: BlockReason): String = when (reason) {
     is BlockReason.Keyed -> zhTestBlockText()(reason.block)
-    is BlockReason.Verbatim -> reason.text
 }

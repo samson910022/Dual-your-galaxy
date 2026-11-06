@@ -210,7 +210,9 @@ class AutoDegradeReuseTest {
         assertEquals(ChannelPreference.AUTO, degraded.channel)
         assertEquals(ResolvedChannel.NOOP, degraded.resolvedGateway)
         assertFalse("NOOP must never be writable", degraded.writeReady)
-        assertTrue("no-su copy expected, got: \"${degraded.degradeNote}\"", degraded.degradeNote.contains("唯讀"))
+        val degradedText = zhTestBlockText()(degraded.degrade!!)
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL, degraded.degrade!!.kind)
+        assertTrue("no-su copy expected, got: \"$degradedText\"", degradedText.contains("唯讀"))
         // Still-referenced reuse: no terminal teardown on the degrade itself.
         assertEquals(
             "SHIZUKU -> NOOP degrade must not terminal-close the reused gateway",

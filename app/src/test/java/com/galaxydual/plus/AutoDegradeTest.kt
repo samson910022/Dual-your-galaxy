@@ -391,7 +391,8 @@ class AutoDegradeTest {
     fun pure_suDeniedShizukuOk_degrades() {
         val d = resolveAutoProbe(suPresent = true, hasRoot = false, hasShizuku = true)
         assertEquals(ResolvedChannel.SHIZUKU, d.channel)
-        assertTrue("degrade note must record the reason, got: \"${d.degradeNote}\"", d.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, d.degrade!!.kind)
+        assertTrue("degrade note must record the reason, got: \"${zhTestBlockText()(d.degrade!!)}\"", zhTestBlockText()(d.degrade!!).contains("降級"))
     }
 
     // Pure matrix: both probes failing -> NOOP read-only with a note.
@@ -399,7 +400,8 @@ class AutoDegradeTest {
     fun pure_bothFail_readOnly() {
         val d = resolveAutoProbe(suPresent = true, hasRoot = false, hasShizuku = false)
         assertEquals(ResolvedChannel.NOOP, d.channel)
-        assertTrue("read-only note expected, got: \"${d.degradeNote}\"", d.degradeNote.contains("唯讀"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED, d.degrade!!.kind)
+        assertTrue("read-only note expected, got: \"${zhTestBlockText()(d.degrade!!)}\"", zhTestBlockText()(d.degrade!!).contains("唯讀"))
     }
 
     // Pure matrix: both succeeding -> ROOT (F4a su-first order, no degrade).
@@ -407,7 +409,7 @@ class AutoDegradeTest {
     fun pure_bothSucceed_prefersRoot() {
         val d = resolveAutoProbe(suPresent = true, hasRoot = true, hasShizuku = true)
         assertEquals(ResolvedChannel.ROOT, d.channel)
-        assertTrue("no degrade note when ROOT is proven, got: \"${d.degradeNote}\"", d.degradeNote.isEmpty())
+        assertTrue("no degrade note when ROOT is proven, got: \"${d.degrade}\"", d.degrade == null)
     }
 
     // su denied + Shizuku proven -> ViewModel degrades to SHIZUKU, writable.
@@ -434,7 +436,8 @@ class AutoDegradeTest {
         assertTrue("degraded SHIZUKU must be writable", s.writeReady)
         assertTrue("degraded SHIZUKU must keep channelReady for compat", s.channelReady)
         assertTrue("device proved a channel", s.anyProbePassed)
-        assertTrue("degrade note must record the reason, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, s.degrade!!.kind)
+        assertTrue("degrade note must record the reason, got: \"${zhTestBlockText()(s.degrade!!)}\"", zhTestBlockText()(s.degrade!!).contains("降級"))
     }
 
     // Both probes failing -> NOOP read-only.
@@ -458,7 +461,7 @@ class AutoDegradeTest {
         assertFalse("NOOP must never be writable", s.writeReady)
         assertFalse("NOOP must never be channelReady", s.channelReady)
         assertFalse("no proven channel", s.anyProbePassed)
-        assertTrue("read-only note expected, got: \"${s.degradeNote}\"", s.degradeNote.contains("唯讀"))
+        assertTrue("read-only note expected, got: \"${s.degrade?.let { zhTestBlockText()(it) }}\"", s.degrade != null && zhTestBlockText()(s.degrade!!).contains("唯讀"))
     }
 
     // Both succeeding -> ROOT (preference order, no degrade note).
@@ -481,7 +484,7 @@ class AutoDegradeTest {
         assertEquals(Privilege.ROOT, s.execIdentity)
         assertTrue(s.writeReady)
         assertTrue(s.anyProbePassed)
-        assertTrue("no degrade when ROOT is proven, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
+        assertTrue("no degrade when ROOT is proven, got: \"${s.degrade}\"", s.degrade == null)
     }
 
     // Explicit SHIZUKU never crosses to ROOT even when ROOT is proven: the
@@ -521,7 +524,7 @@ class AutoDegradeTest {
         assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
         assertEquals(Privilege.SHELL, s.execIdentity)
         assertTrue("explicit SHIZUKU with proven SHELL must be writable", s.writeReady)
-        assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
+        assertTrue("explicit choice clears the Auto degrade note", s.degrade == null)
         // P25 Item 3: routed reflects only the probed (selected) channel --
         // su was intentionally never probed, so this is SHELL, not ROOT.
         // Execution identity stays SHELL either way.
@@ -537,8 +540,8 @@ class AutoDegradeTest {
         assertEquals(ResolvedChannel.SHIZUKU, d.channel)
         assertTrue(
             "no su present so SHIZUKU is the natural pick, note must be empty, " +
-                "got: \"${d.degradeNote}\"",
-            d.degradeNote.isEmpty(),
+                "got: \"${d.degrade}\"",
+            d.degrade == null,
         )
     }
 
@@ -548,10 +551,11 @@ class AutoDegradeTest {
     fun pure_noSuBothFail_secondCopy() {
         val d = resolveAutoProbe(suPresent = false, hasRoot = false, hasShizuku = false)
         assertEquals(ResolvedChannel.NOOP, d.channel)
-        assertTrue("read-only note expected, got: \"${d.degradeNote}\"", d.degradeNote.contains("唯讀"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL, d.degrade!!.kind)
+        assertTrue("read-only note expected, got: \"${zhTestBlockText()(d.degrade!!)}\"", zhTestBlockText()(d.degrade!!).contains("唯讀"))
         assertTrue(
-            "must be the no-su copy, got: \"${d.degradeNote}\"",
-            d.degradeNote.contains("su 不存在"),
+            "must be the no-su copy, got: \"${zhTestBlockText()(d.degrade!!)}\"",
+            zhTestBlockText()(d.degrade!!).contains("su 不存在"),
         )
     }
 
@@ -561,8 +565,8 @@ class AutoDegradeTest {
         val d = resolveAutoProbe(suPresent = true, hasRoot = true, hasShizuku = false)
         assertEquals(ResolvedChannel.ROOT, d.channel)
         assertTrue(
-            "no degrade note when ROOT is proven, got: \"${d.degradeNote}\"",
-            d.degradeNote.isEmpty(),
+            "no degrade note when ROOT is proven, got: \"${d.degrade}\"",
+            d.degrade == null,
         )
     }
 
@@ -614,7 +618,7 @@ class AutoDegradeTest {
         assertEquals(Privilege.ROOT, s.execIdentity)
         assertFalse("explicit ROOT with denied su must not be writable", s.writeReady)
         assertFalse("explicit ROOT with denied su must not be channelReady", s.channelReady)
-        assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
+        assertTrue("explicit choice clears the Auto degrade note", s.degrade == null)
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         // P25 Item 3: Shizuku was intentionally never probed (explicit ROOT
         // probes su only), so anyProbePassed reflects the probed subset only.
@@ -650,7 +654,7 @@ class AutoDegradeTest {
         assertEquals(Privilege.SHELL, s.execIdentity)
         assertFalse("explicit SHIZUKU with denied Shizuku must not be writable", s.writeReady)
         assertFalse("explicit SHIZUKU with denied Shizuku must not be channelReady", s.channelReady)
-        assertTrue("explicit choice clears the Auto degrade note", s.degradeNote.isEmpty())
+        assertTrue("explicit choice clears the Auto degrade note", s.degrade == null)
         assertEquals(MsgKind.CHANNEL, s.msgKind)
         assertEquals(Privilege.NONE, s.privilege)
         assertFalse("unprobed su must not count toward anyProbePassed", s.anyProbePassed)
@@ -760,7 +764,8 @@ class AutoDegradeTest {
         assertEquals(MsgKind.INFO, s.msgKind)
         assertTrue("degraded SHIZUKU refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
         assertTrue("degraded SHIZUKU must stay writable", s.writeReady)
-        assertTrue("degrade note must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, s.degrade!!.kind)
+        assertTrue("degrade note must survive refresh, got: \"${zhTestBlockText()(s.degrade!!)}\"", zhTestBlockText()(s.degrade!!).contains("降級"))
         assertTrue(
             "refresh INFO must carry the degrade note, got: \"${s.msg}\"",
             s.msg.contains("no clones installed") && s.msg.contains("降級"),
@@ -835,7 +840,8 @@ class AutoDegradeTest {
 
         val s = vm.state.value
         assertNull("degrade swap must drop the stale pending (fail closed)", s.pendingRemove)
-        assertTrue("degrade note must record the reason, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, s.degrade!!.kind)
+        assertTrue("degrade note must record the reason, got: \"${zhTestBlockText()(s.degrade!!)}\"", zhTestBlockText()(s.degrade!!).contains("降級"))
         assertTrue("degraded SHIZUKU must be writable", s.writeReady)
     }
 
@@ -867,8 +873,8 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
         assertTrue(
-            "precondition: AUTO must have degraded, got: \"${vm.state.value.degradeNote}\"",
-            vm.state.value.degradeNote.contains("降級"),
+            "precondition: AUTO must have degraded, got: \"${vm.state.value.degrade}\"",
+            vm.state.value.degrade?.kind == WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU,
         )
 
         vm.requestRemove("com.example.chat")
@@ -879,7 +885,7 @@ class AutoDegradeTest {
 
         val s = vm.state.value
         assertEquals(ChannelPreference.ROOT, s.channel)
-        assertTrue("explicit choice clears the Auto degrade note, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
+        assertTrue("explicit choice clears the Auto degrade note, got: \"${s.degrade}\"", s.degrade == null)
         assertNull("channel switch must drop the stale pending (fail closed)", s.pendingRemove)
     }
 
@@ -913,7 +919,8 @@ class AutoDegradeTest {
         val s = vm.state.value
         assertEquals(ChannelPreference.AUTO, s.channel)
         assertEquals(ResolvedChannel.SHIZUKU, s.resolvedGateway)
-        assertTrue("degradeNote must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, s.degrade!!.kind)
+        assertTrue("degrade must survive refresh, got: \"${zhTestBlockText()(s.degrade!!)}\"", zhTestBlockText()(s.degrade!!).contains("降級"))
         assertTrue(
             "refresh INFO must combine with degrade note, got: \"${s.msg}\"",
             s.msg.contains("no clones installed") && s.msg.contains("降級"),
@@ -921,10 +928,10 @@ class AutoDegradeTest {
         assertEquals(MsgKind.INFO, s.msgKind)
         assertTrue("degraded SHIZUKU must stay writable", s.writeReady)
         // channelView short-tag condition (MainActivity appends
-        // "已自 Auto 降級，詳見狀態列" exactly when degradeNote is non-empty).
-        assertTrue(
-            "channelView must show the degrade short tag (degradeNote non-empty)",
-            s.degradeNote.isNotEmpty(),
+        // "已自 Auto 降級，詳見狀態列" exactly when degrade is non-null).
+        assertNotNull(
+            "channelView must show the degrade short tag (degrade non-null)",
+            s.degrade,
         )
         assertTrue("refresh must list profiles, got: ${s.profiles}", s.profiles.any { it.userId == 95 })
     }
@@ -950,8 +957,8 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
         assertTrue(
-            "precondition: AUTO must have degraded to NOOP, got: \"${vm.state.value.degradeNote}\"",
-            vm.state.value.degradeNote.contains("唯讀"),
+            "precondition: AUTO must have degraded to NOOP, got: \"${vm.state.value.degrade}\"",
+            vm.state.value.degrade != null && zhTestBlockText()(vm.state.value.degrade!!).contains("唯讀"),
         )
 
         vm.reconnectAndRefresh()
@@ -968,13 +975,13 @@ class AutoDegradeTest {
             "error stays first with kind CHANNEL, got: \"${s.msg}\"",
             s.msg.contains("channel error"),
         )
-        assertTrue("degradeNote must survive refresh, got: \"${s.degradeNote}\"", s.degradeNote.contains("唯讀"))
+        assertTrue("degrade must survive refresh, got: \"${s.degrade?.let { zhTestBlockText()(it) }}\"", s.degrade != null && zhTestBlockText()(s.degrade!!).contains("唯讀"))
         // Phase B P2 render/state acceptance: the combined status line must
         // carry the full degrade reason inline (not only in the degradeNote
         // field), error first with the recovery note appended.
         assertTrue(
-            "combined msg must carry the full degradeNote inline, got: \"${s.msg}\"",
-            s.degradeNote.isNotEmpty() && s.msg.contains(s.degradeNote),
+            "combined msg must carry the full degrade inline, got: \"${s.msg}\"",
+            s.degrade != null && s.msg.contains(zhTestBlockText()(s.degrade!!)),
         )
         assertTrue(
             "combined msg must carry the 唯讀 reason, got: \"${s.msg}\"",
@@ -985,11 +992,11 @@ class AutoDegradeTest {
             s.msg.contains("重新連線並更新"),
         )
         assertFalse("NOOP must never be writable", s.writeReady)
-        // channelView short-tag condition: degradeNote non-empty under AUTO.
+        // channelView short-tag condition: degrade non-null under AUTO.
         assertEquals(ChannelPreference.AUTO, s.channel)
-        assertTrue(
-            "channelView must show the degrade short tag (degradeNote non-empty)",
-            s.degradeNote.isNotEmpty(),
+        assertNotNull(
+            "channelView must show the degrade short tag (degrade non-null)",
+            s.degrade,
         )
     }
 
@@ -1002,17 +1009,17 @@ class AutoDegradeTest {
         vm: DualViewModel,
         baseMsg: String,
         baseKind: MsgKind,
-        degradeNote: String,
+        degrade: WriteBlock?,
     ): Pair<String, MsgKind> {
         val m = DualViewModel::class.java.getDeclaredMethod(
             "combineWithDegradeNote",
             String::class.java,
             MsgKind::class.java,
-            String::class.java,
+            WriteBlock::class.java,
         )
         m.isAccessible = true
         @Suppress("UNCHECKED_CAST")
-        return m.invoke(vm, baseMsg, baseKind, degradeNote) as Pair<String, MsgKind>
+        return m.invoke(vm, baseMsg, baseKind, degrade) as Pair<String, MsgKind>
     }
 
     @Test
@@ -1028,11 +1035,12 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading }
-        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED)
+        val degradeText = zhTestBlockText()(degrade)
         val (msg, kind) = combineViaReflection(vm, "channel error: denied", MsgKind.CHANNEL, degrade)
         assertEquals(MsgKind.CHANNEL, kind)
         assertTrue("base first, got: \"$msg\"", msg.startsWith("channel error: denied"))
-        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degradeText))
         assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
     }
 
@@ -1049,11 +1057,12 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading }
-        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED)
+        val degradeText = zhTestBlockText()(degrade)
         val (msg, kind) = combineViaReflection(vm, "no dual profile", MsgKind.NO_DUAL, degrade)
         assertEquals(MsgKind.NO_DUAL, kind)
         assertTrue("base first, got: \"$msg\"", msg.startsWith("no dual profile"))
-        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degradeText))
         assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
     }
 
@@ -1070,11 +1079,12 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading }
-        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED)
+        val degradeText = zhTestBlockText()(degrade)
         val (msg, kind) = combineViaReflection(vm, "clone failed: boom", MsgKind.FAILED, degrade)
         assertEquals(MsgKind.FAILED, kind)
         assertTrue("base first, got: \"$msg\"", msg.startsWith("clone failed: boom"))
-        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degradeText))
     }
 
     @Test
@@ -1090,11 +1100,12 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading }
-        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED)
+        val degradeText = zhTestBlockText()(degrade)
         val (msg, kind) = combineViaReflection(vm, "clone verification failed: x not installed", MsgKind.VERIFY, degrade)
         assertEquals(MsgKind.VERIFY, kind)
         assertTrue("base first, got: \"$msg\"", msg.startsWith("clone verification failed"))
-        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degradeText))
     }
 
     @Test
@@ -1110,11 +1121,12 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading }
-        val degrade = "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」"
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED)
+        val degradeText = zhTestBlockText()(degrade)
         val (msg, kind) = combineViaReflection(vm, "invalid package", MsgKind.INVALID, degrade)
         assertEquals(MsgKind.INVALID, kind)
         assertTrue("base first, got: \"$msg\"", msg.startsWith("invalid package"))
-        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degrade))
+        assertTrue("degrade appended, got: \"$msg\"", msg.contains(degradeText))
         assertTrue("recovery entry, got: \"$msg\"", msg.contains("重新連線並更新"))
     }
 
@@ -3053,7 +3065,8 @@ class AutoDegradeTest {
         )
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.SHIZUKU }
         val degraded = vm.state.value
-        assertTrue("degrade note expected, got: \"${degraded.degradeNote}\"", degraded.degradeNote.contains("降級"))
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, degraded.degrade!!.kind)
+        assertTrue("degrade note expected, got: \"${zhTestBlockText()(degraded.degrade!!)}\"", zhTestBlockText()(degraded.degrade!!).contains("降級"))
         assertTrue(degraded.writeReady)
 
         vm.selectChannel(ChannelPreference.LSPOSED)
@@ -3459,13 +3472,13 @@ class AutoDegradeTest {
             initialGateway = suFake,
         )
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.NOOP }
-        assertTrue("downward note expected, got: \"${vm.state.value.degradeNote}\"", vm.state.value.degradeNote.contains("唯讀"))
+        assertTrue("downward note expected, got: \"${vm.state.value.degrade?.let { zhTestBlockText()(it) }}\"", vm.state.value.degrade != null && zhTestBlockText()(vm.state.value.degrade!!).contains("唯讀"))
 
         suFake.rootOk = true
         vm.recheckPrivilege()
         await { !vm.state.value.loading && vm.state.value.resolvedGateway == ResolvedChannel.ROOT }
         val s = vm.state.value
         assertTrue("upgraded ROOT must be writable", s.writeReady)
-        assertTrue("upgrade to ROOT is silent by design, got: \"${s.degradeNote}\"", s.degradeNote.isEmpty())
+        assertTrue("upgrade to ROOT is silent by design, got: \"${s.degrade}\"", s.degrade == null)
     }
 }

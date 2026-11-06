@@ -113,19 +113,20 @@ class UiSemanticsP28Test {
         assertEquals(R.string.write_block_explicit, reason.block.stringRes())
     }
 
-    // writeBlockReason 分支：AUTO 降級註記逐字沿用（不經資源）。
+    // writeBlockReason 分支：AUTO 降級 typed Keyed（P2-3，經資源解析）。
     @Test
-    fun writeBlockReason_autoDegrade_returnsNoteVerbatim() {
-        val note = "Auto 已依實測降級：測試註記"
+    fun writeBlockReason_autoDegrade_returnsDegradeKeyed() {
+        val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU)
         val s = UiState(
             channel = ChannelPreference.AUTO,
             resolvedGateway = ResolvedChannel.SHIZUKU,
             execIdentity = Privilege.SHELL,
             writeReady = false,
-            degradeNote = note,
+            degrade = degrade,
         )
-        val reason = writeBlockReason(s)
-        assertEquals(note, (reason as BlockReason.Verbatim).text)
+        val reason = writeBlockReason(s) as BlockReason.Keyed
+        assertEquals(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU, reason.block.kind)
+        assertEquals(R.string.auto_degrade_su_to_shizuku, reason.block.stringRes())
     }
 
     // writeBlockReason 分支：LSPOSED 佔位——鍵 + Hook 證據參數。
@@ -295,6 +296,9 @@ class UiSemanticsP28Test {
             "write_block_explicit",
             "write_block_pm",
             "write_block_readonly",
+            "auto_degrade_su_to_shizuku",
+            "auto_degrade_both_failed",
+            "auto_degrade_no_channel",
             "input_too_long",
             "invalid_package",
             "channel_group_cd",
@@ -321,6 +325,26 @@ class UiSemanticsP28Test {
         assertTrue(
             "en lsposed must name refused",
             en.getValue("write_block_lsposed").contains("refused"),
+        )
+        // P2-3 AUTO 降級語意：zh 含降級/唯讀，en carries degraded/read-only。
+        assertTrue(
+            "zh su->shizuku must name 降級",
+            zh.getValue("auto_degrade_su_to_shizuku").contains("降級"),
+        )
+        assertTrue(
+            "zh both-fail/no-channel must name 唯讀",
+            zh.getValue("auto_degrade_both_failed").contains("唯讀") &&
+                zh.getValue("auto_degrade_no_channel").contains("唯讀"),
+        )
+        assertTrue(
+            "zh no-channel must name su 不存在",
+            zh.getValue("auto_degrade_no_channel").contains("su 不存在"),
+        )
+        assertTrue(
+            "en degrade must name degraded/read-only",
+            en.getValue("auto_degrade_su_to_shizuku").contains("degraded") &&
+                en.getValue("auto_degrade_both_failed").contains("read-only") &&
+                en.getValue("auto_degrade_no_channel").contains("read-only"),
         )
         // 格式佔位：explicit 雙參、lsposed/上限各一參。
         assertTrue("explicit zh needs %1\$s/%2\$s", zh.getValue("write_block_explicit").contains("%1\$s") && zh.getValue("write_block_explicit").contains("%2\$s"))

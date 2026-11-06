@@ -875,7 +875,7 @@ class MainActivity : ComponentActivity() {
         // so appending it in full would wash the status line every render.
         // p28-1: the RadioButtons above carry the checked state themselves;
         // this line only names preference vs resolved (不再是唯一選擇依據）.
-        channelView.text = if (s.degradeNote.isEmpty()) {
+        channelView.text = if (s.degrade == null) {
             getString(R.string.channel_line, s.channel, s.resolvedGateway)
         } else {
             getString(R.string.channel_line_degraded, s.channel, s.resolvedGateway)
@@ -1559,12 +1559,12 @@ internal fun stripWriteBlockTimeParams(text: String): String {
 }
 
 // B1 去重鍵（純函數，JVM 可測；WriteBlockKind 比對）：Keyed 以 kind + 去時間穩定參數
-// 為鍵（LSPOSED 的 args[0] 為 Hook 證據含時間戳，去時間後只留狀態/範圍）；
-// Verbatim（AUTO 降級註記）逐字為鍵。factory blockText 與 Activity resolveBlockReason
-// 經同一 WriteBlock.stringRes() 解析（見下），此鍵鎖定 single source。
+// 為鍵（LSPOSED 的 args[0] 為 Hook 證據含時間戳，去時間後只留狀態/範圍；
+// P2-3 AUTO 降級亦為 Keyed，kind 即區分）。factory blockText 與
+// Activity resolveBlockReason 經同一 WriteBlock.stringRes() 解析（見下），
+// 此鍵鎖定 single source。
 internal fun writeBlockDedupKey(reason: BlockReason?): String? = when (reason) {
     null -> null
-    is BlockReason.Verbatim -> "V:${stripWriteBlockTimeParams(reason.text)}"
     is BlockReason.Keyed -> when (reason.block.kind) {
         WriteBlockKind.LSPOSED_PLACEHOLDER ->
             "K:${reason.block.kind.name}:${stripWriteBlockTimeParams(reason.block.args.getOrElse(0) { "" })}"
@@ -1596,18 +1596,21 @@ internal fun shouldUpdateWriteBlockText(old: String?, new: String?): Boolean = o
 internal fun shouldUpdateMsgText(old: String?, new: String?): Boolean = old != new
 
 // 寫入拒絕理由鍵 -> string 資源（JVM 可測；Activity/factory 以此解析）。
+// P2-3 AUTO 降級亦經此解析（auto_degrade_*），主路徑無 Verbatim。
 internal fun WriteBlock.stringRes(): Int = when (kind) {
     WriteBlockKind.LSPOSED_PLACEHOLDER -> R.string.write_block_lsposed
     WriteBlockKind.NOOP_FALLBACK -> R.string.write_block_noop
     WriteBlockKind.EXPLICIT_FAILURE -> R.string.write_block_explicit
     WriteBlockKind.PM_UNREADABLE -> R.string.write_block_pm
     WriteBlockKind.NO_PRIVILEGE -> R.string.write_block_readonly
+    WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU -> R.string.auto_degrade_su_to_shizuku
+    WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED -> R.string.auto_degrade_both_failed
+    WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL -> R.string.auto_degrade_no_channel
 }
 
 // Context 解析（Activity 側顯示 + factory 供 VM 的 blockText）。
 internal fun Context.resolveBlockReason(reason: BlockReason): String = when (reason) {
     is BlockReason.Keyed -> getString(reason.block.stringRes(), *reason.block.args.toTypedArray())
-    is BlockReason.Verbatim -> reason.text
 }
 
 // PR-6 P4 (#27 架構整理)：render() 的純字串拆分 (頂層 internal，JVM 可測)。

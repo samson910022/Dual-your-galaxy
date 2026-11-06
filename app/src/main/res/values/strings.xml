@@ -86,6 +86,10 @@
     <string name="write_block_explicit">所選模式 %1$s（%2$s 通道）探測未通過，寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試</string>
     <string name="write_block_pm">探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；請檢查授權後點「重新連線並更新」</string>
     <string name="write_block_readonly">唯讀：無可用權限通道，寫入已禁用；請檢查授權後點「重新連線並更新」</string>
+    <!-- P2-3 Auto 降級 typed 理由（probe 動態產物，經資源解析；主路徑無 Verbatim）。無參數。 -->
+    <string name="auto_degrade_su_to_shizuku">Auto 已依實測降級：偵測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；如需恢復 ROOT 請檢查 su 授權後點「重新連線並更新」</string>
+    <string name="auto_degrade_both_failed">Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；請檢查授權後點「重新連線並更新」</string>
+    <string name="auto_degrade_no_channel">Auto 實測無可用通道（su 不存在且 Shizuku 未通過），目前唯讀；授權 Shizuku 或取得 ROOT 後點「重新連線並更新」</string>
     <!-- p28-1 review：手動包名就地驗證（原 MainActivity.packageInputError 中英混雜）。
          %1$d=上限字元數（MAX_PACKAGE_INPUT_CHARS）。 -->
     <string name="input_too_long">輸入過長（超過 %1$d 字元），已拒絕</string>
