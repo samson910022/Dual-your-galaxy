@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- p28-1 字串資源化：預設為繁中（values/），英文見 values-en/。技術 detail（診斷內文、
+     render* 長診斷文本、VM 其餘 msg）保留程式內字面；寫入拒絕理由與包名就地驗證
+     為使用者可見短句，已資源化（review 缺陷修復）。 -->
+<resources>
+    <!-- 手動包名入口（進階）：單行、IME 完成鍵、就地驗證；Enter 只驗證不移除。 -->
+    <string name="pkg_input_hint">套件名稱（例如 com.example.app）</string>
+    <!-- 主要動作：#28 統一繁中「建立分身／移除分身」。 -->
+    <string name="action_clone">建立分身</string>
+    <string name="action_remove">移除分身</string>
+    <string name="remove_cd">移除分身（需二次確認，第一步僅開啟確認對話框）</string>
+    <string name="action_reconnect">重新連線並更新</string>
+    <string name="action_request_shizuku">請求 Shizuku 授權</string>
+    <string name="action_check_shizuku">檢查 Shizuku 並更新</string>
+    <!-- 通道為識別名，中英同形；互斥單選語意由 RadioGroup/RadioButton 承載。 -->
+    <string name="channel_auto">Auto</string>
+    <string name="channel_root">Root</string>
+    <string name="channel_shizuku">Shizuku</string>
+    <string name="channel_lsposed">LSPosed</string>
+    <string name="action_diagnose_hook">手動診斷 Hook</string>
+    <string name="diagnose_hook_cd">手動診斷 Hook（需要執行 ROOT/Shizuku 診斷指令，僅在此按鈕觸發）</string>
+    <string name="hook_diag_hint">說明：點按將執行 ROOT／Shizuku 特權診斷指令（單次，僅此按鈕觸發）</string>
+    <string name="diag_loading_cd">診斷：載入中</string>
+    <string name="action_export_diagnosis">匯出診斷（已遮蔽可辨識資料，分享前請人工確認）</string>
+    <string name="diagnostic_export_title">診斷匯出預覽（已遮蔽可辨識資料，分享前請人工確認，無自動上傳）</string>
+    <string name="search_hint">搜尋應用名稱 / 包名</string>
+    <string name="system_apps_hidden">系統應用：已隱藏</string>
+    <string name="system_apps_shown">系統應用：顯示中</string>
+    <string name="system_toggle_cd_hidden">系統應用目前已隱藏，點兩下顯示（只切換顯示，不卸載任何分身）</string>
+    <string name="system_toggle_cd_shown">系統應用目前顯示中，點兩下隱藏（只切換顯示，不卸載任何分身）</string>
+    <string name="action_select_visible">全選可見</string>
+    <plurals name="select_visible_cd">
+        <item quantity="one">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+        <item quantity="other">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+    </plurals>
+    <string name="action_clear_selection">清除勾選</string>
+    <string name="clear_selection_cd">清除勾選（不卸載任何分身）</string>
+    <string name="action_save_selection">保存選取</string>
+    <string name="save_selection_cd">保存目前勾選（只保存勾選，不寫入分身）</string>
+    <string name="action_unsave_selection">取消保存</string>
+    <string name="unsave_selection_cd">取消保存選取（不卸載分身，不清除目前勾選）</string>
+    <plurals name="batch_create">
+        <item quantity="one">建立 %d 個分身</item>
+        <item quantity="other">建立 %d 個分身</item>
+    </plurals>
+    <plurals name="batch_create_cd">
+        <item quantity="one">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="other">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+    </plurals>
+    <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
+    <string name="shizuku_listener_failed">Shizuku 監聽註冊失敗：%1$s</string>
+    <string name="copy_failed">複製失敗：%1$s</string>
+    <string name="dialog_close">關閉</string>
+    <string name="dialog_cancel">取消</string>
+    <string name="remove_confirm_title">確認移除分身</string>
+    <string name="remove_confirm_positive">確認移除</string>
+    <string name="shizuku_state_no_binder">Shizuku：binder 未連線（需安裝並啟動 Shizuku）</string>
+    <string name="shizuku_state_ok">Shizuku：已連線・已授權</string>
+    <string name="shizuku_state_unauth">Shizuku：已連線・未授權（請點下方授權）</string>
+    <string name="shizuku_state_unknown">Shizuku：狀態未知（%1$s）</string>
+    <string name="source_empty_loading">應用清單：尚未載入</string>
+    <string name="source_empty_nomatch">應用清單：無符合項目</string>
+    <string name="source_row">%1$s\n%2$s</string>
+    <plurals name="source_truncated">
+        <item quantity="one">…等共 %1$d 筆，僅顯示前 %2$d 筆，全選可見只選前 %2$d 筆（請用搜尋縮小範圍）</item>
+        <item quantity="other">…等共 %1$d 筆，僅顯示前 %2$d 筆，全選可見只選前 %2$d 筆（請用搜尋縮小範圍）</item>
+    </plurals>
+    <string name="privilege_line">權限：%1$s（實際通道 %2$s・%3$s；本次路由 %4$s・本次探測[%5$s]%6$s・%7$s）</string>
+    <string name="channel_line">通道偏好：%1$s・實際：%2$s（選擇已持久化，重啟 App 記住）</string>
+    <string name="channel_line_degraded">通道偏好：%1$s・實際：%2$s（選擇已持久化，重啟 App 記住）；已自 Auto 降級，詳見狀態列</string>
+    <string name="profiles_empty">Profiles：—</string>
+    <string name="profiles_filled">Profiles（%1$d）：\n%2$s</string>
+    <string name="cloned_empty">Cloned：—</string>
+    <string name="cloned_filled">Cloned（%1$d）：\n%2$s</string>
+    <string name="status_loading">載入中…</string>
+    <string name="status_ready">就緒</string>
+    <!-- p28-1 review：寫入拒絕理由（使用者可見短句；原 DualViewModel.writeBlockReason
+         全文硬編碼繁中）。%1$s=Hook 狀態（動態證據）、明選分支 %1$s=模式 %2$s=通道身份。 -->
+    <string name="write_block_lsposed">LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，寫入已拒絕；Hook 狀態：%1$s；如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」</string>
+    <string name="write_block_noop">通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，寫入已禁用；請檢查授權後點「重新連線並更新」</string>
+    <string name="write_block_explicit">所選模式 %1$s（%2$s 通道）探測未通過，寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試</string>
+    <string name="write_block_pm">探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；請檢查授權後點「重新連線並更新」</string>
+    <string name="write_block_readonly">唯讀：無可用權限通道，寫入已禁用；請檢查授權後點「重新連線並更新」</string>
+    <!-- p28-1 review：手動包名就地驗證（原 MainActivity.packageInputError 中英混雜）。
+         %1$d=上限字元數（MAX_PACKAGE_INPUT_CHARS）。 -->
+    <string name="input_too_long">輸入過長（超過 %1$d 字元），已拒絕</string>
+    <string name="invalid_package">包名無效</string>
+    <!-- p28-1 review：通道群組語意標籤（窄螢幕橫滑後 TalkBack 仍可報讀群組用途）。 -->
+    <string name="channel_group_cd">通道選擇（互斥單選）：Auto、Root、Shizuku、LSPosed</string>
+</resources>

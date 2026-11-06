@@ -51,13 +51,20 @@ import android.os.SystemClock
 import android.os.Process
 import android.os.UserManager
 import android.text.Editable
+import android.text.InputType
 import android.text.TextWatcher
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -70,6 +77,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.CloneOutcome
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.ShizukuElevator
+import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -118,10 +126,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var batchBtn: Button
     private lateinit var batchResultView: TextView
     private lateinit var permBtn: Button
-    private lateinit var autoBtn: Button
-    private lateinit var rootBtn: Button
-    private lateinit var shizukuBtn: Button
-    private lateinit var lsposedBtn: Button
+    // p28-1：通道四按鈕改為互斥單選語意（RadioGroup/RadioButton），checked 狀態
+    // 即選擇狀態（TalkBack 報讀「已選取」），不再只靠 channelView 文字行。
+    // 版面主次順序不動（p28-2 範圍），群組仍居 hookView 之後、清單之前。
+    private lateinit var channelGroup: RadioGroup
+    // p28-1 review（窄螢幕）：群組外包橫滑容器（RadioGroup 仍為其唯一直屬子節點）。
+    private lateinit var channelScroll: HorizontalScrollView
+    private lateinit var autoBtn: RadioButton
+    private lateinit var rootBtn: RadioButton
+    private lateinit var shizukuBtn: RadioButton
+    private lateinit var lsposedBtn: RadioButton
     // P2-1: narrow-consent privileged hook re-diagnosis (retained `cat`).
     // Only this tap passes allowPrivilegedHookDiagnosis=true (explicit user
     // consent for a retained privileged read). Every other entry (picker
@@ -139,6 +153,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var hookRow: LinearLayout
     private lateinit var msgView: TextView
     private var defaultMsgColor: Int = Color.BLACK
+    // p28-1 禁用原因行：主操作（建立/移除分身）因通道不可寫被禁用時顯示
+    // VM 拒絕理由（writeBlockReason 資源鍵經 Context 解析，與點按拒絕同文）；可寫或忙碌時隱藏。
+    private lateinit var writeBlockView: TextView
 
     // Two-phase remove dialog (PR-4 P1, issue #23): driven by
     // UiState.pendingRemove, never by a click counter. Non-null pending shows
@@ -211,9 +228,8 @@ class MainActivity : ComponentActivity() {
             Shizuku.addBinderDeadListener(binderDeadListener, mainHandler)
             Shizuku.addRequestPermissionResultListener(permissionResultListener, mainHandler)
         } catch (e: Exception) {
-            msgView.text = "Shizuku 監聽註冊失敗：" +
-                sanitizeForDisplay(e.message ?: "unknown")
-            msgView.setTextColor(colorFor(MsgKind.CHANNEL))
+            msgView.text = getString(R.string.shizuku_listener_failed, sanitizeForDisplay(e.message ?: "unknown"))
+            msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
         }
         // Lifecycle-aware collection: renders every state update while STARTED.
         lifecycleScope.launch {
@@ -335,58 +351,125 @@ class MainActivity : ComponentActivity() {
         profilesView = TextView(this)
         clonedView = TextView(this)
         pkgInput = EditText(this).apply {
-            hint = "package name (e.g. com.example.app)"
+            // p28-1 手動包名（進階入口）：穩定 ID（旋轉恢復文字/游標）+ 單行 +
+            // IME 完成動作 + 就地驗證。IME 完成/Enter 只做驗證並收鍵盤，
+            // 永不觸發建立/移除（移除須經按鈕 + 二次確認）。
+            id = R.id.pkg_input
+            hint = getString(R.string.pkg_input_hint)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    error = packageInputError(s?.toString().orEmpty())?.let { resolvePackageInputError(it) }
+                }
+            })
+            setOnEditorActionListener { v, actionId, event ->
+                val done = actionId == EditorInfo.IME_ACTION_DONE ||
+                    (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
+                if (done) {
+                    error = packageInputError(text?.toString().orEmpty())?.let { resolvePackageInputError(it) }
+                    try {
+                        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                        imm.hideSoftInputFromWindow(v.windowToken, 0)
+                    } catch (_: Exception) {
+                        // Best effort: 收鍵盤失敗不影響驗證顯示。
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
         }
         cloneBtn = Button(this).apply {
-            text = "Clone"
+            id = R.id.clone_btn
+            text = getString(R.string.action_clone)
             setOnClickListener { vm.clone(pkgInput.text.toString()) }
         }
         removeBtn = Button(this).apply {
-            text = "Remove"
+            id = R.id.remove_btn
+            text = getString(R.string.action_remove)
             // TalkBack: the first tap only opens the confirmation dialog, it
             // never uninstalls; the description states the two-phase contract.
-            contentDescription = "移除分身（需二次確認，第一步僅開啟確認對話框）"
+            contentDescription = getString(R.string.remove_cd)
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
         }
         refreshBtn = Button(this).apply {
+            id = R.id.refresh_btn
             // P25 單一入口：probe（含 Auto 降級）+ refresh；PR-37 Phase C #5：
             // catalog 失敗文案指向此按鈕，故同步重試 reloadCatalog（其內部先
             // cancel 舊 catalogJob，語義為「取消在途、重打一次」，不會疊加）。
             // P2-1: reconnect tap is NOT consent for privileged diagnosis --
             // always false (LSPOSED stays direct-only); only the dedicated
             // 手動診斷 Hook button passes true.
-            text = "重新連線並更新"
+            text = getString(R.string.action_reconnect)
             setOnClickListener {
                 vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
                 reloadCatalog()
             }
         }
         permBtn = Button(this).apply {
-            text = "請求 Shizuku 授權"
+            id = R.id.perm_btn
+            text = getString(R.string.action_request_shizuku)
             setOnClickListener { requestShizukuPermission() }
         }
+        // p28-1 通道互斥單選：單一 RadioGroup 承載四個 RadioButton，checked 即
+        // 選擇狀態（視覺圓點 + TalkBack「已選取」），不再只靠 channelView 文字行。
+        // 點按走 setOnClickListener（無 checked-change 回授，render 的 isChecked
+        // 同步不觸發 VM）；同行四顆（標籤短，沿用原一列短標籤設計），版面主次
+        // 順序不動（仍居 hookView 之後、清單之前）。
+        // p28-1 review（窄螢幕）：群組語意標籤，TalkBack 報讀群組用途。
+        channelGroup = RadioGroup(this).apply {
+            id = R.id.channel_group
+            orientation = RadioGroup.HORIZONTAL
+            contentDescription = getString(R.string.channel_group_cd)
+        }
         // Channel picker: exactly the four ChannelPreference values (NoOp is
-        // a fail-closed fallback, never a menu entry). Programmatic buttons
-        // in the existing style; labels stay short for one horizontal row.
-        autoBtn = Button(this).apply {
-            text = "Auto"
+        // a fail-closed fallback, never a menu entry). Radio labels stay short
+        // for one horizontal row.
+        autoBtn = RadioButton(this).apply {
+            id = R.id.channel_auto
+            text = getString(R.string.channel_auto)
             setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, allowPrivilegedHookDiagnosis = false) }
         }
-        rootBtn = Button(this).apply {
-            text = "Root"
+        rootBtn = RadioButton(this).apply {
+            id = R.id.channel_root
+            text = getString(R.string.channel_root)
             setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, allowPrivilegedHookDiagnosis = false) }
         }
-        shizukuBtn = Button(this).apply {
-            text = "Shizuku"
+        shizukuBtn = RadioButton(this).apply {
+            id = R.id.channel_shizuku
+            text = getString(R.string.channel_shizuku)
             setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, allowPrivilegedHookDiagnosis = false) }
         }
-        lsposedBtn = Button(this).apply {
-            text = "LSPosed"
+        lsposedBtn = RadioButton(this).apply {
+            id = R.id.channel_lsposed
+            text = getString(R.string.channel_lsposed)
             setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, allowPrivilegedHookDiagnosis = false) }
+        }
+        channelGroup.addView(autoBtn, radioParams())
+        channelGroup.addView(rootBtn, radioParams())
+        channelGroup.addView(shizukuBtn, radioParams())
+        channelGroup.addView(lsposedBtn, radioParams())
+        // p28-1 review（窄螢幕 320dp 擠壓）：外包 HorizontalScrollView 橫滑；
+        // RadioGroup 仍為滑動區唯一直屬子節點，四顆 RadioButton 仍為群組直屬
+        // 子節點（互斥語意不變）；版面主次順序不動（p28-2 範圍）。
+        channelScroll = HorizontalScrollView(this).apply {
+            id = R.id.channel_scroll
+            isHorizontalScrollBarEnabled = false
+            addView(
+                channelGroup,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
         }
         // P2-1: narrow-consent privileged hook re-diagnosis. Only this tap
         // passes allowPrivilegedHookDiagnosis=true (explicit consent for a
@@ -394,19 +477,20 @@ class MainActivity : ComponentActivity() {
         // lifecycle never `cat`. P3: the copy states the privileged exec
         // directly (button contentDescription + ViewModel docs).
         hookDiagBtn = Button(this).apply {
-            text = "手動診斷 Hook"
+            text = getString(R.string.action_diagnose_hook)
             // P3: 明示此按鈕會執行特權診斷指令（TalkBack 朗讀；點按即明確同意）。
-            contentDescription = "手動診斷 Hook（需要執行 ROOT/Shizuku 診斷指令，僅在此按鈕觸發）"
+            contentDescription = getString(R.string.diagnose_hook_cd)
             setOnClickListener { vm.requestHookRedDiagnosis() }
         }
         // Phase C P1 P3: visible copy of the same consent (sighted users never
         // hear contentDescription). Shown only in LSPOSED mode with the button.
         hookDiagHint = TextView(this).apply {
-            text = "說明：點按將執行 ROOT／Shizuku 特權診斷指令（單次，僅此按鈕觸發）"
+            text = getString(R.string.hook_diag_hint)
             textSize = 12f
         }
         // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
         msgView = TextView(this).apply {
+            id = R.id.msg_view
             textSize = 15f
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
@@ -419,7 +503,7 @@ class MainActivity : ComponentActivity() {
         lastOpView = TextView(this)
         diagView = TextView(this).apply {
             isFocusable = true
-            contentDescription = "診斷：載入中"
+            contentDescription = getString(R.string.diag_loading_cd)
             setOnClickListener {
                 diagExpanded = !diagExpanded
                 lastState?.let { render(it) }
@@ -433,7 +517,7 @@ class MainActivity : ComponentActivity() {
         exportBtn = Button(this).apply {
             // P2-4 誠實文案：遮蔽仍非全面保證，不得只寫「已遮蔽」，
             // 須明示「已遮蔽可辨識資料，分享前請人工確認」。
-            text = "匯出診斷（已遮蔽可辨識資料，分享前請人工確認）"
+            text = getString(R.string.action_export_diagnosis)
             setOnClickListener { showDiagnosticExport() }
         }
         // PR-7 P2 (#26, 階段 1):個人來源 catalog 搜尋/勾選區。
@@ -441,7 +525,8 @@ class MainActivity : ComponentActivity() {
         // cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證
         // (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
         searchInput = EditText(this).apply {
-            hint = "搜尋應用名稱 / 包名"
+            id = R.id.search_input
+            hint = getString(R.string.search_hint)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -464,34 +549,38 @@ class MainActivity : ComponentActivity() {
             })
         }
         systemToggleBtn = Button(this).apply {
-            text = "系統應用：已隱藏"
+            text = getString(R.string.system_apps_hidden)
             // TalkBack：只切換顯示範圍，不卸載任何分身。
-            contentDescription = "切換是否顯示系統應用（只切換顯示，不卸載任何分身）"
+            contentDescription = getString(R.string.system_toggle_cd_hidden)
             setOnClickListener { vm.setIncludeSystemApps(!vm.state.value.includeSystemApps) }
         }
         selectAllBtn = Button(this).apply {
-            text = "全選可見"
+            text = getString(R.string.action_select_visible)
             // TalkBack：只勾選目前可見前 N 筆（與渲染同一截斷，見 currentVisibleKeys），
             // 不寫入分身；超出請用搜尋縮小範圍。
-            contentDescription = "全選目前可見前 $MAX_SOURCE_ROWS 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）"
+            contentDescription = resources.getQuantityString(
+                R.plurals.select_visible_cd,
+                MAX_SOURCE_ROWS,
+                MAX_SOURCE_ROWS,
+            )
             setOnClickListener { vm.selectVisible(currentVisibleKeys()) }
         }
         clearSelBtn = Button(this).apply {
-            text = "清除勾選"
+            text = getString(R.string.action_clear_selection)
             // TalkBack:只清勾選,永不卸載；描述寫明契約。
-            contentDescription = "清除勾選（不卸載任何分身）"
+            contentDescription = getString(R.string.clear_selection_cd)
             setOnClickListener { vm.clearSelectionLocal() }
         }
         saveSelBtn = Button(this).apply {
-            text = "保存選取"
+            text = getString(R.string.action_save_selection)
             // 只保存勾選,不寫入分身；重啟可恢復。
-            contentDescription = "保存目前勾選（只保存勾選，不寫入分身）"
+            contentDescription = getString(R.string.save_selection_cd)
             setOnClickListener { vm.persistSelection(vm.state.value.inventory.targetId) }
         }
         cancelSaveBtn = Button(this).apply {
-            text = "取消保存"
+            text = getString(R.string.action_unsave_selection)
             // 只刪持久化條目,不卸載、不清目前勾選。
-            contentDescription = "取消保存選取（不卸載分身，不清除目前勾選）"
+            contentDescription = getString(R.string.unsave_selection_cd)
             setOnClickListener { vm.cancelSavedSelection() }
         }
         sourceContainer = LinearLayout(this).apply {
@@ -503,9 +592,10 @@ class MainActivity : ComponentActivity() {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         batchBtn = Button(this).apply {
-            text = "建立 0 個分身"
+            id = R.id.batch_btn
+            text = resources.getQuantityString(R.plurals.batch_create, 0, 0)
             // TalkBack：批次對已勾選逐項執行建立；勾選本身≠卸載，取消勾選≠卸載。
-            contentDescription = "批次建立 0 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
+            contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
             setOnClickListener { vm.cloneSelected() }
         }
         batchResultView = TextView(this).apply {
@@ -513,11 +603,19 @@ class MainActivity : ComponentActivity() {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
 
-        // Clone/remove share one row; 重新連線並更新 + permission share the next.
+        // Clone/remove share one row; the block reason below them names the VM
+        // refusal while they are disabled (p28-1); 重新連線並更新 + permission
+        // share the next row.
         val writeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(cloneBtn, rowParams())
             addView(removeBtn, rowParams())
+        }
+        writeBlockView = TextView(this).apply {
+            id = R.id.write_block_reason
+            visibility = View.GONE
+            // Stage4 a11y 同式：禁用原因異動靠 liveRegion 播報（TalkBack polite）。
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         val readRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -541,25 +639,12 @@ class MainActivity : ComponentActivity() {
             addView(saveSelBtn, rowParams())
             addView(cancelSaveBtn, rowParams())
         }
-        // Picker row 1: Auto + Root; row 2: Shizuku + LSPosed (two rows keep
-        // labels legible on narrow screens, same weight style as above).
-        val channelRow1 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(autoBtn, rowParams())
-            addView(rootBtn, rowParams())
-        }
-        val channelRow2 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(shizukuBtn, rowParams())
-            addView(lsposedBtn, rowParams())
-        }
 
         root.addView(privilegeView)
         root.addView(shizukuView)
         root.addView(channelView)
         root.addView(hookView)
-        root.addView(channelRow1)
-        root.addView(channelRow2)
+        root.addView(channelScroll)
         root.addView(profilesView)
         root.addView(clonedView)
         root.addView(inventoryView)
@@ -573,6 +658,7 @@ class MainActivity : ComponentActivity() {
         root.addView(batchResultView)
         root.addView(pkgInput)
         root.addView(writeRow)
+        root.addView(writeBlockView)
         root.addView(readRow)
         root.addView(hookRow)
         root.addView(hookDiagHint)
@@ -599,7 +685,7 @@ class MainActivity : ComponentActivity() {
             // Best effort: 舊預覽關不掉也不阻塞新預覽。
         }
         exportDialog = AlertDialog.Builder(this)
-            .setTitle("診斷匯出預覽（已遮蔽可辨識資料，分享前請人工確認，無自動上傳）")
+            .setTitle(getString(R.string.diagnostic_export_title))
             .setMessage(preview)
             .setCancelable(true)
             .setNeutralButton(DIAGNOSTIC_COPY_BUTTON_TEXT) { _, _ ->
@@ -612,18 +698,34 @@ class MainActivity : ComponentActivity() {
                         ),
                     )
                     msgView.text = DIAGNOSTIC_COPY_SUCCESS_TEXT
-                    msgView.setTextColor(colorFor(MsgKind.INFO))
+                    msgView.setTextColor(msgColorFor(MsgKind.INFO))
                 } catch (e: Exception) {
-                    msgView.text = "複製失敗：${sanitizeForDisplay(e.message ?: "unknown")}"
-                    msgView.setTextColor(colorFor(MsgKind.CHANNEL))
+                    msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
+                    msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
                 }
             }
-            .setPositiveButton("關閉", null)
+            .setPositiveButton(getString(R.string.dialog_close), null)
             .show()
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+    // p28-1 通道 RadioButton 權重（單列四顆，與其他列同式）。
+    private fun radioParams(): RadioGroup.LayoutParams =
+        RadioGroup.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+    // p28-1 訊息語意色（亮/暗 values 資源，白底/深底皆至少 4.5:1；完整主題為
+    // p28-3 範圍）。NONE 回預設文字色。實例方法：需 Context 解析夜間資源。
+    private fun msgColorFor(kind: MsgKind): Int = when (kind) {
+        MsgKind.NONE -> defaultMsgColor
+        MsgKind.INFO -> getColor(R.color.msg_info)
+        MsgKind.INVALID -> getColor(R.color.msg_invalid)
+        MsgKind.NO_DUAL -> getColor(R.color.msg_no_dual)
+        MsgKind.VERIFY -> getColor(R.color.msg_verify)
+        MsgKind.CHANNEL -> getColor(R.color.msg_channel)
+        MsgKind.FAILED -> getColor(R.color.msg_failed)
+    }
 
     // Permission button: no binder -> single reconnect entry (probe keeps the
     // honest NONE state); authorized -> single reconnect entry (probe+refresh);
@@ -665,18 +767,22 @@ class MainActivity : ComponentActivity() {
         }
         val state: String = try {
             if (noBinder) {
-                "Shizuku：binder 未連線（需安裝並啟動 Shizuku）"
+                getString(R.string.shizuku_state_no_binder)
             } else if (authorized) {
-                "Shizuku：已連線・已授權"
+                getString(R.string.shizuku_state_ok)
             } else {
-                "Shizuku：已連線・未授權（請點下方授權）"
+                getString(R.string.shizuku_state_unauth)
             }
         } catch (e: Exception) {
-            "Shizuku：狀態未知（${sanitizeForDisplay(e.message ?: "unknown")}）"
+            getString(R.string.shizuku_state_unknown, sanitizeForDisplay(e.message ?: "unknown"))
         }
         shizukuView.text = state
         try {
-            permBtn.text = if (!noBinder && !authorized) "請求 Shizuku 授權" else "檢查 Shizuku 並更新"
+            permBtn.text = if (!noBinder && !authorized) {
+                getString(R.string.action_request_shizuku)
+            } else {
+                getString(R.string.action_check_shizuku)
+            }
         } catch (_: Exception) {
             // Best effort: updateShizukuLine may run before buildUi in tests.
         }
@@ -714,8 +820,16 @@ class MainActivity : ComponentActivity() {
         val probeMark = s.probeResultMark()
         val scopeLabel = s.probeScope.displayLabel()
         val pmMark = s.pmReadableText()
-        privilegeView.text = "權限：${s.execIdentity}（實際通道 ${s.resolvedGateway}" +
-            "・$readyMark；本次路由 ${s.privilege}・本次探測[$scopeLabel]$probeMark・$pmMark）"
+        privilegeView.text = getString(
+            R.string.privilege_line,
+            s.execIdentity,
+            s.resolvedGateway,
+            readyMark,
+            s.privilege,
+            scopeLabel,
+            probeMark,
+            pmMark,
+        )
         // Title mirrors the actual execution identity (not the routed
         // summary) for quick manual verification.
         title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
@@ -726,9 +840,12 @@ class MainActivity : ComponentActivity() {
         // is intentionally persistent here (it survives msg clears), but
         // only as a short tag: the full note already rides in msg (INFO),
         // so appending it in full would wash the status line every render.
-        channelView.text = buildString {
-            append("通道偏好：${s.channel}・實際：${s.resolvedGateway}（選擇已持久化，重啟 App 記住）")
-            if (s.degradeNote.isNotEmpty()) append("；已自 Auto 降級，詳見狀態列")
+        // p28-1: the RadioButtons above carry the checked state themselves;
+        // this line only names preference vs resolved (不再是唯一選擇依據）.
+        channelView.text = if (s.degradeNote.isEmpty()) {
+            getString(R.string.channel_line, s.channel, s.resolvedGateway)
+        } else {
+            getString(R.string.channel_line_degraded, s.channel, s.resolvedGateway)
         }
         // Hook signal: LSPosed mode only. ACTIVE shows the recorded scopes as
         // a historical marker (existence evidence only, boot freshness
@@ -752,16 +869,22 @@ class MainActivity : ComponentActivity() {
             }
         }
         profilesView.text = if (s.profiles.isEmpty()) {
-            "Profiles：—"
+            getString(R.string.profiles_empty)
         } else {
-            "Profiles (${s.profiles.size})：\n" +
-                s.profiles.joinToString("\n") { "  #${it.userId} ${it.label}" }
+            getString(
+                R.string.profiles_filled,
+                s.profiles.size,
+                s.profiles.joinToString("\n") { "  #${it.userId} ${it.label}" },
+            )
         }
         clonedView.text = if (s.cloned.isEmpty()) {
-            "Cloned：—"
+            getString(R.string.cloned_empty)
         } else {
-            "Cloned (${s.cloned.size})：\n" +
-                s.cloned.joinToString("\n") { "  $it" }
+            getString(
+                R.string.cloned_filled,
+                s.cloned.size,
+                s.cloned.joinToString("\n") { "  $it" },
+            )
         }
         // PR-6 P2 (#27 後半)：清單新鮮度行 (STALE/UNKNOWN 明確標示，
         // FRESH 顯示目標/筆數/查詢時間)。P4：上次操作相位拆至獨立 lastOpView
@@ -776,12 +899,22 @@ class MainActivity : ComponentActivity() {
         // Writes queue in the ViewModel anyway; disabling while busy keeps
         // the read-only placeholder visibly read-only. Channel switches go
         // through the same mutex (selectChannel latest-wins), so the picker
-        // is gated too.
+        // is gated on busy only (never on writability: switching is the
+        // recovery path out of an unwritable channel).
         // PR-37 P3 按鈕狀態：busy 時勾選相關一律禁用（批次執行中不可改勾選）；
         // batch 需非 busy 且有勾選；保存需已知目標 (targetId > 0)。
+        // p28-1 enabled 反映可寫能力：clone/remove/batch 另須可寫
+        // (writeBlockReason == null)；禁用原因由 writeBlockView 顯示
+        // （VM 拒絕理由 single source，VM guard 保留在 isWritable 內）。
         val busy = s.loading
-        cloneBtn.isEnabled = !busy
-        removeBtn.isEnabled = !busy
+        // p28-1 互斥單選同步：checked 即選擇狀態（視覺 + TalkBack）。
+        autoBtn.isChecked = (s.channel == ChannelPreference.AUTO)
+        rootBtn.isChecked = (s.channel == ChannelPreference.ROOT)
+        shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
+        lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
+        val blockReason = if (busy) null else writeBlockReason(s)?.let { resolveBlockReason(it) }
+        cloneBtn.isEnabled = !busy && blockReason == null
+        removeBtn.isEnabled = !busy && blockReason == null
         refreshBtn.isEnabled = !busy
         autoBtn.isEnabled = !busy
         rootBtn.isEnabled = !busy
@@ -798,14 +931,26 @@ class MainActivity : ComponentActivity() {
         clearSelBtn.isEnabled = !busy
         saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
         cancelSaveBtn.isEnabled = !busy
-        batchBtn.isEnabled = !busy && s.selectedKeys.isNotEmpty()
+        batchBtn.isEnabled = !busy && s.selectedKeys.isNotEmpty() && blockReason == null
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
         searchInput.isEnabled = !busy
+        // p28-1 禁用原因行：只在非 busy 且不可寫時顯示 VM 拒絕理由。
+        if (blockReason != null) {
+            writeBlockView.visibility = View.VISIBLE
+            writeBlockView.text = blockReason
+        } else {
+            writeBlockView.visibility = View.GONE
+            writeBlockView.text = ""
+        }
         // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
         // PR-37 P3 差量：列表只在指紋變化時全量重建；其餘文字區各自更新。
         renderSourceList(s)
-        msgView.text = if (busy) "載入中…" else s.msg.ifEmpty { "就緒" }
-        msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else colorFor(s.msgKind))
+        msgView.text = if (busy) {
+            getString(R.string.status_loading)
+        } else {
+            s.msg.ifEmpty { getString(R.string.status_ready) }
+        }
+        msgView.setTextColor(if (busy || (s.msg.isEmpty() && !busy)) defaultMsgColor else msgColorFor(s.msgKind))
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
@@ -862,12 +1007,12 @@ class MainActivity : ComponentActivity() {
         )
         try {
             removeConfirmDialog = AlertDialog.Builder(this)
-                .setTitle("確認移除分身")
+                .setTitle(getString(R.string.remove_confirm_title))
                 .setMessage(message)
                 // Builder 僅有 setCancelable（無 setCanceledOnTouchOutside），touch-outside 由 show 後 dialog 層再設。
                 .setCancelable(!loading)
-                .setPositiveButton("確認移除", null)
-                .setNegativeButton("取消", null)
+                .setPositiveButton(getString(R.string.remove_confirm_positive), null)
+                .setNegativeButton(getString(R.string.dialog_cancel), null)
                 .setOnCancelListener { vm.cancelRemove() }
                 .show()
         } catch (_: Exception) {
@@ -923,7 +1068,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (apps == null) {
-                catalogLoadError = "來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）"
+                catalogLoadError = getString(R.string.catalog_load_failed)
                 updateCatalogErrorView()
                 return@launch
             }
@@ -978,15 +1123,22 @@ class MainActivity : ComponentActivity() {
         val busy = s.loading
         // PR-37 Phase C #6 a11y：文字與 contentDescription 每輪隨 state 同步
         //（按鈕類型不變，最小改動；開關語義靠文案「顯示中/已隱藏＋點兩下切換」傳達）。
-        systemToggleBtn.text = if (s.includeSystemApps) "系統應用：顯示中" else "系統應用：已隱藏"
-        systemToggleBtn.contentDescription = if (s.includeSystemApps) {
-            "系統應用目前顯示中，點兩下隱藏（只切換顯示，不卸載任何分身）"
+        systemToggleBtn.text = if (s.includeSystemApps) {
+            getString(R.string.system_apps_shown)
         } else {
-            "系統應用目前已隱藏，點兩下顯示（只切換顯示，不卸載任何分身）"
+            getString(R.string.system_apps_hidden)
         }
-        batchBtn.text = "建立 ${s.selectedKeys.size} 個分身"
-        batchBtn.contentDescription =
-            "批次建立 ${s.selectedKeys.size} 個分身（對已勾選逐項執行；勾選本身不等於卸載）"
+        systemToggleBtn.contentDescription = if (s.includeSystemApps) {
+            getString(R.string.system_toggle_cd_shown)
+        } else {
+            getString(R.string.system_toggle_cd_hidden)
+        }
+        batchBtn.text = resources.getQuantityString(R.plurals.batch_create, s.selectedKeys.size, s.selectedKeys.size)
+        batchBtn.contentDescription = resources.getQuantityString(
+            R.plurals.batch_create_cd,
+            s.selectedKeys.size,
+            s.selectedKeys.size,
+        )
         updateCatalogErrorView()
         batchResultView.text = batchReportText(s.batchReport)
         val key = buildSourceListKey(s)
@@ -1001,14 +1153,14 @@ class MainActivity : ComponentActivity() {
         lastSourceListKey = key
         sourceContainer.removeAllViews()
         if (s.sourceCatalog.isEmpty()) {
-            sourceContainer.addView(TextView(this).apply { text = "應用清單：尚未載入" })
+            sourceContainer.addView(TextView(this).apply { text = getString(R.string.source_empty_loading) })
         } else if (visible.isEmpty()) {
-            sourceContainer.addView(TextView(this).apply { text = "應用清單：無符合項目" })
+            sourceContainer.addView(TextView(this).apply { text = getString(R.string.source_empty_nomatch) })
         } else {
             for (entry in visible.take(MAX_SOURCE_ROWS)) {
                 val box = CheckBox(this).apply {
                     // 可辨識列:名稱 + 包名；TalkBack 讀同一文字。
-                    text = "${entry.label}\n${entry.packageName}"
+                    text = getString(R.string.source_row, entry.label, entry.packageName)
                     tag = entry.appKey
                     isChecked = entry.appKey in s.selectedKeys
                     // 批次執行中不可改勾選。
@@ -1024,8 +1176,12 @@ class MainActivity : ComponentActivity() {
                 sourceContainer.addView(
                     TextView(this).apply {
                         // 全選可見同樣只取前 N 筆（見 currentVisibleKeys），此處列明契約。
-                        text = "…等共 ${visible.size} 筆，僅顯示前 $MAX_SOURCE_ROWS 筆，" +
-                            "全選可見只選前 $MAX_SOURCE_ROWS 筆（請用搜尋縮小範圍）"
+                        text = resources.getQuantityString(
+                            R.plurals.source_truncated,
+                            visible.size,
+                            visible.size,
+                            MAX_SOURCE_ROWS,
+                        )
                     },
                 )
             }
@@ -1150,18 +1306,61 @@ class MainActivity : ComponentActivity() {
         // 後經 evictIcon 同步清除 drawables＋memo 兩處。
         internal fun pickIconEvictionKey(orderedKeys: List<String>, maxSize: Int): String? =
             if (orderedKeys.size >= maxSize) orderedKeys.firstOrNull() else null
-
-        // Status-line color per message class; NONE falls back to default.
-        private fun colorFor(kind: MsgKind): Int = when (kind) {
-            MsgKind.NONE -> Color.BLACK
-            MsgKind.INFO -> Color.rgb(0x1B, 0x7A, 0x2B)
-            MsgKind.INVALID -> Color.rgb(0xB2, 0x6A, 0x00)
-            MsgKind.NO_DUAL -> Color.rgb(0x9A, 0x6B, 0x00)
-            MsgKind.VERIFY -> Color.rgb(0xB0, 0x00, 0x20)
-            MsgKind.CHANNEL -> Color.rgb(0x6A, 0x1B, 0x9A)
-            MsgKind.FAILED -> Color.rgb(0xB0, 0x00, 0x20)
-        }
     }
+}
+
+// p28-1 手動包名就地驗證（純函數，JVM 可測；Activity TextWatcher/IME 共用）。
+// p28-1 review（en 殘留）：回傳資源鍵（不碰 Context，JVM 可測）；文字見
+// values/strings.xml + values-en/，由 Context.resolvePackageInputError 解析。
+// - 空白不報錯（空欄位不打擾；送出時 VM 仍以 INVALID 拒絕）。
+// - trim 後超長（MAX_PACKAGE_INPUT_CHARS）沿用 VM 拒絕同文（中文語系字面一致；
+//   超長模板與 VM 共用同一上限數字，見 input_too_long）。
+// - 非法字元就地提示已中文化（invalid_package）；VM 內同碼 msg 仍為英文原文
+//   （VM msg 保留程式內字面，見 values/strings.xml 檔頭），英文語系兩側一致。
+// - 字元集不自訂 regex：直接沿用 core ShellEscaper 政策（單一來源），此處僅
+//   提示用 try/catch 轉為 INVALID 鍵；真正執法仍在 repo/VM。
+internal enum class PackageInputProblem {
+    TOO_LONG,
+    INVALID,
+}
+
+internal fun packageInputError(raw: String): PackageInputProblem? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    if (trimmed.length > MAX_PACKAGE_INPUT_CHARS) return PackageInputProblem.TOO_LONG
+    return try {
+        ShellEscaper.escapePackage(trimmed)
+        null
+    } catch (_: IllegalArgumentException) {
+        PackageInputProblem.INVALID
+    }
+}
+
+// 資源鍵 -> string 資源（JVM 可測，不碰 Context；雙語鍵一致性見 UiSemanticsP28Test）。
+internal fun PackageInputProblem.stringRes(): Int = when (this) {
+    PackageInputProblem.TOO_LONG -> R.string.input_too_long
+    PackageInputProblem.INVALID -> R.string.invalid_package
+}
+
+// Context 解析（Activity 側；TOO_LONG 帶上限參數）。
+internal fun Context.resolvePackageInputError(problem: PackageInputProblem): String = when (problem) {
+    PackageInputProblem.TOO_LONG -> getString(problem.stringRes(), MAX_PACKAGE_INPUT_CHARS)
+    PackageInputProblem.INVALID -> getString(problem.stringRes())
+}
+
+// 寫入拒絕理由鍵 -> string 資源（JVM 可測；Activity/factory 以此解析）。
+internal fun WriteBlock.stringRes(): Int = when (kind) {
+    WriteBlockKind.LSPOSED_PLACEHOLDER -> R.string.write_block_lsposed
+    WriteBlockKind.NOOP_FALLBACK -> R.string.write_block_noop
+    WriteBlockKind.EXPLICIT_FAILURE -> R.string.write_block_explicit
+    WriteBlockKind.PM_UNREADABLE -> R.string.write_block_pm
+    WriteBlockKind.NO_PRIVILEGE -> R.string.write_block_readonly
+}
+
+// Context 解析（Activity 側顯示 + factory 供 VM 的 blockText）。
+internal fun Context.resolveBlockReason(reason: BlockReason): String = when (reason) {
+    is BlockReason.Keyed -> getString(reason.block.stringRes(), *reason.block.args.toTypedArray())
+    is BlockReason.Verbatim -> reason.text
 }
 
 // PR-6 P4 (#27 架構整理)：render() 的純字串拆分 (頂層 internal，JVM 可測)。
@@ -1395,6 +1594,14 @@ private class DualViewModelFactory(
                 nowWallMs = { System.currentTimeMillis() },
                 nowMonoMs = { SystemClock.elapsedRealtime() },
                 selectionStore = selPrefs.selectionStore(),
+                // p28-1 review（en 殘留）：寫入拒絕理由經 Application Context
+                // 解析資源（applicationContext，不持 Activity；JVM 測試注入假值）。
+                blockText = { block ->
+                    appContext.applicationContext.getString(
+                        block.stringRes(),
+                        *block.args.toTypedArray(),
+                    )
+                },
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")

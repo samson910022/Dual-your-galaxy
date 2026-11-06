@@ -555,6 +555,12 @@ class DualViewModel(
     // SharedPreferences (selectionStore());JVM 測試注入 HashMap 後端;null
     // 表示無持久化 (既有測試路徑,所有選取操作退化為純記憶體)。
     private val selectionStore: SelectionStore? = null,
+    // p28-1 review（en 殘留）：寫入拒絕理由在地化。VM 本體不碰 Android
+    // Context：文字解析經此注入——生產由 factory 以 Application Context 對接
+    // values/strings.xml（見 MainActivity.resolveBlockReason）；JVM 測試注入
+    // 假值（見 BlockReasonTestFake.zhTestBlockText）。預設回退 key 名
+    // （WriteBlockKind.name），保證主程式碼零硬編碼字面。
+    private val blockText: (WriteBlock) -> String = { it.kind.name },
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -5271,6 +5277,9 @@ class DualViewModel(
             // P25 messages: explicit choices never cross channels -- the text
             // states the selected-mode reason plus the optional recovery
             // entry (switch to Auto or tap "重新連線並更新").
+            // p28-1 review（en 殘留）：文字經 blockText 解析資源（見 values/
+            // strings.xml + values-en/），分支條件與原文一字不動；與 isWritable
+            // 共用 WriteBlock key（single source）。
             val notReadyMsg: String = when {
                 currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER -> {
                     // LSPosed mode semantics (F4b-P2): the gateway is still
@@ -5278,19 +5287,19 @@ class DualViewModel(
                     // so the channel is honestly never ready. The message
                     // states the reason plus the hook signal; it never claims
                     // the channel can execute.
-                    "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
-                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」"
+                    blockText(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(hookDesc)))
                 }
                 gatewayPrivilege == Privilege.NONE -> {
                     if (degradeNoteForState.isNotEmpty()) degradeNoteForState
-                    else "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
-                        "寫入已禁用；請檢查授權後點「重新連線並更新」"
+                    else blockText(WriteBlock(WriteBlockKind.NOOP_FALLBACK))
                 }
                 else -> {
-                    "所選模式 $preference（${gatewayPrivilege} 通道）探測未通過，" +
-                        "寫入已禁用（明選不跨通道）；" +
-                        "可切到 Auto 或點「重新連線並更新」重試"
+                    blockText(
+                        WriteBlock(
+                            WriteBlockKind.EXPLICIT_FAILURE,
+                            listOf(preference.name, gatewayPrivilege.name),
+                        ),
+                    )
                 }
             }
             // When degraded-but-ready (Auto -> SHIZUKU proven), surface the
@@ -5491,8 +5500,20 @@ class DualViewModel(
     // (whitelist branch pending), so writes are refused with the reason
     // stated, including the hook signal. Nothing is ever executed here: the
     // channel must not be mistaken for a working hook path.
+    // p28-1 review：BlockReason -> 顯示文字（isWritable/probeChannels 共用
+    // single source；Activity 側另有 Context 版 resolveBlockReason，見
+    // MainActivity）。
+    private fun resolveReason(reason: BlockReason): String = when (reason) {
+        is BlockReason.Keyed -> blockText(reason.block)
+        is BlockReason.Verbatim -> reason.text
+    }
+
     private fun isWritable(): Boolean {
         val cur = _state.value
+        // p28-1 single source: the refusal reason also shown next to the
+        // disabled write buttons (MainActivity renders writeBlockReason of
+        // the same state). Null means writable -- return before touching msg.
+        val reason = writeBlockReason(cur) ?: return true
         // P1-3 write-guard 拒絕產生 diagnose（CHANNEL_ERROR）：
         // 冷啟動無通道時若 diagnose 留 null，後續寫入拒絕只改 msg，
         // 匯出仍宣稱 OK。優先順序規則同 probeChannels：已有 sticky
@@ -5511,7 +5532,7 @@ class DualViewModel(
             // 歷史（diagnose==null 且 lastOperation.phase != UNKNOWN），
             // 記 CHANNEL_ERROR，techDetail 標註佔位/政策拒寫（明確不是
             // probe failure）；已有診斷（含 sticky UNKNOWN）則保留原值。
-            val hookDesc = cur.hookEvidence().displayText()
+            // 拒絕理由 single source：外層 reason（見 writeBlockReason）。
             _state.update {
                 val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
@@ -5525,9 +5546,7 @@ class DualViewModel(
                                 "(explicit write refused by policy, not a probe failure)",
                         )
                     },
-                    msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
-                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5535,16 +5554,8 @@ class DualViewModel(
         }
         if (!cur.channelReady) {
             // P25: explicit never crosses channels -- state the selected-mode
-            // reason plus the optional recovery entry.
-            val reason = if (cur.degradeNote.isNotEmpty() && cur.channel == ChannelPreference.AUTO) {
-                cur.degradeNote
-            } else if (gatewayPrivilege == Privilege.NONE) {
-                "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
-                    "寫入已禁用；請檢查授權後點「重新連線並更新」"
-            } else {
-                "所選模式 ${cur.channel}（${gatewayPrivilege} 通道）探測未通過，" +
-                    "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
-            }
+            // reason plus the optional recovery entry（拒絕理由 single source：
+            // 外層 reason，見 writeBlockReason，與按鈕旁禁用原因同文）.
             _state.update {
                 val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
@@ -5558,7 +5569,7 @@ class DualViewModel(
                                 "(channel=${it.channel} privilege=$gatewayPrivilege)",
                         )
                     },
-                    msg = reason,
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5576,8 +5587,7 @@ class DualViewModel(
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；" +
-                        "請檢查授權後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5599,8 +5609,7 @@ class DualViewModel(
                             techDetail = "no privilege channel (read-only)",
                         )
                     },
-                    msg = "唯讀：無可用權限通道，寫入已禁用；" +
-                        "請檢查授權後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.INVALID,
                 )
             }
@@ -5844,6 +5853,67 @@ fun UiState.readyMark(): String = when {
     pmReadable == true -> "已就緒"
     pmReadable == false -> "探測通過，PM不可讀"
     else -> "探測通過，PM未確認"
+}
+
+// p28-1（review 修復）：寫入拒絕理由 single source（isWritable() 報入 msg 的
+// 即此 key 經 blockText 解析的文字；MainActivity 在主操作按鈕旁以 Context 版
+// resolveBlockReason 顯示同一 key，不再只靠點按後拒絕才得知）。
+// 回傳資源鍵（JVM 可測，不碰 Android runtime；文字見 values/strings.xml +
+// values-en/），主程式碼零硬編碼字面。
+// Null = 可寫。分支順序與 isWritable 完全一致：LSPOSED 佔位、!writeReady
+//（AUTO 降級註記逐字沿用、無權限 NoOp 回退、明選模式失敗）、PM 不可讀門、
+// 最後不可達的 NONE 權限守衛。channelReady 為 writeReady 舊別名（恆等）；
+// gatewayPrivilege/currentChannel 由 probeChannels 同步拷貝至
+// execIdentity/resolvedGateway，故 isWritable 持鎖下讀 state 等價
+// （明選分支原文用 gatewayPrivilege，此處讀 execIdentity，值相同）。
+// AUTO 降級註記（degradeNote，probe 動態產物）逐字沿用，不經資源。
+enum class WriteBlockKind {
+    LSPOSED_PLACEHOLDER,
+    NOOP_FALLBACK,
+    EXPLICIT_FAILURE,
+    PM_UNREADABLE,
+    NO_PRIVILEGE,
+}
+
+// 資源鍵 + 格式參數：LSPOSED 的 args[0]=Hook 證據文字（動態）；EXPLICIT 的
+// args[0]=模式名、args[1]=通道身份名（列舉名，中英同形）；其餘無參數。
+data class WriteBlock(
+    val kind: WriteBlockKind,
+    val args: List<String> = emptyList(),
+)
+
+sealed interface BlockReason {
+    data class Keyed(val block: WriteBlock) : BlockReason
+    data class Verbatim(val text: String) : BlockReason
+}
+
+internal fun writeBlockReason(s: UiState): BlockReason? {
+    if (s.resolvedGateway == ResolvedChannel.LSPOSED_PLACEHOLDER) {
+        return BlockReason.Keyed(
+            WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(s.hookEvidence().displayText())),
+        )
+    }
+    if (!s.writeReady) {
+        return if (s.degradeNote.isNotEmpty() && s.channel == ChannelPreference.AUTO) {
+            BlockReason.Verbatim(s.degradeNote)
+        } else if (s.execIdentity == Privilege.NONE) {
+            BlockReason.Keyed(WriteBlock(WriteBlockKind.NOOP_FALLBACK))
+        } else {
+            BlockReason.Keyed(
+                WriteBlock(
+                    WriteBlockKind.EXPLICIT_FAILURE,
+                    listOf(s.channel.name, s.execIdentity.name),
+                ),
+            )
+        }
+    }
+    if (s.pmReadable == false) {
+        return BlockReason.Keyed(WriteBlock(WriteBlockKind.PM_UNREADABLE))
+    }
+    if (s.privilege == Privilege.NONE || s.execIdentity == Privilege.NONE) {
+        return BlockReason.Keyed(WriteBlock(WriteBlockKind.NO_PRIVILEGE))
+    }
+    return null
 }
 
 // PR-6 P4 (#27 架構整理)：扁平時間證據欄位的衍生視圖。isWritable 與
