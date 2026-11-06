@@ -120,17 +120,30 @@ class InputRestoreTest {
     // Activity：搜尋輸入 + 通道行在 recreate 後仍渲染（無寫入）。
     @Test
     fun activity_recreate_restoresInputAndChannelRow() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            onView(withHint("搜尋應用名稱 / 包名")).perform(replaceText("mail"))
-            // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
-            scenario.onActivity { activity ->
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            vm.setSourceQuery("mail")
+            HarnessPoll.await { vm.state.value.sourceQuery == "mail" }
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+                }
+                scenario.recreate()
+                scenario.onActivity { activity ->
+                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+                }
+                assertEquals(0, gw.uninstallCalls)
+                assertEquals(0, gw.writeCalls)
             }
-            scenario.recreate()
-            scenario.onActivity { activity ->
-                assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
-            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
         }
     }
 }
