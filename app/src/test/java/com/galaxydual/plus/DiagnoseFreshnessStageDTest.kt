@@ -100,6 +100,25 @@ class DiagnoseFreshnessStageDTest {
         assertEquals("version stays readable", "v1.2.3", redactIp("v1.2.3"))
     }
 
+    // K3：全數字時:分:秒 (雙冒號) 不得誤遮為 <ip>；既有 IPv6 形仍遮。
+    @Test
+    fun k3_hmsTimestamp_notRedacted_ipv6StillMasked() {
+        assertEquals("12:34:56", redactIp("12:34:56"))
+        assertEquals("time 12:34:56 stays readable", "time 12:34:56", redactIp("time 12:34:56"))
+
+        val loop = redactIp("loop ::1 end")
+        assertTrue("ipv6 ::1 must still mask, got: $loop", loop.contains("<ip>"))
+
+        val comp1 = redactIp("addr fe80::1 end")
+        assertTrue("ipv6 fe80::1 must still mask, got: $comp1", comp1.contains("<ip>"))
+
+        val comp2 = redactIp("addr 2001:db8::1 end")
+        assertTrue("ipv6 2001:db8::1 must still mask, got: $comp2", comp2.contains("<ip>"))
+
+        val full = redactIp("addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 end")
+        assertTrue("ipv6 full form must still mask, got: $full", full.contains("<ip>"))
+    }
+
     // D3 匯出 IPv4 不洩 raw。
     @Test
     fun d3_export_ipTech_noRawLeak() {
