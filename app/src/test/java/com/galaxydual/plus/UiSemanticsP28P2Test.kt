@@ -13,7 +13,7 @@
 // - msgView 守衛（shouldUpdateMsgText + lastMsgText + View 實字雙比對）。
 // - busy 打字競態一律禁用三鈕（讀 vm.state 最新，不用 stale lastState）。
 // - 旋轉恢復後重算 enablement（Activity 側 onRestore/onResume 補呼叫；JVM 鎖純函數）。
-// - verifiedTargetAvailable 閾值統一 >0（0 永不可寫；VM pin 為準）。
+// - verifiedTargetAvailable 閾值統一 >0 且 serial 非 null（0 永不可寫；serial null 即 SerialUnavailable，VM pin 為準）。
 // - factory blockText 與 resolveBlockReason 同資源（同 stringRes）。
 package com.galaxydual.plus
 
@@ -290,7 +290,7 @@ class UiSemanticsP28P2Test {
         assertFalse(batchEnabled(busy))
     }
 
-    // ---- B1：verifiedTargetAvailable 閾值統一 >0（0 永不可寫） ----
+    // ---- B1：verifiedTargetAvailable 閾值統一 >0 且 serial 非 null（0 永不可寫；serial null 即 SerialUnavailable，VM pin 必拒絕） ----
 
     @Test
     fun verifiedTargetAvailable_zero_isFalse() {
@@ -299,6 +299,19 @@ class UiSemanticsP28P2Test {
         )
         assertFalse(verifiedTargetAvailable(zero))
         assertFalse(batchEnabled(zero.copy(selectedKeys = setOf("1:com.example.a"))))
+    }
+
+    @Test
+    fun verifiedTargetAvailable_idOnlySerialNull_isFalse() {
+        // owner 複審 P2：targetId>0 但 targetSerial==null（SerialUnavailable 殘留
+        // 或 legacy 未知）時，cloneSelected 起始 pin 需 Confirmed(id+serial) 必拒絕，
+        // 故 UI 亦視為不可用（batch 禁用），不取代 VM 權威判定。
+        val idOnly = writableState().copy(
+            inventory = writableState().inventory.copy(targetSerial = null),
+        )
+        assertTrue(idOnly.inventory.targetId > 0)
+        assertFalse(verifiedTargetAvailable(idOnly))
+        assertFalse(batchEnabled(idOnly.copy(selectedKeys = setOf("1:com.example.a"))))
     }
 
     // ---- B1：旋轉重算（恢復後顯式重算 enablement，避免卡 disabled） ----

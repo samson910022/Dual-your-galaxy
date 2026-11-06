@@ -1555,11 +1555,13 @@ internal fun manualInputActionable(raw: String): Boolean {
 }
 
 // P2-2 目前 verified target 可用性（純函數，JVM 可測；batch enablement 用）。
-// UI 層近似門控：targetId > 0 視為可用（0 永不可寫；-1=NO_TARGET_ID 表未知）。
-// 權威判定以 VM 起始 pin 為準（fetchDualTarget Confirmed 才執行，否則整批拒絕；
-// serial 缺失/無目標時 VM 側仍拒絕為縱深），此處只做 UI 層即時門控。
+// UI 層近似門控：targetId > 0 且 targetSerial 非 null 才視為可用
+// （0 永不可寫；-1=NO_TARGET_ID 表未知；serial null 表 SerialUnavailable，
+// cloneSelected 起始 pin 需 Confirmed(id+serial) 必拒絕，故 UI 亦禁用）。
+// 權威判定以 VM 起始 pin 為準（fetchDualTarget Confirmed 才執行），此處只做
+// UI 層即時門控（fail-closed 對齊，不取代 VM 守衛）。
 internal fun verifiedTargetAvailable(s: UiState): Boolean =
-    s.inventory.targetId > 0
+    s.inventory.targetId > 0 && s.inventory.targetSerial != null
 
 // P2-2 clone/remove enablement（純函數，JVM 可測；render + TextWatcher 共用）。
 // 三條件：非 busy、可寫（writeBlockReason == null）、手動輸入可用。
