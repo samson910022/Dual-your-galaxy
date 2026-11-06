@@ -66,6 +66,8 @@ services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 已被內聯，仍可能收不到回調。
 **反內聯效果未驗證**（無三星實機）：`deoptimize()` 回傳值（成功／no-op）與
 失敗都會記 log（`GalaxyDualHook` tag），不再全吞；hook 本體不受影響、照常安裝。
+JVM 單測僅鎖定呼叫契約（`DeoptimizeContractTest`），ART 內聯繞過需裝置手動矩陣
+（`docs/ACCEPTANCE.md` H1 列，待 p29-1 模板合併後補）。
 Hook Builder 統一使用
 **`ExceptionMode.PROTECTIVE`**（佔位保護）：hook 自身出錯只記 log 並跳過，
 絕不拖垮 `system_server`。
