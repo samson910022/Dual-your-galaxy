@@ -160,10 +160,18 @@ class MainActivity : ComponentActivity() {
     // 不重設 text（避免 POLITE 重播）；僅文字變化時更新。msgView 恆為
     // POLITE 主播報者，writeBlockView 在與 s.msg 同文時降為 NONE。
     // 去重鍵去時間（見 stripWriteBlockTimeParams）：可見文字保留完整時間資訊。
+    // C：快取另存去時間鍵（writeBlockDedupKey 接入生產，BlockReason 層去時間；
+    // msg 側以 stripWriteBlockTimeParams 同式去時間），自更新判斷比鍵不比原文。
     private var lastWriteBlockText: String? = null
+    private var lastWriteBlockDedupKey: String? = null
     // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
     // 與 writeBlockView 同式：快取 + View 實際文字雙重比對，旋轉重建以 View 為準。
+    // C 同式去時間：比對前剝時間鍵，可見文字保留完整時間。
     private var lastMsgText: String? = null
+    // B：batchResult/catalogError 去重快取（比照 msg/writeBlock：shouldUpdate＋
+    // View 實字雙比對，避免無關 render 重播 POLITE；旋轉重建以 View 為準）。
+    private var lastBatchResultText: String? = null
+    private var lastCatalogErrorText: String? = null
 
     // Two-phase remove dialog (PR-4 P1, issue #23): driven by
     // UiState.pendingRemove, never by a click counter. Non-null pending shows
@@ -230,8 +238,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
         // B1：lastWriteBlockText/lastMsgText 隨存活（View 重建為空時以 View 實際文字為準補寫，見 render）。
+        // C：去時間鍵 lastWriteBlockDedupKey 亦隨存活（自更新判斷比鍵；B 的 batch/catalog 僅內存，去重以 View 為準）。
         diagExpanded = savedInstanceState?.getBoolean(KEY_DIAG_EXPANDED) ?: false
         lastWriteBlockText = savedInstanceState?.getString(KEY_WRITE_BLOCK_TEXT)
+        lastWriteBlockDedupKey = savedInstanceState?.getString(KEY_WRITE_BLOCK_DEDUP)
         lastMsgText = savedInstanceState?.getString(KEY_MSG_TEXT)
         buildUi()
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
@@ -291,7 +301,9 @@ class MainActivity : ComponentActivity() {
         outState.putBoolean(KEY_DIAG_EXPANDED, diagExpanded)
         // B1：去重快取隨存活；新 View 重建為空時 render 以 View 實際文字為準補寫，
         // 故恢復值僅作去重參考，不會導致空 View 跳過首寫。
+        // C 去時間鍵亦隨存活（B 的 batch/catalog 僅內存）。
         if (lastWriteBlockText != null) outState.putString(KEY_WRITE_BLOCK_TEXT, lastWriteBlockText)
+        if (lastWriteBlockDedupKey != null) outState.putString(KEY_WRITE_BLOCK_DEDUP, lastWriteBlockDedupKey)
         if (lastMsgText != null) outState.putString(KEY_MSG_TEXT, lastMsgText)
     }
 
@@ -970,7 +982,11 @@ class MainActivity : ComponentActivity() {
         rootBtn.isChecked = (s.channel == ChannelPreference.ROOT)
         shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
         lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
-        val blockReason = if (busy) null else writeBlockReason(s)?.let { resolveBlockReason(it) }
+        // C：保留 BlockReason 原鍵以計算去時間鍵（writeBlockDedupKey 接入生產）；
+        // 可見文字仍為完整 blockReason（含時間），自更新判斷比鍵不比原文。
+        val blockKey = if (busy) null else writeBlockReason(s)
+        val blockReason = blockKey?.let { resolveBlockReason(it) }
+        val blockDedupKey = writeBlockDedupKey(blockKey)
         // P2-2 輕量讀取：buildUi 前 render（測試路徑）視為不可用（fail-closed）。
         val manualActionable = try {
             if (!::pkgInput.isInitialized) false else manualInputActionable(pkgInput.text?.toString().orEmpty())
@@ -1004,6 +1020,8 @@ class MainActivity : ComponentActivity() {
         // NONE；原因未變時不重設 text（避免無關 render 重播）。
         // B1：同文判定去時間（見 isWriteBlockDuplicate/stripWriteBlockTimeParams），
         // 解決 LSPosed displayText 時間戳漂移導致恆 false；可見文字不去時間。
+        // C 自更新去時間：快取比去時間鍵（blockDedupKey，BlockReason 層），
+        // View 比去時間文字；可見文字保留完整時間，只在鍵變化或 View 空時重寫。
         val duplicate = isWriteBlockDuplicate(blockReason, s.msg, busy)
         try {
             writeBlockView.accessibilityLiveRegion =
@@ -1015,12 +1033,15 @@ class MainActivity : ComponentActivity() {
         if (blockReason != null) {
             writeBlockView.visibility = View.VISIBLE
             // B1：快取 + View 實際文字雙重比對；旋轉重建 View 為空時以 View 為準補寫。
+            // C：快取比 dedup 鍵、View 比去時間文字（時間漂移不重播）。
             val writeViewCurrent = try {
                 writeBlockView.text.toString()
             } catch (_: Exception) {
                 null
             }
-            if (shouldUpdateWriteBlockText(lastWriteBlockText, blockReason) || writeViewCurrent != blockReason) {
+            val writeViewStripped = stripWriteBlockTimeParams(writeViewCurrent ?: "")
+            val writeNewStripped = stripWriteBlockTimeParams(blockReason)
+            if (shouldUpdateWriteBlockText(lastWriteBlockDedupKey, blockDedupKey) || writeViewStripped != writeNewStripped) {
                 if (writeViewCurrent != blockReason) {
                     try {
                         writeBlockView.text = blockReason
@@ -1029,12 +1050,14 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 lastWriteBlockText = blockReason
+                lastWriteBlockDedupKey = blockDedupKey
             }
         } else {
-            if (lastWriteBlockText != null) {
+            if (lastWriteBlockText != null || lastWriteBlockDedupKey != null) {
                 writeBlockView.visibility = View.GONE
                 writeBlockView.text = ""
                 lastWriteBlockText = null
+                lastWriteBlockDedupKey = null
             } else {
                 writeBlockView.visibility = View.GONE
                 try {
@@ -1049,6 +1072,7 @@ class MainActivity : ComponentActivity() {
         renderSourceList(s)
         // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
         // 快取 + View 實際文字雙重比對；旋轉重建以 View 為準補寫。
+        // C 同式去時間：快取/View 皆比去時間鍵，可見文字保留完整時間。
         val newMsgText = if (busy) {
             getString(R.string.status_loading)
         } else {
@@ -1059,7 +1083,10 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             null
         }
-        if (shouldUpdateMsgText(lastMsgText, newMsgText) || msgViewCurrent != newMsgText) {
+        val lastMsgStripped = lastMsgText?.let { stripWriteBlockTimeParams(it) }
+        val newMsgStripped = stripWriteBlockTimeParams(newMsgText)
+        val msgViewStripped = msgViewCurrent?.let { stripWriteBlockTimeParams(it) }
+        if (shouldUpdateMsgText(lastMsgStripped, newMsgStripped) || msgViewStripped != newMsgStripped) {
             if (msgViewCurrent != newMsgText) {
                 try {
                     msgView.text = newMsgText
@@ -1271,16 +1298,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // B 去重：比照 msg/writeBlock（shouldUpdate＋View 實字雙比對），
+    // 無關 render 不重設相同文字，避免 POLITE 重播；旋轉重建以 View 為準。
     private fun updateCatalogErrorView() {
         try {
             if (!::catalogErrorView.isInitialized) return
             val err = catalogLoadError
-            if (err.isNullOrEmpty()) {
-                catalogErrorView.visibility = View.GONE
-                catalogErrorView.text = ""
-            } else {
-                catalogErrorView.visibility = View.VISIBLE
-                catalogErrorView.text = err
+            val newText = err.orEmpty()
+            val viewCurrent = try {
+                catalogErrorView.text.toString()
+            } catch (_: Exception) {
+                null
+            }
+            if (shouldUpdateCatalogErrorText(lastCatalogErrorText, newText) || viewCurrent != newText) {
+                if (viewCurrent != newText) catalogErrorView.text = newText
+                lastCatalogErrorText = newText
+            }
+            val wantVisible = !err.isNullOrEmpty()
+            if ((catalogErrorView.visibility == View.VISIBLE) != wantVisible) {
+                catalogErrorView.visibility = if (wantVisible) View.VISIBLE else View.GONE
             }
         } catch (_: Exception) {
             // Best effort: view may not be ready in tests.
@@ -1333,7 +1369,36 @@ class MainActivity : ComponentActivity() {
             s.selectedKeys.size,
         )
         updateCatalogErrorView()
-        batchResultView.text = batchReportText(s.batchReport)
+        // A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時顯示可見原因，
+        // 不可靜默（空報告＋就緒）；有逐項報告時優先顯示報告，無報告才顯示目標原因。
+        // VM 守衛不動（batchEnabled/verifiedTargetAvailable 僅 UI 門控）。
+        // B 去重：比照 msg/writeBlock（shouldUpdate＋View 實字雙比對，避免無關 render 重播）。
+        val batchTargetReason = if (batchTargetUnavailable(s)) {
+            try {
+                getString(R.string.batch_target_unavailable)
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+        val reportText = batchReportText(s.batchReport)
+        val newBatchText = if (reportText.isNotEmpty()) reportText else (batchTargetReason ?: "")
+        val batchViewCurrent = try {
+            batchResultView.text.toString()
+        } catch (_: Exception) {
+            null
+        }
+        if (shouldUpdateBatchResultText(lastBatchResultText, newBatchText) || batchViewCurrent != newBatchText) {
+            if (batchViewCurrent != newBatchText) {
+                try {
+                    batchResultView.text = newBatchText
+                } catch (_: Exception) {
+                    // Best effort: render may run before buildUi in tests.
+                }
+            }
+            lastBatchResultText = newBatchText
+        }
         val key = buildSourceListKey(s)
         if (key == lastSourceListKey) {
             // 指紋未變：不重建列表，只同步勾選區啟用狀態（busy 切換時）。
@@ -1489,7 +1554,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_DIAG_EXPANDED = "diagExpanded"
         // B1 旋轉保留鍵：去重快取（僅去重參考；新 View 重建為空時 render 以 View
         // 實際文字為準補寫，不會因快取命中而跳過首寫）。
+        // C 去時間鍵亦隨存活（自更新判斷比鍵；B 的 batch/catalog 僅內存）。
         private const val KEY_WRITE_BLOCK_TEXT = "writeBlockText"
+        private const val KEY_WRITE_BLOCK_DEDUP = "writeBlockDedup"
         private const val KEY_MSG_TEXT = "msgText"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
@@ -1576,6 +1643,20 @@ internal fun batchEnabled(s: UiState): Boolean =
     !s.loading && s.selectedKeys.isNotEmpty() &&
         writeBlockReason(s) == null && verifiedTargetAvailable(s)
 
+// A 批次目標不可用可見原因（純函數，JVM 可測；render 顯示 batch_target_unavailable 用）。
+// 可寫但 verified target 不可用（targetSerial null/UNKNOWN）時回 true，
+// 呼叫端在 batchResultView 顯示可見原因（不可靜默 GONE+就緒）；
+// VM 守衛不動（writeBlockReason/isWritable 起始 pin 保留為權威）。
+internal fun batchTargetUnavailable(s: UiState): Boolean =
+    !s.loading && writeBlockReason(s) == null && !verifiedTargetAvailable(s)
+
+// B batch/catalog 更新守衛（純函數，JVM 可測；render 決定是否重設 text 用）。
+// 比照 msg/writeBlock：old != new；render 另以 View 實際文字雙重比對
+// （旋轉重建 View 為空時補寫，避免無關 render 重播 POLITE）。
+internal fun shouldUpdateBatchResultText(old: String?, new: String?): Boolean = old != new
+
+internal fun shouldUpdateCatalogErrorText(old: String?, new: String?): Boolean = old != new
+
 // B1 去重鍵去時間（純函數，JVM 可測）：可見文字保留完整時間資訊，
 // 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
 // 剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、重啟舊資料 stale 提示
@@ -1618,11 +1699,13 @@ internal fun isWriteBlockDuplicate(blockReasonText: String?, msg: String, busy: 
 
 // P2-1 文字更新守衛（純函數，JVM 可測；render 決定是否重設 text 用）。
 // 原因未變時回傳 false（呼叫端不碰 text，避免無關 render 重播）。
+// C：生產呼叫端傳去時間鍵（writeBlockDedupKey），此處僅比鍵；可見文字保留完整時間。
 internal fun shouldUpdateWriteBlockText(old: String?, new: String?): Boolean = old != new
 
 // B1 msg 更新守衛（純函數，JVM 可測；render 決定是否重設 msgView.text 用）。
 // 與 shouldUpdateWriteBlockText 同式（old != new）；render 另以 View 實際文字
 // 雙重比對（旋轉重建 View 為空時補寫）。
+// C 同式去時間：生產呼叫端傳去時間文字（stripWriteBlockTimeParams），可見保留完整時間。
 internal fun shouldUpdateMsgText(old: String?, new: String?): Boolean = old != new
 
 // 寫入拒絕理由鍵 -> string 資源（JVM 可測；Activity/factory 以此解析）。

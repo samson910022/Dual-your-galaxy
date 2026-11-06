@@ -309,6 +309,7 @@ class UiSemanticsP28Test {
             "channel_group_cd",
             "diagnostic_copy_button",
             "diagnostic_copy_success",
+            "batch_target_unavailable",
         )
         for (k in keys) {
             assertTrue("zh missing/empty $k", !zh[k].isNullOrEmpty())
@@ -387,6 +388,40 @@ class UiSemanticsP28Test {
         // JVM 常數與 zh 資源同字（UI 以資源為準，const 僅為測試 seam）。
         assertEquals(zh.getValue("diagnostic_copy_button"), DIAGNOSTIC_COPY_BUTTON_TEXT)
         assertEquals(zh.getValue("diagnostic_copy_success"), DIAGNOSTIC_COPY_SUCCESS_TEXT)
+        // A 批次目標不可見原因：中英皆須命名禁用＋重查入口（VM 守衛不動，僅 UI 提示）。
+        assertTrue(
+            "zh batch target must name 已禁用",
+            zh.getValue("batch_target_unavailable").contains("已禁用"),
+        )
+        assertTrue(
+            "zh batch target must name 重新連線並更新",
+            zh.getValue("batch_target_unavailable").contains("重新連線並更新"),
+        )
+        assertTrue(
+            "en batch target must name disabled",
+            en.getValue("batch_target_unavailable").contains("disabled"),
+        )
+        assertTrue(
+            "en batch target must name Reconnect and refresh",
+            en.getValue("batch_target_unavailable").contains("Reconnect and refresh"),
+        )
+    }
+
+    // D 移除確認模板操作指示：四語系同步（中英＋繁中三檔），末行須提示勾選確認框。
+    @Test
+    fun strings_removeConfirmMessage_hasAcknowledgeHint() {
+        val zh = stringMap(resFile("values/strings.xml"))
+        val en = stringMap(resFile("values-en/strings.xml"))
+        val hant = stringMap(resFile("values-b+zh+Hant/strings.xml"))
+        val rtw = stringMap(resFile("values-zh-rTW/strings.xml"))
+        val zhMsg = zh.getValue("remove_confirm_message")
+        assertTrue("zh must name 勾選下方確認框", zhMsg.contains("勾選下方確認框"))
+        assertTrue("zh must name 確認移除", zhMsg.contains("確認移除"))
+        val enMsg = en.getValue("remove_confirm_message")
+        assertTrue("en must name check the confirmation box below", enMsg.contains("check the confirmation box below"))
+        assertTrue("en must name enable Remove", enMsg.contains("enable Remove"))
+        assertEquals(zhMsg, hant.getValue("remove_confirm_message"))
+        assertEquals(zhMsg, rtw.getValue("remove_confirm_message"))
     }
 
     // 資源：三繁中檔（values/b+zh+Hant/zh-rTW）鎖一致（key 集＋逐值相等；

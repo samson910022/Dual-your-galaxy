@@ -52,13 +52,15 @@
         <item quantity="other">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
     </plurals>
     <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
+    <!-- A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時的可見原因（VM 守衛不動，僅 UI 層提示）。 -->
+    <string name="batch_target_unavailable">批次目標未確認（user/serial 未知或 serial 缺失），批次按鈕已禁用；請點「重新連線並更新」重查後再試</string>
     <string name="shizuku_listener_failed">Shizuku 監聽註冊失敗：%1$s</string>
     <string name="copy_failed">複製失敗：%1$s</string>
     <string name="dialog_close">關閉</string>
     <string name="dialog_cancel">取消</string>
     <string name="remove_confirm_title">確認移除分身</string>
     <string name="remove_confirm_positive">確認移除</string>
-    <string name="remove_confirm_message">警告：將刪除該分身的使用者資料且無法復原；僅影響分身（user %3$s），不影響主 profile。\nPackage：%2$s\n已驗證目標：user %3$s，serial %5$s\n應用：%1$s\nProfile：%4$s  [truncated] 表示標籤已截斷。</string>
+    <string name="remove_confirm_message">警告：將刪除該分身的使用者資料且無法復原；僅影響分身（user %3$s），不影響主 profile。\nPackage：%2$s\n已驗證目標：user %3$s，serial %5$s\n應用：%1$s\nProfile：%4$s  [truncated] 表示標籤已截斷。\n須勾選下方確認框才會啟用「確認移除」。</string>
     <string name="remove_confirm_view_labels">標籤詳情</string>
     <string name="remove_confirm_labels">每個標籤最多顯示 256 個字元及 512 個顯示單位；[truncated] 表示已截斷；原文的 [ 會跳脫為 \\[。\n應用：%1$s\nProfile：%2$s</string>
     <string name="remove_confirm_acknowledge">我已閱讀警告，並核對上方完整 package、user 和 serial。</string>
