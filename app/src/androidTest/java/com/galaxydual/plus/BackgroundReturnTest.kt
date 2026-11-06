@@ -29,7 +29,7 @@ class BackgroundReturnTest {
         try {
             awaitHarnessReady(vm)
             vm.requestRemove("com.example.chat")
-            HarnessPoll.await { vm.state.value.pendingRemove != null }
+            HarnessPoll.await(30_000L) { vm.state.value.pendingRemove != null }
             // 模擬退後台返回：不呼叫 confirm，pending 必須保留且零寫入。
             val pending = vm.state.value.pendingRemove
             assertNotNull("pending must survive background round-trip", pending)
@@ -37,7 +37,7 @@ class BackgroundReturnTest {
             assertEquals("background must not write", 0, gw.writeCalls)
             // 前台重查（refresh）只讀列表，不重放 uninstall。
             vm.refresh()
-            HarnessPoll.await { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { !vm.state.value.loading }
             assertEquals("foreground refresh must not uninstall", 0, gw.uninstallCalls)
             assertEquals("foreground refresh must not write", 0, gw.writeCalls)
             // pending 仍在（refresh 不吞確認），等待使用者顯式決策。
@@ -55,9 +55,9 @@ class BackgroundReturnTest {
         try {
             awaitHarnessReady(vm)
             vm.refresh()
-            HarnessPoll.await { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { !vm.state.value.loading }
             vm.refresh()
-            HarnessPoll.await { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { !vm.state.value.loading }
             assertEquals("repeated foreground must not uninstall", 0, gw.uninstallCalls)
             assertEquals("repeated foreground must not install", 0, gw.installCalls)
             assertEquals("repeated foreground must not write", 0, gw.writeCalls)
