@@ -321,10 +321,9 @@ class ReuseProtectionTest {
 
     // listOnProfiles continuity (auto list path, Phase A P1-A): expected
     // serial 15 followed by fresh serial missing yields null (unknown)
-    // without emitting the `pm list packages` probe. Same note as above:
-    // the explicit listClonedPackages(dualId) entry carries expected=null,
-    // so the cross-fetch null is locked via the auto path sharing the same
-    // listOnProfiles guard.
+    // without emitting the `pm list packages` probe. The explicit entry now
+    // carries its own expected pair (see below); the auto path sharing the
+    // same listOnProfiles guard is locked here.
     @Test
     fun autoList_serialContinuityLost_returnsNullWithoutProbe() {
         val gateway = FlipGateway(
@@ -341,6 +340,97 @@ class ReuseProtectionTest {
         assertTrue(
             "no target command for user 95, got: ${gateway.commands}",
             gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // PR-37 P26 Stage 1 (GH #1): explicit listing carries the resolve-time
+    // pair, so a same-id rebuild surfaces as SerialBreach (not Ok) without
+    // probing the new incarnation. The legacy single-arg entry no longer
+    // exists; the explicit entry takes VerifiedTarget? (null stays tolerated).
+    @Test
+    fun explicitList_sameIdSerialRebuild_returnsBreachWithoutProbe() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(41),
+            dumpsysSerials = mutableListOf(41),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val result = runSuspend {
+            repo.listClonedPackages(95, VerifiedTarget(95, 15, parentId = 0))
+        }
+        assertTrue("same-id rebuild must breach, got: $result", result is DualRepository.ListClonedResult.SerialBreach)
+        val breach = result as DualRepository.ListClonedResult.SerialBreach
+        assertEquals(95, breach.fresh?.userId)
+        assertEquals(41, breach.fresh?.serial)
+        assertTrue(
+            "breach must not probe the new incarnation, got: ${gateway.commands}",
+            gateway.listProbes().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Same id + same serial still lists (happy path must not be killed).
+    @Test
+    fun explicitList_sameSerial_returnsOk() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(15),
+            dumpsysSerials = mutableListOf(15),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val result = runSuspend {
+            repo.listClonedPackages(95, VerifiedTarget(95, 15, parentId = 0))
+        }
+        assertTrue("same serial must list, got: $result", result is DualRepository.ListClonedResult.Ok)
+        assertEquals(
+            listOf("com.example.chat"),
+            (result as DualRepository.ListClonedResult.Ok).packages,
+        )
+        assertEquals(1, gateway.listProbes().size)
+    }
+
+    // Known serial followed by missing fresh serial is continuity lost:
+    // SerialBreach without probing (fail closed, never an authoritative list).
+    @Test
+    fun explicitList_serialContinuityLost_returnsBreachWithoutProbe() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf<Int?>(null),
+            dumpsysSerials = mutableListOf<Int?>(null),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val result = runSuspend {
+            repo.listClonedPackages(95, VerifiedTarget(95, 15, parentId = 0))
+        }
+        assertTrue("continuity-lost must breach, got: $result", result is DualRepository.ListClonedResult.SerialBreach)
+        assertTrue(
+            "continuity-lost must not probe, got: ${gateway.commands}",
+            gateway.listProbes().isEmpty(),
+        )
+        assertTrue(
+            "no target command for user 95, got: ${gateway.commands}",
+            gateway.targetCommandsFor(95).isEmpty(),
+        )
+    }
+
+    // Null expected stays tolerated (legacy upgrade path): a fresh serial is
+    // listed without a breach, even when it differs from nothing.
+    @Test
+    fun explicitList_nullExpected_toleratesFreshSerial() {
+        val gateway = FlipGateway(
+            verboseSerials = mutableListOf(41),
+            dumpsysSerials = mutableListOf(41),
+            listPackagesOutput = "package:com.example.chat",
+        )
+        val repo = DualRepository(gateway)
+        val result = runSuspend { repo.listClonedPackages(95, null) }
+        assertTrue("null expected must tolerate, got: $result", result is DualRepository.ListClonedResult.Ok)
+        assertEquals(
+            listOf("com.example.chat"),
+            (result as DualRepository.ListClonedResult.Ok).packages,
         )
     }
 

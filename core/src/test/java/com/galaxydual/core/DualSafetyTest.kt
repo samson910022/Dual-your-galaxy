@@ -201,7 +201,7 @@ class DualSafetyTest {
             "verifyState(0) must be Unknown, got: ${runSuspend { repo.verifyState("com.example.chat", 0) }}",
             runSuspend { repo.verifyState("com.example.chat", 0) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(0) })
+        assertTrue(runSuspend { repo.listClonedPackages(0) } is DualRepository.ListClonedResult.Unknown)
 
         // Belt and suspenders: the command builder layer rejects 0 as well.
         try {
@@ -306,15 +306,15 @@ class DualSafetyTest {
         val gateway = FakeGateway()
         val repo = DualRepository(gateway)
 
-        // dualId 0: graceful Unknown/false/null, never probes user 0.
+        // dualId 0: graceful Unknown/false/Unknown, never probes user 0.
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 0) } is VerifyState.Unknown)
         assertFalse(runSuspend { repo.verify("com.example.chat", 0) })
-        assertNull(runSuspend { repo.listClonedPackages(0) })
+        assertTrue(runSuspend { repo.listClonedPackages(0) } is DualRepository.ListClonedResult.Unknown)
 
-        // Stale id 150 (not in snapshot): graceful Unknown/false/null, never probed.
+        // Stale id 150 (not in snapshot): graceful Unknown/false/Unknown, never probed.
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 150) } is VerifyState.Unknown)
         assertFalse(runSuspend { repo.verify("com.example.chat", 150) })
-        assertNull(runSuspend { repo.listClonedPackages(150) })
+        assertTrue(runSuspend { repo.listClonedPackages(150) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "verify/list must never probe user 0 or a stale id, got: ${gateway.commands}",
@@ -435,7 +435,9 @@ class DualSafetyTest {
                 "id $badId verifyState must be Unknown",
                 runSuspend { repo.verifyState("com.example.chat", badId) } is VerifyState.Unknown,
             )
-            assertNull(runSuspend { repo.listClonedPackages(badId) })
+            assertTrue(
+                runSuspend { repo.listClonedPackages(badId) } is DualRepository.ListClonedResult.Unknown,
+            )
         }
         assertTrue(
             "no target command may run for DUAL-labeled non-CLONE ids, got: ${gateway.commands}",
@@ -508,7 +510,9 @@ class DualSafetyTest {
             assertTrue(
                 runSuspend { repo.verifyState("com.example.chat", badId) } is VerifyState.Unknown,
             )
-            assertNull(runSuspend { repo.listClonedPackages(badId) })
+            assertTrue(
+                runSuspend { repo.listClonedPackages(badId) } is DualRepository.ListClonedResult.Unknown,
+            )
         }
         assertTrue(
             "non-Dual ids must never be targeted, got: ${gateway.commands}",
@@ -717,7 +721,7 @@ class DualSafetyTest {
         assertTrue(explicit.err.startsWith("refused:"))
 
         assertTrue(runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown)
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "no install/uninstall/list target command may run, got: ${gateway.commands}",
@@ -1047,7 +1051,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "mixed-type must not target user 95, got: ${gateway.commands}",
@@ -1120,7 +1124,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "CLONE_extra must not target user 95, got: ${gateway.commands}",
@@ -1194,7 +1198,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile!CLONE must not target user 95, got: ${gateway.commands}",
@@ -1267,7 +1271,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE/evil must not target user 95, got: ${gateway.commands}",
@@ -1339,7 +1343,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE!evil must not target user 95, got: ${gateway.commands}",
@@ -1411,7 +1415,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE/profile!evil must not target user 95, got: ${gateway.commands}",
@@ -1544,7 +1548,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE?evil must not target user 95, got: ${gateway.commands}",
@@ -1619,7 +1623,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE/profilegarbage must not target user 95, got: ${gateway.commands}",
@@ -1696,7 +1700,7 @@ class DualSafetyTest {
         assertTrue(
             runSuspend { repo.verifyState("com.example.chat", 95) } is VerifyState.Unknown,
         )
-        assertNull(runSuspend { repo.listClonedPackages(95) })
+        assertTrue(runSuspend { repo.listClonedPackages(95) } is DualRepository.ListClonedResult.Unknown)
 
         assertTrue(
             "profile.CLONE/profile.MANAGED must not target user 95, got: ${gateway.commands}",

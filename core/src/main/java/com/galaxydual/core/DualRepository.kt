@@ -926,15 +926,38 @@ class DualRepository(
         return listOnProfiles(expected.userId, profiles, expected)
     }
 
+    // Outcome of the explicit-id listing (PR-37 P26 Stage 1, GH #1): the
+    // resolve-time pair must travel into the listing so a same-id rebuild
+    // (fresh serial missing/unequal) is refused BEFORE `pm list packages`.
+    // - Ok(packages): authoritative listing (possibly empty) on the pinned id.
+    // - SerialBreach(fresh): same id but continuityBreach(expected, fresh)
+    //   fired (known expected.serial followed by missing/unequal fresh.serial,
+    //   or both-present parent mismatch). No list probe ran. Callers map this
+    //   to VERIFY_MISMATCH + STALE with the live (fresh) target, never FRESH.
+    // - Unknown: channel failure, guard refusal, id drift/vanish, or untrusted
+    //   listing. Callers keep the old display list (fail closed).
+    // Reuses the listing-internal fetchVerifiedTarget only; no new gateway
+    // triple is introduced by this type.
+    sealed interface ListClonedResult {
+        data class Ok(val packages: List<String>) : ListClonedResult
+        data class SerialBreach(val fresh: VerifiedTarget?, val reason: String = "") : ListClonedResult
+        data object Unknown : ListClonedResult
+    }
+
     // Explicit-id variant with the same verified-dual guard (stage 2) as clone(pkg, dualId):
-    // dualId 0 and ids absent from this call's snapshot yield null (unknown)
-    // without probing; an invalid builder token also yields null.
-    // Residual TOCTOU note: explicit-id entries check only fresh
-    // self-consistency (expected = null); auto listClonedPackages() carries expected.
-    suspend fun listClonedPackages(dualId: Int): List<String>? {
+    // dualId 0 and ids absent from this call's snapshot yield Unknown
+    // without probing; an invalid builder token also yields Unknown.
+    // PR-37 P26 Stage 1 (GH #1): carries the resolve-time identity as
+    // `expected` so continuityBreach is enforced inside listOnProfilesResult
+    // (same serial/parent rule as the auto path). A null expected stays
+    // tolerated (legacy single-fetch upgrade path); a non-null expected with
+    // a known serial that the fresh target drops/changes maps to SerialBreach
+    // (no `pm list packages` probe). Parent follows the existing
+    // continuityBreach semantics (both-present-and-unequal only).
+    suspend fun listClonedPackages(dualId: Int, expected: VerifiedTarget? = null): ListClonedResult {
         val snap = profilesSnapshot()
-        if (snap is ProfilesSnapshot.ChannelError) return null
-        return listOnProfiles(dualId, (snap as ProfilesSnapshot.Loaded).profiles, null)
+        if (snap is ProfilesSnapshot.ChannelError) return ListClonedResult.Unknown
+        return listOnProfilesResult(dualId, (snap as ProfilesSnapshot.Loaded).profiles, expected)
     }
 
     // Pinned clone (Phase C3, issue #9; Phase D target pinning): captures the
@@ -1649,12 +1672,35 @@ class DualRepository(
     // loss, no probe). expected==null or expected.serial==null stays
     // tolerated. Parent needs no known-to-unknown rule (see
     // checkExplicitDualId).
-    private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): List<String>? {
-        if (dualId <= 0 || profiles.none { it.userId == dualId }) return null
+    private suspend fun listOnProfiles(dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): List<String>? =
+        when (val r = listOnProfilesResult(dualId, profiles, expected)) {
+            is ListClonedResult.Ok -> r.packages
+            is ListClonedResult.SerialBreach,
+            is ListClonedResult.Unknown -> null
+        }
+
+    // Sealed listing core (PR-37 P26 Stage 1, GH #1): same guards as
+    // listOnProfiles above, but a continuity breach maps to SerialBreach
+    // (carrying the live fresh target + reason) instead of folding into null,
+    // so the caller can tell "same id, new incarnation" apart from "channel
+    // unknown" without a second identity triple. Breach returns BEFORE `pm
+    // list packages` (never probes the new incarnation). Id drift/vanish
+    // (fresh null or different id) and caller id/expected mismatch stay
+    // Unknown (existing null-path re-verification discriminates those).
+    private suspend fun listOnProfilesResult(dualId: Int, profiles: List<DualProfile>, expected: VerifiedTarget? = null): ListClonedResult {
+        if (dualId <= 0 || profiles.none { it.userId == dualId }) return ListClonedResult.Unknown
+        if (expected != null && expected.userId != dualId) return ListClonedResult.Unknown
         val fresh = fetchVerifiedTarget()
-        if (fresh == null || fresh.userId != dualId) return null
-        if (expected != null && continuityBreach(expected, fresh) != null) return null
-        return listProbe(dualId)
+        if (fresh == null || fresh.userId != dualId) return ListClonedResult.Unknown
+        if (expected != null) {
+            continuityBreach(expected, fresh)?.let { breach ->
+                return ListClonedResult.SerialBreach(fresh, breach)
+            }
+        }
+        return when (val probed = listProbe(dualId)) {
+            null -> ListClonedResult.Unknown
+            else -> ListClonedResult.Ok(probed)
+        }
     }
 
     // List-only probe for an already-verified id (auto listing path): no

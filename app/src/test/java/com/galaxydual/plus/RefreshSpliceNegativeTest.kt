@@ -39,8 +39,10 @@ import org.junit.Test
 class RefreshSpliceNegativeTest {
     // One identity observation: id < 0 means owner-only on all three
     // channels (clean no-claim property); otherwise all three channels
-    // consistently claim [id] with [serial] on both verbose channels.
-    private data class IdentSpec(val id: Int, val serial: Int)
+    // consistently claim [id] with [serial] on both verbose channels (null
+    // serial omits both serial lines, simulating a SerialUnavailable
+    // re-verification that still confirms the id).
+    private data class IdentSpec(val id: Int, val serial: Int?)
 
     // Call-order scripted gateway (per-stage consistent identity).
     private class SpliceGateway(
@@ -49,6 +51,9 @@ class RefreshSpliceNegativeTest {
         val pkgsByUser: MutableMap<Int, MutableSet<String>> = mutableMapOf(),
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
+        var listPackagesCalls: Int = 0
+        var installCalls: Int = 0
+        var uninstallCalls: Int = 0
 
         private fun nextSnap(): Int = if (snaps.size > 1) snaps.removeFirst() else snaps.first()
         private fun nextIdent(): IdentSpec =
@@ -64,7 +69,7 @@ class RefreshSpliceNegativeTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 (if (spec.id < 0) "" else "  UserInfo{${spec.id}:DualApp:400} running:\n" +
-                    "    Serial: ${spec.serial}\n" +
+                    (if (spec.serial != null) "    Serial: ${spec.serial}\n" else "") +
                     "    parentId=0\n" +
                     "    User type: android.os.usertype.profile.CLONE\n")
 
@@ -72,7 +77,8 @@ class RefreshSpliceNegativeTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                (if (spec.id < 0) "" else "  UserInfo{${spec.id}:DualApp:400} serialNo=${spec.serial}:\n" +
+                (if (spec.id < 0) "" else "  UserInfo{${spec.id}:DualApp:400}" +
+                    (if (spec.serial != null) " serialNo=${spec.serial}" else "") + ":\n" +
                     "    parentId=0\n" +
                     "    userType=android.os.usertype.profile.CLONE\n")
 
@@ -95,8 +101,17 @@ class RefreshSpliceNegativeTest {
             }
             cmd.startsWith("pm list packages") -> {
                 val uid = userOfListCmd(cmd)
+                listPackagesCalls++
                 val pkgs = pkgsByUser[uid] ?: emptySet()
                 CmdResult(exit = 0, out = pkgs.map { "package:$it" }.joinToString("\n"), err = "")
+            }
+            cmd.startsWith("pm install-existing") -> {
+                installCalls++
+                CmdResult(exit = 0, out = "ok", err = "")
+            }
+            cmd.startsWith("pm uninstall") -> {
+                uninstallCalls++
+                CmdResult(exit = 0, out = "ok", err = "")
             }
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
@@ -269,11 +284,12 @@ class RefreshSpliceNegativeTest {
         )
     }
 
-    // Same id rebuilt with a fresh serial (95, 15 -> 95, 41): the published
-    // pair must come from one evidence set only -- (95, 15) from the refresh
-    // triple -- never the cross-triple splice (95, 41).
+    // Same id rebuilt with a fresh serial (95, 15 -> 95, 41): Stage 1
+    // serial-breach must never publish FRESH(95, 15) nor probe the new
+    // incarnation. Fail closed: VERIFY_MISMATCH + STALE with the live
+    // (95, 41) target, old cloned kept, old selection cleared, zero writes.
     @Test
-    fun splice_sameIdSerialRebuild_keepsSingleEvidencePair() {
+    fun splice_sameIdSerialRebuild_neverFreshStalePair() {
         val gw = SpliceGateway(
             snaps = snapsOf(95),
             idents = stable95(15),
@@ -282,12 +298,19 @@ class RefreshSpliceNegativeTest {
         val vm = makeVm(gw)
         awaitVm(vm) { vm.state.value.channelReady }
         reachFresh95(gw, vm, serial = 15)
+        // Bind a selection to (95, 15) so the breach must clear it (never
+        // silently carry old勾選 to the new incarnation).
+        vm.setSourceCatalog(
+            listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+        )
+        vm.toggleSelection("0:com.example.chat")
+        assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
 
         // Phase 2: refresh triple still pins (95, 15); the listing-time
-        // re-verification already sees the rebuilt (95, 41). The explicit-id
-        // listing tolerates the serial (expected == null) and probes 95, so
-        // the refresh lands FRESH -- but the pair stays the single-evidence
-        // (95, 15), never the spliced (95, 41).
+        // re-verification already sees the rebuilt (95, 41). The explicit
+        // listing carries the resolve-time pair and returns SerialBreach
+        // BEFORE any `pm list packages` probe (new incarnation never listed).
+        val listProbesBefore = gw.listPackagesCalls
         gw.snaps.clear()
         gw.snaps.addAll(snapsOf(95, 95))
         gw.idents.clear()
@@ -298,15 +321,128 @@ class RefreshSpliceNegativeTest {
             ),
         )
         vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.inventory.freshness != InventoryFreshness.FRESH }
+
+        val s = vm.state.value
+        assertFalse(
+            "same-id rebuild must never be FRESH, got: $s",
+            s.inventory.freshness == InventoryFreshness.FRESH,
+        )
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(
+            "live target must move to the rebuilt serial 41, got: $s",
+            41, s.inventory.targetSerial,
+        )
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, s.diagnose?.code)
+        // Selection clearing overwrites the VERIFY msg with the INVALID
+        // target-changed note (same as the id-drift branch via
+        // handleSelectionTargetChangeLocked); the VERIFY_MISMATCH diagnose is
+        // preserved.
+        assertEquals(MsgKind.INVALID, s.msgKind)
+        assertTrue(
+            "selection change must be explicit, got: ${s.msg}",
+            s.msg.contains("已清空舊勾選"),
+        )
+        assertTrue(
+            "detail must name the serial drift, got: ${s.diagnose?.techDetail}",
+            (s.diagnose?.techDetail ?: "").contains("serial") &&
+                (s.diagnose?.techDetail ?: "").contains("15") &&
+                (s.diagnose?.techDetail ?: "").contains("41"),
+        )
+        assertTrue(
+            "breach must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertTrue(
+            "old selection must be cleared, never carried to the new incarnation, got: ${s.selectedKeys}",
+            s.selectedKeys.isEmpty(),
+        )
+        assertEquals(
+            "breach must not probe the new incarnation list, got: ${gw.listPackagesCalls}",
+            listProbesBefore, gw.listPackagesCalls,
+        )
+        assertEquals("zero installs on breach, got: ${gw.installCalls}", 0, gw.installCalls)
+        assertEquals("zero uninstalls on breach, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
+    }
+
+    // Happy path guard (Stage 1 must not kill it): same id + same serial
+    // still publishes FRESH with the pinned pair.
+    @Test
+    fun splice_sameIdSameSerial_stillFresh() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(15),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Phase 2: refresh triple pins (95, 15) and the listing-time
+        // re-verification still sees (95, 15): authoritative FRESH(95, 15).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95, 95))
+        gw.idents.clear()
+        gw.idents.addAll(
+            ArrayDeque(
+                List(3) { IdentSpec(95, 15) } +
+                    List(3) { IdentSpec(95, 15) },
+            ),
+        )
+        vm.refresh()
         awaitVm(vm) { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
 
         val s = vm.state.value
+        assertEquals(InventoryFreshness.FRESH, s.inventory.freshness)
         assertEquals(95, s.inventory.targetId)
-        assertEquals(
-            "pair must come from one triple, never the cross-triple splice (95,41), got: $s",
-            15,
-            s.inventory.targetSerial,
+        assertEquals(15, s.inventory.targetSerial)
+        assertTrue("stable target must stay listed, got: ${s.cloned}", s.cloned.contains("com.example.chat"))
+    }
+
+    // Listing-time re-verification without a serial (SerialUnavailable shape:
+    // id confirmed, both serial lines missing) fails closed: never FRESH,
+    // old cloned kept, zero writes.
+    @Test
+    fun splice_listingReverifyNoSerial_failClosed() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(15),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
         )
-        assertTrue("rebuilt target list must stay readable, got: ${s.cloned}", s.cloned.contains("com.example.chat"))
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Phase 2: refresh triple pins (95, 15); the listing-time
+        // re-verification confirms the id but carries no serial on either
+        // channel. Known -> unknown serial is continuity lost: SerialBreach,
+        // never FRESH.
+        val listProbesBefore = gw.listPackagesCalls
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95, 95))
+        gw.idents.clear()
+        gw.idents.addAll(
+            ArrayDeque(
+                List(3) { IdentSpec(95, 15) } +
+                    List(3) { IdentSpec(95, null) },
+            ),
+        )
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.inventory.freshness != InventoryFreshness.FRESH }
+
+        val s = vm.state.value
+        assertFalse("serial-unavailable reverify must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, s.diagnose?.code)
+        assertTrue(
+            "reverify without serial must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(
+            "continuity-lost must not probe the list, got: ${gw.listPackagesCalls}",
+            listProbesBefore, gw.listPackagesCalls,
+        )
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
     }
 }

@@ -813,8 +813,8 @@ class CloneVerifyRefreshTest {
     fun listClonedPackages_invalidId_isNull() {
         val gateway = FakeGateway()
         val repo = DualRepository(gateway)
-        assertNull(runSuspend { repo.listClonedPackages(0) })
-        assertNull(runSuspend { repo.listClonedPackages(999) })
+        assertTrue(runSuspend { repo.listClonedPackages(0) } is DualRepository.ListClonedResult.Unknown)
+        assertTrue(runSuspend { repo.listClonedPackages(999) } is DualRepository.ListClonedResult.Unknown)
         assertTrue(
             "no probe may run for refused ids, got: ${gateway.commands}",
             gateway.commands.none { it.startsWith("pm list packages") },
