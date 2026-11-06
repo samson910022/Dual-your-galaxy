@@ -266,6 +266,15 @@ jobs:
             **/build/test-results/
           if-no-files-found: warn
           retention-days: 14
+      # Phase P29 (issue #29): instrumentation harness compiles on every PR,
+      # but never executes here -- hosted runners have no device/emulator.
+      # :app:assembleDebugAndroidTest only compiles androidTest (plus its
+      # runner/espresso/test deps); connectedCheck stays manual
+      # (see the instrumentation-manual job below, workflow_dispatch only).
+      - name: Compile androidTest (no device needed)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebugAndroidTest --no-daemon
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
@@ -283,5 +292,46 @@ jobs:
           path: |
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Phase P29 (issue #29): instrumentation runs only on manual dispatch with
+  # an emulator -- PR CI has no device, so it only compiles androidTest (see
+  # the "Compile androidTest" step above). Current manual job runs a single
+  # profile (API 34, matches compileSdk/targetSdk); API 29 (minSdk floor)
+  # stays a follow-up. Record each manual run in docs/ACCEPTANCE.md (commit /
+  # APK SHA256 / operation / expected / actual / untested / redaction statement).
+  instrumentation-manual:
+    name: Instrumentation (manual emulator matrix)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+      - name: Run instrumentation on emulator (API 34)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          script: ./gradlew :app:connectedDebugAndroidTest --no-daemon
+      - name: Upload instrumentation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-reports
+          path: |
+            **/build/reports/androidTests/
+            **/build/outputs/androidTest-results/
           if-no-files-found: warn
           retention-days: 14
