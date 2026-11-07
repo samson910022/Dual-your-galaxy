@@ -54,6 +54,7 @@ import android.os.UserManager
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -261,6 +262,20 @@ class MainActivity : ComponentActivity() {
     private var catalogLoadError: String? = null
     // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 取消前一個在途任務。
     private var catalogJob: Job? = null
+    // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
+    // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
+    private var lastClonedListKey: String? = null
+    // Phase B B2：分身列表世代 token。renderClonedApps 進入 ++，coroutine
+    // capture gen，完成時比對過期丟棄（避免重建後舊圖貼到新行）。
+    private var clonedGen = 0
+    // Phase B B4：pkg→label 內存快取（catalog 變化失效，避免每次全量 PM IPC）。
+    private val labelCache = LinkedHashMap<String, String>()
+    private var labelCacheCatalogKey: Int? = null
+    // Phase B B4：Shizuku binder 存活 volatile 快取。listener/onResume/授權回調
+    // 經 refreshShizukuPresenceCache 維護，render 經 cachedShizukuPresence 讀快取，
+    // 不再每次 render 都 pingBinder。
+    @Volatile private var cachedShizukuNoBinder: Boolean? = null
+    @Volatile private var cachedShizukuAuthorized: Boolean = false
 
     // Binder attach (sticky: fires immediately when already connected).
     // The channel may be usable now: re-probe privilege, then reload lists.
@@ -315,6 +330,7 @@ class MainActivity : ComponentActivity() {
                 vm.state.collect { s -> render(s) }
             }
         }
+        refreshShizukuPresenceCache()
         updateShizukuLine()
         // 冷啟動單一入口：初查由 onResume.onForeground() (probe+按需 refresh)
         // 覆蓋，此處不再直調 vm.refresh()，避免與 init probe/onForeground/
@@ -335,6 +351,7 @@ class MainActivity : ComponentActivity() {
         // P2-1 (base)：auto 路徑預設 allowPrivilegedHookDiagnosis=false，
         // 不執行特權 cat，與直接調 recheckPrivilege(false) 同契約。
         vm.onForeground()
+        refreshShizukuPresenceCache()
         updateShizukuLine()
         // PR-7 P2 (#26):前景重載來源 catalog (安裝/卸載後保持新鮮)。
         reloadCatalog()
@@ -433,6 +450,7 @@ class MainActivity : ComponentActivity() {
         // taps -- privileged `cat` stays off (false) even on the reread path.
         // Only the dedicated 手動診斷 Hook button consents to privileged reads.
         if (reread) vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false) else vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+        refreshShizukuPresenceCache()
         updateShizukuLine()
     }
 
@@ -1799,32 +1817,61 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showSettingsDialog() {
+        // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛，
+        // 避免後台/銷毀時 show() 拋 WindowManager.BadTokenException。
+        if (isFinishing || isDestroyed) return
         try {
             settingsDialog?.dismiss()
         } catch (_: Exception) {
             // Best effort
         }
-        settingsDialog = AlertDialog.Builder(this)
-            .setTitle(getString(R.string.tab_settings))
-            .setMessage(
-                "${getString(R.string.hero_title_engine)}\n" +
-                    "Version 0.0.1 (Zygote Hook & Shizuku Gateway)\n\n" +
-                    "• ${getString(R.string.status_hook_daemon_running)}\n" +
-                    "• ${getString(R.string.hook_mode_subtitle)}\n\n" +
-                    "MIT License - Dual your Galaxy contributors."
-            )
-            .setPositiveButton(getString(R.string.dialog_close), null)
-            .setNeutralButton(getString(R.string.action_request_shizuku)) { _, _ ->
-                requestShizukuPermission()
-            }
-            .setNegativeButton(getString(R.string.action_export_diagnosis)) { _, _ ->
-                showDiagnosticExport()
-            }
-            .show()
+        try {
+            settingsDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.tab_settings))
+                .setMessage(
+                    "${getString(R.string.hero_title_engine)}\n" +
+                        "Version 0.0.1 (Zygote Hook & Shizuku Gateway)\n\n" +
+                        "• ${getString(R.string.status_hook_daemon_running)}\n" +
+                        "• ${getString(R.string.hook_mode_subtitle)}\n\n" +
+                        "MIT License - Dual your Galaxy contributors."
+                )
+                .setPositiveButton(getString(R.string.dialog_close), null)
+                .setNeutralButton(getString(R.string.action_request_shizuku)) { _, _ ->
+                    requestShizukuPermission()
+                }
+                .setNegativeButton(getString(R.string.action_export_diagnosis)) { _, _ ->
+                    showDiagnosticExport()
+                }
+                .show()
+        } catch (e: Exception) {
+            Log.w(TAG, "showSettingsDialog failed", e)
+            settingsDialog = null
+        }
     }
 
-    private fun renderClonedApps(s: UiState) {
+    // Phase B B1/B2/B4：分身列表渲染。
+    // B1：Switch 為 momentary action（彈回 checked，防視覺翻轉）＋門控
+    // isEnabled = !loading && blockKey == null（呼叫端傳 render 已算好的 blockKey，
+    // 與 clone/remove/batch 同源）＋48dp 觸控目標＋移除語意 contentDescription。
+    // B2：ImageView 先設 tag=appKey；coroutine capture clonedGen，過期丟棄。
+    // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
+    private fun renderClonedApps(s: UiState, blockKey: BlockReason?) {
         if (!::clonedAppsContainer.isInitialized) return
+        val key = buildClonedListKey(s)
+        if (key == lastClonedListKey) {
+            val writable = blockKey == null
+            for (i in 0 until clonedAppsContainer.childCount) {
+                val row = clonedAppsContainer.getChildAt(i) as? LinearLayout ?: continue
+                for (j in 0 until row.childCount) {
+                    val child = row.getChildAt(j)
+                    if (child is Switch) child.isEnabled = !s.loading && writable
+                }
+            }
+            return
+        }
+        // 全量重建才推進世代：在途舊圖完成時比對過期丟棄綁定（快取保留）。
+        val gen = ++clonedGen
+        lastClonedListKey = key
         clonedAppsContainer.removeAllViews()
         if (s.cloned.isEmpty()) {
             val emptyView = TextView(this).apply {
@@ -1837,6 +1884,7 @@ class MainActivity : ComponentActivity() {
             clonedAppsContainer.addView(emptyView)
             return
         }
+        val writable = blockKey == null
         for (pkg in s.cloned) {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1862,7 +1910,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
             val appKey = "${s.inventory.targetSerial ?: 0}:$pkg"
-            requestIcon(pkg, appKey, appIconView)
+            appIconView.tag = appKey
+            requestIcon(pkg, appKey, appIconView, gen)
             val badgeView = TextView(this).apply {
                 layoutParams = FrameLayout.LayoutParams(dp(18), dp(18)).apply {
                     gravity = Gravity.BOTTOM or Gravity.END
@@ -1925,12 +1974,21 @@ class MainActivity : ComponentActivity() {
             textContainer.addView(subtitleView)
             row.addView(textContainer)
 
-            // Switch toggle: checked, toggling off initiates safe two-phase removal
+            // Switch toggle: momentary removal action, always visually checked.
+            // Toggling initiates safe two-phase removal (dialog), never a direct
+            // on/off state flip; disabled while busy or channel unwritable.
             val toggleSwitch = Switch(this).apply {
                 isChecked = true
-                isEnabled = !s.loading
+                isEnabled = !s.loading && writable
+                minimumHeight = dp(48)
+                minimumWidth = dp(48)
                 contentDescription = "${getString(R.string.action_remove)}: $label"
-                setOnClickListener {
+                setOnClickListener { v ->
+                    try {
+                        (v as? Switch)?.isChecked = true
+                    } catch (_: Exception) {
+                        // Best effort: 彈回失敗不阻塞移除請求。
+                    }
                     vm.requestRemove(pkg)
                 }
             }
@@ -1938,6 +1996,10 @@ class MainActivity : ComponentActivity() {
             clonedAppsContainer.addView(row)
         }
     }
+
+    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋loading）。
+    private fun buildClonedListKey(s: UiState): String =
+        "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.loading}"
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
     // (buildDiagnosticExport 經四道遮蔽：先郵件後包名後 IP，最後路徑，大小受限)；只有使用者
@@ -1949,6 +2011,9 @@ class MainActivity : ComponentActivity() {
     // 使用者主動觸發才經 ClipboardManager 複製已遮蔽文本到本機剪貼簿；複製內容
     // 與預覽同字串 (diagnosticExportCopyText)，不做自動傳輸/share。
     private fun showDiagnosticExport() {
+        // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛＋
+        // try/catch 包 show()，避免後台/銷毀時 BadTokenException。
+        if (isFinishing || isDestroyed) return
         val state = lastState ?: vm.state.value
         val preview = buildDiagnosticExport(state)
         try {
@@ -1956,28 +2021,33 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: 舊預覽關不掉也不阻塞新預覽。
         }
-        exportDialog = AlertDialog.Builder(this)
-            .setTitle(getString(R.string.diagnostic_export_title))
-            .setMessage(preview)
-            .setCancelable(true)
-            .setNeutralButton(getString(R.string.diagnostic_copy_button)) { _, _ ->
-                try {
-                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(
-                        ClipData.newPlainText(
-                            "galaxy-dual-diagnostic",
-                            diagnosticExportCopyText(state),
-                        ),
-                    )
-                    msgView.text = getString(R.string.diagnostic_copy_success)
-                    msgView.setTextColor(msgColorFor(MsgKind.INFO))
-                } catch (e: Exception) {
-                    msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
-                    msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+        try {
+            exportDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.diagnostic_export_title))
+                .setMessage(preview)
+                .setCancelable(true)
+                .setNeutralButton(getString(R.string.diagnostic_copy_button)) { _, _ ->
+                    try {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(
+                            ClipData.newPlainText(
+                                "galaxy-dual-diagnostic",
+                                diagnosticExportCopyText(state),
+                            ),
+                        )
+                        msgView.text = getString(R.string.diagnostic_copy_success)
+                        msgView.setTextColor(msgColorFor(MsgKind.INFO))
+                    } catch (e: Exception) {
+                        msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
+                        msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+                    }
                 }
-            }
-            .setPositiveButton(getString(R.string.dialog_close), null)
-            .show()
+                .setPositiveButton(getString(R.string.dialog_close), null)
+                .show()
+        } catch (e: Exception) {
+            Log.w(TAG, "showDiagnosticExport failed", e)
+            exportDialog = null
+        }
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
@@ -2032,22 +2102,25 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
         }
+        refreshShizukuPresenceCache()
         updateShizukuLine()
     }
 
-    // Shizuku binder/authorization line, read live (never cached): pingBinder
-    // guards checkSelfPermission so a dead binder shows 未連線, not a crash.
+    // Shizuku binder/authorization line, read from volatile cache (Phase B B4):
+    // pingBinder guards checkSelfPermission so a dead binder shows 未連線, not a crash.
     // P25: the permission button text follows the same boolean binder/
     // permission state (never parsed from the rendered line): 未連線/已授權 ->
     // "檢查 Shizuku 並更新" (reconnectAndRefresh, 與重新連線並更新按鈕的
     // 「重新連線並更新」區分 TalkBack/視覺）; 未授權 -> "請求 Shizuku 授權"
     // (requestPermission).
+    // Phase B B4: render() 不再每次 pingBinder；binder 存活經 listener/onResume/
+    // 授權回調 refreshShizukuPresenceCache 維護，render 只讀快取。
     private fun updateShizukuLine() {
-        // Boolean binder/permission state first (single live read): the
+        // Boolean binder/permission state first (single cached read): the
         // button branch below keys on these, never on state.contains().
-        // Phase A A4：同一組 booleans 經 readShizukuPresence 單次讀取，同時驅動
+        // Phase A A4：同一組 booleans 經 cachedShizukuPresence 單次讀取，同時驅動
         // 備援卡片標題/徽章（resolveShizukuCardStatus 純函數），卡片永不另行判讀。
-        val (noBinder, authorized) = readShizukuPresence()
+        val (noBinder, authorized) = cachedShizukuPresence()
         val state: String = try {
             if (noBinder) {
                 getString(R.string.shizuku_state_no_binder)
@@ -2110,6 +2183,27 @@ class MainActivity : ComponentActivity() {
         return noBinder to authorized
     }
 
+    // Phase B B4：binder 快取寫入點（listener/onResume/授權回調/按鈕）。
+    // render 只讀 cachedShizukuPresence，不直接 pingBinder。
+    private fun refreshShizukuPresenceCache() {
+        try {
+            val (noBinder, authorized) = readShizukuPresence()
+            cachedShizukuNoBinder = noBinder
+            cachedShizukuAuthorized = authorized
+        } catch (_: Exception) {
+            // Best effort: 快取失敗時讀路徑回退 live read。
+        }
+    }
+
+    private fun cachedShizukuPresence(): Pair<Boolean, Boolean> {
+        val cached = cachedShizukuNoBinder
+        return if (cached != null) {
+            cached to cachedShizukuAuthorized
+        } else {
+            readShizukuPresence()
+        }
+    }
+
     // Renders one UiState: privilege indicator, Shizuku line (live), channel
     // picker state + hook signal, both lists, button enabled state, and the
     // MsgKind-styled status line. P25: shows the resolved gateway (actual
@@ -2121,9 +2215,11 @@ class MainActivity : ComponentActivity() {
     // 以及匯出按鈕 (已遮蔽預覽，無自動上傳)。
     private fun render(s: UiState) {
         // P25: keep the Shizuku binder line in sync on every state render
-        // (cheap live read inside updateShizukuLine, already try/catch
-        // guarded for the pre-buildUi test path). Double-guarded here so a
-        // Shizuku-less test harness calling render can never crash on it.
+        // (cheap cached read inside updateShizukuLine, already try/catch
+        // guarded for the pre-buildUi test path; live binder reads only happen
+        // in refreshShizukuPresenceCache on binder/onResume/permission paths).
+        // Double-guarded here so a Shizuku-less test harness calling render
+        // can never crash on it.
         // PR-6 P2: 同時記住最近一次渲染狀態 (診斷展開/匯出共用)。
         lastState = s
         try {
@@ -2131,6 +2227,12 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: the state render must never depend on Shizuku.
         }
+        // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
+        // renderClonedApps 的 Switch 與稍後按鈕/dialog 共用此 blockKey，不重算。
+        val busy = s.loading
+        // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
+        // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
+        val blockKey = if (busy) null else writeBlockReason(s)
         val readyMark = s.readyMark()
         // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
         // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
@@ -2228,8 +2330,9 @@ class MainActivity : ComponentActivity() {
         diagView.contentDescription = renderDiagnoseDescription(s, diagExpanded)
 
         // One UI 6 Modern Views dynamic update
+        // Phase B B4：分身列表移出此 try（獨立指紋＋獨立 try/catch，下見），
+        // 此段只留計數/狀態徽章；空吞改為 Log.w（測試環境外須可見）。
         try {
-            renderClonedApps(s)
             if (::clonedCountStatView.isInitialized) {
                 clonedCountStatView.text = getString(R.string.stats_injected_format, s.cloned.size, getString(R.string.stats_unit_apps))
             }
@@ -2363,8 +2466,15 @@ class MainActivity : ComponentActivity() {
             for (badge in checklistItemBadges) {
                 badge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
             }
-        } catch (_: Exception) {
-            // Best effort in test environments
+        } catch (e: Exception) {
+            Log.w(TAG, "render OneUI badges failed", e)
+        }
+        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋Switch 寫入門控 blockKey）。
+        // 移出上段 try：列表失敗不吞徽章更新，徽章失敗不吞列表。
+        try {
+            renderClonedApps(s, blockKey)
+        } catch (e: Exception) {
+            Log.w(TAG, "renderClonedApps failed", e)
         }
         // Writes queue in the ViewModel anyway; disabling while busy keeps
         // the read-only placeholder visibly read-only. Channel switches go
@@ -2381,15 +2491,12 @@ class MainActivity : ComponentActivity() {
         // 此處只做 UI 層即時門控）；batch 另須目前 verified target 可用
         // （inventory.targetId 有效，與 cloneSelected 起始 pin fail-closed
         // 一致；VM 側 fetchDualTarget 守衛保留為縱深）。
-        val busy = s.loading
+        // （busy/blockKey 已於 render 入口計算，此處重用，不重算。）
         // p28-1 互斥單選同步：checked 即選擇狀態（視覺 + TalkBack）。
         autoBtn.isChecked = (s.channel == ChannelPreference.AUTO)
         rootBtn.isChecked = (s.channel == ChannelPreference.ROOT)
         shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
         lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
-        // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
-        // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
-        val blockKey = if (busy) null else writeBlockReason(s)
         val blockReason = blockKey?.let { resolveBlockReason(it) }
         val blockDedupKey = writeBlockDedupKey(blockKey)
         // P2-2 輕量讀取：buildUi 前 render（測試路徑）視為不可用（fail-closed）。
@@ -2515,7 +2622,8 @@ class MainActivity : ComponentActivity() {
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
-        syncRemoveDialog(s.pendingRemove, s.loading)
+        // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
+        syncRemoveDialog(s.pendingRemove, s.loading, blockKey)
     }
 
     // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
@@ -2621,7 +2729,9 @@ class MainActivity : ComponentActivity() {
     // 在途 loading 時對話框保留但按鈕禁用，靠 VM dedup + 按鈕禁用雙保險：
     // 同一 pending 只更新按鈕 enabled（不重建）；confirm 點下後下一幀
     // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
-    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean) {
+    // Phase B B1：confirm 另須通道可寫（blockKey == null，與 Switch/按鈕同源；
+    // busy 時 blockKey 為 null 但 loading 仍禁用，不可繞過）。
+    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?) {
         if (isFinishing || isDestroyed) return
         if (pending == null) {
             removeLabelsDialog?.dismiss()
@@ -2639,7 +2749,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
             // 在途不可取消，關閉 cancel 窗的使用者路徑；程式化 cancel 由 repo isStillValid 兜底。
@@ -2714,10 +2824,23 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             removeAcknowledged = checked
             acknowledgedGeneration = if (checked) pending.generation else null
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(vm.state.value.loading, checked)
+            val curWritable = try {
+                val c = vm.state.value
+                !c.loading && writeBlockReason(c) == null
+            } catch (_: Exception) {
+                blockKey == null
+            }
+            val curLoading = try { vm.state.value.loading } catch (_: Exception) { loading }
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(curLoading, checked, curWritable)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            if (canConfirmRemove(vm.state.value.loading, removeAcknowledged)) vm.confirmRemove(pending)
+            val (curLoading, curWritable) = try {
+                val c = vm.state.value
+                c.loading to (!c.loading && writeBlockReason(c) == null)
+            } catch (_: Exception) {
+                loading to (blockKey == null)
+            }
+            if (canConfirmRemove(curLoading, removeAcknowledged, curWritable)) vm.confirmRemove(pending)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove(pending) }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
@@ -2727,7 +2850,7 @@ class MainActivity : ComponentActivity() {
                 .setPositiveButton(android.R.string.ok, null)
                 .show()
         }
-        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
         // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
@@ -2739,8 +2862,20 @@ class MainActivity : ComponentActivity() {
     // installed for the owner, else the raw package token. Never throws: a
     // missing/unreadable package falls back to the token so the dialog always
     // names the exact uninstall target.
-    private fun resolveAppLabel(pkg: String): String =
+    // Phase B B4：pkg→label 內存快取（有界 200，與圖示快取同級）。
+    // catalog 引用變化即失效（重裝/卸載後標籤可能改變）；失敗不快取（包可能稍後出現）。
+    private fun resolveAppLabel(pkg: String): String {
         try {
+            val catalogKey = try { vm.state.value.sourceCatalog.hashCode() } catch (_: Exception) { 0 }
+            if (labelCacheCatalogKey != catalogKey) {
+                labelCache.clear()
+                labelCacheCatalogKey = catalogKey
+            }
+            labelCache[pkg]?.let { return it }
+        } catch (_: Exception) {
+            // Best effort: 快取失敗仍走 PM 查詢。
+        }
+        val label = try {
             val info = if (Build.VERSION.SDK_INT >= 33) {
                 packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
             } else {
@@ -2751,6 +2886,18 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             pkg
         }
+        if (label != pkg) {
+            try {
+                if (labelCache.size >= MAX_LABEL_CACHE) {
+                    labelCache.keys.firstOrNull()?.let { labelCache.remove(it) }
+                }
+                labelCache[pkg] = label
+            } catch (_: Exception) {
+                // Best effort: 快取寫入失敗不影響顯示。
+            }
+        }
+        return label
+    }
 
     // PR-7 P2 (#26):來源 catalog 載入 (授權範圍唯讀)。
     // 包到 MainActivity 的生命週期:IO 執行緒讀 PackageManager,回主執行緒注入
@@ -2988,25 +3135,32 @@ class MainActivity : ComponentActivity() {
                     if (box.tag == appKey && box.parent === sourceContainer) {
                         try {
                             box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-                            return@launch
                         } catch (_: Exception) {
                             // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
                         }
-                    }
-                    for (i in 0 until sourceContainer.childCount) {
-                        val child = sourceContainer.getChildAt(i)
-                        if (child is CheckBox && child.tag == appKey) {
-                            val perView = try {
-                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
-                            } catch (_: Exception) {
-                                fresh
+                    } else {
+                        for (i in 0 until sourceContainer.childCount) {
+                            val child = sourceContainer.getChildAt(i)
+                            if (child is CheckBox && child.tag == appKey) {
+                                val perView = try {
+                                    drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                                } catch (_: Exception) {
+                                    fresh
+                                }
+                                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                                break
                             }
-                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
-                            break
                         }
                     }
                 } catch (_: Exception) {
                     // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+                }
+                // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
+                // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
+                try {
+                    rebindClonedIcon(appKey, drawable)
+                } catch (_: Exception) {
+                    // Best effort.
                 }
             } finally {
                 iconInflight.remove(appKey)
@@ -3014,7 +3168,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestIcon(pkg: String, appKey: String, imageView: ImageView) {
+    // Phase B B2：分身 ImageView 版。呼叫端先設 tag=appKey（此處再設一次兜底）；
+    // 完成時照抄 CheckBox 版：tag＋容器歸屬雙比對，否則在容器內按 tag 找 ImageView
+    // 重綁，找不到丟棄。gen 為 renderClonedApps 世代，過期丟棄綁定（快取保留，
+    // 下次渲染同步路徑可直接命中）。
+    private fun requestIcon(pkg: String, appKey: String, imageView: ImageView, gen: Int) {
+        try {
+            imageView.tag = appKey
+        } catch (_: Exception) {
+            // Best effort.
+        }
         val cached = iconDrawables[appKey]
         if (cached != null) {
             val fresh = try {
@@ -3022,12 +3185,17 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 cached
             }
-            imageView.setImageDrawable(fresh)
+            try {
+                imageView.setImageDrawable(fresh)
+            } catch (_: Exception) {
+                // Best effort.
+            }
             return
         }
         if (iconMemo.isLoaded(appKey)) return
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
+        val capturedGen = gen
         lifecycleScope.launch {
             try {
                 val drawable = withContext(Dispatchers.IO) {
@@ -3042,16 +3210,98 @@ class MainActivity : ComponentActivity() {
                 if (victim != null) evictIcon(victim)
                 iconMemo.markLoaded(appKey)
                 iconDrawables[appKey] = drawable
+                if (capturedGen != clonedGen) return@launch
                 val fresh = try {
                     drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
                 } catch (_: Exception) {
                     drawable
                 }
-                imageView.setImageDrawable(fresh)
+                try {
+                    if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
+                        try {
+                            imageView.setImageDrawable(fresh)
+                        } catch (_: Exception) {
+                            // Best effort: 舊行 detach 後走容器查找。
+                            rebindClonedIcon(appKey, drawable)
+                        }
+                    } else {
+                        rebindClonedIcon(appKey, drawable)
+                    }
+                } catch (_: Exception) {
+                    // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+                }
+                // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
+                try {
+                    rebindSourceIcon(appKey, drawable)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
             } finally {
                 iconInflight.remove(appKey)
             }
         }
+    }
+
+    // Phase B B2：在分身容器內按 tag 找 ImageView 重綁（找不到丟棄）。
+    // 行結構：row(LinearLayout)→iconContainer(FrameLayout)→ImageView＋badge；
+    // 用遞迴兜底未來結構變化。
+    private fun rebindClonedIcon(appKey: String, drawable: Drawable) {
+        if (!::clonedAppsContainer.isInitialized) return
+        val target = findImageViewWithTag(clonedAppsContainer, appKey) ?: return
+        val perView = try {
+            drawable.constantState?.newDrawable()?.mutate()
+                ?: drawable.mutate()
+        } catch (_: Exception) {
+            drawable
+        }
+        target.setImageDrawable(perView)
+    }
+
+    // Phase B B2：在來源容器內按 tag 找 CheckBox 重綁（找不到丟棄）。
+    private fun rebindSourceIcon(appKey: String, drawable: Drawable) {
+        if (!::sourceContainer.isInitialized) return
+        for (i in 0 until sourceContainer.childCount) {
+            val child = sourceContainer.getChildAt(i)
+            if (child is CheckBox && child.tag == appKey) {
+                val perView = try {
+                    drawable.constantState?.newDrawable()?.mutate()
+                        ?: drawable.mutate()
+                } catch (_: Exception) {
+                    drawable
+                }
+                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                break
+            }
+        }
+    }
+
+    private fun findImageViewWithTag(root: View, appKey: String): ImageView? {
+        try {
+            if (root is ImageView && root.tag == appKey) return root
+            if (root is ViewGroup) {
+                for (i in 0 until root.childCount) {
+                    val found = findImageViewWithTag(root.getChildAt(i), appKey)
+                    if (found != null) return found
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return null
+    }
+
+    private fun isUnderClonedContainer(view: View): Boolean {
+        try {
+            if (!::clonedAppsContainer.isInitialized) return false
+            var p = view.parent
+            while (p != null) {
+                if (p === clonedAppsContainer) return true
+                p = (p as? View)?.parent
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return false
     }
 
     // PR-37 Phase C #5 淘汰同步點：同時清除 drawables 與 memo 兩處。
@@ -3074,6 +3324,7 @@ class MainActivity : ComponentActivity() {
         const val TAB_DUAL_APPS = 0
         const val TAB_CORE_ENGINE = 1
         private const val KEY_CURRENT_TAB = "main.current_tab"
+        private const val TAG = "MainActivity"
 
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
@@ -3095,6 +3346,9 @@ class MainActivity : ComponentActivity() {
 
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
+
+        // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
+        private const val MAX_LABEL_CACHE = 200
 
         // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
         // (orderedKeys.size >= maxSize) 時回傳最舊 key（插入順序第一個），
@@ -3456,6 +3710,11 @@ internal fun formatBatchReportText(report: BatchReport?): String {
 // Escape backslashes too, so an actual control cannot be confused with literal text.
 // Trusted isolates keep normal RTL text from reordering the surrounding identity.
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean = !loading && acknowledged
+
+// Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫）。二參版保留供既有
+// JVM 測試；生產呼叫端一律用三參版（writable 即 blockKey == null）。
+internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable: Boolean): Boolean =
+    !loading && acknowledged && writable
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
