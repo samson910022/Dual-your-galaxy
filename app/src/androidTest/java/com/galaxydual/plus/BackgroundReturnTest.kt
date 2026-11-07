@@ -73,6 +73,10 @@ class BackgroundReturnTest {
     }
 
     // Activity 後台往返：不崩潰，返回後按鈕仍可見（無寫入）。
+    // One UI 6 雙 tab：clone/remove 在預設 TAB_DUAL_APPS，refresh 在
+    // TAB_CORE_ENGINE（預設 GONE）。前後兩次皆 tab-aware 斷言；
+    // currentTab 經 KEY_CURRENT_TAB 存取，往返前停在 Apps tab，
+    // 返回後先斷言 Apps tab 再切 Engine tab。
     @Test
     fun activity_backgroundReturn_renders() {
         val gw = FakeHarnessGateway(dualId = 95)
@@ -81,6 +85,7 @@ class BackgroundReturnTest {
             awaitHarnessReady(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                // 預設 Apps tab：clone/remove 可見。
                 scenario.onActivity { activity ->
                     val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
                     assertNotNull(cloneBtn)
@@ -92,14 +97,45 @@ class BackgroundReturnTest {
                     assertTrue(removeBtn is Button)
                     assertEquals(View.VISIBLE, removeBtn.visibility)
                     assertTrue(removeBtn.isShown)
+                }
+                // 切到 Engine tab 斷言 refresh。
+                scenario.onActivity { activity ->
+                    activity.switchTab(MainActivity.TAB_CORE_ENGINE, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                        shown = refreshBtn != null &&
+                            refreshBtn.visibility == View.VISIBLE &&
+                            refreshBtn.isShown
+                    }
+                    shown
+                }
+                scenario.onActivity { activity ->
                     val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
                     assertNotNull(refreshBtn)
                     assertTrue(refreshBtn is Button)
                     assertEquals(View.VISIBLE, refreshBtn.visibility)
                     assertTrue(refreshBtn.isShown)
                 }
+                // 切回 Apps tab（currentTab 存回 TAB_DUAL_APPS），再退後台。
+                scenario.onActivity { activity ->
+                    activity.switchTab(MainActivity.TAB_DUAL_APPS, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                        shown = cloneBtn != null &&
+                            cloneBtn.visibility == View.VISIBLE &&
+                            cloneBtn.isShown
+                    }
+                    shown
+                }
                 scenario.moveToState(Lifecycle.State.CREATED)
                 scenario.moveToState(Lifecycle.State.RESUMED)
+                // 返回後仍是 Apps tab：clone/remove 可見。
                 scenario.onActivity { activity ->
                     val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
                     assertNotNull(cloneBtn)
@@ -111,11 +147,50 @@ class BackgroundReturnTest {
                     assertTrue(removeBtn is Button)
                     assertEquals(View.VISIBLE, removeBtn.visibility)
                     assertTrue(removeBtn.isShown)
+                }
+                // 返回後切 Engine tab 斷言 refresh，再切回 Apps tab。
+                scenario.onActivity { activity ->
+                    activity.switchTab(MainActivity.TAB_CORE_ENGINE, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                        shown = refreshBtn != null &&
+                            refreshBtn.visibility == View.VISIBLE &&
+                            refreshBtn.isShown
+                    }
+                    shown
+                }
+                scenario.onActivity { activity ->
                     val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
                     assertNotNull(refreshBtn)
                     assertTrue(refreshBtn is Button)
                     assertEquals(View.VISIBLE, refreshBtn.visibility)
                     assertTrue(refreshBtn.isShown)
+                    activity.switchTab(MainActivity.TAB_DUAL_APPS, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                        shown = cloneBtn != null &&
+                            cloneBtn.visibility == View.VISIBLE &&
+                            cloneBtn.isShown
+                    }
+                    shown
+                }
+                scenario.onActivity { activity ->
+                    val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                    assertNotNull(cloneBtn)
+                    assertTrue(cloneBtn is Button)
+                    assertEquals(View.VISIBLE, cloneBtn.visibility)
+                    assertTrue(cloneBtn.isShown)
+                    val removeBtn = activity.findViewById<Button>(R.id.remove_btn)
+                    assertNotNull(removeBtn)
+                    assertTrue(removeBtn is Button)
+                    assertEquals(View.VISIBLE, removeBtn.visibility)
+                    assertTrue(removeBtn.isShown)
                 }
             }
         } finally {
