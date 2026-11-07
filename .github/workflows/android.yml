@@ -56,7 +56,7 @@ jobs:
             app/build/reports/androidTests/
             app/build/outputs/androidTest-results/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
 
   build:
     runs-on: ubuntu-latest
@@ -265,7 +265,7 @@ jobs:
             **/build/reports/tests/
             **/build/test-results/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
       # Phase P29 (issue #29): the build job only compiles androidTest here;
       # the full harness executes on the locale-instrumentation job above
       # (API 29 emulator) on every PR. connectedCheck in this job stays a
@@ -283,7 +283,7 @@ jobs:
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/androidTest/debug/*.apk
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
@@ -302,7 +302,7 @@ jobs:
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
 
   # Phase P29 (issue #29): instrumentation manual profile (API 34, matches
   # compileSdk/targetSdk) runs on workflow_dispatch; the API 29 (minSdk floor)
@@ -407,7 +407,7 @@ jobs:
             **/build/reports/androidTests/
             **/build/outputs/androidTest-results/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
       - name: Upload tested APKs + provenance
         if: always()
         uses: actions/upload-artifact@v4
@@ -418,4 +418,4 @@ jobs:
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
             app/build/tested-apk-provenance.txt
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
