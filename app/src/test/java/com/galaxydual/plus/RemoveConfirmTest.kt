@@ -28,9 +28,15 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -78,6 +84,7 @@ class RemoveConfirmTest {
         // `flags=...` segment is an intra-line contradiction (UNKNOWN, no
         // dual target). Flags are display-only; parentId tail retained.
         var s24Verbose: Boolean = false
+        @Volatile var listUsersGate: Pair<CompletableDeferred<Unit>, CompletableDeferred<Unit>>? = null
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -121,6 +128,10 @@ class RemoveConfirmTest {
 
         override suspend fun run(cmd: String): CmdResult {
             commands.add(cmd)
+            if (cmd == DualRepository.CMD_LIST_USERS) listUsersGate?.let { (entered, release) ->
+                entered.complete(Unit)
+                release.await()
+            }
             return when {
                 cmd.trim() == "id -u" ->
                     CmdResult(exit = 0, out = "0\n", err = "")
@@ -466,6 +477,50 @@ class RemoveConfirmTest {
         assertEquals("overwrite must not uninstall", 0, gw.uninstallCalls)
     }
 
+    @Test
+    fun staleDialogConfirmationDoesNotConfirmOrCancelReplacement() {
+        val gw = FakeRepoGateway(dualId = 95)
+        val vm = makeVm(gw)
+        awaitReady(vm)
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null && !vm.state.value.loading }
+        val old = vm.state.value.pendingRemove!!
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove?.let { it.generation != old.generation } == true && !vm.state.value.loading }
+        val replacement = vm.state.value
+        val scheduler = TestCoroutineScheduler()
+        Dispatchers.setMain(StandardTestDispatcher(scheduler))
+        vm.confirmRemove(old)
+        vm.cancelRemove(old)
+        scheduler.runCurrent()
+        assertEquals(replacement, vm.state.value)
+        assertEquals(0, gw.uninstallCalls)
+        assertTrue(old.copy(generation = replacement.pendingRemove!!.generation) != old)
+    }
+
+    @Test
+    fun noArgumentConfirmCapturesPendingBeforeScheduledBody() {
+        val gw = FakeRepoGateway()
+        val vm = makeVm(gw)
+        awaitReady(vm)
+        vm.requestRemove("com.example.chat")
+        awaitVm(vm) { vm.state.value.pendingRemove != null && !vm.state.value.loading }
+        val old = vm.state.value.pendingRemove!!
+        val scheduler = TestCoroutineScheduler()
+        Dispatchers.setMain(StandardTestDispatcher(scheduler))
+        vm.confirmRemove()
+        // Simulate a replacement published before the queued coroutine runs.
+        val field = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val state = field.get(vm) as MutableStateFlow<UiState>
+        val replacement = old.copy(generation = old.generation + 1000)
+        state.value = state.value.copy(pendingRemove = replacement)
+        val expected = state.value
+        scheduler.runCurrent()
+        assertEquals(expected, vm.state.value)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
     // Legacy single-tap entry only opens the confirmation (phase 1): pending
     // is set, no uninstall runs.
     @Suppress("DEPRECATION")
@@ -669,20 +724,8 @@ class RemoveConfirmTest {
     // confirmRemove() is suspended on IO must abort the confirm with zero
     // uninstalls and must preserve the cancel message.
     //
-    // 機制（DualViewModel.kt:844-848, 1000-1003）：Unconfined 下
-    // vm.confirmRemove() 的前綴同步執行——讀 pending、加 dedup key、拿未競爭
-    // 的 opMutex、isWritable 純狀態檢查、置 loading=true——直到首個 onIo
-    //（withContext(IO)，切 dispatcher 必掛起）才交出控制；cancelRemove()
-    // 是同步 _state.update 且不拿 mutex，故必在 confirm 掛起後、post-IO
-    // 重驗前到達並清掉 pending。confirm 的 IO 序列（resolveDualUserId +
-    // fetchDualTarget + profilesSnapshot + verifyState→fetchVerifiedDualId，
-    // 共 3 次 verbose）結束後的 post-IO 重驗（pendingRemove != cur）abort，
-    // 連 repo.removeVerifiedExpected 都沒進（其兩道 isStillValid 閘與
-    // uninstall 皆未到達）；abort 只清 loading，保留 cancel 訊息與 kind。
-    // 誠實註記：掛起後的交錯是執行緒競速而非硬屏障（fake gateway 純記憶體、
-    // IO 極快），計數 verbose 設閘反而脆弱（次數隨 verifyState/repo 內部
-    // 實現漂移），故不設 gate；此測試以 msg 保留斷言鎖定 preserve 語義，
-    // 若未來競速落敗（出現 uninstall 或訊息被覆寫）會直接轉紅而非靜默通過。
+    // Gate the first confirm-time snapshot, so cancellation definitely happens
+    // while the confirm is suspended, rather than racing the IO thread.
     @Test
     fun confirm_cancelDuringConfirm_abortsWithoutUninstall() {
         val gw = FakeRepoGateway(dualId = 95)
@@ -692,8 +735,14 @@ class RemoveConfirmTest {
         vm.requestRemove("com.example.chat")
         awaitVm(vm) { vm.state.value.pendingRemove != null }
 
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        gw.listUsersGate = entered to release
         vm.confirmRemove()
+        runBlocking { withTimeout(5_000) { entered.await() } }
         vm.cancelRemove()
+        gw.listUsersGate = null
+        release.complete(Unit)
         awaitVm(vm) { !vm.state.value.loading && vm.state.value.pendingRemove == null }
 
         assertEquals("cancel-during-confirm must not uninstall", 0, gw.uninstallCalls)

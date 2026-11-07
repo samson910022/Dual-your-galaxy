@@ -299,6 +299,7 @@ class InventorySelectionTest {
             hookDiagnosticGateways = { emptyList() },
             nowWallMs = { clock.now() },
             selectionStore = store,
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         return vm

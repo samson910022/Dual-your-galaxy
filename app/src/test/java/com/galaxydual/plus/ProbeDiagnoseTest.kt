@@ -130,6 +130,7 @@ class ProbeDiagnoseTest {
             // C1 雙時鐘測試同餵：wall/mono 共用同一 fake，沿既有 JumpClock/FakeClock 模式。
             nowWallMs = { clock.now() },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         return vm
@@ -296,6 +297,7 @@ class ProbeDiagnoseTest {
             hookDiagnosticGateways = { emptyList() },
             nowWallMs = { clock.now() },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         await { !vm.state.value.loading }
@@ -366,6 +368,7 @@ class ProbeDiagnoseTest {
             hookDiagnosticGateways = { emptyList() },
             nowWallMs = { clock.now() },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         await { !vm.state.value.loading }
@@ -427,6 +430,7 @@ class ProbeDiagnoseTest {
                 clock.now()
             },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         await { !vm.state.value.loading }
@@ -478,6 +482,7 @@ class ProbeDiagnoseTest {
             hookDiagnosticGateways = { emptyList() },
             nowWallMs = { clock.now() },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         return vm
@@ -667,6 +672,7 @@ class ProbeDiagnoseTest {
             hookDiagnosticGateways = { emptyList() },
             nowWallMs = { clock.now() },
             nowMonoMs = { clock.now() },
+            blockText = zhTestBlockText(),
         )
         vms.add(vm)
         await { vm.state.value.channelReady }

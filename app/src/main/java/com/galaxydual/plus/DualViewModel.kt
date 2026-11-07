@@ -147,12 +147,15 @@ fun ProbeScope.displayLabel(): String = when (this) {
     ProbeScope.NONE -> "未探測"
 }
 
+private val removeGeneration = java.util.concurrent.atomic.AtomicLong()
+
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
     val dualSerial: Int,
     val profileLabel: String,
     val requestedAtMs: Long,
+    val generation: Long = removeGeneration.incrementAndGet(),
 )
 
 // PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
@@ -223,8 +226,8 @@ enum class MsgKind {
 // whether `pm list users` proved readable via refresh (probe never writes it;
 // true readability = pmReadable == true plus writeReady -- never collapse
 // probe identity / PM-read / PM-write into one boolean), writeReady whether
-// the selected channel proved itself, degradeNote the Auto probe-based degrade
-// explanation (empty when none), profiles/cloned the device ground truth,
+// the selected channel proved itself, degrade the Auto probe-based degrade
+// explanation (typed WriteBlock, null when none), profiles/cloned the device ground truth,
 // loading the in-flight flag, and msg (+msgKind) the user-facing status.
 //
 // PR-6 P2 (#27 後半)：另有 inventory (來源/目標身份/查詢時間/新鮮度)、
@@ -292,12 +295,12 @@ data class UiState(
     val pmReadable: Boolean? = null,
     // Selected channel proved itself (same gate as channelReady).
     val writeReady: Boolean = false,
-    // Auto probe-based degrade explanation (P25). Non-empty only for AUTO
-    // when the probes overrode the file heuristic downward (su denied ->
+    // Auto probe-based degrade explanation (P25, P2-3 typed). Non-null only for
+    // AUTO when the probes overrode the file heuristic downward (su denied ->
     // Shizuku) or when both probes failed (read-only); recovery/upgrade back
-    // to ROOT is silent by design (empty note, readyMsg empty -> silent).
-    // Explicit choices clear it.
-    val degradeNote: String = "",
+    // to ROOT is silent by design (null, readyMsg empty -> silent).
+    // Explicit choices clear it. Resolved via blockText (auto_degrade_*).
+    val degrade: WriteBlock? = null,
     // Hook-enable signal from the cross-process marker file (F4b-P2).
     // Refreshed on every probe (recheckPrivilege/selectChannel cover all UI
     // entry points). Honest existence+scope evidence only: the marker
@@ -471,8 +474,8 @@ class DualViewModel(
     ) -> ChannelAssembly = ::assembleChannel,
     // Last Auto probe-based degrade explanation (P25). Recomputed on every
     // probe when preference==AUTO (see degradeAutoLocked); cleared on
-    // explicit selection. Copied into UiState.degradeNote by probeChannels.
-    private var autoDegradeNote: String = "",
+    // explicit selection. Copied into UiState.degrade by probeChannels.
+    private var autoDegrade: WriteBlock? = null,
     // Instance-bound diagnostic evidence (Phase A P2 fix, see
     // DiagnosticEvidence header): su/shizuku each bind to the verified
     // gateway instance + generation. Cold-start = empty (gateway null) so
@@ -555,6 +558,12 @@ class DualViewModel(
     // SharedPreferences (selectionStore());JVM 測試注入 HashMap 後端;null
     // 表示無持久化 (既有測試路徑,所有選取操作退化為純記憶體)。
     private val selectionStore: SelectionStore? = null,
+    // p28-1 review（en 殘留）：寫入拒絕理由在地化。VM 本體不碰 Android
+    // Context：文字解析經此注入——生產由 factory 以 Application Context 對接
+    // values/strings.xml（見 MainActivity.resolveBlockReason）；JVM 測試注入
+    // 假值（見 BlockReasonTestFake.zhTestBlockText）。預設回退 key 名
+    // （WriteBlockKind.name），保證主程式碼零硬編碼字面。
+    private val blockText: (WriteBlock) -> String = { it.kind.name },
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -966,18 +975,19 @@ class DualViewModel(
     // AUTO→NOOP refresh through the NoOp repo always ends as
     // "channel error: denied", so without the error-branch join the full
     // dual-failure reason would be hidden behind the refresh error (only in
-    // degradeNote/channelView short tag).
+    // degrade/channelView short tag).
     // Mirrors the pendingRemove preserve rule (NONE/INFO combinable, errors pass).
     private fun combineWithDegradeNote(
         baseMsg: String,
         baseKind: MsgKind,
-        degradeNote: String,
+        degrade: WriteBlock?,
     ): Pair<String, MsgKind> {
-        if (preference != ChannelPreference.AUTO || degradeNote.isEmpty()) return baseMsg to baseKind
+        if (preference != ChannelPreference.AUTO || degrade == null) return baseMsg to baseKind
+        val degradeText = blockText(degrade)
         return when (baseKind) {
-            MsgKind.NONE -> degradeNote to MsgKind.INFO
-            MsgKind.INFO -> "$baseMsg；$degradeNote" to MsgKind.INFO
-            else -> "$baseMsg；$degradeNote" to baseKind
+            MsgKind.NONE -> degradeText to MsgKind.INFO
+            MsgKind.INFO -> "$baseMsg；$degradeText" to MsgKind.INFO
+            else -> "$baseMsg；$degradeText" to baseKind
         }
     }
 
@@ -1002,7 +1012,7 @@ class DualViewModel(
                         val (combinedMsg, combinedKind) = combineWithDegradeNote(
                             "channel error: ${sanitizeForDisplay(snap.detail)}",
                             MsgKind.CHANNEL,
-                            cur.degradeNote,
+                            cur.degrade,
                         )
                         val next = cur.copy(
                             loading = false,
@@ -1082,7 +1092,7 @@ class DualViewModel(
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "no dual profile",
                                     MsgKind.NO_DUAL,
-                                    cur.degradeNote,
+                                    cur.degrade,
                                 )
                                 cur.copy(
                                     loading = false,
@@ -1111,7 +1121,7 @@ class DualViewModel(
                                     "refresh result unknown: " +
                                         "cannot confirm dual profile",
                                     MsgKind.CHANNEL,
-                                    cur.degradeNote,
+                                    cur.degrade,
                                 )
                                 cur.copy(
                                     loading = false,
@@ -1227,7 +1237,7 @@ class DualViewModel(
                                         "target $dualId#${dualSerial ?: "?"} -> " +
                                         "$liveId#${liveSerial ?: "?"}",
                                     MsgKind.VERIFY,
-                                    cur.degradeNote,
+                                    cur.degrade,
                                 )
                                 cur.copy(
                                     loading = false,
@@ -1270,7 +1280,7 @@ class DualViewModel(
                                         "refresh result unknown: " +
                                             "channel error: ${sanitizeForDisplay(snapErr)}",
                                         MsgKind.CHANNEL,
-                                        cur.degradeNote,
+                                        cur.degrade,
                                     )
                                     cur.copy(
                                         loading = false,
@@ -1307,7 +1317,7 @@ class DualViewModel(
                                         "refresh verification mismatch: " +
                                             "target $dualId -> $newTarget",
                                         MsgKind.VERIFY,
-                                        cur.degradeNote,
+                                        cur.degrade,
                                     )
                                     cur.copy(
                                         loading = false,
@@ -1337,7 +1347,7 @@ class DualViewModel(
                                         "refresh result unknown: " +
                                             "cannot list clones for user $dualId",
                                         MsgKind.CHANNEL,
-                                        cur.degradeNote,
+                                        cur.degrade,
                                     )
                                     cur.copy(
                                         loading = false,
@@ -1373,7 +1383,7 @@ class DualViewModel(
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "no clones installed",
                                     MsgKind.INFO,
-                                    cur.degradeNote,
+                                    cur.degrade,
                                 )
                                 // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
                                 val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
@@ -1410,7 +1420,7 @@ class DualViewModel(
                                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                                     "",
                                     MsgKind.NONE,
-                                    cur.degradeNote,
+                                    cur.degrade,
                                 )
                                 // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
                                 val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
@@ -1483,7 +1493,7 @@ class DualViewModel(
                 val (combinedMsg, combinedKind) = combineWithDegradeNote(
                     "refresh failed: ${sanitizeForDisplay(e.message ?: "refresh failed")}",
                     MsgKind.FAILED,
-                    cur.degradeNote,
+                    cur.degrade,
                 )
                 val next = cur.copy(
                     loading = false,
@@ -2361,8 +2371,13 @@ class DualViewModel(
     // leaves loading untouched so an in-flight confirm/refresh spinner is
     // never overwritten by the cancel.
     fun cancelRemove() {
+        _state.value.pendingRemove?.let { cancelRemove(it) }
+    }
+
+    fun cancelRemove(expected: PendingRemove) {
         _state.update { cur ->
             val pending = cur.pendingRemove ?: return@update cur
+            if (pending != expected) return@update cur
             cur.copy(
                 pendingRemove = null,
                 // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
@@ -2393,24 +2408,28 @@ class DualViewModel(
     // cloned, Unknown -> CHANNEL fail closed) -- only then runs
     // removeVerifiedExpected.
     fun confirmRemove() {
-        viewModelScope.launch {
-            val pendingAtCall = _state.value.pendingRemove
-            if (pendingAtCall == null) {
-                // 終態成功不被遲到/重複 confirm 覆寫（結果釘住）；其餘才報無待確認。
-                _state.update { cur ->
-                    if (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: ")) cur
-                    else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
-                }
-                return@launch
+        val pending = _state.value.pendingRemove
+        if (pending != null) confirmRemove(pending) else {
+            _state.update { cur ->
+                if (cur.pendingRemove != null || (cur.msgKind == MsgKind.INFO && cur.msg.startsWith("removed: "))) cur
+                else cur.copy(msg = "沒有待確認的移除", msgKind = MsgKind.INVALID)
             }
+        }
+    }
+
+    fun confirmRemove(expected: PendingRemove) {
+        viewModelScope.launch {
+            val pendingAtCall = expected
+            if (_state.value.pendingRemove != pendingAtCall) return@launch
             // Write dedup 按世代 (PR-4 P23 stage 2, PR-33 R2 加 serial): key 綁定
-            // pending 世代 (pkg@dualId#serial#requestedAtMs)，避免 v1 卡鎖時 v2
+            // pending 世代 (pkg@dualId#serial#requestedAtMs#generation)，避免 v1 卡鎖時 v2
             // 合法確認被誤殺；a second concurrent confirm of the SAME
             // generation reports instead of queueing a second uninstall.
             val key = "remove:${pendingAtCall.pkg}@${pendingAtCall.dualId}" +
-                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}"
+                "#${pendingAtCall.dualSerial}#${pendingAtCall.requestedAtMs}#${pendingAtCall.generation}"
             if (!inFlightWrites.add(key)) {
                 _state.update {
+                    if (it.pendingRemove != pendingAtCall) return@update it
                     it.copy(
                         // 理由 (m1 本機回音原文)：使用者自輸包名回顯用
                         // sanitizeUserEcho (保原文、去換行，不 redact)；
@@ -2430,11 +2449,9 @@ class DualViewModel(
                     if (cur == null) return@withLock
                     // Full-equality guard (full-equality 含 pkg/timestamp，覆寫即拒):
                     // any overwrite means a newer request replaced ours. 舊 confirm
-                    // abort，保留新 pending，由使用者確認新目標：只清 loading，不動
-                    // pendingRemove 與 msg（保留新 request 的 pending 與「等待確認」訊息），
+                    // abort，保留新 pending 與所有狀態，由使用者確認新目標，
                     // 與 post-IO 一致（preserve 式）。
                     if (cur != pendingAtCall) {
-                        _state.update { it.copy(loading = false) }
                         return@withLock
                     }
                     if (!isWritable()) {
@@ -4649,7 +4666,7 @@ class DualViewModel(
             false
         }
         val decision = resolveAutoProbe(suPresent, hasRoot, hasShizuku)
-        autoDegradeNote = decision.degradeNote
+        autoDegrade = decision.degrade
         if (decision.channel != currentChannel) {
             swapToResolvedLocked(decision.channel)
         }
@@ -4810,7 +4827,7 @@ class DualViewModel(
         elevators = listOf(SuElevator(suGateway), ShizukuElevator(shizukuGateway))
         preference = pref
         currentChannel = asm.channel
-        if (pref != ChannelPreference.AUTO) autoDegradeNote = ""
+        if (pref != ChannelPreference.AUTO) autoDegrade = null
         // Phase A P2: instance-bound evidence deliberately SURVIVES here as
         // STALE entries (unlike autoDegradeNote which clears on explicit):
         // suEvidence/shizukuEvidence keep pointing at the OLD instances with
@@ -4834,7 +4851,7 @@ class DualViewModel(
                 channel = pref,
                 resolvedGateway = asm.channel,
                 execIdentity = asm.gateway.privilege,
-                degradeNote = if (pref == ChannelPreference.AUTO) autoDegradeNote else "",
+                degrade = if (pref == ChannelPreference.AUTO) autoDegrade else null,
                 pendingRemove = null,
                 pmReadable = null,
             )
@@ -5118,7 +5135,7 @@ class DualViewModel(
             // P25: AUTO already follows live probes above (degrade-first); the
             // reusedProbe path (recheck/reconnect) degraded before this call,
             // so nothing remains to do here.
-            val degradeNoteForState = if (preference == ChannelPreference.AUTO) autoDegradeNote else ""
+            val degradeForState = if (preference == ChannelPreference.AUTO) autoDegrade else null
             // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
             // the router encodes that priority, probes only feed it.
             // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
@@ -5271,6 +5288,9 @@ class DualViewModel(
             // P25 messages: explicit choices never cross channels -- the text
             // states the selected-mode reason plus the optional recovery
             // entry (switch to Auto or tap "重新連線並更新").
+            // p28-1 review（en 殘留）：文字經 blockText 解析資源（見 values/
+            // strings.xml + values-en/），分支條件與原文一字不動；與 isWritable
+            // 共用 WriteBlock key（single source）。
             val notReadyMsg: String = when {
                 currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER -> {
                     // LSPosed mode semantics (F4b-P2): the gateway is still
@@ -5278,19 +5298,19 @@ class DualViewModel(
                     // so the channel is honestly never ready. The message
                     // states the reason plus the hook signal; it never claims
                     // the channel can execute.
-                    "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
-                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」"
+                    blockText(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(hookDesc)))
                 }
                 gatewayPrivilege == Privilege.NONE -> {
-                    if (degradeNoteForState.isNotEmpty()) degradeNoteForState
-                    else "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
-                        "寫入已禁用；請檢查授權後點「重新連線並更新」"
+                    if (degradeForState != null) blockText(degradeForState)
+                    else blockText(WriteBlock(WriteBlockKind.NOOP_FALLBACK))
                 }
                 else -> {
-                    "所選模式 $preference（${gatewayPrivilege} 通道）探測未通過，" +
-                        "寫入已禁用（明選不跨通道）；" +
-                        "可切到 Auto 或點「重新連線並更新」重試"
+                    blockText(
+                        WriteBlock(
+                            WriteBlockKind.EXPLICIT_FAILURE,
+                            listOf(preference.name, gatewayPrivilege.name),
+                        ),
+                    )
                 }
             }
             // When degraded-but-ready (Auto -> SHIZUKU proven), surface the
@@ -5303,7 +5323,7 @@ class DualViewModel(
             //   readCap 為 false 時 ready 必為 false 的上位條件 (!readCap ⇒ !ready)，故只判 ready)；
             // - resolved 在本次處理中改變（選定通道已換，舊通道查的資料不可信）；
             // - 已過 maxAge（與 markStaleIfAgedLocked 共用 needsRefresh）。
-            val readyMsg = degradeNoteForState
+            val readyMsg = degradeForState?.let { blockText(it) } ?: ""
             // dialog 開著時狀態列不洗掉確認提示：pendingRemove != null 且新
             // kind == NONE/INFO 才保留原 msg/msgKind，CHANNEL/FAILED 穿透。
             // 其他欄位照寫（loading/hook/ready/resolved/exec/caps 照常更新）。
@@ -5381,7 +5401,7 @@ class DualViewModel(
                     probeScope = preference.probeScope(),
                     writeReady = effectiveReady,
                     pmReadable = if (!effectiveReady) null else cur.pmReadable,
-                    degradeNote = degradeNoteForState,
+                    degrade = degradeForState,
                     inventory = staleInventory,
                     diagnose = probeDiagnose,
                     msg = if (effectiveReady) readyMsg else notReadyMsg,
@@ -5491,8 +5511,19 @@ class DualViewModel(
     // (whitelist branch pending), so writes are refused with the reason
     // stated, including the hook signal. Nothing is ever executed here: the
     // channel must not be mistaken for a working hook path.
+    // p28-1 review：BlockReason -> 顯示文字（isWritable/probeChannels 共用
+    // single source；Activity 側另有 Context 版 resolveBlockReason，見
+    // MainActivity）。
+    private fun resolveReason(reason: BlockReason): String = when (reason) {
+        is BlockReason.Keyed -> blockText(reason.block)
+    }
+
     private fun isWritable(): Boolean {
         val cur = _state.value
+        // p28-1 single source: the refusal reason also shown next to the
+        // disabled write buttons (MainActivity renders writeBlockReason of
+        // the same state). Null means writable -- return before touching msg.
+        val reason = writeBlockReason(cur) ?: return true
         // P1-3 write-guard 拒絕產生 diagnose（CHANNEL_ERROR）：
         // 冷啟動無通道時若 diagnose 留 null，後續寫入拒絕只改 msg，
         // 匯出仍宣稱 OK。優先順序規則同 probeChannels：已有 sticky
@@ -5511,7 +5542,7 @@ class DualViewModel(
             // 歷史（diagnose==null 且 lastOperation.phase != UNKNOWN），
             // 記 CHANNEL_ERROR，techDetail 標註佔位/政策拒寫（明確不是
             // probe failure）；已有診斷（含 sticky UNKNOWN）則保留原值。
-            val hookDesc = cur.hookEvidence().displayText()
+            // 拒絕理由 single source：外層 reason（見 writeBlockReason）。
             _state.update {
                 val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
@@ -5525,9 +5556,7 @@ class DualViewModel(
                                 "(explicit write refused by policy, not a probe failure)",
                         )
                     },
-                    msg = "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                        "寫入已拒絕；Hook 狀態：$hookDesc；" +
-                        "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5535,16 +5564,8 @@ class DualViewModel(
         }
         if (!cur.channelReady) {
             // P25: explicit never crosses channels -- state the selected-mode
-            // reason plus the optional recovery entry.
-            val reason = if (cur.degradeNote.isNotEmpty() && cur.channel == ChannelPreference.AUTO) {
-                cur.degradeNote
-            } else if (gatewayPrivilege == Privilege.NONE) {
-                "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +
-                    "寫入已禁用；請檢查授權後點「重新連線並更新」"
-            } else {
-                "所選模式 ${cur.channel}（${gatewayPrivilege} 通道）探測未通過，" +
-                    "寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試"
-            }
+            // reason plus the optional recovery entry（拒絕理由 single source：
+            // 外層 reason，見 writeBlockReason，與按鈕旁禁用原因同文）.
             _state.update {
                 val sticky = it.lastOperation?.phase == OpPhase.UNKNOWN || it.diagnose != null
                 it.copy(
@@ -5558,7 +5579,7 @@ class DualViewModel(
                                 "(channel=${it.channel} privilege=$gatewayPrivilege)",
                         )
                     },
-                    msg = reason,
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5576,8 +5597,7 @@ class DualViewModel(
             _state.update {
                 it.copy(
                     loading = false,
-                    msg = "探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；" +
-                        "請檢查授權後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5599,8 +5619,7 @@ class DualViewModel(
                             techDetail = "no privilege channel (read-only)",
                         )
                     },
-                    msg = "唯讀：無可用權限通道，寫入已禁用；" +
-                        "請檢查授權後點「重新連線並更新」",
+                    msg = resolveReason(reason),
                     msgKind = MsgKind.INVALID,
                 )
             }
@@ -5844,6 +5863,70 @@ fun UiState.readyMark(): String = when {
     pmReadable == true -> "已就緒"
     pmReadable == false -> "探測通過，PM不可讀"
     else -> "探測通過，PM未確認"
+}
+
+// p28-1（review 修復）：寫入拒絕理由 single source（isWritable() 報入 msg 的
+// 即此 key 經 blockText 解析的文字；MainActivity 在主操作按鈕旁以 Context 版
+// resolveBlockReason 顯示同一 key，不再只靠點按後拒絕才得知）。
+// 回傳資源鍵（JVM 可測，不碰 Android runtime；文字見 values/strings.xml +
+// values-en/），主程式碼零硬編碼字面。
+// Null = 可寫。分支順序與 isWritable 完全一致：LSPOSED 佔位、!writeReady
+//（AUTO 降級 typed Keyed、無權限 NoOp 回退、明選模式失敗）、PM 不可讀門、
+// 最後不可達的 NONE 權限守衛。channelReady 為 writeReady 舊別名（恆等）；
+// gatewayPrivilege/currentChannel 由 probeChannels 同步拷貝至
+// execIdentity/resolvedGateway，故 isWritable 持鎖下讀 state 等價
+// （明選分支原文用 gatewayPrivilege，此處讀 execIdentity，值相同）。
+// P2-3 AUTO 降級註記（probe 動態產物）亦為 typed Keyed（AUTO_DEGRADE_*），
+// 經 blockText/資源解析；主路徑無 Verbatim。
+enum class WriteBlockKind {
+    LSPOSED_PLACEHOLDER,
+    NOOP_FALLBACK,
+    EXPLICIT_FAILURE,
+    PM_UNREADABLE,
+    NO_PRIVILEGE,
+    AUTO_DEGRADE_SU_TO_SHIZUKU,
+    AUTO_DEGRADE_BOTH_FAILED,
+    AUTO_DEGRADE_NO_CHANNEL,
+}
+
+// 資源鍵 + 格式參數：LSPOSED 的 args[0]=Hook 證據文字（動態）；EXPLICIT 的
+// args[0]=模式名、args[1]=通道身份名（列舉名，中英同形）；其餘無參數。
+data class WriteBlock(
+    val kind: WriteBlockKind,
+    val args: List<String> = emptyList(),
+)
+
+sealed interface BlockReason {
+    data class Keyed(val block: WriteBlock) : BlockReason
+}
+
+internal fun writeBlockReason(s: UiState): BlockReason? {
+    if (s.resolvedGateway == ResolvedChannel.LSPOSED_PLACEHOLDER) {
+        return BlockReason.Keyed(
+            WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(s.hookEvidence().displayText())),
+        )
+    }
+    if (!s.writeReady) {
+        return if (s.channel == ChannelPreference.AUTO && s.degrade != null) {
+            BlockReason.Keyed(s.degrade)
+        } else if (s.execIdentity == Privilege.NONE) {
+            BlockReason.Keyed(WriteBlock(WriteBlockKind.NOOP_FALLBACK))
+        } else {
+            BlockReason.Keyed(
+                WriteBlock(
+                    WriteBlockKind.EXPLICIT_FAILURE,
+                    listOf(s.channel.name, s.execIdentity.name),
+                ),
+            )
+        }
+    }
+    if (s.pmReadable == false) {
+        return BlockReason.Keyed(WriteBlock(WriteBlockKind.PM_UNREADABLE))
+    }
+    if (s.privilege == Privilege.NONE || s.execIdentity == Privilege.NONE) {
+        return BlockReason.Keyed(WriteBlock(WriteBlockKind.NO_PRIVILEGE))
+    }
+    return null
 }
 
 // PR-6 P4 (#27 架構整理)：扁平時間證據欄位的衍生視圖。isWritable 與
