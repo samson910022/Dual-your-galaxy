@@ -36,6 +36,9 @@
         </activity>
 
         <!-- Shizuku binder provider; required for Shizuku API V2 to attach. -->
+        <!-- Shizuku-mandated exported provider: the Shizuku manager binds this authority,
+             access is gated by INTERACT_ACROSS_USERS_FULL plus the user's Shizuku grant;
+             never reuse this provider/authority for private app data. -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
