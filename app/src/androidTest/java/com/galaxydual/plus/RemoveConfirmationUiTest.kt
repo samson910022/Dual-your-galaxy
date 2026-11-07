@@ -118,7 +118,7 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 assertFalse(positive.isEnabled)
                 check.performClick()
                 assertTrue(positive.isEnabled)
-                // 三參 dialog 門控零覆蓋：blocked 通道即使已勾選，confirm 仍禁用。
+                // 四參 dialog 門控零覆蓋：blocked 通道即使已勾選，confirm 仍禁用。
                 val blocked = BlockReason.Keyed(WriteBlock(WriteBlockKind.NO_PRIVILEGE))
                 sync.invoke(activity, old, false, blocked, catalogKey)
                 assertTrue(check.isChecked)
