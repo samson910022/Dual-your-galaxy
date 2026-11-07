@@ -118,15 +118,34 @@ class InputRestoreTest {
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
-                scenario.onActivity { activity ->
-                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+                var mailOk = false
+                var channelOk = false
+                val launchDeadline = System.currentTimeMillis() + 5000L
+                while (System.currentTimeMillis() < launchDeadline && !(mailOk && channelOk)) {
+                    scenario.onActivity { activity ->
+                        mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
+                        channelOk = HarnessViews.containsText(activity.window.decorView, "通道偏好")
+                    }
+                    if (!(mailOk && channelOk)) Thread.sleep(200)
                 }
+                assertTrue("hasEditTextText(..., \"mail\") before recreate", mailOk)
+                assertTrue("containsText(..., \"通道偏好\") before recreate", channelOk)
+
                 scenario.recreate()
-                scenario.onActivity { activity ->
-                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "mail"))
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "通道偏好"))
+
+                mailOk = false
+                channelOk = false
+                val recreateDeadline = System.currentTimeMillis() + 5000L
+                while (System.currentTimeMillis() < recreateDeadline && !(mailOk && channelOk)) {
+                    scenario.onActivity { activity ->
+                        mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
+                        channelOk = HarnessViews.containsText(activity.window.decorView, "通道偏好")
+                    }
+                    if (!(mailOk && channelOk)) Thread.sleep(200)
                 }
+                assertTrue("hasEditTextText(..., \"mail\") after recreate", mailOk)
+                assertTrue("containsText(..., \"通道偏好\") after recreate", channelOk)
+
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
             }

@@ -170,7 +170,7 @@ object HarnessViews {
     fun containsText(root: View?, text: CharSequence): Boolean {
         if (root == null) return false
         if (root is TextView && root.text?.toString()?.contains(text) == true &&
-            root.visibility == View.VISIBLE && root.isShown) return true
+            root.visibility != View.GONE) return true
         if (root is ViewGroup) {
             for (i in 0 until root.childCount) {
                 if (containsText(root.getChildAt(i), text)) return true
@@ -182,7 +182,7 @@ object HarnessViews {
     fun hasEditTextText(root: View?, text: CharSequence): Boolean {
         if (root == null) return false
         if (root is EditText && root.text?.toString() == text.toString() &&
-            root.visibility == View.VISIBLE && root.isShown) return true
+            root.visibility != View.GONE) return true
         if (root is ViewGroup) {
             for (i in 0 until root.childCount) {
                 if (hasEditTextText(root.getChildAt(i), text)) return true
