@@ -1,9 +1,10 @@
 # ACCEPTANCE — 實機/模擬器驗收矩陣（Phase P29, issue #29）
 
-> 定位：harness（`app/src/androidTest` + `instrumentation-manual` job）只保證
+> 定位：harness（`app/src/androidTest`）只保證
 > **編譯通過 + 零真機寫入**；真正的裝置驗收一律走本文件的人工矩陣記錄。
-> PR CI 無 device/emulator，只跑 `:app:assembleDebugAndroidTest`（編譯）；
-> `connectedDebugAndroidTest` 僅在 `workflow_dispatch` 手動觸發 + emulator 下執行。
+> harness 測試於每次 PR 的 `locale-instrumentation` job（API 29 emulator）自動執行，
+> 另於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行；
+> PR CI 另跑 `:app:assembleDebugAndroidTest`（編譯）作為編譯閘門。
 
 ## 1. 版本錨定（每次驗收必填）
 
@@ -47,6 +48,9 @@
 ## 5. Harness 對照（免裝置可跑）
 
 Harness 共 20 個自動化測試（`app/src/androidTest`，5 個 test class）。
+這些測試在每次 PR 的 `locale-instrumentation` job（API 29 emulator）自動執行，
+並於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行；
+並非僅手動執行。
 
 | 人工列 | 對應 androidTest | 寫入保證 / 備註 |
 | --- | --- | --- |

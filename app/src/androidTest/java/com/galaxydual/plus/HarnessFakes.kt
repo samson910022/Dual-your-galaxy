@@ -53,7 +53,8 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
     var uninstallCalls = 0
     var installCalls = 0
     var writeCalls = 0
-    val commandLog = mutableListOf<String>()
+    val commandLog = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    val commandCounter = java.util.concurrent.atomic.AtomicInteger(0)
     var serial: Int = 15
     var serialAvailable: Boolean = true
     val installedPkgs = mutableSetOf("com.example.chat")
@@ -83,6 +84,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
 
     override suspend fun run(cmd: String): CmdResult {
         commandLog.add(cmd)
+        commandCounter.incrementAndGet()
         // Read-only commands (pm list, cmd user list -v, dumpsys, id) are
         // NOT counted; only known write verbs are.
         if (cmd.startsWith("pm uninstall") || cmd.startsWith("pm install") ||
