@@ -319,6 +319,12 @@ data class UiState(
     val hookMarkerTimeMs: Long? = null,
     // 診斷是否走 privileged `cat` (沿用 HookStateProvider viaGateway)。
     val hookViaGateway: Boolean = false,
+    // Phase H live-health 誠實門控 (Codex P1 #2732)：本次開機是否已證實 hook
+    // 存活，預設 false。diagnoseHookState 只給存在性證據 (marker survives
+    // reboots，無 boot-identity/freshness)，永不將此欄設 true；未來比較
+    // markerTimeMs vs (nowWallMs - nowMonoMs) 或 BOOT_COUNT/boot_id 通過才
+    // 由專屬 setter 設 true。UI live 宣稱一律經 hookLiveProven() 門控。
+    val hookBootFresh: Boolean = false,
     // All Android profiles parsed from `pm list users`.
     val profiles: List<DualProfile> = emptyList(),
     // Packages currently cloned into the dual profile (MVP tracks by name).
@@ -5829,6 +5835,9 @@ fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long = 0L):
     hookQueriedAtMs = queriedAtMs,
     hookMarkerTimeMs = HookMarker.parseTimeMs(diagnosis.raw)?.takeIf { it > 0 },
     hookViaGateway = diagnosis.viaGateway,
+    // Phase H：診斷只證明歷史存在性，永不證明本次開機存活，fail-closed 歸零
+    // (未來 boot 比較通過由專屬路徑重設 true，不經此處)。
+    hookBootFresh = false,
 )
 
 // Phase C P2 pure display helpers (MainActivity render uses these; JVM tests
@@ -5933,6 +5942,8 @@ internal fun writeBlockReason(s: UiState): BlockReason? {
 // MainActivity hook 行經此組裝 HookEvidence 再 displayText，消滅手動組裝；
 // 扁平欄位 (hookStatus/hookScopes/hookQueriedAtMs/hookMarkerTimeMs/
 // hookViaGateway) 保留 (匯出/測試仍直讀).
+// Phase H：HookEvidence 只攜 existence 證據；live 門控另讀
+// UiState.hookBootFresh (預設 false)，不經此處搬運。
 fun UiState.hookEvidence(): HookEvidence = HookEvidence(
     status = hookStatus,
     scopes = hookScopes,
