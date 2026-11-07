@@ -255,6 +255,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var hookStatusText: TextView
     private lateinit var hookBadgeChip: TextView
     private lateinit var hookSecPmTag: TextView
+    private lateinit var hookUidSandboxTag: TextView
     private lateinit var injectedActiveLabel: TextView
     private lateinit var daemonFooter: LinearLayout
     private lateinit var residentBadge: TextView
@@ -1563,11 +1564,12 @@ class MainActivity : ComponentActivity() {
             val vp = dp(2)
             setPadding(hp, vp, hp, vp)
         }
-        val tag2 = TextView(this).apply {
+        hookUidSandboxTag = TextView(this).apply {
             text = getString(R.string.hook_badge_uid_sandbox)
             textSize = 10f
             setTextColor(getColor(R.color.oneui_text_secondary))
             background = getDrawable(R.drawable.bg_island_card_high)
+            visibility = View.GONE
             val hp = dp(8)
             val vp = dp(2)
             setPadding(hp, vp, hp, vp)
@@ -1576,7 +1578,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         hookTagsRow.addView(hookSecPmTag)
-        hookTagsRow.addView(tag2)
+        hookTagsRow.addView(hookUidSandboxTag)
         hookModeCard.addView(hookTagsRow)
 
         hookModeCard.addView(makeDivider(12, 12))
@@ -2605,6 +2607,9 @@ class MainActivity : ComponentActivity() {
             }
             if (::hookSecPmTag.isInitialized) {
                 hookSecPmTag.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::hookUidSandboxTag.isInitialized) {
+                hookUidSandboxTag.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
             }
             if (::injectedActiveLabel.isInitialized) {
                 injectedActiveLabel.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
