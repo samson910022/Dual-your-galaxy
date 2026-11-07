@@ -36,8 +36,8 @@
     <string name="system_toggle_cd_shown">系統應用目前顯示中，點兩下隱藏（只切換顯示，不卸載任何分身）</string>
     <string name="action_select_visible">全選可見</string>
     <plurals name="select_visible_cd">
-        <item quantity="one">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
-        <item quantity="other">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+        <item quantity="one">全選目前可見前 %1$d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+        <item quantity="other">全選目前可見前 %1$d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
     </plurals>
     <string name="action_clear_selection">清除勾選</string>
     <string name="clear_selection_cd">清除勾選（不卸載任何分身）</string>
@@ -46,12 +46,12 @@
     <string name="action_unsave_selection">取消保存</string>
     <string name="unsave_selection_cd">取消保存選取（不卸載分身，不清除目前勾選）</string>
     <plurals name="batch_create">
-        <item quantity="one">建立 %d 個分身</item>
-        <item quantity="other">建立 %d 個分身</item>
+        <item quantity="one">建立 %1$d 個分身</item>
+        <item quantity="other">建立 %1$d 個分身</item>
     </plurals>
     <plurals name="batch_create_cd">
-        <item quantity="one">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
-        <item quantity="other">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="one">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="other">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
     </plurals>
     <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
     <!-- A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時的可見原因（VM 守衛不動，僅 UI 層提示）。 -->
@@ -163,11 +163,14 @@
     <string name="section_profiles_diagnostics">設定檔與日誌</string>
     <string name="status_hook_injected_active">● Hook 注入活躍中</string>
     <string name="engine_diag_all_normal">5/5 模組運作正常</string>
-    <string name="telemetry_status_active">Active &amp; Injected</string>
+    <string name="telemetry_status_active">運作中·已注入</string>
     <string name="telemetry_latency_unknown">—</string>
-    <string name="engine_uid_label">UID: %d</string>
-    <string name="stats_injected_format">%1$d %2$s (Hook)</string>
-    <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
+    <!-- Phase C: UID 技術詞中文化（英文版保留 UID）。engine_uid_unknown 為初始佔位。 -->
+    <string name="engine_uid_label">使用者識別碼：%1$d</string>
+    <!-- Phase C: zh (Hook) 改（注入）；英文版保留 (Hook)。 -->
+    <string name="stats_injected_format">%1$d %2$s（注入）</string>
+    <!-- Phase C: zh UID 改使用者識別碼（subtitle 空間不足時 ellipsize）。 -->
+    <string name="app_dual_unlocked_format">%1$s · 使用者識別碼 %2$d</string>
     <!-- Phase A 誠實狀態顯示（P0 correctness）：Hook/通道狀態一律由探測信號驅動，
          無信號顯示未知/佔位；LSPosed 版本無運行時查詢源（102 僅為 hook 模組宣告的
          xposedmin/targetapi，非已安裝框架版本），一律顯示版本未知。 -->
@@ -181,4 +184,17 @@
     <string name="engine_diag_unknown">狀態未知</string>
     <string name="engine_fallback_unauth">未授權</string>
     <string name="engine_fallback_nobinder">未連線</string>
+    <!-- Phase C (a11y/i18n)：設定對話框資源化（版本動態）、數字/角標資源化、
+         底部導覽選中狀態、Recents 標題。英文見 values-en/（鍵集一致）。 -->
+    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
+    <string name="settings_about_format">%1$s\n版本 %2$s（%3$s）\n\n• %4$s\n• %5$s\n\n%6$s</string>
+    <string name="settings_about_feature">Zygote Hook 與 Shizuku 閘道</string>
+    <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <string name="settings_version_unknown">未知</string>
+    <string name="badge_number_format">%1$d</string>
+    <string name="dual_badge_cd">分身角標（第二分身）：%1$s</string>
+    <string name="engine_uid_unknown">使用者識別碼：—</string>
+    <string name="nav_tab_state_selected">已選取</string>
+    <string name="nav_tab_cd_selected">%1$s，%2$s</string>
 </resources>
