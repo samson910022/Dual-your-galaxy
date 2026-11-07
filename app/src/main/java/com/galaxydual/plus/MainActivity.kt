@@ -267,12 +267,19 @@ class MainActivity : ComponentActivity() {
     private lateinit var residentBadge: TextView
     private lateinit var telemetryDot: ImageView
     private lateinit var telemetryStatusView: TextView
-    private lateinit var telemetryLatencyView: TextView
+    // Phase G: telemetryLatencyView removed (dead "—" placeholder, no latency
+    // source in repo; render never updated it).
     private lateinit var checklistSummaryView: TextView
     private lateinit var shizukuFallbackDescView: TextView
     private lateinit var shizukuFallbackBadgeView: TextView
     // Phase A A3：診斷清單逐項徽章由 hookProvenActive 驅動（render 內 GONE 門控）。
     private val checklistItemBadges = mutableListOf<TextView>()
+    // Phase G (honest icons)：診斷清單圖示建時綠/藍固定，未證實時須轉灰。
+    // 與徽章同源 hookProvenActive 驅動（render 內 setColorFilter）；isGreen 記
+    // 還原色（綠 secondary / 藍 primary），uidRow 另行綁定（見 engineUidIcon）。
+    private val checklistItemIcons = mutableListOf<ImageView>()
+    private val checklistItemIsGreen = mutableListOf<Boolean>()
+    private var engineUidIcon: ImageView? = null
 
     // PR-37 P3 差量渲染：上次全量重建來源列表的指紋
     // (catalog 引用+內容 hash+query+includeSystem+selectedKeys hash)。
@@ -1324,6 +1331,9 @@ class MainActivity : ComponentActivity() {
                 setPadding(hp, vp, hp, vp)
             }
             checklistItemBadges.add(itemBadge)
+            // Phase G: track icon + provenance color for the unproven-gray switch.
+            checklistItemIcons.add(itemIcon)
+            checklistItemIsGreen.add(isGreen)
             itemRow.addView(itemIcon)
             itemRow.addView(textCol)
             itemRow.addView(itemBadge)
@@ -1331,7 +1341,10 @@ class MainActivity : ComponentActivity() {
         }
 
         checklistItemBadges.clear()
-        addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), "● ${getString(R.string.badge_status_normal)}", true)
+        checklistItemIcons.clear()
+        checklistItemIsGreen.clear()
+        // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
+        addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), getString(R.string.badge_dot_format, getString(R.string.badge_status_normal)), true)
         checklistCard.addView(makeDivider())
         addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_knox_title), getString(R.string.diag_item_knox_desc), getString(R.string.badge_status_bypassed), false)
         checklistCard.addView(makeDivider())
@@ -1343,13 +1356,14 @@ class MainActivity : ComponentActivity() {
             val ip = dp(6)
             setPadding(0, ip, 0, ip)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            // Phase G: uid icon joins the unproven-gray switch (green provenance).
             addView(ImageView(context).apply {
                 setImageDrawable(getDrawable(R.drawable.ic_multi_user))
                 setColorFilter(getColor(R.color.oneui_secondary))
                 // Phase C: decorative (multi-user title/desc beside it carries meaning).
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
-            })
+            }.also { engineUidIcon = it })
             val textCol = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -1385,7 +1399,8 @@ class MainActivity : ComponentActivity() {
         checklistCard.addView(makeDivider())
         addChecklistItem(R.drawable.ic_push_sync, getString(R.string.diag_item_push_title), getString(R.string.diag_item_push_desc), getString(R.string.badge_status_isolated), true)
         checklistCard.addView(makeDivider())
-        addChecklistItem(R.drawable.ic_badge_style, getString(R.string.diag_item_badge_title), getString(R.string.diag_item_badge_desc), "#2 ${getString(R.string.badge_status_dual_tag)}", false)
+        // Phase G: count prefix via badge_dual_tag_format (was hardcoded "#2 ").
+        addChecklistItem(R.drawable.ic_badge_style, getString(R.string.diag_item_badge_title), getString(R.string.diag_item_badge_desc), getString(R.string.badge_dual_tag_format, 2, getString(R.string.badge_status_dual_tag)), false)
 
         tabEngineLayout.addView(checklistCard)
 
@@ -1640,7 +1655,9 @@ class MainActivity : ComponentActivity() {
                 // Phase C: initial value via resources (was hardcoded "0 …(Hook)").
                 text = getString(R.string.stats_injected_format, 0, getString(R.string.stats_unit_apps))
                 textSize = 15f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase G: tint (light #004DA3 on #DFE7F0 = 6.50; primary
+                // #0066D6 was 4.35, failed 4.5).
+                setTextColor(getColor(R.color.oneui_primary_tint))
                 typeface = Typeface.DEFAULT_BOLD
             }
             addView(clonedCountStatView)
@@ -1725,7 +1742,8 @@ class MainActivity : ComponentActivity() {
             })
         }
         residentBadge = TextView(this).apply {
-            text = "● ${getString(R.string.engine_status_active)}"
+            // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
+            text = getString(R.string.badge_dot_format, getString(R.string.engine_status_active))
             textSize = 10f
             // Phase C: green-pill text uses the tint (see hookBadgeChip).
             setTextColor(getColor(R.color.oneui_secondary_tint))
@@ -1761,7 +1779,9 @@ class MainActivity : ComponentActivity() {
             addView(TextView(context).apply {
                 text = getString(R.string.engine_gauge_title)
                 textSize = 16f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase G: tint (light #004DA3 on #DFE7F0 = 6.50; primary
+                // #0066D6 was 4.35, failed 4.5).
+                setTextColor(getColor(R.color.oneui_primary_tint))
                 typeface = Typeface.DEFAULT_BOLD
             })
             addView(TextView(context).apply {
@@ -1789,8 +1809,9 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            // Phase A：telemetry 行由 render() 綁定 hookStatus；初值未知（amber）+
-            // 延遲佔位「—」（全 repo 無延遲測量源，不偽造 0.42ms）。
+            // Phase A：telemetry 行由 render() 綁定 hookStatus；初值未知（amber）。
+            // Phase G：延遲 pill 已移除（全 repo 無延遲測量源，不偽造 0.42ms，
+            // 死佔位「—」render 永不更新）。
             telemetryDot = ImageView(context).apply {
                 setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                 // Phase C: decorative (telemetry text carries the state).
@@ -1805,18 +1826,6 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             addView(telemetryStatusView)
-            telemetryLatencyView = TextView(context).apply {
-                text = getString(R.string.telemetry_latency_unknown)
-                textSize = 11f
-                // Phase C: blue-pill text (see hookSecPmTag).
-                setTextColor(getColor(R.color.oneui_on_primary_container))
-                background = getDrawable(R.drawable.bg_pill_badge_blue)
-                val hp = dp(6)
-                val vp = dp(2)
-                setPadding(hp, vp, hp, vp)
-                typeface = Typeface.MONOSPACE
-            }
-            addView(telemetryLatencyView)
         }
         telemetryBanner.addView(telemetryBottomRow)
         engineMasterCard.addView(telemetryBanner)
@@ -2093,9 +2102,16 @@ class MainActivity : ComponentActivity() {
             appIconView.tag = appKey
             requestIcon(pkg, appKey, appIconView, gen)
             val badgeView = TextView(this).apply {
-                layoutParams = FrameLayout.LayoutParams(dp(18), dp(18)).apply {
+                // Phase G: WRAP_CONTENT + min 18dp (was fixed 18dp, clipped
+                // cloned>=100 at 10sp); large counts grow instead of clipping.
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ).apply {
                     gravity = Gravity.BOTTOM or Gravity.END
                 }
+                minimumWidth = dp(18)
+                minimumHeight = dp(18)
                 background = getDrawable(R.drawable.bg_dual_badge)
                 // Phase C: badge number via resources (was hardcoded "2") with
                 // theme token text (see cloneBtn); context description is set
@@ -2196,7 +2212,8 @@ class MainActivity : ComponentActivity() {
                 minimumWidth = dp(48)
                 // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
                 tag = "switch:$pkg"
-                contentDescription = "${getString(R.string.action_remove)}: $label"
+                // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
+                contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
                     try {
                         (v as? Switch)?.isChecked = true
@@ -2232,7 +2249,8 @@ class MainActivity : ComponentActivity() {
                             // Best effort.
                         }
                         try {
-                            toggleSwitch.contentDescription = "${getString(R.string.action_remove)}: $fresh"
+                            // Phase G: full-width colon via remove_row_cd.
+                            toggleSwitch.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
                         } catch (_: Exception) {
                             // Best effort.
                         }
@@ -2402,7 +2420,9 @@ class MainActivity : ComponentActivity() {
                         shizukuFallbackDescView.text = getString(R.string.shizuku_state_no_binder)
                         shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_nobinder)
                         shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_gray)
-                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_tertiary))
+                        // Phase G: secondary (light #475569 on #DFE7F0 = 6.07;
+                        // tertiary was 3.81, failed 4.5).
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_secondary))
                     }
                     ShizukuCardStatus.UNAUTHORIZED -> {
                         shizukuFallbackDescView.text = getString(R.string.shizuku_state_unauth)
@@ -2414,7 +2434,9 @@ class MainActivity : ComponentActivity() {
                         shizukuFallbackDescView.text = getString(R.string.shizuku_state_ok)
                         shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_standby)
                         shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
-                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_tertiary))
+                        // Phase G: secondary (light #475569 on #FEF3C7 = 6.81;
+                        // tertiary was 4.27, failed 4.5).
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_secondary))
                     }
                 }
             }
@@ -2537,7 +2559,13 @@ class MainActivity : ComponentActivity() {
         title = try {
             getString(R.string.recents_title_format, getString(R.string.app_name), s.execIdentity, s.resolvedGateway)
         } catch (_: Exception) {
-            "Galaxy Dual Plus (${s.execIdentity}/${s.resolvedGateway})"
+            // Phase G: fallback also resourced (was hardcoded English format);
+            // app_name is the localized product name.
+            try {
+                "${getString(R.string.app_name)} (${s.execIdentity}/${s.resolvedGateway})"
+            } catch (_: Exception) {
+                "Galaxy Dual Plus (${s.execIdentity}/${s.resolvedGateway})"
+            }
         }
         // Picker state: persisted preference + actual resolved gateway
         // (restart remembers the preference via SharedPreferences; see
@@ -2667,7 +2695,9 @@ class MainActivity : ComponentActivity() {
                         statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                         statusPillDot.visibility = View.VISIBLE
                         statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_gray)
-                        statusPillText.setTextColor(getColor(R.color.oneui_text_tertiary))
+                        // Phase G: secondary (light #475569 on #DFE7F0 = 6.07;
+                        // tertiary was 3.81, failed 4.5).
+                        statusPillText.setTextColor(getColor(R.color.oneui_text_secondary))
                     }
                     ResolvedChannel.ROOT -> {
                         val writable = writeBlockReason(s) == null
@@ -2759,6 +2789,31 @@ class MainActivity : ComponentActivity() {
             }
             for (badge in checklistItemBadges) {
                 badge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            // Phase G: checklist icons are build-time green/blue; without Hook
+            // proof they must not signal success -- gray them via tertiary.
+            // Tertiary as icon (non-text, 3:1) is 5.19 on island #E8EEF5.
+            for (i in checklistItemIcons.indices) {
+                try {
+                    checklistItemIcons[i].setColorFilter(
+                        getColor(
+                            if (hookProvenActive) {
+                                if (checklistItemIsGreen.getOrElse(i) { true }) R.color.oneui_secondary else R.color.oneui_primary
+                            } else {
+                                R.color.oneui_text_tertiary
+                            },
+                        ),
+                    )
+                } catch (_: Exception) {
+                    // Best effort: render may run before buildUi in tests.
+                }
+            }
+            try {
+                engineUidIcon?.setColorFilter(
+                    getColor(if (hookProvenActive) R.color.oneui_secondary else R.color.oneui_text_tertiary),
+                )
+            } catch (_: Exception) {
+                // Best effort: render may run before buildUi in tests.
             }
         } catch (e: Exception) {
             Log.w(TAG, "render OneUI badges failed", e)
@@ -3361,8 +3416,9 @@ class MainActivity : ComponentActivity() {
                     // Best effort.
                 }
                 try {
+                    // Phase G: full-width colon via remove_row_cd.
                     row.findViewWithTag<Switch>("switch:$pkg")?.contentDescription =
-                        "${getString(R.string.action_remove)}: $label"
+                        getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 } catch (_: Exception) {
                     // Best effort.
                 }
