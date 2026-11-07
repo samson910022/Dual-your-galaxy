@@ -7,6 +7,8 @@
      DiagnoseStrings status lines stay Traditional Chinese (scope-limited). -->
 <resources xmlns:tools="http://schemas.android.com/tools">
     <string name="pkg_input_hint">Package name (e.g. com.example.app)</string>
+    <!-- Blank-disabled perceivable reason: empty + writable channel disables clone/remove solely on empty input (VM guards untouched, UI-only hint). -->
+    <string name="pkg_input_required">Enter a package name (clone/remove is disabled while empty)</string>
     <string name="action_clone">Clone</string>
     <string name="action_remove">Remove</string>
     <string name="remove_cd">Remove clone (requires confirmation; the first tap only opens the dialog)</string>

@@ -9,6 +9,8 @@
 <resources>
     <!-- 手動包名入口（進階）：單行、IME 完成鍵、就地驗證；Enter 只驗證不移除。 -->
     <string name="pkg_input_hint">套件名稱（例如 com.example.app）</string>
+    <!-- 空白禁用可感知理由：空白且通道可寫時 clone/remove 禁用的唯一原因是輸入空白（VM 守衛不動，僅 UI 層提示）。 -->
+    <string name="pkg_input_required">請先輸入包名（空白時建立／移除分身已禁用）</string>
     <!-- 主要動作：#28 統一繁中「建立分身／移除分身」。 -->
     <string name="action_clone">建立分身</string>
     <string name="action_remove">移除分身</string>

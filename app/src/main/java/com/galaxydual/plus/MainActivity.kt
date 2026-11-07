@@ -179,6 +179,9 @@ class MainActivity : ComponentActivity() {
     private var removeConfirmDialog: AlertDialog? = null
     private var removeLabelsDialog: AlertDialog? = null
     private var removeAcknowledged = false
+    // 勾選綁定世代：同一 pending 世代（generation）內保留勾選，跨世代重置；
+    // Neutral（標籤詳情）不解散父對話框、不重置此狀態；旋轉經 Bundle 保留。
+    private var acknowledgedGeneration: Long? = null
     private var shownPending: PendingRemove? = null
 
     // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
@@ -241,6 +244,14 @@ class MainActivity : ComponentActivity() {
         lastWriteBlockText = savedInstanceState?.getString(KEY_WRITE_BLOCK_TEXT)
         lastWriteBlockDedupKey = savedInstanceState?.getString(KEY_WRITE_BLOCK_DEDUP)
         lastMsgText = savedInstanceState?.getString(KEY_MSG_TEXT)
+        // 移除確認勾選綁定世代保留：同世代旋轉保留勾選，跨世代重置。
+        removeAcknowledged = savedInstanceState?.getBoolean(KEY_REMOVE_ACK) ?: false
+        acknowledgedGeneration =
+            if (savedInstanceState?.containsKey(KEY_REMOVE_ACK_GEN) == true) {
+                savedInstanceState.getLong(KEY_REMOVE_ACK_GEN)
+            } else {
+                null
+            }
         buildUi()
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
         // manager (or an unexpected API failure) never crashes the UI.
@@ -303,6 +314,9 @@ class MainActivity : ComponentActivity() {
         if (lastWriteBlockText != null) outState.putString(KEY_WRITE_BLOCK_TEXT, lastWriteBlockText)
         if (lastWriteBlockDedupKey != null) outState.putString(KEY_WRITE_BLOCK_DEDUP, lastWriteBlockDedupKey)
         if (lastMsgText != null) outState.putString(KEY_MSG_TEXT, lastMsgText)
+        // 移除確認勾選綁定世代保留（Neutral 不重置，同世代旋轉保留）。
+        outState.putBoolean(KEY_REMOVE_ACK, removeAcknowledged)
+        if (acknowledgedGeneration != null) outState.putLong(KEY_REMOVE_ACK_GEN, acknowledgedGeneration!!)
     }
 
     override fun onDestroy() {
@@ -472,6 +486,9 @@ class MainActivity : ComponentActivity() {
             id = R.id.channel_group
             orientation = RadioGroup.HORIZONTAL
             contentDescription = getString(R.string.channel_group_cd)
+            // 無障礙語意：群組本身可被螢幕閱讀器聚焦（TalkBack 報讀群組用途），
+            // 四鈕互斥語意不變（仍為群組直屬子節點）。
+            isScreenReaderFocusable = true
         }
         // Channel picker: exactly the four ChannelPreference values (NoOp is
         // a fail-closed fallback, never a menu entry). Radio labels stay short
@@ -481,24 +498,29 @@ class MainActivity : ComponentActivity() {
             text = getString(R.string.channel_auto)
             // 窄螢幕可點按：WRAP_CONTENT＋最小寬（64dp），不靠 weight。
             minimumWidth = (64 * resources.displayMetrics.density).toInt()
+            // 無障礙觸控：最小高 48dp（TalkBack/手指可操作）。
+            minimumHeight = (48 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, allowPrivilegedHookDiagnosis = false) }
         }
         rootBtn = RadioButton(this).apply {
             id = R.id.channel_root
             text = getString(R.string.channel_root)
             minimumWidth = (64 * resources.displayMetrics.density).toInt()
+            minimumHeight = (48 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, allowPrivilegedHookDiagnosis = false) }
         }
         shizukuBtn = RadioButton(this).apply {
             id = R.id.channel_shizuku
             text = getString(R.string.channel_shizuku)
             minimumWidth = (64 * resources.displayMetrics.density).toInt()
+            minimumHeight = (48 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, allowPrivilegedHookDiagnosis = false) }
         }
         lsposedBtn = RadioButton(this).apply {
             id = R.id.channel_lsposed
             text = getString(R.string.channel_lsposed)
             minimumWidth = (64 * resources.displayMetrics.density).toInt()
+            minimumHeight = (48 * resources.displayMetrics.density).toInt()
             setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, allowPrivilegedHookDiagnosis = false) }
         }
         channelGroup.addView(autoBtn, radioParams())
@@ -922,6 +944,14 @@ class MainActivity : ComponentActivity() {
         if (hookText != null) {
             hookView.visibility = View.VISIBLE
             hookView.text = hookText
+            // LSPOSED 模式：手動診斷入口與可見同意說明同顯；按鈕 enable 仍走
+            // 共用 busy 門控（下方 hookDiagBtn.isEnabled = !busy，不在此強制啟用）。
+            try {
+                hookRow.visibility = View.VISIBLE
+                hookDiagHint.visibility = View.VISIBLE
+            } catch (_: Exception) {
+                // Best effort: render may run before buildUi in tests.
+            }
         } else {
             hookView.visibility = View.GONE
             try {
@@ -993,6 +1023,8 @@ class MainActivity : ComponentActivity() {
         }
         cloneBtn.isEnabled = cloneRemoveEnabled(s, manualActionable)
         removeBtn.isEnabled = cloneRemoveEnabled(s, manualActionable)
+        // 空白禁用可感知理由（VM 守衛不動，僅 UI 層提示；通道阻塞/忙碌由 writeBlockView/loading 承載）。
+        syncBlankInputA11y(s)
         refreshBtn.isEnabled = !busy
         autoBtn.isEnabled = !busy
         rootBtn.isEnabled = !busy
@@ -1131,6 +1163,7 @@ class MainActivity : ComponentActivity() {
                 cloneBtn.isEnabled = false
                 removeBtn.isEnabled = false
                 batchBtn.isEnabled = false
+                syncBlankInputA11y(s)
                 return
             }
             val manual = try {
@@ -1141,8 +1174,63 @@ class MainActivity : ComponentActivity() {
             cloneBtn.isEnabled = cloneRemoveEnabled(s, manual)
             removeBtn.isEnabled = cloneRemoveEnabled(s, manual)
             batchBtn.isEnabled = batchEnabled(s)
+            // 空白禁用可感知理由（VM 守衛不動，僅 UI 層提示）。
+            syncBlankInputA11y(s)
         } catch (_: Exception) {
             // Best effort: 輸入門控失敗不影響驗證顯示。
+        }
+    }
+
+    // 空白禁用可感知理由（VM 守衛不動，僅 UI 層提示）：空白且非 busy 且通道可寫時，
+    // clone/remove 禁用的唯一原因是輸入空白，給 pkgInput 可見 error＋contentDescription，
+    // 使禁用原因可感知；通道阻塞/忙碌時禁用原因由 writeBlockView/loading 承載，不疊加。
+    // 非法/超長的就地 error 由 TextWatcher 負責，此處不覆寫；有效輸入或阻塞/忙碌時清除
+    // 空白專用提示（僅當目前 error 正是該提示才清除，避免误删就地驗證）。
+    private fun syncBlankInputA11y(s: UiState) {
+        try {
+            if (!::pkgInput.isInitialized) return
+            val raw = try {
+                pkgInput.text?.toString().orEmpty()
+            } catch (_: Exception) {
+                return
+            }
+            val isBlank = raw.trim().isEmpty()
+            val writeBlocked = try {
+                writeBlockReason(s) != null
+            } catch (_: Exception) {
+                true
+            }
+            val wantBlankReason = shouldShowBlankInputReason(isBlank, s.loading, writeBlocked)
+            val required = try {
+                getString(R.string.pkg_input_required)
+            } catch (_: Exception) {
+                null
+            } ?: return
+            if (wantBlankReason) {
+                try {
+                    if (pkgInput.error?.toString() != required) pkgInput.error = required
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    pkgInput.contentDescription = required
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            } else {
+                try {
+                    if (pkgInput.error?.toString() == required) pkgInput.error = null
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    if (pkgInput.contentDescription?.toString() == required) pkgInput.contentDescription = null
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: 無障礙提示失敗不影響門控。
         }
     }
 
@@ -1168,6 +1256,9 @@ class MainActivity : ComponentActivity() {
             }
             removeConfirmDialog = null
             shownPending = null
+            // 無待確認即無世代可綁定：勾選與世代一併清除，避免殘留污染下一世代。
+            removeAcknowledged = false
+            acknowledgedGeneration = null
             return
         }
         if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
@@ -1187,7 +1278,12 @@ class MainActivity : ComponentActivity() {
             // Best effort.
         }
         shownPending = pending
-        removeAcknowledged = false
+        // 勾選綁定世代保留：同世代（Neutral 未解散/旋轉重建）保留勾選，跨世代重置。
+        // Neutral 走 null listener＋手動 OnClick（下），不解散父對話框，故不經此重置。
+        if (acknowledgedGeneration != pending.generation) {
+            removeAcknowledged = false
+            acknowledgedGeneration = null
+        }
         val appLabel = resolveAppLabel(pending.pkg)
         // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
         // 本地確認畫面顯示完整 package + user/serial，標籤則有明示的上限，
@@ -1212,6 +1308,8 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
             minimumHeight = (48 * d).toInt()
+            // 同世代重建（旋轉）恢復勾選；跨世代已在上重置為 false。
+            isChecked = removeAcknowledged
         }
         try {
             removeConfirmDialog = AlertDialog.Builder(this)
@@ -1234,8 +1332,11 @@ class MainActivity : ComponentActivity() {
         // 只調 VM 不 dismiss，對話框在 VM 結果回來前保持開啟；拒絕路徑 VM 清
         // pendingRemove，dialog 隨狀態關閉（需重新請求）；僅 overwrite/race 的
         // preserve 路徑（新 pending 保留）才不關。
+        // Neutral（標籤詳情）同式：null listener＋手動 OnClick 只展開子對話框，
+        // 不解散父確認框、不重置勾選（勾選綁定世代保留）。
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             removeAcknowledged = checked
+            acknowledgedGeneration = if (checked) pending.generation else null
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(vm.state.value.loading, checked)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
@@ -1562,6 +1663,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_WRITE_BLOCK_TEXT = "writeBlockText"
         private const val KEY_WRITE_BLOCK_DEDUP = "writeBlockDedup"
         private const val KEY_MSG_TEXT = "msgText"
+        // 移除確認勾選綁定世代保留鍵：同世代旋轉保留，跨世代重置；Neutral 不重置。
+        private const val KEY_REMOVE_ACK = "removeAck"
+        private const val KEY_REMOVE_ACK_GEN = "removeAckGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -1625,6 +1729,14 @@ internal fun manualInputActionable(raw: String): Boolean {
     return packageInputError(raw) == null
 }
 
+// 空白禁用可感知理由（純函數，JVM 可測；VM 守衛不動，僅 UI 層提示）。
+// 空白（trim 後空）且非 busy 且通道可寫（writeBlocked == false）時回 true：
+// 此時 clone/remove 禁用的唯一原因是輸入空白，須給 pkgInput 可見 error/helper＋
+// contentDescription（見 syncBlankInputA11y），不可靜默禁用；通道阻塞/忙碌時
+// 禁用原因由 writeBlockView/loading 承載，此處回 false（不疊加提示）。
+internal fun shouldShowBlankInputReason(isBlank: Boolean, busy: Boolean, writeBlocked: Boolean): Boolean =
+    isBlank && !busy && !writeBlocked
+
 // P2-2 目前 verified target 可用性（純函數，JVM 可測；batch enablement 用）。
 // UI 層近似門控：targetId > 0 且 targetSerial 非 null 才視為可用
 // （0 永不可寫；-1=NO_TARGET_ID 表未知；serial null 表 SerialUnavailable，
@@ -1663,13 +1775,21 @@ internal fun shouldUpdateCatalogErrorText(old: String?, new: String?): Boolean =
 
 // B1 去重鍵去時間（純函數，JVM 可測）：可見文字保留完整時間資訊，
 // 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
-// 剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、重啟舊資料 stale 提示
-// （時間衍生，隨 queriedAt 漂移出現/消失）；marker/查詢前綴與經真通道標記保留
-// （結構穩定，不同模板去重後仍不同文）。
+// 雙源時間正規化（probe HookDiagnosis.displayText 無時間 vs writeBlock
+// HookEvidence.displayText 有時間）：兩形經此剝除時間證據後綴收斂為同一基底，
+// 使去重鍵有效。剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、
+// 重啟舊資料 stale 提示、經真通道標記（時間/通道衍生，隨 queriedAt 漂移
+// 出現/消失），以及時間證據前綴「；marker時間=」「；marker 時間未知」
+// 「；查詢於」（結構分隔符，基底文案不含「；」，安全）。
 internal fun stripWriteBlockTimeParams(text: String): String {
-    var k = text.replace(Regex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}"), "")
+    var k = text.replace("（可能為重啟前舊資料，僅存在性證據）", "")
+    k = k.replace("（經真通道讀取）", "")
+    k = k.replace(Regex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}"), "")
     k = k.replace("從未查詢", "")
-    k = k.replace("（可能為重啟前舊資料，僅存在性證據）", "")
+    k = k.replace("；marker時間=", "")
+    k = k.replace("；marker 時間未知", "")
+    k = k.replace("；查詢於 ", "")
+    k = k.replace("；查詢於", "")
     return k
 }
 

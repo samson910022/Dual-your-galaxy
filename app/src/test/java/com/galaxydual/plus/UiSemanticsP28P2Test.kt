@@ -444,4 +444,89 @@ class UiSemanticsP28P2Test {
         val degrade = WriteBlock(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU)
         assertEquals(zhTestBlockText()(degrade), resolveZhTest(BlockReason.Keyed(degrade)))
     }
+
+    // ---- 雙源時間正規化：probe（HookDiagnosis.displayText 無時間）vs
+    // writeBlock（HookEvidence.displayText 有時間）收斂為同一去重鍵 ----
+
+    @Test
+    fun strip_normalizesProbeBaseAndEvidenceTime_noTimeVsTimed() {
+        // 無時間基底（probe 側 HookDiagnosis.displayText）。
+        val base = HookDiagnosis(HookStatus.INACTIVE).displayText()
+        // 有時間證據（writeBlock 側 HookEvidence.displayText）：無 marker、當次查詢時間。
+        val timed = HookEvidence(
+            status = HookStatus.INACTIVE,
+            queriedAtMs = 1_700_000_000_000,
+            markerTimeMs = null,
+            viaGateway = false,
+        ).displayText()
+        assertTrue("timed must carry time suffix, base=$base timed=$timed", timed != base)
+        assertTrue("timed must carry 查詢於", timed.contains("查詢於"))
+        assertEquals(stripWriteBlockTimeParams(base), stripWriteBlockTimeParams(timed))
+    }
+
+    @Test
+    fun strip_normalizesMarkerUnknownAndViaGateway() {
+        val base = HookDiagnosis(HookStatus.ACTIVE, setOf("scope-a")).displayText()
+        val timed = HookEvidence(
+            status = HookStatus.ACTIVE,
+            scopes = setOf("scope-a"),
+            queriedAtMs = 1_700_000_000_000,
+            markerTimeMs = null,
+            viaGateway = true,
+        ).displayText()
+        assertTrue(timed.contains("經真通道讀取"))
+        assertEquals(stripWriteBlockTimeParams(base), stripWriteBlockTimeParams(timed))
+    }
+
+    @Test
+    fun strip_normalizesQueriedAtZeroVsTimed() {
+        // 查詢時間 0（從未查詢）vs 有時間：去重鍵亦收斂（空態明確化不污染去重）。
+        val never = HookEvidence(
+            status = HookStatus.UNKNOWN_NO_DIAGNOSTIC,
+            queriedAtMs = 0L,
+            markerTimeMs = null,
+            viaGateway = false,
+        ).displayText()
+        val timed = HookEvidence(
+            status = HookStatus.UNKNOWN_NO_DIAGNOSTIC,
+            queriedAtMs = 1_700_000_000_000,
+            markerTimeMs = null,
+            viaGateway = false,
+        ).displayText()
+        assertTrue(never.contains("從未查詢"))
+        assertTrue(never != timed)
+        assertEquals(stripWriteBlockTimeParams(never), stripWriteBlockTimeParams(timed))
+    }
+
+    @Test
+    fun dedup_lsposedProbeVsWriteBlock_isDuplicateAndSameKey() {
+        // 端到端：probe 文（無時間經 block 包裝）vs writeBlock 文（有時間）同文判重，
+        // 去重鍵相等（時間戳漂移不拆鍵）。
+        val probeBase = HookDiagnosis(HookStatus.INACTIVE).displayText()
+        val evidenceTimed = HookEvidence(
+            status = HookStatus.INACTIVE,
+            queriedAtMs = 1_700_000_060_000,
+            markerTimeMs = null,
+            viaGateway = false,
+        ).displayText()
+        val probeText = zhTestBlockText()(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(probeBase)))
+        val writeText = zhTestBlockText()(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(evidenceTimed)))
+        assertTrue(probeText != writeText)
+        assertTrue(isWriteBlockDuplicate(writeText, probeText, false))
+        assertEquals(
+            writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(probeBase)))),
+            writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(evidenceTimed)))),
+        )
+        assertFalse(shouldAnnounceMsg(stripWriteBlockTimeParams(writeText), stripWriteBlockTimeParams(probeText)))
+    }
+
+    // ---- 空白禁用可感知理由（VM 守衛不動，純函數門控） ----
+
+    @Test
+    fun blankReason_onlyBlankWritableIdle_shows() {
+        assertTrue(shouldShowBlankInputReason(isBlank = true, busy = false, writeBlocked = false))
+        assertFalse(shouldShowBlankInputReason(isBlank = true, busy = true, writeBlocked = false))
+        assertFalse(shouldShowBlankInputReason(isBlank = true, busy = false, writeBlocked = true))
+        assertFalse(shouldShowBlankInputReason(isBlank = false, busy = false, writeBlocked = false))
+    }
 }
