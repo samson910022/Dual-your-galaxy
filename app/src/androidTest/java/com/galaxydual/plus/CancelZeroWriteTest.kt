@@ -10,12 +10,14 @@
 package com.galaxydual.plus
 
 import android.view.View
+import android.widget.Button
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -84,12 +86,30 @@ class CancelZeroWriteTest {
     // Activity smoke（無寫入）：啟動只斷言按鈕渲染，不觸發任何寫入路徑。
     @Test
     fun activity_launchesWithoutWrite() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.onActivity { activity ->
-                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
-                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
-                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { activity ->
+                    val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                    assertNotNull(cloneBtn)
+                    assertEquals(View.VISIBLE, cloneBtn.visibility)
+                    assertTrue(cloneBtn.isShown)
+                    val removeBtn = activity.findViewById<Button>(R.id.remove_btn)
+                    assertNotNull(removeBtn)
+                    assertEquals(View.VISIBLE, removeBtn.visibility)
+                    assertTrue(removeBtn.isShown)
+                    val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                    assertNotNull(refreshBtn)
+                    assertEquals(View.VISIBLE, refreshBtn.visibility)
+                    assertTrue(refreshBtn.isShown)
+                }
             }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
         }
     }
 }

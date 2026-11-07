@@ -10,12 +10,14 @@
 package com.galaxydual.plus
 
 import android.view.View
+import android.widget.Button
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -73,19 +75,52 @@ class BackgroundReturnTest {
     // Activity 後台往返：不崩潰，返回後按鈕仍可見（無寫入）。
     @Test
     fun activity_backgroundReturn_renders() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.onActivity { activity ->
-                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
-                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
-                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
+        val gw = FakeHarnessGateway(dualId = 95)
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { activity ->
+                    val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                    assertNotNull(cloneBtn)
+                    assertTrue(cloneBtn is Button)
+                    assertEquals(View.VISIBLE, cloneBtn.visibility)
+                    assertTrue(cloneBtn.isShown)
+                    val removeBtn = activity.findViewById<Button>(R.id.remove_btn)
+                    assertNotNull(removeBtn)
+                    assertTrue(removeBtn is Button)
+                    assertEquals(View.VISIBLE, removeBtn.visibility)
+                    assertTrue(removeBtn.isShown)
+                    val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                    assertNotNull(refreshBtn)
+                    assertTrue(refreshBtn is Button)
+                    assertEquals(View.VISIBLE, refreshBtn.visibility)
+                    assertTrue(refreshBtn.isShown)
+                }
+                scenario.moveToState(Lifecycle.State.CREATED)
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                scenario.onActivity { activity ->
+                    val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                    assertNotNull(cloneBtn)
+                    assertTrue(cloneBtn is Button)
+                    assertEquals(View.VISIBLE, cloneBtn.visibility)
+                    assertTrue(cloneBtn.isShown)
+                    val removeBtn = activity.findViewById<Button>(R.id.remove_btn)
+                    assertNotNull(removeBtn)
+                    assertTrue(removeBtn is Button)
+                    assertEquals(View.VISIBLE, removeBtn.visibility)
+                    assertTrue(removeBtn.isShown)
+                    val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                    assertNotNull(refreshBtn)
+                    assertTrue(refreshBtn is Button)
+                    assertEquals(View.VISIBLE, refreshBtn.visibility)
+                    assertTrue(refreshBtn.isShown)
+                }
             }
-            scenario.moveToState(Lifecycle.State.CREATED)
-            scenario.moveToState(Lifecycle.State.RESUMED)
-            scenario.onActivity { activity ->
-                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
-                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
-                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
-            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
         }
     }
 }
