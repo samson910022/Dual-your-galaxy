@@ -50,6 +50,11 @@
          Known residual: oneui_warning text on light containers is 2.55-3.19
          (below AA 4.5); text darkening is follow-up scope, not this change. -->
     <color name="oneui_warning_container">#FEF3C7</color>
+    <!-- Phase D: warning *text* token (light #92400E: 6.37 on
+         warning_container #FEF3C7, 7.09 on assumed #FFFFFF; oneui_warning
+         #D97706 as text is only 2.55-3.19, below AA 4.5. Icons/strokes keep
+         oneui_warning, non-text 3:1). -->
+    <color name="oneui_warning_text">#92400E</color>
     <!-- Phase C: primary-button text token. Light #FFFFFF on oneui_primary
          #0066D6 = 5.42 (AA pass). Night value differs (see values-night):
          white on night primary #0381FE is only 3.77, so night buttons/badges
