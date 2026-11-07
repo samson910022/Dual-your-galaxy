@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="@color/oneui_primary_tint">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/oneui_primary" />
+            <corners android:radius="9999dp" />
+        </shape>
+    </item>
+</ripple>
