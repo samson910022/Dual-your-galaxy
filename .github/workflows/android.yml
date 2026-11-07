@@ -260,7 +260,10 @@ jobs:
           grep -F 'injectedActiveLabel.visibility = if (hookLiveProven)' "$MA"
           grep -F 'daemonFooter.visibility = if (hookLiveProven)' "$MA"
           grep -F 'residentBadge.visibility = if (hookLiveProven)' "$MA"
-          grep -F 'when (hookLiveDisplay(s))' "$MA"
+          # Phase 3 P2 perf: render hoists hookLiveDisplay(s) once into hookDisplay
+          # (val hookDisplay = hookLiveDisplay(s)); both when-branches consume it.
+          grep -F 'val hookDisplay = hookLiveDisplay(s)' "$MA"
+          [ "$(grep -c -F 'when (hookDisplay)' "$MA")" = "2" ] || exit 1
           grep -F 'checklistSummaryView.text = if (hookLiveProven)' "$MA"
           echo "PASS: honesty gate"
       # H1 no-touch gates: Knox/Secure Folder + GPL code containment.

@@ -2265,9 +2265,12 @@ class MainActivity : ComponentActivity() {
                 // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
                 contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
-                    // Phase 1a 縱深：disabled 陳舊點按不得進入 requestRemove（按鈕層已有門控，此處再守一層）。
+                    // 僅以 live View.isEnabled 門控：early-return 路徑每輪 render 皆同步
+                    // enabled，此處 captured `writable`（重建時快照）可能陳舊——fingerprint
+                    // 未變不重建時，writable 翻轉只經 live sync 反映到 View。陳舊 !writable
+                    // 會誤擋有效點按；VM requestRemove 內含 fail-closed isWritable() 複查
+                    // （權威門控，與 a28b56c 行為一致），此處不再用 captured 值攔截。
                     if (v?.isEnabled != true) return@setOnClickListener
-                    if (!writable) return@setOnClickListener
                     try {
                         (v as? Switch)?.isChecked = true
                     } catch (_: Exception) {
