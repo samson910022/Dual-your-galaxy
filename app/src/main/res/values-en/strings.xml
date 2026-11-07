@@ -145,8 +145,6 @@
     <string name="diag_checklist_title">System Hook Diagnostic Checklist</string>
     <string name="diag_item_framework_title">Samsung Framework Hook</string>
     <string name="diag_item_framework_desc">Intercept SecPackageHook and system signatures</string>
-    <string name="diag_item_isolation_title">Knox / Secure Folder Isolation Bypass</string>
-    <string name="diag_item_isolation_desc">Bypass restrictions without creating work folders</string>
     <string name="diag_item_multiuser_title">Multi-User ID Allocation</string>
     <string name="diag_item_multiuser_desc">Core sandbox virtual user slot</string>
     <string name="diag_item_push_title">Push Notification Sync Mechanism</string>
@@ -154,7 +152,6 @@
     <string name="diag_item_badge_title">Dual App Badge Appearance</string>
     <string name="diag_item_badge_desc">Desktop shortcut corner badge visual</string>
     <string name="badge_status_normal">Normal</string>
-    <string name="badge_status_bypassed">Bypassed</string>
     <string name="badge_status_isolated">Isolated</string>
     <string name="badge_status_dual_tag">Dual Badge</string>
     <string name="btn_clear_search">Clear Search</string>
@@ -163,7 +160,7 @@
     <string name="section_channel_preference">Channel Preference</string>
     <string name="section_profiles_diagnostics">Profiles &amp; Diagnostics</string>
     <string name="status_hook_injected_active">● Hook Active &amp; Injected</string>
-    <string name="engine_diag_all_normal">5/5 Modules Operational</string>
+    <string name="engine_diag_all_normal">4/4 Modules Operational</string>
     <string name="telemetry_status_active">Active &amp; Injected</string>
     <!-- Phase G: telemetry_latency_unknown removed with the dead latency pill
          (no latency source in repo); key removed from all three locales. -->
