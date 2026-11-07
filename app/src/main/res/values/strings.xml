@@ -124,7 +124,7 @@
     <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>
     <string name="hook_badge_uid_sandbox">獨立 UID 沙盒</string>
     <string name="stats_native_whitelist">官方原生白名單</string>
-    <string name="stats_injected_count">已強制注入解除</string>
+    <string name="stats_injected_count">已分身/已安裝（pm 可見）</string>
     <string name="stats_hook_status">Hook 攔截狀態</string>
     <string name="stats_hook_active">正常監聽</string>
     <string name="stats_unit_apps">款</string>
@@ -167,8 +167,9 @@
     <string name="telemetry_latency_unknown">—</string>
     <!-- Phase C: UID 技術詞中文化（英文版保留 UID）。engine_uid_unknown 為初始佔位。 -->
     <string name="engine_uid_label">使用者識別碼：%1$d</string>
-    <!-- Phase C: zh (Hook) 改（注入）；英文版保留 (Hook)。 -->
-    <string name="stats_injected_format">%1$d %2$s（注入）</string>
+    <!-- Phase C: zh (Hook) 改（注入）；英文版保留 (Hook)。
+         Phase E E3：改中性（pm 可見），數字語意不變。 -->
+    <string name="stats_injected_format">%1$d %2$s（pm 可見）</string>
     <!-- Phase C: zh UID 改使用者識別碼（subtitle 空間不足時 ellipsize）。 -->
     <string name="app_dual_unlocked_format">%1$s · 使用者識別碼 %2$d</string>
     <!-- Phase A 誠實狀態顯示（P0 correctness）：Hook/通道狀態一律由探測信號驅動，

@@ -122,7 +122,10 @@
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
     <string name="hook_badge_uid_sandbox">Isolated UID Sandbox</string>
     <string name="stats_native_whitelist">Native Whitelist</string>
-    <string name="stats_injected_count">Force Injected</string>
+    <!-- Phase E E3 honesty: this count is pm-visible clones only
+         (s.cloned.size), not Hook-injection proof; neutral wording,
+         number semantics unchanged. -->
+    <string name="stats_injected_count">Cloned (pm visible)</string>
     <string name="stats_hook_status">Hook Status</string>
     <string name="stats_hook_active">Active Monitoring</string>
     <string name="stats_unit_apps">apps</string>
@@ -164,7 +167,7 @@
     <string name="telemetry_status_active">Active &amp; Injected</string>
     <string name="telemetry_latency_unknown">—</string>
     <string name="engine_uid_label">UID: %1$d</string>
-    <string name="stats_injected_format">%1$d %2$s (Hook)</string>
+    <string name="stats_injected_format">%1$d %2$s (pm visible)</string>
     <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
     <!-- Phase A honest state (P0 correctness): Hook/channel badges are always
          driven by probe signals; unknown/placeholder without a signal. The

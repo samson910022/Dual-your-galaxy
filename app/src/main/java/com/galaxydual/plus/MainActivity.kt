@@ -2013,6 +2013,9 @@ class MainActivity : ComponentActivity() {
     // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
     private fun renderClonedApps(s: UiState, blockKey: BlockReason?) {
         if (!::clonedAppsContainer.isInitialized) return
+        // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook 證據驅動（與徽章區同源），
+        // 無證據時 GONE，不得無條件宣稱注入成功。
+        val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
         val key = buildClonedListKey(s)
         if (key == lastClonedListKey) {
             val writable = blockKey == null
@@ -2068,7 +2071,9 @@ class MainActivity : ComponentActivity() {
                 // itself is decorative.
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
-            val appKey = "${s.inventory.targetSerial ?: 0}:$pkg"
+            // Phase E E5：serial null 用不可碰撞 token "na"（"na:$pkg"），
+            // 不得 ?: 0（與真 serial "0" 碰撞，跨列表重綁錯圖）。
+            val appKey = "${s.inventory.targetSerial ?: "na"}:$pkg"
             appIconView.tag = appKey
             requestIcon(pkg, appKey, appIconView, gen)
             val badgeView = TextView(this).apply {
@@ -2119,6 +2124,8 @@ class MainActivity : ComponentActivity() {
             }
             val tagView = TextView(this).apply {
                 text = getString(R.string.tag_forced_injected)
+                // Phase E E2：見函數入口 hookProvenActive（無證據 GONE）。
+                visibility = if (hookProvenActive) View.VISIBLE else View.GONE
                 textSize = 10f
                 // Phase C: blue-pill text (see hookSecPmTag).
                 setTextColor(getColor(R.color.oneui_on_primary_container))
@@ -2134,7 +2141,12 @@ class MainActivity : ComponentActivity() {
             titleRow.addView(tagView)
 
             val subtitleView = TextView(this).apply {
-                text = getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
+                // Phase E E1：targetId 未知時只顯示 desc，不把 -1 格式化進文案。
+                text = if (s.inventory.targetId > NO_TARGET_ID) {
+                    getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
+                } else {
+                    getString(R.string.app_dual_unlocked_desc)
+                }
                 textSize = 12f
                 // Phase C: tint (light #046C4E on #DFE7F0 = 5.16; #059669 was
                 // 3.02).
@@ -2169,9 +2181,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋loading）。
-    private fun buildClonedListKey(s: UiState): String =
-        "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.loading}"
+    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋targetId＋loading
+    // ＋hook 哨兵態）。Phase E E4：納入 targetId（subtitle 含 targetId，
+    // 未納入則目標切換留殘留舊值）；E2 哨兵態亦須入指紋（tag 顯隱由 hook
+    // 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
+    private fun buildClonedListKey(s: UiState): String {
+        val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookProvenActive"
+    }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
     // (buildDiagnosticExport 經四道遮蔽：先郵件後包名後 IP，最後路徑，大小受限)；只有使用者
@@ -2519,7 +2536,13 @@ class MainActivity : ComponentActivity() {
                 clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
             }
             if (::engineUidSlotView.isInitialized) {
-                engineUidSlotView.text = getString(R.string.engine_uid_label, s.inventory.targetId)
+                // Phase E E1：targetId 未知（NO_TARGET_ID=-1）時顯示未知佔位，
+                // 不得將 -1 格式化進 UID 文案（外洩＋TalkBack 誤讀）；a11y P0。
+                engineUidSlotView.text = if (s.inventory.targetId > NO_TARGET_ID) {
+                    getString(R.string.engine_uid_label, s.inventory.targetId)
+                } else {
+                    getString(R.string.engine_uid_unknown)
+                }
             }
             // Phase A A1：Hero 第三格由 hookStatus 驅動；非 LSPOSED 通道整格隱藏
             // （對齊 renderHookText 回 null 條件：channel != LSPOSED）。
@@ -2667,7 +2690,8 @@ class MainActivity : ComponentActivity() {
         // is gated on busy only (never on writability: switching is the
         // recovery path out of an unwritable channel).
         // PR-37 P3 按鈕狀態：busy 時勾選相關一律禁用（批次執行中不可改勾選）；
-        // batch 需非 busy 且有勾選；保存需已知目標 (targetId > 0)。
+        // batch 需非 busy 且有勾選；保存需 verified target 可用（見 E6，
+        // 與 batchEnabled 同源 verifiedTargetAvailable）。
         // p28-1 enabled 反映可寫能力：clone/remove/batch 另須可寫
         // (writeBlockReason == null)；禁用原因由 writeBlockView 顯示
         // （VM 拒絕理由 single source，VM guard 保留在 isWritable 內）。
@@ -2708,7 +2732,9 @@ class MainActivity : ComponentActivity() {
         systemToggleBtn.isEnabled = !busy
         selectAllBtn.isEnabled = !busy
         clearSelBtn.isEnabled = !busy
-        saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
+        // Phase E E6：save 門對齊 verifiedTargetAvailable（targetId>0 且
+        // serial 非 null，與 batch 同源）；VM persistSelection 守衛不動。
+        saveSelBtn.isEnabled = !busy && verifiedTargetAvailable(s)
         cancelSaveBtn.isEnabled = !busy
         batchBtn.isEnabled = batchEnabled(s)
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
