@@ -51,6 +51,17 @@ const val NO_TARGET_ID: Int = -1
 // 時已驗證的 pending，不再檢查。
 const val MAX_PACKAGE_INPUT_CHARS: Int = 256
 
+// Phase 3 P2 B2: producer/stripper 共享字面 (single source)：
+// Hook 時間證據後綴 (timeEvidenceText 產出) 與 MainActivity
+// stripWriteBlockTimeParams (去重比對前剝除) 必須一字不差；抽為 const
+// 防漂移。值與既有字面完全一致 (全形；分號/標記)，行為不變。
+const val NEVER_QUERIED_TEXT: String = "從未查詢"
+const val MARKER_TIME_PREFIX: String = "；marker時間="
+const val MARKER_TIME_UNKNOWN_TEXT: String = "；marker 時間未知"
+const val QUERY_TIME_PREFIX: String = "；查詢於"
+const val STALE_EVIDENCE_HINT: String = "（可能為重啟前舊資料，僅存在性證據）"
+const val VIA_GATEWAY_SUFFIX: String = "（經真通道讀取）"
+
 // 清單新鮮度：FRESH=本次查詢可信；STALE=舊資料 (目標已變/通道已失/過期)；
 // UNKNOWN=從未成功查到或上次查詢不可信。
 enum class InventoryFreshness {
@@ -166,7 +177,7 @@ data class LastOperation(
 // 使用 java.text/java.util (JVM/Android 內建)，不加其他依賴。
 internal fun formatTimeMs(ms: Long): String =
     if (ms <= 0L) {
-        "從未查詢"
+        NEVER_QUERIED_TEXT
     } else {
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(ms))
     }
@@ -209,16 +220,16 @@ fun HookEvidence.displayText(): String {
 
 // 時間證據後綴 (internal 供 MainActivity hook 行共用，免內聯重寫)。
 internal fun HookEvidence.timeEvidenceText(): String {
-    val timePart = if (markerTimeMs != null) "；marker時間=${formatTimeMs(markerTimeMs)}" else "；marker 時間未知"
-    val qPart = "；查詢於 ${formatTimeMs(queriedAtMs)}"
+    val timePart = if (markerTimeMs != null) "$MARKER_TIME_PREFIX${formatTimeMs(markerTimeMs)}" else MARKER_TIME_UNKNOWN_TEXT
+    val qPart = "$QUERY_TIME_PREFIX ${formatTimeMs(queriedAtMs)}"
     val stalePart = if (markerTimeMs != null && markerTimeMs > 0L && queriedAtMs > 0L &&
         (queriedAtMs - markerTimeMs) > INVENTORY_STALE_AFTER_MS
     ) {
-        "（可能為重啟前舊資料，僅存在性證據）"
+        STALE_EVIDENCE_HINT
     } else {
         ""
     }
-    val viaPart = if (viaGateway) "（經真通道讀取）" else ""
+    val viaPart = if (viaGateway) VIA_GATEWAY_SUFFIX else ""
     return timePart + qPart + stalePart + viaPart
 }
 

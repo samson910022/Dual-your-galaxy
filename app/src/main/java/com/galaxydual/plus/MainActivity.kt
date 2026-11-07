@@ -40,7 +40,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.app.AlertDialog
@@ -53,6 +53,8 @@ import android.os.UserManager
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.util.Log
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -61,14 +63,18 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -80,9 +86,11 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
 import java.io.File
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
@@ -163,7 +171,10 @@ class MainActivity : ComponentActivity() {
     // itself on a true channel. Enable still follows the shared busy gate.
     private lateinit var hookRow: LinearLayout
     private lateinit var msgView: TextView
-    private var defaultMsgColor: Int = Color.BLACK
+    // Phase C: default message color resolves the oneui_text_primary token
+    // lazily (post-attach; replaces the old Color.BLACK literal so production
+    // never bypasses the theme token; JVM tests never touch Activity state).
+    private val defaultMsgColor: Int by lazy { getColor(R.color.oneui_text_primary) }
     // p28-1 禁用原因行：主操作（建立/移除分身）因通道不可寫被禁用時顯示
     // VM 拒絕理由（writeBlockReason 資源鍵經 Context 解析，與點按拒絕同文）；可寫或忙碌時隱藏。
     private lateinit var writeBlockView: TextView
@@ -198,6 +209,7 @@ class MainActivity : ComponentActivity() {
     // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
+    private var settingsDialog: AlertDialog? = null
 
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
@@ -214,11 +226,66 @@ class MainActivity : ComponentActivity() {
     // PR-37 Phase C #4 圖示 in-flight 追蹤（與已載入分離）：IO 在途的 appKey，
     // 避免同一指紋重建/重繪重複打 PackageManager；成功才 markLoaded。
     private val iconInflight = mutableSetOf<String>()
+    // Phase F F4：圖示 IO 併發上限。來源列表首輪 miss 最多 200 行（MAX_SOURCE_ROWS
+    // 封頂）同時觸發 loadIcon；無上限時 200 個 coroutine 同時打 PackageManager
+    //（binder 突發）。Semaphore(4) 節流，permit 只在 IO 等待期間持有；超額請求在
+    // Activity 作用域排隊，銷毀隨 lifecycleScope 取消。在途去重仍由 iconInflight 承擔。
+    private val iconLoadSemaphore = Semaphore(4)
 
     // PR-6 P2 (#27 後半)：診斷技術細節展開開關 + 最近一次渲染狀態
     // (點診斷行切換展開/收合，需重渲染同一狀態)。
     private var diagExpanded: Boolean = false
     private var lastState: UiState? = null
+
+    // One UI 6 Navigation & Layout Fields
+    private var currentTab: Int = TAB_DUAL_APPS
+    private lateinit var tabAppsScroll: ScrollView
+    private lateinit var tabEngineScroll: ScrollView
+    private lateinit var heroCategoryView: TextView
+    private lateinit var heroTitleView: TextView
+    private lateinit var heroSubtitleView: TextView
+    private lateinit var statusPillText: TextView
+    private lateinit var statusPillDot: ImageView
+    private lateinit var statusPillContainer: LinearLayout
+    private lateinit var clonedCountStatView: TextView
+    // Phase B P2-2：Hook 卡片副標題 channel-aware（render 內 writeBlockReason
+    // 門控切換 hook_mode_subtitle / _ops；初值白名單文案，fail-closed）。
+    private lateinit var hookDescView: TextView
+    private lateinit var clonedCountBadge: TextView
+    private lateinit var clonedAppsContainer: LinearLayout
+    private lateinit var navTabApps: LinearLayout
+    private lateinit var navTabEngine: LinearLayout
+    private lateinit var navTabSettings: LinearLayout
+    private lateinit var clearSearchBtn: View
+    private lateinit var engineUidSlotView: TextView
+    // Phase A 誠實狀態顯示：Hook stat cell（A1）與信號驅動徽章（A3）皆由 render()
+    // 綁定 hookStatus / resolvedGateway；Shizuku 備援卡片（A4）由 updateShizukuLine()
+    // 經 resolveShizukuCardStatus 同源驅動。
+    private lateinit var hookStatusCell: LinearLayout
+    private lateinit var hookStatusDot: ImageView
+    private lateinit var hookStatusText: TextView
+    private lateinit var hookBadgeChip: TextView
+    private lateinit var hookSecPmTag: TextView
+    private lateinit var hookUidSandboxTag: TextView
+    private lateinit var injectedActiveLabel: TextView
+    private lateinit var daemonFooter: LinearLayout
+    private lateinit var residentBadge: TextView
+    private lateinit var telemetryDot: ImageView
+    private lateinit var telemetryStatusView: TextView
+    // Phase G: telemetryLatencyView removed (dead "—" placeholder, no latency
+    // source in repo; render never updated it).
+    private lateinit var checklistSummaryView: TextView
+    private lateinit var shizukuFallbackDescView: TextView
+    private lateinit var shizukuFallbackBadgeView: TextView
+    // Phase A A3：診斷清單逐項徽章由 hookLiveProven 驅動（render 內 GONE 門控；
+    // Phase H：existence 不足，需 boot-fresh）。
+    private val checklistItemBadges = mutableListOf<TextView>()
+    // Phase G (honest icons)：診斷清單圖示建時綠/藍固定，未證實時須轉灰。
+    // 與徽章同源 hookLiveProven 驅動（render 內 setColorFilter）；isGreen 記
+    // 還原色（綠 secondary / 藍 primary），uidRow 另行綁定（見 engineUidIcon）。
+    private val checklistItemIcons = mutableListOf<ImageView>()
+    private val checklistItemIsGreen = mutableListOf<Boolean>()
+    private var engineUidIcon: ImageView? = null
 
     // PR-37 P3 差量渲染：上次全量重建來源列表的指紋
     // (catalog 引用+內容 hash+query+includeSystem+selectedKeys hash)。
@@ -226,8 +293,48 @@ class MainActivity : ComponentActivity() {
     private var lastSourceListKey: String? = null
     // catalog 載入失敗的獨立錯誤文案（與「尚未載入」區分；失敗保留舊列表）。
     private var catalogLoadError: String? = null
-    // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 取消前一個在途任務。
+    // Phase 3 P2 perf: catalog hash 快取 (referential identity)。
+    // sourceCatalog.hashCode() 為 O(catalog)；render 每幀經 catalogHashCached
+    // 計算 labelCacheKey/buildSourceListKey 指紋時，若引用未變直接回快取，
+    // 重算只在 !== 時發生。syncRemoveDialog 簽名被 seam 測試鎖定 (4-tuple)，
+    // 故其內 catalogLabelsFor 仍讀 vm.state.value (非 trivially safe，不動)。
+    private var lastCatalogHashRef: List<SourceAppEntry>? = null
+    private var lastCatalogHash: Int = 0
+    // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 遇在途直接共用，不取消重掃。
     private var catalogJob: Job? = null
+    // Phase K K2：Shizuku presence 快取在途任務（比照 catalogJob 3536-3537）：
+    // refresh/request 頭寫共用同一 Job 取消，避免 old-live 蓋 new-death。
+    private var shizukuPresenceJob: Job? = null
+    // P1：cancel 非真序列化（pingBinder blocking 不可取消，舊 IO 返回仍寫入
+    // last-writer-wins）。單調世代（比照 clonedGen 2066）：發起時主線 ++ 取值，
+    // IO 回主線後比對，過期丟棄；cancel 保留（快速釋放）＋gen 比對（正確性），雙保險。
+    private var shizukuGen = 0
+    // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
+    // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
+    private var lastClonedListKey: String? = null
+    // Phase B B2：分身列表世代 token。renderClonedApps 進入 ++，coroutine
+    // capture gen，完成時比對過期丟棄（避免重建後舊圖貼到新行）。
+    private var clonedGen = 0
+    // Phase B B4：pkg→label 內存快取（catalog 變化失效，避免每次全量 PM IPC）。
+    // Phase F F1/F2：同步路徑只讀快取（見 resolveAppLabelCached），miss 走
+    // requestLabelAsync 非同步回填；catalogKey 由呼叫端迴圈外一次傳入
+    //（見 syncLabelCache），不再每列重算。
+    private val labelCache = LinkedHashMap<String, String>()
+    private var labelCacheCatalogKey: Int? = null
+    // Phase F F1：label 非同步回填在途集合（與 iconInflight 同式，同一 pkg 在途不重打 PM）。
+    // Phase I I1：per-pkg 回調合併（Codex P2）。同一 pkg 在途時第二 waiter 不再丟棄，
+    // 經 labelCallbacks 合併（各 waiter 舊門保留：行 rowGen/tag、dialog shownPending/isShowing）。
+    // Phase 1a：waiter 攜註冊時 catalog epoch（Pair.first）；完成時 head epoch 失配則整批結果丟棄
+    //（不 cache／不 rebind），僅喚醒註冊 epoch 與當代一致的 waiter（見 requestLabelAsync 完成段守衛）。
+    // 全部主執行緒觸碰（head＋完成皆主線）；完成隨 inflight 清 map；syncLabelCache 清 cache 不清 callbacks。
+    private val labelInflight = mutableSetOf<String>()
+    private val labelCallbacks = mutableMapOf<String, MutableList<Pair<Int?, (String) -> Unit>>>()
+    // Phase B B4：Shizuku binder 存活 volatile 快取。listener/onResume/授權回調
+    // 經 refreshShizukuPresenceCache 維護，render 經 cachedShizukuPresence 讀快取，
+    // 不再每次 render 都 pingBinder。
+    // Phase 1a（P3 N2）：雙 volatile 兩步讀寫可撕裂，改單一 holder 原子寫入／原子讀取。
+    private data class CachedShizukuPresence(val noBinder: Boolean?, val authorized: Boolean)
+    @Volatile private var cachedShizukuState: CachedShizukuPresence? = null
 
     // Binder attach (sticky: fires immediately when already connected).
     // The channel may be usable now: re-probe privilege, then reload lists.
@@ -263,7 +370,11 @@ class MainActivity : ComponentActivity() {
             } else {
                 null
             }
+        currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
+        // Phase C: no announcement for the initial restore (avoids speaking on
+        // launch/rotation); user taps announce via switchTab default.
+        switchTab(currentTab, announce = false)
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
         // manager (or an unexpected API failure) never crashes the UI.
         try {
@@ -280,6 +391,7 @@ class MainActivity : ComponentActivity() {
                 vm.state.collect { s -> render(s) }
             }
         }
+        refreshShizukuPresenceCache()
         updateShizukuLine()
         // 冷啟動單一入口：初查由 onResume.onForeground() (probe+按需 refresh)
         // 覆蓋，此處不再直調 vm.refresh()，避免與 init probe/onForeground/
@@ -300,6 +412,7 @@ class MainActivity : ComponentActivity() {
         // P2-1 (base)：auto 路徑預設 allowPrivilegedHookDiagnosis=false，
         // 不執行特權 cat，與直接調 recheckPrivilege(false) 同契約。
         vm.onForeground()
+        refreshShizukuPresenceCache()
         updateShizukuLine()
         // PR-7 P2 (#26):前景重載來源 catalog (安裝/卸載後保持新鮮)。
         reloadCatalog()
@@ -319,6 +432,7 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
         // 旋轉保留診斷展開開關 (純 UI 狀態，不經 ViewModel)。
         outState.putBoolean(KEY_DIAG_EXPANDED, diagExpanded)
+        outState.putInt(KEY_CURRENT_TAB, currentTab)
         // B1：去重快取隨存活；新 View 重建為空時 render 以 View 實際文字為準補寫，
         // 故恢復值僅作顯示/去重參考，不會導致空 View 跳過首寫。
         // 去重鍵（lastWriteBlockDedupKey）亦隨存活，僅控制播報；B 的 batch/catalog 僅內存。
@@ -346,6 +460,12 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         exportDialog = null
+        try {
+            settingsDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        settingsDialog = null
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -391,35 +511,55 @@ class MainActivity : ComponentActivity() {
         // taps -- privileged `cat` stays off (false) even on the reread path.
         // Only the dedicated 手動診斷 Hook button consents to privileged reads.
         if (reread) vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false) else vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+        refreshShizukuPresenceCache()
         updateShizukuLine()
     }
 
-    // Programmatic layout: ScrollView > vertical LinearLayout. Keeps the
-    // dependency set minimal (no Compose, no XML resources to maintain).
-    private fun buildUi() {
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-        }
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-        privilegeView = TextView(this).apply { textSize = 18f }
-        shizukuView = TextView(this)
-        // Phase F4b-P2 (issue #6): channel picker display. channelView shows
-        // the persisted selection (SharedPreferences via the factory, so a
-        // restart remembers it); hookView shows the hook-enable signal only
-        // in LSPosed mode (GONE otherwise). The four buttons call
-        // vm.selectChannel(pref), which persists + swaps + re-probes.
-        channelView = TextView(this)
-        hookView = TextView(this)
-        profilesView = TextView(this)
-        clonedView = TextView(this)
+    // Phase D: 內聯 divider 共用建構（hook 卡片 12dp／診斷清單預設 4dp 上下邊距）。
+    private fun makeDivider(topDp: Int = 4, bottomDp: Int = 4): View = View(this).apply {
+        background = getDrawable(R.drawable.divider_horizontal)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+            setMargins(0, dp(topDp), 0, dp(bottomDp))
+        }
+    }
+
+    // Programmatic layout: One UI 6 Two-Tab System Utility Architecture.
+    private fun buildUi() {
+        // --- 1. Functional Views Initialization (Preserving all IDs and contracts) ---
+        privilegeView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        shizukuView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        channelView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(getColor(R.color.oneui_text_primary))
+        }
+        hookView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        profilesView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        clonedView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
         pkgInput = EditText(this).apply {
-            // p28-1 手動包名（進階入口）：穩定 ID（旋轉恢復文字/游標）+ 單行 +
-            // IME 完成動作 + 就地驗證。IME 完成/Enter 只做驗證並收鍵盤，
-            // 永不觸發建立/移除（移除須經按鈕 + 二次確認）。
             id = R.id.pkg_input
             hint = getString(R.string.pkg_input_hint)
+            background = getDrawable(R.drawable.bg_search_input)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            setHintTextColor(getColor(R.color.oneui_text_secondary))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -432,9 +572,6 @@ class MainActivity : ComponentActivity() {
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun afterTextChanged(s: Editable?) {
                     error = packageInputError(s?.toString().orEmpty())?.let { resolvePackageInputError(it) }
-                    // P2-2：手動輸入門控即時反映到 clone/remove enablement
-                    //（render 讀同一 manualInputActionable；此處輕量只更新按鈕，
-                    // 不做全量 render，避免每鍵重建列表）。
                     refreshManualEnablement()
                 }
             })
@@ -447,7 +584,6 @@ class MainActivity : ComponentActivity() {
                         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                         imm.hideSoftInputFromWindow(v.windowToken, 0)
                     } catch (_: Exception) {
-                        // Best effort: 收鍵盤失敗不影響驗證顯示。
                     }
                     true
                 } else {
@@ -458,25 +594,31 @@ class MainActivity : ComponentActivity() {
         cloneBtn = Button(this).apply {
             id = R.id.clone_btn
             text = getString(R.string.action_clone)
+            background = getDrawable(R.drawable.bg_pill_button)
+            // Phase C: theme token (light #FFFFFF 5.42 on primary; night
+            // #002958 4.52 on primary_container via drawable-night).
+            setTextColor(getColor(R.color.oneui_button_text))
+            typeface = Typeface.DEFAULT_BOLD
+            minimumHeight = dp(48)
             setOnClickListener { vm.clone(pkgInput.text.toString()) }
         }
         removeBtn = Button(this).apply {
             id = R.id.remove_btn
             text = getString(R.string.action_remove)
-            // TalkBack: the first tap only opens the confirmation dialog, it
-            // never uninstalls; the description states the two-phase contract.
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
             contentDescription = getString(R.string.remove_cd)
+            minimumHeight = dp(48)
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
         }
         refreshBtn = Button(this).apply {
             id = R.id.refresh_btn
-            // P25 單一入口：probe（含 Auto 降級）+ refresh；PR-37 Phase C #5：
-            // catalog 失敗文案指向此按鈕，故同步重試 reloadCatalog（其內部先
-            // cancel 舊 catalogJob，語義為「取消在途、重打一次」，不會疊加）。
-            // P2-1: reconnect tap is NOT consent for privileged diagnosis --
-            // always false (LSPOSED stays direct-only); only the dedicated
-            // 手動診斷 Hook button passes true.
             text = getString(R.string.action_reconnect)
+            background = getDrawable(R.drawable.bg_pill_button)
+            // Phase C: theme token (see cloneBtn).
+            setTextColor(getColor(R.color.oneui_button_text))
+            typeface = Typeface.DEFAULT_BOLD
+            minimumHeight = dp(48)
             setOnClickListener {
                 vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
                 reloadCatalog()
@@ -485,62 +627,54 @@ class MainActivity : ComponentActivity() {
         permBtn = Button(this).apply {
             id = R.id.perm_btn
             text = getString(R.string.action_request_shizuku)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumHeight = dp(48)
             setOnClickListener { requestShizukuPermission() }
         }
-        // p28-1 通道互斥單選：單一 RadioGroup 承載四個 RadioButton，checked 即
-        // 選擇狀態（視覺圓點 + TalkBack「已選取」），不再只靠 channelView 文字行。
-        // 點按走 setOnClickListener（無 checked-change 回授，render 的 isChecked
-        // 同步不觸發 VM）；同行四顆（標籤短，沿用原一列短標籤設計），版面主次
-        // 順序不動（仍居 hookView 之後、清單之前）。
-        // p28-1 review（窄螢幕）：群組語意標籤，TalkBack 報讀群組用途。
         channelGroup = RadioGroup(this).apply {
             id = R.id.channel_group
             orientation = RadioGroup.HORIZONTAL
             contentDescription = getString(R.string.channel_group_cd)
-            // 無障礙語意：群組本身可被螢幕閱讀器聚焦（TalkBack 報讀群組用途），
-            // 四鈕互斥語意不變（仍為群組直屬子節點）。
             isScreenReaderFocusable = true
         }
-        // Channel picker: exactly the four ChannelPreference values (NoOp is
-        // a fail-closed fallback, never a menu entry). Radio labels stay short
-        // for one horizontal row.
         autoBtn = RadioButton(this).apply {
             id = R.id.channel_auto
             text = getString(R.string.channel_auto)
-            // 窄螢幕可點按：WRAP_CONTENT＋最小寬（64dp），不靠 weight。
-            minimumWidth = (64 * resources.displayMetrics.density).toInt()
-            // 無障礙觸控：最小高 48dp（TalkBack/手指可操作）。
-            minimumHeight = (48 * resources.displayMetrics.density).toInt()
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumWidth = dp(64)
+            minimumHeight = dp(48)
             setOnClickListener { vm.selectChannel(ChannelPreference.AUTO, allowPrivilegedHookDiagnosis = false) }
         }
         rootBtn = RadioButton(this).apply {
             id = R.id.channel_root
             text = getString(R.string.channel_root)
-            minimumWidth = (64 * resources.displayMetrics.density).toInt()
-            minimumHeight = (48 * resources.displayMetrics.density).toInt()
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumWidth = dp(64)
+            minimumHeight = dp(48)
             setOnClickListener { vm.selectChannel(ChannelPreference.ROOT, allowPrivilegedHookDiagnosis = false) }
         }
         shizukuBtn = RadioButton(this).apply {
             id = R.id.channel_shizuku
             text = getString(R.string.channel_shizuku)
-            minimumWidth = (64 * resources.displayMetrics.density).toInt()
-            minimumHeight = (48 * resources.displayMetrics.density).toInt()
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumWidth = dp(64)
+            minimumHeight = dp(48)
             setOnClickListener { vm.selectChannel(ChannelPreference.SHIZUKU, allowPrivilegedHookDiagnosis = false) }
         }
         lsposedBtn = RadioButton(this).apply {
             id = R.id.channel_lsposed
             text = getString(R.string.channel_lsposed)
-            minimumWidth = (64 * resources.displayMetrics.density).toInt()
-            minimumHeight = (48 * resources.displayMetrics.density).toInt()
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumWidth = dp(64)
+            minimumHeight = dp(48)
             setOnClickListener { vm.selectChannel(ChannelPreference.LSPOSED, allowPrivilegedHookDiagnosis = false) }
         }
         channelGroup.addView(autoBtn, radioParams())
         channelGroup.addView(rootBtn, radioParams())
         channelGroup.addView(shizukuBtn, radioParams())
         channelGroup.addView(lsposedBtn, radioParams())
-        // p28-1 review（窄螢幕 320dp 擠壓）：外包 HorizontalScrollView 橫滑；
-        // RadioGroup 仍為滑動區唯一直屬子節點，四顆 RadioButton 仍為群組直屬
-        // 子節點（互斥語意不變）；版面主次順序不動（p28-2 範圍）。
+
         channelScroll = HorizontalScrollView(this).apply {
             id = R.id.channel_scroll
             isHorizontalScrollBarEnabled = false
@@ -552,38 +686,47 @@ class MainActivity : ComponentActivity() {
                 ),
             )
         }
-        // P2-1: narrow-consent privileged hook re-diagnosis. Only this tap
-        // passes allowPrivilegedHookDiagnosis=true (explicit consent for a
-        // retained privileged `cat`); picker taps, reconnect taps, and auto
-        // lifecycle never `cat`. P3: the copy states the privileged exec
-        // directly (button contentDescription + ViewModel docs).
         hookDiagBtn = Button(this).apply {
             text = getString(R.string.action_diagnose_hook)
-            // P3: 明示此按鈕會執行特權診斷指令（TalkBack 朗讀；點按即明確同意）。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
             contentDescription = getString(R.string.diagnose_hook_cd)
+            minimumHeight = dp(48)
             setOnClickListener { vm.requestHookRedDiagnosis() }
         }
-        // Phase C P1 P3: visible copy of the same consent (sighted users never
-        // hear contentDescription). Shown only in LSPOSED mode with the button.
         hookDiagHint = TextView(this).apply {
             text = getString(R.string.hook_diag_hint)
             textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_tertiary))
         }
-        // 確認/取消結果靠 liveRegion 播報（TalkBack polite）。
         msgView = TextView(this).apply {
             id = R.id.msg_view
-            textSize = 15f
+            textSize = 13f
+            setTextColor(getColor(R.color.oneui_text_primary))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        defaultMsgColor = msgView.currentTextColor
-        // PR-6 P2 (#27 後半)：清單新鮮度行 + 診斷事件行 + 匯出按鈕。
-        // diagView 點一下展開/收合技術細節；匯出只顯示已遮蔽的本機預覽，
-        // 無自動上傳 (buildDiagnosticExport 為純字串，無網路呼叫)。
-        // P4 a11y：可聚焦 + 狀態 contentDescription，切換時 announce。
-        inventoryView = TextView(this)
-        lastOpView = TextView(this)
+        writeBlockView = TextView(this).apply {
+            id = R.id.write_block_reason
+            visibility = View.GONE
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_warning_text))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        inventoryView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        lastOpView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_tertiary))
+        }
         diagView = TextView(this).apply {
             isFocusable = true
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            // Phase 3 P2 a11y: 48dp touch target via minimumHeight (height
+            // stays WRAP_CONTENT so large fonts grow instead of clipping).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.diag_loading_cd)
             setOnClickListener {
                 diagExpanded = !diagExpanded
@@ -591,54 +734,64 @@ class MainActivity : ComponentActivity() {
                 try {
                     announceForAccessibility(contentDescription)
                 } catch (_: Exception) {
-                    // Best effort: 無障礙宣告失敗不影響顯示。
                 }
             }
         }
         exportBtn = Button(this).apply {
-            // P2-4 誠實文案：遮蔽仍非全面保證，不得只寫「已遮蔽」，
-            // 須明示「已遮蔽可辨識資料，分享前請人工確認」。
             text = getString(R.string.action_export_diagnosis)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            minimumHeight = dp(48)
             setOnClickListener { showDiagnosticExport() }
         }
-        // PR-7 P2 (#26, 階段 1):個人來源 catalog 搜尋/勾選區。
-        // 唯讀展示 + 勾選；batchBtn 顯示「建立 N 個分身」,走
-        // cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證
-        // (見 DualViewModel.cloneSelected)。取消勾選 ≠ 卸載。
         searchInput = EditText(this).apply {
             id = R.id.search_input
             hint = getString(R.string.search_hint)
+            background = null
+            setTextColor(getColor(R.color.oneui_text_primary))
+            // Phase C: hint uses text_secondary (#475569 on #DFE7F0 = 6.07;
+            // tertiary was 3.81, below AA 4.5).
+            setHintTextColor(getColor(R.color.oneui_text_secondary))
+            textSize = 14f
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f,
             )
-            // 旋轉回填：ViewModel retained 保留 sourceQuery，Activity 重建時先回填
-            // 舊 query 再掛 TextWatcher，避免 setText 觸發 afterTextChanged 迴圈。
             setText(vm.state.value.sourceQuery)
-            // 游標置尾，方便繼續編輯。
             try {
                 setSelection(text?.length ?: 0)
             } catch (_: Exception) {
-                // Best effort.
             }
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
                 override fun afterTextChanged(s: Editable?) {
                     vm.setSourceQuery(s?.toString().orEmpty())
+                    if (::clearSearchBtn.isInitialized) {
+                        clearSearchBtn.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                    }
                 }
             })
         }
         systemToggleBtn = Button(this).apply {
             text = getString(R.string.system_apps_hidden)
-            // TalkBack：只切換顯示範圍，不卸載任何分身。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (height is
+            // WRAP_CONTENT so large fonts grow instead of clipping).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.system_toggle_cd_hidden)
             setOnClickListener { vm.setIncludeSystemApps(!vm.state.value.includeSystemApps) }
         }
         selectAllBtn = Button(this).apply {
             text = getString(R.string.action_select_visible)
-            // TalkBack：只勾選目前可見前 N 筆（與渲染同一截斷，見 currentVisibleKeys），
-            // 不寫入分身；超出請用搜尋縮小範圍。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(
                 R.plurals.select_visible_cd,
                 MAX_SOURCE_ROWS,
@@ -648,19 +801,31 @@ class MainActivity : ComponentActivity() {
         }
         clearSelBtn = Button(this).apply {
             text = getString(R.string.action_clear_selection)
-            // TalkBack:只清勾選,永不卸載；描述寫明契約。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.clear_selection_cd)
             setOnClickListener { vm.clearSelectionLocal() }
         }
         saveSelBtn = Button(this).apply {
             text = getString(R.string.action_save_selection)
-            // 只保存勾選,不寫入分身；重啟可恢復。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.save_selection_cd)
             setOnClickListener { vm.persistSelection(vm.state.value.inventory.targetId) }
         }
         cancelSaveBtn = Button(this).apply {
             text = getString(R.string.action_unsave_selection)
-            // 只刪持久化條目,不卸載、不清目前勾選。
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.unsave_selection_cd)
             setOnClickListener { vm.cancelSavedSelection() }
         }
@@ -669,85 +834,1509 @@ class MainActivity : ComponentActivity() {
         }
         catalogErrorView = TextView(this).apply {
             visibility = View.GONE
-            // Stage4 a11y：錯誤行異動靠 liveRegion 播報（TalkBack polite）。
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_error))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         batchBtn = Button(this).apply {
             id = R.id.batch_btn
             text = resources.getQuantityString(R.plurals.batch_create, 0, 0)
-            // TalkBack：批次對已勾選逐項執行建立；勾選本身≠卸載，取消勾選≠卸載。
+            background = getDrawable(R.drawable.bg_pill_button)
+            // Phase C: theme token (see cloneBtn).
+            setTextColor(getColor(R.color.oneui_button_text))
+            typeface = Typeface.DEFAULT_BOLD
+            minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
             setOnClickListener { vm.cloneSelected() }
         }
         batchResultView = TextView(this).apply {
-            // Stage4 a11y：批次逐項結果異動靠 liveRegion 播報（TalkBack polite）。
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-
-        // Clone/remove share one row; the block reason below them names the VM
-        // refusal while they are disabled (p28-1); 重新連線並更新 + permission
-        // share the next row.
-        val writeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(cloneBtn, rowParams())
-            addView(removeBtn, rowParams())
-        }
-        writeBlockView = TextView(this).apply {
-            id = R.id.write_block_reason
-            visibility = View.GONE
-            // Stage4 a11y 同式：禁用原因異動靠 liveRegion 播報（TalkBack polite）。
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        val readRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(refreshBtn, rowParams())
-            addView(permBtn, rowParams())
         }
         hookRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(hookDiagBtn, rowParams())
         }
-        // Catalog rows: search full width, then toggle/select/clear,
-        // then save/cancel-save, then the list, batch button and results.
-        val catalogRow1 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(systemToggleBtn, rowParams())
-            addView(selectAllBtn, rowParams())
-            addView(clearSelBtn, rowParams())
-        }
-        val catalogRow2 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(saveSelBtn, rowParams())
-            addView(cancelSaveBtn, rowParams())
+
+        // --- 2. Build Root and Containers ---
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.oneui_canvas))
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
         }
 
-        root.addView(privilegeView)
-        root.addView(shizukuView)
-        root.addView(channelView)
-        root.addView(hookView)
-        root.addView(channelScroll)
-        root.addView(profilesView)
-        root.addView(clonedView)
-        root.addView(inventoryView)
-        root.addView(lastOpView)
-        root.addView(searchInput)
-        root.addView(catalogRow1)
-        root.addView(catalogRow2)
-        root.addView(sourceContainer)
-        root.addView(catalogErrorView)
-        root.addView(batchBtn)
-        root.addView(batchResultView)
-        root.addView(pkgInput)
-        root.addView(writeRow)
-        root.addView(writeBlockView)
-        root.addView(readRow)
-        root.addView(hookRow)
-        root.addView(hookDiagHint)
-        root.addView(msgView)
-        root.addView(diagView)
-        root.addView(exportBtn)
-        setContentView(ScrollView(this).apply { addView(root) })
+        // Top Fixed Header
+        val headerContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.oneui_surface))
+            setPadding(dp(20), dp(16), dp(20), dp(12))
+            elevation = dp(2).toFloat()
+        }
+
+        val brandRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val brandLogo = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_nav_dual_apps))
+            setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (brand text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
+        }
+        val brandText = TextView(this).apply {
+            text = getString(R.string.hero_brand_title)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(8)
+            }
+        }
+        statusPillDot = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+            // Phase C: decorative status dot (pill text carries the state).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        statusPillText = TextView(this).apply {
+            // Phase A：初值走資源的中性 loading（render 前無通道信號，不預設 LSPosed 綠）。
+            text = getString(R.string.status_loading)
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_warning_text))
+            typeface = Typeface.MONOSPACE
+        }
+        statusPillContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = getDrawable(R.drawable.bg_pill_badge_amber)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            addView(statusPillDot)
+            addView(statusPillText)
+        }
+        brandRow.addView(brandLogo)
+        brandRow.addView(brandText)
+        brandRow.addView(statusPillContainer)
+        headerContainer.addView(brandRow)
+
+        heroCategoryView = TextView(this).apply {
+            text = getString(R.string.badge_samsung_hook)
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        heroTitleView = TextView(this).apply {
+            text = getString(R.string.hero_title_apps)
+            textSize = 24f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(2)
+            }
+        }
+        val subRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(2)
+            }
+        }
+        val subIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_security))
+            setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (subtitle text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(14), dp(14)).apply {
+                marginEnd = dp(4)
+            }
+        }
+        heroSubtitleView = TextView(this).apply {
+            text = getString(R.string.hero_subtitle_apps)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+        }
+        subRow.addView(subIcon)
+        subRow.addView(heroSubtitleView)
+
+        headerContainer.addView(heroCategoryView)
+        headerContainer.addView(heroTitleView)
+        headerContainer.addView(subRow)
+        root.addView(headerContainer)
+
+        // Persistent Status & Feedback Banner
+        val statusBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                val h = dp(16)
+                setMargins(h, dp(6), h, dp(2))
+            }
+        }
+        statusBanner.addView(msgView)
+        statusBanner.addView(writeBlockView)
+        root.addView(statusBanner)
+
+        // Content Frame (Holds Tab 1 & Tab 2 ScrollViews)
+        val contentFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+
+        // ================= Tab 1: 雙開應用 (Dual Apps) =================
+        tabAppsScroll = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        val tabAppsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = dp(16)
+            setPadding(pad, dp(8), pad, dp(16))
+        }
+
+        tabAppsLayout.addView(buildHookModeCard())
+
+        // Batch Action Button
+        tabAppsLayout.addView(batchBtn)
+        tabAppsLayout.addView(batchResultView)
+
+        // Search Bar with Clear Button (Phase C: WRAP_CONTENT + minimumHeight so
+        // large fonts grow instead of clipping in a fixed dp48 box).
+        val searchContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = getDrawable(R.drawable.bg_search_input)
+            val p = dp(10)
+            setPadding(p, dp(4), p, dp(4))
+            minimumHeight = dp(48)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(8)
+            }
+        }
+        val searchIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_search))
+            setColorFilter(getColor(R.color.oneui_text_tertiary))
+            // Phase C: decorative (search field hint carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                marginEnd = dp(8)
+            }
+        }
+        clearSearchBtn = ImageView(this).apply {
+            contentDescription = getString(R.string.btn_clear_search)
+            setImageDrawable(getDrawable(R.drawable.ic_clear))
+            setColorFilter(getColor(R.color.oneui_text_tertiary))
+            val cp = dp(14)
+            setPadding(cp, cp, cp, cp)
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+            visibility = if (searchInput.text.isNullOrEmpty()) View.GONE else View.VISIBLE
+            setOnClickListener { searchInput.setText("") }
+        }
+        searchContainer.addView(searchIcon)
+        searchContainer.addView(searchInput)
+        searchContainer.addView(clearSearchBtn)
+        tabAppsLayout.addView(searchContainer)
+
+        // Catalog Filter Buttons (Horizontal Scroll)
+        val filterScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val filterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val p = dp(4)
+            // Phase C: WRAP_CONTENT height + 48dp minimumHeight (was fixed dp48,
+            // which clips large fonts). Touch target stays >= 48dp.
+            addView(systemToggleBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(selectAllBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(clearSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(saveSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(cancelSaveBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+        }
+        filterScroll.addView(filterRow)
+        tabAppsLayout.addView(filterScroll)
+
+        // Section 1: Injected Bypass Apps
+        val injectedHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        val injectedTitle = TextView(this).apply {
+            text = getString(R.string.section_injected_apps)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        clonedCountBadge = TextView(this).apply {
+            // Phase C: initial count via resources (was hardcoded "0").
+            text = getString(R.string.badge_number_format, 0)
+            textSize = 11f
+            // Phase C: blue-pill text (see hookSecPmTag).
+            setTextColor(getColor(R.color.oneui_on_primary_container))
+            background = getDrawable(R.drawable.bg_pill_badge_blue)
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(6)
+            }
+        }
+        injectedActiveLabel = TextView(this).apply {
+            text = getString(R.string.status_hook_injected_active)
+            textSize = 11f
+            // Phase C: tint (light #046C4E on canvas #F0F4FA ≈ 5.8; #059669
+            // was 3.60).
+            setTextColor(getColor(R.color.oneui_secondary_tint))
+            visibility = View.GONE
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        injectedHeader.addView(injectedTitle)
+        injectedHeader.addView(clonedCountBadge)
+        injectedHeader.addView(injectedActiveLabel)
+        tabAppsLayout.addView(injectedHeader)
+
+        val injectedCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        clonedAppsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        injectedCard.addView(clonedAppsContainer)
+        // Keep clonedView attached inside the card for accessibility/testing
+        clonedView.visibility = View.GONE
+        injectedCard.addView(clonedView)
+        tabAppsLayout.addView(injectedCard)
+
+        // Section 2: Pending Recommendation Injections
+        val pendingHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        val pendingTitle = TextView(this).apply {
+            text = getString(R.string.section_pending_apps)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val pendingHint = TextView(this).apply {
+            text = getString(R.string.section_pending_apps_hint)
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_text_tertiary))
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        pendingHeader.addView(pendingTitle)
+        pendingHeader.addView(pendingHint)
+        tabAppsLayout.addView(pendingHeader)
+
+        val pendingCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        pendingCard.addView(sourceContainer)
+        pendingCard.addView(catalogErrorView)
+        tabAppsLayout.addView(pendingCard)
+
+        // Section 3: Advanced Manual Entry
+        val manualCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        val manualTitle = TextView(this).apply {
+            text = getString(R.string.section_advanced_manual)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        }
+        manualCard.addView(manualTitle)
+        manualCard.addView(pkgInput)
+        val writeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+            addView(cloneBtn, rowParams())
+            addView(removeBtn, rowParams())
+        }
+        manualCard.addView(writeRow)
+        tabAppsLayout.addView(manualCard)
+
+        // Daemon Footer Inset Card (Phase A: render() 僅在 LSPOSED + ACTIVE 時顯示，
+        // 無 Hook 信號前隱藏，不再無條件宣稱攔截成功)。
+        daemonFooter = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(10)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(16)
+            }
+        }
+        val terminalIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_terminal))
+            setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (daemon text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply {
+                marginEnd = dp(8)
+            }
+        }
+        val daemonTextContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(context).apply {
+                text = getString(R.string.status_hook_daemon_running)
+                textSize = 12f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(TextView(context).apply {
+                text = getString(R.string.status_hook_daemon_desc)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+        }
+        daemonFooter.addView(terminalIcon)
+        daemonFooter.addView(daemonTextContainer)
+        tabAppsLayout.addView(daemonFooter)
+
+        tabAppsScroll.addView(tabAppsLayout)
+        contentFrame.addView(tabAppsScroll)
+
+        // ================= Tab 2: 核心引擎 (Core Engine) =================
+        tabEngineScroll = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            visibility = View.GONE
+        }
+        val tabEngineLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = dp(16)
+            setPadding(pad, dp(8), pad, dp(16))
+        }
+
+        tabEngineLayout.addView(buildEngineMasterCard())
+
+        // Island 2: Channel Preference & Execution Mode
+        val channelCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val channelCardTitle = TextView(this).apply {
+            text = getString(R.string.section_channel_preference)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        channelCard.addView(channelCardTitle)
+        channelCard.addView(channelView)
+        channelCard.addView(channelScroll)
+        channelCard.addView(hookView)
+        channelCard.addView(hookRow)
+        channelCard.addView(hookDiagHint)
+        tabEngineLayout.addView(channelCard)
+
+        // Island 3: System Hook Diagnostics Checklist
+        val checklistCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val checkHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(10)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.diag_checklist_title)
+                textSize = 13f
+                setTextColor(getColor(R.color.oneui_primary))
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            // Phase A：4/4 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
+            checklistSummaryView = TextView(context).apply {
+                text = getString(R.string.engine_diag_unknown)
+                textSize = 11f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+                typeface = Typeface.MONOSPACE
+            }
+            addView(checklistSummaryView)
+        }
+        checklistCard.addView(checkHeader)
+
+        // 5 Diagnostic Items
+        fun addChecklistItem(iconRes: Int, titleStr: String, descStr: String, badgeText: String, isGreen: Boolean = true) {
+            val itemRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                val ip = dp(6)
+                setPadding(0, ip, 0, ip)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+            val itemIcon = ImageView(this).apply {
+                setImageDrawable(getDrawable(iconRes))
+                setColorFilter(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
+                // Phase C: decorative (item title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
+            }
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(context).apply {
+                    text = titleStr
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_text_primary))
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(context).apply {
+                    text = descStr
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                })
+            }
+            val itemBadge = TextView(this).apply {
+                text = badgeText
+                textSize = 10f
+                // Phase C: green badge text uses the tint, blue badge text uses
+                // on_primary_container (see hookBadgeChip/hookSecPmTag).
+                setTextColor(getColor(if (isGreen) R.color.oneui_secondary_tint else R.color.oneui_on_primary_container))
+                background = getDrawable(if (isGreen) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_blue)
+                visibility = View.GONE
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+                // Phase 3 P3 a11y: badge content = title + badge text (reuses
+                // remove_row_cd so the separator stays locale-correct:
+                // full-width colon in zh, half-width in en; no new key needed).
+                try {
+                    contentDescription = getString(R.string.remove_row_cd, titleStr, badgeText)
+                } catch (_: Exception) {
+                    contentDescription = "$titleStr: $badgeText"
+                }
+            }
+            checklistItemBadges.add(itemBadge)
+            // Phase G: track icon + provenance color for the unproven-gray switch.
+            checklistItemIcons.add(itemIcon)
+            checklistItemIsGreen.add(isGreen)
+            itemRow.addView(itemIcon)
+            itemRow.addView(textCol)
+            itemRow.addView(itemBadge)
+            checklistCard.addView(itemRow)
+        }
+
+        checklistItemBadges.clear()
+        checklistItemIcons.clear()
+        checklistItemIsGreen.clear()
+        // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
+        addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), getString(R.string.badge_dot_format, getString(R.string.badge_status_normal)), true)
+        checklistCard.addView(makeDivider())
+
+        // Item 2: Multi-User UID
+        val uidRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val ip = dp(6)
+            setPadding(0, ip, 0, ip)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            // Phase G: uid icon joins the unproven-gray switch (green provenance).
+            addView(ImageView(context).apply {
+                setImageDrawable(getDrawable(R.drawable.ic_multi_user))
+                setColorFilter(getColor(R.color.oneui_secondary))
+                // Phase C: decorative (multi-user title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
+            }.also { engineUidIcon = it })
+            val textCol = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(context).apply {
+                    text = getString(R.string.diag_item_multiuser_title)
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_text_primary))
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(context).apply {
+                    text = getString(R.string.diag_item_multiuser_desc)
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                })
+            }
+            addView(textCol)
+            engineUidSlotView = TextView(context).apply {
+                // Phase C: initial placeholder via resources (was "UID: —").
+                text = getString(R.string.engine_uid_unknown)
+                textSize = 11f
+                // Phase C: primary on island_card_high is 4.35/4.23; tint is
+                // 6.50/9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
+                background = getDrawable(R.drawable.bg_island_card_high)
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+                typeface = Typeface.MONOSPACE
+            }
+            addView(engineUidSlotView)
+        }
+        checklistCard.addView(uidRow)
+        checklistCard.addView(makeDivider())
+        addChecklistItem(R.drawable.ic_push_sync, getString(R.string.diag_item_push_title), getString(R.string.diag_item_push_desc), getString(R.string.badge_status_isolated), true)
+        checklistCard.addView(makeDivider())
+        // Phase G: count prefix via badge_dual_tag_format (was hardcoded "#2 ").
+        addChecklistItem(R.drawable.ic_badge_style, getString(R.string.diag_item_badge_title), getString(R.string.diag_item_badge_desc), getString(R.string.badge_dual_tag_format, 2, getString(R.string.badge_status_dual_tag)), false)
+
+        tabEngineLayout.addView(checklistCard)
+
+        // Island 4: Snapshots & Technical Telemetry
+        val techCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        techCard.addView(TextView(this).apply {
+            text = getString(R.string.section_profiles_diagnostics)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        })
+        techCard.addView(privilegeView)
+        techCard.addView(profilesView)
+        techCard.addView(inventoryView)
+        techCard.addView(lastOpView)
+        techCard.addView(diagView)
+        tabEngineLayout.addView(techCard)
+
+        // Engine Action Buttons
+        val engineActionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(16)
+            }
+            addView(refreshBtn, rowParams())
+            addView(exportBtn, rowParams())
+        }
+        tabEngineLayout.addView(engineActionRow)
+
+        tabEngineScroll.addView(tabEngineLayout)
+        contentFrame.addView(tabEngineScroll)
+        root.addView(contentFrame)
+
+        // ================= Bottom Navigation Bar =================
+        // Phase C: WRAP_CONTENT + minimumHeight (was fixed dp60, clips large
+        // fonts). Touch target stays >= 60dp.
+        val bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(getColor(R.color.oneui_surface_container_lowest))
+            minimumHeight = dp(60)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            elevation = dp(8).toFloat()
+        }
+
+        fun createNavItem(iconRes: Int, labelStr: String, onClick: () -> Unit): LinearLayout {
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                isClickable = true
+                isFocusable = true
+                // Phase C: the item carries the label (+selected state, synced
+                // in updateNavTabStyles); children stay silent to avoid double
+                // announcement.
+                contentDescription = labelStr
+                val p = dp(6)
+                setPadding(p, p, p, p)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                val icon = ImageView(context).apply {
+                    setImageDrawable(getDrawable(iconRes))
+                    setColorFilter(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
+                }
+                val label = TextView(context).apply {
+                    text = labelStr
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        topMargin = dp(2)
+                    }
+                }
+                addView(icon)
+                addView(label)
+                setOnClickListener { onClick() }
+            }
+        }
+
+        navTabApps = createNavItem(R.drawable.ic_nav_dual_apps, getString(R.string.tab_dual_apps)) {
+            switchTab(TAB_DUAL_APPS)
+        }
+        navTabEngine = createNavItem(R.drawable.ic_nav_engine, getString(R.string.tab_core_engine)) {
+            switchTab(TAB_CORE_ENGINE)
+        }
+        navTabSettings = createNavItem(R.drawable.ic_nav_settings, getString(R.string.tab_settings)) {
+            showSettingsDialog()
+        }
+
+        bottomBar.addView(navTabApps)
+        bottomBar.addView(navTabEngine)
+        bottomBar.addView(navTabSettings)
+        root.addView(bottomBar)
+
+        setContentView(root)
     }
+
+    // Phase D: buildUi 最小拆（純建構提取，行為不變）。兩卡片僅搬移程式碼位置：
+    // lateinit 綁定、Phase A-D 語意、監聽器與初值皆保留原邏輯，不做重構。
+    private fun buildHookModeCard(): LinearLayout {
+        // Card 1: Hook Mode Status Card
+        val hookModeCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(16)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val hookTitleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val boltIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_bolt))
+            setColorFilter(getColor(R.color.oneui_secondary))
+            // Phase C: decorative (card title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        val hookModeTitle = TextView(this).apply {
+            // Phase A：LSPosed 版本無運行時查詢源，不寫死 102，顯示版本未知。
+            text = getString(R.string.hook_mode_title, getString(R.string.lsposed_version_unknown))
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        hookBadgeChip = TextView(this).apply {
+            text = getString(R.string.hook_badge_sec_hook)
+            textSize = 10f
+            // Phase C: body green text uses the tint (light #046C4E on
+            // #D1FAE5 = 5.68; #059669 was 3.32). Icons/strokes keep secondary.
+            setTextColor(getColor(R.color.oneui_secondary_tint))
+            background = getDrawable(R.drawable.bg_pill_badge_green)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+        }
+        hookTitleRow.addView(boltIcon)
+        hookTitleRow.addView(hookModeTitle)
+        hookTitleRow.addView(hookBadgeChip)
+        hookModeCard.addView(hookTitleRow)
+
+        hookDescView = TextView(this).apply {
+            text = getString(R.string.hook_mode_subtitle)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        hookModeCard.addView(hookDescView)
+
+        val hookTagsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        }
+        hookSecPmTag = TextView(this).apply {
+            text = getString(R.string.hook_badge_sec_pm)
+            textSize = 10f
+            // Phase C: blue-pill text uses on_primary_container (light #001D4D
+            // on #D6E4FF = 12.78; night #002958 on #418FFF = 4.52). primary was
+            // 4.24 light and primary_tint (#AAC7FF night) is 1.87 on #418FFF.
+            setTextColor(getColor(R.color.oneui_on_primary_container))
+            background = getDrawable(R.drawable.bg_pill_badge_blue)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+        }
+        hookUidSandboxTag = TextView(this).apply {
+            text = getString(R.string.hook_badge_uid_sandbox)
+            textSize = 10f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            background = getDrawable(R.drawable.bg_island_card_high)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(6)
+            }
+        }
+        hookTagsRow.addView(hookSecPmTag)
+        hookTagsRow.addView(hookUidSandboxTag)
+        hookModeCard.addView(hookTagsRow)
+
+        hookModeCard.addView(makeDivider(12, 12))
+
+        // 3-Column Stats Row
+        val statsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val col1 = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_native_whitelist)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+            addView(TextView(context).apply {
+                // Phase A：官方白名單數無數據源（repo 從未讀取三星白名單），不寫死 5 款。
+                text = getString(R.string.stats_value_unknown)
+                textSize = 15f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                typeface = Typeface.DEFAULT_BOLD
+            })
+        }
+        val col2 = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_injected_count)
+                textSize = 10f
+                // Phase C: primary on island_card_high (#DFE7F0) is 4.35 light
+                // / 4.23 night; tint is 6.50 / 9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
+            })
+            clonedCountStatView = TextView(context).apply {
+                // Phase C: initial value via resources (was hardcoded "0 …(Hook)").
+                text = getString(R.string.stats_injected_format, 0, getString(R.string.stats_unit_apps))
+                textSize = 15f
+                // Phase G: tint (light #004DA3 on #DFE7F0 = 6.50; primary
+                // #0066D6 was 4.35, failed 4.5).
+                setTextColor(getColor(R.color.oneui_primary_tint))
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            addView(clonedCountStatView)
+        }
+        // Phase A A1：第三格由 render() 綁定 hookStatus；初值為未知（amber），
+        // 非 LSPOSED 通道時整格隱藏（對齊 renderHookText 回 null 條件）。
+        hookStatusCell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_hook_status)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+            val statusItem = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(ImageView(context).apply {
+                    setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                    // Phase C: decorative (hook status text carries the state).
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(4) }
+                }.also { hookStatusDot = it })
+                addView(TextView(context).apply {
+                    text = getString(R.string.stats_hook_unknown)
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_warning_text))
+                    typeface = Typeface.DEFAULT_BOLD
+                }.also { hookStatusText = it })
+            }
+            addView(statusItem)
+        }
+        statsRow.addView(col1)
+        statsRow.addView(col2)
+        statsRow.addView(hookStatusCell)
+        hookModeCard.addView(statsRow)
+        return hookModeCard
+    }
+
+    private fun buildEngineMasterCard(): LinearLayout {
+        // Island 1: Master Visual Card
+        val engineMasterCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(16)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val engineTitleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val engineIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_nav_engine))
+            setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (engine title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(22), dp(22)).apply {
+                marginEnd = dp(8)
+            }
+        }
+        val engineTitleContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(context).apply {
+                text = getString(R.string.engine_status_title)
+                textSize = 14f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(TextView(context).apply {
+                text = getString(R.string.engine_status_subtitle)
+                textSize = 11f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+        }
+        residentBadge = TextView(this).apply {
+            // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
+            text = getString(R.string.badge_dot_format, getString(R.string.engine_status_active))
+            textSize = 10f
+            // Phase C: green-pill text uses the tint (see hookBadgeChip).
+            setTextColor(getColor(R.color.oneui_secondary_tint))
+            background = getDrawable(R.drawable.bg_pill_badge_green)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+        }
+        engineTitleRow.addView(engineIcon)
+        engineTitleRow.addView(engineTitleContainer)
+        engineTitleRow.addView(residentBadge)
+        engineMasterCard.addView(engineTitleRow)
+
+        // Telemetry Inset Banner
+        val telemetryBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(12)
+                bottomMargin = dp(10)
+            }
+        }
+        val telemetryTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val gaugeTitles = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(context).apply {
+                text = getString(R.string.engine_gauge_title)
+                textSize = 16f
+                // Phase G: tint (light #004DA3 on #DFE7F0 = 6.50; primary
+                // #0066D6 was 4.35, failed 4.5).
+                setTextColor(getColor(R.color.oneui_primary_tint))
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(TextView(context).apply {
+                // Phase A：版本無運行時查詢源，不寫死 102，顯示版本未知。
+                text = getString(R.string.engine_gauge_subtitle, getString(R.string.lsposed_version_unknown))
+                textSize = 11f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+                typeface = Typeface.MONOSPACE
+            })
+        }
+        val gaugeIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_nav_engine))
+            setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (gauge title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(26), dp(26))
+        }
+        telemetryTopRow.addView(gaugeTitles)
+        telemetryTopRow.addView(gaugeIcon)
+        telemetryBanner.addView(telemetryTopRow)
+
+        val telemetryBottomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+            // Phase A：telemetry 行由 render() 綁定 hookStatus；初值未知（amber）。
+            // Phase G：延遲 pill 已移除（全 repo 無延遲測量源，不偽造 0.42ms，
+            // 死佔位「—」render 永不更新）。
+            telemetryDot = ImageView(context).apply {
+                setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                // Phase C: decorative (telemetry text carries the state).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(6) }
+            }
+            addView(telemetryDot)
+            telemetryStatusView = TextView(context).apply {
+                text = getString(R.string.telemetry_status_unknown)
+                textSize = 12f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            addView(telemetryStatusView)
+        }
+        telemetryBanner.addView(telemetryBottomRow)
+        engineMasterCard.addView(telemetryBanner)
+
+        // Shizuku Fallback Inset Card
+        val shizukuCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(12)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val shizukuTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ImageView(context).apply {
+                setImageDrawable(getDrawable(R.drawable.ic_terminal))
+                setColorFilter(getColor(R.color.oneui_text_secondary))
+                // Phase C: decorative (fallback title beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(8) }
+            })
+            val titleCol = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(context).apply {
+                    text = getString(R.string.engine_fallback_title)
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_text_primary))
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                // Phase A A4：初值未知（updateShizukuLine 經同源 booleans 覆寫，
+                // 不再預設已授權）；徽章同。
+                shizukuFallbackDescView = TextView(context).apply {
+                    text = getString(R.string.shizuku_state_unknown, getString(R.string.status_loading))
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                }
+                addView(shizukuFallbackDescView)
+                addView(shizukuView)
+            }
+            addView(titleCol)
+            shizukuFallbackBadgeView = TextView(context).apply {
+                text = getString(R.string.status_loading)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_warning_text))
+                background = getDrawable(R.drawable.bg_pill_badge_amber)
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+            }
+            addView(shizukuFallbackBadgeView)
+        }
+        shizukuCard.addView(shizukuTopRow)
+        val permRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+            // Phase C: WRAP_CONTENT height (permBtn already has 48dp
+            // minimumHeight) so large fonts grow instead of clipping.
+            addView(permBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        shizukuCard.addView(permRow)
+        engineMasterCard.addView(shizukuCard)
+        return engineMasterCard
+    }
+
+    @VisibleForTesting
+    internal fun switchTab(tab: Int, announce: Boolean = true) {
+        currentTab = tab
+        if (!::tabAppsScroll.isInitialized || !::tabEngineScroll.isInitialized) return
+        if (tab == TAB_DUAL_APPS) {
+            tabAppsScroll.visibility = View.VISIBLE
+            tabEngineScroll.visibility = View.GONE
+            heroCategoryView.text = getString(R.string.badge_samsung_hook)
+            heroTitleView.text = getString(R.string.hero_title_apps)
+            heroSubtitleView.text = getString(R.string.hero_subtitle_apps)
+            updateNavTabStyles(TAB_DUAL_APPS)
+        } else {
+            tabAppsScroll.visibility = View.GONE
+            tabEngineScroll.visibility = View.VISIBLE
+            heroCategoryView.text = getString(R.string.badge_oneui_sandbox)
+            heroTitleView.text = getString(R.string.hero_title_engine)
+            heroSubtitleView.text = getString(R.string.hero_subtitle_engine)
+            updateNavTabStyles(TAB_CORE_ENGINE)
+        }
+        // Phase C: VISIBLE/GONE switches move no focus, so announce the new
+        // hero title for screen readers (a no-op when a11y is off).
+        if (announce) {
+            try {
+                heroTitleView.announceForAccessibility(heroTitleView.text)
+            } catch (_: Exception) {
+                // Best effort: announcement failure must not break tab switch.
+            }
+        }
+    }
+
+    private fun updateNavTabStyles(activeTab: Int) {
+        if (!::navTabApps.isInitialized || !::navTabEngine.isInitialized || !::navTabSettings.isInitialized) return
+        val activeColor = getColor(R.color.oneui_primary)
+        val inactiveColor = getColor(R.color.oneui_text_tertiary)
+
+        // Phase C: selection semantics for screen readers (isSelected +
+        // "label, selected" description; unselected tabs expose the bare label).
+        navTabApps.isSelected = activeTab == TAB_DUAL_APPS
+        navTabApps.contentDescription = navTabDescription(getString(R.string.tab_dual_apps), activeTab == TAB_DUAL_APPS)
+        navTabEngine.isSelected = activeTab == TAB_CORE_ENGINE
+        navTabEngine.contentDescription = navTabDescription(getString(R.string.tab_core_engine), activeTab == TAB_CORE_ENGINE)
+        navTabSettings.isSelected = false
+        // Phase 3 P3 B7: 設定開啟的是對話框 (非切頁)，CD 明示開啟對話框
+        // (settings_tab_cd: EN "opens dialog" / zh "開啟對話框"，三語系 parity)。
+        navTabSettings.contentDescription = getString(R.string.settings_tab_cd)
+
+        val appsIcon = navTabApps.getChildAt(0) as? ImageView
+        val appsLabel = navTabApps.getChildAt(1) as? TextView
+        appsIcon?.setColorFilter(if (activeTab == TAB_DUAL_APPS) activeColor else inactiveColor)
+        appsLabel?.setTextColor(if (activeTab == TAB_DUAL_APPS) activeColor else inactiveColor)
+        appsLabel?.typeface = if (activeTab == TAB_DUAL_APPS) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+
+        val engineIcon = navTabEngine.getChildAt(0) as? ImageView
+        val engineLabel = navTabEngine.getChildAt(1) as? TextView
+        engineIcon?.setColorFilter(if (activeTab == TAB_CORE_ENGINE) activeColor else inactiveColor)
+        engineLabel?.setTextColor(if (activeTab == TAB_CORE_ENGINE) activeColor else inactiveColor)
+        engineLabel?.typeface = if (activeTab == TAB_CORE_ENGINE) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+
+        val settingsIcon = navTabSettings.getChildAt(0) as? ImageView
+        val settingsLabel = navTabSettings.getChildAt(1) as? TextView
+        settingsIcon?.setColorFilter(inactiveColor)
+        settingsLabel?.setTextColor(inactiveColor)
+        settingsLabel?.typeface = Typeface.DEFAULT
+    }
+
+    // Phase C: bottom-nav content description ("label, selected" when active,
+    // bare label otherwise). try/catch keeps the pre-buildUi test path safe.
+    private fun navTabDescription(label: String, selected: Boolean): String =
+        if (selected) {
+            try {
+                getString(R.string.nav_tab_cd_selected, label, getString(R.string.nav_tab_state_selected))
+            } catch (_: Exception) {
+                label
+            }
+        } else {
+            label
+        }
+
+    private fun showSettingsDialog() {
+        // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛，
+        // 避免後台/銷毀時 show() 拋 WindowManager.BadTokenException。
+        if (isFinishing || isDestroyed) return
+        try {
+            settingsDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort
+        }
+        try {
+            settingsDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.tab_settings))
+                // Phase C: about copy fully resourced (was hardcoded English
+                // "Version 0.0.1 ..." + "MIT ..."); version is dynamic.
+                // Phase H P1：%4$s live 宣稱經 hookLiveProven 門控，無 boot-fresh 證據時
+                // 用中性 engine_diag_unknown（既有鍵，不新增綠文案），不直嵌 daemon_running.
+                // Phase C：%5$s 與卡片副標題單一來源 hookSubtitleResFor，點擊時取
+                // live snapshot（與 %4$s hookLiveProven(vm.state.value) 同 staleness 類）。
+                .setMessage(
+                    getString(
+                        R.string.settings_about_format,
+                        getString(R.string.hero_title_engine),
+                        appVersionName(),
+                        getString(R.string.settings_about_feature),
+                        getString(if (hookLiveProven(vm.state.value)) R.string.status_hook_daemon_running else R.string.engine_diag_unknown),
+                        getString(hookSubtitleResFor(writeBlockReason(vm.state.value) == null)),
+                        getString(R.string.settings_license),
+                    ),
+                )
+                .setPositiveButton(getString(R.string.dialog_close), null)
+                .setNeutralButton(getString(R.string.action_request_shizuku)) { _, _ ->
+                    requestShizukuPermission()
+                }
+                .setNegativeButton(getString(R.string.action_export_diagnosis)) { _, _ ->
+                    showDiagnosticExport()
+                }
+                .show()
+        } catch (e: Exception) {
+            Log.w(TAG, "showSettingsDialog failed", e)
+            settingsDialog = null
+        }
+    }
+
+    // Phase C: dynamic app version for the settings about dialog (PackageInfo
+    // at runtime, localized "unknown" fallback). No BuildConfig dependency.
+    // Phase L L2：one-shot 快取（設定對話框非 hot path；首次 PM IPC 後快取，
+    // 後續零 binder；失敗回退為本地化佔位，不快取以免語系切換殘留）。
+    private var cachedAppVersionName: String? = null
+
+    private fun appVersionName(): String {
+        cachedAppVersionName?.let { return it }
+        try {
+            @Suppress("DEPRECATION")
+            val v = packageManager.getPackageInfo(packageName, 0).versionName
+            if (!v.isNullOrBlank()) {
+                cachedAppVersionName = v
+                return v
+            }
+        } catch (_: Exception) {
+            // Fall through to the localized placeholder.
+        }
+        return try {
+            getString(R.string.settings_version_unknown)
+        } catch (_: Exception) {
+            // Phase 3 P3 B6: catch-path 不再硬編碼英文 "unknown"——資源不可用時
+            // 回 locale-neutral 佔位 (與 stats_value_unknown 同字 "—")。
+            "—"
+        }
+    }
+
+    // Phase B B1/B2/B4：分身列表渲染。
+    // B1：Switch 為 momentary action（彈回 checked，防視覺翻轉）＋門控
+    // isEnabled = !loading && blockKey == null（呼叫端傳 render 已算好的 blockKey，
+    // 與 clone/remove/batch 同源）＋48dp 觸控目標＋移除語意 contentDescription。
+    // B2：ImageView 先設 tag=appKey；coroutine capture clonedGen，過期丟棄。
+    // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
+    private fun renderClonedApps(s: UiState, blockKey: BlockReason?, catalogKey: Int) {
+        if (!::clonedAppsContainer.isInitialized) return
+        // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook live 證據驅動（與徽章區同源
+        // hookLiveProven，Phase H：existence 不足，需 boot-fresh），無 live 證據時
+        // GONE，不得無條件宣稱注入成功。
+        val hookLiveProven = hookLiveProven(s)
+        // Phase L L2：catalogKey 由 render 入口一次算好傳入（與 dialog 共用），
+        // 此處只 sync＋比對指紋，不再重算 O(catalog)。
+        syncLabelCache(catalogKey)
+        val key = buildClonedListKey(s, catalogKey)
+        if (key == lastClonedListKey) {
+            val writable = blockKey == null
+            for (i in 0 until clonedAppsContainer.childCount) {
+                val row = clonedAppsContainer.getChildAt(i) as? LinearLayout ?: continue
+                for (j in 0 until row.childCount) {
+                    val child = row.getChildAt(j)
+                    if (child is Switch) child.isEnabled = !s.loading && writable
+                }
+            }
+            return
+        }
+        // 全量重建才推進世代：在途舊圖完成時比對過期丟棄綁定（快取保留）。
+        val gen = ++clonedGen
+        lastClonedListKey = key
+        clonedAppsContainer.removeAllViews()
+        if (s.cloned.isEmpty()) {
+            val emptyView = TextView(this).apply {
+                text = getString(R.string.cloned_empty)
+                textSize = 13f
+                setTextColor(getColor(R.color.oneui_text_secondary))
+                val p = dp(12)
+                setPadding(p, p, p, p)
+            }
+            clonedAppsContainer.addView(emptyView)
+            return
+        }
+        val writable = blockKey == null
+        // Phase F F1：catalogLabels 本輪預取（reloadCatalog IO 路徑已查好的 label 就地取用）。
+        // Phase L L1：sync 已在指紋比對前完成，此處不再重算 hash／重 sync。
+        val catalogLabels = catalogLabelsFor(s.sourceCatalog)
+        for (pkg in s.cloned) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                val p = dp(8)
+                setPadding(p, p, p, p)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    bottomMargin = dp(6)
+                }
+                background = getDrawable(R.drawable.bg_island_card_high)
+            }
+
+            // Left icon container with #2 badge overlay
+            val iconContainer = FrameLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+            }
+            val appIconView = ImageView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(36), dp(36)).apply {
+                    gravity = Gravity.CENTER
+                }
+                // Phase C: the row title/switch already names the app; the icon
+                // itself is decorative.
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+            // Phase E E5：serial null 用不可碰撞 token "na"（"na:$pkg"），
+            // 不得 ?: 0（與真 serial "0" 碰撞，跨列表重綁錯圖）。
+            val appKey = "${s.inventory.targetSerial ?: "na"}:$pkg"
+            appIconView.tag = appKey
+            requestIcon(pkg, appKey, appIconView, gen)
+            val badgeView = TextView(this).apply {
+                // Phase G: WRAP_CONTENT + min 18dp (was fixed 18dp, clipped
+                // cloned>=100 at 10sp); large counts grow instead of clipping.
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    gravity = Gravity.BOTTOM or Gravity.END
+                }
+                minimumWidth = dp(18)
+                minimumHeight = dp(18)
+                background = getDrawable(R.drawable.bg_dual_badge)
+                // Phase C: badge number via resources (was hardcoded "2") with
+                // theme token text (see cloneBtn); context description is set
+                // below once the app label is resolved.
+                // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
+                tag = "badge:$pkg"
+                text = getString(R.string.badge_number_format, 2)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_button_text))
+                gravity = Gravity.CENTER
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            iconContainer.addView(appIconView)
+            iconContainer.addView(badgeView)
+            row.addView(iconContainer)
+
+            // Center details
+            val textContainer = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = dp(10)
+                    marginEnd = dp(8)
+                }
+            }
+            val titleRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            // Phase F F1：同步只讀快取，miss 先顯示 pkg 佔位（catalog 預取次之），
+            // 真標籤經 requestLabelAsync 回填（比照 loadIcon）；主執行緒不打 PM binder。
+            var label = resolveAppLabelCached(pkg)
+            if (label == pkg) {
+                catalogLabels[pkg]?.let {
+                    label = it
+                    cacheLabel(pkg, it)
+                }
+            }
+            // Phase C: the "2" badge alone is meaningless to screen readers;
+            // name whose second copy it marks.
+            try {
+                badgeView.contentDescription = getString(R.string.dual_badge_cd, label)
+            } catch (_: Exception) {
+                // Best effort: label context is enhancement-only.
+            }
+            val titleView = TextView(this).apply {
+                // Phase F F1：tag 供非同步回填的 tag 檢查＋重綁定位。
+                tag = pkg
+                text = label
+                textSize = 14f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+            val tagView = TextView(this).apply {
+                text = getString(R.string.tag_forced_injected)
+                // Phase E E2：見函數入口 hookLiveProven（無 live 證據 GONE）。
+                visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+                textSize = 10f
+                // Phase C: blue-pill text (see hookSecPmTag).
+                setTextColor(getColor(R.color.oneui_on_primary_container))
+                background = getDrawable(R.drawable.bg_pill_badge_blue)
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    marginStart = dp(6)
+                }
+            }
+            titleRow.addView(titleView)
+            titleRow.addView(tagView)
+
+            val subtitleView = TextView(this).apply {
+                // Phase E E1：targetId 未知時只顯示 desc，不把未知 id（<=0）格式化進文案。
+                text = if (s.inventory.targetId > 0) {
+                    getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
+                } else {
+                    getString(R.string.app_dual_unlocked_desc)
+                }
+                textSize = 12f
+                // Phase C: tint (light #046C4E on #DFE7F0 = 5.16; #059669 was
+                // 3.02).
+                setTextColor(getColor(R.color.oneui_secondary_tint))
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+            textContainer.addView(titleRow)
+            textContainer.addView(subtitleView)
+            row.addView(textContainer)
+
+            // Switch toggle: momentary removal action, always visually checked.
+            // Toggling initiates safe two-phase removal (dialog), never a direct
+            // on/off state flip; disabled while busy or channel unwritable.
+            val toggleSwitch = Switch(this).apply {
+                isChecked = true
+                isEnabled = !s.loading && writable
+                minimumHeight = dp(48)
+                minimumWidth = dp(48)
+                // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
+                tag = "switch:$pkg"
+                // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
+                contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
+                setOnClickListener { v ->
+                    // 僅以 live View.isEnabled 門控：early-return 路徑每輪 render 皆同步
+                    // enabled，此處 captured `writable`（重建時快照）可能陳舊——fingerprint
+                    // 未變不重建時，writable 翻轉只經 live sync 反映到 View。陳舊 !writable
+                    // 會誤擋有效點按；VM requestRemove 內含 fail-closed isWritable() 複查
+                    // （權威門控，與 a28b56c 行為一致），此處不再用 captured 值攔截。
+                    if (v?.isEnabled != true) return@setOnClickListener
+                    try {
+                        (v as? Switch)?.isChecked = true
+                    } catch (_: Exception) {
+                        // Best effort: 彈回失敗不阻塞移除請求。
+                    }
+                    vm.requestRemove(pkg)
+                }
+            }
+            row.addView(toggleSwitch)
+            clonedAppsContainer.addView(row)
+            // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
+            // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。
+            if (!isLabelCached(pkg)) {
+                val rowGen = gen
+                requestLabelAsync(pkg) { fresh ->
+                    try {
+                        if (rowGen != clonedGen) return@requestLabelAsync
+                        if (titleView.tag != pkg) return@requestLabelAsync
+                        if (!isUnderClonedContainer(titleView)) {
+                            rebindClonedLabel(pkg, fresh)
+                            return@requestLabelAsync
+                        }
+                        try {
+                            titleView.text = fresh
+                        } catch (_: Exception) {
+                            rebindClonedLabel(pkg, fresh)
+                            return@requestLabelAsync
+                        }
+                        try {
+                            badgeView.contentDescription = getString(R.string.dual_badge_cd, fresh)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                        try {
+                            // Phase G: full-width colon via remove_row_cd.
+                            toggleSwitch.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋targetId
+    // ＋hook 哨兵態；刻意不含 loading）。Phase E E4：納入 targetId（subtitle 含 targetId，
+    // 未納入則目標切換留殘留舊值）；E2 哨兵態亦須入指紋（tag 顯隱由 hook
+    // live 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
+    // Phase H：哨兵升格為 hookLiveProven（含 hookBootFresh，boot-fresh 落地
+    // 翻轉時重建）。
+    // Phase L L1：追加 catalogKey（labelCacheKey／catalog.hashCode 同源，呼叫端
+    // 單次計算傳入，sync＋key 共用一次 hash）。catalog label 變化即重建，
+    // 舊快取不再經 !isLabelCached 命中殘留；同內容同 hash，不致過度重建。
+    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步 Switch enabled；
+    // 納入指紋會致每次 op 全量 removeAllViews＋重建＋圖示/label 重發兩次，並推進
+    // clonedGen 使在途回調失效。
+    private fun buildClonedListKey(s: UiState, catalogKey: Int): String =
+        clonedListKeyFor(s.cloned, s.inventory.targetSerial, s.inventory.targetId, hookLiveProven(s), catalogKey)
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
     // (buildDiagnosticExport 經四道遮蔽：先郵件後包名後 IP，最後路徑，大小受限)；只有使用者
@@ -759,6 +2348,9 @@ class MainActivity : ComponentActivity() {
     // 使用者主動觸發才經 ClipboardManager 複製已遮蔽文本到本機剪貼簿；複製內容
     // 與預覽同字串 (diagnosticExportCopyText)，不做自動傳輸/share。
     private fun showDiagnosticExport() {
+        // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛＋
+        // try/catch 包 show()，避免後台/銷毀時 BadTokenException。
+        if (isFinishing || isDestroyed) return
         val state = lastState ?: vm.state.value
         val preview = buildDiagnosticExport(state)
         try {
@@ -766,28 +2358,39 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: 舊預覽關不掉也不阻塞新預覽。
         }
-        exportDialog = AlertDialog.Builder(this)
-            .setTitle(getString(R.string.diagnostic_export_title))
-            .setMessage(preview)
-            .setCancelable(true)
-            .setNeutralButton(getString(R.string.diagnostic_copy_button)) { _, _ ->
-                try {
-                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(
-                        ClipData.newPlainText(
-                            "galaxy-dual-diagnostic",
-                            diagnosticExportCopyText(state),
-                        ),
-                    )
-                    msgView.text = getString(R.string.diagnostic_copy_success)
-                    msgView.setTextColor(msgColorFor(MsgKind.INFO))
-                } catch (e: Exception) {
-                    msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
-                    msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+        try {
+            exportDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.diagnostic_export_title))
+                .setMessage(preview)
+                .setCancelable(true)
+                .setNeutralButton(getString(R.string.diagnostic_copy_button)) { _, _ ->
+                    try {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(
+                            ClipData.newPlainText(
+                                "galaxy-dual-diagnostic",
+                                diagnosticExportCopyText(state),
+                            ),
+                        )
+                        msgView.text = getString(R.string.diagnostic_copy_success)
+                        msgView.setTextColor(msgColorFor(MsgKind.INFO))
+                    } catch (e: Exception) {
+                        // Phase 3 P3 B4: catch 內再寫 msgView 須有內層守衛——
+                        // msgView 未就緒/getString 失敗時的外拋不得逃出 listener。
+                        try {
+                            msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
+                            msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+                        } catch (e2: Exception) {
+                            Log.w(TAG, "showDiagnosticExport copy-failed status failed", e2)
+                        }
+                    }
                 }
-            }
-            .setPositiveButton(getString(R.string.dialog_close), null)
-            .show()
+                .setPositiveButton(getString(R.string.dialog_close), null)
+                .show()
+        } catch (e: Exception) {
+            Log.w(TAG, "showDiagnosticExport failed", e)
+            exportDialog = null
+        }
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
@@ -828,39 +2431,73 @@ class MainActivity : ComponentActivity() {
     // otherwise ask Shizuku. The button text mirrors the same boolean split in
     // updateShizukuLine so 文案/動作一致（重連分支為「檢查 Shizuku 並更新」，
     // 與重新連線並更新按鈕「重新連線並更新」區分；未授權分支為「請求 Shizuku 授權」）.
+    // Phase I I4：binder IPC（pingBinder＋checkSelfPermission）搬到 Dispatchers.IO
+    //（refresh 模式：IO 讀＋回主更新／分支）。主執行緒只做分支＋requestPermission＋讀快取重繪，
+    // 永不直呼 pingBinder（讀經 readShizukuPresence 僅 IO 執行緒）。
     private fun requestShizukuPermission() {
-        try {
-            if (!Shizuku.pingBinder()) {
-                // P2-1: permission-button tap re-probes/refreshes but is NOT
-                // consent for privileged `cat` (always false).
-                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
-            } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
-            } else {
-                Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+        // Phase K K2：頭寫與 refresh 共用同一 shizukuPresenceJob 協調，先取消在途 refresh。
+        shizukuPresenceJob?.cancel()
+        // P1：發起時主線取值（見 shizukuGen），IO 回主線後比對過期丟棄。
+        val my = ++shizukuGen
+        // Phase K review：頭寫亦賦值回 shizukuPresenceJob（與 catalogJob 範式一致），
+        // 使 refresh 側 cancel 能取消在途頭寫，避免 old-live 蓋 new-death。
+        shizukuPresenceJob = lifecycleScope.launch {
+            val presence = try {
+                withContext(Dispatchers.IO) { readShizukuPresence() }
+            } catch (_: Exception) {
+                null
             }
-        } catch (e: Exception) {
-            vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+            if (my != shizukuGen) return@launch
+            if (presence != null) {
+                try {
+                    // Phase 1a（P3 N2）：holder 單次原子寫入。
+                    cachedShizukuState = CachedShizukuPresence(presence.first, presence.second)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+            try {
+                val (noBinder, authorized) = presence ?: cachedShizukuPresence()
+                if (noBinder) {
+                    // P2-1: permission-button tap re-probes/refreshes but is NOT
+                    // consent for privileged `cat` (always false).
+                    vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
+                } else if (authorized) {
+                    vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
+                } else {
+                    Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+                }
+            } catch (e: Exception) {
+                try {
+                    vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+            refreshShizukuPresenceCache()
+            try {
+                updateShizukuLine()
+            } catch (_: Exception) {
+                // Best effort.
+            }
         }
-        updateShizukuLine()
     }
 
-    // Shizuku binder/authorization line, read live (never cached): pingBinder
-    // guards checkSelfPermission so a dead binder shows 未連線, not a crash.
+    // Shizuku binder/authorization line, read from volatile cache (Phase B B4):
+    // pingBinder guards checkSelfPermission so a dead binder shows 未連線, not a crash.
     // P25: the permission button text follows the same boolean binder/
     // permission state (never parsed from the rendered line): 未連線/已授權 ->
     // "檢查 Shizuku 並更新" (reconnectAndRefresh, 與重新連線並更新按鈕的
     // 「重新連線並更新」區分 TalkBack/視覺）; 未授權 -> "請求 Shizuku 授權"
     // (requestPermission).
+    // Phase B B4: render() 不再每次 pingBinder；binder 存活經 listener/onResume/
+    // 授權回調 refreshShizukuPresenceCache 維護，render 只讀快取。
     private fun updateShizukuLine() {
-        // Boolean binder/permission state first (single live read): the
+        // Boolean binder/permission state first (single cached read): the
         // button branch below keys on these, never on state.contains().
-        val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
-        val authorized: Boolean = try {
-            !noBinder && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
+        // Phase A A4：同一組 booleans 經 cachedShizukuPresence 單次讀取，同時驅動
+        // 備援卡片標題/徽章（resolveShizukuCardStatus 純函數），卡片永不另行判讀。
+        val (noBinder, authorized) = cachedShizukuPresence()
         val state: String = try {
             if (noBinder) {
                 getString(R.string.shizuku_state_no_binder)
@@ -882,6 +2519,100 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: updateShizukuLine may run before buildUi in tests.
         }
+        // Phase A A4：備援卡片與狀態行同源（同一組 noBinder/authorized），不再寫死已授權。
+        try {
+            if (::shizukuFallbackDescView.isInitialized && ::shizukuFallbackBadgeView.isInitialized) {
+                when (resolveShizukuCardStatus(noBinder, authorized)) {
+                    ShizukuCardStatus.NO_BINDER -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_no_binder)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_nobinder)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_gray)
+                        // Phase G: secondary (light #475569 on #DFE7F0 = 6.07;
+                        // tertiary was 3.81, failed 4.5).
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_secondary))
+                    }
+                    ShizukuCardStatus.UNAUTHORIZED -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_unauth)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_unauth)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_warning_text))
+                    }
+                    ShizukuCardStatus.AUTHORIZED -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_ok)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_standby)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
+                        // Phase G: secondary (light #475569 on #FEF3C7 = 6.81;
+                        // tertiary was 4.27, failed 4.5).
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_secondary))
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: updateShizukuLine may run before buildUi in tests.
+        }
+    }
+
+    // Phase A A4：Shizuku binder/授權單次 live 讀取。Phase F F3＋Phase I I4：僅 IO 執行緒呼叫
+    //（經 refreshShizukuPresenceCache／requestShizukuPermission 內 withContext(IO)）；主執行緒永不直呼
+    //（binder IPC：pingBinder＋checkSelfPermission）。
+    private fun readShizukuPresence(): Pair<Boolean, Boolean> {
+        val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
+        val authorized: Boolean = try {
+            !noBinder && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+        return noBinder to authorized
+    }
+
+    // Phase B B4：binder 快取寫入點（listener/onResume/授權回調/按鈕）。
+    // render 只讀 cachedShizukuPresence，不直接 pingBinder。
+    // Phase F F3：binder IPC 搬到 Dispatchers.IO（refresh 內 launch IO，結果回主執行緒
+    // 更新快取＋重繪狀態行）。呼叫端當幀的 updateShizukuLine 讀舊快取，IO 回來再刷一次。
+    private fun refreshShizukuPresenceCache() {
+        try {
+            // Phase K K2：比照 catalogJob（3536-3537）取消前一個在途任務，避免疊加
+            //（old-live 蓋 new-death）；與 requestShizukuPermission 頭寫共用同一 job。
+            shizukuPresenceJob?.cancel()
+            // P1：發起時主線取值（見 shizukuGen），IO 回主線後比對過期丟棄。
+            val my = ++shizukuGen
+            shizukuPresenceJob = lifecycleScope.launch {
+                val next = withContext(Dispatchers.IO) {
+                    try {
+                        readShizukuPresence()
+                    } catch (_: Exception) {
+                        null
+                    }
+                } ?: return@launch
+                if (my != shizukuGen) return@launch
+                try {
+                    // Phase 1a（P3 N2）：holder 單次原子寫入。
+                    cachedShizukuState = CachedShizukuPresence(next.first, next.second)
+                } catch (_: Exception) {
+                    return@launch
+                }
+                try {
+                    updateShizukuLine()
+                } catch (_: Exception) {
+                    // Best effort: 容器未就緒（測試路徑）時不阻塞快取。
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: 快取失敗時讀路徑回保守預設（見 cachedShizukuPresence）。
+        }
+    }
+
+    // Phase F F3：render 只讀快取，不做 live binder。快取未就緒（首幀 IO 未回）回保守
+    // 預設（noBinder=true＝未連線），待 refresh 回填後重繪；不再主執行緒 pingBinder。
+    private fun cachedShizukuPresence(): Pair<Boolean, Boolean> {
+        // Phase 1a（P3 N2）：holder 單次原子讀取，不再兩步讀雙 volatile（防撕裂）。
+        val snapshot = cachedShizukuState
+        val noBinder = snapshot?.noBinder
+        return if (noBinder != null && snapshot != null) {
+            noBinder to snapshot.authorized
+        } else {
+            true to false
+        }
     }
 
     // Renders one UiState: privilege indicator, Shizuku line (live), channel
@@ -895,9 +2626,12 @@ class MainActivity : ComponentActivity() {
     // 以及匯出按鈕 (已遮蔽預覽，無自動上傳)。
     private fun render(s: UiState) {
         // P25: keep the Shizuku binder line in sync on every state render
-        // (cheap live read inside updateShizukuLine, already try/catch
-        // guarded for the pre-buildUi test path). Double-guarded here so a
-        // Shizuku-less test harness calling render can never crash on it.
+        // (cheap cached read inside updateShizukuLine, already try/catch
+        // guarded for the pre-buildUi test path; live binder reads only happen
+        // on Dispatchers.IO in refreshShizukuPresenceCache on binder/onResume/
+        // permission paths, Phase F F3).
+        // Double-guarded here so a Shizuku-less test harness calling render
+        // can never crash on it.
         // PR-6 P2: 同時記住最近一次渲染狀態 (診斷展開/匯出共用)。
         lastState = s
         try {
@@ -905,6 +2639,17 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: the state render must never depend on Shizuku.
         }
+        // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
+        // renderClonedApps 的 Switch 與稍後按鈕/dialog 共用此 blockKey，不重算。
+        val busy = s.loading
+        // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
+        // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
+        val blockKey = if (busy) null else writeBlockReason(s)
+        // Phase L L2：catalogKey render 入口算一次，傳給 renderClonedApps 與
+        // syncRemoveDialog 共用（各入口不再各自重算 O(catalog)）。
+        // Phase 3 P2 perf: 直接以 s.sourceCatalog 經 referential 快取計算，
+        // 不再重讀 vm.state.value (labelCacheKey no-arg seam 保留供 dialog/測試)。
+        val catalogKey = catalogHashCached(s.sourceCatalog)
         val readyMark = s.readyMark()
         // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
         // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
@@ -928,7 +2673,26 @@ class MainActivity : ComponentActivity() {
         )
         // Title mirrors the actual execution identity (not the routed
         // summary) for quick manual verification.
-        title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
+        // Phase C: Recents title fully resourced (was hardcoded English
+        // "GalaxyDual Plus (...)"); product name stays English by-design
+        // (matches the manifest label).
+        // Phase 3 P3 B6: 最內層不再硬編碼英文產品名——資源不可用時改用
+        // packageName (runtime，不經資源)，仍不可用才保留現標題。
+        try {
+            title = getString(R.string.recents_title_format, getString(R.string.app_name), s.execIdentity, s.resolvedGateway)
+        } catch (_: Exception) {
+            // Phase G: fallback also resourced (was hardcoded English format);
+            // app_name is the localized product name.
+            try {
+                title = "${getString(R.string.app_name)} (${s.execIdentity}/${s.resolvedGateway})"
+            } catch (_: Exception) {
+                try {
+                    title = "$packageName (${s.execIdentity}/${s.resolvedGateway})"
+                } catch (_: Exception) {
+                    // Best effort: resources unavailable, keep current title.
+                }
+            }
+        }
         // Picker state: persisted preference + actual resolved gateway
         // (restart remembers the preference via SharedPreferences; see
         // factory). Always shown so the user can tell which channel the
@@ -951,7 +2715,13 @@ class MainActivity : ComponentActivity() {
         // note stays visible so the mode is never mistaken for a working
         // channel. P4: 時間證據經 hookEvidence()+timeEvidenceText 統一
         // (狀態文案維持本頁提示，不動)。
-        val hookText = renderHookText(s)
+        // Phase L L3：顯示行走 EN 分支（null 判定語意不變，另兩處 null 檢查沿用預設）。
+        // Phase 3 P2 perf: hook 三態 render 內一次算好重用 (hookText/hookLive/
+        // hookDisplay 皆為 s 的純函數；null 語意恆等於 channel != LSPOSED)，
+        // 不再每分支重算 renderHookText/hookLiveProven/hookLiveDisplay (~6x)。
+        val hookText = renderHookText(s, isEnglishLocale())
+        val hookLive = hookLiveProven(s)
+        val hookDisplay = hookLiveDisplay(s)
         if (hookText != null) {
             hookView.visibility = View.VISIBLE
             hookView.text = hookText
@@ -993,20 +2763,229 @@ class MainActivity : ComponentActivity() {
         // PR-6 P2 (#27 後半)：清單新鮮度行 (STALE/UNKNOWN 明確標示，
         // FRESH 顯示目標/筆數/查詢時間)。P4：上次操作相位拆至獨立 lastOpView
         // 行 (renderLastOpText)，此處只剩清單；查詢時間經 formatTimeMs。
-        inventoryView.text = renderInventoryText(s)
+        // Phase L L3：EN 分支（diag/lastOp 仍繁中，為 P2 餘項）。
+        inventoryView.text = renderInventoryText(s, isEnglishLocale())
         lastOpView.text = renderLastOpText(s)
         // PR-6 P2 (#27 後半)：診斷事件行。穩定碼 + 繁中摘要/下一步常顯；
         // 點一下展開 exit/技術 detail (大小受限)。無事件時顯示就緒。
         // P4 a11y：同步更新 contentDescription (含展開狀態)。
         diagView.text = renderDiagnoseText(s, diagExpanded)
         diagView.contentDescription = renderDiagnoseDescription(s, diagExpanded)
+
+        // One UI 6 Modern Views dynamic update
+        // Phase B B4：分身列表移出此 try（獨立指紋＋獨立 try/catch，下見），
+        // 此段只留計數/狀態徽章；空吞改為 Log.w（測試環境外須可見）。
+        try {
+            if (::clonedCountStatView.isInitialized) {
+                clonedCountStatView.text = getString(R.string.stats_injected_format, s.cloned.size, getString(R.string.stats_unit_apps))
+            }
+            // Phase B P2-2：Hook 卡片副標題 channel-aware。真可寫
+            //（writeBlockReason == null）走 _ops（特權通道直寫、無需 Hook）；
+            // 其餘（loading→writeReady=false 亦含）走白名單原文案。初建即白名單
+            // 文案，首幀前 fail-closed；顯式 ROOT 拒絕等不可寫態不誇大可寫。
+            if (::hookDescView.isInitialized) {
+                hookDescView.text = getString(hookSubtitleResFor(writeBlockReason(s) == null))
+            }
+            if (::clonedCountBadge.isInitialized) {
+                clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
+            }
+            if (::engineUidSlotView.isInitialized) {
+                // Phase E E1：targetId 未知（<=0；-1=NO_TARGET_ID 表未知，0 無合法顯示語意）時顯示未知佔位，
+                // 不得將未知 id 格式化進 UID 文案（外洩＋TalkBack 誤讀）；a11y P0。
+                engineUidSlotView.text = if (s.inventory.targetId > 0) {
+                    getString(R.string.engine_uid_label, s.inventory.targetId)
+                } else {
+                    getString(R.string.engine_uid_unknown)
+                }
+            }
+            // Phase A A1：Hero 第三格由 hookStatus 驅動；非 LSPOSED 通道整格隱藏
+            // （對齊 renderHookText 回 null 條件：channel != LSPOSED）。
+            if (::hookStatusCell.isInitialized && ::hookStatusDot.isInitialized && ::hookStatusText.isInitialized) {
+                // Phase 3 P2 perf: 沿用 render 入口 hookText (null 語意不變)。
+                if (hookText == null) {
+                    hookStatusCell.visibility = View.GONE
+                } else {
+                    hookStatusCell.visibility = View.VISIBLE
+                    // Phase H：ACTIVE 僅歷史 existence 證據；綠＋正常監聽只給
+                    // boot-fresh 證實 (hookLiveDisplay LIVE)，歷史標記走 UNKNOWN。
+                    // Phase 3 P2 perf: 沿用 render 入口 hookDisplay。
+                    when (hookDisplay) {
+                        HookLiveDisplay.LIVE -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+                            hookStatusText.text = getString(R.string.stats_hook_active)
+                            // Phase C: tint (see subtitleView).
+                            hookStatusText.setTextColor(getColor(R.color.oneui_secondary_tint))
+                        }
+                        HookLiveDisplay.INACTIVE -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                            hookStatusText.text = getString(R.string.stats_hook_inactive)
+                            hookStatusText.setTextColor(getColor(R.color.oneui_text_tertiary))
+                        }
+                        HookLiveDisplay.UNKNOWN -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                            hookStatusText.text = getString(R.string.stats_hook_unknown)
+                            hookStatusText.setTextColor(getColor(R.color.oneui_warning_text))
+                        }
+                    }
+                }
+            }
+            // Phase A A2：statusPill 誠實化。LSPosed 佔位永為唯讀（writeBlockReason
+            // 恆非 null），只給灰＋佔位文案，永不給綠；ROOT/SHIZUKU 綠色只給
+            // writeBlockReason(s) == null（真可寫）的通道；其餘走 amber 中性。
+            if (::statusPillText.isInitialized && ::statusPillDot.isInitialized && ::statusPillContainer.isInitialized) {
+                when (s.resolvedGateway) {
+                    ResolvedChannel.LSPOSED_PLACEHOLDER -> {
+                        statusPillText.text = getString(R.string.status_pill_lsposed_placeholder)
+                        statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                        statusPillDot.visibility = View.VISIBLE
+                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_gray)
+                        // Phase G: secondary (light #475569 on #DFE7F0 = 6.07;
+                        // tertiary was 3.81, failed 4.5).
+                        statusPillText.setTextColor(getColor(R.color.oneui_text_secondary))
+                    }
+                    ResolvedChannel.ROOT -> {
+                        val writable = writeBlockReason(s) == null
+                        statusPillText.text = getString(R.string.channel_root)
+                        statusPillDot.setImageDrawable(
+                            getDrawable(if (writable) R.drawable.ic_dot_green else R.drawable.ic_dot_amber),
+                        )
+                        statusPillDot.visibility = View.VISIBLE
+                        statusPillContainer.background = getDrawable(
+                            if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
+                        )
+                        statusPillText.setTextColor(
+                            // Phase C: writable green text uses the tint (see hookBadgeChip).
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning_text),
+                        )
+                    }
+                    ResolvedChannel.SHIZUKU -> {
+                        val writable = writeBlockReason(s) == null
+                        statusPillText.text = getString(R.string.channel_shizuku)
+                        statusPillDot.setImageDrawable(
+                            getDrawable(if (writable) R.drawable.ic_dot_green else R.drawable.ic_dot_amber),
+                        )
+                        statusPillDot.visibility = View.VISIBLE
+                        statusPillContainer.background = getDrawable(
+                            if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
+                        )
+                        statusPillText.setTextColor(
+                            // Phase C: writable green text uses the tint (see hookBadgeChip).
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning_text),
+                        )
+                    }
+                    else -> {
+                        statusPillText.text = if (s.channel == ChannelPreference.AUTO) getString(R.string.channel_auto) else getString(R.string.status_ready)
+                        statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                        statusPillDot.visibility = View.VISIBLE
+                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_amber)
+                        statusPillText.setTextColor(getColor(R.color.oneui_warning_text))
+                    }
+                }
+            }
+            // Phase A A3：成功宣稱類徽章一律由 Hook live 信號驅動；僅
+            // hookLiveProven (LSPOSED + ACTIVE + boot-fresh) 顯示，無 live 證據
+            // 前隱藏，不再無條件全綠。Phase H：existence (ACTIVE 歷史標記) 不足，
+            // daemonFooter 門控條件同升格 (原 ACTIVE 即顯，現需 live)。
+            // Phase 3 P2 perf: 沿用 render 入口 hookLive (同 s 純函數，語意不變)。
+            val hookLiveProven = hookLive
+            if (::hookBadgeChip.isInitialized) {
+                hookBadgeChip.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::hookSecPmTag.isInitialized) {
+                hookSecPmTag.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::hookUidSandboxTag.isInitialized) {
+                hookUidSandboxTag.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::injectedActiveLabel.isInitialized) {
+                injectedActiveLabel.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::daemonFooter.isInitialized) {
+                daemonFooter.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::residentBadge.isInitialized) {
+                residentBadge.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            if (::telemetryDot.isInitialized && ::telemetryStatusView.isInitialized) {
+                // Phase 3 P2 perf: 沿用 render 入口 hookText (null 語意不變)。
+                if (hookText == null) {
+                    telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                    telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
+                } else {
+                    // Phase H：ACTIVE 綠＋運作中·已注入只給 boot-fresh 證實；
+                    // 歷史標記走 UNKNOWN (amber＋狀態未知，永不給綠)。
+                    // Phase 3 P2 perf: 沿用 render 入口 hookDisplay。
+                    when (hookDisplay) {
+                        HookLiveDisplay.LIVE -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_active)
+                        }
+                        HookLiveDisplay.INACTIVE -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_inactive)
+                        }
+                        HookLiveDisplay.UNKNOWN -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
+                        }
+                    }
+                }
+            }
+            if (::checklistSummaryView.isInitialized) {
+                // Phase H：4/4 模組運作正常只給 live 證實；ACTIVE 歷史標記走 unknown。
+                checklistSummaryView.text = if (hookLiveProven) {
+                    getString(R.string.engine_diag_all_normal)
+                } else {
+                    getString(R.string.engine_diag_unknown)
+                }
+            }
+            for (badge in checklistItemBadges) {
+                badge.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
+            }
+            // Phase G: checklist icons are build-time green/blue; without Hook
+            // live proof they must not signal success -- gray them via tertiary.
+            // Tertiary as icon (non-text, 3:1) is 5.19 on island #E8EEF5.
+            // Phase H: 門控由 existence 升格為 hookLiveProven。
+            for (i in checklistItemIcons.indices) {
+                try {
+                    checklistItemIcons[i].setColorFilter(
+                        getColor(
+                            if (hookLiveProven) {
+                                if (checklistItemIsGreen.getOrElse(i) { true }) R.color.oneui_secondary else R.color.oneui_primary
+                            } else {
+                                R.color.oneui_text_tertiary
+                            },
+                        ),
+                    )
+                } catch (_: Exception) {
+                    // Best effort: render may run before buildUi in tests.
+                }
+            }
+            try {
+                engineUidIcon?.setColorFilter(
+                    getColor(if (hookLiveProven) R.color.oneui_secondary else R.color.oneui_text_tertiary),
+                )
+            } catch (_: Exception) {
+                // Best effort: render may run before buildUi in tests.
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "render OneUI badges failed", e)
+        }
+        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋Switch 寫入門控 blockKey）。
+        // 移出上段 try：列表失敗不吞徽章更新，徽章失敗不吞列表。
+        try {
+            renderClonedApps(s, blockKey, catalogKey)
+        } catch (e: Exception) {
+            Log.w(TAG, "renderClonedApps failed", e)
+        }
         // Writes queue in the ViewModel anyway; disabling while busy keeps
         // the read-only placeholder visibly read-only. Channel switches go
         // through the same mutex (selectChannel latest-wins), so the picker
         // is gated on busy only (never on writability: switching is the
         // recovery path out of an unwritable channel).
         // PR-37 P3 按鈕狀態：busy 時勾選相關一律禁用（批次執行中不可改勾選）；
-        // batch 需非 busy 且有勾選；保存需已知目標 (targetId > 0)。
+        // batch 需非 busy 且有勾選；保存需 verified target 可用（見 E6，
+        // 與 batchEnabled 同源 verifiedTargetAvailable）。
         // p28-1 enabled 反映可寫能力：clone/remove/batch 另須可寫
         // (writeBlockReason == null)；禁用原因由 writeBlockView 顯示
         // （VM 拒絕理由 single source，VM guard 保留在 isWritable 內）。
@@ -1015,15 +2994,12 @@ class MainActivity : ComponentActivity() {
         // 此處只做 UI 層即時門控）；batch 另須目前 verified target 可用
         // （inventory.targetId 有效，與 cloneSelected 起始 pin fail-closed
         // 一致；VM 側 fetchDualTarget 守衛保留為縱深）。
-        val busy = s.loading
+        // （busy/blockKey 已於 render 入口計算，此處重用，不重算。）
         // p28-1 互斥單選同步：checked 即選擇狀態（視覺 + TalkBack）。
         autoBtn.isChecked = (s.channel == ChannelPreference.AUTO)
         rootBtn.isChecked = (s.channel == ChannelPreference.ROOT)
         shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
         lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
-        // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
-        // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
-        val blockKey = if (busy) null else writeBlockReason(s)
         val blockReason = blockKey?.let { resolveBlockReason(it) }
         val blockDedupKey = writeBlockDedupKey(blockKey)
         // P2-2 輕量讀取：buildUi 前 render（測試路徑）視為不可用（fail-closed）。
@@ -1050,7 +3026,9 @@ class MainActivity : ComponentActivity() {
         systemToggleBtn.isEnabled = !busy
         selectAllBtn.isEnabled = !busy
         clearSelBtn.isEnabled = !busy
-        saveSelBtn.isEnabled = !busy && s.inventory.targetId > 0
+        // Phase E E6：save 門對齊 verifiedTargetAvailable（targetId>0 且
+        // serial 非 null，與 batch 同源）；VM persistSelection 守衛不動。
+        saveSelBtn.isEnabled = !busy && verifiedTargetAvailable(s)
         cancelSaveBtn.isEnabled = !busy
         batchBtn.isEnabled = batchEnabled(s)
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
@@ -1149,7 +3127,13 @@ class MainActivity : ComponentActivity() {
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
-        syncRemoveDialog(s.pendingRemove, s.loading)
+        // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
+        // try 包裝比照 renderClonedApps：未來契約 misfire 時降級，不殺 StateFlow collector。
+        try {
+            syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
+        } catch (e: Exception) {
+            Log.w(TAG, "syncRemoveDialog failed", e)
+        }
     }
 
     // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
@@ -1255,7 +3239,9 @@ class MainActivity : ComponentActivity() {
     // 在途 loading 時對話框保留但按鈕禁用，靠 VM dedup + 按鈕禁用雙保險：
     // 同一 pending 只更新按鈕 enabled（不重建）；confirm 點下後下一幀
     // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
-    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean) {
+    // Phase B B1：confirm 另須通道可寫（blockKey == null，與 Switch/按鈕同源；
+    // busy 時 blockKey 為 null 但 loading 仍禁用，不可繞過）。
+    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?, catalogKey: Int) {
         if (isFinishing || isDestroyed) return
         if (pending == null) {
             removeLabelsDialog?.dismiss()
@@ -1272,8 +3258,11 @@ class MainActivity : ComponentActivity() {
             acknowledgedGeneration = null
             return
         }
+        // Phase 1a：sync 上提到 early-return 之前——對話框顯示中 catalog 變化亦能刷新快取，
+        // 避免殘留舊 cache／舊文案（idempotent＋cheap，見 syncLabelCache）。
+        syncLabelCache(catalogKey)
         if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
             // 在途不可取消，關閉 cancel 窗的使用者路徑；程式化 cancel 由 repo isStillValid 兜底。
@@ -1295,7 +3284,23 @@ class MainActivity : ComponentActivity() {
             removeAcknowledged = false
             acknowledgedGeneration = null
         }
-        val appLabel = resolveAppLabel(pending.pkg)
+        // Phase F F1/F2：catalogKey 由 render 入口傳入（與 renderClonedApps 共用，
+        // 不再此處重算）；同步只讀快取＋catalog 預取，
+        // miss 顯示 pkg 佔位，dialog 顯示後非同步回填（同 pending 仍在屏才更新）。
+        // 主執行緒不打 PM binder（原每 show 一次連續 binder）。
+        // Phase 1a：sync 已在 early-return 前完成（見上），此處不再重複。
+        var appLabel = resolveAppLabelCached(pending.pkg)
+        if (appLabel == pending.pkg) {
+            val prefilled = try {
+                catalogLabelsFor(vm.state.value.sourceCatalog)[pending.pkg]
+            } catch (_: Exception) {
+                null
+            }
+            if (prefilled != null) {
+                appLabel = prefilled
+                cacheLabel(pending.pkg, prefilled)
+            }
+        }
         // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
         // 本地確認畫面顯示完整 package + user/serial，標籤則有明示的上限，
         // 不經 sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
@@ -1348,53 +3353,432 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             removeAcknowledged = checked
             acknowledgedGeneration = if (checked) pending.generation else null
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(vm.state.value.loading, checked)
+            // 確定性路徑：用本次 sync 傳入的 loading/blockKey（render 每幀刷新，
+            // early-return 路徑 3176 與初始值 3293 同源），不即時重算 live 狀態，
+            // 避免背景任務（init probe/catalog 刷新）中途翻轉造成按鈕閃爍／測試
+            // flaky；loading 變化由下一次 render 的 early-return 同步，真正寫入
+            // 門控在 Positive 點擊即時重讀＋VM confirmRemove isWritable() 雙層
+            // fail-closed，此處僅控按鈕顯示。
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, checked, blockKey == null)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            if (canConfirmRemove(vm.state.value.loading, removeAcknowledged)) vm.confirmRemove(pending)
+            val (curLoading, curWritable) = try {
+                val c = vm.state.value
+                c.loading to (!c.loading && writeBlockReason(c) == null)
+            } catch (_: Exception) {
+                loading to (blockKey == null)
+            }
+            if (canConfirmRemove(curLoading, removeAcknowledged, curWritable)) vm.confirmRemove(pending)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove(pending) }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            removeLabelsDialog = AlertDialog.Builder(this)
-                .setTitle(R.string.remove_confirm_view_labels)
-                .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), appLabel, pending.profileLabel))
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
+            // Phase 3 P3: Neutral 子對話框比照 settingsDialog/syncRemoveDialog
+            // 的 BadToken 守衛 (isFinishing/isDestroyed + try/catch 包 show)。
+            if (isFinishing || isDestroyed) return@setOnClickListener
+            try {
+                removeLabelsDialog = AlertDialog.Builder(this)
+                    .setTitle(R.string.remove_confirm_view_labels)
+                    // Phase K K1 加固：即時讀快取（回調已回填時取 fresh，未回仍為佔位，不差於 captured var）。
+                    .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), resolveAppLabelCached(pending.pkg).takeIf { it != pending.pkg } ?: appLabel, pending.profileLabel))
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            } catch (e: Exception) {
+                Log.w(TAG, "removeLabelsDialog failed", e)
+                removeLabelsDialog = null
+            }
         }
-        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged)
+        removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = !loading
         // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
         removeConfirmDialog?.setCancelable(!loading)
         removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
+        // Phase F F1：快取＋catalog 皆 miss 才起 IO；回來時同 pending 仍在屏才更新
+        // 訊息＋標籤詳情（buildRemove* 純函數重算，Phase E 誠實語意不變）。
+        if (!isLabelCached(pending.pkg)) {
+            // Phase 1a 世代守衛：回填時 catalog 世代已變則丟棄（dialog 文案以下次 render 重建為準）。
+            val dialogEpoch = labelCacheCatalogKey
+            requestLabelAsync(pending.pkg) { fresh ->
+                try {
+                    if (shownPending != pending) return@requestLabelAsync
+                    if (dialogEpoch != labelCacheCatalogKey) return@requestLabelAsync
+                    val dlg = removeConfirmDialog ?: return@requestLabelAsync
+                    if (dlg.isShowing != true) return@requestLabelAsync
+                    // Phase K K1：回寫 captured var（NEUTRAL 閉包經 Ref 後續可見），
+                    // NEUTRAL 後開 detail 不再讀佔位。
+                    appLabel = fresh
+                    val newMessage = buildRemoveConfirmMessage(
+                        template = getString(R.string.remove_confirm_message),
+                        pkg = pending.pkg,
+                        appLabel = fresh,
+                        profileLabel = pending.profileLabel,
+                        dualId = pending.dualId,
+                        serial = pending.dualSerial,
+                    )
+                    try {
+                        dlg.setMessage(newMessage)
+                    } catch (_: Exception) {
+                        try {
+                            dlg.findViewById<TextView>(android.R.id.message)?.text = newMessage
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                    }
+                    try {
+                        removeLabelsDialog?.setMessage(
+                            buildRemoveLabelsMessage(
+                                getString(R.string.remove_confirm_labels),
+                                fresh,
+                                pending.profileLabel,
+                            ),
+                        )
+                    } catch (_: Exception) {
+                        // Best effort: 標籤詳情未展開時無需更新。
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        }
     }
 
     // Best-effort display name for the dialog: the PackageManager label when
     // installed for the owner, else the raw package token. Never throws: a
     // missing/unreadable package falls back to the token so the dialog always
     // names the exact uninstall target.
-    private fun resolveAppLabel(pkg: String): String =
-        try {
-            val info = if (Build.VERSION.SDK_INT >= 33) {
-                packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getApplicationInfo(pkg, 0)
-            }
-            packageManager.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
+    // Phase B B4：pkg→label 內存快取（有界 200，與圖示快取同級）。
+    // catalog 引用變化即失效（重裝/卸載後標籤可能改變）；失敗不快取（包可能稍後出現）。
+    // Phase F F1：主執行緒永不 PM IPC。同步路徑只讀快取（resolveAppLabelCached），
+    // miss 回 pkg 佔位並經 requestLabelAsync 在 IO 查詢後回填＋重綁（比照 loadIcon：
+    // tag/世代檢查，過期丟棄，快取保留）。catalog 自帶 label（IO 已查好）由呼叫端
+    // 經 catalogLabelsFor 優先填入，等價於 reloadCatalog IO 路徑預取且無執行緒競爭。
+    // Phase F F2：catalogKey 由 render 入口一次計算，傳給 renderClonedApps 與
+    // syncRemoveDialog 共用（syncLabelCache＋指紋共用），不再各入口各自重算
+    //（O(cloned×catalog) → O(catalog)）。命中移尾改 LRU（與圖示快取一致 remove+put，
+    // 首項＝最久未用）。失效語義保留全清：label 僅顯示用，重裝/卸載後標籤可能改變，
+    // 全清為正確性優先的簡單選擇（重填走非同步 IO，有界 200，不阻塞主執行緒）。
+    // Phase 3 P2 perf: catalog 內容 hash 快取 (referential identity; 同一實例
+    // O(1))。labelCacheKey (no-arg seam 供 dialog/測試) 與 buildSourceListKey/
+    // render 共用；引用未變直接回快取，行為不變 (hashCode 值語意相同)。
+    private fun catalogHashCached(catalog: List<SourceAppEntry>): Int {
+        return try {
+            val ref = lastCatalogHashRef
+            if (ref !== null && ref === catalog) return lastCatalogHash
+            val h = catalog.hashCode()
+            lastCatalogHashRef = catalog
+            lastCatalogHash = h
+            h
         } catch (_: Exception) {
-            pkg
+            0
         }
+    }
+
+    private fun labelCacheKey(): Int = try {
+        catalogHashCached(vm.state.value.sourceCatalog)
+    } catch (_: Exception) {
+        0
+    }
+
+    // Phase I I1：只清 cache，不清 labelCallbacks（在途合併中回調仍有效；失效後重填走非同步 IO）。
+    // Phase 1a（P3 N4）：主執行緒專用契約（labelCache／labelInflight／labelCallbacks 皆主線觸碰）。
+    private fun syncLabelCache(catalogKey: Int) {
+        check(Looper.getMainLooper().isCurrentThread) { "syncLabelCache must run on main thread" }
+        try {
+            if (labelCacheCatalogKey != catalogKey) {
+                labelCache.clear()
+                labelCacheCatalogKey = catalogKey
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // 同步只讀快取（LRU 命中移尾），miss 回 pkg，不打 PM binder。主執行緒唯一同步入口。
+    private fun resolveAppLabelCached(pkg: String): String {
+        try {
+            labelCache[pkg]?.let {
+                labelCache.remove(pkg)
+                labelCache.put(pkg, it)
+                return it
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return pkg
+    }
+
+    // LRU 寫入（有界 MAX_LABEL_CACHE，滿時淘汰最久未用首項；與圖示快取同式）。
+    // Phase 1a（P3 N4）：主執行緒專用契約。
+    private fun cacheLabel(pkg: String, label: String) {
+        check(Looper.getMainLooper().isCurrentThread) { "cacheLabel must run on main thread" }
+        try {
+            labelCache.remove(pkg)
+            if (labelCache.size >= MAX_LABEL_CACHE) {
+                labelCache.keys.firstOrNull()?.let { labelCache.remove(it) }
+            }
+            labelCache[pkg] = label
+        } catch (_: Exception) {
+            // Best effort: 快取寫入失敗不影響顯示。
+        }
+    }
+
+    // render 側 catalog 預取：catalog 每項 label 本就在 reloadCatalog IO 路徑查好，
+    // 此處一次建表（O(catalog)）供本輪各列 O(1) 取用並順手灌快取；仍缺才走
+    // requestLabelAsync。呼叫端（renderClonedApps/dialog）在同步綁定前呼叫。
+    private fun catalogLabelsFor(catalog: List<SourceAppEntry>): Map<String, String> = try {
+        val m = HashMap<String, String>(catalog.size)
+        for (e in catalog) {
+            try {
+                if (e.label.isNotBlank() && e.label != e.packageName) m[e.packageName] = e.label
+            } catch (_: Exception) {
+                continue
+            }
+        }
+        m
+    } catch (_: Exception) {
+        emptyMap()
+    }
+
+    // Phase F F1：miss 時 IO 查詢後回填。同一 pkg 在途合併（labelInflight＋labelCallbacks）；
+    // Phase I I1：per-pkg 回調合併——head：cache 命中 return；inflight 命中則合併回調後 return；
+    // 否則記 inflight＋註冊回調後起 IO。完成：remove inflight→cacheLabel→無條件 rebindClonedLabel
+    // （I2，tag 精確只碰同 pkg 行，覆蓋防禦性 return 極窄窗口；dialog 無 tag 容器可掃，靠自有回調）。
+    // IO 查 PM，主執行緒經各 onLoaded 回填（呼叫端各做 tag/世代檢查後重綁，舊門保留）。
+    // 失敗不快取（包可能稍後出現）；同 epoch 失敗清 inflight＋callbacks（drop 不回調，避免洩漏），
+    // 在途 catalog 變化且有新世代 waiter 則重掛＋重發一次 IO（見完成段 RELAUNCH_FRESH 臂）。
+    // 分身列表規模小（非 200 來源列），不另設 Semaphore。
+    // 全部主執行緒觸碰（head 同步＋完成回主線）；syncLabelCache 清 cache 不清 callbacks。
+    // Phase 1a：waiter 攜註冊 epoch；完成經 arbitrateLabelCompletion 統一仲裁
+    // （見完成段：同 epoch 成功 FANOUT／其餘 DROP・SERVE 快取・RELAUNCH fresh 重發；
+    // stale 路徑永不派發舊 pm label）。同 epoch 成功語義不變（無條件 rebind＋全量 fanout）。
+    private fun requestLabelAsync(pkg: String, onLoaded: (String) -> Unit) {
+        // Phase 1a（P3 N4）：主執行緒專用契約（head＋完成皆主線觸碰 labelCache／inflight／callbacks）。
+        check(Looper.getMainLooper().isCurrentThread) { "requestLabelAsync must run on main thread" }
+        // Phase 1a（P2 世代守衛）：head 在主線 capture catalog epoch，與 pkg 一併作為在途鍵。
+        val reqEpoch = labelCacheCatalogKey
+        try {
+            if (labelCache.containsKey(pkg)) return
+            if (pkg in labelInflight) {
+                labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(reqEpoch to onLoaded)
+                return
+            }
+            labelInflight.add(pkg)
+            labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(reqEpoch to onLoaded)
+        } catch (_: Exception) {
+            return
+        }
+        // Phase 1a（CHANGES-REQUESTED）：IO 發起段抽為 local fun，launch 時重取當代 epoch；
+        // 失敗路徑若在途發生 catalog 變化且有新世代 waiter，重掛＋重發一次 IO，避免新世代
+        // waiter 被舊失敗靜默丟棄。同 epoch 失敗語義不變（全丟，下次 render 重註冊）。
+        fun launchLabelLookup() {
+            val launchEpoch = labelCacheCatalogKey
+            lifecycleScope.launch {
+                val label: String? = withContext(Dispatchers.IO) {
+                try {
+                    val info = if (Build.VERSION.SDK_INT >= 33) {
+                        packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        packageManager.getApplicationInfo(pkg, 0)
+                    }
+                    packageManager.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() }
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            try {
+                labelInflight.remove(pkg)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            // Phase A (P2-1 stale-success)：統一仲裁——快照 waiter、在移除後取樣
+            // freshCacheHit（B-render 可能經 catalogLabelsFor＋cacheLabel 在 IO 與
+            // 完成之間預填），再執行恰一臂。stale 路徑永不派發舊 pm label：
+            // 無 fresh→DROP；有 fresh 且快取命中→SERVE 快取；否則重掛 fresh＋重發
+            // 一次 IO（RELAUNCH，launchLabelLookup 內重捕 fresh epoch）。
+            // 同 epoch 成功路徑語義不變（FANOUT：cache＋rebind＋全量 fanout）。
+            val pmSuccess = label != null && label != pkg
+            val currentEpoch = labelCacheCatalogKey
+            val snapshot: List<Pair<Int?, (String) -> Unit>> = try {
+                labelCallbacks.remove(pkg) ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val waiterEpochs: List<Int?> = try {
+                snapshot.map { it.first }
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val freshCacheHit: Boolean = try {
+                labelCache.containsKey(pkg)
+            } catch (_: Exception) {
+                false
+            }
+            when (arbitrateLabelCompletion(launchEpoch, currentEpoch, waiterEpochs, pmSuccess, freshCacheHit)) {
+                LabelCompletionAction.FANOUT_SAME_EPOCH -> {
+                    val ok = label
+                    if (ok == null || ok == pkg) return@launch
+                    cacheLabel(pkg, ok)
+                    // Phase I I2：無條件重綁同 pkg 行（tag 精確），覆蓋各 waiter 防禦性 return 極窄窗口。
+                    try {
+                        rebindClonedLabel(pkg, ok)
+                    } catch (_: Exception) {
+                        // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
+                    }
+                    for ((_, cb) in snapshot) {
+                        try {
+                            cb(ok)
+                        } catch (_: Exception) {
+                            // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                        }
+                    }
+                }
+                LabelCompletionAction.DROP_ALL -> {
+                    // 同 epoch 失敗沿舊語義全丟（cache 仍 miss，下次 render 重註冊）；
+                    // stale 無 fresh waiter 亦全丟：不觸 cache／rebind／回調／重發。
+                    return@launch
+                }
+                LabelCompletionAction.SERVE_FROM_CACHE -> {
+                    val cached: String? = try {
+                        labelCache[pkg]
+                    } catch (_: Exception) {
+                        null
+                    }
+                    val fresh = try {
+                        snapshot.filter { it.first == currentEpoch }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    if (cached == null || cached == pkg || fresh.isEmpty()) {
+                        // 快取競失（主線無掛起理論不可達；防禦）：保活重發 fresh，
+                        // 永不回退為派發舊 pm label。
+                        if (fresh.isNotEmpty()) {
+                            try {
+                                labelInflight.add(pkg)
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            try {
+                                labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
+                            } catch (_: Exception) {
+                                try {
+                                    labelInflight.remove(pkg)
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                return@launch
+                            }
+                            launchLabelLookup()
+                        }
+                        return@launch
+                    }
+                    try {
+                        rebindClonedLabel(pkg, cached)
+                    } catch (_: Exception) {
+                        // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
+                    }
+                    for ((_, cb) in fresh) {
+                        try {
+                            cb(cached)
+                        } catch (_: Exception) {
+                            // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                        }
+                    }
+                }
+                LabelCompletionAction.RELAUNCH_FRESH -> {
+                    // 在途 catalog 變化（A→B）且有新世代 waiter：重掛 fresh waiter
+                    // 並重發一次 IO；舊 pm label 丟棄（不 cache／不 rebind／不回調）。
+                    val fresh = try {
+                        snapshot.filter { it.first == currentEpoch }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    if (fresh.isEmpty()) return@launch
+                    try {
+                        labelInflight.add(pkg)
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                    try {
+                        labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
+                    } catch (_: Exception) {
+                        try {
+                            labelInflight.remove(pkg)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                        return@launch
+                    }
+                    launchLabelLookup()
+                }
+            }
+            }
+        }
+        launchLabelLookup()
+    }
+
+    private fun isLabelCached(pkg: String): Boolean = try {
+        labelCache.containsKey(pkg)
+    } catch (_: Exception) {
+        false
+    }
+
+    // Phase F F1：分身行 label 回填 fallback（發起行已 detach 時走容器按 tag 查找）。
+    // 同行內按 tag 更新：title（tag=pkg）設文字，badge（tag=badge:pkg）與
+    // Switch（tag=switch:pkg）更新 contentDescription；找不到丟棄（快取保留）。
+    // Switch 亦為 TextView 子類，故 title 查找另加型別守衛（title 建時只給純 TextView
+    // 設 tag=pkg，Switch 的 tag 為 switch:pkg）。
+    private fun rebindClonedLabel(pkg: String, label: String) {
+        try {
+            if (!::clonedAppsContainer.isInitialized) return
+            for (i in 0 until clonedAppsContainer.childCount) {
+                val row = clonedAppsContainer.getChildAt(i) as? ViewGroup ?: continue
+                val title = try {
+                    row.findViewWithTag<TextView>(pkg)
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+                if (title is Switch) continue
+                try {
+                    title.text = label
+                } catch (_: Exception) {
+                    continue
+                }
+                try {
+                    row.findViewWithTag<TextView>("badge:$pkg")?.contentDescription =
+                        getString(R.string.dual_badge_cd, label)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    // Phase G: full-width colon via remove_row_cd.
+                    row.findViewWithTag<Switch>("switch:$pkg")?.contentDescription =
+                        getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // 相容舊同步入口：僅主執行緒快取快讀（miss 回 pkg，不打 PM binder）。
+    // Phase 1a（CHANGES-REQUESTED）：背景同步 PM 分支已刪除——syncLabelCache／cacheLabel
+    // 皆有主執行緒契約，背景直呼必拋（且全 repo 零呼叫端）；保留簽名供未來主線呼叫。
+    private fun resolveAppLabel(pkg: String): String = resolveAppLabelCached(pkg)
 
     // PR-7 P2 (#26):來源 catalog 載入 (授權範圍唯讀)。
     // 包到 MainActivity 的生命週期:IO 執行緒讀 PackageManager,回主執行緒注入
     // ViewModel。serial 取自身 user (UserManager,失敗回退 0);AppKey =
     // serial:package (見 SourceInventory)。
     // PR-37 P3:失敗不清空（保留舊列表，不呼叫 setSourceCatalog），錯誤走獨立
-    // 文案 catalogLoadError（與「尚未載入」區分）；onCreate+onResume 雙觸發以
-    // catalogJob 取消前一個在途任務，避免疊加。
+    // 文案 catalogLoadError（與「尚未載入」區分）。
+    // Phase 3 P3 N5: 在途守衛——onCreate+onResume 連續觸發時若已有掃描在途
+    // 直接共用，不取消重掃 (避免兩次全量 PM 掃描併發；同範圍重載結果等價，
+    // 寫入仍 last-writer-wins，語義不變)。
     private fun reloadCatalog() {
-        catalogJob?.cancel()
+        if (catalogJob?.isActive == true) return
         catalogJob = lifecycleScope.launch {
             val apps: List<SourceAppEntry>? = withContext(Dispatchers.IO) {
                 try {
@@ -1539,6 +3923,9 @@ class MainActivity : ComponentActivity() {
                     isChecked = entry.appKey in s.selectedKeys
                     // 批次執行中不可改勾選。
                     isEnabled = !busy
+                    // Phase 3 P2 a11y: 48dp touch target via minimumHeight
+                    // (height stays WRAP_CONTENT so large fonts grow).
+                    minimumHeight = dp(48)
                 }
                 requestIcon(entry.packageName, entry.appKey, box)
                 box.setOnCheckedChangeListener { _, checked ->
@@ -1562,9 +3949,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 來源列表指紋：catalog 引用+內容 hash、query、系統開關、勾選集合 hash。
+    // 來源列表指紋：catalog 內容 hash（與 labelCacheKey 同源，見 syncLabelCache）、query、系統開關、勾選集合 hash。
+    // Phase 3 P2 perf: catalog hash 經 referential 快取 (catalogHashCached)，
+    // 引用未變 O(1)，行為不變。
     private fun buildSourceListKey(s: UiState): String =
-        "${System.identityHashCode(s.sourceCatalog)}:${s.sourceCatalog.hashCode()}:" +
+        "${catalogHashCached(s.sourceCatalog)}:" +
             "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
 
     // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
@@ -1582,39 +3971,69 @@ class MainActivity : ComponentActivity() {
     // 對應 key（見 evictIcon／pickIconEvictionKey）。之後回到該 App：快取 miss
     // ＋未 loaded → 重新請求圖示。淘汰永不碰 iconInflight（在途 key 本就不在
     // 快取內，被害者不可能是自己）；完成寫入時即使快取已滿也正常寫入＋淘汰最舊。
-    private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
-        val cached = iconDrawables[appKey]
-        if (cached != null) {
-            val fresh = try {
-                cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
-            } catch (_: Exception) {
-                cached
-            }
-            box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-            return
-        }
+    // Phase D 共用圖示載入核心（雙 requestIcon overload single source）：
+    // 快取命中由 freshIconDrawable 同步供呼叫端綁定；未命中走 loadIcon
+    //（memo/inflight/淘汰/回填），完成經 onLoaded 回主執行緒綁定。
+    // LRU：命中移尾（LinkedHashMap 插入序，首項＝最久未用，
+    // pickIconEvictionKey 照舊淘汰首項）。
+    private fun freshIconDrawable(cached: Drawable): Drawable = try {
+        cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
+    } catch (_: Exception) {
+        cached
+    }
+
+    private fun loadIcon(pkg: String, appKey: String, onLoaded: (Drawable) -> Unit) {
         if (iconMemo.isLoaded(appKey)) return
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
         lifecycleScope.launch {
-            val drawable = withContext(Dispatchers.IO) {
-                try {
-                    packageManager.getApplicationIcon(pkg)
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            iconInflight.remove(appKey)
-            if (drawable == null) return@launch
-            val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
-            if (victim != null) evictIcon(victim)
-            iconMemo.markLoaded(appKey)
-            iconDrawables[appKey] = drawable
-            val fresh = try {
-                drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
+            // Phase F F4：併發上限（見 iconLoadSemaphore）。acquire 失敗（銷毀取消）
+            // 即清 inflight 返回，允許下次列表重建時重試。
+            try {
+                iconLoadSemaphore.acquire()
             } catch (_: Exception) {
-                drawable
+                try {
+                    iconInflight.remove(appKey)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                return@launch
             }
+            try {
+                val drawable = withContext(Dispatchers.IO) {
+                    try {
+                        packageManager.getApplicationIcon(pkg)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (drawable == null) return@launch
+                val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
+                if (victim != null) evictIcon(victim)
+                iconMemo.markLoaded(appKey)
+                iconDrawables[appKey] = drawable
+                onLoaded(drawable)
+            } finally {
+                try {
+                    iconLoadSemaphore.release()
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                iconInflight.remove(appKey)
+            }
+        }
+    }
+
+    private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
+        val cached = iconDrawables[appKey]
+        if (cached != null) {
+            iconDrawables.remove(appKey)
+            iconDrawables[appKey] = cached
+            box.setCompoundDrawablesWithIntrinsicBounds(freshIconDrawable(cached), null, null, null)
+            return
+        }
+        loadIcon(pkg, appKey) { drawable ->
+            val fresh = freshIconDrawable(drawable)
             // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
             // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
             //（找不到＝已過濾掉／換 catalog，不貼）。
@@ -1622,27 +4041,152 @@ class MainActivity : ComponentActivity() {
                 if (box.tag == appKey && box.parent === sourceContainer) {
                     try {
                         box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-                        return@launch
                     } catch (_: Exception) {
                         // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
                     }
-                }
-                for (i in 0 until sourceContainer.childCount) {
-                    val child = sourceContainer.getChildAt(i)
-                    if (child is CheckBox && child.tag == appKey) {
-                        val perView = try {
-                            drawable.constantState?.newDrawable()?.mutate() ?: fresh
-                        } catch (_: Exception) {
-                            fresh
+                } else {
+                    for (i in 0 until sourceContainer.childCount) {
+                        val child = sourceContainer.getChildAt(i)
+                        if (child is CheckBox && child.tag == appKey) {
+                            val perView = try {
+                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                            } catch (_: Exception) {
+                                fresh
+                            }
+                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                            break
                         }
-                        child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
-                        break
                     }
                 }
             } catch (_: Exception) {
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
+            // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
+            // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
+            try {
+                rebindClonedIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
+            }
         }
+    }
+
+    // Phase B B2：分身 ImageView 版。呼叫端先設 tag=appKey（此處再設一次兜底）；
+    // 完成時照抄 CheckBox 版：tag＋容器歸屬雙比對，否則在容器內按 tag 找 ImageView
+    // 重綁，找不到丟棄。gen 為 renderClonedApps 世代，過期丟棄綁定（快取保留，
+    // 下次渲染同步路徑可直接命中）。
+    // Phase I I3：跨容器重綁（rebindClonedIcon＋rebindSourceIcon）移到 gen 檢查前，
+    // 鏡像來源路徑（CheckBox 版無 gen 門）；tag＋容器雙比對防貼錯，gen 只守直接
+    // setImageDrawable（發起 View 仍掛載才直貼）。避免重建後舊回調因 capturedGen
+    // 擋在重綁前，致新行（同 appKey）永久無圖。
+    private fun requestIcon(pkg: String, appKey: String, imageView: ImageView, gen: Int) {
+        try {
+            imageView.tag = appKey
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        val cached = iconDrawables[appKey]
+        if (cached != null) {
+            iconDrawables.remove(appKey)
+            iconDrawables[appKey] = cached
+            try {
+                imageView.setImageDrawable(freshIconDrawable(cached))
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            return
+        }
+        val capturedGen = gen
+        loadIcon(pkg, appKey) { drawable ->
+            // Phase I I3：先跨容器/同容器重綁（tag 精確，找不到丟棄），再做 gen 門。
+            try {
+                rebindClonedIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
+            try {
+                rebindSourceIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            if (capturedGen != clonedGen) return@loadIcon
+            val fresh = freshIconDrawable(drawable)
+            try {
+                if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
+                    try {
+                        imageView.setImageDrawable(fresh)
+                    } catch (_: Exception) {
+                        // Best effort: 舊行 detach 後已由上重綁覆蓋。
+                    }
+                }
+                // else 分支已由上重綁覆蓋（容器內按 tag 找同 key 行），此處不再重複。
+            } catch (_: Exception) {
+                // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+            }
+        }
+    }
+
+    // Phase B B2：在分身容器內按 tag 找 ImageView 重綁（找不到丟棄）。
+    // 行結構：row(LinearLayout)→iconContainer(FrameLayout)→ImageView＋badge；
+    // 用遞迴兜底未來結構變化。
+    private fun rebindClonedIcon(appKey: String, drawable: Drawable) {
+        if (!::clonedAppsContainer.isInitialized) return
+        val target = findImageViewWithTag(clonedAppsContainer, appKey) ?: return
+        val perView = try {
+            drawable.constantState?.newDrawable()?.mutate()
+                ?: drawable.mutate()
+        } catch (_: Exception) {
+            drawable
+        }
+        target.setImageDrawable(perView)
+    }
+
+    // Phase B B2：在來源容器內按 tag 找 CheckBox 重綁（找不到丟棄）。
+    private fun rebindSourceIcon(appKey: String, drawable: Drawable) {
+        if (!::sourceContainer.isInitialized) return
+        for (i in 0 until sourceContainer.childCount) {
+            val child = sourceContainer.getChildAt(i)
+            if (child is CheckBox && child.tag == appKey) {
+                val perView = try {
+                    drawable.constantState?.newDrawable()?.mutate()
+                        ?: drawable.mutate()
+                } catch (_: Exception) {
+                    drawable
+                }
+                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                break
+            }
+        }
+    }
+
+    private fun findImageViewWithTag(root: View, appKey: String): ImageView? {
+        try {
+            if (root is ImageView && root.tag == appKey) return root
+            if (root is ViewGroup) {
+                for (i in 0 until root.childCount) {
+                    val found = findImageViewWithTag(root.getChildAt(i), appKey)
+                    if (found != null) return found
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return null
+    }
+
+    private fun isUnderClonedContainer(view: View): Boolean {
+        try {
+            if (!::clonedAppsContainer.isInitialized) return false
+            var p = view.parent
+            while (p != null) {
+                if (p === clonedAppsContainer) return true
+                p = (p as? View)?.parent
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return false
     }
 
     // PR-37 Phase C #5 淘汰同步點：同時清除 drawables 與 memo 兩處。
@@ -1668,6 +4212,11 @@ class MainActivity : ComponentActivity() {
         @Volatile
         internal var testViewModel: DualViewModel? = null
 
+        const val TAB_DUAL_APPS = 0
+        const val TAB_CORE_ENGINE = 1
+        private const val KEY_CURRENT_TAB = "main.current_tab"
+        private const val TAG = "MainActivity"
+
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
         private const val SHIZUKU_REQUEST_CODE = 1001
@@ -1689,14 +4238,66 @@ class MainActivity : ComponentActivity() {
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
 
+        // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
+        private const val MAX_LABEL_CACHE = 200
+
         // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
-        // (orderedKeys.size >= maxSize) 時回傳最舊 key（插入順序第一個），
-        // 未滿回傳 null。只用 stdlib 集合、無 Android 依賴；呼叫方拿到 victim
+        // (orderedKeys.size >= maxSize) 時回傳最久未用 key（Phase D 起 LRU：
+        // 命中移尾，故插入順序第一個＝最久未用），未滿回傳 null。只用 stdlib 集合、無 Android 依賴；呼叫方拿到 victim
         // 後經 evictIcon 同步清除 drawables＋memo 兩處。
         internal fun pickIconEvictionKey(orderedKeys: List<String>, maxSize: Int): String? =
             if (orderedKeys.size >= maxSize) orderedKeys.firstOrNull() else null
     }
 }
+
+// Phase A (P2-1 stale-success)：label 補查完成仲裁（純函數，JVM 可測；
+// Activity 完成段快照 waiter＋取樣 freshCacheHit 後呼叫，執行恰一臂，
+// 副作用留 Activity；呼叫端 when 窮舉無 else，新臂加入即編譯失敗）。
+// 行覆寫引理：B-epoch waiter 的行 rowGen／tag／dialog 守衛對當代 waiter 合法
+// 通過——若 stale 成功仍把舊 pm label 派發給當代 waiter，會以舊資料覆寫
+// title／badge CD／Switch CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
+// 成功）可派發本次 pm label，stale 完成只允許 DROP（丟棄）、SERVE_FROM_CACHE
+//（派發 B-render 已預填的當代快取，永非舊 label）、RELAUNCH_FRESH（重掛 fresh
+// waiter＋重發一次 IO）。same-epoch 失敗語義不變（DROP 全丟，下次 render 重註冊）。
+internal enum class LabelCompletionAction {
+    FANOUT_SAME_EPOCH,
+    DROP_ALL,
+    SERVE_FROM_CACHE,
+    RELAUNCH_FRESH,
+}
+
+internal fun arbitrateLabelCompletion(
+    launchEpoch: Int?,
+    currentEpoch: Int?,
+    waiterEpochs: List<Int?>,
+    pmSuccess: Boolean,
+    freshCacheHit: Boolean,
+): LabelCompletionAction {
+    if (launchEpoch == currentEpoch) {
+        return if (pmSuccess) LabelCompletionAction.FANOUT_SAME_EPOCH else LabelCompletionAction.DROP_ALL
+    }
+    if (waiterEpochs.none { it == currentEpoch }) {
+        return LabelCompletionAction.DROP_ALL
+    }
+    if (!pmSuccess && !freshCacheHit) {
+        return LabelCompletionAction.RELAUNCH_FRESH
+    }
+    if (freshCacheHit) {
+        return LabelCompletionAction.SERVE_FROM_CACHE
+    }
+    return LabelCompletionAction.RELAUNCH_FRESH
+}
+
+// Phase 1a 分身列表指紋鍵（純函數，JVM 可測；buildClonedListKey 委派，
+// 刻意不含 loading——busy 邊沿只走 early-return 同步 Switch enabled，納入
+// 指紋會致每次 op 全量重建＋圖示／label 重發兩次並推進 clonedGen 使在途回調失效）。
+internal fun clonedListKeyFor(
+    cloned: List<String>,
+    targetSerial: Any?,
+    targetId: Int,
+    hookLiveProven: Boolean,
+    catalogKey: Int,
+): String = "${cloned.hashCode()}:$targetSerial:$targetId:$hookLiveProven:$catalogKey"
 
 // p28-1 手動包名就地驗證（純函數，JVM 可測；Activity TextWatcher/IME 共用）。
 // p28-1 review（en 殘留）：回傳資源鍵（不碰 Context，JVM 可測）；文字見
@@ -1794,19 +4395,20 @@ internal fun shouldUpdateCatalogErrorText(old: String?, new: String?): Boolean =
 // 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
 // 雙源時間正規化（probe HookDiagnosis.displayText 無時間 vs writeBlock
 // HookEvidence.displayText 有時間）：兩形經此剝除時間證據後綴收斂為同一基底，
-// 使去重鍵有效。剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、
-// 重啟舊資料 stale 提示、經真通道標記（時間/通道衍生，隨 queriedAt 漂移
-// 出現/消失），以及時間證據前綴「；marker時間=」「；marker 時間未知」
-// 「；查詢於」（結構分隔符，基底文案不含「；」，安全）。
+// 使去重鍵有效。剝除項：格式化日期（yyyy-MM-dd HH:mm）、NEVER_QUERIED_TEXT 空態、
+// STALE_EVIDENCE_HINT 重啟舊資料提醒、VIA_GATEWAY_SUFFIX 經真通道標記（時間/通道衍生，
+// 隨 queriedAt 漂移出現/消失），以及時間證據前綴 MARKER_TIME_PREFIX／
+// MARKER_TIME_UNKNOWN_TEXT／QUERY_TIME_PREFIX（結構分隔符，基底文案不含「；」，安全）。
+// Phase 3 P2 B2: 字面改引 DiagnoseFreshness 共享 const (single source)，一字不差，行為不變。
 internal fun stripWriteBlockTimeParams(text: String): String {
-    var k = text.replace("（可能為重啟前舊資料，僅存在性證據）", "")
-    k = k.replace("（經真通道讀取）", "")
+    var k = text.replace(STALE_EVIDENCE_HINT, "")
+    k = k.replace(VIA_GATEWAY_SUFFIX, "")
     k = k.replace(Regex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}"), "")
-    k = k.replace("從未查詢", "")
-    k = k.replace("；marker時間=", "")
-    k = k.replace("；marker 時間未知", "")
-    k = k.replace("；查詢於 ", "")
-    k = k.replace("；查詢於", "")
+    k = k.replace(NEVER_QUERIED_TEXT, "")
+    k = k.replace(MARKER_TIME_PREFIX, "")
+    k = k.replace(MARKER_TIME_UNKNOWN_TEXT, "")
+    k = k.replace("$QUERY_TIME_PREFIX ", "")
+    k = k.replace(QUERY_TIME_PREFIX, "")
     return k
 }
 
@@ -1885,10 +4487,37 @@ internal fun Context.resolveBlockReason(reason: BlockReason): String = when (rea
 // 雙語範圍誠實化：以下 render*/formatBatchReport 皆保留繁中（scope-limited，
 // 非全量雙語；僅寫入拒絕/輸入驗證/診斷複製短句已資源化中英＋繁中）。未來在地化
 // 再抽資源，穩定碼/測試鎖定繁中字面不受影響。
+// Phase L L3 最小 EN 分支：renderInventoryText＋renderHookText 支援 isEnglish
+//（生產呼叫端傳 isEnglishLocale()，預設 false 保中文測試；英文文案為 scope-limited
+// 硬編碼，參照 values-en 語氣，未新增資源鍵故三語系鍵集不變）。
+// P2 餘項（本次未動，僅記錄）：renderDiagnoseText／renderDiagnoseDescription／
+// renderLastOpText／formatBatchReportText／DiagnoseStrings 表／
+// HookEvidence.timeEvidenceText（212-213／289-297）／
+// DualViewModel probeResultMark・pmReadableText・readyMark（5852-5877）／
+// formatTimeMs「從未查詢」；manifest theme 為 p28-3 範圍，本次不動。
+internal fun isEnglishLocale(locale: Locale = Locale.getDefault()): Boolean =
+    try {
+        locale.language.equals("en", ignoreCase = true)
+    } catch (_: Exception) {
+        false
+    }
+
 // 清單新鮮度行：STALE/UNKNOWN 明確標示，FRESH 顯示目標/筆數/查詢時間。
-internal fun renderInventoryText(s: UiState): String = buildString {
+internal fun renderInventoryText(s: UiState, isEnglish: Boolean = false): String = buildString {
+    if (isEnglish) {
+        append("Inventory: ${s.inventory.freshness}")
+        if (s.inventory.targetId > 0) {
+            append(" (user ${s.inventory.targetId}, ${s.inventory.count} items)")
+        }
+        val q = if (s.inventory.queryTimeMs <= 0L) "Never queried" else formatTimeMs(s.inventory.queryTimeMs)
+        append(" · queried at $q")
+        if (s.inventory.freshness != InventoryFreshness.FRESH) {
+            append(" (may be stale; auto-refreshed or tap \"Reconnect and refresh\")")
+        }
+        return@buildString
+    }
     append("清單：${s.inventory.freshness}")
-    if (s.inventory.targetId > NO_TARGET_ID) {
+    if (s.inventory.targetId > 0) {
         append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
     }
     append("・查詢於 ${formatTimeMs(s.inventory.queryTimeMs)}")
@@ -1907,18 +4536,92 @@ internal fun renderLastOpText(s: UiState): String {
     val last = s.lastOperation
     return if (last != null) {
         val targetPart =
-            if (last.pinnedTarget > NO_TARGET_ID) " target=${last.pinnedTarget}" else ""
+            if (last.pinnedTarget > 0) " target=${last.pinnedTarget}" else ""
         "上次操作：${redactPackage(last.appKey)}$targetPart 相位 ${last.phase}"
     } else {
         "上次操作：無"
     }
 }
 
+// Phase A A4：Shizuku 備援卡片狀態純函數（JVM 可測）。輸入即 updateShizukuLine()
+// 的同一組 live booleans（noBinder 优先：binder 死時授權無意義），輸出卡片
+// 三態；卡片標題/徽章只經此映射，不另行判讀 Shizuku。
+internal enum class ShizukuCardStatus {
+    NO_BINDER,
+    UNAUTHORIZED,
+    AUTHORIZED,
+}
+
+internal fun resolveShizukuCardStatus(noBinder: Boolean, authorized: Boolean): ShizukuCardStatus =
+    if (noBinder) {
+        ShizukuCardStatus.NO_BINDER
+    } else if (authorized) {
+        ShizukuCardStatus.AUTHORIZED
+    } else {
+        ShizukuCardStatus.UNAUTHORIZED
+    }
+
+// Phase H live-health 誠實門控 (Codex P1 #2732，JVM 可測；render 內三處
+// hookProvenActive 同源改用 hookLiveProven)：
+// - hookHistoryActive = existence 證據 (marker present，survives reboots，
+//   未確認本次開機；僅驅動歷史文案 renderHookText，不驅動 live 宣稱)。
+// - hookLiveProven = existence + hookBootFresh (本次開機存活證明；今日恆
+//   false，因全 repo 無 BOOT_COUNT/boot_id/uptime 讀取，boot 比較未落地)。
+// 六徽章/badges/icons/summary/telemetry 綠/ACTIVE 文案/逐行 tag 一律由
+// hookLiveProven 驅動；hookHistoryActive 為真但 hookBootFresh 為 false 時
+// 全 GONE/unknown/灰。boot-fresh 落地後自動點亮，無需改 render。
+// 文案紀律：boot-fresh 前不得用 已注入/攔截中/運作中/常駐中/正常監聽/4/4/
+// Active/Running/Intercepting/Injected 作 live 宣稱；歷史顯示重用
+// telemetry_status_unknown/stats_hook_unknown/engine_diag_unknown，永不給綠。
+internal fun hookHistoryActive(s: UiState): Boolean =
+    renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+
+internal fun hookLiveProven(s: UiState): Boolean =
+    hookHistoryActive(s) && s.hookBootFresh
+
+// Phase C channel-aware subtitle single source for card + About (JVM seam；
+// 真可寫走 _ops，特權通道直寫、無需 Hook；其餘走白名單原文案)。
+internal fun hookSubtitleResFor(writable: Boolean): Int =
+    if (writable) R.string.hook_mode_subtitle_ops else R.string.hook_mode_subtitle
+
+// 六徽章＋逐行 tag＋checklist badges＋icons 著色單一可見源 (JVM seam；
+// render 直接以此作 visibility/color 條件，免三處各寫各的)。
+internal fun hookLiveBadgesVisible(s: UiState): Boolean = hookLiveProven(s)
+
+// Hero/telemetry/summary 誠實三態 (JVM seam；render 映射至資源，鍵集不變)：
+// LIVE (boot-fresh 證實) 才給綠＋live 文案；INACTIVE 照舊灰＋未偵測；其餘
+// (含 ACTIVE 但未 boot-fresh 的歷史標記) 一律 UNKNOWN (amber/灰＋狀態未知)。
+internal enum class HookLiveDisplay {
+    LIVE,
+    INACTIVE,
+    UNKNOWN,
+}
+
+internal fun hookLiveDisplay(s: UiState): HookLiveDisplay = when {
+    hookLiveProven(s) -> HookLiveDisplay.LIVE
+    s.hookStatus == HookStatus.INACTIVE -> HookLiveDisplay.INACTIVE
+    else -> HookLiveDisplay.UNKNOWN
+}
+
 // Hook 行：非 LSPosed 模式回 null (呼叫端 Gone)；狀態文案維持本頁提示
 // (ACTIVE 歷史證據措辭/INACTIVE 啟用提示/UNKNOWN 真通道提示，不動)，
 // 時間證據經 hookEvidence()+timeEvidenceText 統一。
-internal fun renderHookText(s: UiState): String? {
+// Phase L L3：isEnglish 分支（ACTIVE 歷史措辭＋全行英文；時間後綴仍繁中為 P2 餘項）。
+internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
     if (s.channel != ChannelPreference.LSPOSED) return null
+    if (isEnglish) {
+        val enStatus = when (s.hookStatus) {
+            HookStatus.ACTIVE ->
+                "Historical Hook marker detected (${s.hookScopes.sorted().joinToString(", ")}, existence-only evidence; not confirmed for this boot)"
+            HookStatus.INACTIVE ->
+                "Not detected (enable the module in LSPosed Manager and reboot)"
+            HookStatus.UNKNOWN_UNREADABLE ->
+                "Unknown (no read permission; full diagnosis needs a ROOT/Shizuku channel, see #27)"
+            HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
+                "Unknown (no diagnostic channel; switch to a ROOT/Shizuku channel and re-probe, see #27)"
+        }
+        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), whitelist policy branch pending, writes disabled"
+    }
     // ACTIVE is historical existence+scope evidence only (the marker
     // survives reboots; S24 evidence shows it predating boot by ~5.5h
     // with no boot-identity/freshness check): the text names that
@@ -2032,6 +4735,11 @@ internal fun formatBatchReportText(report: BatchReport?): String {
 // Trusted isolates keep normal RTL text from reordering the surrounding identity.
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean = !loading && acknowledged
 
+// Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫）。二參版保留供既有
+// JVM 測試；生產呼叫端一律用三參版（writable 即 blockKey == null）。
+internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable: Boolean): Boolean =
+    !loading && acknowledged && writable
+
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
     val out = StringBuilder("\u2068")
@@ -2122,7 +4830,11 @@ private class DualViewModelFactory(
                 Context.MODE_PRIVATE,
             )
             val pref = loadChannelPreference(prefs)
-            val asm = assembleChannel(pref, suBinaryPresent(), shizukuAuthorizedNow(), appPackageName)
+            // Phase I I4：factory 跑主執行緒，永不直呼 binder IPC（shizukuAuthorizedNow）。
+            // 啟動以 fail-closed false 組裝（明選 SHIZUKU 不受影響，仍直選 SHIZUKU；
+            // AUTO 若真有 Shizuku 授權，VM init probeChannels 經 onIo 探測後由
+            // degradeAutoLocked 按 live probe 糾正為 SHIZUKU）。
+            val asm = assembleChannel(pref, suBinaryPresent(), false, appPackageName)
             // PR-7 P2 (#26):選取持久化綁定 app-private SharedPreferences
             // (SELECTION_PREFS_NAME,MODE_PRIVATE);與通道偏好不同檔,互不干擾。
             val selPrefs = appContext.applicationContext.getSharedPreferences(
@@ -2144,6 +4856,8 @@ private class DualViewModelFactory(
                         // Best effort: the in-memory swap already happened.
                     }
                 },
+                // Phase I I4：此二 check 皆可能觸 I/O（su 檔探測／Shizuku binder），
+                // VM 側 swapToLocked/degradeAutoLocked 經 onIo 包裝後呼叫，永不在主線直跑。
                 suPresentCheck = { suBinaryPresent() },
                 shizukuAuthCheck = { shizukuAuthorizedNow() },
                 activeGateway = asm.gateway,
@@ -2182,6 +4896,8 @@ private class DualViewModelFactory(
             }
 
         // Live binder + granted permission, read synchronously (never cached).
+        // Phase I I4：僅 IO 執行緒呼叫（VM 經 onIo 包裝的 shizukuAuthCheck；
+        // factory 啟動不再主線直呼，改 fail-closed false＋probe 糾正）。
         internal fun shizukuAuthorizedNow(): Boolean =
             try {
                 Shizuku.pingBinder() &&

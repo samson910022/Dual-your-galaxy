@@ -84,6 +84,8 @@ class CancelZeroWriteTest {
     }
 
     // Activity smoke（無寫入）：啟動只斷言按鈕渲染，不觸發任何寫入路徑。
+    // One UI 6 雙 tab：clone/remove 在預設 TAB_DUAL_APPS，refresh 在
+    // TAB_CORE_ENGINE（預設 GONE）。只切 tab + 斷言渲染，絕不點 Clone/確認。
     @Test
     fun activity_launchesWithoutWrite() {
         val gw = FakeHarnessGateway(dualId = 95)
@@ -92,6 +94,7 @@ class CancelZeroWriteTest {
             awaitHarnessReady(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                // 預設 Apps tab：clone/remove 可見。
                 scenario.onActivity { activity ->
                     val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
                     assertNotNull(cloneBtn)
@@ -101,10 +104,50 @@ class CancelZeroWriteTest {
                     assertNotNull(removeBtn)
                     assertEquals(View.VISIBLE, removeBtn.visibility)
                     assertTrue(removeBtn.isShown)
+                }
+                // 切到 Engine tab 再斷言 refresh（UI 執行緒切 tab，測試執行緒輪詢）。
+                scenario.onActivity { activity ->
+                    activity.switchTab(MainActivity.TAB_CORE_ENGINE, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
+                        shown = refreshBtn != null &&
+                            refreshBtn.visibility == View.VISIBLE &&
+                            refreshBtn.isShown
+                    }
+                    shown
+                }
+                scenario.onActivity { activity ->
                     val refreshBtn = activity.findViewById<Button>(R.id.refresh_btn)
                     assertNotNull(refreshBtn)
                     assertEquals(View.VISIBLE, refreshBtn.visibility)
                     assertTrue(refreshBtn.isShown)
+                }
+                // 切回 Apps tab，重新斷言 clone/remove。
+                scenario.onActivity { activity ->
+                    activity.switchTab(MainActivity.TAB_DUAL_APPS, announce = false)
+                }
+                HarnessPoll.await {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                        shown = cloneBtn != null &&
+                            cloneBtn.visibility == View.VISIBLE &&
+                            cloneBtn.isShown
+                    }
+                    shown
+                }
+                scenario.onActivity { activity ->
+                    val cloneBtn = activity.findViewById<Button>(R.id.clone_btn)
+                    assertNotNull(cloneBtn)
+                    assertEquals(View.VISIBLE, cloneBtn.visibility)
+                    assertTrue(cloneBtn.isShown)
+                    val removeBtn = activity.findViewById<Button>(R.id.remove_btn)
+                    assertNotNull(removeBtn)
+                    assertEquals(View.VISIBLE, removeBtn.visibility)
+                    assertTrue(removeBtn.isShown)
                 }
             }
         } finally {

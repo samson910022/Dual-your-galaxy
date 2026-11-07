@@ -319,6 +319,12 @@ data class UiState(
     val hookMarkerTimeMs: Long? = null,
     // 診斷是否走 privileged `cat` (沿用 HookStateProvider viaGateway)。
     val hookViaGateway: Boolean = false,
+    // Phase H live-health 誠實門控 (Codex P1 #2732)：本次開機是否已證實 hook
+    // 存活，預設 false。diagnoseHookState 只給存在性證據 (marker survives
+    // reboots，無 boot-identity/freshness)，永不將此欄設 true；未來比較
+    // markerTimeMs vs (nowWallMs - nowMonoMs) 或 BOOT_COUNT/boot_id 通過才
+    // 由專屬 setter 設 true。UI live 宣稱一律經 hookLiveProven() 門控。
+    val hookBootFresh: Boolean = false,
     // All Android profiles parsed from `pm list users`.
     val profiles: List<DualProfile> = emptyList(),
     // Packages currently cloned into the dual profile (MVP tracks by name).
@@ -4659,8 +4665,9 @@ class DualViewModel(
     // Elevator instances are reused so fake-injected tests and the Shizuku
     // binder cache survive the swap. Must run under opMutex.
     private suspend fun degradeAutoLocked(hasRoot: Boolean, hasShizuku: Boolean) {
+        // Phase I I4：su 檔探測經 onIo（VM 永不主線直跑阻塞 I/O；binder 類比 swapToLocked）。
         val suPresent = try {
-            suPresentCheck()
+            onIo { suPresentCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false
@@ -4797,14 +4804,16 @@ class DualViewModel(
         // defaults (never lateinit), so this snapshot is safe on every path.
         val oldSu = suGateway
         val oldShizuku = shizukuGateway
+        // Phase I I4：su 檔探測＋Shizuku binder 授權經 onIo（主線永不直呼 binder IPC；
+        // 與 repo/elevator probe 同式，仍在 opMutex 內，dispatcher hop 無死鎖）。
         val suPresent = try {
-            suPresentCheck()
+            onIo { suPresentCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false
         }
         val shizukuAuth = try {
-            shizukuAuthCheck()
+            onIo { shizukuAuthCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false
@@ -5829,6 +5838,10 @@ fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long = 0L):
     hookQueriedAtMs = queriedAtMs,
     hookMarkerTimeMs = HookMarker.parseTimeMs(diagnosis.raw)?.takeIf { it > 0 },
     hookViaGateway = diagnosis.viaGateway,
+    // Phase H：診斷只證明歷史存在性，永不證明本次開機存活，fail-closed 歸零
+    // (未來 boot 比較通過由專屬路徑重設 true，不經此處)。
+    // TODO: 未來 setter 必須經 boot 比較 markerTimeMs vs boot（見 HookMarker.parseTimeMs），不得在此直設 true。
+    hookBootFresh = false,
 )
 
 // Phase C P2 pure display helpers (MainActivity render uses these; JVM tests
@@ -5933,6 +5946,8 @@ internal fun writeBlockReason(s: UiState): BlockReason? {
 // MainActivity hook 行經此組裝 HookEvidence 再 displayText，消滅手動組裝；
 // 扁平欄位 (hookStatus/hookScopes/hookQueriedAtMs/hookMarkerTimeMs/
 // hookViaGateway) 保留 (匯出/測試仍直讀).
+// Phase H：HookEvidence 只攜 existence 證據；live 門控另讀
+// UiState.hookBootFresh (預設 false)，不經此處搬運。
 fun UiState.hookEvidence(): HookEvidence = HookEvidence(
     status = hookStatus,
     scopes = hookScopes,

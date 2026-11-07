@@ -11,10 +11,72 @@
      - 其餘沿用現行色（假設白底：INFO 7.09（#166627 實測值）、VERIFY/FAILED 7.33、CHANNEL 9.39，皆達標）。
      完整主題（含實際 surface 綁定）為 p28-3 範圍，此處只定義訊息語意色，不做全 App 主題。 -->
 <resources>
+    <!-- Legacy semantic colors for tests & msgView -->
     <color name="msg_info">#166627</color>
     <color name="msg_invalid">#8A5200</color>
     <color name="msg_no_dual">#7A5600</color>
     <color name="msg_verify">#B00020</color>
     <color name="msg_failed">#B00020</color>
     <color name="msg_channel">#6A1B9A</color>
+
+    <!-- One UI 6 Light Design Tokens -->
+    <color name="oneui_canvas">#F0F4FA</color>
+    <color name="oneui_surface">#F8FAFC</color>
+    <color name="oneui_surface_container_lowest">#FFFFFF</color>
+    <color name="oneui_surface_container_low">#F1F5F9</color>
+    <color name="oneui_surface_container">#E8EEF5</color>
+    <color name="oneui_surface_container_high">#DFE7F0</color>
+    <color name="oneui_surface_container_highest">#D2DEEB</color>
+
+    <color name="oneui_primary">#0066D6</color>
+    <color name="oneui_primary_tint">#004DA3</color>
+    <color name="oneui_primary_container">#D6E4FF</color>
+    <color name="oneui_on_primary">#FFFFFF</color>
+    <color name="oneui_on_primary_container">#001D4D</color>
+
+    <color name="oneui_secondary">#059669</color>
+    <!-- Phase C (a11y contrast): tint darkened #047857 -> #046C4E. Measured
+         light-theme ratios: on secondary_container #D1FAE5 5.68 (was 4.84),
+         on surface_container_high #DFE7F0 5.16 (was 4.39, failed 4.5),
+         on island_card #F8FAFC 6.16. Night tint unchanged (#4EDEA3, >=9.3 on
+         dark surfaces). Icons/strokes keep oneui_secondary (non-text, 3:1). -->
+    <color name="oneui_secondary_tint">#046C4E</color>
+    <color name="oneui_secondary_container">#D1FAE5</color>
+    <color name="oneui_on_secondary">#FFFFFF</color>
+
+    <color name="oneui_warning">#D97706</color>
+    <!-- Phase C: warning container tokenized (was hardcoded #26F59E0B in
+         bg_pill_badge_amber). Light #FEF3C7 keeps translucent-amber look.
+         Known residual: oneui_warning text on light containers is 2.55-3.19
+         (below AA 4.5); text darkening is follow-up scope, not this change. -->
+    <color name="oneui_warning_container">#FEF3C7</color>
+    <!-- Phase D: warning *text* token (light #92400E: 6.37 on
+         warning_container #FEF3C7, 7.09 on assumed #FFFFFF; oneui_warning
+         #D97706 as text is only 2.55-3.19, below AA 4.5. Icons/strokes keep
+         oneui_warning, non-text 3:1). -->
+    <color name="oneui_warning_text">#92400E</color>
+    <!-- Phase C: primary-button text token. Light #FFFFFF on oneui_primary
+         #0066D6 = 5.42 (AA pass). Night value differs (see values-night):
+         white on night primary #0381FE is only 3.77, so night buttons/badges
+         use primary_container bg + this token (#002958, 4.52) instead of
+         darkening night primary (which would break primary-as-text on dark
+         surfaces: #0B6BDD measured 3.16-3.69). -->
+    <color name="oneui_button_text">#FFFFFF</color>
+    <!-- Phase G (contrast): error darkened #DC2626 -> #B91C1C. Measured
+         light-theme ratios: on surface_container #E8EEF5 5.54 (was 4.13,
+         failed 4.5), on surface_container_high #DFE7F0 5.18, on canvas
+         #F0F4FA 5.86, on surface #F8FAFC 6.18. Night unchanged (#EF4444). -->
+    <color name="oneui_error">#B91C1C</color>
+    <color name="oneui_stroke_subtle">#CBD5E1</color>
+    <color name="oneui_divider">#E2E8F0</color>
+
+    <color name="oneui_text_primary">#0F172A</color>
+    <color name="oneui_text_secondary">#475569</color>
+    <!-- Phase G (contrast): tertiary darkened #64748B -> #52647A. Measured
+         light-theme ratios: on surface_container_high #DFE7F0 4.86 (was
+         3.81), on surface_container #E8EEF5 5.19 (was 4.07), on canvas
+         #F0F4FA 5.49 (was 4.31), on warning_container #FEF3C7 5.45 (was
+         4.27), on surface #F8FAFC 5.80 (was 4.55), on #FFFFFF 6.06 (was
+         4.76). Night unchanged (#8B91A0, already >= 5.0 on dark). -->
+    <color name="oneui_text_tertiary">#52647A</color>
 </resources>
