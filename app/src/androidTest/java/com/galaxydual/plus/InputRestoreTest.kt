@@ -93,7 +93,6 @@ class InputRestoreTest {
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw, preference = ChannelPreference.SHIZUKU)
         try {
-            awaitHarnessReady(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
