@@ -203,4 +203,6 @@
     <string name="engine_uid_unknown">UID: —</string>
     <string name="nav_tab_state_selected">selected</string>
     <string name="nav_tab_cd_selected">%1$s, %2$s</string>
+    <!-- Phase 3 P3 B7: settings nav opens a dialog (not a tab); CD names it. -->
+    <string name="settings_tab_cd">Settings, double-tap opens dialog</string>
 </resources>

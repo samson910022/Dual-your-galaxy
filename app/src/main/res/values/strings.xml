@@ -204,4 +204,6 @@
     <string name="engine_uid_unknown">使用者識別碼：—</string>
     <string name="nav_tab_state_selected">已選取</string>
     <string name="nav_tab_cd_selected">%1$s，%2$s</string>
+    <!-- Phase 3 P3 B7: 設定 nav 開啟對話框 (非切頁)，CD 明示開啟對話框。 -->
+    <string name="settings_tab_cd">設定，點兩下開啟對話框</string>
 </resources>
