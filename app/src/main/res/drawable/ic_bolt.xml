@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11,21h-1l1,-7H7.5c-0.88,0 -1.33,-0.6 -1.02,-1.31L11,3h5l-2,8h3.5c0.88,0 1.05,0.69 0.52,1.44L11,21z" />
+</vector>

@@ -32,8 +32,8 @@
     <string name="system_toggle_cd_shown">System apps are shown; double-tap to hide (display only, never uninstalls)</string>
     <string name="action_select_visible">Select visible</string>
     <plurals name="select_visible_cd">
-        <item quantity="one">Select the first %d visible row (checks only, never writes; narrow with search if truncated)</item>
-        <item quantity="other">Select the first %d visible rows (checks only, never writes; narrow with search if truncated)</item>
+        <item quantity="one">Select the first %1$d visible row (checks only, never writes; narrow with search if truncated)</item>
+        <item quantity="other">Select the first %1$d visible rows (checks only, never writes; narrow with search if truncated)</item>
     </plurals>
     <string name="action_clear_selection">Clear selection</string>
     <string name="clear_selection_cd">Clear checks (never uninstalls anything)</string>
@@ -42,12 +42,12 @@
     <string name="action_unsave_selection">Unsave selection</string>
     <string name="unsave_selection_cd">Drop the saved selection (never uninstalls, keeps current checks)</string>
     <plurals name="batch_create">
-        <item quantity="one">Create %d clone</item>
-        <item quantity="other">Create %d clones</item>
+        <item quantity="one">Create %1$d clone</item>
+        <item quantity="other">Create %1$d clones</item>
     </plurals>
     <plurals name="batch_create_cd">
-        <item quantity="one">Batch create %d clone (runs per checked app; checking alone never uninstalls)</item>
-        <item quantity="other">Batch create %d clones (runs per checked app; checking alone never uninstalls)</item>
+        <item quantity="one">Batch create %1$d clone (runs per checked app; checking alone never uninstalls)</item>
+        <item quantity="other">Batch create %1$d clones (runs per checked app; checking alone never uninstalls)</item>
     </plurals>
     <string name="catalog_load_failed">Source list failed to load; kept the old list (tap Reconnect and refresh to retry)</string>
     <!-- A: visible reason when writable but the batch target is unverified (targetSerial null/UNKNOWN); UI-only hint, VM guards untouched. -->
@@ -104,4 +104,106 @@
     <!-- p28-1 review: diagnostic copy button/success (user-visible, localized; zh+en+Hant). -->
     <string name="diagnostic_copy_button">Copy redacted content (review before sharing)</string>
     <string name="diagnostic_copy_success">Copied redacted diagnosis (local clipboard only, no upload; review before sharing, clear clipboard after use)</string>
+
+    <!-- One UI 6 Navigation & Section Strings -->
+    <string name="tab_dual_apps">Dual Apps</string>
+    <string name="tab_core_engine">Core Engine</string>
+    <string name="tab_settings">Settings</string>
+    <string name="hero_brand_title">Galaxy Tool</string>
+    <string name="hero_title_apps">Dual App Whitelist Injector</string>
+    <string name="hero_title_engine">Dual your Galaxy</string>
+    <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist</string>
+    <string name="hero_subtitle_engine">Knox Isolated Sandbox · Core Engine</string>
+    <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
+    <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
+    <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
+    <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed.</string>
+    <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
+    <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
+    <string name="hook_badge_uid_sandbox">Isolated UID Sandbox</string>
+    <string name="stats_native_whitelist">Native Whitelist</string>
+    <!-- Phase E E3 honesty: this count is pm-visible clones only
+         (s.cloned.size), not Hook-injection proof; neutral wording,
+         number semantics unchanged. -->
+    <string name="stats_injected_count">Cloned (pm visible)</string>
+    <string name="stats_hook_status">Hook Status</string>
+    <string name="stats_hook_active">Active Monitoring</string>
+    <string name="stats_unit_apps">apps</string>
+    <string name="section_injected_apps">Force-Injected Dual Apps</string>
+    <string name="section_pending_apps">Available Installed Apps</string>
+    <string name="section_pending_apps_hint">Toggle switch to override dual whitelist</string>
+    <string name="section_advanced_manual">Advanced Manual Package Entry</string>
+    <string name="status_hook_daemon_running">Native Dual Messenger Core Hook Running</string>
+    <string name="status_hook_daemon_desc">Successfully intercepted daagent whitelist verification callbacks</string>
+    <string name="engine_status_title">Low-Level Injection Status</string>
+    <string name="engine_status_subtitle">One UI 6.1 · Android 14+</string>
+    <string name="engine_status_active">Resident</string>
+    <string name="engine_gauge_title">LSPosed Core Engine</string>
+    <string name="engine_gauge_subtitle">%1$s · Zygote Mode</string>
+    <string name="engine_fallback_title">Shizuku Service (Fallback Mode)</string>
+    <string name="engine_fallback_standby">Standby</string>
+    <string name="diag_checklist_title">System Hook Diagnostic Checklist</string>
+    <string name="diag_item_framework_title">Samsung Framework Hook</string>
+    <string name="diag_item_framework_desc">Intercept SecPackageHook and system signatures</string>
+    <string name="diag_item_knox_title">Knox / Secure Folder Isolation Bypass</string>
+    <string name="diag_item_knox_desc">Bypass restrictions without creating work folders</string>
+    <string name="diag_item_multiuser_title">Multi-User ID Allocation</string>
+    <string name="diag_item_multiuser_desc">Core sandbox virtual user slot</string>
+    <string name="diag_item_push_title">Push Notification Sync Mechanism</string>
+    <string name="diag_item_push_desc">FCM &amp; Samsung cloud background broadcast routing</string>
+    <string name="diag_item_badge_title">Dual App Badge Appearance</string>
+    <string name="diag_item_badge_desc">Desktop shortcut corner badge visual</string>
+    <string name="badge_status_normal">Normal</string>
+    <string name="badge_status_bypassed">Bypassed</string>
+    <string name="badge_status_isolated">Isolated</string>
+    <string name="badge_status_dual_tag">Dual Badge</string>
+    <string name="btn_clear_search">Clear Search</string>
+    <string name="tag_forced_injected">⚡ Force Injected</string>
+    <string name="app_dual_unlocked_desc">Dual app unlocked</string>
+    <string name="section_channel_preference">Channel Preference</string>
+    <string name="section_profiles_diagnostics">Profiles &amp; Diagnostics</string>
+    <string name="status_hook_injected_active">● Hook Active &amp; Injected</string>
+    <string name="engine_diag_all_normal">5/5 Modules Operational</string>
+    <string name="telemetry_status_active">Active &amp; Injected</string>
+    <!-- Phase G: telemetry_latency_unknown removed with the dead latency pill
+         (no latency source in repo); key removed from all three locales. -->
+    <string name="engine_uid_label">UID: %1$d</string>
+    <string name="stats_injected_format">%1$d %2$s (pm visible)</string>
+    <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
+    <!-- Phase A honest state (P0 correctness): Hook/channel badges are always
+         driven by probe signals; unknown/placeholder without a signal. The
+         LSPosed version has no runtime query source (102 is only the hook
+         module manifest xposedmin/targetapi, not the installed framework
+         version), so it always renders as unknown. -->
+    <string name="stats_hook_inactive">Not detected</string>
+    <string name="stats_hook_unknown">Unknown status</string>
+    <string name="status_pill_lsposed_placeholder">LSPosed (read-only placeholder)</string>
+    <string name="lsposed_version_unknown">Unknown version</string>
+    <string name="telemetry_status_unknown">Status unknown</string>
+    <string name="telemetry_status_inactive">Inactive</string>
+    <string name="stats_value_unknown">—</string>
+    <string name="engine_diag_unknown">Unknown status</string>
+    <string name="engine_fallback_unauth">Not authorized</string>
+    <string name="engine_fallback_nobinder">Not connected</string>
+    <!-- Phase C (a11y/i18n): localized settings dialog (dynamic version),
+         resourced numbers/badges, bottom-nav selected state, Recents title. -->
+    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
+    <string name="settings_about_format">%1$s\nVersion %2$s (%3$s)\n\n• %4$s\n• %5$s\n\n%6$s</string>
+    <string name="settings_about_feature">Zygote Hook &amp; Shizuku Gateway</string>
+    <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <string name="settings_version_unknown">unknown</string>
+    <string name="badge_number_format">%1$d</string>
+    <!-- Phase G (i18n): bullet/count prefixes as format resources (were
+         hardcoded "● %s" / "#2 %s" concatenations in code; locale reorder
+         safe, sorting/localization unbroken). -->
+    <string name="badge_dot_format">● %1$s</string>
+    <string name="badge_dual_tag_format">#%1$d %2$s</string>
+    <!-- Phase G (i18n): remove-row content description (was hardcoded
+         half-width ":" concatenation in code; full-width colon, zh/en sync). -->
+    <string name="remove_row_cd">%1$s：%2$s</string>
+    <string name="dual_badge_cd">Clone badge (second copy): %1$s</string>
+    <string name="engine_uid_unknown">UID: —</string>
+    <string name="nav_tab_state_selected">selected</string>
+    <string name="nav_tab_cd_selected">%1$s, %2$s</string>
 </resources>

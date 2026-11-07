@@ -5,8 +5,9 @@
 //   實際拒絕同 key（single source，經測試假值解析比對）。
 // - packageInputError：空白/超長/字元集/有效輸入（資源鍵斷言）。
 // - 資源鎖定：繁中預設 + 英文 values-en 同鍵、Clone/Remove 統一字面、
-//   寫入拒絕/輸入驗證/診斷複製鍵雙語齊備（含格式佔位）、三繁中檔（values/
-//   b+zh+Hant/zh-rTW）鎖一致；
+//   寫入拒絕/輸入驗證/診斷複製鍵雙語齊備（含格式佔位）、兩繁中檔（values/
+//   b+zh+Hant）鎖一致（Phase D 起刪除 legacy values-zh-rTW：minSdk 29 下
+//   BCP-47 b+zh+Hant 在 API 24+ 永遠勝出，zh-rTW 永不勝出，故只留 b+）；
 //   語意色亮/暗對假設背景 #FFFFFF/#121212 的數學檢查皆至少 4.5:1
 //   （非實際主題聲稱；Manifest 未宣告 theme，實際 surface 未驗證；#B26A00 已移除）。
 //   雙語範圍誠實化：僅上述短句為中英雙語；render*/DiagnoseStrings 狀態行保留
@@ -425,13 +426,13 @@ class UiSemanticsP28Test {
         )
     }
 
-    // D 移除確認模板操作指示：四語系同步（中英＋繁中三檔），末行須提示勾選確認框。
+    // D 移除確認模板操作指示：三語系檔同步（預設/英/b+zh+Hant），末行須提示勾選確認框。
+    // （Phase D 起刪除 legacy values-zh-rTW，見 strings_zhVariants_consistent。）
     @Test
     fun strings_removeConfirmMessage_hasAcknowledgeHint() {
         val zh = stringMap(resFile("values/strings.xml"))
         val en = stringMap(resFile("values-en/strings.xml"))
         val hant = stringMap(resFile("values-b+zh+Hant/strings.xml"))
-        val rtw = stringMap(resFile("values-zh-rTW/strings.xml"))
         val zhMsg = zh.getValue("remove_confirm_message")
         assertTrue("zh must name 勾選下方確認框", zhMsg.contains("勾選下方確認框"))
         assertTrue("zh must name 確認移除", zhMsg.contains("確認移除"))
@@ -439,22 +440,20 @@ class UiSemanticsP28Test {
         assertTrue("en must name check the confirmation box below", enMsg.contains("check the confirmation box below"))
         assertTrue("en must name enable Remove", enMsg.contains("enable Remove"))
         assertEquals(zhMsg, hant.getValue("remove_confirm_message"))
-        assertEquals(zhMsg, rtw.getValue("remove_confirm_message"))
     }
 
-    // 資源：三繁中檔（values/b+zh+Hant/zh-rTW）鎖一致（key 集＋逐值相等；
-    // minSdk 29，b+zh+Hant 在 API24+ 覆蓋 zh-TW，預設亦為繁中故 instrumentation
-    // zh-TW 回退仍為繁中；此處鎖語意一致，RemoveConfirmMessageTest 另鎖位元一致）。
+    // 資源：兩繁中檔（values/b+zh+Hant）鎖一致（key 集＋逐值相等；
+    // minSdk 29，b+zh+Hant 在 API24+ 覆蓋 zh-TW；legacy values-zh-rTW 已於
+    // Phase D 刪除（BCP-47 b+ 永遠勝出，legacy 永不勝出），預設亦為繁中故
+    // instrumentation zh-TW 回退仍為繁中；此處鎖語意一致，
+    // RemoveConfirmMessageTest 另鎖位元一致）。
     @Test
     fun strings_zhVariants_consistent() {
         val def = stringMap(resFile("values/strings.xml"))
         val hant = stringMap(resFile("values-b+zh+Hant/strings.xml"))
-        val rtw = stringMap(resFile("values-zh-rTW/strings.xml"))
         assertEquals(def.keys, hant.keys)
-        assertEquals(def.keys, rtw.keys)
         for (k in def.keys) {
             assertEquals("Hant mismatch $k", def.getValue(k), hant.getValue(k))
-            assertEquals("rTW mismatch $k", def.getValue(k), rtw.getValue(k))
         }
         assertEquals(
             def.keys + pluralNames(resFile("values/strings.xml")),
@@ -479,6 +478,22 @@ class UiSemanticsP28Test {
         }
         val raw = resFile("values/colors.xml").readText() + resFile("values-night/colors.xml").readText()
         assertTrue("舊 #B26A00 對假設白底未達 4.5:1，須移除", !raw.contains("B26A00", ignoreCase = true))
+    }
+
+    // Phase D: warning *text* token（文字用）對其容器＋假設背景皆至少 4.5:1。
+    // oneui_warning 本體僅留給圖示/描邊（非文字 3:1），文字一律走 warning_text。
+    @Test
+    fun warningText_contrastAtLeast45() {
+        val light = colorMap(resFile("values/colors.xml"))
+        val dark = colorMap(resFile("values-night/colors.xml"))
+        val lt = light.getValue("oneui_warning_text")
+        val lc = light.getValue("oneui_warning_container")
+        assertTrue("light warning_text on container < 4.5 ($lt on $lc)", contrast(lt, lc) >= 4.5)
+        assertTrue("light warning_text on assumed #FFFFFF < 4.5 ($lt)", contrast(lt, "#FFFFFF") >= 4.5)
+        val dt = dark.getValue("oneui_warning_text")
+        val dc = dark.getValue("oneui_warning_container")
+        assertTrue("night warning_text on container < 4.5 ($dt on $dc)", contrast(dt, dc) >= 4.5)
+        assertTrue("night warning_text on assumed #121212 < 4.5 ($dt)", contrast(dt, "#121212") >= 4.5)
     }
 
     // ---- 資源讀取/對比小工具（測試專用，不進生產） ----
