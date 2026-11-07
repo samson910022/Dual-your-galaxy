@@ -306,6 +306,7 @@ class UiSemanticsP28Test {
             "auto_degrade_no_channel",
             "input_too_long",
             "invalid_package",
+            "pkg_input_required",
             "channel_group_cd",
             "diagnostic_copy_button",
             "diagnostic_copy_success",
@@ -404,6 +405,23 @@ class UiSemanticsP28Test {
         assertTrue(
             "en batch target must name Reconnect and refresh",
             en.getValue("batch_target_unavailable").contains("Reconnect and refresh"),
+        )
+        // 空白禁用可感知理由：zh 須命名已禁用＋輸入包名，en 須命名 disabled＋Enter a package name。
+        assertTrue(
+            "zh required must name 已禁用",
+            zh.getValue("pkg_input_required").contains("已禁用"),
+        )
+        assertTrue(
+            "zh required must name 輸入包名",
+            zh.getValue("pkg_input_required").contains("輸入包名"),
+        )
+        assertTrue(
+            "en required must name disabled",
+            en.getValue("pkg_input_required").contains("disabled"),
+        )
+        assertTrue(
+            "en required must name Enter a package name",
+            en.getValue("pkg_input_required").contains("Enter a package name"),
         )
     }
 
