@@ -5,7 +5,7 @@
 // 旋轉/重建後輸入恢復：
 // - ViewModel 層（FakeHarnessGateway，零寫入）：sourceQuery、selectedKeys、
 //   pendingRemove 在同實例（旋轉語義）下保留；取消勾選只清選取不卸載。
-// - Activity 層：搜尋框輸入 + 通道偏好行在 recreate 後仍渲染（無寫入）。
+// - Activity 層：搜尋框輸入 + 通道行（AUTO）在 recreate 後仍渲染（無寫入）。
 package com.galaxydual.plus
 
 import androidx.test.core.app.ActivityScenario
@@ -117,19 +117,20 @@ class InputRestoreTest {
             HarnessPoll.await { vm.state.value.sourceQuery == "mail" }
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                // 通道偏好行：前綴「通道偏好」穩定存在（後綴隨裝置通道而異，只匹配前綴）。
+                // 通道行：預設通道 enum 值 "AUTO" 出現在 zh/en 的 channel_line 中
+                // （locale-independent；不再匹配「通道偏好」前綴）。
                 var mailOk = false
                 var channelOk = false
                 val launchDeadline = System.currentTimeMillis() + 5000L
                 while (System.currentTimeMillis() < launchDeadline && !(mailOk && channelOk)) {
                     scenario.onActivity { activity ->
                         mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
-                        channelOk = HarnessViews.containsText(activity.window.decorView, "通道偏好")
+                        channelOk = HarnessViews.containsText(activity.window.decorView, "AUTO")
                     }
                     if (!(mailOk && channelOk)) Thread.sleep(200)
                 }
                 assertTrue("hasEditTextText(..., \"mail\") before recreate", mailOk)
-                assertTrue("containsText(..., \"通道偏好\") before recreate", channelOk)
+                assertTrue("containsText(..., \"AUTO\") before recreate", channelOk)
 
                 scenario.recreate()
 
@@ -139,12 +140,12 @@ class InputRestoreTest {
                 while (System.currentTimeMillis() < recreateDeadline && !(mailOk && channelOk)) {
                     scenario.onActivity { activity ->
                         mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
-                        channelOk = HarnessViews.containsText(activity.window.decorView, "通道偏好")
+                        channelOk = HarnessViews.containsText(activity.window.decorView, "AUTO")
                     }
                     if (!(mailOk && channelOk)) Thread.sleep(200)
                 }
                 assertTrue("hasEditTextText(..., \"mail\") after recreate", mailOk)
-                assertTrue("containsText(..., \"通道偏好\") after recreate", channelOk)
+                assertTrue("containsText(..., \"AUTO\") after recreate", channelOk)
 
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
