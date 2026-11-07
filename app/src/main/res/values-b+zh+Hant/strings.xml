@@ -115,7 +115,7 @@
     <string name="hero_title_apps">雙開白名單注入器</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
     <string name="hero_subtitle_apps">需 LSPosed Hook 生效後，方可突破限制注入白名單</string>
-    <string name="hero_subtitle_engine">Knox 隔離環境 · Core Engine</string>
+    <string name="hero_subtitle_engine">隔離環境 · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
@@ -129,7 +129,7 @@
     <string name="stats_hook_active">正常監聽</string>
     <string name="stats_unit_apps">款</string>
     <string name="section_injected_apps">非官方破除限制注入</string>
-    <string name="section_pending_apps">待注入推薦應用</string>
+    <string name="section_pending_apps">可用已安裝應用</string>
     <string name="section_pending_apps_hint">點擊開關即可自動覆寫白名單</string>
     <string name="section_advanced_manual">進階手動包名注入</string>
     <string name="status_hook_daemon_running">原生 Dual Messenger 核心 Hook 運作中</string>

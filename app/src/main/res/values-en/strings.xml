@@ -113,7 +113,7 @@
     <string name="hero_title_apps">Dual App Whitelist Injector</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
     <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist</string>
-    <string name="hero_subtitle_engine">Knox Isolated Sandbox · Core Engine</string>
+    <string name="hero_subtitle_engine">Isolated Environment · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
