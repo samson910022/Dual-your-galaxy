@@ -140,7 +140,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
             cmd.startsWith("pm list packages") -> {
                 val tokens = cmd.trim().split("\\s+".toRegex())
                 val user = parseUser(tokens)
-                if (user != null && user != dualId.toString()) {
+                if (user == null || user != dualId.toString()) {
                     CmdResult(exit = 1, out = "", err = "wrong user")
                 } else {
                     val base = installedPkgs.map { "package:$it" }.joinToString("\n")
@@ -150,7 +150,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
             cmd.startsWith("appops set") -> {
                 val tokens = cmd.trim().split("\\s+".toRegex())
                 val user = parseUser(tokens)
-                if (user != null && user != dualId.toString()) {
+                if (user == null || user != dualId.toString()) {
                     CmdResult(exit = 1, out = "", err = "wrong user")
                 } else {
                     CmdResult(exit = 0, out = "Success", err = "")
