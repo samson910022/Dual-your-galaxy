@@ -74,6 +74,7 @@ import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -1905,7 +1906,8 @@ class MainActivity : ComponentActivity() {
         return engineMasterCard
     }
 
-    private fun switchTab(tab: Int, announce: Boolean = true) {
+    @VisibleForTesting
+    internal fun switchTab(tab: Int, announce: Boolean = true) {
         currentTab = tab
         if (!::tabAppsScroll.isInitialized || !::tabEngineScroll.isInitialized) return
         if (tab == TAB_DUAL_APPS) {
