@@ -62,11 +62,21 @@
          darkening night primary (which would break primary-as-text on dark
          surfaces: #0B6BDD measured 3.16-3.69). -->
     <color name="oneui_button_text">#FFFFFF</color>
-    <color name="oneui_error">#DC2626</color>
+    <!-- Phase G (contrast): error darkened #DC2626 -> #B91C1C. Measured
+         light-theme ratios: on surface_container #E8EEF5 5.54 (was 4.13,
+         failed 4.5), on surface_container_high #DFE7F0 5.18, on canvas
+         #F0F4FA 5.86, on surface #F8FAFC 6.18. Night unchanged (#EF4444). -->
+    <color name="oneui_error">#B91C1C</color>
     <color name="oneui_stroke_subtle">#CBD5E1</color>
     <color name="oneui_divider">#E2E8F0</color>
 
     <color name="oneui_text_primary">#0F172A</color>
     <color name="oneui_text_secondary">#475569</color>
-    <color name="oneui_text_tertiary">#64748B</color>
+    <!-- Phase G (contrast): tertiary darkened #64748B -> #52647A. Measured
+         light-theme ratios: on surface_container_high #DFE7F0 4.86 (was
+         3.81), on surface_container #E8EEF5 5.19 (was 4.07), on canvas
+         #F0F4FA 5.49 (was 4.31), on warning_container #FEF3C7 5.45 (was
+         4.27), on surface #F8FAFC 5.80 (was 4.55), on #FFFFFF 6.06 (was
+         4.76). Night unchanged (#8B91A0, already >= 5.0 on dark). -->
+    <color name="oneui_text_tertiary">#52647A</color>
 </resources>

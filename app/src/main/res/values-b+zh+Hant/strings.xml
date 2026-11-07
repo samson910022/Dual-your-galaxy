@@ -114,12 +114,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">雙開白名單注入器</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">突破三星官方限制 · 強制注入任意 App 白名單</string>
+    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後，方可突破限制注入白名單</string>
     <string name="hero_subtitle_engine">Knox 隔離環境 · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
-    <string name="hook_mode_subtitle">解除官方雙開限制，強制注入任意第三方應用 (遊戲/社群/工具) 至原生 Dual App 白名單，無需 Knox / 安全資料夾。</string>
+    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後，方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾。</string>
     <string name="hook_badge_sec_hook">已注入 SecPackageHook</string>
     <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>
     <string name="hook_badge_uid_sandbox">獨立 UID 沙盒</string>
@@ -164,7 +164,8 @@
     <string name="status_hook_injected_active">● Hook 注入活躍中</string>
     <string name="engine_diag_all_normal">5/5 模組運作正常</string>
     <string name="telemetry_status_active">運作中·已注入</string>
-    <string name="telemetry_latency_unknown">—</string>
+    <!-- Phase G: telemetry_latency_unknown removed with the dead latency pill
+         (no latency source in repo); key removed from all three locales. -->
     <!-- Phase C: UID 技術詞中文化（英文版保留 UID）。engine_uid_unknown 為初始佔位。 -->
     <string name="engine_uid_label">使用者識別碼：%1$d</string>
     <!-- Phase C: zh (Hook) 改（注入）；英文版保留 (Hook)。
@@ -194,6 +195,14 @@
     <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
     <string name="settings_version_unknown">未知</string>
     <string name="badge_number_format">%1$d</string>
+    <!-- Phase G (i18n): bullet/count prefixes as format resources (were
+         hardcoded "● %s" / "#2 %s" concatenations in code; locale reorder
+         safe, sorting/localization unbroken). -->
+    <string name="badge_dot_format">● %1$s</string>
+    <string name="badge_dual_tag_format">#%1$d %2$s</string>
+    <!-- Phase G (i18n): remove-row content description (was hardcoded
+         half-width ":" concatenation in code; full-width colon, zh/en sync). -->
+    <string name="remove_row_cd">%1$s：%2$s</string>
     <string name="dual_badge_cd">分身角標（第二分身）：%1$s</string>
     <string name="engine_uid_unknown">使用者識別碼：—</string>
     <string name="nav_tab_state_selected">已選取</string>
