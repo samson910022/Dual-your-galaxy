@@ -2330,10 +2330,8 @@ class MainActivity : ComponentActivity() {
     // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步 Switch enabled；
     // 納入指紋會致每次 op 全量 removeAllViews＋重建＋圖示/label 重發兩次，並推進
     // clonedGen 使在途回調失效。
-    private fun buildClonedListKey(s: UiState, catalogKey: Int): String {
-        val hookLiveProven = hookLiveProven(s)
-        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:$hookLiveProven:$catalogKey"
-    }
+    private fun buildClonedListKey(s: UiState, catalogKey: Int): String =
+        clonedListKeyFor(s.cloned, s.inventory.targetSerial, s.inventory.targetId, hookLiveProven(s), catalogKey)
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
     // (buildDiagnosticExport 經四道遮蔽：先郵件後包名後 IP，最後路徑，大小受限)；只有使用者
@@ -3535,11 +3533,12 @@ class MainActivity : ComponentActivity() {
     // （I2，tag 精確只碰同 pkg 行，覆蓋防禦性 return 極窄窗口；dialog 無 tag 容器可掃，靠自有回調）。
     // IO 查 PM，主執行緒經各 onLoaded 回填（呼叫端各做 tag/世代檢查後重綁，舊門保留）。
     // 失敗不快取（包可能稍後出現）；同 epoch 失敗清 inflight＋callbacks（drop 不回調，避免洩漏），
-    // 在途 catalog 變化且有新世代 waiter 則重掛＋重發一次 IO（見 launchLabelLookup 失敗段）。
+    // 在途 catalog 變化且有新世代 waiter 則重掛＋重發一次 IO（見完成段 RELAUNCH_FRESH 臂）。
     // 分身列表規模小（非 200 來源列），不另設 Semaphore。
     // 全部主執行緒觸碰（head 同步＋完成回主線）；syncLabelCache 清 cache 不清 callbacks。
-    // Phase 1a：waiter 攜註冊 epoch；完成時 head epoch 失配（在途 catalog 變化）則整批結果丟棄，
-    // 僅喚醒當代 waiter（見完成段守衛）；同 epoch 路徑語義不變（無條件 rebind＋全量 fanout）。
+    // Phase 1a：waiter 攜註冊 epoch；完成經 arbitrateLabelCompletion 統一仲裁
+    // （見完成段：同 epoch 成功 FANOUT／其餘 DROP・SERVE 快取・RELAUNCH fresh 重發；
+    // stale 路徑永不派發舊 pm label）。同 epoch 成功語義不變（無條件 rebind＋全量 fanout）。
     private fun requestLabelAsync(pkg: String, onLoaded: (String) -> Unit) {
         // Phase 1a（P3 N4）：主執行緒專用契約（head＋完成皆主線觸碰 labelCache／inflight／callbacks）。
         check(Looper.getMainLooper().isCurrentThread) { "requestLabelAsync must run on main thread" }
@@ -3580,79 +3579,125 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 // Best effort.
             }
-            if (label == null || label == pkg) {
-                val currentEpoch = labelCacheCatalogKey
-                val dropped = try {
-                    labelCallbacks.remove(pkg)
-                } catch (_: Exception) {
-                    null
+            // Phase A (P2-1 stale-success)：統一仲裁——快照 waiter、在移除後取樣
+            // freshCacheHit（B-render 可能經 catalogLabelsFor＋cacheLabel 在 IO 與
+            // 完成之間預填），再執行恰一臂。stale 路徑永不派發舊 pm label：
+            // 無 fresh→DROP；有 fresh 且快取命中→SERVE 快取；否則重掛 fresh＋重發
+            // 一次 IO（RELAUNCH，launchLabelLookup 內重捕 fresh epoch）。
+            // 同 epoch 成功路徑語義不變（FANOUT：cache＋rebind＋全量 fanout）。
+            val pmSuccess = label != null && label != pkg
+            val currentEpoch = labelCacheCatalogKey
+            val snapshot: List<Pair<Int?, (String) -> Unit>> = try {
+                labelCallbacks.remove(pkg) ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val waiterEpochs: List<Int?> = try {
+                snapshot.map { it.first }
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val freshCacheHit: Boolean = try {
+                labelCache.containsKey(pkg)
+            } catch (_: Exception) {
+                false
+            }
+            when (arbitrateLabelCompletion(launchEpoch, currentEpoch, waiterEpochs, pmSuccess, freshCacheHit)) {
+                LabelCompletionAction.FANOUT_SAME_EPOCH -> {
+                    val ok = label
+                    if (ok == null || ok == pkg) return@launch
+                    cacheLabel(pkg, ok)
+                    // Phase I I2：無條件重綁同 pkg 行（tag 精確），覆蓋各 waiter 防禦性 return 極窄窗口。
+                    try {
+                        rebindClonedLabel(pkg, ok)
+                    } catch (_: Exception) {
+                        // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
+                    }
+                    for ((_, cb) in snapshot) {
+                        try {
+                            cb(ok)
+                        } catch (_: Exception) {
+                            // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                        }
+                    }
                 }
-                // 在途 catalog 變化（A→B）且有新世代 waiter：重掛 fresh waiter 並重發一次 IO；
-                // 同 epoch 失敗沿舊語義全丟（cache 仍 miss，下次 render 重註冊）。
-                if (launchEpoch != currentEpoch && dropped != null) {
+                LabelCompletionAction.DROP_ALL -> {
+                    // 同 epoch 失敗沿舊語義全丟（cache 仍 miss，下次 render 重註冊）；
+                    // stale 無 fresh waiter 亦全丟：不觸 cache／rebind／回調／重發。
+                    return@launch
+                }
+                LabelCompletionAction.SERVE_FROM_CACHE -> {
+                    val cached: String? = try {
+                        labelCache[pkg]
+                    } catch (_: Exception) {
+                        null
+                    }
                     val fresh = try {
-                        dropped.filter { it.first == currentEpoch }
+                        snapshot.filter { it.first == currentEpoch }
                     } catch (_: Exception) {
                         emptyList()
                     }
-                    if (fresh.isNotEmpty()) {
-                        try {
-                            labelInflight.add(pkg)
-                        } catch (_: Exception) {
-                            // Best effort.
-                        }
-                        try {
-                            labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
-                        } catch (_: Exception) {
+                    if (cached == null || cached == pkg || fresh.isEmpty()) {
+                        // 快取競失（主線無掛起理論不可達；防禦）：保活重發 fresh，
+                        // 永不回退為派發舊 pm label。
+                        if (fresh.isNotEmpty()) {
                             try {
-                                labelInflight.remove(pkg)
+                                labelInflight.add(pkg)
                             } catch (_: Exception) {
                                 // Best effort.
                             }
-                            return@launch
+                            try {
+                                labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
+                            } catch (_: Exception) {
+                                try {
+                                    labelInflight.remove(pkg)
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                return@launch
+                            }
+                            launchLabelLookup()
                         }
-                        launchLabelLookup()
+                        return@launch
                     }
-                }
-                return@launch
-            }
-            // Phase 1a（P2 世代守衛）：IO 期間 catalog 變化（epoch 失配）則丟棄本 epoch 結果——
-            // 不 cacheLabel、不 rebindClonedLabel；只喚醒註冊 epoch 與當代一致的 waiter，
-            // 過期 waiter 丟棄（cache 仍 miss，下次 render 重註冊）。同 epoch 路徑語義不變。
-            if (launchEpoch != labelCacheCatalogKey) {
-                val currentEpoch = labelCacheCatalogKey
-                val staleWaiters = try {
-                    labelCallbacks.remove(pkg)
-                } catch (_: Exception) {
-                    null
-                } ?: return@launch
-                for ((waiterEpoch, cb) in staleWaiters) {
-                    if (waiterEpoch != currentEpoch) continue
                     try {
-                        cb(label)
+                        rebindClonedLabel(pkg, cached)
                     } catch (_: Exception) {
-                        // Best effort: 單個重綁失敗不影響其餘 waiter（下次同步命中）。
+                        // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
+                    }
+                    for ((_, cb) in fresh) {
+                        try {
+                            cb(cached)
+                        } catch (_: Exception) {
+                            // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                        }
                     }
                 }
-                return@launch
-            }
-            cacheLabel(pkg, label)
-            // Phase I I2：無條件重綁同 pkg 行（tag 精確），覆蓋各 waiter 防禦性 return 極窄窗口。
-            try {
-                rebindClonedLabel(pkg, label)
-            } catch (_: Exception) {
-                // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
-            }
-            val waiters = try {
-                labelCallbacks.remove(pkg)
-            } catch (_: Exception) {
-                null
-            } ?: return@launch
-            for ((_, cb) in waiters) {
-                try {
-                    cb(label)
-                } catch (_: Exception) {
-                    // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                LabelCompletionAction.RELAUNCH_FRESH -> {
+                    // 在途 catalog 變化（A→B）且有新世代 waiter：重掛 fresh waiter
+                    // 並重發一次 IO；舊 pm label 丟棄（不 cache／不 rebind／不回調）。
+                    val fresh = try {
+                        snapshot.filter { it.first == currentEpoch }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    if (fresh.isEmpty()) return@launch
+                    try {
+                        labelInflight.add(pkg)
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                    try {
+                        labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
+                    } catch (_: Exception) {
+                        try {
+                            labelInflight.remove(pkg)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                        return@launch
+                    }
+                    launchLabelLookup()
                 }
             }
             }
@@ -4192,6 +4237,55 @@ class MainActivity : ComponentActivity() {
             if (orderedKeys.size >= maxSize) orderedKeys.firstOrNull() else null
     }
 }
+
+// Phase A (P2-1 stale-success)：label 補查完成仲裁（純函數，JVM 可測；
+// Activity 完成段快照 waiter＋取樣 freshCacheHit 後呼叫，執行恰一臂，
+// 副作用留 Activity；呼叫端 when 窮舉無 else，新臂加入即編譯失敗）。
+// 行覆寫引理：B-epoch waiter 的行 rowGen／tag／dialog 守衛對當代 waiter 合法
+// 通過——若 stale 成功仍把舊 pm label 派發給當代 waiter，會以舊資料覆寫
+// title／badge CD／Switch CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
+// 成功）可派發本次 pm label，stale 完成只允許 DROP（丟棄）、SERVE_FROM_CACHE
+//（派發 B-render 已預填的當代快取，永非舊 label）、RELAUNCH_FRESH（重掛 fresh
+// waiter＋重發一次 IO）。same-epoch 失敗語義不變（DROP 全丟，下次 render 重註冊）。
+internal enum class LabelCompletionAction {
+    FANOUT_SAME_EPOCH,
+    DROP_ALL,
+    SERVE_FROM_CACHE,
+    RELAUNCH_FRESH,
+}
+
+internal fun arbitrateLabelCompletion(
+    launchEpoch: Int?,
+    currentEpoch: Int?,
+    waiterEpochs: List<Int?>,
+    pmSuccess: Boolean,
+    freshCacheHit: Boolean,
+): LabelCompletionAction {
+    if (launchEpoch == currentEpoch) {
+        return if (pmSuccess) LabelCompletionAction.FANOUT_SAME_EPOCH else LabelCompletionAction.DROP_ALL
+    }
+    if (waiterEpochs.none { it == currentEpoch }) {
+        return LabelCompletionAction.DROP_ALL
+    }
+    if (!pmSuccess && !freshCacheHit) {
+        return LabelCompletionAction.RELAUNCH_FRESH
+    }
+    if (freshCacheHit) {
+        return LabelCompletionAction.SERVE_FROM_CACHE
+    }
+    return LabelCompletionAction.RELAUNCH_FRESH
+}
+
+// Phase 1a 分身列表指紋鍵（純函數，JVM 可測；buildClonedListKey 委派，
+// 刻意不含 loading——busy 邊沿只走 early-return 同步 Switch enabled，納入
+// 指紋會致每次 op 全量重建＋圖示／label 重發兩次並推進 clonedGen 使在途回調失效）。
+internal fun clonedListKeyFor(
+    cloned: List<String>,
+    targetSerial: Any?,
+    targetId: Int,
+    hookLiveProven: Boolean,
+    catalogKey: Int,
+): String = "${cloned.hashCode()}:$targetSerial:$targetId:$hookLiveProven:$catalogKey"
 
 // p28-1 手動包名就地驗證（純函數，JVM 可測；Activity TextWatcher/IME 共用）。
 // p28-1 review（en 殘留）：回傳資源鍵（不碰 Context，JVM 可測）；文字見
