@@ -233,6 +233,25 @@ class MainActivity : ComponentActivity() {
     private lateinit var navTabSettings: LinearLayout
     private lateinit var clearSearchBtn: View
     private lateinit var engineUidSlotView: TextView
+    // Phase A 誠實狀態顯示：Hook stat cell（A1）與信號驅動徽章（A3）皆由 render()
+    // 綁定 hookStatus / resolvedGateway；Shizuku 備援卡片（A4）由 updateShizukuLine()
+    // 經 resolveShizukuCardStatus 同源驅動。
+    private lateinit var hookStatusCell: LinearLayout
+    private lateinit var hookStatusDot: ImageView
+    private lateinit var hookStatusText: TextView
+    private lateinit var hookBadgeChip: TextView
+    private lateinit var hookSecPmTag: TextView
+    private lateinit var injectedActiveLabel: TextView
+    private lateinit var daemonFooter: LinearLayout
+    private lateinit var residentBadge: TextView
+    private lateinit var telemetryDot: ImageView
+    private lateinit var telemetryStatusView: TextView
+    private lateinit var telemetryLatencyView: TextView
+    private lateinit var checklistSummaryView: TextView
+    private lateinit var shizukuFallbackDescView: TextView
+    private lateinit var shizukuFallbackBadgeView: TextView
+    // Phase A A3：診斷清單逐項徽章由 hookProvenActive 驅動（render 內 GONE 門控）。
+    private val checklistItemBadges = mutableListOf<TextView>()
 
     // PR-37 P3 差量渲染：上次全量重建來源列表的指紋
     // (catalog 引用+內容 hash+query+includeSystem+selectedKeys hash)。
@@ -772,21 +791,22 @@ class MainActivity : ComponentActivity() {
             }
         }
         statusPillDot = ImageView(this).apply {
-            setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+            setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
             layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply {
                 marginEnd = dp(6)
             }
         }
         statusPillText = TextView(this).apply {
-            text = "LSPosed 102"
+            // Phase A：初值走資源的中性 loading（render 前無通道信號，不預設 LSPosed 綠）。
+            text = getString(R.string.status_loading)
             textSize = 11f
-            setTextColor(getColor(R.color.oneui_secondary))
+            setTextColor(getColor(R.color.oneui_warning))
             typeface = Typeface.MONOSPACE
         }
         statusPillContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = getDrawable(R.drawable.bg_pill_badge_green)
+            background = getDrawable(R.drawable.bg_pill_badge_amber)
             setPadding(dp(10), dp(4), dp(10), dp(4))
             addView(statusPillDot)
             addView(statusPillText)
@@ -893,17 +913,19 @@ class MainActivity : ComponentActivity() {
             }
         }
         val hookModeTitle = TextView(this).apply {
-            text = getString(R.string.hook_mode_title)
+            // Phase A：LSPosed 版本無運行時查詢源，不寫死 102，顯示版本未知。
+            text = getString(R.string.hook_mode_title, getString(R.string.lsposed_version_unknown))
             textSize = 14f
             setTextColor(getColor(R.color.oneui_text_primary))
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val hookBadgeChip = TextView(this).apply {
+        hookBadgeChip = TextView(this).apply {
             text = getString(R.string.hook_badge_sec_hook)
             textSize = 10f
             setTextColor(getColor(R.color.oneui_secondary))
             background = getDrawable(R.drawable.bg_pill_badge_green)
+            visibility = View.GONE
             val hp = dp(8)
             val vp = dp(2)
             setPadding(hp, vp, hp, vp)
@@ -930,11 +952,12 @@ class MainActivity : ComponentActivity() {
                 topMargin = dp(8)
             }
         }
-        val tag1 = TextView(this).apply {
+        hookSecPmTag = TextView(this).apply {
             text = getString(R.string.hook_badge_sec_pm)
             textSize = 10f
             setTextColor(getColor(R.color.oneui_primary))
             background = getDrawable(R.drawable.bg_pill_badge_blue)
+            visibility = View.GONE
             val hp = dp(8)
             val vp = dp(2)
             setPadding(hp, vp, hp, vp)
@@ -951,7 +974,7 @@ class MainActivity : ComponentActivity() {
                 marginStart = dp(6)
             }
         }
-        hookTagsRow.addView(tag1)
+        hookTagsRow.addView(hookSecPmTag)
         hookTagsRow.addView(tag2)
         hookModeCard.addView(hookTagsRow)
 
@@ -983,7 +1006,8 @@ class MainActivity : ComponentActivity() {
                 setTextColor(getColor(R.color.oneui_text_tertiary))
             })
             addView(TextView(context).apply {
-                text = "5 ${getString(R.string.stats_unit_apps)}"
+                // Phase A：官方白名單數無數據源（repo 從未讀取三星白名單），不寫死 5 款。
+                text = getString(R.string.stats_value_unknown)
                 textSize = 15f
                 setTextColor(getColor(R.color.oneui_text_primary))
                 typeface = Typeface.DEFAULT_BOLD
@@ -1011,7 +1035,9 @@ class MainActivity : ComponentActivity() {
             }
             addView(clonedCountStatView)
         }
-        val col3 = LinearLayout(this).apply {
+        // Phase A A1：第三格由 render() 綁定 hookStatus；初值為未知（amber），
+        // 非 LSPOSED 通道時整格隱藏（對齊 renderHookText 回 null 條件）。
+        hookStatusCell = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = getDrawable(R.drawable.bg_island_card_high)
             val p = dp(8)
@@ -1028,21 +1054,21 @@ class MainActivity : ComponentActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 addView(ImageView(context).apply {
-                    setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+                    setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                     layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(4) }
-                })
+                }.also { hookStatusDot = it })
                 addView(TextView(context).apply {
-                    text = getString(R.string.stats_hook_active)
+                    text = getString(R.string.stats_hook_unknown)
                     textSize = 13f
-                    setTextColor(getColor(R.color.oneui_secondary))
+                    setTextColor(getColor(R.color.oneui_warning))
                     typeface = Typeface.DEFAULT_BOLD
-                })
+                }.also { hookStatusText = it })
             }
             addView(statusItem)
         }
         statsRow.addView(col1)
         statsRow.addView(col2)
-        statsRow.addView(col3)
+        statsRow.addView(hookStatusCell)
         hookModeCard.addView(statsRow)
 
         tabAppsLayout.addView(hookModeCard)
@@ -1130,10 +1156,11 @@ class MainActivity : ComponentActivity() {
                 marginStart = dp(6)
             }
         }
-        val injectedActiveLabel = TextView(this).apply {
+        injectedActiveLabel = TextView(this).apply {
             text = getString(R.string.status_hook_injected_active)
             textSize = 11f
             setTextColor(getColor(R.color.oneui_secondary))
+            visibility = View.GONE
             gravity = Gravity.END
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
@@ -1230,10 +1257,12 @@ class MainActivity : ComponentActivity() {
         manualCard.addView(writeRow)
         tabAppsLayout.addView(manualCard)
 
-        // Daemon Footer Inset Card
-        val daemonFooter = LinearLayout(this).apply {
+        // Daemon Footer Inset Card (Phase A: render() 僅在 LSPOSED + ACTIVE 時顯示，
+        // 無 Hook 信號前隱藏，不再無條件宣稱攔截成功)。
+        daemonFooter = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
             background = getDrawable(R.drawable.bg_island_card_high)
             val p = dp(10)
             setPadding(p, p, p, p)
@@ -1317,11 +1346,12 @@ class MainActivity : ComponentActivity() {
                 setTextColor(getColor(R.color.oneui_text_tertiary))
             })
         }
-        val residentBadge = TextView(this).apply {
+        residentBadge = TextView(this).apply {
             text = "● ${getString(R.string.engine_status_active)}"
             textSize = 10f
             setTextColor(getColor(R.color.oneui_secondary))
             background = getDrawable(R.drawable.bg_pill_badge_green)
+            visibility = View.GONE
             val hp = dp(8)
             val vp = dp(2)
             setPadding(hp, vp, hp, vp)
@@ -1356,7 +1386,8 @@ class MainActivity : ComponentActivity() {
                 typeface = Typeface.DEFAULT_BOLD
             })
             addView(TextView(context).apply {
-                text = getString(R.string.engine_gauge_subtitle)
+                // Phase A：版本無運行時查詢源，不寫死 102，顯示版本未知。
+                text = getString(R.string.engine_gauge_subtitle, getString(R.string.lsposed_version_unknown))
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_text_tertiary))
                 typeface = Typeface.MONOSPACE
@@ -1377,18 +1408,22 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            addView(ImageView(context).apply {
-                setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+            // Phase A：telemetry 行由 render() 綁定 hookStatus；初值未知（amber）+
+            // 延遲佔位「—」（全 repo 無延遲測量源，不偽造 0.42ms）。
+            telemetryDot = ImageView(context).apply {
+                setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                 layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(6) }
-            })
-            addView(TextView(context).apply {
-                text = getString(R.string.telemetry_status_active)
+            }
+            addView(telemetryDot)
+            telemetryStatusView = TextView(context).apply {
+                text = getString(R.string.telemetry_status_unknown)
                 textSize = 12f
                 setTextColor(getColor(R.color.oneui_text_primary))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            addView(TextView(context).apply {
-                text = getString(R.string.telemetry_latency_format, "0.42")
+            }
+            addView(telemetryStatusView)
+            telemetryLatencyView = TextView(context).apply {
+                text = getString(R.string.telemetry_latency_unknown)
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_primary))
                 background = getDrawable(R.drawable.bg_pill_badge_blue)
@@ -1396,7 +1431,8 @@ class MainActivity : ComponentActivity() {
                 val vp = dp(2)
                 setPadding(hp, vp, hp, vp)
                 typeface = Typeface.MONOSPACE
-            })
+            }
+            addView(telemetryLatencyView)
         }
         telemetryBanner.addView(telemetryBottomRow)
         engineMasterCard.addView(telemetryBanner)
@@ -1426,23 +1462,27 @@ class MainActivity : ComponentActivity() {
                     setTextColor(getColor(R.color.oneui_text_primary))
                     typeface = Typeface.DEFAULT_BOLD
                 })
-                addView(TextView(context).apply {
-                    text = getString(R.string.engine_fallback_desc)
+                // Phase A A4：初值未知（updateShizukuLine 經同源 booleans 覆寫，
+                // 不再預設已授權）；徽章同。
+                shizukuFallbackDescView = TextView(context).apply {
+                    text = getString(R.string.shizuku_state_unknown, getString(R.string.status_loading))
                     textSize = 11f
                     setTextColor(getColor(R.color.oneui_text_tertiary))
-                })
+                }
+                addView(shizukuFallbackDescView)
                 addView(shizukuView)
             }
             addView(titleCol)
-            addView(TextView(context).apply {
-                text = getString(R.string.engine_fallback_standby)
+            shizukuFallbackBadgeView = TextView(context).apply {
+                text = getString(R.string.status_loading)
                 textSize = 10f
-                setTextColor(getColor(R.color.oneui_text_tertiary))
+                setTextColor(getColor(R.color.oneui_warning))
                 background = getDrawable(R.drawable.bg_pill_badge_amber)
                 val hp = dp(6)
                 val vp = dp(2)
                 setPadding(hp, vp, hp, vp)
-            })
+            }
+            addView(shizukuFallbackBadgeView)
         }
         shizukuCard.addView(shizukuTopRow)
         val permRow = LinearLayout(this).apply {
@@ -1507,12 +1547,14 @@ class MainActivity : ComponentActivity() {
                 typeface = Typeface.DEFAULT_BOLD
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
-            addView(TextView(context).apply {
-                text = getString(R.string.engine_diag_all_normal)
+            // Phase A：5/5 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
+            checklistSummaryView = TextView(context).apply {
+                text = getString(R.string.engine_diag_unknown)
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_text_tertiary))
                 typeface = Typeface.MONOSPACE
-            })
+            }
+            addView(checklistSummaryView)
         }
         checklistCard.addView(checkHeader)
 
@@ -1550,16 +1592,19 @@ class MainActivity : ComponentActivity() {
                 textSize = 10f
                 setTextColor(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
                 background = getDrawable(if (isGreen) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_blue)
+                visibility = View.GONE
                 val hp = dp(6)
                 val vp = dp(2)
                 setPadding(hp, vp, hp, vp)
             }
+            checklistItemBadges.add(itemBadge)
             itemRow.addView(itemIcon)
             itemRow.addView(textCol)
             itemRow.addView(itemBadge)
             checklistCard.addView(itemRow)
         }
 
+        checklistItemBadges.clear()
         addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), "● ${getString(R.string.badge_status_normal)}", true)
         checklistCard.addView(View(this).apply { background = getDrawable(R.drawable.divider_horizontal); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) } })
         addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_knox_title), getString(R.string.diag_item_knox_desc), getString(R.string.badge_status_bypassed), false)
@@ -1594,7 +1639,7 @@ class MainActivity : ComponentActivity() {
             }
             addView(textCol)
             engineUidSlotView = TextView(context).apply {
-                text = "UID: 95"
+                text = "UID: —"
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_primary))
                 background = getDrawable(R.drawable.bg_island_card_high)
@@ -2000,12 +2045,9 @@ class MainActivity : ComponentActivity() {
     private fun updateShizukuLine() {
         // Boolean binder/permission state first (single live read): the
         // button branch below keys on these, never on state.contains().
-        val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
-        val authorized: Boolean = try {
-            !noBinder && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
+        // Phase A A4：同一組 booleans 經 readShizukuPresence 單次讀取，同時驅動
+        // 備援卡片標題/徽章（resolveShizukuCardStatus 純函數），卡片永不另行判讀。
+        val (noBinder, authorized) = readShizukuPresence()
         val state: String = try {
             if (noBinder) {
                 getString(R.string.shizuku_state_no_binder)
@@ -2027,6 +2069,45 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: updateShizukuLine may run before buildUi in tests.
         }
+        // Phase A A4：備援卡片與狀態行同源（同一組 noBinder/authorized），不再寫死已授權。
+        try {
+            if (::shizukuFallbackDescView.isInitialized && ::shizukuFallbackBadgeView.isInitialized) {
+                when (resolveShizukuCardStatus(noBinder, authorized)) {
+                    ShizukuCardStatus.NO_BINDER -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_no_binder)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_nobinder)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_gray)
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_tertiary))
+                    }
+                    ShizukuCardStatus.UNAUTHORIZED -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_unauth)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_unauth)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_warning))
+                    }
+                    ShizukuCardStatus.AUTHORIZED -> {
+                        shizukuFallbackDescView.text = getString(R.string.shizuku_state_ok)
+                        shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_standby)
+                        shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_text_tertiary))
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: updateShizukuLine may run before buildUi in tests.
+        }
+    }
+
+    // Phase A A4：Shizuku binder/授權單次 live 讀取（供 updateShizukuLine 狀態行與
+    // 備援卡片共用；pingBinder 守衛 checkSelfPermission，binder 死時顯示未連線不崩潰）。
+    private fun readShizukuPresence(): Pair<Boolean, Boolean> {
+        val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
+        val authorized: Boolean = try {
+            !noBinder && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+        return noBinder to authorized
     }
 
     // Renders one UiState: privilege indicator, Shizuku line (live), channel
@@ -2158,33 +2239,129 @@ class MainActivity : ComponentActivity() {
             if (::engineUidSlotView.isInitialized) {
                 engineUidSlotView.text = getString(R.string.engine_uid_label, s.inventory.targetId)
             }
+            // Phase A A1：Hero 第三格由 hookStatus 驅動；非 LSPOSED 通道整格隱藏
+            // （對齊 renderHookText 回 null 條件：channel != LSPOSED）。
+            if (::hookStatusCell.isInitialized && ::hookStatusDot.isInitialized && ::hookStatusText.isInitialized) {
+                if (renderHookText(s) == null) {
+                    hookStatusCell.visibility = View.GONE
+                } else {
+                    hookStatusCell.visibility = View.VISIBLE
+                    when (s.hookStatus) {
+                        HookStatus.ACTIVE -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+                            hookStatusText.text = getString(R.string.stats_hook_active)
+                            hookStatusText.setTextColor(getColor(R.color.oneui_secondary))
+                        }
+                        HookStatus.INACTIVE -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                            hookStatusText.text = getString(R.string.stats_hook_inactive)
+                            hookStatusText.setTextColor(getColor(R.color.oneui_text_tertiary))
+                        }
+                        HookStatus.UNKNOWN_UNREADABLE, HookStatus.UNKNOWN_NO_DIAGNOSTIC -> {
+                            hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                            hookStatusText.text = getString(R.string.stats_hook_unknown)
+                            hookStatusText.setTextColor(getColor(R.color.oneui_warning))
+                        }
+                    }
+                }
+            }
+            // Phase A A2：statusPill 誠實化。LSPosed 佔位永為唯讀（writeBlockReason
+            // 恆非 null），只給灰＋佔位文案，永不給綠；ROOT/SHIZUKU 綠色只給
+            // writeBlockReason(s) == null（真可寫）的通道；其餘走 amber 中性。
             if (::statusPillText.isInitialized && ::statusPillDot.isInitialized && ::statusPillContainer.isInitialized) {
                 when (s.resolvedGateway) {
                     ResolvedChannel.LSPOSED_PLACEHOLDER -> {
-                        statusPillText.text = "${getString(R.string.channel_lsposed)} 102"
+                        statusPillText.text = getString(R.string.status_pill_lsposed_placeholder)
+                        statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                         statusPillDot.visibility = View.VISIBLE
-                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_green)
-                        statusPillText.setTextColor(getColor(R.color.oneui_secondary))
+                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_gray)
+                        statusPillText.setTextColor(getColor(R.color.oneui_text_tertiary))
                     }
                     ResolvedChannel.ROOT -> {
+                        val writable = writeBlockReason(s) == null
                         statusPillText.text = getString(R.string.channel_root)
+                        statusPillDot.setImageDrawable(
+                            getDrawable(if (writable) R.drawable.ic_dot_green else R.drawable.ic_dot_amber),
+                        )
                         statusPillDot.visibility = View.VISIBLE
-                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_green)
-                        statusPillText.setTextColor(getColor(R.color.oneui_secondary))
+                        statusPillContainer.background = getDrawable(
+                            if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
+                        )
+                        statusPillText.setTextColor(
+                            getColor(if (writable) R.color.oneui_secondary else R.color.oneui_warning),
+                        )
                     }
                     ResolvedChannel.SHIZUKU -> {
+                        val writable = writeBlockReason(s) == null
                         statusPillText.text = getString(R.string.channel_shizuku)
+                        statusPillDot.setImageDrawable(
+                            getDrawable(if (writable) R.drawable.ic_dot_green else R.drawable.ic_dot_amber),
+                        )
                         statusPillDot.visibility = View.VISIBLE
-                        statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_green)
-                        statusPillText.setTextColor(getColor(R.color.oneui_secondary))
+                        statusPillContainer.background = getDrawable(
+                            if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
+                        )
+                        statusPillText.setTextColor(
+                            getColor(if (writable) R.color.oneui_secondary else R.color.oneui_warning),
+                        )
                     }
                     else -> {
                         statusPillText.text = if (s.channel == ChannelPreference.AUTO) getString(R.string.channel_auto) else getString(R.string.status_ready)
+                        statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                         statusPillDot.visibility = View.VISIBLE
                         statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_amber)
                         statusPillText.setTextColor(getColor(R.color.oneui_warning))
                     }
                 }
+            }
+            // Phase A A3：成功宣稱類徽章一律由 Hook 信號驅動；僅 LSPOSED + ACTIVE
+            // 顯示，無信號前隱藏，不再無條件全綠。
+            val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+            if (::hookBadgeChip.isInitialized) {
+                hookBadgeChip.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::hookSecPmTag.isInitialized) {
+                hookSecPmTag.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::injectedActiveLabel.isInitialized) {
+                injectedActiveLabel.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::daemonFooter.isInitialized) {
+                daemonFooter.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::residentBadge.isInitialized) {
+                residentBadge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+            }
+            if (::telemetryDot.isInitialized && ::telemetryStatusView.isInitialized) {
+                if (renderHookText(s) == null) {
+                    telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                    telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
+                } else {
+                    when (s.hookStatus) {
+                        HookStatus.ACTIVE -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_active)
+                        }
+                        HookStatus.INACTIVE -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_inactive)
+                        }
+                        HookStatus.UNKNOWN_UNREADABLE, HookStatus.UNKNOWN_NO_DIAGNOSTIC -> {
+                            telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                            telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
+                        }
+                    }
+                }
+            }
+            if (::checklistSummaryView.isInitialized) {
+                checklistSummaryView.text = if (hookProvenActive) {
+                    getString(R.string.engine_diag_all_normal)
+                } else {
+                    getString(R.string.engine_diag_unknown)
+                }
+            }
+            for (badge in checklistItemBadges) {
+                badge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
             }
         } catch (_: Exception) {
             // Best effort in test environments
@@ -3143,6 +3320,24 @@ internal fun renderLastOpText(s: UiState): String {
         "上次操作：無"
     }
 }
+
+// Phase A A4：Shizuku 備援卡片狀態純函數（JVM 可測）。輸入即 updateShizukuLine()
+// 的同一組 live booleans（noBinder 优先：binder 死時授權無意義），輸出卡片
+// 三態；卡片標題/徽章只經此映射，不另行判讀 Shizuku。
+internal enum class ShizukuCardStatus {
+    NO_BINDER,
+    UNAUTHORIZED,
+    AUTHORIZED,
+}
+
+internal fun resolveShizukuCardStatus(noBinder: Boolean, authorized: Boolean): ShizukuCardStatus =
+    if (noBinder) {
+        ShizukuCardStatus.NO_BINDER
+    } else if (authorized) {
+        ShizukuCardStatus.AUTHORIZED
+    } else {
+        ShizukuCardStatus.UNAUTHORIZED
+    }
 
 // Hook 行：非 LSPosed 模式回 null (呼叫端 Gone)；狀態文案維持本頁提示
 // (ACTIVE 歷史證據措辭/INACTIVE 啟用提示/UNKNOWN 真通道提示，不動)，

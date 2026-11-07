@@ -116,7 +116,7 @@
     <string name="hero_subtitle_engine">Knox Isolated Sandbox · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
-    <string name="hook_mode_title">Hook Mode: LSPosed API 102</string>
+    <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
     <string name="hook_mode_subtitle">Bypass official dual limits, force-inject any third-party app into native Dual App whitelist without Knox or Secure Folder.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
@@ -136,9 +136,8 @@
     <string name="engine_status_subtitle">One UI 6.1 · Android 14+</string>
     <string name="engine_status_active">Resident</string>
     <string name="engine_gauge_title">LSPosed Core Engine</string>
-    <string name="engine_gauge_subtitle">API 102 · Zygote Mode</string>
+    <string name="engine_gauge_subtitle">%1$s · Zygote Mode</string>
     <string name="engine_fallback_title">Shizuku Service (Fallback Mode)</string>
-    <string name="engine_fallback_desc">Wireless debugging permission granted</string>
     <string name="engine_fallback_standby">Standby</string>
     <string name="diag_checklist_title">System Hook Diagnostic Checklist</string>
     <string name="diag_item_framework_title">Samsung Framework Hook</string>
@@ -163,8 +162,23 @@
     <string name="status_hook_injected_active">● Hook Active &amp; Injected</string>
     <string name="engine_diag_all_normal">5/5 Modules Operational</string>
     <string name="telemetry_status_active">Active &amp; Injected</string>
-    <string name="telemetry_latency_format">%s ms latency</string>
+    <string name="telemetry_latency_unknown">—</string>
     <string name="engine_uid_label">UID: %d</string>
     <string name="stats_injected_format">%1$d %2$s (Hook)</string>
     <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
+    <!-- Phase A honest state (P0 correctness): Hook/channel badges are always
+         driven by probe signals; unknown/placeholder without a signal. The
+         LSPosed version has no runtime query source (102 is only the hook
+         module manifest xposedmin/targetapi, not the installed framework
+         version), so it always renders as unknown. -->
+    <string name="stats_hook_inactive">Not detected</string>
+    <string name="stats_hook_unknown">Unknown status</string>
+    <string name="status_pill_lsposed_placeholder">LSPosed (read-only placeholder)</string>
+    <string name="lsposed_version_unknown">Unknown version</string>
+    <string name="telemetry_status_unknown">Status unknown</string>
+    <string name="telemetry_status_inactive">Inactive</string>
+    <string name="stats_value_unknown">—</string>
+    <string name="engine_diag_unknown">Unknown status</string>
+    <string name="engine_fallback_unauth">Not authorized</string>
+    <string name="engine_fallback_nobinder">Not connected</string>
 </resources>
