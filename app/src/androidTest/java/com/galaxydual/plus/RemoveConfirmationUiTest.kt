@@ -62,9 +62,22 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 assertTrue("ack must be checked after explicit set", check.isChecked)
                 val liveDlg = field(activity, "removeConfirmDialog") as AlertDialog
                 val gateDirect = canConfirmRemove(false, true, true)
+                fun countBoxes(v: View): Int {
+                    var n = if (v is CheckBox) 1 else 0
+                    if (v is ViewGroup) for (i in 0 until v.childCount) n += countBoxes(v.getChildAt(i))
+                    return n
+                }
+                val listenerState = try {
+                    val lf = android.widget.CompoundButton::class.java.getDeclaredField("mOnCheckedChangeListener").apply { isAccessible = true }
+                    val bf = android.widget.CompoundButton::class.java.getDeclaredField("mBroadcasting").apply { isAccessible = true }
+                    "listener=${lf.get(check) != null} broadcasting=${bf.getBoolean(check)}"
+                } catch (e: Exception) {
+                    "reflBlocked=${e.javaClass.simpleName}"
+                }
                 assertTrue(
                     "diag: checked=${check.isChecked} gateDirect=$gateDirect sameDlg=${liveDlg === dialog} " +
-                        "sameBtn=${liveDlg.getButton(AlertDialog.BUTTON_POSITIVE) === positive} btn=${positive.isEnabled}",
+                        "sameBtn=${liveDlg.getButton(AlertDialog.BUTTON_POSITIVE) === positive} btn=${positive.isEnabled} " +
+                        "boxes=${countBoxes(dialog.window!!.decorView)} $listenerState",
                     positive.isEnabled,
                 )
                 sync.invoke(activity, old, true, null, catalogKey)
