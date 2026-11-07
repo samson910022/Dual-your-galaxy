@@ -9,12 +9,13 @@
 //   （全程不點任何寫入按鈕）。
 package com.galaxydual.plus
 
+import android.view.View
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -74,16 +75,16 @@ class BackgroundReturnTest {
     fun activity_backgroundReturn_renders() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Clone"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Remove"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "重新連線並更新"))
+                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
+                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
+                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
             }
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
             scenario.onActivity { activity ->
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Clone"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Remove"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "重新連線並更新"))
+                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
+                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
+                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
             }
         }
     }

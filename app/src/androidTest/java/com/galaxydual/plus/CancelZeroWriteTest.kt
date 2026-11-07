@@ -9,12 +9,13 @@
 // 不點確認移除（真機/模擬器上無 verified dual 目標，request 會 fail-closed 拒絕）。
 package com.galaxydual.plus
 
+import android.view.View
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -85,9 +86,9 @@ class CancelZeroWriteTest {
     fun activity_launchesWithoutWrite() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Clone"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "Remove"))
-                assertTrue(HarnessViews.containsText(activity.window.decorView, "重新連線並更新"))
+                assertNotNull(activity.findViewById<View>(R.id.clone_btn))
+                assertNotNull(activity.findViewById<View>(R.id.remove_btn))
+                assertNotNull(activity.findViewById<View>(R.id.refresh_btn))
             }
         }
     }
