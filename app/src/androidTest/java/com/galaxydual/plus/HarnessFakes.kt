@@ -82,13 +82,19 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n")
 
+    private fun parseUser(tokens: List<String>): String? {
+        val idx = tokens.indexOf("--user")
+        return if (idx >= 0 && idx + 1 < tokens.size) tokens[idx + 1] else null
+    }
+
     override suspend fun run(cmd: String): CmdResult {
         commandLog.add(cmd)
         commandCounter.incrementAndGet()
         // Read-only commands (pm list, cmd user list -v, dumpsys, id) are
         // NOT counted; only known write verbs are.
         if (cmd.startsWith("pm uninstall") || cmd.startsWith("pm install") ||
-            cmd.startsWith("pm grant") || cmd.startsWith("am ") ||
+            cmd.startsWith("pm grant") || cmd.startsWith("appops set") ||
+            cmd.startsWith("am ") ||
             (cmd.startsWith("cmd ") && !cmd.startsWith("cmd user list"))) {
             writeCalls++
         }
@@ -104,32 +110,57 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
             cmd == DualRepository.CMD_GETPROP_DUAL ->
                 CmdResult(exit = 0, out = "$dualId\n", err = "")
             cmd.startsWith("pm uninstall") -> {
-                uninstallCalls++
                 val tokens = cmd.trim().split("\\s+".toRegex())
+                val user = parseUser(tokens)
                 val pkg = run {
                     val idx = tokens.indexOf("--user")
                     if (idx >= 0 && idx + 2 < tokens.size) tokens[idx + 2]
                     else tokens.lastOrNull() ?: ""
                 }
-                installedPkgs.remove(pkg)
-                CmdResult(exit = 0, out = "Success", err = "")
+                if (user == null || user != dualId.toString()) {
+                    CmdResult(exit = 1, out = "", err = "wrong user")
+                } else {
+                    uninstallCalls++
+                    installedPkgs.remove(pkg)
+                    CmdResult(exit = 0, out = "Success", err = "")
+                }
             }
             cmd.startsWith("pm install-existing") -> {
-                installCalls++
                 val tokens = cmd.trim().split("\\s+".toRegex())
+                val user = parseUser(tokens)
                 val pkg = run {
                     val idx = tokens.indexOf("--user")
                     if (idx >= 0 && idx + 2 < tokens.size) tokens[idx + 2]
                     else tokens.lastOrNull() ?: ""
                 }
-                if (pkg.isNotBlank()) installedPkgs.add(pkg)
-                CmdResult(exit = 0, out = "Success", err = "")
+                if (user == null || user != dualId.toString()) {
+                    CmdResult(exit = 1, out = "", err = "wrong user")
+                } else {
+                    installCalls++
+                    if (pkg.isNotBlank()) installedPkgs.add(pkg)
+                    CmdResult(exit = 0, out = "Success", err = "")
+                }
             }
             cmd.startsWith("pm list packages") -> {
-                val base = installedPkgs.map { "package:$it" }.joinToString("\n")
-                CmdResult(exit = 0, out = base, err = "")
+                val tokens = cmd.trim().split("\\s+".toRegex())
+                val user = parseUser(tokens)
+                if (user != null && user != dualId.toString()) {
+                    CmdResult(exit = 1, out = "", err = "wrong user")
+                } else {
+                    val base = installedPkgs.map { "package:$it" }.joinToString("\n")
+                    CmdResult(exit = 0, out = base, err = "")
+                }
             }
-            else -> CmdResult(exit = 0, out = "ok", err = "")
+            cmd.startsWith("appops set") -> {
+                val tokens = cmd.trim().split("\\s+".toRegex())
+                val user = parseUser(tokens)
+                if (user != null && user != dualId.toString()) {
+                    CmdResult(exit = 1, out = "", err = "wrong user")
+                } else {
+                    CmdResult(exit = 0, out = "Success", err = "")
+                }
+            }
+            else -> CmdResult(exit = 1, out = "", err = "unknown command")
         }
     }
 }

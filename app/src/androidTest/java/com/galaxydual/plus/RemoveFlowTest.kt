@@ -67,6 +67,7 @@ class RemoveFlowTest {
             HarnessPoll.await(30_000L) { vm.state.value.msg.startsWith("removed: ") }
             assertEquals(1, gw.uninstallCalls)
             assertEquals(1, gw.writeCalls)
+            assertTrue(gw.commandLog.any { it == "pm uninstall --user 95 com.example.chat" })
             assertNull(vm.state.value.pendingRemove)
             assertTrue(!gw.installedPkgs.contains("com.example.chat"))
             // 重複 confirm 跑空（終態成功釘住），不追加 uninstall。
