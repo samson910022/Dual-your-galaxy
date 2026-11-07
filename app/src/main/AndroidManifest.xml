@@ -21,6 +21,8 @@
     <!-- allowBackup=false：無備份需求，排除 dual_selection (SharedPreferences) 上雲；
          選取僅本機持久化，重裝即失效符合 fail-closed。 -->
     <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Galaxy Dual Plus"
         android:supportsRtl="true"
         android:allowBackup="false">
@@ -34,6 +36,9 @@
         </activity>
 
         <!-- Shizuku binder provider; required for Shizuku API V2 to attach. -->
+        <!-- Shizuku-mandated exported provider: the Shizuku manager binds this authority,
+             access is gated by INTERACT_ACROSS_USERS_FULL plus the user's Shizuku grant;
+             never reuse this provider/authority for private app data. -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"

@@ -218,24 +218,82 @@ jobs:
             echo "FAIL: unverified success claim found (use [待實機驗證]/DEVICE-UNVERIFIED instead)"
             exit 1
           fi
+          echo "== live-claim phrases stay in sanctioned gated keys =="
+          # 已注入/攔截中/運作中/常駐中 assert interception as fact. They may appear
+          # ONLY in the sanctioned keys below, whose views default to GONE and render
+          # solely under hookLiveProven/hookLiveDisplay LIVE (MainActivity render();
+          # copy discipline documented at MainActivity.kt 文案紀律). A new key carrying
+          # these phrases fails this gate. (.kt comments legitimately discuss the
+          # discipline, so code is covered by the R.string reference check below,
+          # not by this phrase grep.)
+          if grep -rn --include='*.xml' -E '已注入|攔截中|運作中|常駐中' app/src/main/res \
+            | grep -v -E 'name="(hook_badge_sec_hook|hook_badge_sec_pm|status_hook_daemon_running|status_hook_daemon_desc|engine_status_active|telemetry_status_active|status_hook_injected_active|engine_diag_all_normal)"'; then
+            echo "FAIL: live-claim phrase outside sanctioned hookLive-gated keys"
+            exit 1
+          fi
+          echo "== live-claim R.string refs keep exact gated counts =="
+          # Each sanctioned key may be referenced from executable sources ONLY with the
+          # allowlisted occurrence counts below (every use verified hookLiveProven/
+          # hookLiveDisplay-gated with a GONE default at HEAD). A new unconditional
+          # render adds an occurrence and fails; removing a guard fails the asserts
+          # that follow. Tests (app/src/test) may assert the gates and stay out of scope.
+          FAIL=0
+          check_count() {
+            N=$(grep -r -E -o "R\\.string\\.$1" app/src/main hook/src/main core/src/main 2>/dev/null | wc -l)
+            if [ "$N" != "$2" ]; then echo "FAIL: R.string.$1 occurs $N times, expected $2 (new/removed render?)"; FAIL=1; fi
+          }
+          check_count hook_badge_sec_hook 1
+          check_count hook_badge_sec_pm 1
+          check_count status_hook_daemon_running 2
+          check_count status_hook_daemon_desc 1
+          check_count engine_status_active 1
+          check_count telemetry_status_active 1
+          check_count status_hook_injected_active 1
+          check_count engine_diag_all_normal 1
+          if [ "$FAIL" != "0" ]; then exit 1; fi
+          echo "== live-claim views keep their hookLive guards =="
+          # Every sanctioned view keeps its default-GONE + hookLiveProven/LIVE gate
+          # (grep finds the assignment; set -e fails the job if one is removed).
+          MA=app/src/main/java/com/galaxydual/plus/MainActivity.kt
+          grep -F 'hookBadgeChip.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'hookSecPmTag.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'injectedActiveLabel.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'daemonFooter.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'residentBadge.visibility = if (hookLiveProven)' "$MA"
+          # Phase 3 P2 perf: render hoists hookLiveDisplay(s) once into hookDisplay
+          # (val hookDisplay = hookLiveDisplay(s)); both when-branches consume it.
+          grep -F 'val hookDisplay = hookLiveDisplay(s)' "$MA"
+          [ "$(grep -c -F 'when (hookDisplay)' "$MA")" = "2" ] || exit 1
+          grep -F 'checklistSummaryView.text = if (hookLiveProven)' "$MA"
           echo "PASS: honesty gate"
       # H1 no-touch gates: Knox/Secure Folder + GPL code containment.
-      # Scope is intentionally */src/main + *.kt: policy docs (docs/, README)
+      # Scope is intentionally */src/main + *.kt/*.xml: policy docs (docs/, README)
       # may name these projects/systems to declare them out of scope, and
       # tests may assert the gates themselves; executable sources must not.
       - name: Knox no-touch gate
         run: |
           set -e
           echo "== Knox/Secure Folder must only appear in policy docs =="
-          # Scope is *.kt-only under */src/main (docs + manifest description
-          # may name these systems to declare them out of scope; unit tests
-          # asserting the gates themselves are excluded by-design);
+          # Scope is *.kt (zero tolerance) plus *.xml under */src/main (docs + hook
+          # manifest description may name these systems to declare them out of scope;
+          # unit tests asserting the gates themselves are excluded by-design);
           # never in hook/core/app executable sources.
           # \b is a GNU grep extension (runner is ubuntu-latest); it keeps
           # short tokens (edm/mdm/persona) from false-positive on words like
           # "declaredMethods".
           if grep -rni --include='*.kt' -E 'knox|secure_?folder|timakeystore|dualspa|enterprise_container|sec_container|container_?agent|knox_container|\bedm\b|\bmdm\b|\bpersona\b|warranty.*void.*0x1|defex|/data/knox|/mnt/knox|/data/media/0/../knox' hook/src/main app/src/main core/src/main ; then
             echo "FAIL: Knox-related reference in executable sources"
+            exit 1
+          fi
+          echo "== Knox/Secure Folder in XML must be sanctioned non-use only =="
+          # Sanctioned XML declarations (allowlisted below) declare NON-use as fact:
+          # - hook_mode_subtitle ("no Knox or Secure Folder needed" + privileged-channel
+          #   qualifier): always-visible disclaimer, not a bypass claim.
+          # - hook manifest xposeddescription "(MIT, no Knox access)": manager metadata
+          #   declaring no Knox access. Anything else fails.
+          if grep -rni --include='*.xml' -E 'knox|secure_?folder|timakeystore|dualspa|enterprise_container|sec_container|container_?agent|knox_container|\bedm\b|\bmdm\b|\bpersona\b|warranty.*void.*0x1|defex|/data/knox|/mnt/knox|/data/media/0/../knox' hook/src/main app/src/main core/src/main \
+            | grep -v -E 'name="hook_mode_subtitle"|no Knox access'; then
+            echo "FAIL: unsanctioned Knox-related reference in executable XML sources"
             exit 1
           fi
           echo "PASS: Knox no-touch"

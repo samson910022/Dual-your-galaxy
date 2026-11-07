@@ -36,8 +36,8 @@
     <string name="system_toggle_cd_shown">系統應用目前顯示中，點兩下隱藏（只切換顯示，不卸載任何分身）</string>
     <string name="action_select_visible">全選可見</string>
     <plurals name="select_visible_cd">
-        <item quantity="one">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
-        <item quantity="other">全選目前可見前 %d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+        <item quantity="one">全選目前可見前 %1$d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
+        <item quantity="other">全選目前可見前 %1$d 筆（只勾選，不寫入分身；超出請用搜尋縮小範圍）</item>
     </plurals>
     <string name="action_clear_selection">清除勾選</string>
     <string name="clear_selection_cd">清除勾選（不卸載任何分身）</string>
@@ -46,12 +46,12 @@
     <string name="action_unsave_selection">取消保存</string>
     <string name="unsave_selection_cd">取消保存選取（不卸載分身，不清除目前勾選）</string>
     <plurals name="batch_create">
-        <item quantity="one">建立 %d 個分身</item>
-        <item quantity="other">建立 %d 個分身</item>
+        <item quantity="one">建立 %1$d 個分身</item>
+        <item quantity="other">建立 %1$d 個分身</item>
     </plurals>
     <plurals name="batch_create_cd">
-        <item quantity="one">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
-        <item quantity="other">批次建立 %d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="one">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="other">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
     </plurals>
     <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
     <!-- A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時的可見原因（VM 守衛不動，僅 UI 層提示）。 -->
@@ -106,4 +106,105 @@
     <!-- p28-1 review：診斷複製按鈕/成功訊息（使用者可見短句，已資源化；中英＋繁中）。 -->
     <string name="diagnostic_copy_button">複製已遮蔽內容（分享前請人工確認）</string>
     <string name="diagnostic_copy_success">已複製已遮蔽的診斷內容（僅本機剪貼簿，無上傳，分享前請人工確認，用後請清除剪貼簿）</string>
+
+    <!-- One UI 6 Navigation & Section Strings -->
+    <string name="tab_dual_apps">雙開應用</string>
+    <string name="tab_core_engine">核心引擎</string>
+    <string name="tab_settings">設定</string>
+    <string name="hero_brand_title">Galaxy Tool</string>
+    <string name="hero_title_apps">雙開白名單注入器</string>
+    <string name="hero_title_engine">Dual your Galaxy</string>
+    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後，方可突破限制注入白名單；寫入分身仍需特權通道（Auto／Root／Shizuku）</string>
+    <string name="hero_subtitle_engine">隔離環境 · Core Engine</string>
+    <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
+    <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
+    <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
+    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後，方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道。</string>
+    <string name="hook_mode_subtitle_ops">當前特權通道（Auto／Root／Shizuku）可直接在已驗證分身中建立／移除分身，無需 Hook；LSPosed 僅用於更深度的三星白名單與原生介面整合。</string>
+    <string name="hook_badge_sec_hook">已注入 SecPackageHook</string>
+    <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>
+    <string name="hook_badge_uid_sandbox">獨立 UID 沙盒</string>
+    <string name="stats_native_whitelist">官方原生白名單</string>
+    <string name="stats_injected_count">已分身/已安裝（pm 可見）</string>
+    <string name="stats_hook_status">Hook 攔截狀態</string>
+    <string name="stats_hook_active">正常監聽</string>
+    <string name="stats_unit_apps">款</string>
+    <string name="section_injected_apps">已分身應用（pm 可見）</string>
+    <string name="section_pending_apps">可用已安裝應用</string>
+    <string name="section_pending_apps_hint">勾選後請用「批次建立」寫入分身（勾選本身不寫入）</string>
+    <string name="section_advanced_manual">進階手動包名注入</string>
+    <string name="status_hook_daemon_running">原生 Dual Messenger 核心 Hook 運作中</string>
+    <string name="status_hook_daemon_desc">已成功攔截 com.samsung.android.daagent 白名單驗證回呼</string>
+    <string name="engine_status_title">底層注入狀態</string>
+    <string name="engine_status_subtitle">One UI · Android 10+</string>
+    <string name="engine_status_active">常駐中</string>
+    <string name="engine_gauge_title">LSPosed 核心引擎</string>
+    <string name="engine_gauge_subtitle">%1$s · Zygote 模式</string>
+    <string name="engine_fallback_title">Shizuku 服務 (備援模式)</string>
+    <string name="engine_fallback_standby">已待命 (Standby)</string>
+    <string name="diag_checklist_title">系統 Hook 診斷清單</string>
+    <string name="diag_item_framework_title">Samsung Framework Hook</string>
+    <string name="diag_item_framework_desc">攔截 SecPackageHook 與系統簽章</string>
+    <string name="diag_item_multiuser_title">多用戶 (Multi-User) ID 分配</string>
+    <string name="diag_item_multiuser_desc">核心沙盒虛擬使用者槽位</string>
+    <string name="diag_item_push_title">通知推送同步機制</string>
+    <string name="diag_item_push_desc">FCM / 三星雲端背景廣播分流</string>
+    <string name="diag_item_badge_title">自定義分身角標外觀</string>
+    <string name="diag_item_badge_desc">應用桌面捷徑標籤視覺</string>
+    <string name="badge_status_normal">正常運行</string>
+    <string name="badge_status_isolated">獨立處理</string>
+    <string name="badge_status_dual_tag">雙開標籤</string>
+    <string name="btn_clear_search">清除搜尋</string>
+    <string name="tag_forced_injected">⚡ 強制注入</string>
+    <string name="app_dual_unlocked_desc">原生雙開已解鎖</string>
+    <string name="section_channel_preference">執行通道偏好</string>
+    <string name="section_profiles_diagnostics">設定檔與日誌</string>
+    <string name="status_hook_injected_active">● Hook 注入活躍中</string>
+    <string name="engine_diag_all_normal">4/4 模組運作正常</string>
+    <string name="telemetry_status_active">運作中·已注入</string>
+    <!-- Phase G: telemetry_latency_unknown removed with the dead latency pill
+         (no latency source in repo); key removed from all three locales. -->
+    <!-- Phase C: UID 技術詞中文化（英文版保留 UID）。engine_uid_unknown 為初始佔位。 -->
+    <string name="engine_uid_label">使用者識別碼：%1$d</string>
+    <!-- Phase C: zh (Hook) 改（注入）；英文版保留 (Hook)。
+         Phase E E3：改中性（pm 可見），數字語意不變。 -->
+    <string name="stats_injected_format">%1$d %2$s（pm 可見）</string>
+    <!-- Phase C: zh UID 改使用者識別碼（subtitle 空間不足時 ellipsize）。 -->
+    <string name="app_dual_unlocked_format">%1$s · 使用者識別碼 %2$d</string>
+    <!-- Phase A 誠實狀態顯示（P0 correctness）：Hook/通道狀態一律由探測信號驅動，
+         無信號顯示未知/佔位；LSPosed 版本無運行時查詢源（102 僅為 hook 模組宣告的
+         xposedmin/targetapi，非已安裝框架版本），一律顯示版本未知。 -->
+    <string name="stats_hook_inactive">未偵測</string>
+    <string name="stats_hook_unknown">狀態未知</string>
+    <string name="status_pill_lsposed_placeholder">LSPosed（唯讀佔位）</string>
+    <string name="lsposed_version_unknown">版本未知</string>
+    <string name="telemetry_status_unknown">狀態未知</string>
+    <string name="telemetry_status_inactive">未偵測</string>
+    <string name="stats_value_unknown">—</string>
+    <string name="engine_diag_unknown">狀態未知</string>
+    <string name="engine_fallback_unauth">未授權</string>
+    <string name="engine_fallback_nobinder">未連線</string>
+    <!-- Phase C (a11y/i18n)：設定對話框資源化（版本動態）、數字/角標資源化、
+         底部導覽選中狀態、Recents 標題。英文見 values-en/（鍵集一致）。 -->
+    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
+    <string name="settings_about_format">%1$s\n版本 %2$s（%3$s）\n\n• %4$s\n• %5$s\n\n%6$s</string>
+    <string name="settings_about_feature">Zygote Hook 與 Shizuku 閘道</string>
+    <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <string name="settings_version_unknown">未知</string>
+    <string name="badge_number_format">%1$d</string>
+    <!-- Phase G (i18n): bullet/count prefixes as format resources (were
+         hardcoded "● %s" / "#2 %s" concatenations in code; locale reorder
+         safe, sorting/localization unbroken). -->
+    <string name="badge_dot_format">● %1$s</string>
+    <string name="badge_dual_tag_format">#%1$d %2$s</string>
+    <!-- Phase G (i18n): remove-row content description (was hardcoded
+         half-width ":" concatenation in code; full-width colon, zh/en sync). -->
+    <string name="remove_row_cd">%1$s：%2$s</string>
+    <string name="dual_badge_cd">分身角標（第二分身）：%1$s</string>
+    <string name="engine_uid_unknown">使用者識別碼：—</string>
+    <string name="nav_tab_state_selected">已選取</string>
+    <string name="nav_tab_cd_selected">%1$s，%2$s</string>
+    <!-- Phase 3 P3 B7: 設定 nav 開啟對話框 (非切頁)，CD 明示開啟對話框。 -->
+    <string name="settings_tab_cd">設定，點兩下開啟對話框</string>
 </resources>
