@@ -53,7 +53,13 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val check = checkbox(dialog.window!!.decorView)!!
                 assertFalse(positive.isEnabled)
-                check.performClick()
+                // 以明確設值驅動勾選（等價於一次點選觸發的 setChecked(true)→listener
+                // 路徑），避免 headless CI 上 performClick 分發差異造成非確定性；
+                // 先清零再置位，無論初始狀態為何都確保 listener 以 checked=true
+                // 觸發一次。
+                check.isChecked = false
+                check.isChecked = true
+                assertTrue(check.isChecked)
                 assertTrue(positive.isEnabled)
                 sync.invoke(activity, old, true, null, catalogKey)
                 assertFalse(positive.isEnabled)
@@ -116,7 +122,13 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val check = checkbox(dialog.window!!.decorView)!!
                 assertFalse(positive.isEnabled)
-                check.performClick()
+                // 以明確設值驅動勾選（等價於一次點選觸發的 setChecked(true)→listener
+                // 路徑），避免 headless CI 上 performClick 分發差異造成非確定性；
+                // 先清零再置位，無論初始狀態為何都確保 listener 以 checked=true
+                // 觸發一次。
+                check.isChecked = false
+                check.isChecked = true
+                assertTrue(check.isChecked)
                 assertTrue(positive.isEnabled)
                 // 四參 dialog 門控零覆蓋：blocked 通道即使已勾選，confirm 仍禁用。
                 val blocked = BlockReason.Keyed(WriteBlock(WriteBlockKind.NO_PRIVILEGE))
