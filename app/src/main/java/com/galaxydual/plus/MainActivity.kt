@@ -1289,7 +1289,7 @@ class MainActivity : ComponentActivity() {
                 typeface = Typeface.DEFAULT_BOLD
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
-            // Phase A：5/5 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
+            // Phase A：4/4 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
             checklistSummaryView = TextView(context).apply {
                 text = getString(R.string.engine_diag_unknown)
                 textSize = 11f
@@ -1359,10 +1359,8 @@ class MainActivity : ComponentActivity() {
         // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
         addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), getString(R.string.badge_dot_format, getString(R.string.badge_status_normal)), true)
         checklistCard.addView(makeDivider())
-        addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_isolation_title), getString(R.string.diag_item_isolation_desc), getString(R.string.badge_status_bypassed), false)
-        checklistCard.addView(makeDivider())
 
-        // Item 3: Multi-User UID
+        // Item 2: Multi-User UID
         val uidRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -2210,8 +2208,8 @@ class MainActivity : ComponentActivity() {
             titleRow.addView(tagView)
 
             val subtitleView = TextView(this).apply {
-                // Phase E E1：targetId 未知時只顯示 desc，不把 -1 格式化進文案。
-                text = if (s.inventory.targetId > NO_TARGET_ID) {
+                // Phase E E1：targetId 未知時只顯示 desc，不把未知 id（<=0）格式化進文案。
+                text = if (s.inventory.targetId > 0) {
                     getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
                 } else {
                     getString(R.string.app_dual_unlocked_desc)
@@ -2725,9 +2723,9 @@ class MainActivity : ComponentActivity() {
                 clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
             }
             if (::engineUidSlotView.isInitialized) {
-                // Phase E E1：targetId 未知（NO_TARGET_ID=-1）時顯示未知佔位，
-                // 不得將 -1 格式化進 UID 文案（外洩＋TalkBack 誤讀）；a11y P0。
-                engineUidSlotView.text = if (s.inventory.targetId > NO_TARGET_ID) {
+                // Phase E E1：targetId 未知（<=0；-1=NO_TARGET_ID 表未知，0 無合法顯示語意）時顯示未知佔位，
+                // 不得將未知 id 格式化進 UID 文案（外洩＋TalkBack 誤讀）；a11y P0。
+                engineUidSlotView.text = if (s.inventory.targetId > 0) {
                     getString(R.string.engine_uid_label, s.inventory.targetId)
                 } else {
                     getString(R.string.engine_uid_unknown)
@@ -2862,7 +2860,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (::checklistSummaryView.isInitialized) {
-                // Phase H：5/5 模組運作正常只給 live 證實；ACTIVE 歷史標記走 unknown。
+                // Phase H：4/4 模組運作正常只給 live 證實；ACTIVE 歷史標記走 unknown。
                 checklistSummaryView.text = if (hookLiveProven) {
                     getString(R.string.engine_diag_all_normal)
                 } else {
@@ -4259,7 +4257,7 @@ internal fun isEnglishLocale(locale: Locale = Locale.getDefault()): Boolean =
 internal fun renderInventoryText(s: UiState, isEnglish: Boolean = false): String = buildString {
     if (isEnglish) {
         append("Inventory: ${s.inventory.freshness}")
-        if (s.inventory.targetId > NO_TARGET_ID) {
+        if (s.inventory.targetId > 0) {
             append(" (user ${s.inventory.targetId}, ${s.inventory.count} items)")
         }
         val q = if (s.inventory.queryTimeMs <= 0L) "Never queried" else formatTimeMs(s.inventory.queryTimeMs)
@@ -4270,7 +4268,7 @@ internal fun renderInventoryText(s: UiState, isEnglish: Boolean = false): String
         return@buildString
     }
     append("清單：${s.inventory.freshness}")
-    if (s.inventory.targetId > NO_TARGET_ID) {
+    if (s.inventory.targetId > 0) {
         append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
     }
     append("・查詢於 ${formatTimeMs(s.inventory.queryTimeMs)}")
@@ -4289,7 +4287,7 @@ internal fun renderLastOpText(s: UiState): String {
     val last = s.lastOperation
     return if (last != null) {
         val targetPart =
-            if (last.pinnedTarget > NO_TARGET_ID) " target=${last.pinnedTarget}" else ""
+            if (last.pinnedTarget > 0) " target=${last.pinnedTarget}" else ""
         "上次操作：${redactPackage(last.appKey)}$targetPart 相位 ${last.phase}"
     } else {
         "上次操作：無"
@@ -4323,7 +4321,7 @@ internal fun resolveShizukuCardStatus(noBinder: Boolean, authorized: Boolean): S
 // 六徽章/badges/icons/summary/telemetry 綠/ACTIVE 文案/逐行 tag 一律由
 // hookLiveProven 驅動；hookHistoryActive 為真但 hookBootFresh 為 false 時
 // 全 GONE/unknown/灰。boot-fresh 落地後自動點亮，無需改 render。
-// 文案紀律：boot-fresh 前不得用 已注入/攔截中/運作中/常駐中/正常監聽/5/5/
+// 文案紀律：boot-fresh 前不得用 已注入/攔截中/運作中/常駐中/正常監聽/4/4/
 // Active/Running/Intercepting/Injected 作 live 宣稱；歷史顯示重用
 // telemetry_status_unknown/stats_hook_unknown/engine_diag_unknown，永不給綠。
 internal fun hookHistoryActive(s: UiState): Boolean =
