@@ -5840,6 +5840,7 @@ fun UiState.withHookDiagnosis(diagnosis: HookDiagnosis, queriedAtMs: Long = 0L):
     hookViaGateway = diagnosis.viaGateway,
     // Phase H：診斷只證明歷史存在性，永不證明本次開機存活，fail-closed 歸零
     // (未來 boot 比較通過由專屬路徑重設 true，不經此處)。
+    // TODO: 未來 setter 必須經 boot 比較 markerTimeMs vs boot（見 HookMarker.parseTimeMs），不得在此直設 true。
     hookBootFresh = false,
 )
 

@@ -95,4 +95,21 @@ class HookLiveGateTest {
     @Test fun hookBootFreshDefaultsFalse() {
         assertFalse("new field must default fail-closed", UiState().hookBootFresh)
     }
+
+    @Test fun withHookDiagnosisNeverSetsBootFresh() {
+        val base = UiState(channel = ChannelPreference.LSPOSED)
+        val diagnoses = listOf(
+            HookDiagnosis(HookStatus.ACTIVE, setOf("system_server")),
+            HookDiagnosis(HookStatus.INACTIVE),
+            HookDiagnosis(HookStatus.UNKNOWN_UNREADABLE),
+            HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC),
+        )
+        for (diagnosis in diagnoses) {
+            val mapped = base.withHookDiagnosis(diagnosis, queriedAtMs = 1L)
+            assertFalse(
+                "withHookDiagnosis is existence-only, never proves boot freshness ($diagnosis)",
+                mapped.hookBootFresh,
+            )
+        }
+    }
 }
