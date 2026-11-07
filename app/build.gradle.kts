@@ -77,6 +77,11 @@ android {
     // SDK levels are single-sourced from gradle/libs.versions.toml.
     compileSdk = libs.versions.compileSdk.get().toInt()
 
+    // Phase F4a: BuildConfig.DEBUG gates the GalaxyExecService deny-path logs.
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "com.galaxydual.plus"
         minSdk = libs.versions.minSdk.get().toInt()

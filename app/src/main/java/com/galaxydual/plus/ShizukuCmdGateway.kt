@@ -33,6 +33,7 @@ import android.content.pm.PackageManager
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.util.Log
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
@@ -80,11 +81,26 @@ import rikka.shizuku.Shizuku
 //   3. confirm the bound service runs the new capture/marker contract (an
 //      exit=0 partial read-error / join-expired reply arrives WITH marker and
 //      parses as Unknown on the new client).
+// Caller-identity gate (P0 security): the service runs under the shell/root
+// uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
+// Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
+// device), so fail closed: only the owner app uid (captured from the Context
+// constructor, NOT the service process uid) may EXEC. Enforced in
+// GalaxyExecService.onTransact via isAllowedCaller() below (pure,
+// JVM-tested); foreign callers get the frozen denied reply and their command
+// is never read nor executed. DESTROY is intentionally left ungated (see
+// onTransact DESTROY): actual sender uid is DEVICE-UNVERIFIED, gating risks
+// orphaned resident services defeating SERVICE_VERSION, and foreign DESTROY
+// is availability-only DoS (Shizuku rebinds, no command execution). EXEC
+// remains the P0-gated vector.
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
     const val BIND_TIMEOUT_MS = 10_000L
     const val EXEC_TIMEOUT_MS = 60_000L
+    // Wire-frozen denied reply for foreign callers (exit=1, out="", err=this).
+    // The onTransact auth gate writes it without reading/executing the cmd.
+    const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
     // UserService implementation version. v1 = cap-only marker (old service
     // semantics); v2 = whenever-truncated marker (current capture contract).
     // Bump whenever the service-side capture/encode code changes: Shizuku
@@ -94,6 +110,29 @@ object ShizukuExecProtocol {
     // stable service identity below).
     const val SERVICE_VERSION = 2
 }
+
+/**
+ * Owner-uid caller gate for [GalaxyExecService].
+ *
+ * [expectedAppUid] is the owner app uid (from `Context.applicationInfo.uid`
+ * captured in the service's Context constructor), NOT the service process
+ * uid: the service runs as shell (2000) / root (0) and those uids are shared
+ * across processes, so `==` against `Process.myUid()` is NOT authentication
+ * (it self-DoSes the legit app caller while letting any shell-peer through).
+ * Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
+ * device), so fail closed to the owner app uid instead of trusting the bind
+ * layer. A negative expected uid (daemon default-constructor path, resolution
+ * failure) never matches.
+ *
+ * Do NOT add android:sharedUserId — uid-equality gate would admit sibling
+ * packages; redesign gate first.
+ *
+ * Pure JVM-testable seam: [callingUid] is `Binder.getCallingUid()`; only
+ * this comparison is unit-tested -- Binder/Parcel round-trips stay
+ * device-only (android.jar stubs on the JVM).
+ */
+fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
+    callingUid == expectedAppUid && expectedAppUid >= 0
 
 // Pure error mapping for every Shizuku-side failure. Tri-state contract
 // (PR-32 P1-1 timeout, extended by P1-2 transport-unknown): the repository
@@ -175,6 +214,15 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
         truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
     )
 
+// Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
+// err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
+// paths log it locally in DEBUG builds only).
+private fun writeDenied(reply: Parcel?) {
+    reply?.writeInt(1)
+    reply?.writeString("")
+    reply?.writeString(ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+}
+
 // Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
 // needs a real IBinder (synchronous binder.transact on a Parcel pair), so its
 // catch chain is not JVM-testable -- only this mapping is (GatewayAssemblyTest
@@ -223,19 +271,48 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 //   -keep class com.galaxydual.plus.GalaxyExecService { <init>(...); }
 // DEVICE-UNVERIFIED: bind/exec round-trip never ran on a device.
 class GalaxyExecService : Binder {
-    constructor() : super()
+    // Owner app uid captured from the Context constructor (the package-scoped
+    // user context). The default constructor (old-server daemon path) has no
+    // Context, so it stays -1 and the EXEC gate fails closed.
+    private val expectedUid: Int
 
-    @Suppress("UNUSED_PARAMETER")
-    constructor(context: Context) : super()
+    constructor() : super() {
+        expectedUid = -1
+    }
+
+    constructor(context: Context) : super() {
+        expectedUid = try {
+            context.applicationInfo.uid
+        } catch (_: Exception) {
+            try {
+                context.packageManager.getPackageUid(context.packageName, 0)
+            } catch (_: Exception) {
+                -1
+            }
+        }
+    }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
         when (code) {
             ShizukuExecProtocol.TRANSACTION_DESTROY -> {
-                // Reserved destroy entry: cleanup then exit, per official guide.
+                // DESTROY is sent by Shizuku server on teardown/version-invalidation;
+                // actual sender uid is DEVICE-UNVERIFIED (could be system 1000 / shell 2000 / root 0);
+                // gating risks orphaned resident services defeating SERVICE_VERSION;
+                // foreign DESTROY impact is negligible availability-only DoS (Shizuku rebinds, no command execution),
+                // so leave ungated deliberately. EXEC remains the P0-gated vector.
                 System.exit(0)
                 return true
             }
             ShizukuExecProtocol.TRANSACTION_EXEC -> {
+                // P0 gate: auth runs BEFORE reading the cmd (fail closed, do
+                // no work for a foreign caller; Parcel position is left
+                // unread on deny -- the reply is terminal either way).
+                val callingUid = Binder.getCallingUid()
+                if (!isAllowedCaller(callingUid, expectedUid)) {
+                    if (BuildConfig.DEBUG) Log.w("GalaxyExec", "denied code=$code callingUid=$callingUid")
+                    writeDenied(reply)
+                    return true
+                }
                 val cmd = try {
                     data.readString() ?: ""
                 } catch (e: Exception) {
