@@ -40,7 +40,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.os.Bundle
@@ -169,7 +168,10 @@ class MainActivity : ComponentActivity() {
     // itself on a true channel. Enable still follows the shared busy gate.
     private lateinit var hookRow: LinearLayout
     private lateinit var msgView: TextView
-    private var defaultMsgColor: Int = Color.BLACK
+    // Phase C: default message color resolves the oneui_text_primary token
+    // lazily (post-attach; replaces the old Color.BLACK literal so production
+    // never bypasses the theme token; JVM tests never touch Activity state).
+    private val defaultMsgColor: Int by lazy { getColor(R.color.oneui_text_primary) }
     // p28-1 禁用原因行：主操作（建立/移除分身）因通道不可寫被禁用時顯示
     // VM 拒絕理由（writeBlockReason 資源鍵經 Context 解析，與點按拒絕同文）；可寫或忙碌時隱藏。
     private lateinit var writeBlockView: TextView
@@ -324,7 +326,9 @@ class MainActivity : ComponentActivity() {
             }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
-        switchTab(currentTab)
+        // Phase C: no announcement for the initial restore (avoids speaking on
+        // launch/rotation); user taps announce via switchTab default.
+        switchTab(currentTab, announce = false)
         // Shizuku lifecycle wiring; guarded so a device without the Shizuku
         // manager (or an unexpected API failure) never crashes the UI.
         try {
@@ -501,7 +505,7 @@ class MainActivity : ComponentActivity() {
             val p = dp(12)
             setPadding(p, p, p, p)
             setTextColor(getColor(R.color.oneui_text_primary))
-            setHintTextColor(getColor(R.color.oneui_text_tertiary))
+            setHintTextColor(getColor(R.color.oneui_text_secondary))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -537,7 +541,9 @@ class MainActivity : ComponentActivity() {
             id = R.id.clone_btn
             text = getString(R.string.action_clone)
             background = getDrawable(R.drawable.bg_pill_button)
-            setTextColor(Color.WHITE)
+            // Phase C: theme token (light #FFFFFF 5.42 on primary; night
+            // #002958 4.52 on primary_container via drawable-night).
+            setTextColor(getColor(R.color.oneui_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener { vm.clone(pkgInput.text.toString()) }
@@ -555,7 +561,8 @@ class MainActivity : ComponentActivity() {
             id = R.id.refresh_btn
             text = getString(R.string.action_reconnect)
             background = getDrawable(R.drawable.bg_pill_button)
-            setTextColor(Color.WHITE)
+            // Phase C: theme token (see cloneBtn).
+            setTextColor(getColor(R.color.oneui_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener {
@@ -644,7 +651,6 @@ class MainActivity : ComponentActivity() {
             setTextColor(getColor(R.color.oneui_text_primary))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        defaultMsgColor = getColor(R.color.oneui_text_primary)
         writeBlockView = TextView(this).apply {
             id = R.id.write_block_reason
             visibility = View.GONE
@@ -686,7 +692,9 @@ class MainActivity : ComponentActivity() {
             hint = getString(R.string.search_hint)
             background = null
             setTextColor(getColor(R.color.oneui_text_primary))
-            setHintTextColor(getColor(R.color.oneui_text_tertiary))
+            // Phase C: hint uses text_secondary (#475569 on #DFE7F0 = 6.07;
+            // tertiary was 3.81, below AA 4.5).
+            setHintTextColor(getColor(R.color.oneui_text_secondary))
             textSize = 14f
             layoutParams = LinearLayout.LayoutParams(
                 0,
@@ -714,6 +722,9 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (height is
+            // WRAP_CONTENT so large fonts grow instead of clipping).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.system_toggle_cd_hidden)
             setOnClickListener { vm.setIncludeSystemApps(!vm.state.value.includeSystemApps) }
         }
@@ -722,6 +733,8 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(
                 R.plurals.select_visible_cd,
                 MAX_SOURCE_ROWS,
@@ -734,6 +747,8 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.clear_selection_cd)
             setOnClickListener { vm.clearSelectionLocal() }
         }
@@ -742,6 +757,8 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.save_selection_cd)
             setOnClickListener { vm.persistSelection(vm.state.value.inventory.targetId) }
         }
@@ -750,6 +767,8 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
+            // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.unsave_selection_cd)
             setOnClickListener { vm.cancelSavedSelection() }
         }
@@ -766,7 +785,8 @@ class MainActivity : ComponentActivity() {
             id = R.id.batch_btn
             text = resources.getQuantityString(R.plurals.batch_create, 0, 0)
             background = getDrawable(R.drawable.bg_pill_button)
-            setTextColor(Color.WHITE)
+            // Phase C: theme token (see cloneBtn).
+            setTextColor(getColor(R.color.oneui_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
@@ -808,6 +828,8 @@ class MainActivity : ComponentActivity() {
         val brandLogo = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_nav_dual_apps))
             setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (brand text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
         }
         val brandText = TextView(this).apply {
@@ -821,6 +843,8 @@ class MainActivity : ComponentActivity() {
         }
         statusPillDot = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+            // Phase C: decorative status dot (pill text carries the state).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply {
                 marginEnd = dp(6)
             }
@@ -873,6 +897,8 @@ class MainActivity : ComponentActivity() {
         val subIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_security))
             setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (subtitle text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(14), dp(14)).apply {
                 marginEnd = dp(4)
             }
@@ -937,6 +963,8 @@ class MainActivity : ComponentActivity() {
         val boltIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_bolt))
             setColorFilter(getColor(R.color.oneui_secondary))
+            // Phase C: decorative (card title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
                 marginEnd = dp(6)
             }
@@ -952,7 +980,9 @@ class MainActivity : ComponentActivity() {
         hookBadgeChip = TextView(this).apply {
             text = getString(R.string.hook_badge_sec_hook)
             textSize = 10f
-            setTextColor(getColor(R.color.oneui_secondary))
+            // Phase C: body green text uses the tint (light #046C4E on
+            // #D1FAE5 = 5.68; #059669 was 3.32). Icons/strokes keep secondary.
+            setTextColor(getColor(R.color.oneui_secondary_tint))
             background = getDrawable(R.drawable.bg_pill_badge_green)
             visibility = View.GONE
             val hp = dp(8)
@@ -984,7 +1014,10 @@ class MainActivity : ComponentActivity() {
         hookSecPmTag = TextView(this).apply {
             text = getString(R.string.hook_badge_sec_pm)
             textSize = 10f
-            setTextColor(getColor(R.color.oneui_primary))
+            // Phase C: blue-pill text uses on_primary_container (light #001D4D
+            // on #D6E4FF = 12.78; night #002958 on #418FFF = 4.52). primary was
+            // 4.24 light and primary_tint (#AAC7FF night) is 1.87 on #418FFF.
+            setTextColor(getColor(R.color.oneui_on_primary_container))
             background = getDrawable(R.drawable.bg_pill_badge_blue)
             visibility = View.GONE
             val hp = dp(8)
@@ -1054,10 +1087,13 @@ class MainActivity : ComponentActivity() {
             addView(TextView(context).apply {
                 text = getString(R.string.stats_injected_count)
                 textSize = 10f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase C: primary on island_card_high (#DFE7F0) is 4.35 light
+                // / 4.23 night; tint is 6.50 / 9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
             })
             clonedCountStatView = TextView(context).apply {
-                text = "0 ${getString(R.string.stats_unit_apps)} (Hook)"
+                // Phase C: initial value via resources (was hardcoded "0 …(Hook)").
+                text = getString(R.string.stats_injected_format, 0, getString(R.string.stats_unit_apps))
                 textSize = 15f
                 setTextColor(getColor(R.color.oneui_primary))
                 typeface = Typeface.DEFAULT_BOLD
@@ -1084,6 +1120,8 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 addView(ImageView(context).apply {
                     setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                    // Phase C: decorative (hook status text carries the state).
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(4) }
                 }.also { hookStatusDot = it })
                 addView(TextView(context).apply {
@@ -1106,14 +1144,16 @@ class MainActivity : ComponentActivity() {
         tabAppsLayout.addView(batchBtn)
         tabAppsLayout.addView(batchResultView)
 
-        // Search Bar with Clear Button
+        // Search Bar with Clear Button (Phase C: WRAP_CONTENT + minimumHeight so
+        // large fonts grow instead of clipping in a fixed dp48 box).
         val searchContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = getDrawable(R.drawable.bg_search_input)
             val p = dp(10)
             setPadding(p, dp(4), p, dp(4))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply {
+            minimumHeight = dp(48)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
                 bottomMargin = dp(8)
             }
@@ -1121,6 +1161,8 @@ class MainActivity : ComponentActivity() {
         val searchIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_search))
             setColorFilter(getColor(R.color.oneui_text_tertiary))
+            // Phase C: decorative (search field hint carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
                 marginEnd = dp(8)
             }
@@ -1150,11 +1192,13 @@ class MainActivity : ComponentActivity() {
         val filterRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             val p = dp(4)
-            addView(systemToggleBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
-            addView(selectAllBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
-            addView(clearSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
-            addView(saveSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
-            addView(cancelSaveBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
+            // Phase C: WRAP_CONTENT height + 48dp minimumHeight (was fixed dp48,
+            // which clips large fonts). Touch target stays >= 48dp.
+            addView(systemToggleBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(selectAllBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(clearSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(saveSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
+            addView(cancelSaveBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(p, 0, p, 0) })
         }
         filterScroll.addView(filterRow)
         tabAppsLayout.addView(filterScroll)
@@ -1174,9 +1218,11 @@ class MainActivity : ComponentActivity() {
             typeface = Typeface.DEFAULT_BOLD
         }
         clonedCountBadge = TextView(this).apply {
-            text = "0"
+            // Phase C: initial count via resources (was hardcoded "0").
+            text = getString(R.string.badge_number_format, 0)
             textSize = 11f
-            setTextColor(getColor(R.color.oneui_primary))
+            // Phase C: blue-pill text (see hookSecPmTag).
+            setTextColor(getColor(R.color.oneui_on_primary_container))
             background = getDrawable(R.drawable.bg_pill_badge_blue)
             val hp = dp(8)
             val vp = dp(2)
@@ -1188,7 +1234,9 @@ class MainActivity : ComponentActivity() {
         injectedActiveLabel = TextView(this).apply {
             text = getString(R.string.status_hook_injected_active)
             textSize = 11f
-            setTextColor(getColor(R.color.oneui_secondary))
+            // Phase C: tint (light #046C4E on canvas #F0F4FA ≈ 5.8; #059669
+            // was 3.60).
+            setTextColor(getColor(R.color.oneui_secondary_tint))
             visibility = View.GONE
             gravity = Gravity.END
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -1302,6 +1350,8 @@ class MainActivity : ComponentActivity() {
         val terminalIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_terminal))
             setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (daemon text beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply {
                 marginEnd = dp(8)
             }
@@ -1356,6 +1406,8 @@ class MainActivity : ComponentActivity() {
         val engineIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_nav_engine))
             setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (engine title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(22), dp(22)).apply {
                 marginEnd = dp(8)
             }
@@ -1378,7 +1430,8 @@ class MainActivity : ComponentActivity() {
         residentBadge = TextView(this).apply {
             text = "● ${getString(R.string.engine_status_active)}"
             textSize = 10f
-            setTextColor(getColor(R.color.oneui_secondary))
+            // Phase C: green-pill text uses the tint (see hookBadgeChip).
+            setTextColor(getColor(R.color.oneui_secondary_tint))
             background = getDrawable(R.drawable.bg_pill_badge_green)
             visibility = View.GONE
             val hp = dp(8)
@@ -1425,6 +1478,8 @@ class MainActivity : ComponentActivity() {
         val gaugeIcon = ImageView(this).apply {
             setImageDrawable(getDrawable(R.drawable.ic_nav_engine))
             setColorFilter(getColor(R.color.oneui_primary))
+            // Phase C: decorative (gauge title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             layoutParams = LinearLayout.LayoutParams(dp(26), dp(26))
         }
         telemetryTopRow.addView(gaugeTitles)
@@ -1441,6 +1496,8 @@ class MainActivity : ComponentActivity() {
             // 延遲佔位「—」（全 repo 無延遲測量源，不偽造 0.42ms）。
             telemetryDot = ImageView(context).apply {
                 setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                // Phase C: decorative (telemetry text carries the state).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(6) }
             }
             addView(telemetryDot)
@@ -1454,7 +1511,8 @@ class MainActivity : ComponentActivity() {
             telemetryLatencyView = TextView(context).apply {
                 text = getString(R.string.telemetry_latency_unknown)
                 textSize = 11f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase C: blue-pill text (see hookSecPmTag).
+                setTextColor(getColor(R.color.oneui_on_primary_container))
                 background = getDrawable(R.drawable.bg_pill_badge_blue)
                 val hp = dp(6)
                 val vp = dp(2)
@@ -1480,6 +1538,8 @@ class MainActivity : ComponentActivity() {
             addView(ImageView(context).apply {
                 setImageDrawable(getDrawable(R.drawable.ic_terminal))
                 setColorFilter(getColor(R.color.oneui_text_secondary))
+                // Phase C: decorative (fallback title beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(8) }
             })
             val titleCol = LinearLayout(context).apply {
@@ -1519,7 +1579,9 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            addView(permBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
+            // Phase C: WRAP_CONTENT height (permBtn already has 48dp
+            // minimumHeight) so large fonts grow instead of clipping.
+            addView(permBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         shizukuCard.addView(permRow)
         engineMasterCard.addView(shizukuCard)
@@ -1599,6 +1661,8 @@ class MainActivity : ComponentActivity() {
             val itemIcon = ImageView(this).apply {
                 setImageDrawable(getDrawable(iconRes))
                 setColorFilter(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
+                // Phase C: decorative (item title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
             }
             val textCol = LinearLayout(this).apply {
@@ -1619,7 +1683,9 @@ class MainActivity : ComponentActivity() {
             val itemBadge = TextView(this).apply {
                 text = badgeText
                 textSize = 10f
-                setTextColor(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
+                // Phase C: green badge text uses the tint, blue badge text uses
+                // on_primary_container (see hookBadgeChip/hookSecPmTag).
+                setTextColor(getColor(if (isGreen) R.color.oneui_secondary_tint else R.color.oneui_on_primary_container))
                 background = getDrawable(if (isGreen) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_blue)
                 visibility = View.GONE
                 val hp = dp(6)
@@ -1649,6 +1715,8 @@ class MainActivity : ComponentActivity() {
             addView(ImageView(context).apply {
                 setImageDrawable(getDrawable(R.drawable.ic_multi_user))
                 setColorFilter(getColor(R.color.oneui_secondary))
+                // Phase C: decorative (multi-user title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
             })
             val textCol = LinearLayout(context).apply {
@@ -1668,9 +1736,12 @@ class MainActivity : ComponentActivity() {
             }
             addView(textCol)
             engineUidSlotView = TextView(context).apply {
-                text = "UID: —"
+                // Phase C: initial placeholder via resources (was "UID: —").
+                text = getString(R.string.engine_uid_unknown)
                 textSize = 11f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase C: primary on island_card_high is 4.35/4.23; tint is
+                // 6.50/9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
                 background = getDrawable(R.drawable.bg_island_card_high)
                 val hp = dp(6)
                 val vp = dp(2)
@@ -1729,11 +1800,14 @@ class MainActivity : ComponentActivity() {
         root.addView(contentFrame)
 
         // ================= Bottom Navigation Bar =================
+        // Phase C: WRAP_CONTENT + minimumHeight (was fixed dp60, clips large
+        // fonts). Touch target stays >= 60dp.
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(getColor(R.color.oneui_surface_container_lowest))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60))
+            minimumHeight = dp(60)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             elevation = dp(8).toFloat()
         }
 
@@ -1743,18 +1817,24 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 isClickable = true
                 isFocusable = true
+                // Phase C: the item carries the label (+selected state, synced
+                // in updateNavTabStyles); children stay silent to avoid double
+                // announcement.
+                contentDescription = labelStr
                 val p = dp(6)
                 setPadding(p, p, p, p)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
                 val icon = ImageView(context).apply {
                     setImageDrawable(getDrawable(iconRes))
                     setColorFilter(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
                 }
                 val label = TextView(context).apply {
                     text = labelStr
                     textSize = 11f
                     setTextColor(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                         topMargin = dp(2)
                     }
@@ -1783,7 +1863,7 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    private fun switchTab(tab: Int) {
+    private fun switchTab(tab: Int, announce: Boolean = true) {
         currentTab = tab
         if (!::tabAppsScroll.isInitialized || !::tabEngineScroll.isInitialized) return
         if (tab == TAB_DUAL_APPS) {
@@ -1801,12 +1881,30 @@ class MainActivity : ComponentActivity() {
             heroSubtitleView.text = getString(R.string.hero_subtitle_engine)
             updateNavTabStyles(TAB_CORE_ENGINE)
         }
+        // Phase C: VISIBLE/GONE switches move no focus, so announce the new
+        // hero title for screen readers (a no-op when a11y is off).
+        if (announce) {
+            try {
+                heroTitleView.announceForAccessibility(heroTitleView.text)
+            } catch (_: Exception) {
+                // Best effort: announcement failure must not break tab switch.
+            }
+        }
     }
 
     private fun updateNavTabStyles(activeTab: Int) {
         if (!::navTabApps.isInitialized || !::navTabEngine.isInitialized || !::navTabSettings.isInitialized) return
         val activeColor = getColor(R.color.oneui_primary)
         val inactiveColor = getColor(R.color.oneui_text_tertiary)
+
+        // Phase C: selection semantics for screen readers (isSelected +
+        // "label, selected" description; unselected tabs expose the bare label).
+        navTabApps.isSelected = activeTab == TAB_DUAL_APPS
+        navTabApps.contentDescription = navTabDescription(getString(R.string.tab_dual_apps), activeTab == TAB_DUAL_APPS)
+        navTabEngine.isSelected = activeTab == TAB_CORE_ENGINE
+        navTabEngine.contentDescription = navTabDescription(getString(R.string.tab_core_engine), activeTab == TAB_CORE_ENGINE)
+        navTabSettings.isSelected = false
+        navTabSettings.contentDescription = getString(R.string.tab_settings)
 
         val appsIcon = navTabApps.getChildAt(0) as? ImageView
         val appsLabel = navTabApps.getChildAt(1) as? TextView
@@ -1827,6 +1925,19 @@ class MainActivity : ComponentActivity() {
         settingsLabel?.typeface = Typeface.DEFAULT
     }
 
+    // Phase C: bottom-nav content description ("label, selected" when active,
+    // bare label otherwise). try/catch keeps the pre-buildUi test path safe.
+    private fun navTabDescription(label: String, selected: Boolean): String =
+        if (selected) {
+            try {
+                getString(R.string.nav_tab_cd_selected, label, getString(R.string.nav_tab_state_selected))
+            } catch (_: Exception) {
+                label
+            }
+        } else {
+            label
+        }
+
     private fun showSettingsDialog() {
         // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛，
         // 避免後台/銷毀時 show() 拋 WindowManager.BadTokenException。
@@ -1839,12 +1950,18 @@ class MainActivity : ComponentActivity() {
         try {
             settingsDialog = AlertDialog.Builder(this)
                 .setTitle(getString(R.string.tab_settings))
+                // Phase C: about copy fully resourced (was hardcoded English
+                // "Version 0.0.1 ..." + "MIT ..."); version is dynamic.
                 .setMessage(
-                    "${getString(R.string.hero_title_engine)}\n" +
-                        "Version 0.0.1 (Zygote Hook & Shizuku Gateway)\n\n" +
-                        "• ${getString(R.string.status_hook_daemon_running)}\n" +
-                        "• ${getString(R.string.hook_mode_subtitle)}\n\n" +
-                        "MIT License - Dual your Galaxy contributors."
+                    getString(
+                        R.string.settings_about_format,
+                        getString(R.string.hero_title_engine),
+                        appVersionName(),
+                        getString(R.string.settings_about_feature),
+                        getString(R.string.status_hook_daemon_running),
+                        getString(R.string.hook_mode_subtitle),
+                        getString(R.string.settings_license),
+                    ),
                 )
                 .setPositiveButton(getString(R.string.dialog_close), null)
                 .setNeutralButton(getString(R.string.action_request_shizuku)) { _, _ ->
@@ -1857,6 +1974,23 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "showSettingsDialog failed", e)
             settingsDialog = null
+        }
+    }
+
+    // Phase C: dynamic app version for the settings about dialog (PackageInfo
+    // at runtime, localized "unknown" fallback). No BuildConfig dependency.
+    private fun appVersionName(): String {
+        try {
+            @Suppress("DEPRECATION")
+            val v = packageManager.getPackageInfo(packageName, 0).versionName
+            if (!v.isNullOrBlank()) return v
+        } catch (_: Exception) {
+            // Fall through to the localized placeholder.
+        }
+        return try {
+            getString(R.string.settings_version_unknown)
+        } catch (_: Exception) {
+            "unknown"
         }
     }
 
@@ -1919,6 +2053,9 @@ class MainActivity : ComponentActivity() {
                 layoutParams = FrameLayout.LayoutParams(dp(36), dp(36)).apply {
                     gravity = Gravity.CENTER
                 }
+                // Phase C: the row title/switch already names the app; the icon
+                // itself is decorative.
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
             val appKey = "${s.inventory.targetSerial ?: 0}:$pkg"
             appIconView.tag = appKey
@@ -1928,9 +2065,12 @@ class MainActivity : ComponentActivity() {
                     gravity = Gravity.BOTTOM or Gravity.END
                 }
                 background = getDrawable(R.drawable.bg_dual_badge)
-                text = "2"
+                // Phase C: badge number via resources (was hardcoded "2") with
+                // theme token text (see cloneBtn); context description is set
+                // below once the app label is resolved.
+                text = getString(R.string.badge_number_format, 2)
                 textSize = 10f
-                setTextColor(Color.WHITE)
+                setTextColor(getColor(R.color.oneui_button_text))
                 gravity = Gravity.CENTER
                 typeface = Typeface.DEFAULT_BOLD
             }
@@ -1951,6 +2091,13 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
             }
             val label = resolveAppLabel(pkg)
+            // Phase C: the "2" badge alone is meaningless to screen readers;
+            // name whose second copy it marks.
+            try {
+                badgeView.contentDescription = getString(R.string.dual_badge_cd, label)
+            } catch (_: Exception) {
+                // Best effort: label context is enhancement-only.
+            }
             val titleView = TextView(this).apply {
                 text = label
                 textSize = 14f
@@ -1962,7 +2109,8 @@ class MainActivity : ComponentActivity() {
             val tagView = TextView(this).apply {
                 text = getString(R.string.tag_forced_injected)
                 textSize = 10f
-                setTextColor(getColor(R.color.oneui_primary))
+                // Phase C: blue-pill text (see hookSecPmTag).
+                setTextColor(getColor(R.color.oneui_on_primary_container))
                 background = getDrawable(R.drawable.bg_pill_badge_blue)
                 val hp = dp(6)
                 val vp = dp(2)
@@ -1977,7 +2125,9 @@ class MainActivity : ComponentActivity() {
             val subtitleView = TextView(this).apply {
                 text = getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
                 textSize = 12f
-                setTextColor(getColor(R.color.oneui_secondary))
+                // Phase C: tint (light #046C4E on #DFE7F0 = 5.16; #059669 was
+                // 3.02).
+                setTextColor(getColor(R.color.oneui_secondary_tint))
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
             }
@@ -2267,7 +2417,14 @@ class MainActivity : ComponentActivity() {
         )
         // Title mirrors the actual execution identity (not the routed
         // summary) for quick manual verification.
-        title = "GalaxyDual Plus (${s.execIdentity}/${s.resolvedGateway})"
+        // Phase C: Recents title fully resourced (was hardcoded English
+        // "GalaxyDual Plus (...)"); product name stays English by-design
+        // (matches the manifest label).
+        title = try {
+            getString(R.string.recents_title_format, getString(R.string.app_name), s.execIdentity, s.resolvedGateway)
+        } catch (_: Exception) {
+            "Galaxy Dual Plus (${s.execIdentity}/${s.resolvedGateway})"
+        }
         // Picker state: persisted preference + actual resolved gateway
         // (restart remembers the preference via SharedPreferences; see
         // factory). Always shown so the user can tell which channel the
@@ -2348,7 +2505,7 @@ class MainActivity : ComponentActivity() {
                 clonedCountStatView.text = getString(R.string.stats_injected_format, s.cloned.size, getString(R.string.stats_unit_apps))
             }
             if (::clonedCountBadge.isInitialized) {
-                clonedCountBadge.text = "${s.cloned.size}"
+                clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
             }
             if (::engineUidSlotView.isInitialized) {
                 engineUidSlotView.text = getString(R.string.engine_uid_label, s.inventory.targetId)
@@ -2364,7 +2521,8 @@ class MainActivity : ComponentActivity() {
                         HookStatus.ACTIVE -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
                             hookStatusText.text = getString(R.string.stats_hook_active)
-                            hookStatusText.setTextColor(getColor(R.color.oneui_secondary))
+                            // Phase C: tint (see subtitleView).
+                            hookStatusText.setTextColor(getColor(R.color.oneui_secondary_tint))
                         }
                         HookStatus.INACTIVE -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
@@ -2402,7 +2560,8 @@ class MainActivity : ComponentActivity() {
                             if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
                         )
                         statusPillText.setTextColor(
-                            getColor(if (writable) R.color.oneui_secondary else R.color.oneui_warning),
+                            // Phase C: writable green text uses the tint (see hookBadgeChip).
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning),
                         )
                     }
                     ResolvedChannel.SHIZUKU -> {
@@ -2416,7 +2575,8 @@ class MainActivity : ComponentActivity() {
                             if (writable) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_amber,
                         )
                         statusPillText.setTextColor(
-                            getColor(if (writable) R.color.oneui_secondary else R.color.oneui_warning),
+                            // Phase C: writable green text uses the tint (see hookBadgeChip).
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning),
                         )
                     }
                     else -> {

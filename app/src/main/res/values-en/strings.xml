@@ -32,8 +32,8 @@
     <string name="system_toggle_cd_shown">System apps are shown; double-tap to hide (display only, never uninstalls)</string>
     <string name="action_select_visible">Select visible</string>
     <plurals name="select_visible_cd">
-        <item quantity="one">Select the first %d visible row (checks only, never writes; narrow with search if truncated)</item>
-        <item quantity="other">Select the first %d visible rows (checks only, never writes; narrow with search if truncated)</item>
+        <item quantity="one">Select the first %1$d visible row (checks only, never writes; narrow with search if truncated)</item>
+        <item quantity="other">Select the first %1$d visible rows (checks only, never writes; narrow with search if truncated)</item>
     </plurals>
     <string name="action_clear_selection">Clear selection</string>
     <string name="clear_selection_cd">Clear checks (never uninstalls anything)</string>
@@ -42,12 +42,12 @@
     <string name="action_unsave_selection">Unsave selection</string>
     <string name="unsave_selection_cd">Drop the saved selection (never uninstalls, keeps current checks)</string>
     <plurals name="batch_create">
-        <item quantity="one">Create %d clone</item>
-        <item quantity="other">Create %d clones</item>
+        <item quantity="one">Create %1$d clone</item>
+        <item quantity="other">Create %1$d clones</item>
     </plurals>
     <plurals name="batch_create_cd">
-        <item quantity="one">Batch create %d clone (runs per checked app; checking alone never uninstalls)</item>
-        <item quantity="other">Batch create %d clones (runs per checked app; checking alone never uninstalls)</item>
+        <item quantity="one">Batch create %1$d clone (runs per checked app; checking alone never uninstalls)</item>
+        <item quantity="other">Batch create %1$d clones (runs per checked app; checking alone never uninstalls)</item>
     </plurals>
     <string name="catalog_load_failed">Source list failed to load; kept the old list (tap Reconnect and refresh to retry)</string>
     <!-- A: visible reason when writable but the batch target is unverified (targetSerial null/UNKNOWN); UI-only hint, VM guards untouched. -->
@@ -163,7 +163,7 @@
     <string name="engine_diag_all_normal">5/5 Modules Operational</string>
     <string name="telemetry_status_active">Active &amp; Injected</string>
     <string name="telemetry_latency_unknown">—</string>
-    <string name="engine_uid_label">UID: %d</string>
+    <string name="engine_uid_label">UID: %1$d</string>
     <string name="stats_injected_format">%1$d %2$s (Hook)</string>
     <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
     <!-- Phase A honest state (P0 correctness): Hook/channel badges are always
@@ -181,4 +181,17 @@
     <string name="engine_diag_unknown">Unknown status</string>
     <string name="engine_fallback_unauth">Not authorized</string>
     <string name="engine_fallback_nobinder">Not connected</string>
+    <!-- Phase C (a11y/i18n): localized settings dialog (dynamic version),
+         resourced numbers/badges, bottom-nav selected state, Recents title. -->
+    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
+    <string name="settings_about_format">%1$s\nVersion %2$s (%3$s)\n\n• %4$s\n• %5$s\n\n%6$s</string>
+    <string name="settings_about_feature">Zygote Hook &amp; Shizuku Gateway</string>
+    <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <string name="settings_version_unknown">unknown</string>
+    <string name="badge_number_format">%1$d</string>
+    <string name="dual_badge_cd">Clone badge (second copy): %1$s</string>
+    <string name="engine_uid_unknown">UID: —</string>
+    <string name="nav_tab_state_selected">selected</string>
+    <string name="nav_tab_cd_selected">%1$s, %2$s</string>
 </resources>

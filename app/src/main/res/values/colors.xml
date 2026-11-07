@@ -35,11 +35,28 @@
     <color name="oneui_on_primary_container">#001D4D</color>
 
     <color name="oneui_secondary">#059669</color>
-    <color name="oneui_secondary_tint">#047857</color>
+    <!-- Phase C (a11y contrast): tint darkened #047857 -> #046C4E. Measured
+         light-theme ratios: on secondary_container #D1FAE5 5.68 (was 4.84),
+         on surface_container_high #DFE7F0 5.16 (was 4.39, failed 4.5),
+         on island_card #F8FAFC 6.16. Night tint unchanged (#4EDEA3, >=9.3 on
+         dark surfaces). Icons/strokes keep oneui_secondary (non-text, 3:1). -->
+    <color name="oneui_secondary_tint">#046C4E</color>
     <color name="oneui_secondary_container">#D1FAE5</color>
     <color name="oneui_on_secondary">#FFFFFF</color>
 
     <color name="oneui_warning">#D97706</color>
+    <!-- Phase C: warning container tokenized (was hardcoded #26F59E0B in
+         bg_pill_badge_amber). Light #FEF3C7 keeps translucent-amber look.
+         Known residual: oneui_warning text on light containers is 2.55-3.19
+         (below AA 4.5); text darkening is follow-up scope, not this change. -->
+    <color name="oneui_warning_container">#FEF3C7</color>
+    <!-- Phase C: primary-button text token. Light #FFFFFF on oneui_primary
+         #0066D6 = 5.42 (AA pass). Night value differs (see values-night):
+         white on night primary #0381FE is only 3.77, so night buttons/badges
+         use primary_container bg + this token (#002958, 4.52) instead of
+         darkening night primary (which would break primary-as-text on dark
+         surfaces: #0B6BDD measured 3.16-3.69). -->
+    <color name="oneui_button_text">#FFFFFF</color>
     <color name="oneui_error">#DC2626</color>
     <color name="oneui_stroke_subtle">#CBD5E1</color>
     <color name="oneui_divider">#E2E8F0</color>

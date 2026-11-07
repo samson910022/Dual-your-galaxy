@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- Phase C (night contrast): dual badge uses primary_container bg in night
+     mode, pairing with oneui_button_text (#002958, 4.52 on #418FFF). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@color/oneui_primary_container" />
+</shape>
