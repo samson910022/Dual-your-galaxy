@@ -17,6 +17,15 @@ shizuku = "13.1.5"
 coroutines = "1.9.0"
 lifecycle = "2.8.7"
 activity = "1.9.2"
+# Phase P29 (issue #29): instrumentation harness (runner/androidTest).
+# Versions pinned to the compileSdk 34 era (same policy as lifecycle/activity
+# above): runner+core 1.6.1 / ext-junit 1.2.1 are the
+# stable 34-baseline set (1.7.x moved to compileSdk 35).
+# junit 4.13.2: same pinned artifact the unit tests already use (cached).
+testRunner = "1.6.1"
+testExtJunit = "1.2.1"
+testCore = "1.6.1"
+junit = "4.13.2"
 
 [libraries]
 shizuku-api = { group = "dev.rikka.shizuku", name = "api", version.ref = "shizuku" }
@@ -30,6 +39,16 @@ coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-
 lifecycle-viewmodel-ktx = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-ktx", version.ref = "lifecycle" }
 lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
 activity-ktx = { group = "androidx.activity", name = "activity-ktx", version.ref = "activity" }
+# Phase P29 (issue #29): androidTest harness only (production untouched).
+# Runner drives ActivityScenario; ext-junit provides AndroidJUnit4;
+# core provides ActivityScenario.
+# (uiautomator intentionally not pulled: system back-press shares the same
+# cancelRemove path already locked by CancelZeroWriteTest at VM level;
+# device back-press stays in the manual matrix.)
+test-runner = { group = "androidx.test", name = "runner", version.ref = "testRunner" }
+test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "testExtJunit" }
+test-core = { group = "androidx.test", name = "core", version.ref = "testCore" }
+junit-junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -56,7 +56,7 @@ jobs:
             app/build/reports/androidTests/
             app/build/outputs/androidTest-results/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
 
   build:
     runs-on: ubuntu-latest
@@ -265,7 +265,25 @@ jobs:
             **/build/reports/tests/
             **/build/test-results/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
+      # Phase P29 (issue #29): the build job only compiles androidTest here;
+      # the full harness executes on the locale-instrumentation job above
+      # (API 29 emulator) on every PR. connectedCheck in this job stays a
+      # compile gate only (see locale-instrumentation job for execution).
+      - name: Compile androidTest (no device needed)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebugAndroidTest --no-daemon
+      - name: Upload APK artifacts (debug + androidTest)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 30
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
@@ -284,4 +302,120 @@ jobs:
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
+
+  # Phase P29 (issue #29): instrumentation manual profile (API 34, matches
+  # compileSdk/targetSdk) runs on workflow_dispatch; the API 29 (minSdk floor)
+  # profile runs on every PR via the locale-instrumentation job above.
+  # Record each manual run in docs/ACCEPTANCE.md (commit / APK SHA256 /
+  # operation / expected / actual / untested / redaction statement).
+  instrumentation-manual:
+    name: Instrumentation (manual emulator matrix)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run instrumentation on emulator (API 34)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          disable-animations: true
+          script: |
+            chmod +x ./gradlew
+            adb shell input keyevent 82 || true
+            adb shell input keyevent 224 || true
+            adb shell wm dismiss-keyguard || true
+            sleep 2
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
+      - name: Record tested APK provenance
+        if: always()
+        run: |
+          set -e
+          APP_APK=app/build/outputs/apk/debug/app-debug.apk
+          TEST_APK=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          test -f "$APP_APK"
+          test -f "$TEST_APK"
+          APP_SHA=$(sha256sum "$APP_APK" | awk '{print $1}')
+          TEST_SHA=$(sha256sum "$TEST_APK" | awk '{print $1}')
+          # Extract aggregate test counts from androidTest result XMLs.
+          TEST_COUNTS=$(python3 <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          tests = failures = errors = skipped = 0
+          for f in glob.glob('app/build/outputs/androidTest-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for ts in root.iter('testsuite'):
+                  try:
+                      tests += int(ts.get('tests', '0') or '0')
+                      failures += int(ts.get('failures', '0') or '0')
+                      errors += int(ts.get('errors', '0') or '0')
+                      skipped += int(ts.get('skipped', '0') or '0')
+                  except ValueError:
+                      pass
+          print(tests, failures, errors, skipped)
+          PY
+          )
+          set -- $TEST_COUNTS
+          TESTS=$1; FAILURES=$2; ERRORS=$3; SKIPPED=$4
+          mkdir -p app/build
+          {
+            echo "GITHUB_SHA=$GITHUB_SHA"
+            echo "APP_APK=$APP_APK"
+            echo "APP_SHA256=$APP_SHA"
+            echo "TEST_APK=$TEST_APK"
+            echo "TEST_SHA256=$TEST_SHA"
+            echo "EMULATOR_API=34"
+            echo "EMULATOR_TARGET=default"
+            echo "EMULATOR_ARCH=x86_64"
+            echo "COMMAND=./gradlew :app:connectedDebugAndroidTest"
+            echo "RESULT=${{ job.status }}"
+            echo "TESTS=$TESTS"
+            echo "FAILURES=$FAILURES"
+            echo "ERRORS=$ERRORS"
+            echo "SKIPPED=$SKIPPED"
+          } > app/build/tested-apk-provenance.txt
+          echo "=== tested-apk-provenance.txt ==="
+          cat app/build/tested-apk-provenance.txt
+          echo "=== sha256sum (both APKs) ==="
+          sha256sum "$APP_APK" "$TEST_APK"
+      - name: Upload instrumentation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-reports
+          path: |
+            **/build/reports/androidTests/
+            **/build/outputs/androidTest-results/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload tested APKs + provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-apk-provenance
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            app/build/tested-apk-provenance.txt
+          if-no-files-found: error
+          retention-days: 30

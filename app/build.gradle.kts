@@ -83,7 +83,11 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.0.1"
-        testInstrumentationRunner = "android.test.InstrumentationTestRunner"
+        // Phase P29 (issue #29): instrumentation harness runner.
+        // connectedCheck needs a device/emulator (CI has none, so PR CI only
+        // compiles androidTest via :app:assembleDebugAndroidTest); the runner
+        // entry must still be declared so emulator/manual runs can execute.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -169,4 +173,15 @@ dependencies {
     // so JVM tests can replace Main with Unconfined; same coroutines line as
     // the app (1.9.0).
     testImplementation(libs.coroutines.test)
+    // Phase P29 (issue #29): instrumentation harness (androidTest only,
+    // production untouched). PR CI runs the full harness on the
+    // locale-instrumentation job (API 29 emulator) and compiles these via
+    // :app:assembleDebugAndroidTest in the build job; an additional manual
+    // profile (API 34) runs on workflow_dispatch (see android.yml
+    // instrumentation-manual). Fake gateway keeps every test zero-write:
+    // no test ever calls confirmRemove()/clone on a real gateway.
+    androidTestImplementation(libs.test.runner)
+    androidTestImplementation(libs.test.ext.junit)
+    androidTestImplementation(libs.test.core)
+    androidTestImplementation(libs.junit.junit)
 }

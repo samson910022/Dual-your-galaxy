@@ -92,7 +92,18 @@ class MainActivity : ComponentActivity() {
     // ViewModel with the F4a real-channel repository. No hardcoded privilege
     // flags here: the ViewModel probes elevators and routes the decision.
     // DEVICE-UNVERIFIED: gateway selection/exec never ran on a device.
-    private val vm: DualViewModel by viewModels { DualViewModelFactory(applicationContext, packageName) }
+    private val vm: DualViewModel by viewModels {
+        object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                val injected = testViewModel
+                if (injected != null && modelClass.isAssignableFrom(DualViewModel::class.java)) {
+                    return injected as T
+                }
+                return DualViewModelFactory(applicationContext, packageName).create(modelClass)
+            }
+        }
+    }
 
     private lateinit var privilegeView: TextView
     private lateinit var shizukuView: TextView
@@ -1651,6 +1662,12 @@ class MainActivity : ComponentActivity() {
     private fun batchReportText(report: BatchReport?): String = formatBatchReportText(report)
 
     companion object {
+        // Test seam: allow instrumentation to inject a fake-backed ViewModel
+        // (zero device writes) without changing production defaults. Null in
+        // production.
+        @Volatile
+        internal var testViewModel: DualViewModel? = null
+
         // Shizuku permission request code; matched in both the Shizuku result
         // listener and the defensive onRequestPermissionsResult override.
         private const val SHIZUKU_REQUEST_CODE = 1001
