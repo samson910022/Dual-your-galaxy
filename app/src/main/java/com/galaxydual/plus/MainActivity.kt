@@ -290,7 +290,14 @@ class MainActivity : ComponentActivity() {
     private var lastSourceListKey: String? = null
     // catalog 載入失敗的獨立錯誤文案（與「尚未載入」區分；失敗保留舊列表）。
     private var catalogLoadError: String? = null
-    // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 取消前一個在途任務。
+    // Phase 3 P2 perf: catalog hash 快取 (referential identity)。
+    // sourceCatalog.hashCode() 為 O(catalog)；render 每幀經 catalogHashCached
+    // 計算 labelCacheKey/buildSourceListKey 指紋時，若引用未變直接回快取，
+    // 重算只在 !== 時發生。syncRemoveDialog 簽名被 seam 測試鎖定 (4-tuple)，
+    // 故其內 catalogLabelsFor 仍讀 vm.state.value (非 trivially safe，不動)。
+    private var lastCatalogHashRef: List<SourceAppEntry>? = null
+    private var lastCatalogHash: Int = 0
+    // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 遇在途直接共用，不取消重掃。
     private var catalogJob: Job? = null
     // Phase K K2：Shizuku presence 快取在途任務（比照 catalogJob 3536-3537）：
     // refresh/request 頭寫共用同一 Job 取消，避免 old-live 蓋 new-death。
@@ -714,6 +721,9 @@ class MainActivity : ComponentActivity() {
             isFocusable = true
             textSize = 12f
             setTextColor(getColor(R.color.oneui_text_secondary))
+            // Phase 3 P2 a11y: 48dp touch target via minimumHeight (height
+            // stays WRAP_CONTENT so large fonts grow instead of clipping).
+            minimumHeight = dp(48)
             contentDescription = getString(R.string.diag_loading_cd)
             setOnClickListener {
                 diagExpanded = !diagExpanded
@@ -1346,6 +1356,14 @@ class MainActivity : ComponentActivity() {
                 val hp = dp(6)
                 val vp = dp(2)
                 setPadding(hp, vp, hp, vp)
+                // Phase 3 P3 a11y: badge content = title + badge text (reuses
+                // remove_row_cd so the separator stays locale-correct:
+                // full-width colon in zh, half-width in en; no new key needed).
+                try {
+                    contentDescription = getString(R.string.remove_row_cd, titleStr, badgeText)
+                } catch (_: Exception) {
+                    contentDescription = "$titleStr: $badgeText"
+                }
             }
             checklistItemBadges.add(itemBadge)
             // Phase G: track icon + provenance color for the unproven-gray switch.
@@ -1951,7 +1969,9 @@ class MainActivity : ComponentActivity() {
         navTabEngine.isSelected = activeTab == TAB_CORE_ENGINE
         navTabEngine.contentDescription = navTabDescription(getString(R.string.tab_core_engine), activeTab == TAB_CORE_ENGINE)
         navTabSettings.isSelected = false
-        navTabSettings.contentDescription = getString(R.string.tab_settings)
+        // Phase 3 P3 B7: 設定開啟的是對話框 (非切頁)，CD 明示開啟對話框
+        // (settings_tab_cd: EN "opens dialog" / zh "開啟對話框"，三語系 parity)。
+        navTabSettings.contentDescription = getString(R.string.settings_tab_cd)
 
         val appsIcon = navTabApps.getChildAt(0) as? ImageView
         val appsLabel = navTabApps.getChildAt(1) as? TextView
@@ -2047,7 +2067,9 @@ class MainActivity : ComponentActivity() {
         return try {
             getString(R.string.settings_version_unknown)
         } catch (_: Exception) {
-            "unknown"
+            // Phase 3 P3 B6: catch-path 不再硬編碼英文 "unknown"——資源不可用時
+            // 回 locale-neutral 佔位 (與 stats_value_unknown 同字 "—")。
+            "—"
         }
     }
 
@@ -2347,8 +2369,14 @@ class MainActivity : ComponentActivity() {
                         msgView.text = getString(R.string.diagnostic_copy_success)
                         msgView.setTextColor(msgColorFor(MsgKind.INFO))
                     } catch (e: Exception) {
-                        msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
-                        msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+                        // Phase 3 P3 B4: catch 內再寫 msgView 須有內層守衛——
+                        // msgView 未就緒/getString 失敗時的外拋不得逃出 listener。
+                        try {
+                            msgView.text = getString(R.string.copy_failed, sanitizeForDisplay(e.message ?: "unknown"))
+                            msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
+                        } catch (e2: Exception) {
+                            Log.w(TAG, "showDiagnosticExport copy-failed status failed", e2)
+                        }
                     }
                 }
                 .setPositiveButton(getString(R.string.dialog_close), null)
@@ -2613,7 +2641,9 @@ class MainActivity : ComponentActivity() {
         val blockKey = if (busy) null else writeBlockReason(s)
         // Phase L L2：catalogKey render 入口算一次，傳給 renderClonedApps 與
         // syncRemoveDialog 共用（各入口不再各自重算 O(catalog)）。
-        val catalogKey = labelCacheKey()
+        // Phase 3 P2 perf: 直接以 s.sourceCatalog 經 referential 快取計算，
+        // 不再重讀 vm.state.value (labelCacheKey no-arg seam 保留供 dialog/測試)。
+        val catalogKey = catalogHashCached(s.sourceCatalog)
         val readyMark = s.readyMark()
         // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
         // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
@@ -2640,15 +2670,21 @@ class MainActivity : ComponentActivity() {
         // Phase C: Recents title fully resourced (was hardcoded English
         // "GalaxyDual Plus (...)"); product name stays English by-design
         // (matches the manifest label).
-        title = try {
-            getString(R.string.recents_title_format, getString(R.string.app_name), s.execIdentity, s.resolvedGateway)
+        // Phase 3 P3 B6: 最內層不再硬編碼英文產品名——資源不可用時改用
+        // packageName (runtime，不經資源)，仍不可用才保留現標題。
+        try {
+            title = getString(R.string.recents_title_format, getString(R.string.app_name), s.execIdentity, s.resolvedGateway)
         } catch (_: Exception) {
             // Phase G: fallback also resourced (was hardcoded English format);
             // app_name is the localized product name.
             try {
-                "${getString(R.string.app_name)} (${s.execIdentity}/${s.resolvedGateway})"
+                title = "${getString(R.string.app_name)} (${s.execIdentity}/${s.resolvedGateway})"
             } catch (_: Exception) {
-                "Galaxy Dual Plus (${s.execIdentity}/${s.resolvedGateway})"
+                try {
+                    title = "$packageName (${s.execIdentity}/${s.resolvedGateway})"
+                } catch (_: Exception) {
+                    // Best effort: resources unavailable, keep current title.
+                }
             }
         }
         // Picker state: persisted preference + actual resolved gateway
@@ -2674,7 +2710,12 @@ class MainActivity : ComponentActivity() {
         // channel. P4: 時間證據經 hookEvidence()+timeEvidenceText 統一
         // (狀態文案維持本頁提示，不動)。
         // Phase L L3：顯示行走 EN 分支（null 判定語意不變，另兩處 null 檢查沿用預設）。
+        // Phase 3 P2 perf: hook 三態 render 內一次算好重用 (hookText/hookLive/
+        // hookDisplay 皆為 s 的純函數；null 語意恆等於 channel != LSPOSED)，
+        // 不再每分支重算 renderHookText/hookLiveProven/hookLiveDisplay (~6x)。
         val hookText = renderHookText(s, isEnglishLocale())
+        val hookLive = hookLiveProven(s)
+        val hookDisplay = hookLiveDisplay(s)
         if (hookText != null) {
             hookView.visibility = View.VISIBLE
             hookView.text = hookText
@@ -2747,13 +2788,15 @@ class MainActivity : ComponentActivity() {
             // Phase A A1：Hero 第三格由 hookStatus 驅動；非 LSPOSED 通道整格隱藏
             // （對齊 renderHookText 回 null 條件：channel != LSPOSED）。
             if (::hookStatusCell.isInitialized && ::hookStatusDot.isInitialized && ::hookStatusText.isInitialized) {
-                if (renderHookText(s) == null) {
+                // Phase 3 P2 perf: 沿用 render 入口 hookText (null 語意不變)。
+                if (hookText == null) {
                     hookStatusCell.visibility = View.GONE
                 } else {
                     hookStatusCell.visibility = View.VISIBLE
                     // Phase H：ACTIVE 僅歷史 existence 證據；綠＋正常監聽只給
                     // boot-fresh 證實 (hookLiveDisplay LIVE)，歷史標記走 UNKNOWN。
-                    when (hookLiveDisplay(s)) {
+                    // Phase 3 P2 perf: 沿用 render 入口 hookDisplay。
+                    when (hookDisplay) {
                         HookLiveDisplay.LIVE -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
                             hookStatusText.text = getString(R.string.stats_hook_active)
@@ -2830,7 +2873,8 @@ class MainActivity : ComponentActivity() {
             // hookLiveProven (LSPOSED + ACTIVE + boot-fresh) 顯示，無 live 證據
             // 前隱藏，不再無條件全綠。Phase H：existence (ACTIVE 歷史標記) 不足，
             // daemonFooter 門控條件同升格 (原 ACTIVE 即顯，現需 live)。
-            val hookLiveProven = hookLiveProven(s)
+            // Phase 3 P2 perf: 沿用 render 入口 hookLive (同 s 純函數，語意不變)。
+            val hookLiveProven = hookLive
             if (::hookBadgeChip.isInitialized) {
                 hookBadgeChip.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
@@ -2850,13 +2894,15 @@ class MainActivity : ComponentActivity() {
                 residentBadge.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::telemetryDot.isInitialized && ::telemetryStatusView.isInitialized) {
-                if (renderHookText(s) == null) {
+                // Phase 3 P2 perf: 沿用 render 入口 hookText (null 語意不變)。
+                if (hookText == null) {
                     telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                     telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
                 } else {
                     // Phase H：ACTIVE 綠＋運作中·已注入只給 boot-fresh 證實；
                     // 歷史標記走 UNKNOWN (amber＋狀態未知，永不給綠)。
-                    when (hookLiveDisplay(s)) {
+                    // Phase 3 P2 perf: 沿用 render 入口 hookDisplay。
+                    when (hookDisplay) {
                         HookLiveDisplay.LIVE -> {
                             telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
                             telemetryStatusView.text = getString(R.string.telemetry_status_active)
@@ -3313,12 +3359,20 @@ class MainActivity : ComponentActivity() {
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener { vm.cancelRemove(pending) }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            removeLabelsDialog = AlertDialog.Builder(this)
-                .setTitle(R.string.remove_confirm_view_labels)
-                // Phase K K1 加固：即時讀快取（回調已回填時取 fresh，未回仍為佔位，不差於 captured var）。
-                .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), resolveAppLabelCached(pending.pkg).takeIf { it != pending.pkg } ?: appLabel, pending.profileLabel))
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
+            // Phase 3 P3: Neutral 子對話框比照 settingsDialog/syncRemoveDialog
+            // 的 BadToken 守衛 (isFinishing/isDestroyed + try/catch 包 show)。
+            if (isFinishing || isDestroyed) return@setOnClickListener
+            try {
+                removeLabelsDialog = AlertDialog.Builder(this)
+                    .setTitle(R.string.remove_confirm_view_labels)
+                    // Phase K K1 加固：即時讀快取（回調已回填時取 fresh，未回仍為佔位，不差於 captured var）。
+                    .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), resolveAppLabelCached(pending.pkg).takeIf { it != pending.pkg } ?: appLabel, pending.profileLabel))
+                    .setPositiveButton(android.R.string.ok, null)
+                    .show()
+            } catch (e: Exception) {
+                Log.w(TAG, "removeLabelsDialog failed", e)
+                removeLabelsDialog = null
+            }
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
@@ -3390,8 +3444,24 @@ class MainActivity : ComponentActivity() {
     //（O(cloned×catalog) → O(catalog)）。命中移尾改 LRU（與圖示快取一致 remove+put，
     // 首項＝最久未用）。失效語義保留全清：label 僅顯示用，重裝/卸載後標籤可能改變，
     // 全清為正確性優先的簡單選擇（重填走非同步 IO，有界 200，不阻塞主執行緒）。
+    // Phase 3 P2 perf: catalog 內容 hash 快取 (referential identity; 同一實例
+    // O(1))。labelCacheKey (no-arg seam 供 dialog/測試) 與 buildSourceListKey/
+    // render 共用；引用未變直接回快取，行為不變 (hashCode 值語意相同)。
+    private fun catalogHashCached(catalog: List<SourceAppEntry>): Int {
+        return try {
+            val ref = lastCatalogHashRef
+            if (ref !== null && ref === catalog) return lastCatalogHash
+            val h = catalog.hashCode()
+            lastCatalogHashRef = catalog
+            lastCatalogHash = h
+            h
+        } catch (_: Exception) {
+            0
+        }
+    }
+
     private fun labelCacheKey(): Int = try {
-        vm.state.value.sourceCatalog.hashCode()
+        catalogHashCached(vm.state.value.sourceCatalog)
     } catch (_: Exception) {
         0
     }
@@ -3643,10 +3713,12 @@ class MainActivity : ComponentActivity() {
     // ViewModel。serial 取自身 user (UserManager,失敗回退 0);AppKey =
     // serial:package (見 SourceInventory)。
     // PR-37 P3:失敗不清空（保留舊列表，不呼叫 setSourceCatalog），錯誤走獨立
-    // 文案 catalogLoadError（與「尚未載入」區分）；onCreate+onResume 雙觸發以
-    // catalogJob 取消前一個在途任務，避免疊加。
+    // 文案 catalogLoadError（與「尚未載入」區分）。
+    // Phase 3 P3 N5: 在途守衛——onCreate+onResume 連續觸發時若已有掃描在途
+    // 直接共用，不取消重掃 (避免兩次全量 PM 掃描併發；同範圍重載結果等價，
+    // 寫入仍 last-writer-wins，語義不變)。
     private fun reloadCatalog() {
-        catalogJob?.cancel()
+        if (catalogJob?.isActive == true) return
         catalogJob = lifecycleScope.launch {
             val apps: List<SourceAppEntry>? = withContext(Dispatchers.IO) {
                 try {
@@ -3791,6 +3863,9 @@ class MainActivity : ComponentActivity() {
                     isChecked = entry.appKey in s.selectedKeys
                     // 批次執行中不可改勾選。
                     isEnabled = !busy
+                    // Phase 3 P2 a11y: 48dp touch target via minimumHeight
+                    // (height stays WRAP_CONTENT so large fonts grow).
+                    minimumHeight = dp(48)
                 }
                 requestIcon(entry.packageName, entry.appKey, box)
                 box.setOnCheckedChangeListener { _, checked ->
@@ -3815,8 +3890,10 @@ class MainActivity : ComponentActivity() {
     }
 
     // 來源列表指紋：catalog 內容 hash（與 labelCacheKey 同源，見 syncLabelCache）、query、系統開關、勾選集合 hash。
+    // Phase 3 P2 perf: catalog hash 經 referential 快取 (catalogHashCached)，
+    // 引用未變 O(1)，行為不變。
     private fun buildSourceListKey(s: UiState): String =
-        "${s.sourceCatalog.hashCode()}:" +
+        "${catalogHashCached(s.sourceCatalog)}:" +
             "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
 
     // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
@@ -4209,19 +4286,20 @@ internal fun shouldUpdateCatalogErrorText(old: String?, new: String?): Boolean =
 // 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
 // 雙源時間正規化（probe HookDiagnosis.displayText 無時間 vs writeBlock
 // HookEvidence.displayText 有時間）：兩形經此剝除時間證據後綴收斂為同一基底，
-// 使去重鍵有效。剝除項：格式化日期（yyyy-MM-dd HH:mm）、「從未查詢」空態、
-// 重啟舊資料 stale 提示、經真通道標記（時間/通道衍生，隨 queriedAt 漂移
-// 出現/消失），以及時間證據前綴「；marker時間=」「；marker 時間未知」
-// 「；查詢於」（結構分隔符，基底文案不含「；」，安全）。
+// 使去重鍵有效。剝除項：格式化日期（yyyy-MM-dd HH:mm）、NEVER_QUERIED_TEXT 空態、
+// STALE_EVIDENCE_HINT 重啟舊資料提醒、VIA_GATEWAY_SUFFIX 經真通道標記（時間/通道衍生，
+// 隨 queriedAt 漂移出現/消失），以及時間證據前綴 MARKER_TIME_PREFIX／
+// MARKER_TIME_UNKNOWN_TEXT／QUERY_TIME_PREFIX（結構分隔符，基底文案不含「；」，安全）。
+// Phase 3 P2 B2: 字面改引 DiagnoseFreshness 共享 const (single source)，一字不差，行為不變。
 internal fun stripWriteBlockTimeParams(text: String): String {
-    var k = text.replace("（可能為重啟前舊資料，僅存在性證據）", "")
-    k = k.replace("（經真通道讀取）", "")
+    var k = text.replace(STALE_EVIDENCE_HINT, "")
+    k = k.replace(VIA_GATEWAY_SUFFIX, "")
     k = k.replace(Regex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}"), "")
-    k = k.replace("從未查詢", "")
-    k = k.replace("；marker時間=", "")
-    k = k.replace("；marker 時間未知", "")
-    k = k.replace("；查詢於 ", "")
-    k = k.replace("；查詢於", "")
+    k = k.replace(NEVER_QUERIED_TEXT, "")
+    k = k.replace(MARKER_TIME_PREFIX, "")
+    k = k.replace(MARKER_TIME_UNKNOWN_TEXT, "")
+    k = k.replace("$QUERY_TIME_PREFIX ", "")
+    k = k.replace(QUERY_TIME_PREFIX, "")
     return k
 }
 
