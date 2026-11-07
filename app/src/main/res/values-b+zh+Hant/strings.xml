@@ -144,8 +144,8 @@
     <string name="diag_checklist_title">系統 Hook 診斷清單</string>
     <string name="diag_item_framework_title">Samsung Framework Hook</string>
     <string name="diag_item_framework_desc">攔截 SecPackageHook 與系統簽章</string>
-    <string name="diag_item_knox_title">Knox / 安全資料夾隔離解除</string>
-    <string name="diag_item_knox_desc">繞過限制，免建立工作資料夾</string>
+    <string name="diag_item_isolation_title">Knox / 安全資料夾隔離解除</string>
+    <string name="diag_item_isolation_desc">繞過限制，免建立工作資料夾</string>
     <string name="diag_item_multiuser_title">多用戶 (Multi-User) ID 分配</string>
     <string name="diag_item_multiuser_desc">核心沙盒虛擬使用者槽位</string>
     <string name="diag_item_push_title">通知推送同步機制</string>

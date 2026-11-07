@@ -145,8 +145,8 @@
     <string name="diag_checklist_title">System Hook Diagnostic Checklist</string>
     <string name="diag_item_framework_title">Samsung Framework Hook</string>
     <string name="diag_item_framework_desc">Intercept SecPackageHook and system signatures</string>
-    <string name="diag_item_knox_title">Knox / Secure Folder Isolation Bypass</string>
-    <string name="diag_item_knox_desc">Bypass restrictions without creating work folders</string>
+    <string name="diag_item_isolation_title">Knox / Secure Folder Isolation Bypass</string>
+    <string name="diag_item_isolation_desc">Bypass restrictions without creating work folders</string>
     <string name="diag_item_multiuser_title">Multi-User ID Allocation</string>
     <string name="diag_item_multiuser_desc">Core sandbox virtual user slot</string>
     <string name="diag_item_push_title">Push Notification Sync Mechanism</string>
