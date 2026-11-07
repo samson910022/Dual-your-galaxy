@@ -36,8 +36,9 @@ class BackgroundReturnTest {
             assertEquals("background must not resend", 0, gw.uninstallCalls)
             assertEquals("background must not write", 0, gw.writeCalls)
             // 前台重查（refresh）只讀列表，不重放 uninstall。
+            val refreshBaseline = gw.commandLog.size
             vm.refresh()
-            HarnessPoll.await(30_000L) { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { gw.commandLog.size > refreshBaseline && !vm.state.value.loading }
             assertEquals("foreground refresh must not uninstall", 0, gw.uninstallCalls)
             assertEquals("foreground refresh must not write", 0, gw.writeCalls)
             // pending 仍在（refresh 不吞確認），等待使用者顯式決策。
@@ -54,10 +55,12 @@ class BackgroundReturnTest {
         val vm = newHarnessViewModel(gw)
         try {
             awaitHarnessReady(vm)
+            val refreshBaseline1 = gw.commandLog.size
             vm.refresh()
-            HarnessPoll.await(30_000L) { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { gw.commandLog.size > refreshBaseline1 && !vm.state.value.loading }
+            val refreshBaseline2 = gw.commandLog.size
             vm.refresh()
-            HarnessPoll.await(30_000L) { !vm.state.value.loading }
+            HarnessPoll.await(30_000L) { gw.commandLog.size > refreshBaseline2 && !vm.state.value.loading }
             assertEquals("repeated foreground must not uninstall", 0, gw.uninstallCalls)
             assertEquals("repeated foreground must not install", 0, gw.installCalls)
             assertEquals("repeated foreground must not write", 0, gw.writeCalls)
