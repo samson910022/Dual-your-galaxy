@@ -10,6 +10,8 @@
 // B1 阻塞修復：
 // - 同文去重鍵去時間（stripWriteBlockTimeParams/writeBlockDedupKey），LSPosed
 //   displayText 時間戳漂移仍判重；可見文字保留完整時間。
+// - 顯示新鮮度與播報去重分離：顯示比完整文字（時間戳僅變亦刷新），播報僅比
+//   穩定去重鍵（shouldAnnounceWriteBlock/shouldAnnounceMsg 控制 liveRegion）。
 // - msgView 守衛（shouldUpdateMsgText + lastMsgText + View 實字雙比對）。
 // - busy 打字競態一律禁用三鈕（讀 vm.state 最新，不用 stale lastState）。
 // - 旋轉恢復後重算 enablement（Activity 側 onRestore/onResume 補呼叫；JVM 鎖純函數）。
@@ -364,6 +366,50 @@ class UiSemanticsP28P2Test {
         val k1 = writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(d1))))
         val k2 = writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(d2))))
         assertEquals(k1, k2)
+    }
+
+    // ---- P2 顯示新鮮度與播報去重分離：時間戳僅變仍刷新顯示、抑制播報 ----
+
+    @Test
+    fun writeBlockDisplay_lsposedTimeDrift_stillRefreshes_suppressesAnnounce() {
+        val e1 = HookEvidence(status = HookStatus.INACTIVE, queriedAtMs = 1_700_000_000_000)
+        val e2 = HookEvidence(status = HookStatus.INACTIVE, queriedAtMs = 1_700_000_060_000)
+        val t1 = zhTestBlockText()(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(e1.displayText())))
+        val t2 = zhTestBlockText()(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(e2.displayText())))
+        assertTrue("time-only drift must differ in full text", t1 != t2)
+        // 顯示：完整文字變化即刷新（render 以全文比快取 + View 實字，不跳過 setText）。
+        assertTrue(shouldUpdateWriteBlockText(t1, t2))
+        assertTrue(shouldUpdateMsgText(t1, t2))
+        // 播報：穩定去重鍵相等 → 抑制（render 降 liveRegion 為 NONE，不阻止顯示刷新）。
+        val k1 = writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(e1.displayText()))))
+        val k2 = writeBlockDedupKey(BlockReason.Keyed(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(e2.displayText()))))
+        assertEquals(k1, k2)
+        assertFalse(shouldAnnounceWriteBlock(k1, k2, crossDuplicate = false))
+        assertFalse(shouldAnnounceMsg(stripWriteBlockTimeParams(t1), stripWriteBlockTimeParams(t2)))
+        // 跨節點同文（writeBlock 與 msg 同源）亦抑制 writeBlock 播報，只留 msg 節點。
+        assertTrue(isWriteBlockDuplicate(t1, t2, false))
+        assertFalse(shouldAnnounceWriteBlock(k1, k2, crossDuplicate = true))
+    }
+
+    @Test
+    fun announce_realContentChange_announces() {
+        // 去重鍵變化（真內容變化）→ 播報；跨節點同文時 writeBlock 仍抑制（只留 msg）。
+        assertTrue(shouldAnnounceWriteBlock("K:A", "K:B", crossDuplicate = false))
+        assertFalse(shouldAnnounceWriteBlock("K:B", "K:B", crossDuplicate = false))
+        assertFalse(shouldAnnounceWriteBlock("K:A", "K:B", crossDuplicate = true))
+        assertFalse(shouldAnnounceWriteBlock(null, null, crossDuplicate = false))
+        assertTrue(shouldAnnounceWriteBlock(null, "K:B", crossDuplicate = false))
+        assertTrue(shouldAnnounceMsg("去時間A", "去時間B"))
+        assertFalse(shouldAnnounceMsg("去時間A", "去時間A"))
+        assertFalse(shouldAnnounceMsg(null, null))
+        assertTrue(shouldAnnounceMsg(null, "去時間B"))
+        // 顯示：全文相同不刷新，相異刷新（batch/catalog 保留同式全文去重）。
+        assertFalse(shouldUpdateWriteBlockText("同文", "同文"))
+        assertTrue(shouldUpdateWriteBlockText("同文A", "同文B"))
+        assertFalse(shouldUpdateBatchResultText("同文", "同文"))
+        assertTrue(shouldUpdateBatchResultText("同文A", "同文B"))
+        assertFalse(shouldUpdateCatalogErrorText("同文", "同文"))
+        assertTrue(shouldUpdateCatalogErrorText("同文A", "同文B"))
     }
 
     @Test

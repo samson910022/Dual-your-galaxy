@@ -156,17 +156,15 @@ class MainActivity : ComponentActivity() {
     // p28-1 禁用原因行：主操作（建立/移除分身）因通道不可寫被禁用時顯示
     // VM 拒絕理由（writeBlockReason 資源鍵經 Context 解析，與點按拒絕同文）；可寫或忙碌時隱藏。
     private lateinit var writeBlockView: TextView
-    // P2-1 去重播報：上次已顯示的禁用原因文字。相同原因在無關 render
-    // 不重設 text（避免 POLITE 重播）；僅文字變化時更新。msgView 恆為
-    // POLITE 主播報者，writeBlockView 在與 s.msg 同文時降為 NONE。
-    // 去重鍵去時間（見 stripWriteBlockTimeParams）：可見文字保留完整時間資訊。
-    // C：快取另存去時間鍵（writeBlockDedupKey 接入生產，BlockReason 層去時間；
-    // msg 側以 stripWriteBlockTimeParams 同式去時間），自更新判斷比鍵不比原文。
+    // P2-1 去重播報：上次已顯示的禁用原因文字。顯示新鮮度與播報去重分離：
+    // 顯示比完整文字（lastWriteBlockText + View 實字），時間戳僅變亦刷新；
+    // 播報僅比穩定去重鍵（lastWriteBlockDedupKey/BlockReason 層）控制 liveRegion，
+    // 不阻止顯示刷新。msgView 同式（完整比顯示、去時間比播報）。
+    // batch/catalog 無時間戳，保留完整文字去重。
     private var lastWriteBlockText: String? = null
     private var lastWriteBlockDedupKey: String? = null
-    // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
-    // 與 writeBlockView 同式：快取 + View 實際文字雙重比對，旋轉重建以 View 為準。
-    // C 同式去時間：比對前剝時間鍵，可見文字保留完整時間。
+    // B1 msg 守衛：顯示比完整文字（lastMsgText + View 實字），播報比去時間鍵
+    // （stripWriteBlockTimeParams）；時間戳僅變刷新顯示、抑制播報。
     private var lastMsgText: String? = null
     // B：batchResult/catalogError 去重快取（比照 msg/writeBlock：shouldUpdate＋
     // View 實字雙比對，避免無關 render 重播 POLITE；旋轉重建以 View 為準）。
@@ -237,8 +235,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
-        // B1：lastWriteBlockText/lastMsgText 隨存活（View 重建為空時以 View 實際文字為準補寫，見 render）。
-        // C：去時間鍵 lastWriteBlockDedupKey 亦隨存活（自更新判斷比鍵；B 的 batch/catalog 僅內存，去重以 View 為準）。
+        // B1：lastWriteBlockText/lastMsgText 為顯示快取（完整文字），View 重建為空時
+        // 以 View 實際文字為準補寫；lastWriteBlockDedupKey 為播報去重鍵（穩定去時間），亦隨存活。
         diagExpanded = savedInstanceState?.getBoolean(KEY_DIAG_EXPANDED) ?: false
         lastWriteBlockText = savedInstanceState?.getString(KEY_WRITE_BLOCK_TEXT)
         lastWriteBlockDedupKey = savedInstanceState?.getString(KEY_WRITE_BLOCK_DEDUP)
@@ -300,8 +298,8 @@ class MainActivity : ComponentActivity() {
         // 旋轉保留診斷展開開關 (純 UI 狀態，不經 ViewModel)。
         outState.putBoolean(KEY_DIAG_EXPANDED, diagExpanded)
         // B1：去重快取隨存活；新 View 重建為空時 render 以 View 實際文字為準補寫，
-        // 故恢復值僅作去重參考，不會導致空 View 跳過首寫。
-        // C 去時間鍵亦隨存活（B 的 batch/catalog 僅內存）。
+        // 故恢復值僅作顯示/去重參考，不會導致空 View 跳過首寫。
+        // 去重鍵（lastWriteBlockDedupKey）亦隨存活，僅控制播報；B 的 batch/catalog 僅內存。
         if (lastWriteBlockText != null) outState.putString(KEY_WRITE_BLOCK_TEXT, lastWriteBlockText)
         if (lastWriteBlockDedupKey != null) outState.putString(KEY_WRITE_BLOCK_DEDUP, lastWriteBlockDedupKey)
         if (lastMsgText != null) outState.putString(KEY_MSG_TEXT, lastMsgText)
@@ -982,8 +980,8 @@ class MainActivity : ComponentActivity() {
         rootBtn.isChecked = (s.channel == ChannelPreference.ROOT)
         shizukuBtn.isChecked = (s.channel == ChannelPreference.SHIZUKU)
         lsposedBtn.isChecked = (s.channel == ChannelPreference.LSPOSED)
-        // C：保留 BlockReason 原鍵以計算去時間鍵（writeBlockDedupKey 接入生產）；
-        // 可見文字仍為完整 blockReason（含時間），自更新判斷比鍵不比原文。
+        // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
+        // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
         val blockKey = if (busy) null else writeBlockReason(s)
         val blockReason = blockKey?.let { resolveBlockReason(it) }
         val blockDedupKey = writeBlockDedupKey(blockKey)
@@ -1015,33 +1013,32 @@ class MainActivity : ComponentActivity() {
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
         searchInput.isEnabled = !busy
         // p28-1 禁用原因行：只在非 busy 且不可寫時顯示 VM 拒絕理由。
-        // P2-1 去重播報：可見文字保留完整時間資訊，但同一拒絕理由只由單一節點播報
-        // （傾向 msgView）。s.msg 與 blockReason 同文時 writeBlockView 降為
-        // NONE；原因未變時不重設 text（避免無關 render 重播）。
+        // P2-1 去重播報：同一拒絕理由只由單一節點播報（傾向 msgView）。
+        // 顯示新鮮度與播報去重分離：顯示比完整文字（時間戳僅變亦刷新 setText，
+        // 避免可見時間證據陳舊）；播報僅比穩定去重鍵（writeBlockDedupKey +
+        // 跨節點同文 isWriteBlockDuplicate）控制 liveRegion，不阻止顯示刷新。
         // B1：同文判定去時間（見 isWriteBlockDuplicate/stripWriteBlockTimeParams），
         // 解決 LSPosed displayText 時間戳漂移導致恆 false；可見文字不去時間。
-        // C 自更新去時間：快取比去時間鍵（blockDedupKey，BlockReason 層），
-        // View 比去時間文字；可見文字保留完整時間，只在鍵變化或 View 空時重寫。
         val duplicate = isWriteBlockDuplicate(blockReason, s.msg, busy)
+        val writeAnnounce = shouldAnnounceWriteBlock(lastWriteBlockDedupKey, blockDedupKey, duplicate)
         try {
             writeBlockView.accessibilityLiveRegion =
-                if (duplicate) View.ACCESSIBILITY_LIVE_REGION_NONE
-                else View.ACCESSIBILITY_LIVE_REGION_POLITE
+                if (writeAnnounce) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                else View.ACCESSIBILITY_LIVE_REGION_NONE
         } catch (_: Exception) {
             // Best effort: 無障礙屬性失敗不影響顯示。
         }
         if (blockReason != null) {
             writeBlockView.visibility = View.VISIBLE
-            // B1：快取 + View 實際文字雙重比對；旋轉重建 View 為空時以 View 為準補寫。
-            // C：快取比 dedup 鍵、View 比去時間文字（時間漂移不重播）。
+            // 顯示：快取（完整文字）+ View 實際文字雙重比對；旋轉重建 View 為空時
+            // 以 View 為準補寫。時間戳僅變（完整不同、去重鍵同）仍刷新顯示，
+            // 播報已由上式 liveRegion 抑制，不跳過 setText。
             val writeViewCurrent = try {
                 writeBlockView.text.toString()
             } catch (_: Exception) {
                 null
             }
-            val writeViewStripped = stripWriteBlockTimeParams(writeViewCurrent ?: "")
-            val writeNewStripped = stripWriteBlockTimeParams(blockReason)
-            if (shouldUpdateWriteBlockText(lastWriteBlockDedupKey, blockDedupKey) || writeViewStripped != writeNewStripped) {
+            if (shouldUpdateWriteBlockText(lastWriteBlockText, blockReason) || writeViewCurrent != blockReason) {
                 if (writeViewCurrent != blockReason) {
                     try {
                         writeBlockView.text = blockReason
@@ -1070,9 +1067,9 @@ class MainActivity : ComponentActivity() {
         // PR-7 P2 (#26):catalog 區渲染 (搜尋/勾選/批次按鈕計數/逐項結果)。
         // PR-37 P3 差量：列表只在指紋變化時全量重建；其餘文字區各自更新。
         renderSourceList(s)
-        // B1 msg 守衛：無關 render 不重設相同文字（避免 POLITE 重播）。
+        // 與 writeBlockView 同式：顯示比完整文字（時間戳僅變亦刷新，避免陳舊），
+        // 播報僅比去時間穩定鍵控制 liveRegion，不阻止顯示刷新。
         // 快取 + View 實際文字雙重比對；旋轉重建以 View 為準補寫。
-        // C 同式去時間：快取/View 皆比去時間鍵，可見文字保留完整時間。
         val newMsgText = if (busy) {
             getString(R.string.status_loading)
         } else {
@@ -1085,8 +1082,15 @@ class MainActivity : ComponentActivity() {
         }
         val lastMsgStripped = lastMsgText?.let { stripWriteBlockTimeParams(it) }
         val newMsgStripped = stripWriteBlockTimeParams(newMsgText)
-        val msgViewStripped = msgViewCurrent?.let { stripWriteBlockTimeParams(it) }
-        if (shouldUpdateMsgText(lastMsgStripped, newMsgStripped) || msgViewStripped != newMsgStripped) {
+        val msgAnnounce = shouldAnnounceMsg(lastMsgStripped, newMsgStripped)
+        try {
+            msgView.accessibilityLiveRegion =
+                if (msgAnnounce) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                else View.ACCESSIBILITY_LIVE_REGION_NONE
+        } catch (_: Exception) {
+            // Best effort: 無障礙屬性失敗不影響顯示。
+        }
+        if (shouldUpdateMsgText(lastMsgText, newMsgText) || msgViewCurrent != newMsgText) {
             if (msgViewCurrent != newMsgText) {
                 try {
                     msgView.text = newMsgText
@@ -1698,15 +1702,23 @@ internal fun isWriteBlockDuplicate(blockReasonText: String?, msg: String, busy: 
 }
 
 // P2-1 文字更新守衛（純函數，JVM 可測；render 決定是否重設 text 用）。
-// 原因未變時回傳 false（呼叫端不碰 text，避免無關 render 重播）。
-// C：生產呼叫端傳去時間鍵（writeBlockDedupKey），此處僅比鍵；可見文字保留完整時間。
+// 顯示新鮮度：比完整文字（old != new）；時間戳僅變亦回傳 true，呼叫端刷新顯示。
+// 播報抑制另見 shouldAnnounceWriteBlock/shouldAnnounceMsg（穩定去重鍵控制 liveRegion）。
 internal fun shouldUpdateWriteBlockText(old: String?, new: String?): Boolean = old != new
 
 // B1 msg 更新守衛（純函數，JVM 可測；render 決定是否重設 msgView.text 用）。
-// 與 shouldUpdateWriteBlockText 同式（old != new）；render 另以 View 實際文字
-// 雙重比對（旋轉重建 View 為空時補寫）。
-// C 同式去時間：生產呼叫端傳去時間文字（stripWriteBlockTimeParams），可見保留完整時間。
+// 與 shouldUpdateWriteBlockText 同式：比完整文字（old != new）；
+// 播報抑制另見 shouldAnnounceMsg（去時間鍵控制 liveRegion）。
 internal fun shouldUpdateMsgText(old: String?, new: String?): Boolean = old != new
+
+// P2 播報抑制（純函數，JVM 可測；render 決定 liveRegion 用，不阻止顯示刷新）。
+// writeBlock：穩定去重鍵未變（時間戳僅變）或跨節點同文時不播報（NONE），
+// 僅去重鍵變化且非跨節點同文才播報（POLITE）；顯示仍以 shouldUpdate* 全文比對刷新。
+internal fun shouldAnnounceWriteBlock(oldDedupKey: String?, newDedupKey: String?, crossDuplicate: Boolean): Boolean =
+    !crossDuplicate && oldDedupKey != newDedupKey
+
+// msg 同式：去時間鍵未變（時間戳僅變）不播報，變化才播報；顯示仍全文比對刷新。
+internal fun shouldAnnounceMsg(oldStripped: String?, newStripped: String?): Boolean = oldStripped != newStripped
 
 // 寫入拒絕理由鍵 -> string 資源（JVM 可測；Activity/factory 以此解析）。
 // P2-3 AUTO 降級亦經此解析（auto_degrade_*），主路徑無 Verbatim。
