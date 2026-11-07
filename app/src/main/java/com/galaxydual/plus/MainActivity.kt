@@ -290,6 +290,9 @@ class MainActivity : ComponentActivity() {
     private var catalogLoadError: String? = null
     // 啟動 double-load 守衛：onCreate+onResume 雙 reloadCatalog 取消前一個在途任務。
     private var catalogJob: Job? = null
+    // Phase K K2：Shizuku presence 快取在途任務（比照 catalogJob 3536-3537）：
+    // refresh/request 頭寫共用同一 Job 取消，避免 old-live 蓋 new-death。
+    private var shizukuPresenceJob: Job? = null
     // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
     // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
     private var lastClonedListKey: String? = null
@@ -2372,7 +2375,11 @@ class MainActivity : ComponentActivity() {
     //（refresh 模式：IO 讀＋回主更新／分支）。主執行緒只做分支＋requestPermission＋讀快取重繪，
     // 永不直呼 pingBinder（讀經 readShizukuPresence 僅 IO 執行緒）。
     private fun requestShizukuPermission() {
-        lifecycleScope.launch {
+        // Phase K K2：頭寫與 refresh 共用同一 shizukuPresenceJob 協調，先取消在途 refresh。
+        shizukuPresenceJob?.cancel()
+        // Phase K review：頭寫亦賦值回 shizukuPresenceJob（與 catalogJob 範式一致），
+        // 使 refresh 側 cancel 能取消在途頭寫，避免 old-live 蓋 new-death。
+        shizukuPresenceJob = lifecycleScope.launch {
             val presence = try {
                 withContext(Dispatchers.IO) { readShizukuPresence() }
             } catch (_: Exception) {
@@ -2501,7 +2508,10 @@ class MainActivity : ComponentActivity() {
     // 更新快取＋重繪狀態行）。呼叫端當幀的 updateShizukuLine 讀舊快取，IO 回來再刷一次。
     private fun refreshShizukuPresenceCache() {
         try {
-            lifecycleScope.launch {
+            // Phase K K2：比照 catalogJob（3536-3537）取消前一個在途任務，避免疊加
+            //（old-live 蓋 new-death）；與 requestShizukuPermission 頭寫共用同一 job。
+            shizukuPresenceJob?.cancel()
+            shizukuPresenceJob = lifecycleScope.launch {
                 val next = withContext(Dispatchers.IO) {
                     try {
                         readShizukuPresence()
@@ -3258,7 +3268,8 @@ class MainActivity : ComponentActivity() {
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
             removeLabelsDialog = AlertDialog.Builder(this)
                 .setTitle(R.string.remove_confirm_view_labels)
-                .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), appLabel, pending.profileLabel))
+                // Phase K K1 加固：即時讀快取（回調已回填時取 fresh，未回仍為佔位，不差於 captured var）。
+                .setMessage(buildRemoveLabelsMessage(getString(R.string.remove_confirm_labels), resolveAppLabelCached(pending.pkg).takeIf { it != pending.pkg } ?: appLabel, pending.profileLabel))
                 .setPositiveButton(android.R.string.ok, null)
                 .show()
         }
@@ -3276,6 +3287,9 @@ class MainActivity : ComponentActivity() {
                     if (shownPending != pending) return@requestLabelAsync
                     val dlg = removeConfirmDialog ?: return@requestLabelAsync
                     if (dlg.isShowing != true) return@requestLabelAsync
+                    // Phase K K1：回寫 captured var（NEUTRAL 閉包經 Ref 後續可見），
+                    // NEUTRAL 後開 detail 不再讀佔位。
+                    appLabel = fresh
                     val newMessage = buildRemoveConfirmMessage(
                         template = getString(R.string.remove_confirm_message),
                         pkg = pending.pkg,
