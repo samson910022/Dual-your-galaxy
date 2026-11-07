@@ -87,24 +87,24 @@ class InputRestoreTest {
         }
     }
 
-    // Activity：非預設通道偏好在 recreate 後仍顯示（注入 fake-backed VM）。
+    // Activity：非預設通道偏好 (ROOT，fake 完整支援) 在 recreate 後仍顯示（注入 fake-backed VM）。
     @Test
     fun activity_recreate_retainsNonDefaultChannelPreference() {
         val gw = FakeHarnessGateway(dualId = 95)
-        val vm = newHarnessViewModel(gw, preference = ChannelPreference.SHIZUKU)
+        val vm = newHarnessViewModel(gw, preference = ChannelPreference.ROOT)
         try {
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
-                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_shizuku).isChecked)
+                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_root).isChecked)
                     assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "ROOT"))
                 }
                 scenario.recreate()
                 scenario.onActivity { activity ->
-                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_shizuku).isChecked)
+                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_root).isChecked)
                     assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
+                    assertTrue(HarnessViews.containsText(activity.window.decorView, "ROOT"))
                 }
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
