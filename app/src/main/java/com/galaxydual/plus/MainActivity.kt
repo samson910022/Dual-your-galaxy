@@ -2054,16 +2054,14 @@ class MainActivity : ComponentActivity() {
     // 與 clone/remove/batch 同源）＋48dp 觸控目標＋移除語意 contentDescription。
     // B2：ImageView 先設 tag=appKey；coroutine capture clonedGen，過期丟棄。
     // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
-    private fun renderClonedApps(s: UiState, blockKey: BlockReason?) {
+    private fun renderClonedApps(s: UiState, blockKey: BlockReason?, catalogKey: Int) {
         if (!::clonedAppsContainer.isInitialized) return
         // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook live 證據驅動（與徽章區同源
         // hookLiveProven，Phase H：existence 不足，需 boot-fresh），無 live 證據時
         // GONE，不得無條件宣稱注入成功。
         val hookLiveProven = hookLiveProven(s)
-        // Phase L L1：catalogKey 先算＋先 sync 再比對指紋；指紋納入 catalogKey，
-        // catalog label 變化即重建，舊快取 !isLabelCached 不再命中殘留。
-        // 單次 hash 重用（sync＋key 共用），同內容同 hash 不致過度重建。
-        val catalogKey = labelCacheKey()
+        // Phase L L2：catalogKey 由 render 入口一次算好傳入（與 dialog 共用），
+        // 此處只 sync＋比對指紋，不再重算 O(catalog)。
         syncLabelCache(catalogKey)
         val key = buildClonedListKey(s, catalogKey)
         if (key == lastClonedListKey) {
@@ -2602,6 +2600,9 @@ class MainActivity : ComponentActivity() {
         // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
         // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
         val blockKey = if (busy) null else writeBlockReason(s)
+        // Phase L L2：catalogKey render 入口算一次，傳給 renderClonedApps 與
+        // syncRemoveDialog 共用（各入口不再各自重算 O(catalog)）。
+        val catalogKey = labelCacheKey()
         val readyMark = s.readyMark()
         // Phase C P2: 本次探測三態 + 範圍限定 -- privilege/anyProbePassed 只反映
         // 本次探測子集 (probeScope)，非裝置總能力。NONE（LSPOSED 零探測）顯示
@@ -2903,7 +2904,7 @@ class MainActivity : ComponentActivity() {
         // Phase B B1/B4：分身列表獨立渲染（指紋差量＋Switch 寫入門控 blockKey）。
         // 移出上段 try：列表失敗不吞徽章更新，徽章失敗不吞列表。
         try {
-            renderClonedApps(s, blockKey)
+            renderClonedApps(s, blockKey, catalogKey)
         } catch (e: Exception) {
             Log.w(TAG, "renderClonedApps failed", e)
         }
@@ -3057,7 +3058,7 @@ class MainActivity : ComponentActivity() {
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
         // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
-        syncRemoveDialog(s.pendingRemove, s.loading, blockKey)
+        syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
     }
 
     // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
@@ -3165,7 +3166,7 @@ class MainActivity : ComponentActivity() {
     // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
     // Phase B B1：confirm 另須通道可寫（blockKey == null，與 Switch/按鈕同源；
     // busy 時 blockKey 為 null 但 loading 仍禁用，不可繞過）。
-    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?) {
+    private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?, catalogKey: Int) {
         if (isFinishing || isDestroyed) return
         if (pending == null) {
             removeLabelsDialog?.dismiss()
@@ -3205,10 +3206,11 @@ class MainActivity : ComponentActivity() {
             removeAcknowledged = false
             acknowledgedGeneration = null
         }
-        // Phase F F1/F2：入口一次算 key＋對齊快取；同步只讀快取＋catalog 預取，
+        // Phase F F1/F2：catalogKey 由 render 入口傳入（與 renderClonedApps 共用，
+        // 不再此處重算）；同步只讀快取＋catalog 預取，
         // miss 顯示 pkg 佔位，dialog 顯示後非同步回填（同 pending 仍在屏才更新）。
         // 主執行緒不打 PM binder（原每 show 一次連續 binder）。
-        syncLabelCache(labelCacheKey())
+        syncLabelCache(catalogKey)
         var appLabel = resolveAppLabelCached(pending.pkg)
         if (appLabel == pending.pkg) {
             val prefilled = try {
@@ -3362,8 +3364,8 @@ class MainActivity : ComponentActivity() {
     // miss 回 pkg 佔位並經 requestLabelAsync 在 IO 查詢後回填＋重綁（比照 loadIcon：
     // tag/世代檢查，過期丟棄，快取保留）。catalog 自帶 label（IO 已查好）由呼叫端
     // 經 catalogLabelsFor 優先填入，等價於 reloadCatalog IO 路徑預取且無執行緒競爭。
-    // Phase F F2：catalogKey 由呼叫端（renderClonedApps/syncRemoveDialog 入口）一次
-    // 計算傳入 syncLabelCache，不再每列重算 sourceCatalog.hashCode()
+    // Phase F F2：catalogKey 由 render 入口一次計算，傳給 renderClonedApps 與
+    // syncRemoveDialog 共用（syncLabelCache＋指紋共用），不再各入口各自重算
     //（O(cloned×catalog) → O(catalog)）。命中移尾改 LRU（與圖示快取一致 remove+put，
     // 首項＝最久未用）。失效語義保留全清：label 僅顯示用，重裝/卸載後標籤可能改變，
     // 全清為正確性優先的簡單選擇（重填走非同步 IO，有界 200，不阻塞主執行緒）。
@@ -3753,9 +3755,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 來源列表指紋：catalog 引用+內容 hash、query、系統開關、勾選集合 hash。
+    // 來源列表指紋：catalog 內容 hash、query、系統開關、勾選集合 hash。
     private fun buildSourceListKey(s: UiState): String =
-        "${System.identityHashCode(s.sourceCatalog)}:${s.sourceCatalog.hashCode()}:" +
+        "${s.sourceCatalog.hashCode()}:" +
             "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
 
     // 圖示非同步載入:IO 讀取,主執行緒貼到仍綁定同一 appKey 的列。
