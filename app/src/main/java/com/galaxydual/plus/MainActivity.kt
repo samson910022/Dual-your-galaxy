@@ -272,10 +272,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var checklistSummaryView: TextView
     private lateinit var shizukuFallbackDescView: TextView
     private lateinit var shizukuFallbackBadgeView: TextView
-    // Phase A A3：診斷清單逐項徽章由 hookProvenActive 驅動（render 內 GONE 門控）。
+    // Phase A A3：診斷清單逐項徽章由 hookLiveProven 驅動（render 內 GONE 門控；
+    // Phase H：existence 不足，需 boot-fresh）。
     private val checklistItemBadges = mutableListOf<TextView>()
     // Phase G (honest icons)：診斷清單圖示建時綠/藍固定，未證實時須轉灰。
-    // 與徽章同源 hookProvenActive 驅動（render 內 setColorFilter）；isGreen 記
+    // 與徽章同源 hookLiveProven 驅動（render 內 setColorFilter）；isGreen 記
     // 還原色（綠 secondary / 藍 primary），uidRow 另行綁定（見 engineUidIcon）。
     private val checklistItemIcons = mutableListOf<ImageView>()
     private val checklistItemIsGreen = mutableListOf<Boolean>()
@@ -2033,9 +2034,10 @@ class MainActivity : ComponentActivity() {
     // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
     private fun renderClonedApps(s: UiState, blockKey: BlockReason?) {
         if (!::clonedAppsContainer.isInitialized) return
-        // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook 證據驅動（與徽章區同源），
-        // 無證據時 GONE，不得無條件宣稱注入成功。
-        val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+        // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook live 證據驅動（與徽章區同源
+        // hookLiveProven，Phase H：existence 不足，需 boot-fresh），無 live 證據時
+        // GONE，不得無條件宣稱注入成功。
+        val hookLiveProven = hookLiveProven(s)
         val key = buildClonedListKey(s)
         if (key == lastClonedListKey) {
             val writable = blockKey == null
@@ -2168,8 +2170,8 @@ class MainActivity : ComponentActivity() {
             }
             val tagView = TextView(this).apply {
                 text = getString(R.string.tag_forced_injected)
-                // Phase E E2：見函數入口 hookProvenActive（無證據 GONE）。
-                visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                // Phase E E2：見函數入口 hookLiveProven（無 live 證據 GONE）。
+                visibility = if (hookLiveProven) View.VISIBLE else View.GONE
                 textSize = 10f
                 // Phase C: blue-pill text (see hookSecPmTag).
                 setTextColor(getColor(R.color.oneui_on_primary_container))
@@ -2265,10 +2267,12 @@ class MainActivity : ComponentActivity() {
     // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋targetId＋loading
     // ＋hook 哨兵態）。Phase E E4：納入 targetId（subtitle 含 targetId，
     // 未納入則目標切換留殘留舊值）；E2 哨兵態亦須入指紋（tag 顯隱由 hook
-    // 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
+    // live 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
+    // Phase H：哨兵升格為 hookLiveProven（含 hookBootFresh，boot-fresh 落地
+    // 翻轉時重建）。
     private fun buildClonedListKey(s: UiState): String {
-        val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
-        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookProvenActive"
+        val hookLiveProven = hookLiveProven(s)
+        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookLiveProven"
     }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
@@ -2665,19 +2669,21 @@ class MainActivity : ComponentActivity() {
                     hookStatusCell.visibility = View.GONE
                 } else {
                     hookStatusCell.visibility = View.VISIBLE
-                    when (s.hookStatus) {
-                        HookStatus.ACTIVE -> {
+                    // Phase H：ACTIVE 僅歷史 existence 證據；綠＋正常監聽只給
+                    // boot-fresh 證實 (hookLiveDisplay LIVE)，歷史標記走 UNKNOWN。
+                    when (hookLiveDisplay(s)) {
+                        HookLiveDisplay.LIVE -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
                             hookStatusText.text = getString(R.string.stats_hook_active)
                             // Phase C: tint (see subtitleView).
                             hookStatusText.setTextColor(getColor(R.color.oneui_secondary_tint))
                         }
-                        HookStatus.INACTIVE -> {
+                        HookLiveDisplay.INACTIVE -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                             hookStatusText.text = getString(R.string.stats_hook_inactive)
                             hookStatusText.setTextColor(getColor(R.color.oneui_text_tertiary))
                         }
-                        HookStatus.UNKNOWN_UNREADABLE, HookStatus.UNKNOWN_NO_DIAGNOSTIC -> {
+                        HookLiveDisplay.UNKNOWN -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                             hookStatusText.text = getString(R.string.stats_hook_unknown)
                             hookStatusText.setTextColor(getColor(R.color.oneui_warning_text))
@@ -2738,42 +2744,46 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-            // Phase A A3：成功宣稱類徽章一律由 Hook 信號驅動；僅 LSPOSED + ACTIVE
-            // 顯示，無信號前隱藏，不再無條件全綠。
-            val hookProvenActive = renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+            // Phase A A3：成功宣稱類徽章一律由 Hook live 信號驅動；僅
+            // hookLiveProven (LSPOSED + ACTIVE + boot-fresh) 顯示，無 live 證據
+            // 前隱藏，不再無條件全綠。Phase H：existence (ACTIVE 歷史標記) 不足，
+            // daemonFooter 門控條件同升格 (原 ACTIVE 即顯，現需 live)。
+            val hookLiveProven = hookLiveProven(s)
             if (::hookBadgeChip.isInitialized) {
-                hookBadgeChip.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                hookBadgeChip.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::hookSecPmTag.isInitialized) {
-                hookSecPmTag.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                hookSecPmTag.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::hookUidSandboxTag.isInitialized) {
-                hookUidSandboxTag.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                hookUidSandboxTag.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::injectedActiveLabel.isInitialized) {
-                injectedActiveLabel.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                injectedActiveLabel.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::daemonFooter.isInitialized) {
-                daemonFooter.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                daemonFooter.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::residentBadge.isInitialized) {
-                residentBadge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                residentBadge.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             if (::telemetryDot.isInitialized && ::telemetryStatusView.isInitialized) {
                 if (renderHookText(s) == null) {
                     telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                     telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
                 } else {
-                    when (s.hookStatus) {
-                        HookStatus.ACTIVE -> {
+                    // Phase H：ACTIVE 綠＋運作中·已注入只給 boot-fresh 證實；
+                    // 歷史標記走 UNKNOWN (amber＋狀態未知，永不給綠)。
+                    when (hookLiveDisplay(s)) {
+                        HookLiveDisplay.LIVE -> {
                             telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_green))
                             telemetryStatusView.text = getString(R.string.telemetry_status_active)
                         }
-                        HookStatus.INACTIVE -> {
+                        HookLiveDisplay.INACTIVE -> {
                             telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_gray))
                             telemetryStatusView.text = getString(R.string.telemetry_status_inactive)
                         }
-                        HookStatus.UNKNOWN_UNREADABLE, HookStatus.UNKNOWN_NO_DIAGNOSTIC -> {
+                        HookLiveDisplay.UNKNOWN -> {
                             telemetryDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                             telemetryStatusView.text = getString(R.string.telemetry_status_unknown)
                         }
@@ -2781,23 +2791,25 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (::checklistSummaryView.isInitialized) {
-                checklistSummaryView.text = if (hookProvenActive) {
+                // Phase H：5/5 模組運作正常只給 live 證實；ACTIVE 歷史標記走 unknown。
+                checklistSummaryView.text = if (hookLiveProven) {
                     getString(R.string.engine_diag_all_normal)
                 } else {
                     getString(R.string.engine_diag_unknown)
                 }
             }
             for (badge in checklistItemBadges) {
-                badge.visibility = if (hookProvenActive) View.VISIBLE else View.GONE
+                badge.visibility = if (hookLiveProven) View.VISIBLE else View.GONE
             }
             // Phase G: checklist icons are build-time green/blue; without Hook
-            // proof they must not signal success -- gray them via tertiary.
+            // live proof they must not signal success -- gray them via tertiary.
             // Tertiary as icon (non-text, 3:1) is 5.19 on island #E8EEF5.
+            // Phase H: 門控由 existence 升格為 hookLiveProven。
             for (i in checklistItemIcons.indices) {
                 try {
                     checklistItemIcons[i].setColorFilter(
                         getColor(
-                            if (hookProvenActive) {
+                            if (hookLiveProven) {
                                 if (checklistItemIsGreen.getOrElse(i) { true }) R.color.oneui_secondary else R.color.oneui_primary
                             } else {
                                 R.color.oneui_text_tertiary
@@ -2810,7 +2822,7 @@ class MainActivity : ComponentActivity() {
             }
             try {
                 engineUidIcon?.setColorFilter(
-                    getColor(if (hookProvenActive) R.color.oneui_secondary else R.color.oneui_text_tertiary),
+                    getColor(if (hookLiveProven) R.color.oneui_secondary else R.color.oneui_text_tertiary),
                 )
             } catch (_: Exception) {
                 // Best effort: render may run before buildUi in tests.
@@ -4161,6 +4173,43 @@ internal fun resolveShizukuCardStatus(noBinder: Boolean, authorized: Boolean): S
     } else {
         ShizukuCardStatus.UNAUTHORIZED
     }
+
+// Phase H live-health 誠實門控 (Codex P1 #2732，JVM 可測；render 內三處
+// hookProvenActive 同源改用 hookLiveProven)：
+// - hookHistoryActive = existence 證據 (marker present，survives reboots，
+//   未確認本次開機；僅驅動歷史文案 renderHookText，不驅動 live 宣稱)。
+// - hookLiveProven = existence + hookBootFresh (本次開機存活證明；今日恆
+//   false，因全 repo 無 BOOT_COUNT/boot_id/uptime 讀取，boot 比較未落地)。
+// 六徽章/badges/icons/summary/telemetry 綠/ACTIVE 文案/逐行 tag 一律由
+// hookLiveProven 驅動；hookHistoryActive 為真但 hookBootFresh 為 false 時
+// 全 GONE/unknown/灰。boot-fresh 落地後自動點亮，無需改 render。
+// 文案紀律：boot-fresh 前不得用 已注入/攔截中/運作中/常駐中/正常監聽/5/5/
+// Active/Running/Intercepting/Injected 作 live 宣稱；歷史顯示重用
+// telemetry_status_unknown/stats_hook_unknown/engine_diag_unknown，永不給綠。
+internal fun hookHistoryActive(s: UiState): Boolean =
+    renderHookText(s) != null && s.hookStatus == HookStatus.ACTIVE
+
+internal fun hookLiveProven(s: UiState): Boolean =
+    hookHistoryActive(s) && s.hookBootFresh
+
+// 六徽章＋逐行 tag＋checklist badges＋icons 著色單一可見源 (JVM seam；
+// render 直接以此作 visibility/color 條件，免三處各寫各的)。
+internal fun hookLiveBadgesVisible(s: UiState): Boolean = hookLiveProven(s)
+
+// Hero/telemetry/summary 誠實三態 (JVM seam；render 映射至資源，鍵集不變)：
+// LIVE (boot-fresh 證實) 才給綠＋live 文案；INACTIVE 照舊灰＋未偵測；其餘
+// (含 ACTIVE 但未 boot-fresh 的歷史標記) 一律 UNKNOWN (amber/灰＋狀態未知)。
+internal enum class HookLiveDisplay {
+    LIVE,
+    INACTIVE,
+    UNKNOWN,
+}
+
+internal fun hookLiveDisplay(s: UiState): HookLiveDisplay = when {
+    hookLiveProven(s) -> HookLiveDisplay.LIVE
+    s.hookStatus == HookStatus.INACTIVE -> HookLiveDisplay.INACTIVE
+    else -> HookLiveDisplay.UNKNOWN
+}
 
 // Hook 行：非 LSPosed 模式回 null (呼叫端 Gone)；狀態文案維持本頁提示
 // (ACTIVE 歷史證據措辭/INACTIVE 啟用提示/UNKNOWN 真通道提示，不動)，
