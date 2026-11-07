@@ -118,6 +118,7 @@
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
     <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
+    <string name="hook_mode_subtitle_ops">Clone and remove work on the verified profile through this privileged channel (Auto/Root/Shizuku) with no Hook required; LSPosed only adds deeper Samsung whitelist and native UI integration.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
     <string name="hook_badge_uid_sandbox">Isolated UID Sandbox</string>

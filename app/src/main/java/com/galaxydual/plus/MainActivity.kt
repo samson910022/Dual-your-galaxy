@@ -248,6 +248,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var statusPillDot: ImageView
     private lateinit var statusPillContainer: LinearLayout
     private lateinit var clonedCountStatView: TextView
+    // Phase B P2-2：Hook 卡片副標題 channel-aware（render 內 writeBlockReason
+    // 門控切換 hook_mode_subtitle / _ops；初值白名單文案，fail-closed）。
+    private lateinit var hookDescView: TextView
     private lateinit var clonedCountBadge: TextView
     private lateinit var clonedAppsContainer: LinearLayout
     private lateinit var navTabApps: LinearLayout
@@ -1593,7 +1596,7 @@ class MainActivity : ComponentActivity() {
         hookTitleRow.addView(hookBadgeChip)
         hookModeCard.addView(hookTitleRow)
 
-        val hookDesc = TextView(this).apply {
+        hookDescView = TextView(this).apply {
             text = getString(R.string.hook_mode_subtitle)
             textSize = 12f
             setTextColor(getColor(R.color.oneui_text_secondary))
@@ -1601,7 +1604,7 @@ class MainActivity : ComponentActivity() {
                 topMargin = dp(6)
             }
         }
-        hookModeCard.addView(hookDesc)
+        hookModeCard.addView(hookDescView)
 
         val hookTagsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2773,6 +2776,13 @@ class MainActivity : ComponentActivity() {
         try {
             if (::clonedCountStatView.isInitialized) {
                 clonedCountStatView.text = getString(R.string.stats_injected_format, s.cloned.size, getString(R.string.stats_unit_apps))
+            }
+            // Phase B P2-2：Hook 卡片副標題 channel-aware。真可寫
+            //（writeBlockReason == null）走 _ops（特權通道直寫、無需 Hook）；
+            // 其餘（loading→writeReady=false 亦含）走白名單原文案。初建即白名單
+            // 文案，首幀前 fail-closed；顯式 ROOT 拒絕等不可寫態不誇大可寫。
+            if (::hookDescView.isInitialized) {
+                hookDescView.text = getString(if (writeBlockReason(s) == null) R.string.hook_mode_subtitle_ops else R.string.hook_mode_subtitle)
             }
             if (::clonedCountBadge.isInitialized) {
                 clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
