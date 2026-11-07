@@ -314,14 +314,17 @@ class MainActivity : ComponentActivity() {
     // Phase F F1：label 非同步回填在途集合（與 iconInflight 同式，同一 pkg 在途不重打 PM）。
     // Phase I I1：per-pkg 回調合併（Codex P2）。同一 pkg 在途時第二 waiter 不再丟棄，
     // 經 labelCallbacks 合併（各 waiter 舊門保留：行 rowGen/tag、dialog shownPending/isShowing）。
+    // Phase 1a：waiter 攜註冊時 catalog epoch（Pair.first）；完成時 head epoch 失配則整批結果丟棄
+    //（不 cache／不 rebind），僅喚醒註冊 epoch 與當代一致的 waiter（見 requestLabelAsync 完成段守衛）。
     // 全部主執行緒觸碰（head＋完成皆主線）；完成隨 inflight 清 map；syncLabelCache 清 cache 不清 callbacks。
     private val labelInflight = mutableSetOf<String>()
-    private val labelCallbacks = mutableMapOf<String, MutableList<(String) -> Unit>>()
+    private val labelCallbacks = mutableMapOf<String, MutableList<Pair<Int?, (String) -> Unit>>>()
     // Phase B B4：Shizuku binder 存活 volatile 快取。listener/onResume/授權回調
     // 經 refreshShizukuPresenceCache 維護，render 經 cachedShizukuPresence 讀快取，
     // 不再每次 render 都 pingBinder。
-    @Volatile private var cachedShizukuNoBinder: Boolean? = null
-    @Volatile private var cachedShizukuAuthorized: Boolean = false
+    // Phase 1a（P3 N2）：雙 volatile 兩步讀寫可撕裂，改單一 holder 原子寫入／原子讀取。
+    private data class CachedShizukuPresence(val noBinder: Boolean?, val authorized: Boolean)
+    @Volatile private var cachedShizukuState: CachedShizukuPresence? = null
 
     // Binder attach (sticky: fires immediately when already connected).
     // The channel may be usable now: re-probe privilege, then reload lists.
@@ -2240,6 +2243,9 @@ class MainActivity : ComponentActivity() {
                 // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
                 contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
+                    // Phase 1a 縱深：disabled 陳舊點按不得進入 requestRemove（按鈕層已有門控，此處再守一層）。
+                    if (v?.isEnabled != true) return@setOnClickListener
+                    if (!writable) return@setOnClickListener
                     try {
                         (v as? Switch)?.isChecked = true
                     } catch (_: Exception) {
@@ -2287,8 +2293,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋targetId＋loading
-    // ＋hook 哨兵態）。Phase E E4：納入 targetId（subtitle 含 targetId，
+    // Phase B B4：分身列表指紋（cloned 內容＋目標 serial＋targetId
+    // ＋hook 哨兵態；刻意不含 loading）。Phase E E4：納入 targetId（subtitle 含 targetId，
     // 未納入則目標切換留殘留舊值）；E2 哨兵態亦須入指紋（tag 顯隱由 hook
     // live 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
     // Phase H：哨兵升格為 hookLiveProven（含 hookBootFresh，boot-fresh 落地
@@ -2296,9 +2302,12 @@ class MainActivity : ComponentActivity() {
     // Phase L L1：追加 catalogKey（labelCacheKey／catalog.hashCode 同源，呼叫端
     // 單次計算傳入，sync＋key 共用一次 hash）。catalog label 變化即重建，
     // 舊快取不再經 !isLabelCached 命中殘留；同內容同 hash，不致過度重建。
+    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步 Switch enabled；
+    // 納入指紋會致每次 op 全量 removeAllViews＋重建＋圖示/label 重發兩次，並推進
+    // clonedGen 使在途回調失效。
     private fun buildClonedListKey(s: UiState, catalogKey: Int): String {
         val hookLiveProven = hookLiveProven(s)
-        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookLiveProven:$catalogKey"
+        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:$hookLiveProven:$catalogKey"
     }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
@@ -2407,8 +2416,8 @@ class MainActivity : ComponentActivity() {
             if (my != shizukuGen) return@launch
             if (presence != null) {
                 try {
-                    cachedShizukuNoBinder = presence.first
-                    cachedShizukuAuthorized = presence.second
+                    // Phase 1a（P3 N2）：holder 單次原子寫入。
+                    cachedShizukuState = CachedShizukuPresence(presence.first, presence.second)
                 } catch (_: Exception) {
                     // Best effort.
                 }
@@ -2543,8 +2552,8 @@ class MainActivity : ComponentActivity() {
                 } ?: return@launch
                 if (my != shizukuGen) return@launch
                 try {
-                    cachedShizukuNoBinder = next.first
-                    cachedShizukuAuthorized = next.second
+                    // Phase 1a（P3 N2）：holder 單次原子寫入。
+                    cachedShizukuState = CachedShizukuPresence(next.first, next.second)
                 } catch (_: Exception) {
                     return@launch
                 }
@@ -2562,9 +2571,11 @@ class MainActivity : ComponentActivity() {
     // Phase F F3：render 只讀快取，不做 live binder。快取未就緒（首幀 IO 未回）回保守
     // 預設（noBinder=true＝未連線），待 refresh 回填後重繪；不再主執行緒 pingBinder。
     private fun cachedShizukuPresence(): Pair<Boolean, Boolean> {
-        val cached = cachedShizukuNoBinder
-        return if (cached != null) {
-            cached to cachedShizukuAuthorized
+        // Phase 1a（P3 N2）：holder 單次原子讀取，不再兩步讀雙 volatile（防撕裂）。
+        val snapshot = cachedShizukuState
+        val noBinder = snapshot?.noBinder
+        return if (noBinder != null && snapshot != null) {
+            noBinder to snapshot.authorized
         } else {
             true to false
         }
@@ -3058,7 +3069,12 @@ class MainActivity : ComponentActivity() {
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
         // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
-        syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
+        // try 包裝比照 renderClonedApps：未來契約 misfire 時降級，不殺 StateFlow collector。
+        try {
+            syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
+        } catch (e: Exception) {
+            Log.w(TAG, "syncRemoveDialog failed", e)
+        }
     }
 
     // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
@@ -3183,6 +3199,9 @@ class MainActivity : ComponentActivity() {
             acknowledgedGeneration = null
             return
         }
+        // Phase 1a：sync 上提到 early-return 之前——對話框顯示中 catalog 變化亦能刷新快取，
+        // 避免殘留舊 cache／舊文案（idempotent＋cheap，見 syncLabelCache）。
+        syncLabelCache(catalogKey)
         if (removeConfirmDialog?.isShowing == true && shownPending == pending) {
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, removeAcknowledged, blockKey == null)
             removeConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !loading
@@ -3210,7 +3229,7 @@ class MainActivity : ComponentActivity() {
         // 不再此處重算）；同步只讀快取＋catalog 預取，
         // miss 顯示 pkg 佔位，dialog 顯示後非同步回填（同 pending 仍在屏才更新）。
         // 主執行緒不打 PM binder（原每 show 一次連續 binder）。
-        syncLabelCache(catalogKey)
+        // Phase 1a：sync 已在 early-return 前完成（見上），此處不再重複。
         var appLabel = resolveAppLabelCached(pending.pkg)
         if (appLabel == pending.pkg) {
             val prefilled = try {
@@ -3310,9 +3329,12 @@ class MainActivity : ComponentActivity() {
         // Phase F F1：快取＋catalog 皆 miss 才起 IO；回來時同 pending 仍在屏才更新
         // 訊息＋標籤詳情（buildRemove* 純函數重算，Phase E 誠實語意不變）。
         if (!isLabelCached(pending.pkg)) {
+            // Phase 1a 世代守衛：回填時 catalog 世代已變則丟棄（dialog 文案以下次 render 重建為準）。
+            val dialogEpoch = labelCacheCatalogKey
             requestLabelAsync(pending.pkg) { fresh ->
                 try {
                     if (shownPending != pending) return@requestLabelAsync
+                    if (dialogEpoch != labelCacheCatalogKey) return@requestLabelAsync
                     val dlg = removeConfirmDialog ?: return@requestLabelAsync
                     if (dlg.isShowing != true) return@requestLabelAsync
                     // Phase K K1：回寫 captured var（NEUTRAL 閉包經 Ref 後續可見），
@@ -3375,7 +3397,9 @@ class MainActivity : ComponentActivity() {
     }
 
     // Phase I I1：只清 cache，不清 labelCallbacks（在途合併中回調仍有效；失效後重填走非同步 IO）。
+    // Phase 1a（P3 N4）：主執行緒專用契約（labelCache／labelInflight／labelCallbacks 皆主線觸碰）。
     private fun syncLabelCache(catalogKey: Int) {
+        check(Looper.getMainLooper().isCurrentThread) { "syncLabelCache must run on main thread" }
         try {
             if (labelCacheCatalogKey != catalogKey) {
                 labelCache.clear()
@@ -3401,7 +3425,9 @@ class MainActivity : ComponentActivity() {
     }
 
     // LRU 寫入（有界 MAX_LABEL_CACHE，滿時淘汰最久未用首項；與圖示快取同式）。
+    // Phase 1a（P3 N4）：主執行緒專用契約。
     private fun cacheLabel(pkg: String, label: String) {
+        check(Looper.getMainLooper().isCurrentThread) { "cacheLabel must run on main thread" }
         try {
             labelCache.remove(pkg)
             if (labelCache.size >= MAX_LABEL_CACHE) {
@@ -3435,23 +3461,35 @@ class MainActivity : ComponentActivity() {
     // 否則記 inflight＋註冊回調後起 IO。完成：remove inflight→cacheLabel→無條件 rebindClonedLabel
     // （I2，tag 精確只碰同 pkg 行，覆蓋防禦性 return 極窄窗口；dialog 無 tag 容器可掃，靠自有回調）。
     // IO 查 PM，主執行緒經各 onLoaded 回填（呼叫端各做 tag/世代檢查後重綁，舊門保留）。
-    // 失敗不快取（包可能稍後出現）但仍清 inflight＋callbacks（drop 不回調，避免洩漏）。
+    // 失敗不快取（包可能稍後出現）；同 epoch 失敗清 inflight＋callbacks（drop 不回調，避免洩漏），
+    // 在途 catalog 變化且有新世代 waiter 則重掛＋重發一次 IO（見 launchLabelLookup 失敗段）。
     // 分身列表規模小（非 200 來源列），不另設 Semaphore。
     // 全部主執行緒觸碰（head 同步＋完成回主線）；syncLabelCache 清 cache 不清 callbacks。
+    // Phase 1a：waiter 攜註冊 epoch；完成時 head epoch 失配（在途 catalog 變化）則整批結果丟棄，
+    // 僅喚醒當代 waiter（見完成段守衛）；同 epoch 路徑語義不變（無條件 rebind＋全量 fanout）。
     private fun requestLabelAsync(pkg: String, onLoaded: (String) -> Unit) {
+        // Phase 1a（P3 N4）：主執行緒專用契約（head＋完成皆主線觸碰 labelCache／inflight／callbacks）。
+        check(Looper.getMainLooper().isCurrentThread) { "requestLabelAsync must run on main thread" }
+        // Phase 1a（P2 世代守衛）：head 在主線 capture catalog epoch，與 pkg 一併作為在途鍵。
+        val reqEpoch = labelCacheCatalogKey
         try {
             if (labelCache.containsKey(pkg)) return
             if (pkg in labelInflight) {
-                labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(onLoaded)
+                labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(reqEpoch to onLoaded)
                 return
             }
             labelInflight.add(pkg)
-            labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(onLoaded)
+            labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(reqEpoch to onLoaded)
         } catch (_: Exception) {
             return
         }
-        lifecycleScope.launch {
-            val label: String? = withContext(Dispatchers.IO) {
+        // Phase 1a（CHANGES-REQUESTED）：IO 發起段抽為 local fun，launch 時重取當代 epoch；
+        // 失敗路徑若在途發生 catalog 變化且有新世代 waiter，重掛＋重發一次 IO，避免新世代
+        // waiter 被舊失敗靜默丟棄。同 epoch 失敗語義不變（全丟，下次 render 重註冊）。
+        fun launchLabelLookup() {
+            val launchEpoch = labelCacheCatalogKey
+            lifecycleScope.launch {
+                val label: String? = withContext(Dispatchers.IO) {
                 try {
                     val info = if (Build.VERSION.SDK_INT >= 33) {
                         packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
@@ -3470,10 +3508,58 @@ class MainActivity : ComponentActivity() {
                 // Best effort.
             }
             if (label == null || label == pkg) {
-                try {
+                val currentEpoch = labelCacheCatalogKey
+                val dropped = try {
                     labelCallbacks.remove(pkg)
                 } catch (_: Exception) {
-                    // Best effort.
+                    null
+                }
+                // 在途 catalog 變化（A→B）且有新世代 waiter：重掛 fresh waiter 並重發一次 IO；
+                // 同 epoch 失敗沿舊語義全丟（cache 仍 miss，下次 render 重註冊）。
+                if (launchEpoch != currentEpoch && dropped != null) {
+                    val fresh = try {
+                        dropped.filter { it.first == currentEpoch }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    if (fresh.isNotEmpty()) {
+                        try {
+                            labelInflight.add(pkg)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                        try {
+                            labelCallbacks.getOrPut(pkg) { mutableListOf() }.addAll(fresh)
+                        } catch (_: Exception) {
+                            try {
+                                labelInflight.remove(pkg)
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            return@launch
+                        }
+                        launchLabelLookup()
+                    }
+                }
+                return@launch
+            }
+            // Phase 1a（P2 世代守衛）：IO 期間 catalog 變化（epoch 失配）則丟棄本 epoch 結果——
+            // 不 cacheLabel、不 rebindClonedLabel；只喚醒註冊 epoch 與當代一致的 waiter，
+            // 過期 waiter 丟棄（cache 仍 miss，下次 render 重註冊）。同 epoch 路徑語義不變。
+            if (launchEpoch != labelCacheCatalogKey) {
+                val currentEpoch = labelCacheCatalogKey
+                val staleWaiters = try {
+                    labelCallbacks.remove(pkg)
+                } catch (_: Exception) {
+                    null
+                } ?: return@launch
+                for ((waiterEpoch, cb) in staleWaiters) {
+                    if (waiterEpoch != currentEpoch) continue
+                    try {
+                        cb(label)
+                    } catch (_: Exception) {
+                        // Best effort: 單個重綁失敗不影響其餘 waiter（下次同步命中）。
+                    }
                 }
                 return@launch
             }
@@ -3489,14 +3575,16 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 null
             } ?: return@launch
-            for (cb in waiters) {
+            for ((_, cb) in waiters) {
                 try {
                     cb(label)
                 } catch (_: Exception) {
                     // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
                 }
             }
+            }
         }
+        launchLabelLookup()
     }
 
     private fun isLabelCached(pkg: String): Boolean = try {
@@ -3545,38 +3633,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 相容舊同步入口。主執行緒只讀快取（miss 回 pkg，不打 PM binder）；
-    // 背景執行緒（已在 IO）保留同步 PM 查詢供非 UI 路徑（key 對齊＋hash 皆在 IO，無主執行緒成本）。
-    private fun resolveAppLabel(pkg: String): String {
-        try {
-            if (Looper.myLooper() == Looper.getMainLooper()) return resolveAppLabelCached(pkg)
-        } catch (_: Exception) {
-            return resolveAppLabelCached(pkg)
-        }
-        syncLabelCache(labelCacheKey())
-        try {
-            labelCache[pkg]?.let {
-                labelCache.remove(pkg)
-                labelCache.put(pkg, it)
-                return it
-            }
-        } catch (_: Exception) {
-            // Best effort: 快取失敗仍走 PM 查詢。
-        }
-        val label = try {
-            val info = if (Build.VERSION.SDK_INT >= 33) {
-                packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getApplicationInfo(pkg, 0)
-            }
-            packageManager.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
-        } catch (_: Exception) {
-            pkg
-        }
-        if (label != pkg) cacheLabel(pkg, label)
-        return label
-    }
+    // 相容舊同步入口：僅主執行緒快取快讀（miss 回 pkg，不打 PM binder）。
+    // Phase 1a（CHANGES-REQUESTED）：背景同步 PM 分支已刪除——syncLabelCache／cacheLabel
+    // 皆有主執行緒契約，背景直呼必拋（且全 repo 零呼叫端）；保留簽名供未來主線呼叫。
+    private fun resolveAppLabel(pkg: String): String = resolveAppLabelCached(pkg)
 
     // PR-7 P2 (#26):來源 catalog 載入 (授權範圍唯讀)。
     // 包到 MainActivity 的生命週期:IO 執行緒讀 PackageManager,回主執行緒注入
