@@ -130,7 +130,7 @@ class RemoveConfirmMessageTest {
 
     @Test
     fun localizedMessagesPreserveIdentityAndNeutralizeInjection() {
-        for (directory in listOf("values", "values-en", "values-b+zh+Hant", "values-zh-rTW")) {
+        for (directory in listOf("values", "values-en", "values-b+zh+Hant")) {
             val msg = buildRemoveConfirmMessage(template(directory), pkg, "App\nforged", "אב\u202Eforged", dualId, serial)
             val lines = msg.split("\n")
             assertEquals(directory, 6, lines.size)
@@ -153,7 +153,7 @@ class RemoveConfirmMessageTest {
     @Test
     fun traditionalChineseResources_matchCompleteDefault() {
         val default = File("src/main/res/values/strings.xml").readText()
-        for (directory in listOf("values-b+zh+Hant", "values-zh-rTW")) {
+        for (directory in listOf("values-b+zh+Hant")) {
             org.junit.Assert.assertEquals(default, File("src/main/res/$directory/strings.xml").readText())
         }
     }

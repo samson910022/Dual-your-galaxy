@@ -471,6 +471,14 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+    // Phase D: 內聯 divider 共用建構（hook 卡片 12dp／診斷清單預設 4dp 上下邊距）。
+    private fun makeDivider(topDp: Int = 4, bottomDp: Int = 4): View = View(this).apply {
+        background = getDrawable(R.drawable.divider_horizontal)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+            setMargins(0, dp(topDp), 0, dp(bottomDp))
+        }
+    }
+
     // Programmatic layout: One UI 6 Two-Tab System Utility Architecture.
     private fun buildUi() {
         // --- 1. Functional Views Initialization (Preserving all IDs and contracts) ---
@@ -655,7 +663,7 @@ class MainActivity : ComponentActivity() {
             id = R.id.write_block_reason
             visibility = View.GONE
             textSize = 12f
-            setTextColor(getColor(R.color.oneui_warning))
+            setTextColor(getColor(R.color.oneui_warning_text))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         inventoryView = TextView(this).apply {
@@ -853,7 +861,7 @@ class MainActivity : ComponentActivity() {
             // Phase A：初值走資源的中性 loading（render 前無通道信號，不預設 LSPosed 綠）。
             text = getString(R.string.status_loading)
             textSize = 11f
-            setTextColor(getColor(R.color.oneui_warning))
+            setTextColor(getColor(R.color.oneui_warning_text))
             typeface = Typeface.MONOSPACE
         }
         statusPillContainer = LinearLayout(this).apply {
@@ -946,199 +954,7 @@ class MainActivity : ComponentActivity() {
             setPadding(pad, dp(8), pad, dp(16))
         }
 
-        // Card 1: Hook Mode Status Card
-        val hookModeCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card)
-            val p = dp(16)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(12)
-            }
-        }
-        val hookTitleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val boltIcon = ImageView(this).apply {
-            setImageDrawable(getDrawable(R.drawable.ic_bolt))
-            setColorFilter(getColor(R.color.oneui_secondary))
-            // Phase C: decorative (card title beside it carries meaning).
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
-                marginEnd = dp(6)
-            }
-        }
-        val hookModeTitle = TextView(this).apply {
-            // Phase A：LSPosed 版本無運行時查詢源，不寫死 102，顯示版本未知。
-            text = getString(R.string.hook_mode_title, getString(R.string.lsposed_version_unknown))
-            textSize = 14f
-            setTextColor(getColor(R.color.oneui_text_primary))
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        hookBadgeChip = TextView(this).apply {
-            text = getString(R.string.hook_badge_sec_hook)
-            textSize = 10f
-            // Phase C: body green text uses the tint (light #046C4E on
-            // #D1FAE5 = 5.68; #059669 was 3.32). Icons/strokes keep secondary.
-            setTextColor(getColor(R.color.oneui_secondary_tint))
-            background = getDrawable(R.drawable.bg_pill_badge_green)
-            visibility = View.GONE
-            val hp = dp(8)
-            val vp = dp(2)
-            setPadding(hp, vp, hp, vp)
-        }
-        hookTitleRow.addView(boltIcon)
-        hookTitleRow.addView(hookModeTitle)
-        hookTitleRow.addView(hookBadgeChip)
-        hookModeCard.addView(hookTitleRow)
-
-        val hookDesc = TextView(this).apply {
-            text = getString(R.string.hook_mode_subtitle)
-            textSize = 12f
-            setTextColor(getColor(R.color.oneui_text_secondary))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(6)
-            }
-        }
-        hookModeCard.addView(hookDesc)
-
-        val hookTagsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
-            }
-        }
-        hookSecPmTag = TextView(this).apply {
-            text = getString(R.string.hook_badge_sec_pm)
-            textSize = 10f
-            // Phase C: blue-pill text uses on_primary_container (light #001D4D
-            // on #D6E4FF = 12.78; night #002958 on #418FFF = 4.52). primary was
-            // 4.24 light and primary_tint (#AAC7FF night) is 1.87 on #418FFF.
-            setTextColor(getColor(R.color.oneui_on_primary_container))
-            background = getDrawable(R.drawable.bg_pill_badge_blue)
-            visibility = View.GONE
-            val hp = dp(8)
-            val vp = dp(2)
-            setPadding(hp, vp, hp, vp)
-        }
-        val tag2 = TextView(this).apply {
-            text = getString(R.string.hook_badge_uid_sandbox)
-            textSize = 10f
-            setTextColor(getColor(R.color.oneui_text_secondary))
-            background = getDrawable(R.drawable.bg_island_card_high)
-            val hp = dp(8)
-            val vp = dp(2)
-            setPadding(hp, vp, hp, vp)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                marginStart = dp(6)
-            }
-        }
-        hookTagsRow.addView(hookSecPmTag)
-        hookTagsRow.addView(tag2)
-        hookModeCard.addView(hookTagsRow)
-
-        val hookDivider = View(this).apply {
-            background = getDrawable(R.drawable.divider_horizontal)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
-                topMargin = dp(12)
-                bottomMargin = dp(12)
-            }
-        }
-        hookModeCard.addView(hookDivider)
-
-        // 3-Column Stats Row
-        val statsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        }
-        val col1 = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card_high)
-            val p = dp(8)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = dp(4)
-            }
-            addView(TextView(context).apply {
-                text = getString(R.string.stats_native_whitelist)
-                textSize = 10f
-                setTextColor(getColor(R.color.oneui_text_tertiary))
-            })
-            addView(TextView(context).apply {
-                // Phase A：官方白名單數無數據源（repo 從未讀取三星白名單），不寫死 5 款。
-                text = getString(R.string.stats_value_unknown)
-                textSize = 15f
-                setTextColor(getColor(R.color.oneui_text_primary))
-                typeface = Typeface.DEFAULT_BOLD
-            })
-        }
-        val col2 = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card_high)
-            val p = dp(8)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(4)
-                marginEnd = dp(4)
-            }
-            addView(TextView(context).apply {
-                text = getString(R.string.stats_injected_count)
-                textSize = 10f
-                // Phase C: primary on island_card_high (#DFE7F0) is 4.35 light
-                // / 4.23 night; tint is 6.50 / 9.35.
-                setTextColor(getColor(R.color.oneui_primary_tint))
-            })
-            clonedCountStatView = TextView(context).apply {
-                // Phase C: initial value via resources (was hardcoded "0 …(Hook)").
-                text = getString(R.string.stats_injected_format, 0, getString(R.string.stats_unit_apps))
-                textSize = 15f
-                setTextColor(getColor(R.color.oneui_primary))
-                typeface = Typeface.DEFAULT_BOLD
-            }
-            addView(clonedCountStatView)
-        }
-        // Phase A A1：第三格由 render() 綁定 hookStatus；初值為未知（amber），
-        // 非 LSPOSED 通道時整格隱藏（對齊 renderHookText 回 null 條件）。
-        hookStatusCell = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card_high)
-            val p = dp(8)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(4)
-            }
-            addView(TextView(context).apply {
-                text = getString(R.string.stats_hook_status)
-                textSize = 10f
-                setTextColor(getColor(R.color.oneui_text_tertiary))
-            })
-            val statusItem = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(ImageView(context).apply {
-                    setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
-                    // Phase C: decorative (hook status text carries the state).
-                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                    layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(4) }
-                }.also { hookStatusDot = it })
-                addView(TextView(context).apply {
-                    text = getString(R.string.stats_hook_unknown)
-                    textSize = 13f
-                    setTextColor(getColor(R.color.oneui_warning))
-                    typeface = Typeface.DEFAULT_BOLD
-                }.also { hookStatusText = it })
-            }
-            addView(statusItem)
-        }
-        statsRow.addView(col1)
-        statsRow.addView(col2)
-        statsRow.addView(hookStatusCell)
-        hookModeCard.addView(statsRow)
-
-        tabAppsLayout.addView(hookModeCard)
+        tabAppsLayout.addView(buildHookModeCard())
 
         // Batch Action Button
         tabAppsLayout.addView(batchBtn)
@@ -1389,6 +1205,474 @@ class MainActivity : ComponentActivity() {
             setPadding(pad, dp(8), pad, dp(16))
         }
 
+        tabEngineLayout.addView(buildEngineMasterCard())
+
+        // Island 2: Channel Preference & Execution Mode
+        val channelCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val channelCardTitle = TextView(this).apply {
+            text = getString(R.string.section_channel_preference)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        channelCard.addView(channelCardTitle)
+        channelCard.addView(channelView)
+        channelCard.addView(channelScroll)
+        channelCard.addView(hookView)
+        channelCard.addView(hookRow)
+        channelCard.addView(hookDiagHint)
+        tabEngineLayout.addView(channelCard)
+
+        // Island 3: System Hook Diagnostics Checklist
+        val checklistCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val checkHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(10)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.diag_checklist_title)
+                textSize = 13f
+                setTextColor(getColor(R.color.oneui_primary))
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            // Phase A：5/5 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
+            checklistSummaryView = TextView(context).apply {
+                text = getString(R.string.engine_diag_unknown)
+                textSize = 11f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+                typeface = Typeface.MONOSPACE
+            }
+            addView(checklistSummaryView)
+        }
+        checklistCard.addView(checkHeader)
+
+        // 5 Diagnostic Items
+        fun addChecklistItem(iconRes: Int, titleStr: String, descStr: String, badgeText: String, isGreen: Boolean = true) {
+            val itemRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                val ip = dp(6)
+                setPadding(0, ip, 0, ip)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+            val itemIcon = ImageView(this).apply {
+                setImageDrawable(getDrawable(iconRes))
+                setColorFilter(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
+                // Phase C: decorative (item title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
+            }
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(context).apply {
+                    text = titleStr
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_text_primary))
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(context).apply {
+                    text = descStr
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                })
+            }
+            val itemBadge = TextView(this).apply {
+                text = badgeText
+                textSize = 10f
+                // Phase C: green badge text uses the tint, blue badge text uses
+                // on_primary_container (see hookBadgeChip/hookSecPmTag).
+                setTextColor(getColor(if (isGreen) R.color.oneui_secondary_tint else R.color.oneui_on_primary_container))
+                background = getDrawable(if (isGreen) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_blue)
+                visibility = View.GONE
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+            }
+            checklistItemBadges.add(itemBadge)
+            itemRow.addView(itemIcon)
+            itemRow.addView(textCol)
+            itemRow.addView(itemBadge)
+            checklistCard.addView(itemRow)
+        }
+
+        checklistItemBadges.clear()
+        addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), "● ${getString(R.string.badge_status_normal)}", true)
+        checklistCard.addView(makeDivider())
+        addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_knox_title), getString(R.string.diag_item_knox_desc), getString(R.string.badge_status_bypassed), false)
+        checklistCard.addView(makeDivider())
+
+        // Item 3: Multi-User UID
+        val uidRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val ip = dp(6)
+            setPadding(0, ip, 0, ip)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            addView(ImageView(context).apply {
+                setImageDrawable(getDrawable(R.drawable.ic_multi_user))
+                setColorFilter(getColor(R.color.oneui_secondary))
+                // Phase C: decorative (multi-user title/desc beside it carries meaning).
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
+            })
+            val textCol = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(context).apply {
+                    text = getString(R.string.diag_item_multiuser_title)
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_text_primary))
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(context).apply {
+                    text = getString(R.string.diag_item_multiuser_desc)
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                })
+            }
+            addView(textCol)
+            engineUidSlotView = TextView(context).apply {
+                // Phase C: initial placeholder via resources (was "UID: —").
+                text = getString(R.string.engine_uid_unknown)
+                textSize = 11f
+                // Phase C: primary on island_card_high is 4.35/4.23; tint is
+                // 6.50/9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
+                background = getDrawable(R.drawable.bg_island_card_high)
+                val hp = dp(6)
+                val vp = dp(2)
+                setPadding(hp, vp, hp, vp)
+                typeface = Typeface.MONOSPACE
+            }
+            addView(engineUidSlotView)
+        }
+        checklistCard.addView(uidRow)
+        checklistCard.addView(makeDivider())
+        addChecklistItem(R.drawable.ic_push_sync, getString(R.string.diag_item_push_title), getString(R.string.diag_item_push_desc), getString(R.string.badge_status_isolated), true)
+        checklistCard.addView(makeDivider())
+        addChecklistItem(R.drawable.ic_badge_style, getString(R.string.diag_item_badge_title), getString(R.string.diag_item_badge_desc), "#2 ${getString(R.string.badge_status_dual_tag)}", false)
+
+        tabEngineLayout.addView(checklistCard)
+
+        // Island 4: Snapshots & Technical Telemetry
+        val techCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        techCard.addView(TextView(this).apply {
+            text = getString(R.string.section_profiles_diagnostics)
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        })
+        techCard.addView(privilegeView)
+        techCard.addView(profilesView)
+        techCard.addView(inventoryView)
+        techCard.addView(lastOpView)
+        techCard.addView(diagView)
+        tabEngineLayout.addView(techCard)
+
+        // Engine Action Buttons
+        val engineActionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(16)
+            }
+            addView(refreshBtn, rowParams())
+            addView(exportBtn, rowParams())
+        }
+        tabEngineLayout.addView(engineActionRow)
+
+        tabEngineScroll.addView(tabEngineLayout)
+        contentFrame.addView(tabEngineScroll)
+        root.addView(contentFrame)
+
+        // ================= Bottom Navigation Bar =================
+        // Phase C: WRAP_CONTENT + minimumHeight (was fixed dp60, clips large
+        // fonts). Touch target stays >= 60dp.
+        val bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(getColor(R.color.oneui_surface_container_lowest))
+            minimumHeight = dp(60)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            elevation = dp(8).toFloat()
+        }
+
+        fun createNavItem(iconRes: Int, labelStr: String, onClick: () -> Unit): LinearLayout {
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                isClickable = true
+                isFocusable = true
+                // Phase C: the item carries the label (+selected state, synced
+                // in updateNavTabStyles); children stay silent to avoid double
+                // announcement.
+                contentDescription = labelStr
+                val p = dp(6)
+                setPadding(p, p, p, p)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                val icon = ImageView(context).apply {
+                    setImageDrawable(getDrawable(iconRes))
+                    setColorFilter(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
+                }
+                val label = TextView(context).apply {
+                    text = labelStr
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        topMargin = dp(2)
+                    }
+                }
+                addView(icon)
+                addView(label)
+                setOnClickListener { onClick() }
+            }
+        }
+
+        navTabApps = createNavItem(R.drawable.ic_nav_dual_apps, getString(R.string.tab_dual_apps)) {
+            switchTab(TAB_DUAL_APPS)
+        }
+        navTabEngine = createNavItem(R.drawable.ic_nav_engine, getString(R.string.tab_core_engine)) {
+            switchTab(TAB_CORE_ENGINE)
+        }
+        navTabSettings = createNavItem(R.drawable.ic_nav_settings, getString(R.string.tab_settings)) {
+            showSettingsDialog()
+        }
+
+        bottomBar.addView(navTabApps)
+        bottomBar.addView(navTabEngine)
+        bottomBar.addView(navTabSettings)
+        root.addView(bottomBar)
+
+        setContentView(root)
+    }
+
+    // Phase D: buildUi 最小拆（純建構提取，行為不變）。兩卡片僅搬移程式碼位置：
+    // lateinit 綁定、Phase A-D 語意、監聽器與初值皆保留原邏輯，不做重構。
+    private fun buildHookModeCard(): LinearLayout {
+        // Card 1: Hook Mode Status Card
+        val hookModeCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(16)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val hookTitleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val boltIcon = ImageView(this).apply {
+            setImageDrawable(getDrawable(R.drawable.ic_bolt))
+            setColorFilter(getColor(R.color.oneui_secondary))
+            // Phase C: decorative (card title beside it carries meaning).
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        val hookModeTitle = TextView(this).apply {
+            // Phase A：LSPosed 版本無運行時查詢源，不寫死 102，顯示版本未知。
+            text = getString(R.string.hook_mode_title, getString(R.string.lsposed_version_unknown))
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        hookBadgeChip = TextView(this).apply {
+            text = getString(R.string.hook_badge_sec_hook)
+            textSize = 10f
+            // Phase C: body green text uses the tint (light #046C4E on
+            // #D1FAE5 = 5.68; #059669 was 3.32). Icons/strokes keep secondary.
+            setTextColor(getColor(R.color.oneui_secondary_tint))
+            background = getDrawable(R.drawable.bg_pill_badge_green)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+        }
+        hookTitleRow.addView(boltIcon)
+        hookTitleRow.addView(hookModeTitle)
+        hookTitleRow.addView(hookBadgeChip)
+        hookModeCard.addView(hookTitleRow)
+
+        val hookDesc = TextView(this).apply {
+            text = getString(R.string.hook_mode_subtitle)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        hookModeCard.addView(hookDesc)
+
+        val hookTagsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        }
+        hookSecPmTag = TextView(this).apply {
+            text = getString(R.string.hook_badge_sec_pm)
+            textSize = 10f
+            // Phase C: blue-pill text uses on_primary_container (light #001D4D
+            // on #D6E4FF = 12.78; night #002958 on #418FFF = 4.52). primary was
+            // 4.24 light and primary_tint (#AAC7FF night) is 1.87 on #418FFF.
+            setTextColor(getColor(R.color.oneui_on_primary_container))
+            background = getDrawable(R.drawable.bg_pill_badge_blue)
+            visibility = View.GONE
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+        }
+        val tag2 = TextView(this).apply {
+            text = getString(R.string.hook_badge_uid_sandbox)
+            textSize = 10f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val hp = dp(8)
+            val vp = dp(2)
+            setPadding(hp, vp, hp, vp)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(6)
+            }
+        }
+        hookTagsRow.addView(hookSecPmTag)
+        hookTagsRow.addView(tag2)
+        hookModeCard.addView(hookTagsRow)
+
+        hookModeCard.addView(makeDivider(12, 12))
+
+        // 3-Column Stats Row
+        val statsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val col1 = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_native_whitelist)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+            addView(TextView(context).apply {
+                // Phase A：官方白名單數無數據源（repo 從未讀取三星白名單），不寫死 5 款。
+                text = getString(R.string.stats_value_unknown)
+                textSize = 15f
+                setTextColor(getColor(R.color.oneui_text_primary))
+                typeface = Typeface.DEFAULT_BOLD
+            })
+        }
+        val col2 = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_injected_count)
+                textSize = 10f
+                // Phase C: primary on island_card_high (#DFE7F0) is 4.35 light
+                // / 4.23 night; tint is 6.50 / 9.35.
+                setTextColor(getColor(R.color.oneui_primary_tint))
+            })
+            clonedCountStatView = TextView(context).apply {
+                // Phase C: initial value via resources (was hardcoded "0 …(Hook)").
+                text = getString(R.string.stats_injected_format, 0, getString(R.string.stats_unit_apps))
+                textSize = 15f
+                setTextColor(getColor(R.color.oneui_primary))
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            addView(clonedCountStatView)
+        }
+        // Phase A A1：第三格由 render() 綁定 hookStatus；初值為未知（amber），
+        // 非 LSPOSED 通道時整格隱藏（對齊 renderHookText 回 null 條件）。
+        hookStatusCell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card_high)
+            val p = dp(8)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(4)
+            }
+            addView(TextView(context).apply {
+                text = getString(R.string.stats_hook_status)
+                textSize = 10f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            })
+            val statusItem = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(ImageView(context).apply {
+                    setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
+                    // Phase C: decorative (hook status text carries the state).
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(4) }
+                }.also { hookStatusDot = it })
+                addView(TextView(context).apply {
+                    text = getString(R.string.stats_hook_unknown)
+                    textSize = 13f
+                    setTextColor(getColor(R.color.oneui_warning_text))
+                    typeface = Typeface.DEFAULT_BOLD
+                }.also { hookStatusText = it })
+            }
+            addView(statusItem)
+        }
+        statsRow.addView(col1)
+        statsRow.addView(col2)
+        statsRow.addView(hookStatusCell)
+        hookModeCard.addView(statsRow)
+        return hookModeCard
+    }
+
+    private fun buildEngineMasterCard(): LinearLayout {
         // Island 1: Master Visual Card
         val engineMasterCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1565,7 +1849,7 @@ class MainActivity : ComponentActivity() {
             shizukuFallbackBadgeView = TextView(context).apply {
                 text = getString(R.string.status_loading)
                 textSize = 10f
-                setTextColor(getColor(R.color.oneui_warning))
+                setTextColor(getColor(R.color.oneui_warning_text))
                 background = getDrawable(R.drawable.bg_pill_badge_amber)
                 val hp = dp(6)
                 val vp = dp(2)
@@ -1585,282 +1869,7 @@ class MainActivity : ComponentActivity() {
         }
         shizukuCard.addView(permRow)
         engineMasterCard.addView(shizukuCard)
-
-        tabEngineLayout.addView(engineMasterCard)
-
-        // Island 2: Channel Preference & Execution Mode
-        val channelCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card)
-            val p = dp(14)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(12)
-            }
-        }
-        val channelCardTitle = TextView(this).apply {
-            text = getString(R.string.section_channel_preference)
-            textSize = 14f
-            setTextColor(getColor(R.color.oneui_text_primary))
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(6)
-            }
-        }
-        channelCard.addView(channelCardTitle)
-        channelCard.addView(channelView)
-        channelCard.addView(channelScroll)
-        channelCard.addView(hookView)
-        channelCard.addView(hookRow)
-        channelCard.addView(hookDiagHint)
-        tabEngineLayout.addView(channelCard)
-
-        // Island 3: System Hook Diagnostics Checklist
-        val checklistCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card)
-            val p = dp(14)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(12)
-            }
-        }
-        val checkHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(10)
-            }
-            addView(TextView(context).apply {
-                text = getString(R.string.diag_checklist_title)
-                textSize = 13f
-                setTextColor(getColor(R.color.oneui_primary))
-                typeface = Typeface.DEFAULT_BOLD
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            // Phase A：5/5 全綠僅在 LSPOSED + ACTIVE 時顯示；初值/無信號為未知。
-            checklistSummaryView = TextView(context).apply {
-                text = getString(R.string.engine_diag_unknown)
-                textSize = 11f
-                setTextColor(getColor(R.color.oneui_text_tertiary))
-                typeface = Typeface.MONOSPACE
-            }
-            addView(checklistSummaryView)
-        }
-        checklistCard.addView(checkHeader)
-
-        // 5 Diagnostic Items
-        fun addChecklistItem(iconRes: Int, titleStr: String, descStr: String, badgeText: String, isGreen: Boolean = true) {
-            val itemRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                val ip = dp(6)
-                setPadding(0, ip, 0, ip)
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            }
-            val itemIcon = ImageView(this).apply {
-                setImageDrawable(getDrawable(iconRes))
-                setColorFilter(getColor(if (isGreen) R.color.oneui_secondary else R.color.oneui_primary))
-                // Phase C: decorative (item title/desc beside it carries meaning).
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
-            }
-            val textCol = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                addView(TextView(context).apply {
-                    text = titleStr
-                    textSize = 13f
-                    setTextColor(getColor(R.color.oneui_text_primary))
-                    typeface = Typeface.DEFAULT_BOLD
-                })
-                addView(TextView(context).apply {
-                    text = descStr
-                    textSize = 11f
-                    setTextColor(getColor(R.color.oneui_text_tertiary))
-                })
-            }
-            val itemBadge = TextView(this).apply {
-                text = badgeText
-                textSize = 10f
-                // Phase C: green badge text uses the tint, blue badge text uses
-                // on_primary_container (see hookBadgeChip/hookSecPmTag).
-                setTextColor(getColor(if (isGreen) R.color.oneui_secondary_tint else R.color.oneui_on_primary_container))
-                background = getDrawable(if (isGreen) R.drawable.bg_pill_badge_green else R.drawable.bg_pill_badge_blue)
-                visibility = View.GONE
-                val hp = dp(6)
-                val vp = dp(2)
-                setPadding(hp, vp, hp, vp)
-            }
-            checklistItemBadges.add(itemBadge)
-            itemRow.addView(itemIcon)
-            itemRow.addView(textCol)
-            itemRow.addView(itemBadge)
-            checklistCard.addView(itemRow)
-        }
-
-        checklistItemBadges.clear()
-        addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), "● ${getString(R.string.badge_status_normal)}", true)
-        checklistCard.addView(View(this).apply { background = getDrawable(R.drawable.divider_horizontal); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) } })
-        addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_knox_title), getString(R.string.diag_item_knox_desc), getString(R.string.badge_status_bypassed), false)
-        checklistCard.addView(View(this).apply { background = getDrawable(R.drawable.divider_horizontal); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) } })
-
-        // Item 3: Multi-User UID
-        val uidRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val ip = dp(6)
-            setPadding(0, ip, 0, ip)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            addView(ImageView(context).apply {
-                setImageDrawable(getDrawable(R.drawable.ic_multi_user))
-                setColorFilter(getColor(R.color.oneui_secondary))
-                // Phase C: decorative (multi-user title/desc beside it carries meaning).
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(10) }
-            })
-            val textCol = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                addView(TextView(context).apply {
-                    text = getString(R.string.diag_item_multiuser_title)
-                    textSize = 13f
-                    setTextColor(getColor(R.color.oneui_text_primary))
-                    typeface = Typeface.DEFAULT_BOLD
-                })
-                addView(TextView(context).apply {
-                    text = getString(R.string.diag_item_multiuser_desc)
-                    textSize = 11f
-                    setTextColor(getColor(R.color.oneui_text_tertiary))
-                })
-            }
-            addView(textCol)
-            engineUidSlotView = TextView(context).apply {
-                // Phase C: initial placeholder via resources (was "UID: —").
-                text = getString(R.string.engine_uid_unknown)
-                textSize = 11f
-                // Phase C: primary on island_card_high is 4.35/4.23; tint is
-                // 6.50/9.35.
-                setTextColor(getColor(R.color.oneui_primary_tint))
-                background = getDrawable(R.drawable.bg_island_card_high)
-                val hp = dp(6)
-                val vp = dp(2)
-                setPadding(hp, vp, hp, vp)
-                typeface = Typeface.MONOSPACE
-            }
-            addView(engineUidSlotView)
-        }
-        checklistCard.addView(uidRow)
-        checklistCard.addView(View(this).apply { background = getDrawable(R.drawable.divider_horizontal); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) } })
-        addChecklistItem(R.drawable.ic_push_sync, getString(R.string.diag_item_push_title), getString(R.string.diag_item_push_desc), getString(R.string.badge_status_isolated), true)
-        checklistCard.addView(View(this).apply { background = getDrawable(R.drawable.divider_horizontal); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) } })
-        addChecklistItem(R.drawable.ic_badge_style, getString(R.string.diag_item_badge_title), getString(R.string.diag_item_badge_desc), "#2 ${getString(R.string.badge_status_dual_tag)}", false)
-
-        tabEngineLayout.addView(checklistCard)
-
-        // Island 4: Snapshots & Technical Telemetry
-        val techCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = getDrawable(R.drawable.bg_island_card)
-            val p = dp(14)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(14)
-            }
-        }
-        techCard.addView(TextView(this).apply {
-            text = getString(R.string.section_profiles_diagnostics)
-            textSize = 14f
-            setTextColor(getColor(R.color.oneui_text_primary))
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(6)
-            }
-        })
-        techCard.addView(privilegeView)
-        techCard.addView(profilesView)
-        techCard.addView(inventoryView)
-        techCard.addView(lastOpView)
-        techCard.addView(diagView)
-        tabEngineLayout.addView(techCard)
-
-        // Engine Action Buttons
-        val engineActionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(16)
-            }
-            addView(refreshBtn, rowParams())
-            addView(exportBtn, rowParams())
-        }
-        tabEngineLayout.addView(engineActionRow)
-
-        tabEngineScroll.addView(tabEngineLayout)
-        contentFrame.addView(tabEngineScroll)
-        root.addView(contentFrame)
-
-        // ================= Bottom Navigation Bar =================
-        // Phase C: WRAP_CONTENT + minimumHeight (was fixed dp60, clips large
-        // fonts). Touch target stays >= 60dp.
-        val bottomBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(getColor(R.color.oneui_surface_container_lowest))
-            minimumHeight = dp(60)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            elevation = dp(8).toFloat()
-        }
-
-        fun createNavItem(iconRes: Int, labelStr: String, onClick: () -> Unit): LinearLayout {
-            return LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                isClickable = true
-                isFocusable = true
-                // Phase C: the item carries the label (+selected state, synced
-                // in updateNavTabStyles); children stay silent to avoid double
-                // announcement.
-                contentDescription = labelStr
-                val p = dp(6)
-                setPadding(p, p, p, p)
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-                val icon = ImageView(context).apply {
-                    setImageDrawable(getDrawable(iconRes))
-                    setColorFilter(getColor(R.color.oneui_text_tertiary))
-                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                    layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
-                }
-                val label = TextView(context).apply {
-                    text = labelStr
-                    textSize = 11f
-                    setTextColor(getColor(R.color.oneui_text_tertiary))
-                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                        topMargin = dp(2)
-                    }
-                }
-                addView(icon)
-                addView(label)
-                setOnClickListener { onClick() }
-            }
-        }
-
-        navTabApps = createNavItem(R.drawable.ic_nav_dual_apps, getString(R.string.tab_dual_apps)) {
-            switchTab(TAB_DUAL_APPS)
-        }
-        navTabEngine = createNavItem(R.drawable.ic_nav_engine, getString(R.string.tab_core_engine)) {
-            switchTab(TAB_CORE_ENGINE)
-        }
-        navTabSettings = createNavItem(R.drawable.ic_nav_settings, getString(R.string.tab_settings)) {
-            showSettingsDialog()
-        }
-
-        bottomBar.addView(navTabApps)
-        bottomBar.addView(navTabEngine)
-        bottomBar.addView(navTabSettings)
-        root.addView(bottomBar)
-
-        setContentView(root)
+        return engineMasterCard
     }
 
     private fun switchTab(tab: Int, announce: Boolean = true) {
@@ -2317,7 +2326,7 @@ class MainActivity : ComponentActivity() {
                         shizukuFallbackDescView.text = getString(R.string.shizuku_state_unauth)
                         shizukuFallbackBadgeView.text = getString(R.string.engine_fallback_unauth)
                         shizukuFallbackBadgeView.background = getDrawable(R.drawable.bg_pill_badge_amber)
-                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_warning))
+                        shizukuFallbackBadgeView.setTextColor(getColor(R.color.oneui_warning_text))
                     }
                     ShizukuCardStatus.AUTHORIZED -> {
                         shizukuFallbackDescView.text = getString(R.string.shizuku_state_ok)
@@ -2532,7 +2541,7 @@ class MainActivity : ComponentActivity() {
                         HookStatus.UNKNOWN_UNREADABLE, HookStatus.UNKNOWN_NO_DIAGNOSTIC -> {
                             hookStatusDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                             hookStatusText.text = getString(R.string.stats_hook_unknown)
-                            hookStatusText.setTextColor(getColor(R.color.oneui_warning))
+                            hookStatusText.setTextColor(getColor(R.color.oneui_warning_text))
                         }
                     }
                 }
@@ -2561,7 +2570,7 @@ class MainActivity : ComponentActivity() {
                         )
                         statusPillText.setTextColor(
                             // Phase C: writable green text uses the tint (see hookBadgeChip).
-                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning),
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning_text),
                         )
                     }
                     ResolvedChannel.SHIZUKU -> {
@@ -2576,7 +2585,7 @@ class MainActivity : ComponentActivity() {
                         )
                         statusPillText.setTextColor(
                             // Phase C: writable green text uses the tint (see hookBadgeChip).
-                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning),
+                            getColor(if (writable) R.color.oneui_secondary_tint else R.color.oneui_warning_text),
                         )
                     }
                     else -> {
@@ -2584,7 +2593,7 @@ class MainActivity : ComponentActivity() {
                         statusPillDot.setImageDrawable(getDrawable(R.drawable.ic_dot_amber))
                         statusPillDot.visibility = View.VISIBLE
                         statusPillContainer.background = getDrawable(R.drawable.bg_pill_badge_amber)
-                        statusPillText.setTextColor(getColor(R.color.oneui_warning))
+                        statusPillText.setTextColor(getColor(R.color.oneui_warning_text))
                     }
                 }
             }
@@ -3266,17 +3275,18 @@ class MainActivity : ComponentActivity() {
     // 對應 key（見 evictIcon／pickIconEvictionKey）。之後回到該 App：快取 miss
     // ＋未 loaded → 重新請求圖示。淘汰永不碰 iconInflight（在途 key 本就不在
     // 快取內，被害者不可能是自己）；完成寫入時即使快取已滿也正常寫入＋淘汰最舊。
-    private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
-        val cached = iconDrawables[appKey]
-        if (cached != null) {
-            val fresh = try {
-                cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
-            } catch (_: Exception) {
-                cached
-            }
-            box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-            return
-        }
+    // Phase D 共用圖示載入核心（雙 requestIcon overload single source）：
+    // 快取命中由 freshIconDrawable 同步供呼叫端綁定；未命中走 loadIcon
+    //（memo/inflight/淘汰/回填），完成經 onLoaded 回主執行緒綁定。
+    // LRU：命中移尾（LinkedHashMap 插入序，首項＝最久未用，
+    // pickIconEvictionKey 照舊淘汰首項）。
+    private fun freshIconDrawable(cached: Drawable): Drawable = try {
+        cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
+    } catch (_: Exception) {
+        cached
+    }
+
+    private fun loadIcon(pkg: String, appKey: String, onLoaded: (Drawable) -> Unit) {
         if (iconMemo.isLoaded(appKey)) return
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
@@ -3294,47 +3304,56 @@ class MainActivity : ComponentActivity() {
                 if (victim != null) evictIcon(victim)
                 iconMemo.markLoaded(appKey)
                 iconDrawables[appKey] = drawable
-                val fresh = try {
-                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
-                } catch (_: Exception) {
-                    drawable
-                }
-                // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
-                // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
-                //（找不到＝已過濾掉／換 catalog，不貼）。
-                try {
-                    if (box.tag == appKey && box.parent === sourceContainer) {
-                        try {
-                            box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-                        } catch (_: Exception) {
-                            // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
-                        }
-                    } else {
-                        for (i in 0 until sourceContainer.childCount) {
-                            val child = sourceContainer.getChildAt(i)
-                            if (child is CheckBox && child.tag == appKey) {
-                                val perView = try {
-                                    drawable.constantState?.newDrawable()?.mutate() ?: fresh
-                                } catch (_: Exception) {
-                                    fresh
-                                }
-                                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
-                                break
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                    // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
-                }
-                // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
-                // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
-                try {
-                    rebindClonedIcon(appKey, drawable)
-                } catch (_: Exception) {
-                    // Best effort.
-                }
+                onLoaded(drawable)
             } finally {
                 iconInflight.remove(appKey)
+            }
+        }
+    }
+
+    private fun requestIcon(pkg: String, appKey: String, box: CheckBox) {
+        val cached = iconDrawables[appKey]
+        if (cached != null) {
+            iconDrawables.remove(appKey)
+            iconDrawables[appKey] = cached
+            box.setCompoundDrawablesWithIntrinsicBounds(freshIconDrawable(cached), null, null, null)
+            return
+        }
+        loadIcon(pkg, appKey) { drawable ->
+            val fresh = freshIconDrawable(drawable)
+            // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
+            // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
+            //（找不到＝已過濾掉／換 catalog，不貼）。
+            try {
+                if (box.tag == appKey && box.parent === sourceContainer) {
+                    try {
+                        box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
+                    } catch (_: Exception) {
+                        // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
+                    }
+                } else {
+                    for (i in 0 until sourceContainer.childCount) {
+                        val child = sourceContainer.getChildAt(i)
+                        if (child is CheckBox && child.tag == appKey) {
+                            val perView = try {
+                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                            } catch (_: Exception) {
+                                fresh
+                            }
+                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                            break
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+            }
+            // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
+            // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
+            try {
+                rebindClonedIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
             }
         }
     }
@@ -3351,64 +3370,38 @@ class MainActivity : ComponentActivity() {
         }
         val cached = iconDrawables[appKey]
         if (cached != null) {
-            val fresh = try {
-                cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
-            } catch (_: Exception) {
-                cached
-            }
+            iconDrawables.remove(appKey)
+            iconDrawables[appKey] = cached
             try {
-                imageView.setImageDrawable(fresh)
+                imageView.setImageDrawable(freshIconDrawable(cached))
             } catch (_: Exception) {
                 // Best effort.
             }
             return
         }
-        if (iconMemo.isLoaded(appKey)) return
-        if (appKey in iconInflight) return
-        iconInflight.add(appKey)
         val capturedGen = gen
-        lifecycleScope.launch {
+        loadIcon(pkg, appKey) { drawable ->
+            if (capturedGen != clonedGen) return@loadIcon
+            val fresh = freshIconDrawable(drawable)
             try {
-                val drawable = withContext(Dispatchers.IO) {
+                if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
                     try {
-                        packageManager.getApplicationIcon(pkg)
+                        imageView.setImageDrawable(fresh)
                     } catch (_: Exception) {
-                        null
-                    }
-                }
-                if (drawable == null) return@launch
-                val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
-                if (victim != null) evictIcon(victim)
-                iconMemo.markLoaded(appKey)
-                iconDrawables[appKey] = drawable
-                if (capturedGen != clonedGen) return@launch
-                val fresh = try {
-                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
-                } catch (_: Exception) {
-                    drawable
-                }
-                try {
-                    if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
-                        try {
-                            imageView.setImageDrawable(fresh)
-                        } catch (_: Exception) {
-                            // Best effort: 舊行 detach 後走容器查找。
-                            rebindClonedIcon(appKey, drawable)
-                        }
-                    } else {
+                        // Best effort: 舊行 detach 後走容器查找。
                         rebindClonedIcon(appKey, drawable)
                     }
-                } catch (_: Exception) {
-                    // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+                } else {
+                    rebindClonedIcon(appKey, drawable)
                 }
-                // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
-                try {
-                    rebindSourceIcon(appKey, drawable)
-                } catch (_: Exception) {
-                    // Best effort.
-                }
-            } finally {
-                iconInflight.remove(appKey)
+            } catch (_: Exception) {
+                // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+            }
+            // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
+            try {
+                rebindSourceIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
             }
         }
     }
@@ -3528,8 +3521,8 @@ class MainActivity : ComponentActivity() {
         private const val MAX_LABEL_CACHE = 200
 
         // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
-        // (orderedKeys.size >= maxSize) 時回傳最舊 key（插入順序第一個），
-        // 未滿回傳 null。只用 stdlib 集合、無 Android 依賴；呼叫方拿到 victim
+        // (orderedKeys.size >= maxSize) 時回傳最久未用 key（Phase D 起 LRU：
+        // 命中移尾，故插入順序第一個＝最久未用），未滿回傳 null。只用 stdlib 集合、無 Android 依賴；呼叫方拿到 victim
         // 後經 evictIcon 同步清除 drawables＋memo 兩處。
         internal fun pickIconEvictionKey(orderedKeys: List<String>, maxSize: Int): String? =
             if (orderedKeys.size >= maxSize) orderedKeys.firstOrNull() else null

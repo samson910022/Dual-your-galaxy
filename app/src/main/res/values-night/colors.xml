@@ -46,6 +46,11 @@
          Residual: warning text on light containers (light theme) still below
          4.5; tracked separately, not changed here. -->
     <color name="oneui_warning_container">#2A1F0D</color>
+    <!-- Phase D: night warning *text* token (#F59E0B: 7.52 on warning_container
+         #2A1F0D, >= 8.3 on dark surfaces; pairs with the amber pill bg and
+         dark canvas. Value intentionally equals night oneui_warning today so
+         text and decoration can diverge later). -->
+    <color name="oneui_warning_text">#F59E0B</color>
     <!-- Phase C: night button/badge text. #002958 on primary_container
          #418FFF = 4.52 (AA). Night primary #0381FE intentionally NOT darkened:
          it passes as text on dark surfaces (4.76-5.23) while #0B6BDD would
