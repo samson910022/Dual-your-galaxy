@@ -48,38 +48,26 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 val old = PendingRemove("com.example.old", 95, 15, "Profile", 1)
                 val replacement = PendingRemove("com.example.new", 95, 15, "Profile", 2)
                 state.value = state.value.copy(pendingRemove = old, loading = false)
+                // 上一行在主執行緒直接改 state，lifecycleScope（Main.immediate）的
+                // collector 會同步重入 render() 並先用 live 參數建好對話框；此處
+                // 若直接 sync 會走 early-return，沿用舊 listener 的 blockKey。
+                // 先解散，強制下面的明確 sync 走重建路徑並掛上測試參數的 listener。
+                try {
+                    (field(activity, "removeConfirmDialog") as AlertDialog?)?.dismiss()
+                } catch (_: Exception) {
+                }
                 sync.invoke(activity, old, false, null, catalogKey)
                 val dialog = field(activity, "removeConfirmDialog") as AlertDialog
                 val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val check = checkbox(dialog.window!!.decorView)!!
                 assertFalse(positive.isEnabled)
                 // 以明確設值驅動勾選（等價於一次點選觸發的 setChecked(true)→listener
-                // 路徑），避免 headless CI 上 performClick 分發差異造成非確定性；
-                // 先清零再置位，無論初始狀態為何都確保 listener 以 checked=true
-                // 觸發一次。
+                // 路徑）；先清零再置位，無論初始狀態為何都確保 listener 以
+                // checked=true 觸發一次。
                 check.isChecked = false
                 check.isChecked = true
-                assertTrue("ack must be checked after explicit set", check.isChecked)
-                val liveDlg = field(activity, "removeConfirmDialog") as AlertDialog
-                val gateDirect = canConfirmRemove(false, true, true)
-                fun countBoxes(v: View): Int {
-                    var n = if (v is CheckBox) 1 else 0
-                    if (v is ViewGroup) for (i in 0 until v.childCount) n += countBoxes(v.getChildAt(i))
-                    return n
-                }
-                val listenerState = try {
-                    val lf = android.widget.CompoundButton::class.java.getDeclaredField("mOnCheckedChangeListener").apply { isAccessible = true }
-                    val bf = android.widget.CompoundButton::class.java.getDeclaredField("mBroadcasting").apply { isAccessible = true }
-                    "listener=${lf.get(check) != null} broadcasting=${bf.getBoolean(check)}"
-                } catch (e: Exception) {
-                    "reflBlocked=${e.javaClass.simpleName}"
-                }
-                assertTrue(
-                    "diag: checked=${check.isChecked} gateDirect=$gateDirect sameDlg=${liveDlg === dialog} " +
-                        "sameBtn=${liveDlg.getButton(AlertDialog.BUTTON_POSITIVE) === positive} btn=${positive.isEnabled} " +
-                        "boxes=${countBoxes(dialog.window!!.decorView)} $listenerState",
-                    positive.isEnabled,
-                )
+                assertTrue(check.isChecked)
+                assertTrue(positive.isEnabled)
                 sync.invoke(activity, old, true, null, catalogKey)
                 assertFalse(positive.isEnabled)
                 assertFalse(dialog.getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled)
@@ -136,15 +124,22 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 val catalogKey = activity.javaClass.getDeclaredMethod("labelCacheKey").apply { isAccessible = true }.invoke(activity) as Int
                 val old = PendingRemove("com.example.old", 95, 15, "Profile", 1)
                 state.value = state.value.copy(pendingRemove = old, loading = false)
+                // 上一行在主執行緒直接改 state，lifecycleScope（Main.immediate）的
+                // collector 會同步重入 render() 並先用 live 參數建好對話框；此處
+                // 若直接 sync 會走 early-return，沿用舊 listener 的 blockKey。
+                // 先解散，強制下面的明確 sync 走重建路徑並掛上測試參數的 listener。
+                try {
+                    (field(activity, "removeConfirmDialog") as AlertDialog?)?.dismiss()
+                } catch (_: Exception) {
+                }
                 sync.invoke(activity, old, false, null, catalogKey)
                 val dialog = field(activity, "removeConfirmDialog") as AlertDialog
                 val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val check = checkbox(dialog.window!!.decorView)!!
                 assertFalse(positive.isEnabled)
                 // 以明確設值驅動勾選（等價於一次點選觸發的 setChecked(true)→listener
-                // 路徑），避免 headless CI 上 performClick 分發差異造成非確定性；
-                // 先清零再置位，無論初始狀態為何都確保 listener 以 checked=true
-                // 觸發一次。
+                // 路徑）；先清零再置位，無論初始狀態為何都確保 listener 以
+                // checked=true 觸發一次。
                 check.isChecked = false
                 check.isChecked = true
                 assertTrue(check.isChecked)
