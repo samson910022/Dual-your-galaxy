@@ -4665,8 +4665,9 @@ class DualViewModel(
     // Elevator instances are reused so fake-injected tests and the Shizuku
     // binder cache survive the swap. Must run under opMutex.
     private suspend fun degradeAutoLocked(hasRoot: Boolean, hasShizuku: Boolean) {
+        // Phase I I4：su 檔探測經 onIo（VM 永不主線直跑阻塞 I/O；binder 類比 swapToLocked）。
         val suPresent = try {
-            suPresentCheck()
+            onIo { suPresentCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false
@@ -4803,14 +4804,16 @@ class DualViewModel(
         // defaults (never lateinit), so this snapshot is safe on every path.
         val oldSu = suGateway
         val oldShizuku = shizukuGateway
+        // Phase I I4：su 檔探測＋Shizuku binder 授權經 onIo（主線永不直呼 binder IPC；
+        // 與 repo/elevator probe 同式，仍在 opMutex 內，dispatcher hop 無死鎖）。
         val suPresent = try {
-            suPresentCheck()
+            onIo { suPresentCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false
         }
         val shizukuAuth = try {
-            shizukuAuthCheck()
+            onIo { shizukuAuthCheck() }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             false

@@ -303,7 +303,11 @@ class MainActivity : ComponentActivity() {
     private val labelCache = LinkedHashMap<String, String>()
     private var labelCacheCatalogKey: Int? = null
     // Phase F F1：label 非同步回填在途集合（與 iconInflight 同式，同一 pkg 在途不重打 PM）。
+    // Phase I I1：per-pkg 回調合併（Codex P2）。同一 pkg 在途時第二 waiter 不再丟棄，
+    // 經 labelCallbacks 合併（各 waiter 舊門保留：行 rowGen/tag、dialog shownPending/isShowing）。
+    // 全部主執行緒觸碰（head＋完成皆主線）；完成隨 inflight 清 map；syncLabelCache 清 cache 不清 callbacks。
     private val labelInflight = mutableSetOf<String>()
+    private val labelCallbacks = mutableMapOf<String, MutableList<(String) -> Unit>>()
     // Phase B B4：Shizuku binder 存活 volatile 快取。listener/onResume/授權回調
     // 經 refreshShizukuPresenceCache 維護，render 經 cachedShizukuPresence 讀快取，
     // 不再每次 render 都 pingBinder。
@@ -2362,22 +2366,49 @@ class MainActivity : ComponentActivity() {
     // otherwise ask Shizuku. The button text mirrors the same boolean split in
     // updateShizukuLine so 文案/動作一致（重連分支為「檢查 Shizuku 並更新」，
     // 與重新連線並更新按鈕「重新連線並更新」區分；未授權分支為「請求 Shizuku 授權」）.
+    // Phase I I4：binder IPC（pingBinder＋checkSelfPermission）搬到 Dispatchers.IO
+    //（refresh 模式：IO 讀＋回主更新／分支）。主執行緒只做分支＋requestPermission＋讀快取重繪，
+    // 永不直呼 pingBinder（讀經 readShizukuPresence 僅 IO 執行緒）。
     private fun requestShizukuPermission() {
-        try {
-            if (!Shizuku.pingBinder()) {
-                // P2-1: permission-button tap re-probes/refreshes but is NOT
-                // consent for privileged `cat` (always false).
-                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
-            } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
-            } else {
-                Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+        lifecycleScope.launch {
+            val presence = try {
+                withContext(Dispatchers.IO) { readShizukuPresence() }
+            } catch (_: Exception) {
+                null
             }
-        } catch (e: Exception) {
-            vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+            if (presence != null) {
+                try {
+                    cachedShizukuNoBinder = presence.first
+                    cachedShizukuAuthorized = presence.second
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+            try {
+                val (noBinder, authorized) = presence ?: cachedShizukuPresence()
+                if (noBinder) {
+                    // P2-1: permission-button tap re-probes/refreshes but is NOT
+                    // consent for privileged `cat` (always false).
+                    vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
+                } else if (authorized) {
+                    vm.reconnectAndRefresh(allowPrivilegedHookDiagnosis = false)
+                } else {
+                    Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+                }
+            } catch (e: Exception) {
+                try {
+                    vm.recheckPrivilege(allowPrivilegedHookDiagnosis = false)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+            refreshShizukuPresenceCache()
+            try {
+                updateShizukuLine()
+            } catch (_: Exception) {
+                // Best effort.
+            }
         }
-        refreshShizukuPresenceCache()
-        updateShizukuLine()
     }
 
     // Shizuku binder/authorization line, read from volatile cache (Phase B B4):
@@ -2449,8 +2480,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Phase A A4：Shizuku binder/授權單次 live 讀取。Phase F F3：僅 IO 執行緒呼叫
-    //（經 refreshShizukuPresenceCache 內 withContext(IO)）；主執行緒永不直呼
+    // Phase A A4：Shizuku binder/授權單次 live 讀取。Phase F F3＋Phase I I4：僅 IO 執行緒呼叫
+    //（經 refreshShizukuPresenceCache／requestShizukuPermission 內 withContext(IO)）；主執行緒永不直呼
     //（binder IPC：pingBinder＋checkSelfPermission）。
     private fun readShizukuPresence(): Pair<Boolean, Boolean> {
         val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
@@ -3299,6 +3330,7 @@ class MainActivity : ComponentActivity() {
         0
     }
 
+    // Phase I I1：只清 cache，不清 labelCallbacks（在途合併中回調仍有效；失效後重填走非同步 IO）。
     private fun syncLabelCache(catalogKey: Int) {
         try {
             if (labelCacheCatalogKey != catalogKey) {
@@ -3354,14 +3386,23 @@ class MainActivity : ComponentActivity() {
         emptyMap()
     }
 
-    // Phase F F1：miss 時 IO 查詢後回填。同一 pkg 在途合併（labelInflight）；IO 查
-    // PM，主執行緒經 onLoaded 回填（呼叫端做 tag/世代檢查後重綁）。失敗不快取
-    //（包可能稍後出現）。分身列表規模小（非 200 來源列），不另設 Semaphore。
+    // Phase F F1：miss 時 IO 查詢後回填。同一 pkg 在途合併（labelInflight＋labelCallbacks）；
+    // Phase I I1：per-pkg 回調合併——head：cache 命中 return；inflight 命中則合併回調後 return；
+    // 否則記 inflight＋註冊回調後起 IO。完成：remove inflight→cacheLabel→無條件 rebindClonedLabel
+    // （I2，tag 精確只碰同 pkg 行，覆蓋防禦性 return 極窄窗口；dialog 無 tag 容器可掃，靠自有回調）。
+    // IO 查 PM，主執行緒經各 onLoaded 回填（呼叫端各做 tag/世代檢查後重綁，舊門保留）。
+    // 失敗不快取（包可能稍後出現）但仍清 inflight＋callbacks（drop 不回調，避免洩漏）。
+    // 分身列表規模小（非 200 來源列），不另設 Semaphore。
+    // 全部主執行緒觸碰（head 同步＋完成回主線）；syncLabelCache 清 cache 不清 callbacks。
     private fun requestLabelAsync(pkg: String, onLoaded: (String) -> Unit) {
         try {
             if (labelCache.containsKey(pkg)) return
-            if (pkg in labelInflight) return
+            if (pkg in labelInflight) {
+                labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(onLoaded)
+                return
+            }
             labelInflight.add(pkg)
+            labelCallbacks.getOrPut(pkg) { mutableListOf() }.add(onLoaded)
         } catch (_: Exception) {
             return
         }
@@ -3384,12 +3425,32 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 // Best effort.
             }
-            if (label == null || label == pkg) return@launch
+            if (label == null || label == pkg) {
+                try {
+                    labelCallbacks.remove(pkg)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                return@launch
+            }
             cacheLabel(pkg, label)
+            // Phase I I2：無條件重綁同 pkg 行（tag 精確），覆蓋各 waiter 防禦性 return 極窄窗口。
             try {
-                onLoaded(label)
+                rebindClonedLabel(pkg, label)
             } catch (_: Exception) {
-                // Best effort: 重綁失敗不影響快取（下次同步命中）。
+                // Best effort: 重綁失敗不影響快取與各回調（下次同步命中）。
+            }
+            val waiters = try {
+                labelCallbacks.remove(pkg)
+            } catch (_: Exception) {
+                null
+            } ?: return@launch
+            for (cb in waiters) {
+                try {
+                    cb(label)
+                } catch (_: Exception) {
+                    // Best effort: 單個重綁失敗不影響快取與其餘 waiter（下次同步命中）。
+                }
             }
         }
     }
@@ -3773,6 +3834,10 @@ class MainActivity : ComponentActivity() {
     // 完成時照抄 CheckBox 版：tag＋容器歸屬雙比對，否則在容器內按 tag 找 ImageView
     // 重綁，找不到丟棄。gen 為 renderClonedApps 世代，過期丟棄綁定（快取保留，
     // 下次渲染同步路徑可直接命中）。
+    // Phase I I3：跨容器重綁（rebindClonedIcon＋rebindSourceIcon）移到 gen 檢查前，
+    // 鏡像來源路徑（CheckBox 版無 gen 門）；tag＋容器雙比對防貼錯，gen 只守直接
+    // setImageDrawable（發起 View 仍掛載才直貼）。避免重建後舊回調因 capturedGen
+    // 擋在重綁前，致新行（同 appKey）永久無圖。
     private fun requestIcon(pkg: String, appKey: String, imageView: ImageView, gen: Int) {
         try {
             imageView.tag = appKey
@@ -3792,6 +3857,18 @@ class MainActivity : ComponentActivity() {
         }
         val capturedGen = gen
         loadIcon(pkg, appKey) { drawable ->
+            // Phase I I3：先跨容器/同容器重綁（tag 精確，找不到丟棄），再做 gen 門。
+            try {
+                rebindClonedIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
+            try {
+                rebindSourceIcon(appKey, drawable)
+            } catch (_: Exception) {
+                // Best effort.
+            }
             if (capturedGen != clonedGen) return@loadIcon
             val fresh = freshIconDrawable(drawable)
             try {
@@ -3799,20 +3876,12 @@ class MainActivity : ComponentActivity() {
                     try {
                         imageView.setImageDrawable(fresh)
                     } catch (_: Exception) {
-                        // Best effort: 舊行 detach 後走容器查找。
-                        rebindClonedIcon(appKey, drawable)
+                        // Best effort: 舊行 detach 後已由上重綁覆蓋。
                     }
-                } else {
-                    rebindClonedIcon(appKey, drawable)
                 }
+                // else 分支已由上重綁覆蓋（容器內按 tag 找同 key 行），此處不再重複。
             } catch (_: Exception) {
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
-            }
-            // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
-            try {
-                rebindSourceIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
             }
         }
     }
@@ -4424,7 +4493,11 @@ private class DualViewModelFactory(
                 Context.MODE_PRIVATE,
             )
             val pref = loadChannelPreference(prefs)
-            val asm = assembleChannel(pref, suBinaryPresent(), shizukuAuthorizedNow(), appPackageName)
+            // Phase I I4：factory 跑主執行緒，永不直呼 binder IPC（shizukuAuthorizedNow）。
+            // 啟動以 fail-closed false 組裝（明選 SHIZUKU 不受影響，仍直選 SHIZUKU；
+            // AUTO 若真有 Shizuku 授權，VM init probeChannels 經 onIo 探測後由
+            // degradeAutoLocked 按 live probe 糾正為 SHIZUKU）。
+            val asm = assembleChannel(pref, suBinaryPresent(), false, appPackageName)
             // PR-7 P2 (#26):選取持久化綁定 app-private SharedPreferences
             // (SELECTION_PREFS_NAME,MODE_PRIVATE);與通道偏好不同檔,互不干擾。
             val selPrefs = appContext.applicationContext.getSharedPreferences(
@@ -4446,6 +4519,8 @@ private class DualViewModelFactory(
                         // Best effort: the in-memory swap already happened.
                     }
                 },
+                // Phase I I4：此二 check 皆可能觸 I/O（su 檔探測／Shizuku binder），
+                // VM 側 swapToLocked/degradeAutoLocked 經 onIo 包裝後呼叫，永不在主線直跑。
                 suPresentCheck = { suBinaryPresent() },
                 shizukuAuthCheck = { shizukuAuthorizedNow() },
                 activeGateway = asm.gateway,
@@ -4484,6 +4559,8 @@ private class DualViewModelFactory(
             }
 
         // Live binder + granted permission, read synchronously (never cached).
+        // Phase I I4：僅 IO 執行緒呼叫（VM 經 onIo 包裝的 shizukuAuthCheck；
+        // factory 啟動不再主線直呼，改 fail-closed false＋probe 糾正）。
         internal fun shizukuAuthorizedNow(): Boolean =
             try {
                 Shizuku.pingBinder() &&
