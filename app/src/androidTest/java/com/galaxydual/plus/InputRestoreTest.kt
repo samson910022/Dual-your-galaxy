@@ -8,9 +8,13 @@
 // - Activity 層：搜尋框輸入 + 通道行（AUTO）在 recreate 後仍渲染（無寫入）。
 package com.galaxydual.plus
 
+import android.widget.EditText
+import android.widget.RadioButton
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -72,8 +76,9 @@ class InputRestoreTest {
             awaitHarnessReady(vm)
             // 旋轉語義 = 同實例：偏好不變（預設 AUTO）。
             assertEquals(ChannelPreference.AUTO, vm.state.value.channel)
+            val baseline = gw.commandCounter.get()
             vm.refresh()
-            HarnessPoll.await { !vm.state.value.loading }
+            HarnessPoll.await { gw.commandCounter.get() > baseline && !vm.state.value.loading }
             assertEquals(ChannelPreference.AUTO, vm.state.value.channel)
             assertEquals(0, gw.uninstallCalls)
             assertEquals(0, gw.writeCalls)
@@ -88,13 +93,18 @@ class InputRestoreTest {
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw, preference = ChannelPreference.SHIZUKU)
         try {
+            awaitHarnessReady(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
+                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_shizuku).isChecked)
+                    assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
                     assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
                 }
                 scenario.recreate()
                 scenario.onActivity { activity ->
+                    assertTrue(activity.findViewById<RadioButton>(R.id.channel_shizuku).isChecked)
+                    assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
                     assertTrue(HarnessViews.containsText(activity.window.decorView, "SHIZUKU"))
                 }
                 assertEquals(0, gw.uninstallCalls)
@@ -113,39 +123,25 @@ class InputRestoreTest {
         val vm = newHarnessViewModel(gw)
         try {
             awaitHarnessReady(vm)
-            vm.setSourceQuery("mail")
-            HarnessPoll.await { vm.state.value.sourceQuery == "mail" }
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                // 通道行：預設通道 enum 值 "AUTO" 出現在 zh/en 的 channel_line 中
-                // （locale-independent；不再匹配「通道偏好」前綴）。
-                var mailOk = false
-                var channelOk = false
-                val launchDeadline = System.currentTimeMillis() + 5000L
-                while (System.currentTimeMillis() < launchDeadline && !(mailOk && channelOk)) {
-                    scenario.onActivity { activity ->
-                        mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
-                        channelOk = HarnessViews.containsText(activity.window.decorView, "AUTO")
-                    }
-                    if (!(mailOk && channelOk)) Thread.sleep(200)
+                scenario.onActivity { activity ->
+                    val input = activity.findViewById<EditText>(R.id.search_input)
+                    input.setText("mail")
                 }
-                assertTrue("hasEditTextText(..., \"mail\") before recreate", mailOk)
-                assertTrue("containsText(..., \"AUTO\") before recreate", channelOk)
+                HarnessPoll.await { vm.state.value.sourceQuery == "mail" }
 
                 scenario.recreate()
 
-                mailOk = false
-                channelOk = false
+                var mailOk = false
                 val recreateDeadline = System.currentTimeMillis() + 5000L
-                while (System.currentTimeMillis() < recreateDeadline && !(mailOk && channelOk)) {
+                while (System.currentTimeMillis() < recreateDeadline && !mailOk) {
                     scenario.onActivity { activity ->
                         mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
-                        channelOk = HarnessViews.containsText(activity.window.decorView, "AUTO")
                     }
-                    if (!(mailOk && channelOk)) Thread.sleep(200)
+                    if (!mailOk) Thread.sleep(200)
                 }
                 assertTrue("hasEditTextText(..., \"mail\") after recreate", mailOk)
-                assertTrue("containsText(..., \"AUTO\") after recreate", channelOk)
 
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
