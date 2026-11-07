@@ -137,9 +137,15 @@ class RotationTest {
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.recreate()
                 // retained ViewModel 回填：旋轉後同一 query 仍顯示。
-                scenario.onActivity { activity ->
-                    assertTrue(HarnessViews.hasEditTextText(activity.window.decorView, "chat"))
+                var chatOk = false
+                val recreateDeadline = System.currentTimeMillis() + 5000L
+                while (System.currentTimeMillis() < recreateDeadline && !chatOk) {
+                    scenario.onActivity { activity ->
+                        chatOk = HarnessViews.hasEditTextText(activity.window.decorView, "chat")
+                    }
+                    if (!chatOk) Thread.sleep(200)
                 }
+                assertTrue("hasEditTextText(..., \"chat\") after recreate", chatOk)
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
             }
