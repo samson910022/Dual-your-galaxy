@@ -174,9 +174,10 @@ dependencies {
     // the app (1.9.0).
     testImplementation(libs.coroutines.test)
     // Phase P29 (issue #29): instrumentation harness (androidTest only,
-    // production untouched). PR CI has no device/emulator, so it only
-    // compiles these via :app:assembleDebugAndroidTest; real connectedCheck
-    // runs on manual dispatch with an emulator (see android.yml
+    // production untouched). PR CI runs the full harness on the
+    // locale-instrumentation job (API 29 emulator) and compiles these via
+    // :app:assembleDebugAndroidTest in the build job; an additional manual
+    // profile (API 34) runs on workflow_dispatch (see android.yml
     // instrumentation-manual). Fake gateway keeps every test zero-write:
     // no test ever calls confirmRemove()/clone on a real gateway.
     androidTestImplementation(libs.test.runner)
