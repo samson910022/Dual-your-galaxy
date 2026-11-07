@@ -112,12 +112,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">Dual App Whitelist Injector</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist</string>
+    <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku)</string>
     <string name="hero_subtitle_engine">Isolated Environment · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
-    <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed.</string>
+    <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
     <string name="hook_badge_uid_sandbox">Isolated UID Sandbox</string>
@@ -129,14 +129,14 @@
     <string name="stats_hook_status">Hook Status</string>
     <string name="stats_hook_active">Active Monitoring</string>
     <string name="stats_unit_apps">apps</string>
-    <string name="section_injected_apps">Force-Injected Dual Apps</string>
+    <string name="section_injected_apps">Cloned Dual Apps</string>
     <string name="section_pending_apps">Available Installed Apps</string>
-    <string name="section_pending_apps_hint">Toggle switch to override dual whitelist</string>
+    <string name="section_pending_apps_hint">Check apps to select; Batch create writes the clones (checking alone writes nothing)</string>
     <string name="section_advanced_manual">Advanced Manual Package Entry</string>
     <string name="status_hook_daemon_running">Native Dual Messenger Core Hook Running</string>
     <string name="status_hook_daemon_desc">Successfully intercepted daagent whitelist verification callbacks</string>
     <string name="engine_status_title">Low-Level Injection Status</string>
-    <string name="engine_status_subtitle">One UI 6.1 · Android 14+</string>
+    <string name="engine_status_subtitle">One UI · Android 10+</string>
     <string name="engine_status_active">Resident</string>
     <string name="engine_gauge_title">LSPosed Core Engine</string>
     <string name="engine_gauge_subtitle">%1$s · Zygote Mode</string>
@@ -198,7 +198,7 @@
     <string name="badge_dual_tag_format">#%1$d %2$s</string>
     <!-- Phase G (i18n): remove-row content description (was hardcoded
          half-width ":" concatenation in code; full-width colon, zh/en sync). -->
-    <string name="remove_row_cd">%1$s：%2$s</string>
+    <string name="remove_row_cd">%1$s: %2$s</string>
     <string name="dual_badge_cd">Clone badge (second copy): %1$s</string>
     <string name="engine_uid_unknown">UID: —</string>
     <string name="nav_tab_state_selected">selected</string>
