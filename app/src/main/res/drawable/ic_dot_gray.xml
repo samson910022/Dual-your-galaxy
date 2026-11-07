@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- Phase A honest state: neutral gray dot for INACTIVE / not-applicable Hook
+     telemetry (pairs with bg_pill_badge_gray). Fill is theme-aware
+     (oneui_text_tertiary has light + night values). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="6dp"
+    android:height="6dp"
+    android:viewportWidth="6"
+    android:viewportHeight="6">
+    <path
+        android:fillColor="@color/oneui_text_tertiary"
+        android:pathData="M3,0a3,3 0 1,0 0.001,0Z" />
+</vector>
