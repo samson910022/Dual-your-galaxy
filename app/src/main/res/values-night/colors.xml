@@ -42,6 +42,16 @@
     <color name="oneui_on_secondary">#003824</color>
 
     <color name="oneui_warning">#F59E0B</color>
+    <!-- Phase C: night warning container. #F59E0B on #2A1F0D = 7.52 (AA).
+         Residual: warning text on light containers (light theme) still below
+         4.5; tracked separately, not changed here. -->
+    <color name="oneui_warning_container">#2A1F0D</color>
+    <!-- Phase C: night button/badge text. #002958 on primary_container
+         #418FFF = 4.52 (AA). Night primary #0381FE intentionally NOT darkened:
+         it passes as text on dark surfaces (4.76-5.23) while #0B6BDD would
+         drop to 3.16-3.69. Night buttons/badges swap bg to primary_container
+         (see drawable-night/bg_pill_button.xml, bg_dual_badge.xml). -->
+    <color name="oneui_button_text">#002958</color>
     <color name="oneui_error">#EF4444</color>
     <color name="oneui_stroke_subtle">#66263044</color>
     <color name="oneui_divider">#99263044</color>
