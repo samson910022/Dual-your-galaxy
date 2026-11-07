@@ -88,6 +88,7 @@ import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
@@ -212,6 +213,11 @@ class MainActivity : ComponentActivity() {
     // PR-37 Phase C #4 圖示 in-flight 追蹤（與已載入分離）：IO 在途的 appKey，
     // 避免同一指紋重建/重繪重複打 PackageManager；成功才 markLoaded。
     private val iconInflight = mutableSetOf<String>()
+    // Phase F F4：圖示 IO 併發上限。來源列表首輪 miss 最多 200 行（MAX_SOURCE_ROWS
+    // 封頂）同時觸發 loadIcon；無上限時 200 個 coroutine 同時打 PackageManager
+    //（binder 突發）。Semaphore(4) 節流，permit 只在 IO 等待期間持有；超額請求在
+    // Activity 作用域排隊，銷毀隨 lifecycleScope 取消。在途去重仍由 iconInflight 承擔。
+    private val iconLoadSemaphore = Semaphore(4)
 
     // PR-6 P2 (#27 後半)：診斷技術細節展開開關 + 最近一次渲染狀態
     // (點診斷行切換展開/收合，需重渲染同一狀態)。
@@ -272,8 +278,13 @@ class MainActivity : ComponentActivity() {
     // capture gen，完成時比對過期丟棄（避免重建後舊圖貼到新行）。
     private var clonedGen = 0
     // Phase B B4：pkg→label 內存快取（catalog 變化失效，避免每次全量 PM IPC）。
+    // Phase F F1/F2：同步路徑只讀快取（見 resolveAppLabelCached），miss 走
+    // requestLabelAsync 非同步回填；catalogKey 由呼叫端迴圈外一次傳入
+    //（見 syncLabelCache），不再每列重算。
     private val labelCache = LinkedHashMap<String, String>()
     private var labelCacheCatalogKey: Int? = null
+    // Phase F F1：label 非同步回填在途集合（與 iconInflight 同式，同一 pkg 在途不重打 PM）。
+    private val labelInflight = mutableSetOf<String>()
     // Phase B B4：Shizuku binder 存活 volatile 快取。listener/onResume/授權回調
     // 經 refreshShizukuPresenceCache 維護，render 經 cachedShizukuPresence 讀快取，
     // 不再每次 render 都 pingBinder。
@@ -2033,6 +2044,11 @@ class MainActivity : ComponentActivity() {
             return
         }
         val writable = blockKey == null
+        // Phase F F2：catalogKey 迴圈外一次計算＋快取對齊（原每列 resolveAppLabel 內重算
+        // sourceCatalog.hashCode()，O(cloned×catalog) → O(catalog)）。
+        // Phase F F1：catalogLabels 本輪預取（reloadCatalog IO 路徑已查好的 label 就地取用）。
+        syncLabelCache(labelCacheKey())
+        val catalogLabels = catalogLabelsFor(s.sourceCatalog)
         for (pkg in s.cloned) {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -2073,6 +2089,8 @@ class MainActivity : ComponentActivity() {
                 // Phase C: badge number via resources (was hardcoded "2") with
                 // theme token text (see cloneBtn); context description is set
                 // below once the app label is resolved.
+                // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
+                tag = "badge:$pkg"
                 text = getString(R.string.badge_number_format, 2)
                 textSize = 10f
                 setTextColor(getColor(R.color.oneui_button_text))
@@ -2095,7 +2113,15 @@ class MainActivity : ComponentActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            val label = resolveAppLabel(pkg)
+            // Phase F F1：同步只讀快取，miss 先顯示 pkg 佔位（catalog 預取次之），
+            // 真標籤經 requestLabelAsync 回填（比照 loadIcon）；主執行緒不打 PM binder。
+            var label = resolveAppLabelCached(pkg)
+            if (label == pkg) {
+                catalogLabels[pkg]?.let {
+                    label = it
+                    cacheLabel(pkg, it)
+                }
+            }
             // Phase C: the "2" badge alone is meaningless to screen readers;
             // name whose second copy it marks.
             try {
@@ -2104,6 +2130,8 @@ class MainActivity : ComponentActivity() {
                 // Best effort: label context is enhancement-only.
             }
             val titleView = TextView(this).apply {
+                // Phase F F1：tag 供非同步回填的 tag 檢查＋重綁定位。
+                tag = pkg
                 text = label
                 textSize = 14f
                 setTextColor(getColor(R.color.oneui_text_primary))
@@ -2155,6 +2183,8 @@ class MainActivity : ComponentActivity() {
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
+                // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
+                tag = "switch:$pkg"
                 contentDescription = "${getString(R.string.action_remove)}: $label"
                 setOnClickListener { v ->
                     try {
@@ -2167,6 +2197,39 @@ class MainActivity : ComponentActivity() {
             }
             row.addView(toggleSwitch)
             clonedAppsContainer.addView(row)
+            // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
+            // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。
+            if (!isLabelCached(pkg)) {
+                val rowGen = gen
+                requestLabelAsync(pkg) { fresh ->
+                    try {
+                        if (rowGen != clonedGen) return@requestLabelAsync
+                        if (titleView.tag != pkg) return@requestLabelAsync
+                        if (!isUnderClonedContainer(titleView)) {
+                            rebindClonedLabel(pkg, fresh)
+                            return@requestLabelAsync
+                        }
+                        try {
+                            titleView.text = fresh
+                        } catch (_: Exception) {
+                            rebindClonedLabel(pkg, fresh)
+                            return@requestLabelAsync
+                        }
+                        try {
+                            badgeView.contentDescription = getString(R.string.dual_badge_cd, fresh)
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                        try {
+                            toggleSwitch.contentDescription = "${getString(R.string.action_remove)}: $fresh"
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                }
+            }
         }
     }
 
@@ -2349,8 +2412,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Phase A A4：Shizuku binder/授權單次 live 讀取（供 updateShizukuLine 狀態行與
-    // 備援卡片共用；pingBinder 守衛 checkSelfPermission，binder 死時顯示未連線不崩潰）。
+    // Phase A A4：Shizuku binder/授權單次 live 讀取。Phase F F3：僅 IO 執行緒呼叫
+    //（經 refreshShizukuPresenceCache 內 withContext(IO)）；主執行緒永不直呼
+    //（binder IPC：pingBinder＋checkSelfPermission）。
     private fun readShizukuPresence(): Pair<Boolean, Boolean> {
         val noBinder: Boolean = try { !Shizuku.pingBinder() } catch (_: Exception) { true }
         val authorized: Boolean = try {
@@ -2363,22 +2427,43 @@ class MainActivity : ComponentActivity() {
 
     // Phase B B4：binder 快取寫入點（listener/onResume/授權回調/按鈕）。
     // render 只讀 cachedShizukuPresence，不直接 pingBinder。
+    // Phase F F3：binder IPC 搬到 Dispatchers.IO（refresh 內 launch IO，結果回主執行緒
+    // 更新快取＋重繪狀態行）。呼叫端當幀的 updateShizukuLine 讀舊快取，IO 回來再刷一次。
     private fun refreshShizukuPresenceCache() {
         try {
-            val (noBinder, authorized) = readShizukuPresence()
-            cachedShizukuNoBinder = noBinder
-            cachedShizukuAuthorized = authorized
+            lifecycleScope.launch {
+                val next = withContext(Dispatchers.IO) {
+                    try {
+                        readShizukuPresence()
+                    } catch (_: Exception) {
+                        null
+                    }
+                } ?: return@launch
+                try {
+                    cachedShizukuNoBinder = next.first
+                    cachedShizukuAuthorized = next.second
+                } catch (_: Exception) {
+                    return@launch
+                }
+                try {
+                    updateShizukuLine()
+                } catch (_: Exception) {
+                    // Best effort: 容器未就緒（測試路徑）時不阻塞快取。
+                }
+            }
         } catch (_: Exception) {
-            // Best effort: 快取失敗時讀路徑回退 live read。
+            // Best effort: 快取失敗時讀路徑回保守預設（見 cachedShizukuPresence）。
         }
     }
 
+    // Phase F F3：render 只讀快取，不做 live binder。快取未就緒（首幀 IO 未回）回保守
+    // 預設（noBinder=true＝未連線），待 refresh 回填後重繪；不再主執行緒 pingBinder。
     private fun cachedShizukuPresence(): Pair<Boolean, Boolean> {
         val cached = cachedShizukuNoBinder
         return if (cached != null) {
             cached to cachedShizukuAuthorized
         } else {
-            readShizukuPresence()
+            true to false
         }
     }
 
@@ -2395,7 +2480,8 @@ class MainActivity : ComponentActivity() {
         // P25: keep the Shizuku binder line in sync on every state render
         // (cheap cached read inside updateShizukuLine, already try/catch
         // guarded for the pre-buildUi test path; live binder reads only happen
-        // in refreshShizukuPresenceCache on binder/onResume/permission paths).
+        // on Dispatchers.IO in refreshShizukuPresenceCache on binder/onResume/
+        // permission paths, Phase F F3).
         // Double-guarded here so a Shizuku-less test harness calling render
         // can never crash on it.
         // PR-6 P2: 同時記住最近一次渲染狀態 (診斷展開/匯出共用)。
@@ -2971,7 +3057,22 @@ class MainActivity : ComponentActivity() {
             removeAcknowledged = false
             acknowledgedGeneration = null
         }
-        val appLabel = resolveAppLabel(pending.pkg)
+        // Phase F F1/F2：入口一次算 key＋對齊快取；同步只讀快取＋catalog 預取，
+        // miss 顯示 pkg 佔位，dialog 顯示後非同步回填（同 pending 仍在屏才更新）。
+        // 主執行緒不打 PM binder（原每 show 一次連續 binder）。
+        syncLabelCache(labelCacheKey())
+        var appLabel = resolveAppLabelCached(pending.pkg)
+        if (appLabel == pending.pkg) {
+            val prefilled = try {
+                catalogLabelsFor(vm.state.value.sourceCatalog)[pending.pkg]
+            } catch (_: Exception) {
+                null
+            }
+            if (prefilled != null) {
+                appLabel = prefilled
+                cacheLabel(pending.pkg, prefilled)
+            }
+        }
         // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：
         // 本地確認畫面顯示完整 package + user/serial，標籤則有明示的上限，
         // 不經 sanitizeForDisplay/redact，否則使用者無法核對卸載目標；
@@ -3056,6 +3157,47 @@ class MainActivity : ComponentActivity() {
         // show 後再設一次以覆蓋 render 更新（在途不可取消，關閉 cancel 窗的使用者路徑）。
         removeConfirmDialog?.setCancelable(!loading)
         removeConfirmDialog?.setCanceledOnTouchOutside(!loading)
+        // Phase F F1：快取＋catalog 皆 miss 才起 IO；回來時同 pending 仍在屏才更新
+        // 訊息＋標籤詳情（buildRemove* 純函數重算，Phase E 誠實語意不變）。
+        if (!isLabelCached(pending.pkg)) {
+            requestLabelAsync(pending.pkg) { fresh ->
+                try {
+                    if (shownPending != pending) return@requestLabelAsync
+                    val dlg = removeConfirmDialog ?: return@requestLabelAsync
+                    if (dlg.isShowing != true) return@requestLabelAsync
+                    val newMessage = buildRemoveConfirmMessage(
+                        template = getString(R.string.remove_confirm_message),
+                        pkg = pending.pkg,
+                        appLabel = fresh,
+                        profileLabel = pending.profileLabel,
+                        dualId = pending.dualId,
+                        serial = pending.dualSerial,
+                    )
+                    try {
+                        dlg.setMessage(newMessage)
+                    } catch (_: Exception) {
+                        try {
+                            dlg.findViewById<TextView>(android.R.id.message)?.text = newMessage
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                    }
+                    try {
+                        removeLabelsDialog?.setMessage(
+                            buildRemoveLabelsMessage(
+                                getString(R.string.remove_confirm_labels),
+                                fresh,
+                                pending.profileLabel,
+                            ),
+                        )
+                    } catch (_: Exception) {
+                        // Best effort: 標籤詳情未展開時無需更新。
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        }
     }
 
     // Best-effort display name for the dialog: the PackageManager label when
@@ -3064,14 +3206,176 @@ class MainActivity : ComponentActivity() {
     // names the exact uninstall target.
     // Phase B B4：pkg→label 內存快取（有界 200，與圖示快取同級）。
     // catalog 引用變化即失效（重裝/卸載後標籤可能改變）；失敗不快取（包可能稍後出現）。
-    private fun resolveAppLabel(pkg: String): String {
+    // Phase F F1：主執行緒永不 PM IPC。同步路徑只讀快取（resolveAppLabelCached），
+    // miss 回 pkg 佔位並經 requestLabelAsync 在 IO 查詢後回填＋重綁（比照 loadIcon：
+    // tag/世代檢查，過期丟棄，快取保留）。catalog 自帶 label（IO 已查好）由呼叫端
+    // 經 catalogLabelsFor 優先填入，等價於 reloadCatalog IO 路徑預取且無執行緒競爭。
+    // Phase F F2：catalogKey 由呼叫端（renderClonedApps/syncRemoveDialog 入口）一次
+    // 計算傳入 syncLabelCache，不再每列重算 sourceCatalog.hashCode()
+    //（O(cloned×catalog) → O(catalog)）。命中移尾改 LRU（與圖示快取一致 remove+put，
+    // 首項＝最久未用）。失效語義保留全清：label 僅顯示用，重裝/卸載後標籤可能改變，
+    // 全清為正確性優先的簡單選擇（重填走非同步 IO，有界 200，不阻塞主執行緒）。
+    private fun labelCacheKey(): Int = try {
+        vm.state.value.sourceCatalog.hashCode()
+    } catch (_: Exception) {
+        0
+    }
+
+    private fun syncLabelCache(catalogKey: Int) {
         try {
-            val catalogKey = try { vm.state.value.sourceCatalog.hashCode() } catch (_: Exception) { 0 }
             if (labelCacheCatalogKey != catalogKey) {
                 labelCache.clear()
                 labelCacheCatalogKey = catalogKey
             }
-            labelCache[pkg]?.let { return it }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // 同步只讀快取（LRU 命中移尾），miss 回 pkg，不打 PM binder。主執行緒唯一同步入口。
+    private fun resolveAppLabelCached(pkg: String): String {
+        try {
+            labelCache[pkg]?.let {
+                labelCache.remove(pkg)
+                labelCache.put(pkg, it)
+                return it
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        return pkg
+    }
+
+    // LRU 寫入（有界 MAX_LABEL_CACHE，滿時淘汰最久未用首項；與圖示快取同式）。
+    private fun cacheLabel(pkg: String, label: String) {
+        try {
+            labelCache.remove(pkg)
+            if (labelCache.size >= MAX_LABEL_CACHE) {
+                labelCache.keys.firstOrNull()?.let { labelCache.remove(it) }
+            }
+            labelCache[pkg] = label
+        } catch (_: Exception) {
+            // Best effort: 快取寫入失敗不影響顯示。
+        }
+    }
+
+    // render 側 catalog 預取：catalog 每項 label 本就在 reloadCatalog IO 路徑查好，
+    // 此處一次建表（O(catalog)）供本輪各列 O(1) 取用並順手灌快取；仍缺才走
+    // requestLabelAsync。呼叫端（renderClonedApps/dialog）在同步綁定前呼叫。
+    private fun catalogLabelsFor(catalog: List<SourceAppEntry>): Map<String, String> = try {
+        val m = HashMap<String, String>(catalog.size)
+        for (e in catalog) {
+            try {
+                if (e.label.isNotBlank() && e.label != e.packageName) m[e.packageName] = e.label
+            } catch (_: Exception) {
+                continue
+            }
+        }
+        m
+    } catch (_: Exception) {
+        emptyMap()
+    }
+
+    // Phase F F1：miss 時 IO 查詢後回填。同一 pkg 在途合併（labelInflight）；IO 查
+    // PM，主執行緒經 onLoaded 回填（呼叫端做 tag/世代檢查後重綁）。失敗不快取
+    //（包可能稍後出現）。分身列表規模小（非 200 來源列），不另設 Semaphore。
+    private fun requestLabelAsync(pkg: String, onLoaded: (String) -> Unit) {
+        try {
+            if (labelCache.containsKey(pkg)) return
+            if (pkg in labelInflight) return
+            labelInflight.add(pkg)
+        } catch (_: Exception) {
+            return
+        }
+        lifecycleScope.launch {
+            val label: String? = withContext(Dispatchers.IO) {
+                try {
+                    val info = if (Build.VERSION.SDK_INT >= 33) {
+                        packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        packageManager.getApplicationInfo(pkg, 0)
+                    }
+                    packageManager.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() }
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            try {
+                labelInflight.remove(pkg)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            if (label == null || label == pkg) return@launch
+            cacheLabel(pkg, label)
+            try {
+                onLoaded(label)
+            } catch (_: Exception) {
+                // Best effort: 重綁失敗不影響快取（下次同步命中）。
+            }
+        }
+    }
+
+    private fun isLabelCached(pkg: String): Boolean = try {
+        labelCache.containsKey(pkg)
+    } catch (_: Exception) {
+        false
+    }
+
+    // Phase F F1：分身行 label 回填 fallback（發起行已 detach 時走容器按 tag 查找）。
+    // 同行內按 tag 更新：title（tag=pkg）設文字，badge（tag=badge:pkg）與
+    // Switch（tag=switch:pkg）更新 contentDescription；找不到丟棄（快取保留）。
+    // Switch 亦為 TextView 子類，故 title 查找另加型別守衛（title 建時只給純 TextView
+    // 設 tag=pkg，Switch 的 tag 為 switch:pkg）。
+    private fun rebindClonedLabel(pkg: String, label: String) {
+        try {
+            if (!::clonedAppsContainer.isInitialized) return
+            for (i in 0 until clonedAppsContainer.childCount) {
+                val row = clonedAppsContainer.getChildAt(i) as? ViewGroup ?: continue
+                val title = try {
+                    row.findViewWithTag<TextView>(pkg)
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+                if (title is Switch) continue
+                try {
+                    title.text = label
+                } catch (_: Exception) {
+                    continue
+                }
+                try {
+                    row.findViewWithTag<TextView>("badge:$pkg")?.contentDescription =
+                        getString(R.string.dual_badge_cd, label)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    row.findViewWithTag<Switch>("switch:$pkg")?.contentDescription =
+                        "${getString(R.string.action_remove)}: $label"
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // 相容舊同步入口。主執行緒只讀快取（miss 回 pkg，不打 PM binder）；
+    // 背景執行緒（已在 IO）保留同步 PM 查詢供非 UI 路徑（key 對齊＋hash 皆在 IO，無主執行緒成本）。
+    private fun resolveAppLabel(pkg: String): String {
+        try {
+            if (Looper.myLooper() == Looper.getMainLooper()) return resolveAppLabelCached(pkg)
+        } catch (_: Exception) {
+            return resolveAppLabelCached(pkg)
+        }
+        syncLabelCache(labelCacheKey())
+        try {
+            labelCache[pkg]?.let {
+                labelCache.remove(pkg)
+                labelCache.put(pkg, it)
+                return it
+            }
         } catch (_: Exception) {
             // Best effort: 快取失敗仍走 PM 查詢。
         }
@@ -3086,16 +3390,7 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             pkg
         }
-        if (label != pkg) {
-            try {
-                if (labelCache.size >= MAX_LABEL_CACHE) {
-                    labelCache.keys.firstOrNull()?.let { labelCache.remove(it) }
-                }
-                labelCache[pkg] = label
-            } catch (_: Exception) {
-                // Best effort: 快取寫入失敗不影響顯示。
-            }
-        }
+        if (label != pkg) cacheLabel(pkg, label)
         return label
     }
 
@@ -3311,6 +3606,18 @@ class MainActivity : ComponentActivity() {
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
         lifecycleScope.launch {
+            // Phase F F4：併發上限（見 iconLoadSemaphore）。acquire 失敗（銷毀取消）
+            // 即清 inflight 返回，允許下次列表重建時重試。
+            try {
+                iconLoadSemaphore.acquire()
+            } catch (_: Exception) {
+                try {
+                    iconInflight.remove(appKey)
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                return@launch
+            }
             try {
                 val drawable = withContext(Dispatchers.IO) {
                     try {
@@ -3326,6 +3633,11 @@ class MainActivity : ComponentActivity() {
                 iconDrawables[appKey] = drawable
                 onLoaded(drawable)
             } finally {
+                try {
+                    iconLoadSemaphore.release()
+                } catch (_: Exception) {
+                    // Best effort.
+                }
                 iconInflight.remove(appKey)
             }
         }
