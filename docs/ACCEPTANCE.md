@@ -11,12 +11,17 @@
 | 欄位 | 值 |
 | --- | --- |
 | source commit | `<git rev-parse HEAD>` |
-| APK SHA256 | `<sha256sum app-debug.apk>`（CI 產物見 `apk-debug` artifact；無 emulator 時由本機 build 取得） |
+| APK SHA256 | `<sha256sum app-debug.apk>`（**測試位元組證據必須來自 manual job 的 `tested-apk-provenance` artifact**；`apk-debug` artifact 僅為編譯產物，**不是** tested-byte 證據；無 emulator 時由本機 build 取得且須自行記錄 provenance） |
 | 測試 APK（androidTest） | `<sha256sum ...-androidTest.apk>` |
 | 裝置 / 模擬器 | 例：Pixel 8 API 34 emulator / S24 One UI 6.1 |
 | 通道 | Auto / Root / Shizuku / LSPosed（實際以畫面「實際：」行為準） |
 | 驗收人 / 日期 | |
 | 已測 APK provenance | manual job 產出的 `tested-apk-provenance` artifact（`tested-apk-provenance.txt`：GITHUB_SHA、APK 路徑/SHA256、emulator API/profile、command、result） |
+| artifact / run ID | `<workflow run id / artifact name>`（例：`instrumentation-manual` run #N 的 `tested-apk-provenance`） |
+| artifact source commit | `<GITHUB_SHA from tested-apk-provenance.txt>` |
+| installed APK SHA | `<APP_SHA256 from tested-apk-provenance.txt>`（實機安裝之 APK SHA，須與上列 APK SHA256 一致） |
+| install result | 成功 / 失敗（含錯誤訊息） |
+| versionCode / versionName | `<versionCode>` / `<versionName>`（須與 app/build.gradle.kts 一致） |
 
 ## 2. 操作矩陣
 

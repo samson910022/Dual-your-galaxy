@@ -266,11 +266,10 @@ jobs:
             **/build/test-results/
           if-no-files-found: warn
           retention-days: 14
-      # Phase P29 (issue #29): instrumentation harness compiles on every PR,
-      # but never executes here -- hosted runners have no device/emulator.
-      # :app:assembleDebugAndroidTest only compiles androidTest (plus its
-      # runner/espresso/test deps); connectedCheck stays manual
-      # (see the instrumentation-manual job below, workflow_dispatch only).
+      # Phase P29 (issue #29): the build job only compiles androidTest here;
+      # the full harness executes on the locale-instrumentation job above
+      # (API 29 emulator) on every PR. connectedCheck in this job stays a
+      # compile gate only (see locale-instrumentation job for execution).
       - name: Compile androidTest (no device needed)
         run: |
           chmod +x ./gradlew
@@ -305,12 +304,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # Phase P29 (issue #29): instrumentation runs only on manual dispatch with
-  # an emulator -- PR CI has no device, so it only compiles androidTest (see
-  # the "Compile androidTest" step above). Current manual job runs a single
-  # profile (API 34, matches compileSdk/targetSdk); API 29 (minSdk floor)
-  # stays a follow-up. Record each manual run in docs/ACCEPTANCE.md (commit /
-  # APK SHA256 / operation / expected / actual / untested / redaction statement).
+  # Phase P29 (issue #29): instrumentation manual profile (API 34, matches
+  # compileSdk/targetSdk) runs on workflow_dispatch; the API 29 (minSdk floor)
+  # profile runs on every PR via the locale-instrumentation job above.
+  # Record each manual run in docs/ACCEPTANCE.md (commit / APK SHA256 /
+  # operation / expected / actual / untested / redaction statement).
   instrumentation-manual:
     name: Instrumentation (manual emulator matrix)
     if: github.event_name == 'workflow_dispatch'
