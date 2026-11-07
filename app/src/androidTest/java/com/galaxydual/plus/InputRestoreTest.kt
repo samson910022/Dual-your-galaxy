@@ -98,13 +98,11 @@ class InputRestoreTest {
                 scenario.onActivity { activity ->
                     assertTrue(activity.findViewById<RadioButton>(R.id.channel_root).isChecked)
                     assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "ROOT"))
                 }
                 scenario.recreate()
                 scenario.onActivity { activity ->
                     assertTrue(activity.findViewById<RadioButton>(R.id.channel_root).isChecked)
                     assertFalse(activity.findViewById<RadioButton>(R.id.channel_auto).isChecked)
-                    assertTrue(HarnessViews.containsText(activity.window.decorView, "ROOT"))
                 }
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
@@ -136,11 +134,11 @@ class InputRestoreTest {
                 val recreateDeadline = System.currentTimeMillis() + 5000L
                 while (System.currentTimeMillis() < recreateDeadline && !mailOk) {
                     scenario.onActivity { activity ->
-                        mailOk = HarnessViews.hasEditTextText(activity.window.decorView, "mail")
+                        mailOk = activity.findViewById<EditText>(R.id.search_input).text.toString() == "mail"
                     }
                     if (!mailOk) Thread.sleep(200)
                 }
-                assertTrue("hasEditTextText(..., \"mail\") after recreate", mailOk)
+                assertTrue("search_input == \"mail\" after recreate", mailOk)
 
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)

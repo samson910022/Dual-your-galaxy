@@ -10,8 +10,10 @@
 //   ViewModel 回填 sourceQuery）；recreate 不崩潰。
 package com.galaxydual.plus
 
+import android.widget.EditText
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -109,11 +111,11 @@ class RotationTest {
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
-                    assertTrue(HarnessViews.isRemoveDialogShowing(activity))
+                    assertTrue(isRemoveDialogShowing(activity))
                 }
                 scenario.recreate()
                 scenario.onActivity { activity ->
-                    assertTrue(HarnessViews.isRemoveDialogShowing(activity))
+                    assertTrue(isRemoveDialogShowing(activity))
                 }
                 assertEquals(0, gw.uninstallCalls)
                 assertEquals(0, gw.writeCalls)
@@ -141,7 +143,7 @@ class RotationTest {
                 val recreateDeadline = System.currentTimeMillis() + 5000L
                 while (System.currentTimeMillis() < recreateDeadline && !chatOk) {
                     scenario.onActivity { activity ->
-                        chatOk = HarnessViews.hasEditTextText(activity.window.decorView, "chat")
+                        chatOk = activity.findViewById<EditText>(R.id.search_input).text.toString() == "chat"
                     }
                     if (!chatOk) Thread.sleep(200)
                 }

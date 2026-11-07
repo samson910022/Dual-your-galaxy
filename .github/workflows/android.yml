@@ -355,6 +355,28 @@ jobs:
           test -f "$TEST_APK"
           APP_SHA=$(sha256sum "$APP_APK" | awk '{print $1}')
           TEST_SHA=$(sha256sum "$TEST_APK" | awk '{print $1}')
+          # Extract aggregate test counts from androidTest result XMLs.
+          TEST_COUNTS=$(python3 <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          tests = failures = errors = skipped = 0
+          for f in glob.glob('app/build/outputs/androidTest-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for ts in root.iter('testsuite'):
+                  try:
+                      tests += int(ts.get('tests', '0') or '0')
+                      failures += int(ts.get('failures', '0') or '0')
+                      errors += int(ts.get('errors', '0') or '0')
+                      skipped += int(ts.get('skipped', '0') or '0')
+                  except ValueError:
+                      pass
+          print(tests, failures, errors, skipped)
+          PY
+          )
+          set -- $TEST_COUNTS
+          TESTS=$1; FAILURES=$2; ERRORS=$3; SKIPPED=$4
           mkdir -p app/build
           {
             echo "GITHUB_SHA=$GITHUB_SHA"
@@ -367,6 +389,10 @@ jobs:
             echo "EMULATOR_ARCH=x86_64"
             echo "COMMAND=./gradlew :app:connectedDebugAndroidTest"
             echo "RESULT=${{ job.status }}"
+            echo "TESTS=$TESTS"
+            echo "FAILURES=$FAILURES"
+            echo "ERRORS=$ERRORS"
+            echo "SKIPPED=$SKIPPED"
           } > app/build/tested-apk-provenance.txt
           echo "=== tested-apk-provenance.txt ==="
           cat app/build/tested-apk-provenance.txt
@@ -380,7 +406,7 @@ jobs:
           path: |
             **/build/reports/androidTests/
             **/build/outputs/androidTest-results/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
       - name: Upload tested APKs + provenance
         if: always()
@@ -391,5 +417,5 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
             app/build/tested-apk-provenance.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
