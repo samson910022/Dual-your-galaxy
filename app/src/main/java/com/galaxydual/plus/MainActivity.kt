@@ -1988,13 +1988,15 @@ class MainActivity : ComponentActivity() {
                 .setTitle(getString(R.string.tab_settings))
                 // Phase C: about copy fully resourced (was hardcoded English
                 // "Version 0.0.1 ..." + "MIT ..."); version is dynamic.
+                // Phase H P1：%4$s live 宣稱經 hookLiveProven 門控，無 boot-fresh 證據時
+                // 用中性 engine_diag_unknown（既有鍵，不新增綠文案），不直嵌 daemon_running.
                 .setMessage(
                     getString(
                         R.string.settings_about_format,
                         getString(R.string.hero_title_engine),
                         appVersionName(),
                         getString(R.string.settings_about_feature),
-                        getString(R.string.status_hook_daemon_running),
+                        getString(if (hookLiveProven(vm.state.value)) R.string.status_hook_daemon_running else R.string.engine_diag_unknown),
                         getString(R.string.hook_mode_subtitle),
                         getString(R.string.settings_license),
                     ),
