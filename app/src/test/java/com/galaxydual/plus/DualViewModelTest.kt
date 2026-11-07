@@ -209,6 +209,7 @@ class DualViewModelTest {
             currentChannel = ResolvedChannel.NOOP,
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
+            blockText = zhTestBlockText(),
         )
 
     // Select-test rig: fake-backed channel assembly through the

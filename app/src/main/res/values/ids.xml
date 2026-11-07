@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- p28-1 穩定 ID：程式化 View 以資源 ID 供狀態保存（旋轉恢復輸入/游標）與未來 UI 測試定位。 -->
+<resources>
+    <item name="pkg_input" type="id" />
+    <item name="search_input" type="id" />
+    <item name="channel_group" type="id" />
+    <item name="channel_auto" type="id" />
+    <item name="channel_root" type="id" />
+    <item name="channel_shizuku" type="id" />
+    <item name="channel_lsposed" type="id" />
+    <item name="clone_btn" type="id" />
+    <item name="remove_btn" type="id" />
+    <item name="refresh_btn" type="id" />
+    <item name="perm_btn" type="id" />
+    <item name="batch_btn" type="id" />
+    <item name="msg_view" type="id" />
+    <item name="write_block_reason" type="id" />
+    <item name="channel_scroll" type="id" />
+</resources>

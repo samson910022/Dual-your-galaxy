@@ -17,8 +17,9 @@
 //   pick keeps the F4a file heuristic (su presence first, then Shizuku auth,
 //   else NoOp) so the factory stays I/O-free, but DualViewModel degrades that
 //   pick once elevator probes report actual capability (see resolveAutoProbe):
-//   su present but probe-denied + Shizuku proven -> SHIZUKU with a degrade
-//   note; both probes failing -> NOOP read-only; both succeeding -> ROOT.
+//   su present but probe-denied + Shizuku proven -> SHIZUKU with a typed
+//   degrade (WriteBlock); both probes failing -> NOOP read-only (typed);
+//   both succeeding -> ROOT (null degrade).
 //   The hook channel is never auto-selected (conservative continuation:
 //   the marker signal is display-only evidence, see HookMarker, and must
 //   never grant privilege without on-device verification).
@@ -111,18 +112,19 @@ fun ChannelPreference.resolveChannel(suPresent: Boolean, shizukuAuthorized: Bool
 // - hasRoot true -> ROOT (su first; covers both-probes-succeed: follows the
 //   F4a preference order, no degrade note).
 // - else hasShizuku true -> SHIZUKU; when suPresent is also true the su file
-//   exists but its probe was denied, so this is a degrade and the note
-//   records the reason plus the recovery entry.
-// - else NOOP read-only with a note stating both probes failed plus recovery.
-// F7 semantics (locked by AutoDegradeTest): the note records DOWNWARD
+//   exists but its probe was denied, so this is a degrade and the typed reason
+//   (WriteBlock) records it plus the recovery entry via resources.
+// - else NOOP read-only with a typed reason stating both probes failed plus
+//   recovery (via resources).
+// F7 semantics (locked by AutoDegradeTest): the typed reason records DOWNWARD
 // overrides only. Recovery/upgrade back to ROOT (hasRoot true) is silent by
-// design (empty note) -- a proven ROOT channel needs no explanation.
+// design (null) -- a proven ROOT channel needs no explanation.
 // Explicit preferences never reach here (the ViewModel only calls this for
 // AUTO): explicit choices never cross channels, they fail closed with their
 // own message instead.
 data class AutoProbeDecision(
     val channel: ResolvedChannel,
-    val degradeNote: String,
+    val degrade: WriteBlock? = null,
 )
 
 fun resolveAutoProbe(
@@ -130,27 +132,24 @@ fun resolveAutoProbe(
     hasRoot: Boolean,
     hasShizuku: Boolean,
 ): AutoProbeDecision = when {
-    hasRoot -> AutoProbeDecision(ResolvedChannel.ROOT, "")
+    hasRoot -> AutoProbeDecision(ResolvedChannel.ROOT, null)
     hasShizuku -> if (suPresent) {
         AutoProbeDecision(
             ResolvedChannel.SHIZUKU,
-            "Auto 已依實測降級：偵測到 su 但探測拒絕（id -u 未通過），已切換至 Shizuku；" +
-                "如需恢復 ROOT 請檢查 su 授權後點「重新連線並更新」",
+            WriteBlock(WriteBlockKind.AUTO_DEGRADE_SU_TO_SHIZUKU),
         )
     } else {
-        AutoProbeDecision(ResolvedChannel.SHIZUKU, "")
+        AutoProbeDecision(ResolvedChannel.SHIZUKU, null)
     }
     else -> if (suPresent) {
         AutoProbeDecision(
             ResolvedChannel.NOOP,
-            "Auto 實測雙通道皆失敗（su 存在但拒絕且 Shizuku 未通過），目前唯讀；" +
-                "請檢查授權後點「重新連線並更新」",
+            WriteBlock(WriteBlockKind.AUTO_DEGRADE_BOTH_FAILED),
         )
     } else {
         AutoProbeDecision(
             ResolvedChannel.NOOP,
-            "Auto 實測無可用通道（su 不存在且 Shizuku 未通過），目前唯讀；" +
-                "授權 Shizuku 或取得 ROOT 後點「重新連線並更新」",
+            WriteBlock(WriteBlockKind.AUTO_DEGRADE_NO_CHANNEL),
         )
     }
 }

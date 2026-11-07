@@ -22,9 +22,11 @@
 // - 時間一律 wall-clock (System.currentTimeMillis)：有回撥/偽造風險，僅為
 //   存在性證據，絕不作授權依據。needsRefresh 把未來時間戳 (now < queryTime)
 //   視為需重查；marker 時間遠舊於查詢時間者顯示加註舊資料提醒。
-// - i18n 缺口 (刻意保留現狀)：診斷摘要/下一步皆為硬編碼繁中常數
-//   (DiagnoseStrings)，未抽 res/values string resources；未來需在地化時
-//   把該表換成資源查詢即可，穩定碼 (stableId) 不受影響。
+// - i18n 範圍誠實化 (scope-limited)：診斷摘要/下一步皆為硬編碼繁中常數
+//   (DiagnoseStrings)，未抽 res/values string resources；僅寫入拒絕/輸入驗證/
+//   診斷複製短句已資源化中英＋繁中，renderInventory/renderLastOp/renderHook/
+//   renderDiagnose/formatBatchReport/DiagnoseStrings 等狀態行保留繁中（非全量
+//   雙語）。未來需在地化時把該表換成資源查詢即可，穩定碼 (stableId) 不受影響。
 package com.galaxydual.plus
 
 import com.galaxydual.core.CloneOutcome
@@ -279,7 +281,7 @@ internal fun capDetail(raw: String): String =
     if (raw.length <= MAX_DIAG_DETAIL_CHARS) raw else raw.take(MAX_DIAG_DETAIL_CHARS)
 
 // 繁中摘要/下一步常數表 (同檔頂層 object)：9 組穩定碼各一對，diagnoseEvent
-// 改引用此表 (文案一字不差)；i18n 缺口見檔頭 (無 res/values)。
+// 改引用此表 (文案一字不差)；保留繁中 scope-limited（非全量雙語，見檔頭 i18n 範圍）。
 object DiagnoseStrings {
     // 契約：每碼恰一對 (summary, nextStep)；diagnoseEvent 以 getValue 取，
     // 缺碼即拋 (fail-fast，缺文案不可靜默空字串)。
@@ -503,7 +505,7 @@ fun redactPackage(pkg: String): String {
 
 // 診斷匯出 (使用者預覽/主動匯出用，已遮蔽可辨識資料、大小受限、無自動上傳)。
 // 誠實文案：遮蔽仍非全面保證，標題明示「分享前請人工確認」，不得宣稱絕對乾淨。
-// 輸入 UiState，輸出多行繁中文字；呼叫端 (MainActivity 匯出按鈕) 只負責顯示，
+// 輸入 UiState，輸出多行繁中文字（scope-limited 繁中，非雙語）；呼叫端 (MainActivity 匯出按鈕) 只負責顯示，
 // 不做任何網路上傳 (契約見檔頭與 MainActivity 註解)。
 fun buildDiagnosticExport(state: UiState): String {
     // m2 匯出行注入防護 (入口全量清洗，與 redact 同層；顯示側不動)：

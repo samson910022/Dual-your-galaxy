@@ -72,6 +72,8 @@ val releaseSigningReady =
 // Application-specific Android configuration.
 android {
     namespace = "com.galaxydual.plus"
+    useLibrary("android.test.runner")
+    useLibrary("android.test.base")
     // SDK levels are single-sourced from gradle/libs.versions.toml.
     compileSdk = libs.versions.compileSdk.get().toInt()
 
@@ -81,6 +83,7 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.0.1"
+        testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
 
     signingConfigs {
