@@ -59,8 +59,14 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 // 觸發一次。
                 check.isChecked = false
                 check.isChecked = true
-                assertTrue(check.isChecked)
-                assertTrue(positive.isEnabled)
+                assertTrue("ack must be checked after explicit set", check.isChecked)
+                val liveDlg = field(activity, "removeConfirmDialog") as AlertDialog
+                val gateDirect = canConfirmRemove(false, true, true)
+                assertTrue(
+                    "diag: checked=${check.isChecked} gateDirect=$gateDirect sameDlg=${liveDlg === dialog} " +
+                        "sameBtn=${liveDlg.getButton(AlertDialog.BUTTON_POSITIVE) === positive} btn=${positive.isEnabled}",
+                    positive.isEnabled,
+                )
                 sync.invoke(activity, old, true, null, catalogKey)
                 assertFalse(positive.isEnabled)
                 assertFalse(dialog.getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled)
