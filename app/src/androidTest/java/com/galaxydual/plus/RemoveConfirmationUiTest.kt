@@ -43,21 +43,21 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
             instrumentation.runOnMainSync {
                 @Suppress("UNCHECKED_CAST")
                 val state = field(vm, "_state") as MutableStateFlow<UiState>
-                val sync = activity.javaClass.getDeclaredMethod("syncRemoveDialog", PendingRemove::class.java, Boolean::class.javaPrimitiveType).apply { isAccessible = true }
+                val sync = activity.javaClass.getDeclaredMethod("syncRemoveDialog", PendingRemove::class.java, Boolean::class.javaPrimitiveType, BlockReason::class.java).apply { isAccessible = true }
                 val old = PendingRemove("com.example.old", 95, 15, "Profile", 1)
                 val replacement = PendingRemove("com.example.new", 95, 15, "Profile", 2)
                 state.value = state.value.copy(pendingRemove = old, loading = false)
-                sync.invoke(activity, old, false)
+                sync.invoke(activity, old, false, null)
                 val dialog = field(activity, "removeConfirmDialog") as AlertDialog
                 val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val check = checkbox(dialog.window!!.decorView)!!
                 assertFalse(positive.isEnabled)
                 check.performClick()
                 assertTrue(positive.isEnabled)
-                sync.invoke(activity, old, true)
+                sync.invoke(activity, old, true, null)
                 assertFalse(positive.isEnabled)
                 assertFalse(dialog.getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled)
-                sync.invoke(activity, old, false)
+                sync.invoke(activity, old, false, null)
                 dialog.getButton(AlertDialog.BUTTON_NEUTRAL).performClick()
                 val details = field(activity, "removeLabelsDialog") as AlertDialog
                 assertTrue(details.isShowing)
@@ -74,7 +74,7 @@ class RemoveConfirmationUiTest : InstrumentationTestCase() {
                 state.value = state.value.copy(pendingRemove = replacement, loading = false)
                 positive.performClick()
                 assertEquals(replacement, state.value.pendingRemove)
-                sync.invoke(activity, replacement, false)
+                sync.invoke(activity, replacement, false, null)
                 val newDialog = field(activity, "removeConfirmDialog") as AlertDialog
                 assertFalse(newDialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
                 assertFalse(checkbox(newDialog.window!!.decorView)!!.isChecked)

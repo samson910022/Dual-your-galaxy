@@ -1359,7 +1359,7 @@ class MainActivity : ComponentActivity() {
         // Phase G: bullet prefix via badge_dot_format (was hardcoded "● ").
         addChecklistItem(R.drawable.ic_layers, getString(R.string.diag_item_framework_title), getString(R.string.diag_item_framework_desc), getString(R.string.badge_dot_format, getString(R.string.badge_status_normal)), true)
         checklistCard.addView(makeDivider())
-        addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_knox_title), getString(R.string.diag_item_knox_desc), getString(R.string.badge_status_bypassed), false)
+        addChecklistItem(R.drawable.ic_security, getString(R.string.diag_item_isolation_title), getString(R.string.diag_item_isolation_desc), getString(R.string.badge_status_bypassed), false)
         checklistCard.addView(makeDivider())
 
         // Item 3: Multi-User UID
