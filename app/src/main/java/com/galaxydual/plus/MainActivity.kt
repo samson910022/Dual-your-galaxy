@@ -3275,12 +3275,13 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             removeAcknowledged = checked
             acknowledgedGeneration = if (checked) pending.generation else null
-            // 確定性路徑：用本次 sync 傳入的 blockKey（render 每幀刷新，early-return
-            // 路徑 3176 與初始值 3294 同源），不即時重算 live 可寫性，避免背景狀態
-            // 競態造成按鈕閃爍／測試 flaky；真正寫入門控在 Positive 點擊即時重讀＋
-            // VM confirmRemove isWritable() 雙層 fail-closed，此處僅控按鈕顯示。
-            val curLoading = try { vm.state.value.loading } catch (_: Exception) { loading }
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(curLoading, checked, blockKey == null)
+            // 確定性路徑：用本次 sync 傳入的 loading/blockKey（render 每幀刷新，
+            // early-return 路徑 3176 與初始值 3293 同源），不即時重算 live 狀態，
+            // 避免背景任務（init probe/catalog 刷新）中途翻轉造成按鈕閃爍／測試
+            // flaky；loading 變化由下一次 render 的 early-return 同步，真正寫入
+            // 門控在 Positive 點擊即時重讀＋VM confirmRemove isWritable() 雙層
+            // fail-closed，此處僅控按鈕顯示。
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(loading, checked, blockKey == null)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             val (curLoading, curWritable) = try {
