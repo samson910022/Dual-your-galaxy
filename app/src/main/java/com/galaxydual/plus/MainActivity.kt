@@ -294,6 +294,10 @@ class MainActivity : ComponentActivity() {
     // Phase K K2：Shizuku presence 快取在途任務（比照 catalogJob 3536-3537）：
     // refresh/request 頭寫共用同一 Job 取消，避免 old-live 蓋 new-death。
     private var shizukuPresenceJob: Job? = null
+    // P1：cancel 非真序列化（pingBinder blocking 不可取消，舊 IO 返回仍寫入
+    // last-writer-wins）。單調世代（比照 clonedGen 2066）：發起時主線 ++ 取值，
+    // IO 回主線後比對，過期丟棄；cancel 保留（快速釋放）＋gen 比對（正確性），雙保險。
+    private var shizukuGen = 0
     // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
     // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
     private var lastClonedListKey: String? = null
@@ -2392,6 +2396,8 @@ class MainActivity : ComponentActivity() {
     private fun requestShizukuPermission() {
         // Phase K K2：頭寫與 refresh 共用同一 shizukuPresenceJob 協調，先取消在途 refresh。
         shizukuPresenceJob?.cancel()
+        // P1：發起時主線取值（見 shizukuGen），IO 回主線後比對過期丟棄。
+        val my = ++shizukuGen
         // Phase K review：頭寫亦賦值回 shizukuPresenceJob（與 catalogJob 範式一致），
         // 使 refresh 側 cancel 能取消在途頭寫，避免 old-live 蓋 new-death。
         shizukuPresenceJob = lifecycleScope.launch {
@@ -2400,6 +2406,7 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 null
             }
+            if (my != shizukuGen) return@launch
             if (presence != null) {
                 try {
                     cachedShizukuNoBinder = presence.first
@@ -2526,6 +2533,8 @@ class MainActivity : ComponentActivity() {
             // Phase K K2：比照 catalogJob（3536-3537）取消前一個在途任務，避免疊加
             //（old-live 蓋 new-death）；與 requestShizukuPermission 頭寫共用同一 job。
             shizukuPresenceJob?.cancel()
+            // P1：發起時主線取值（見 shizukuGen），IO 回主線後比對過期丟棄。
+            val my = ++shizukuGen
             shizukuPresenceJob = lifecycleScope.launch {
                 val next = withContext(Dispatchers.IO) {
                     try {
@@ -2534,6 +2543,7 @@ class MainActivity : ComponentActivity() {
                         null
                     }
                 } ?: return@launch
+                if (my != shizukuGen) return@launch
                 try {
                     cachedShizukuNoBinder = next.first
                     cachedShizukuAuthorized = next.second
