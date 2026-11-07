@@ -2024,6 +2024,8 @@ class MainActivity : ComponentActivity() {
                 // "Version 0.0.1 ..." + "MIT ..."); version is dynamic.
                 // Phase H P1：%4$s live 宣稱經 hookLiveProven 門控，無 boot-fresh 證據時
                 // 用中性 engine_diag_unknown（既有鍵，不新增綠文案），不直嵌 daemon_running.
+                // Phase C：%5$s 與卡片副標題單一來源 hookSubtitleResFor，點擊時取
+                // live snapshot（與 %4$s hookLiveProven(vm.state.value) 同 staleness 類）。
                 .setMessage(
                     getString(
                         R.string.settings_about_format,
@@ -2031,7 +2033,7 @@ class MainActivity : ComponentActivity() {
                         appVersionName(),
                         getString(R.string.settings_about_feature),
                         getString(if (hookLiveProven(vm.state.value)) R.string.status_hook_daemon_running else R.string.engine_diag_unknown),
-                        getString(R.string.hook_mode_subtitle),
+                        getString(hookSubtitleResFor(writeBlockReason(vm.state.value) == null)),
                         getString(R.string.settings_license),
                     ),
                 )
@@ -2782,7 +2784,7 @@ class MainActivity : ComponentActivity() {
             // 其餘（loading→writeReady=false 亦含）走白名單原文案。初建即白名單
             // 文案，首幀前 fail-closed；顯式 ROOT 拒絕等不可寫態不誇大可寫。
             if (::hookDescView.isInitialized) {
-                hookDescView.text = getString(if (writeBlockReason(s) == null) R.string.hook_mode_subtitle_ops else R.string.hook_mode_subtitle)
+                hookDescView.text = getString(hookSubtitleResFor(writeBlockReason(s) == null))
             }
             if (::clonedCountBadge.isInitialized) {
                 clonedCountBadge.text = getString(R.string.badge_number_format, s.cloned.size)
@@ -4576,6 +4578,11 @@ internal fun hookHistoryActive(s: UiState): Boolean =
 
 internal fun hookLiveProven(s: UiState): Boolean =
     hookHistoryActive(s) && s.hookBootFresh
+
+// Phase C channel-aware subtitle single source for card + About (JVM seam；
+// 真可寫走 _ops，特權通道直寫、無需 Hook；其餘走白名單原文案)。
+internal fun hookSubtitleResFor(writable: Boolean): Int =
+    if (writable) R.string.hook_mode_subtitle_ops else R.string.hook_mode_subtitle
 
 // 六徽章＋逐行 tag＋checklist badges＋icons 著色單一可見源 (JVM seam；
 // render 直接以此作 visibility/color 條件，免三處各寫各的)。
