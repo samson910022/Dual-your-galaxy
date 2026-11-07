@@ -25,10 +25,6 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 
 import android.app.AlertDialog
-import android.view.View
-import android.view.ViewGroup
-import android.widget.EditText
-import android.widget.TextView
 
 // Bounded poll helper for instrumentation threads (UI thread must never
 // block on it; call from the test thread only).
@@ -195,43 +191,15 @@ fun awaitHarnessReady(vm: DualViewModel, timeoutMs: Long = 15_000L) {
     HarnessPoll.await(timeoutMs) { vm.state.value.channelReady }
 }
 
-// Focus-independent view traversal helpers for Activity-level assertions.
-// Avoids Espresso's RootViewWithoutFocusException on CI emulator by walking
-// the activity's decor view tree directly instead of relying on Espresso's
-// focused-root resolution.
-object HarnessViews {
-    fun containsText(root: View?, text: CharSequence): Boolean {
-        if (root == null) return false
-        if (root is TextView && root.text?.toString()?.contains(text) == true &&
-            root.visibility != View.GONE) return true
-        if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                if (containsText(root.getChildAt(i), text)) return true
-            }
-        }
-        return false
-    }
-
-    fun hasEditTextText(root: View?, text: CharSequence): Boolean {
-        if (root == null) return false
-        if (root is EditText && root.text?.toString() == text.toString() &&
-            root.visibility != View.GONE) return true
-        if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                if (hasEditTextText(root.getChildAt(i), text)) return true
-            }
-        }
-        return false
-    }
-
-    fun isRemoveDialogShowing(activity: MainActivity): Boolean {
-        return try {
-            val field = MainActivity::class.java.getDeclaredField("removeConfirmDialog")
-            field.isAccessible = true
-            val dialog = field.get(activity) as? AlertDialog
-            dialog?.isShowing == true
-        } catch (e: Exception) {
-            false
-        }
+// Reflection helper: whether the remove-confirmation dialog is currently showing.
+// Top-level function (replaces the removed HarnessViews object).
+fun isRemoveDialogShowing(activity: MainActivity): Boolean {
+    return try {
+        val field = MainActivity::class.java.getDeclaredField("removeConfirmDialog")
+        field.isAccessible = true
+        val dialog = field.get(activity) as? AlertDialog
+        dialog?.isShowing == true
+    } catch (e: Exception) {
+        false
     }
 }

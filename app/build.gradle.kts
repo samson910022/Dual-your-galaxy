@@ -181,9 +181,7 @@ dependencies {
     // instrumentation-manual). Fake gateway keeps every test zero-write:
     // no test ever calls confirmRemove()/clone on a real gateway.
     androidTestImplementation(libs.test.runner)
-    androidTestImplementation(libs.test.rules)
     androidTestImplementation(libs.test.ext.junit)
     androidTestImplementation(libs.test.core)
-    androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.junit.junit)
 }
