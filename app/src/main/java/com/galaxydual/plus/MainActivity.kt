@@ -3755,7 +3755,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 來源列表指紋：catalog 內容 hash、query、系統開關、勾選集合 hash。
+    // 來源列表指紋：catalog 內容 hash（與 labelCacheKey 同源，見 syncLabelCache）、query、系統開關、勾選集合 hash。
     private fun buildSourceListKey(s: UiState): String =
         "${s.sourceCatalog.hashCode()}:" +
             "${s.sourceQuery}:${s.includeSystemApps}:${s.selectedKeys.hashCode()}"
