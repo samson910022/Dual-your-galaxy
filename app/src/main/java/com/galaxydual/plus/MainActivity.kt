@@ -3275,14 +3275,12 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             removeAcknowledged = checked
             acknowledgedGeneration = if (checked) pending.generation else null
-            val curWritable = try {
-                val c = vm.state.value
-                !c.loading && writeBlockReason(c) == null
-            } catch (_: Exception) {
-                blockKey == null
-            }
+            // 確定性路徑：用本次 sync 傳入的 blockKey（render 每幀刷新，early-return
+            // 路徑 3176 與初始值 3294 同源），不即時重算 live 可寫性，避免背景狀態
+            // 競態造成按鈕閃爍／測試 flaky；真正寫入門控在 Positive 點擊即時重讀＋
+            // VM confirmRemove isWritable() 雙層 fail-closed，此處僅控按鈕顯示。
             val curLoading = try { vm.state.value.loading } catch (_: Exception) { loading }
-            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(curLoading, checked, curWritable)
+            removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = canConfirmRemove(curLoading, checked, blockKey == null)
         }
         removeConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             val (curLoading, curWritable) = try {
