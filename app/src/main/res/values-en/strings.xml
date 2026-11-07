@@ -157,6 +157,14 @@
     <string name="badge_status_dual_tag">Dual Badge</string>
     <string name="btn_clear_search">Clear Search</string>
     <string name="tag_forced_injected">⚡ Force Injected</string>
-    <string name="tag_native_supported">Native Supported</string>
     <string name="app_dual_unlocked_desc">Dual app unlocked</string>
+    <string name="section_channel_preference">Channel Preference</string>
+    <string name="section_profiles_diagnostics">Profiles &amp; Diagnostics</string>
+    <string name="status_hook_injected_active">● Hook Active &amp; Injected</string>
+    <string name="engine_diag_all_normal">5/5 Modules Operational</string>
+    <string name="telemetry_status_active">Active &amp; Injected</string>
+    <string name="telemetry_latency_format">%s ms latency</string>
+    <string name="engine_uid_label">UID: %d</string>
+    <string name="stats_injected_format">%1$d %2$s (Hook)</string>
+    <string name="app_dual_unlocked_format">%1$s · UID %2$d</string>
 </resources>

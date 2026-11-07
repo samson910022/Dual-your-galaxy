@@ -203,6 +203,7 @@ class MainActivity : ComponentActivity() {
     // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
+    private var settingsDialog: AlertDialog? = null
 
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
@@ -373,6 +374,12 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         exportDialog = null
+        try {
+            settingsDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        settingsDialog = null
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -586,7 +593,7 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             contentDescription = getString(R.string.diagnose_hook_cd)
-            minimumHeight = dp(44)
+            minimumHeight = dp(48)
             setOnClickListener { vm.requestHookRedDiagnosis() }
         }
         hookDiagHint = TextView(this).apply {
@@ -1062,7 +1069,7 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_search_input)
             val p = dp(10)
             setPadding(p, dp(4), p, dp(4))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply {
                 topMargin = dp(8)
                 bottomMargin = dp(8)
             }
@@ -1075,9 +1082,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         clearSearchBtn = ImageView(this).apply {
+            contentDescription = getString(R.string.btn_clear_search)
             setImageDrawable(getDrawable(R.drawable.ic_clear))
             setColorFilter(getColor(R.color.oneui_text_tertiary))
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20))
+            val cp = dp(14)
+            setPadding(cp, cp, cp, cp)
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
             visibility = if (searchInput.text.isNullOrEmpty()) View.GONE else View.VISIBLE
             setOnClickListener { searchInput.setText("") }
         }
@@ -1096,11 +1106,11 @@ class MainActivity : ComponentActivity() {
         val filterRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             val p = dp(4)
-            addView(systemToggleBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)).apply { setMargins(p, 0, p, 0) })
-            addView(selectAllBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)).apply { setMargins(p, 0, p, 0) })
-            addView(clearSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)).apply { setMargins(p, 0, p, 0) })
-            addView(saveSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)).apply { setMargins(p, 0, p, 0) })
-            addView(cancelSaveBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)).apply { setMargins(p, 0, p, 0) })
+            addView(systemToggleBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
+            addView(selectAllBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
+            addView(clearSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
+            addView(saveSelBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
+            addView(cancelSaveBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { setMargins(p, 0, p, 0) })
         }
         filterScroll.addView(filterRow)
         tabAppsLayout.addView(filterScroll)
@@ -1132,7 +1142,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         val injectedActiveLabel = TextView(this).apply {
-            text = "● Hook 注入活躍中"
+            text = getString(R.string.status_hook_injected_active)
             textSize = 11f
             setTextColor(getColor(R.color.oneui_secondary))
             gravity = Gravity.END
@@ -1383,13 +1393,13 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(6) }
             })
             addView(TextView(context).apply {
-                text = "Active & Injected"
+                text = getString(R.string.telemetry_status_active)
                 textSize = 12f
                 setTextColor(getColor(R.color.oneui_text_primary))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             addView(TextView(context).apply {
-                text = "0.42 ms 延遲"
+                text = getString(R.string.telemetry_latency_format, "0.42")
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_primary))
                 background = getDrawable(R.drawable.bg_pill_badge_blue)
@@ -1427,6 +1437,11 @@ class MainActivity : ComponentActivity() {
                     setTextColor(getColor(R.color.oneui_text_primary))
                     typeface = Typeface.DEFAULT_BOLD
                 })
+                addView(TextView(context).apply {
+                    text = getString(R.string.engine_fallback_desc)
+                    textSize = 11f
+                    setTextColor(getColor(R.color.oneui_text_tertiary))
+                })
                 addView(shizukuView)
             }
             addView(titleCol)
@@ -1446,7 +1461,7 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            addView(permBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+            addView(permBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
         }
         shizukuCard.addView(permRow)
         engineMasterCard.addView(shizukuCard)
@@ -1464,7 +1479,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         val channelCardTitle = TextView(this).apply {
-            text = "執行通道偏好"
+            text = getString(R.string.section_channel_preference)
             textSize = 14f
             setTextColor(getColor(R.color.oneui_text_primary))
             typeface = Typeface.DEFAULT_BOLD
@@ -1504,7 +1519,7 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             addView(TextView(context).apply {
-                text = "5/5 模組運作正常"
+                text = getString(R.string.engine_diag_all_normal)
                 textSize = 11f
                 setTextColor(getColor(R.color.oneui_text_tertiary))
                 typeface = Typeface.MONOSPACE
@@ -1620,7 +1635,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         techCard.addView(TextView(this).apply {
-            text = "設定檔與日誌"
+            text = getString(R.string.section_profiles_diagnostics)
             textSize = 14f
             setTextColor(getColor(R.color.oneui_text_primary))
             typeface = Typeface.DEFAULT_BOLD
@@ -1750,7 +1765,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showSettingsDialog() {
-        AlertDialog.Builder(this)
+        try {
+            settingsDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort
+        }
+        settingsDialog = AlertDialog.Builder(this)
             .setTitle(getString(R.string.tab_settings))
             .setMessage(
                 "${getString(R.string.hero_title_engine)}\n" +
@@ -1861,7 +1881,7 @@ class MainActivity : ComponentActivity() {
             titleRow.addView(tagView)
 
             val subtitleView = TextView(this).apply {
-                text = "${getString(R.string.app_dual_unlocked_desc)} · UID ${s.inventory.targetId}"
+                text = getString(R.string.app_dual_unlocked_format, getString(R.string.app_dual_unlocked_desc), s.inventory.targetId)
                 textSize = 12f
                 setTextColor(getColor(R.color.oneui_secondary))
                 maxLines = 1
@@ -1875,6 +1895,7 @@ class MainActivity : ComponentActivity() {
             val toggleSwitch = Switch(this).apply {
                 isChecked = true
                 isEnabled = !s.loading
+                contentDescription = "${getString(R.string.action_remove)}: $label"
                 setOnClickListener {
                     vm.requestRemove(pkg)
                 }
@@ -2140,13 +2161,13 @@ class MainActivity : ComponentActivity() {
         try {
             renderClonedApps(s)
             if (::clonedCountStatView.isInitialized) {
-                clonedCountStatView.text = "${s.cloned.size} ${getString(R.string.stats_unit_apps)} (Hook)"
+                clonedCountStatView.text = getString(R.string.stats_injected_format, s.cloned.size, getString(R.string.stats_unit_apps))
             }
             if (::clonedCountBadge.isInitialized) {
                 clonedCountBadge.text = "${s.cloned.size}"
             }
             if (::engineUidSlotView.isInitialized) {
-                engineUidSlotView.text = "UID: ${s.inventory.targetId}"
+                engineUidSlotView.text = getString(R.string.engine_uid_label, s.inventory.targetId)
             }
             if (::statusPillText.isInitialized && ::statusPillDot.isInitialized && ::statusPillContainer.isInitialized) {
                 when (s.resolvedGateway) {
@@ -2776,50 +2797,53 @@ class MainActivity : ComponentActivity() {
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
         lifecycleScope.launch {
-            val drawable = withContext(Dispatchers.IO) {
-                try {
-                    packageManager.getApplicationIcon(pkg)
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            iconInflight.remove(appKey)
-            if (drawable == null) return@launch
-            val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
-            if (victim != null) evictIcon(victim)
-            iconMemo.markLoaded(appKey)
-            iconDrawables[appKey] = drawable
-            val fresh = try {
-                drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
-            } catch (_: Exception) {
-                drawable
-            }
-            // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
-            // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
-            //（找不到＝已過濾掉／換 catalog，不貼）。
             try {
-                if (box.tag == appKey && box.parent === sourceContainer) {
+                val drawable = withContext(Dispatchers.IO) {
                     try {
-                        box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-                        return@launch
+                        packageManager.getApplicationIcon(pkg)
                     } catch (_: Exception) {
-                        // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
+                        null
                     }
                 }
-                for (i in 0 until sourceContainer.childCount) {
-                    val child = sourceContainer.getChildAt(i)
-                    if (child is CheckBox && child.tag == appKey) {
-                        val perView = try {
-                            drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                if (drawable == null) return@launch
+                val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
+                if (victim != null) evictIcon(victim)
+                iconMemo.markLoaded(appKey)
+                iconDrawables[appKey] = drawable
+                val fresh = try {
+                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
+                } catch (_: Exception) {
+                    drawable
+                }
+                // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
+                // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
+                //（找不到＝已過濾掉／換 catalog，不貼）。
+                try {
+                    if (box.tag == appKey && box.parent === sourceContainer) {
+                        try {
+                            box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
+                            return@launch
                         } catch (_: Exception) {
-                            fresh
+                            // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
                         }
-                        child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
-                        break
                     }
+                    for (i in 0 until sourceContainer.childCount) {
+                        val child = sourceContainer.getChildAt(i)
+                        if (child is CheckBox && child.tag == appKey) {
+                            val perView = try {
+                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                            } catch (_: Exception) {
+                                fresh
+                            }
+                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                            break
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
                 }
-            } catch (_: Exception) {
-                // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
+            } finally {
+                iconInflight.remove(appKey)
             }
         }
     }
@@ -2839,25 +2863,28 @@ class MainActivity : ComponentActivity() {
         if (appKey in iconInflight) return
         iconInflight.add(appKey)
         lifecycleScope.launch {
-            val drawable = withContext(Dispatchers.IO) {
-                try {
-                    packageManager.getApplicationIcon(pkg)
-                } catch (_: Exception) {
-                    null
+            try {
+                val drawable = withContext(Dispatchers.IO) {
+                    try {
+                        packageManager.getApplicationIcon(pkg)
+                    } catch (_: Exception) {
+                        null
+                    }
                 }
+                if (drawable == null) return@launch
+                val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
+                if (victim != null) evictIcon(victim)
+                iconMemo.markLoaded(appKey)
+                iconDrawables[appKey] = drawable
+                val fresh = try {
+                    drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
+                } catch (_: Exception) {
+                    drawable
+                }
+                imageView.setImageDrawable(fresh)
+            } finally {
+                iconInflight.remove(appKey)
             }
-            iconInflight.remove(appKey)
-            if (drawable == null) return@launch
-            val victim = pickIconEvictionKey(iconDrawables.keys.toList(), MAX_ICON_CACHE)
-            if (victim != null) evictIcon(victim)
-            iconMemo.markLoaded(appKey)
-            iconDrawables[appKey] = drawable
-            val fresh = try {
-                drawable.constantState?.newDrawable()?.mutate() ?: drawable.mutate()
-            } catch (_: Exception) {
-                drawable
-            }
-            imageView.setImageDrawable(fresh)
         }
     }
 
