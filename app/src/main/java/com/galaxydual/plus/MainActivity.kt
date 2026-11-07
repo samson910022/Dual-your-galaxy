@@ -85,6 +85,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
 import java.io.File
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -2020,11 +2021,19 @@ class MainActivity : ComponentActivity() {
 
     // Phase C: dynamic app version for the settings about dialog (PackageInfo
     // at runtime, localized "unknown" fallback). No BuildConfig dependency.
+    // Phase L L2：one-shot 快取（設定對話框非 hot path；首次 PM IPC 後快取，
+    // 後續零 binder；失敗回退為本地化佔位，不快取以免語系切換殘留）。
+    private var cachedAppVersionName: String? = null
+
     private fun appVersionName(): String {
+        cachedAppVersionName?.let { return it }
         try {
             @Suppress("DEPRECATION")
             val v = packageManager.getPackageInfo(packageName, 0).versionName
-            if (!v.isNullOrBlank()) return v
+            if (!v.isNullOrBlank()) {
+                cachedAppVersionName = v
+                return v
+            }
         } catch (_: Exception) {
             // Fall through to the localized placeholder.
         }
@@ -2047,7 +2056,12 @@ class MainActivity : ComponentActivity() {
         // hookLiveProven，Phase H：existence 不足，需 boot-fresh），無 live 證據時
         // GONE，不得無條件宣稱注入成功。
         val hookLiveProven = hookLiveProven(s)
-        val key = buildClonedListKey(s)
+        // Phase L L1：catalogKey 先算＋先 sync 再比對指紋；指紋納入 catalogKey，
+        // catalog label 變化即重建，舊快取 !isLabelCached 不再命中殘留。
+        // 單次 hash 重用（sync＋key 共用），同內容同 hash 不致過度重建。
+        val catalogKey = labelCacheKey()
+        syncLabelCache(catalogKey)
+        val key = buildClonedListKey(s, catalogKey)
         if (key == lastClonedListKey) {
             val writable = blockKey == null
             for (i in 0 until clonedAppsContainer.childCount) {
@@ -2075,10 +2089,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         val writable = blockKey == null
-        // Phase F F2：catalogKey 迴圈外一次計算＋快取對齊（原每列 resolveAppLabel 內重算
-        // sourceCatalog.hashCode()，O(cloned×catalog) → O(catalog)）。
         // Phase F F1：catalogLabels 本輪預取（reloadCatalog IO 路徑已查好的 label 就地取用）。
-        syncLabelCache(labelCacheKey())
+        // Phase L L1：sync 已在指紋比對前完成，此處不再重算 hash／重 sync。
         val catalogLabels = catalogLabelsFor(s.sourceCatalog)
         for (pkg in s.cloned) {
             val row = LinearLayout(this).apply {
@@ -2279,9 +2291,12 @@ class MainActivity : ComponentActivity() {
     // live 證據驅動，未納入則 hook 翻轉時 early-return 留下殘留 VISIBLE）。
     // Phase H：哨兵升格為 hookLiveProven（含 hookBootFresh，boot-fresh 落地
     // 翻轉時重建）。
-    private fun buildClonedListKey(s: UiState): String {
+    // Phase L L1：追加 catalogKey（labelCacheKey／catalog.hashCode 同源，呼叫端
+    // 單次計算傳入，sync＋key 共用一次 hash）。catalog label 變化即重建，
+    // 舊快取不再經 !isLabelCached 命中殘留；同內容同 hash，不致過度重建。
+    private fun buildClonedListKey(s: UiState, catalogKey: Int): String {
         val hookLiveProven = hookLiveProven(s)
-        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookLiveProven"
+        return "${s.cloned.hashCode()}:${s.inventory.targetSerial}:${s.inventory.targetId}:${s.loading}:$hookLiveProven:$catalogKey"
     }
 
     // PR-6 P2 (#27 後半)：診斷匯出預覽。顯示已遮蔽可辨識資料的本機文字
@@ -2636,7 +2651,8 @@ class MainActivity : ComponentActivity() {
         // note stays visible so the mode is never mistaken for a working
         // channel. P4: 時間證據經 hookEvidence()+timeEvidenceText 統一
         // (狀態文案維持本頁提示，不動)。
-        val hookText = renderHookText(s)
+        // Phase L L3：顯示行走 EN 分支（null 判定語意不變，另兩處 null 檢查沿用預設）。
+        val hookText = renderHookText(s, isEnglishLocale())
         if (hookText != null) {
             hookView.visibility = View.VISIBLE
             hookView.text = hookText
@@ -2678,7 +2694,8 @@ class MainActivity : ComponentActivity() {
         // PR-6 P2 (#27 後半)：清單新鮮度行 (STALE/UNKNOWN 明確標示，
         // FRESH 顯示目標/筆數/查詢時間)。P4：上次操作相位拆至獨立 lastOpView
         // 行 (renderLastOpText)，此處只剩清單；查詢時間經 formatTimeMs。
-        inventoryView.text = renderInventoryText(s)
+        // Phase L L3：EN 分支（diag/lastOp 仍繁中，為 P2 餘項）。
+        inventoryView.text = renderInventoryText(s, isEnglishLocale())
         lastOpView.text = renderLastOpText(s)
         // PR-6 P2 (#27 後半)：診斷事件行。穩定碼 + 繁中摘要/下一步常顯；
         // 點一下展開 exit/技術 detail (大小受限)。無事件時顯示就緒。
@@ -4212,8 +4229,35 @@ internal fun Context.resolveBlockReason(reason: BlockReason): String = when (rea
 // 雙語範圍誠實化：以下 render*/formatBatchReport 皆保留繁中（scope-limited，
 // 非全量雙語；僅寫入拒絕/輸入驗證/診斷複製短句已資源化中英＋繁中）。未來在地化
 // 再抽資源，穩定碼/測試鎖定繁中字面不受影響。
+// Phase L L3 最小 EN 分支：renderInventoryText＋renderHookText 支援 isEnglish
+//（生產呼叫端傳 isEnglishLocale()，預設 false 保中文測試；英文文案為 scope-limited
+// 硬編碼，參照 values-en 語氣，未新增資源鍵故三語系鍵集不變）。
+// P2 餘項（本次未動，僅記錄）：renderDiagnoseText／renderDiagnoseDescription／
+// renderLastOpText／formatBatchReportText／DiagnoseStrings 表／
+// HookEvidence.timeEvidenceText（212-213／289-297）／
+// DualViewModel probeResultMark・pmReadableText・readyMark（5852-5877）／
+// formatTimeMs「從未查詢」；manifest theme 為 p28-3 範圍，本次不動。
+internal fun isEnglishLocale(locale: Locale = Locale.getDefault()): Boolean =
+    try {
+        locale.language.equals("en", ignoreCase = true)
+    } catch (_: Exception) {
+        false
+    }
+
 // 清單新鮮度行：STALE/UNKNOWN 明確標示，FRESH 顯示目標/筆數/查詢時間。
-internal fun renderInventoryText(s: UiState): String = buildString {
+internal fun renderInventoryText(s: UiState, isEnglish: Boolean = false): String = buildString {
+    if (isEnglish) {
+        append("Inventory: ${s.inventory.freshness}")
+        if (s.inventory.targetId > NO_TARGET_ID) {
+            append(" (user ${s.inventory.targetId}, ${s.inventory.count} items)")
+        }
+        val q = if (s.inventory.queryTimeMs <= 0L) "Never queried" else formatTimeMs(s.inventory.queryTimeMs)
+        append(" · queried at $q")
+        if (s.inventory.freshness != InventoryFreshness.FRESH) {
+            append(" (may be stale; auto-refreshed or tap \"Reconnect and refresh\")")
+        }
+        return@buildString
+    }
     append("清單：${s.inventory.freshness}")
     if (s.inventory.targetId > NO_TARGET_ID) {
         append("（user ${s.inventory.targetId}・${s.inventory.count} 筆）")
@@ -4299,8 +4343,22 @@ internal fun hookLiveDisplay(s: UiState): HookLiveDisplay = when {
 // Hook 行：非 LSPosed 模式回 null (呼叫端 Gone)；狀態文案維持本頁提示
 // (ACTIVE 歷史證據措辭/INACTIVE 啟用提示/UNKNOWN 真通道提示，不動)，
 // 時間證據經 hookEvidence()+timeEvidenceText 統一。
-internal fun renderHookText(s: UiState): String? {
+// Phase L L3：isEnglish 分支（ACTIVE 歷史措辭＋全行英文；時間後綴仍繁中為 P2 餘項）。
+internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
     if (s.channel != ChannelPreference.LSPOSED) return null
+    if (isEnglish) {
+        val enStatus = when (s.hookStatus) {
+            HookStatus.ACTIVE ->
+                "Historical Hook marker detected (${s.hookScopes.sorted().joinToString(", ")}, existence-only evidence; not confirmed for this boot)"
+            HookStatus.INACTIVE ->
+                "Not detected (enable the module in LSPosed Manager and reboot)"
+            HookStatus.UNKNOWN_UNREADABLE ->
+                "Unknown (no read permission; full diagnosis needs a ROOT/Shizuku channel, see #27)"
+            HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
+                "Unknown (no diagnostic channel; switch to a ROOT/Shizuku channel and re-probe, see #27)"
+        }
+        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), whitelist policy branch pending, writes disabled"
+    }
     // ACTIVE is historical existence+scope evidence only (the marker
     // survives reboots; S24 evidence shows it predating boot by ~5.5h
     // with no boot-identity/freshness check): the text names that
