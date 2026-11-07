@@ -157,4 +157,61 @@ class RemoveConfirmMessageTest {
             org.junit.Assert.assertEquals(default, File("src/main/res/$directory/strings.xml").readText())
         }
     }
+
+    // Phase 1b：生產三參門控 (MainActivity.kt canConfirmRemove(loading,
+    // acknowledged, writable)，所有生產呼叫端皆用此版) 全真值表。internal
+    // 頂層函數 → 同模組直接呼叫，arity/參數順序變化即編譯失敗 (compile-time
+    // coupling，不經反射)。
+    @Test
+    fun threeArgGate_fullTruthTable() {
+        // Triple(loading, acknowledged, writable) to expected.
+        val cases = mapOf(
+            Triple(false, false, false) to false,
+            Triple(false, false, true) to false,
+            Triple(false, true, false) to false,
+            Triple(false, true, true) to true,
+            Triple(true, false, false) to false,
+            Triple(true, false, true) to false,
+            Triple(true, true, false) to false,
+            Triple(true, true, true) to false,
+        )
+        assertEquals("truth table must cover all 8 combos", 8, cases.size)
+        for ((input, expected) in cases) {
+            val (loading, acknowledged, writable) = input
+            assertEquals(
+                "canConfirmRemove(loading=$loading, ack=$acknowledged, writable=$writable)",
+                expected,
+                canConfirmRemove(loading, acknowledged, writable),
+            )
+        }
+    }
+
+    // Phase 1b：fail-closed 鎖定 — writable=false 時 loading/ack 任意組合皆拒絕。
+    // 生產呼叫端以 blockKey == null 餵 writable，被擋通道永遠不可經確認框寫入。
+    @Test
+    fun threeArgGate_notWritableAlwaysBlocks() {
+        for (loading in listOf(false, true)) {
+            for (acknowledged in listOf(false, true)) {
+                assertTrue(
+                    "writable=false must block even when loading=$loading ack=$acknowledged",
+                    !canConfirmRemove(loading, acknowledged, false),
+                )
+            }
+        }
+    }
+
+    // Phase 1b：雙參 legacy overload 與三參 (writable=true) 語意一致。
+    // 生產唯讀路徑退化為 writable=true 時，行為必須等同既有已覆蓋語意。
+    @Test
+    fun threeArgGate_writableTrueAgreesWithLegacyTwoArg() {
+        for (loading in listOf(false, true)) {
+            for (acknowledged in listOf(false, true)) {
+                assertEquals(
+                    "loading=$loading ack=$acknowledged",
+                    canConfirmRemove(loading, acknowledged),
+                    canConfirmRemove(loading, acknowledged, true),
+                )
+            }
+        }
+    }
 }
