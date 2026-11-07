@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/oneui_surface_container_high" />
+    <corners android:radius="20dp" />
+    <stroke
+        android:width="1dp"
+        android:color="@color/oneui_stroke_subtle" />
+</shape>
