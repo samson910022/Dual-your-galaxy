@@ -62,7 +62,7 @@ import rikka.shizuku.Shizuku
 // only, no independent completeness bit; adding one is a wire break, so the
 // truncated flag travels as marker text inside the streams).
 // The client re-derives truncated from the core TRUNCATION_MARKER via
-// decodeExecReply() below. Marker semantics v2 + v3 + v4 (SERVICE_VERSION = 4): the
+// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 (SERVICE_VERSION = 5): the
 // service appends the marker whenever the capture is truncated (cap, read
 // error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
 // so every truncated=true result carries detectable text (review Phase B,
@@ -70,12 +70,16 @@ import rikka.shizuku.Shizuku
 // a read-error / join-expiry path returned exit=0 partial package lines (or
 // clean empty) with NO marker, which a new client decodes as truncated=false.
 // v2 = whenever-truncated marker with ungated EXEC (prior contract, kept
-// accurate here -- marker behavior unchanged in v3/v4). v3 = v2 marker plus
+// accurate here -- marker behavior unchanged in v3/v4/v5). v3 = v2 marker plus
 // owner-uid EXEC gate (below); v3 invalidates ungated v2 resident services.
 // v4 = v3 marker+gate with appId normalization (auth code changed; C2):
 // the gate now strips the user offset before the AID_APP_START comparison,
 // so privileged appIds (0/1000/2000) stay denied regardless of user; v4
 // invalidates v3 resident services (full-UID >=10000 gate).
+// v5 = v4 marker+gate with appId upper bound (auth code changed; D2):
+// the gate now caps appId at 19999 (AID_APP_LAST), so SDK sandbox
+// (20000-29999) and isolated (99000-99999) appIds stay denied regardless
+// of user; v5 invalidates v4 resident services.
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
@@ -88,7 +92,7 @@ import rikka.shizuku.Shizuku
 // is removed by the D1 migration on the first successful run() (retryable);
 // if cleanup never succeeds until restart, the orphan sits inert (daemon
 // restart reaps). SERVICE_VERSION is
-// 4 (C2 bumped it for the appId change); the version bump remains the
+// 5 (D2 bumped it for the appId upper bound); the version bump remains the
 // invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
@@ -102,6 +106,8 @@ import rikka.shizuku.Shizuku
 //   5. (v3 -> v4) confirm secondary-user privileged uids are denied
 //      (e.g. user 10 shell 1002000) and a secondary-user app uid succeeds
 //      (e.g. user 10 app 1010234).
+//   6. (v4 -> v5) confirm appIds > 19999 are denied (e.g. 20000 SDK sandbox,
+//      99000 isolated) and appId 19999 succeeds.
 // Caller-identity gate (P0 security): the service runs under the shell/root
 // uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
 // Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
@@ -131,28 +137,35 @@ object ShizukuExecProtocol {
     // UserService implementation version. v1 = cap-only marker (old service
     // semantics); v2 = whenever-truncated marker (prior capture contract,
     // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
-    // marker+gate with appId normalization (current contract). Bump whenever
+    // marker+gate with appId normalization; v5 = v4 marker+gate with appId
+    // upper bound (current contract). Bump whenever
     // the service-side capture/encode/auth code changes: Shizuku requires a
     // different version code on service-code updates so the daemon (default
     // true) rebuilds the UserService instead of reusing the resident old
-    // one -- v4 therefore invalidates v3 resident services (full-UID gate),
-    // as v3 invalidated ungated v2 resident services. The bind tag is
+    // one -- v5 therefore invalidates v4 resident services (appId upper
+    // bound), as v4 invalidated v3 resident services (full-UID gate) and
+    // v3 invalidated ungated v2 resident services. The bind tag is
     // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
     // galaxyExecServiceTag); the legacy fixed tag "GalaxyDualExec-v1" is
     // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
     // is NOT bound. Its old service record is removed by the D1 migration
     // on the first successful run() (retryable); if cleanup never succeeds
-    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 4 (C2 bumped it for the
-    // appId change; auth code changed so the daemon must rebuild).
-    const val SERVICE_VERSION = 4
+    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it for the
+    // appId upper bound; auth code changed so the daemon must rebuild).
+    const val SERVICE_VERSION = 5
 }
 
 // UID decomposition consts (Phase C2). Literals, not android.os imports,
 // for JVM purity: android.os.UserHandle.PER_USER_RANGE is 100000 and
-// android.os.Process.FIRST_APPLICATION_UID (AID_APP_START) is 10000.
+// android.os.Process.FIRST_APPLICATION_UID (AID_APP_START) is 10000,
+// android.os.Process.LAST_APPLICATION_UID (AID_APP_LAST) is 19999.
 // Full uid = userId * UID_PER_USER_RANGE + appId.
 internal const val UID_PER_USER_RANGE = 100_000
 internal const val AID_APP_START = 10_000
+// Phase D2 (P2 appId upper bound): SDK sandbox (20000-29999) and isolated
+// (99000-99999) ranges are intentionally excluded (appIds > AID_APP_LAST
+// stay denied), so only appIds in 10000..19999 count as applications.
+internal const val AID_APP_LAST = 19_999
 
 // Strips the user offset: appId = uid % UID_PER_USER_RANGE.
 // Kotlin `%` remainder sign follows the dividend, never floorMod: a
@@ -161,11 +174,13 @@ internal const val AID_APP_START = 10_000
 internal fun appIdOf(uid: Int): Int = uid % UID_PER_USER_RANGE
 
 // True iff uid is a normal application uid: non-negative and its appId
-// (full uid without the user offset) is >= AID_APP_START. Privileged appIds
-// 0 (root), 1000 (system), 2000 (shell) are always < 10000 regardless of
-// user, so secondary-user privileged uids (e.g. user 10 shell 1002000)
+// (full uid without the user offset) is in 10000..19999
+// (AID_APP_START..AID_APP_LAST). Privileged appIds 0 (root), 1000 (system),
+// 2000 (shell) are always < 10000 regardless of user, and SDK sandbox
+// (20000-29999) / isolated (99000-99999) appIds are always > 19999, so
+// secondary-user privileged uids (e.g. user 10 shell 1002000)
 // are denied, while secondary-user app uids (e.g. 1010234) succeed.
-internal fun isApplicationUid(uid: Int): Boolean = uid >= 0 && appIdOf(uid) >= AID_APP_START
+internal fun isApplicationUid(uid: Int): Boolean = uid >= 0 && appIdOf(uid) in AID_APP_START..AID_APP_LAST
 
 // Fail-closed expected-uid resolution: keeps the full uid only when it is
 // an application uid, else -1 (never matches, gate fails closed).
@@ -182,8 +197,8 @@ internal fun resolveExpectedAppUid(resolved: Int): Int = if (isApplicationUid(re
  * authentication (it self-DoSes the legit app caller while letting any
  * shell-peer through). Root (0), system (1000), and shell (2000) are shared
  * privileged/system uids and are never legitimate expected owner uids, so only
- * an application uid (non-negative full uid whose appId >= 10000,
- * AID_APP_START) can ever match. A negative expected uid (daemon
+ * an application uid (non-negative full uid whose appId in 10000..19999,
+ * AID_APP_START..AID_APP_LAST) can ever match. A negative expected uid (daemon
  * default-constructor path, resolution failure, or a privileged/system
  * resolution) never matches and fails closed. Equality stays full-UID
  * (never appId equality): a same-appId uid from a different user (e.g.
@@ -398,9 +413,10 @@ class GalaxyExecService : Binder {
         // the user offset is in the same full-uid domain as
         // Binder.getCallingUid() (both carry userId*100000 + appId), so the
         // equality gate stays consistent. Resolved values whose appId
-        // < 10000 (AID_APP_START) are privileged/shared uids (root 0,
-        // system 1000, shell 2000, regardless of user offset) and are
-        // never legitimate owners -> -1 via resolveExpectedAppUid().
+        // outside 10000..19999 (AID_APP_START..AID_APP_LAST) are
+        // privileged/shared uids (root 0, system 1000, shell 2000,
+        // regardless of user offset) or sandbox/isolated appIds (> 19999)
+        // and are never legitimate owners -> -1 via resolveExpectedAppUid().
         expectedAppUid = try {
             if (context.packageName != BuildConfig.APPLICATION_ID) {
                 -1
@@ -536,7 +552,7 @@ private val legacyCleanupNoOpConnection = object : ServiceConnection {
 // ONLY the legacy fixed tag (NO processNameSuffix/version -- a minimal args
 // pair that addresses the old record; suffix/version would scope it to a
 // different identity and miss). remove=true drops the resident record so the
-// first per-UID v4 bind starts clean; unbinding an already-gone record is a
+// first per-UID v5 bind starts clean; unbinding an already-gone record is a
 // normal idempotent return. Throws propagate to the gateway's retry wrapper.
 private class RealShizukuLegacyCleaner(
     private val packageName: String,
@@ -560,7 +576,7 @@ private class RealShizukuBindDriver(
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
             // Tag is per-UID derived via galaxyExecServiceTag(callerUid)
-            // (full caller uid, stable); SERVICE_VERSION (4) remains the
+            // (full caller uid, stable); SERVICE_VERSION (5) remains the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
         ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag(galaxyExecServiceTag(callerUid))
@@ -682,7 +698,7 @@ class ShizukuCmdGateway(
 
             val version = try { Shizuku.getVersion() } catch (e: Exception) { if (e is CancellationException) throw e; return@withContext ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName) }
             if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
-            // Before first per-UID v4 bind, legacy fixed-tag ungated v2 record removed; failure swallowed+retried (see ensure doc).
+            // Before first per-UID v5 bind, legacy fixed-tag ungated v2 record removed; failure swallowed+retried (see ensure doc).
             ensureLegacyCleanupDone()
             // No dropBindingLocked here (nothing bound by this call; must not cache)
             val binder = try {
@@ -755,7 +771,7 @@ class ShizukuCmdGateway(
 
     // One-time legacy fixed-tag cleanup (Phase D1, P1 legacy fixed-tag
     // migration): removes the pre-C1 ungated v2 resident record
-    // (LEGACY_GALAXY_EXEC_TAG) before the first per-UID v4 bind. The run()
+    // (LEGACY_GALAXY_EXEC_TAG) before the first per-UID v5 bind. The run()
     // call site sits after the ping/permission/v13 gate, so this assumes the
     // caller already passed those checks; it runs on Dispatchers.IO (inside
     // run()'s withContext) and never holds bindMutex (it precedes boundBinder

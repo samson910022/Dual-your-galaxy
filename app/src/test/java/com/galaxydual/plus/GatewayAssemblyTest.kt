@@ -406,17 +406,19 @@ class GatewayAssemblyTest {
     // UserService implementation version pin: v1 = cap-only marker (old
     // service semantics), v2 = whenever-truncated marker (prior contract,
     // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate, v4 = v3
-    // marker+gate with appId normalization (current contract).
+    // marker+gate with appId normalization, v5 = v4 marker+gate with appId
+    // upper bound (current contract).
     // bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
-    // rebuilds the resident UserService on upgrade (v4 invalidates v3
-    // resident services, as v3 invalidated ungated v2 resident services);
+    // rebuilds the resident UserService on upgrade (v5 invalidates v4
+    // resident services, as v4 invalidated v3 resident services and v3
+    // invalidated ungated v2 resident services);
     // the bind tag is per-UID derived
     // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag) and the
     // legacy fixed tag "GalaxyDualExec-v1" record orphans until Shizuku
-    // restart (daemon restart reaps). SERVICE_VERSION is 4 (C2 bumped it
-    // for the appId change; auth code changed so the daemon must rebuild).
-    @Test fun serviceVersion_isV4() {
-        assertEquals(4, ShizukuExecProtocol.SERVICE_VERSION)
+    // restart (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it
+    // for the appId upper bound; auth code changed so the daemon must rebuild).
+    @Test fun serviceVersion_isV5() {
+        assertEquals(5, ShizukuExecProtocol.SERVICE_VERSION)
     }
 
     // P1 UserService version gap -- read-only reproducible verification, OLD
