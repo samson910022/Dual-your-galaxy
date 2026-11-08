@@ -326,4 +326,13 @@ class GalaxyExecAuthTest {
         }
         assertNotEquals(ShizukuExecProtocol.DENIED_FOREIGN_CALLER, res.err)
     }
+
+    @Test fun legacyTagPins() {
+        // Phase D1 (P1 legacy fixed-tag migration) pins the frozen legacy
+        // record identity: the fixed tag is never bound by the per-UID path
+        // and is only the cleanup target (D1 migration removes it on the
+        // first successful run(), retryable).
+        assertEquals("GalaxyDualExec-v1", LEGACY_GALAXY_EXEC_TAG)
+        assertEquals("GalaxyDualExec-v1-u", GALAXY_EXEC_TAG_PREFIX)
+    }
 }
