@@ -431,7 +431,7 @@ class GatewayAssemblyTest {
     }
 
     // P1 UserService version gap -- read-only reproducible verification, NEW
-    // side (JVM): the same partial content from a new v2 service (join-expiry
+    // side (JVM): the same partial content from a new v3 service (join-expiry
     // path built by buildResult, marker on both streams) decodes as
     // truncated=true and parses as Unknown. Paired with the OLD test above,
     // this pins the v1-vs-v2 contract difference without touching a device.

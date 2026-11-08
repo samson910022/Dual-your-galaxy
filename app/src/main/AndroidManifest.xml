@@ -20,6 +20,7 @@
 
     <!-- allowBackup=false：無備份需求，排除 dual_selection (SharedPreferences) 上雲；
          選取僅本機持久化，重裝即失效符合 fail-closed。 -->
+    <!-- Do NOT add android:sharedUserId: uid-equality gate (ShizukuCmdGateway.isAllowedCaller) would admit sibling packages; redesign gate first. ShizukuProvider is not a trust boundary for GalaxyExecService. -->
     <application
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
