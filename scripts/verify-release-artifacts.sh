@@ -46,15 +46,15 @@ for apk in "$@"; do
     fail "ShizukuProvider not found in packaged manifest of $apk"
   fi
 
-  # 2. ShizukuProvider survives into the released DEX (fully-qualified slash form).
+  # 2. ShizukuProvider survives into the released DEX (exact descriptor).
   FOUND=0
   DEX_COUNT=0
   while IFS= read -r dex; do
     [ -z "$dex" ] && continue
     DEX_COUNT=$((DEX_COUNT + 1))
-    hits="$(unzip -p "$apk" "$dex" | grep -aFc "rikka/shizuku/ShizukuProvider" || true)"
+    hits="$(unzip -p "$apk" "$dex" | grep -aFc 'Lrikka/shizuku/ShizukuProvider;' || true)"
     if [ "${hits:-0}" -gt 0 ]; then
-      echo "FOUND rikka/shizuku/ShizukuProvider in $dex"
+      echo "FOUND Lrikka/shizuku/ShizukuProvider; in $dex"
       FOUND=1
     fi
   done < <(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex' | sort -u)
@@ -62,7 +62,7 @@ for apk in "$@"; do
     fail "No DEX entries found in $apk"
   fi
   if [ "$FOUND" -eq 0 ]; then
-    fail "ShizukuProvider class string not found in DEX of $apk"
+    fail "ShizukuProvider class descriptor not found in DEX of $apk"
   fi
 
   # 3. Exact Xposed archive members exist (no suffix false-positives).
@@ -81,15 +81,15 @@ for apk in "$@"; do
   fi
   echo "FOUND DualHook entry in java_init.list"
 
-  # 5. DualHook survives into the DEX (fully-qualified slash form).
+  # 5. DualHook survives into the DEX (exact descriptor).
   FOUND=0
   DEX_COUNT=0
   while IFS= read -r dex; do
     [ -z "$dex" ] && continue
     DEX_COUNT=$((DEX_COUNT + 1))
-    hits="$(unzip -p "$apk" "$dex" | grep -aFc "com/galaxydual/hook/DualHook" || true)"
+    hits="$(unzip -p "$apk" "$dex" | grep -aFc 'Lcom/galaxydual/hook/DualHook;' || true)"
     if [ "${hits:-0}" -gt 0 ]; then
-      echo "FOUND com/galaxydual/hook/DualHook in $dex"
+      echo "FOUND Lcom/galaxydual/hook/DualHook; in $dex"
       FOUND=1
     fi
   done < <(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex' | sort -u)
@@ -97,7 +97,7 @@ for apk in "$@"; do
     fail "No DEX entries found in $apk"
   fi
   if [ "$FOUND" -eq 0 ]; then
-    fail "DualHook class string not found in DEX of $apk"
+    fail "DualHook class descriptor not found in DEX of $apk"
   fi
 
   # 6. scope.list carries exactly the canonical two scopes.

@@ -288,28 +288,20 @@ jobs:
           fi
           rm -rf release-publish
           mkdir -p release-publish
+          chmod +x scripts/parse-apksigner-output.sh
           for apk in "${apks[@]}"; do
             echo "--- verifying $apk ---"
-            if "$apksigner" verify --verbose --print-certs "$apk"; then
-              signers="$("$apksigner" verify --print-certs "$apk" | grep -c '^Signer #' || true)"
-              if [ "${signers:-0}" -ne 1 ]; then
-                echo "::error::Expected exactly one signer for $apk (found ${signers:-0})"
-                exit 1
-              fi
-              cert="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //Ip' | tr -d ' :' | tr 'A-F' 'a-f')"
-              if ! [[ "$cert" =~ ^[0-9a-f]{64}$ ]]; then
-                echo "::error::Could not parse signer certificate digest for $apk (got '$cert')"
-                exit 1
-              fi
-              if [ "$cert" != "$EXPECTED_CERT_SHA256" ]; then
-                echo "::error::Certificate mismatch for $apk (got $cert, expected $EXPECTED_CERT_SHA256)"
-                exit 1
-              fi
-              cp "$apk" release-publish/
-            else
+            verify_output="$("$apksigner" verify --verbose --print-certs "$apk" 2>&1)" || {
+              echo "$verify_output"
               echo "::error::Signature verification FAILED for $apk; refusing to publish."
               exit 1
-            fi
+            }
+            echo "$verify_output"
+            EXPECTED_CERT_SHA256="$EXPECTED_CERT_SHA256" ./scripts/parse-apksigner-output.sh <<< "$verify_output" || {
+              echo "::error::Signer/certificate check FAILED for $apk; refusing to publish."
+              exit 1
+            }
+            cp "$apk" release-publish/
           done
           # Generate SHA256SUMS.txt next to the verified bytes (same step = no TOCTOU).
           (
