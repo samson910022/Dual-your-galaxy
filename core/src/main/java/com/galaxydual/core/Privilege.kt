@@ -4,7 +4,7 @@ package com.galaxydual.core
 // Privilege level selected by the router.
 // NONE: read-only, no write channel.
 // SHELL: Shizuku / ADB shell channel.
-// ROOT: LSPosed hook or su channel (highest privilege).
+// ROOT: su channel (highest privilege). LSPosed is display-only and never grants privilege.
 enum class Privilege {
     NONE,
     SHELL,
@@ -21,21 +21,16 @@ data class ProbeResult(
 )
 
 // Pure privilege selector, no side effects.
-// LSPosed auto-mount and su root both grant ROOT; Shizuku grants SHELL.
-fun routePrivilege(hasLsposed: Boolean, hasShizuku: Boolean, hasRoot: Boolean): Privilege {
-    return if (hasLsposed || hasRoot) {
+// su root grants ROOT; Shizuku grants SHELL. LSPosed is display-only and never
+// grants privilege (hook signal must never be fed as an authorization input).
+fun routePrivilege(hasShizuku: Boolean, hasRoot: Boolean): Privilege {
+    return if (hasRoot) {
         Privilege.ROOT
     } else if (hasShizuku) {
         Privilege.SHELL
     } else {
         Privilege.NONE
     }
-}
-
-// Backward-compatible overload for callers using the older 2-arg form.
-// hookActive maps to hasLsposed, shizukuAlive maps to hasShizuku.
-fun routePrivilege(hookActive: Boolean, shizukuAlive: Boolean): Privilege {
-    return routePrivilege(hasLsposed = hookActive, hasShizuku = shizukuAlive, hasRoot = false)
 }
 
 // Pure readiness gate: is the selected gateway's channel proven?

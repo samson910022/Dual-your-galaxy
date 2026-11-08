@@ -289,7 +289,7 @@ class HookDiagnosisTest {
         for (hasRoot in listOf(false, true)) {
             for (hasShizuku in listOf(false, true)) {
                 assertEquals(
-                    routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot),
+                    routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot),
                     hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku),
                 )
                 for (status in HookStatus.values()) {
