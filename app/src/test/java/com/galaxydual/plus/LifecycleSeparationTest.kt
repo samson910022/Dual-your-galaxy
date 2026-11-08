@@ -9,8 +9,10 @@ import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
@@ -64,27 +66,27 @@ class LifecycleSeparationTest {
     }
 
     private class FakeClock(var tick: Long = 0L) {
-        fun now(): Long {
-            tick += 1
-            return tick * 1000L
-        }
+        private val counter = AtomicLong(tick)
+        fun now(): Long = counter.incrementAndGet() * 1000L
     }
 
     private class FakeRepo(
         var dualId: Int = 95,
         val rootOk: Boolean = true,
         var dualSerial: Int = 15,
-        val installedForUser: MutableSet<String> = mutableSetOf(),
+        val installedForUser: MutableSet<String> = ConcurrentHashMap.newKeySet(),
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
-        val installCalls = mutableListOf<String>()
-        val uninstallCalls = mutableListOf<String>()
+        val installCalls = Collections.synchronizedList(mutableListOf<String>())
+        val uninstallCalls = Collections.synchronizedList(mutableListOf<String>())
         // Command audit: every command issued is recorded; writes and any
         // command outside the known allow-list are tracked separately so tests
         // can assert "zero auto-resend" covers ALL command categories.
-        val allCommands = mutableListOf<String>()
-        val writeCommands = mutableListOf<String>()
-        val unexpectedCommands = mutableListOf<String>()
+        // Synchronized because DualViewModel runs repository calls on
+        // Dispatchers.IO while the test thread reads sizes concurrently.
+        val allCommands = Collections.synchronizedList(mutableListOf<String>())
+        val writeCommands = Collections.synchronizedList(mutableListOf<String>())
+        val unexpectedCommands = Collections.synchronizedList(mutableListOf<String>())
 
         private fun hasShellSeparator(cmd: String): Boolean =
             cmd.contains(";") || cmd.contains("&&") || cmd.contains("||") ||
@@ -321,6 +323,7 @@ class LifecycleSeparationTest {
         assertEquals(0, gwEmpty.uninstallCalls.size)
         assertEquals(0, gwEmpty.writeCommands.size)
         assertEquals(0, gwEmpty.unexpectedCommands.size)
+        assertTrue(gwEmpty.allCommands.isNotEmpty())
 
         val backendCorrupt = MapBackend()
         backendCorrupt.map[SELECTION_KEY] = "garbage-not-a-snapshot"
@@ -430,14 +433,16 @@ class LifecycleSeparationTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
-        // Refresh verifies target 96; await an actual store read so the async
-        // restore/cleanup stage has completed (not just the inventory write).
+        // Refresh verifies target 96. refreshLocked publishes inventory before
+        // restoreSelectionLocked does async store I/O (onIo), so await an
+        // actual store read to prove restore/cleanup started before seeding.
+        val readsBeforeRefresh = backend.reads.get()
         vm.setSourceCatalog(catalog())
         vm.refresh()
-        await { vm.state.value.inventory.targetId > 0 }
+        await { backend.reads.get() > readsBeforeRefresh && vm.state.value.inventory.targetId > 0 }
         assertEquals(96, vm.state.value.inventory.targetId)
 
-        // Seed a 95 snapshot only after refresh has fully completed.
+        // Seed a 95 snapshot only after refresh's restore/cleanup has run.
         assertTrue(
             backend.store().save(
                 SELECTION_SOURCE_CATALOG,
