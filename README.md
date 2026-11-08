@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > 三星 Dual 雙開工具（開發中腳手架，僅有有限情境實機證據）：設計目標為自動提權路由，
-> LSPosed 優先、Shizuku 降級，絕不觸碰 Secure Folder。
+> LSPosed 通道為 NoOp 佔位＋marker 顯示（永不授權）、Shizuku 降級，絕不觸碰 Secure Folder。
 > 目前路由純函數、命令封裝、真通道組裝＋手動 picker＋hook marker 顯示有單元測試；App 真通道＋picker＋marker 顯示已接線。分層實證（[S24 已驗證]僅限此句，其餘 [待實機驗證]）：App ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、裸 pm clone、uninstall 回滾、`su -c` 重裝、system hook（DualAppManagerService 雙方法 deoptimize＋hooked）、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取，不等於 callback 執行或包名放寬）、marker 主路徑 scope=system_server（早於本次開機約5.5h 的歷史證據，不能宣稱本次開機有效）。
 
 > **實機證據更新（2026-11-05）**：[S24 調查與追蹤計畫](docs/UX_REVIEW_S24.md) 區分原碼、歷史實機與本輪唯讀證據，並連結 issues #21–#29。指定正常 SHELL clone/remove＋手動通道歷史見該文 §5。下文較舊 F4a 段落中的「全部未驗／啟動時靜態選路」描述不應當成目前完整現況：手動通道、偏好保存與動態重選已實作，但 Auto 降級、安全負向邊界及當前 source 的可追溯裝置驗收仍待完成。
@@ -46,7 +46,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 
 - Android 10+，建議三星 One UI 4.0+，`compileSdk 34`。
 - Kotlin 2.x，AGP 8.x，JDK 17。
-- 可選：LSPosed（優先）、Shizuku v13+（降級；低於 v13 無 Context 構造 → -1 → EXEC 一律拒絕，本 App 綁定前明確拒絕）。
+- 可選：LSPosed（NoOp 佔位＋marker 顯示，永不授權）、Shizuku v13+（通道；低於 v13 無 Context 構造 → -1 → EXEC 一律拒絕，本 App 綁定前明確拒絕）。
 
 ## 快速開始 (Quick Start)
 
@@ -68,7 +68,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 路由純函數（`routePrivilege`＋`channelReadyFor`，[已支援]，單元測試覆蓋）依序判斷；App 端探測＋選擇框架（`probeChannels`／`recheckPrivilege`／`selectChannel`＋手動 `ChannelPreference` picker＋Shizuku 生命週期）已接真 gateway（`SuCmdGateway` 經 `su -c`、`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；hook 訊號為 file marker 存在性證據，僅顯示、永不進入路由，[待實機驗證]；`selectChannel` 動態換 gateway；選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，hook 永不授權，NONE 永不就緒）。以下順序仍是設計＋純函數行為，App 端 Shizuku 切換（未授權路徑／首次選路／marker gateway-`cat` 顯示 [待實機驗證]；已授權一鍵、ROOT 一鍵／su／uninstall 已驗，見「實作狀態」）：
 
-1. 偵測 LSPosed 模組是否啟用 → `Privilege.ROOT`。
+1. 偵測 su 是否可用 → `Privilege.ROOT`（LSPosed marker 不進入路由，[待實機驗證]）。
 2. 否則偵測 Shizuku 是否可用 → `Privilege.SHELL`。
 3. 否則 → `Privilege.NONE`，僅顯示唯讀狀態，不執行寫入。
 
@@ -102,7 +102,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## English Summary
 
 Galaxy-Dual-app-Plus is a scaffold towards enabling Samsung Dual Messenger / Dual Apps
-via a privilege router (LSPosed first, Shizuku fallback). It never touches Secure Folder (Knox).
+via a privilege router (LSPosed display-only marker/NoOp placeholder, Shizuku fallback). It never touches Secure Folder (Knox).
 Modules: `app` (UI wired with Clone/Remove/Reconnect-and-refresh/permission buttons + channel picker + hook marker row + StateFlow + Shizuku lifecycle; true-channel + picker + marker display wired: ROOT via `SuCmdGateway` (`su -c`), SHELL via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5), LSPosed via NoOp placeholder (writes refused, marker display-only), `ChannelPreference` (AUTO default, `selectChannel` swaps gateway + re-probes) with `NoOp` fail-closed fallback, `channelReady` true only when the selected channel's probe passes (`channelReadyFor`, tested)), `core` (privilege abstraction, tested), `hook` (LSPosed module,
 API 102, observe-only placeholder with empty policy + file-marker writer).
 Status: routing pure function (`routePrivilege` + `channelReadyFor`), `pm` command encapsulation, channel picker + marker display, gateway assembly JVM tests, hook pure-function tests (`WhitelistPolicy`/`WhitelistPatch`/`PolicySource`/`HookMarker`), and lint/CI gates are implemented
