@@ -98,7 +98,7 @@ val privilege: Privilege = when {
 2. UI builds a `CmdGateway` matching that level.
 3. Gateway runs `pm` / `dumpsys` commands.
 4. Raw stdout goes through `PmOutputParser` into UI state.
-5. Hook path (ROOT) may bypass shell by calling the dual-app service directly.
+5. LSPosed / hook path (display-only): marker presence and hook registration are existence+scope evidence only; they never grant write capability. No direct service-backed executable hook gateway is wired in the selected path — `ChannelPreference.assembleChannel(ChannelPreference.LSPOSED, …)` constructs `NoOpGateway` (writes refused). LSPosed channel remains a NoOp placeholder.
 6. Concurrency boundary (#24; busy = `UiState.loading`, merge = coalesce):
    `opMutex` serializes probe/refresh/clone/remove; rapid refresh taps coalesce
    into one trailing run, clone/request-remove/confirm dedup by op key (`already in progress`,
@@ -110,8 +110,8 @@ val privilege: Privilege = when {
    註：`DualViewModel.refreshLocked()` 目前仍走 9 命令 resolve-then-reverify 舊路徑（`DualViewModel.kt:399-490`），遷移到 `refreshVerified()` 5 命令為 follow-up；兩者同為 fail-closed，僅命令數差異。
 
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
-   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24；`app/src/androidTest` 現已含 7 個 test class / 8 個檔案的 harness，見 docs/ACCEPTANCE.md §5；本 PR 不新增 instrumentation）。
-   本 PR 只保證 JVM 語意 + CI 綠燈。
+   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
+   `app/src/androidTest/` 現已含 8 個檔案 / 7 個 test class 的 harness（27 個自動化測試：20 JUnit4 + 7 JUnit3，見 docs/ACCEPTANCE.md §5）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
 
 ## Non-Goals
 
