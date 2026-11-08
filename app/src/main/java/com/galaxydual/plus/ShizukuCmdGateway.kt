@@ -33,6 +33,7 @@ import android.content.pm.PackageManager
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.os.Process
 import android.util.Log
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
@@ -75,8 +76,12 @@ import rikka.shizuku.Shizuku
 // use a different version code whenever the service code is updated; daemon
 // defaults to true), so the next bind with the new args rebuilds the
 // resident UserService instead of reusing the old one. The
-// tag stays "GalaxyDualExec-v1" for stable service identity; the version bump
-// is the invalidation signal.
+// bind tag is per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
+// galaxyExecServiceTag) so each user instance gets its own service record;
+// the legacy fixed tag "GalaxyDualExec-v1" no longer binds and its record
+// orphans until Shizuku restart (daemon restart reaps). SERVICE_VERSION stays
+// 3 in this phase (C2 will bump it for the appId change); the version bump
+// remains the invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
 //   1. install the old APK and start the resident UserService (v1);
@@ -113,8 +118,12 @@ object ShizukuExecProtocol {
     // changes: Shizuku requires a different version code on service-code
     // updates so the daemon (default true) rebuilds the UserService instead
     // of reusing the resident old one -- v3 therefore invalidates ungated v2
-    // resident services. Tag is intentionally NOT bumped ("GalaxyDualExec-v1"
-    // stays the stable service identity below).
+    // resident services. The bind tag is per-UID derived
+    // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag); the legacy
+    // fixed tag "GalaxyDualExec-v1" is retained only as LEGACY_GALAXY_EXEC_TAG
+    // for cleanup/documentation and is NOT bound. Its old service record
+    // orphans until Shizuku restart (daemon restart reaps). SERVICE_VERSION
+    // stays 3 in this phase; C2 will bump it to 4 for the appId change.
     const val SERVICE_VERSION = 3
 }
 
@@ -145,6 +154,22 @@ object ShizukuExecProtocol {
  */
 internal fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
     callingUid == expectedAppUid && expectedAppUid >= 10_000
+
+// Legacy fixed bind tag (pre-Phase C1). Retained for cleanup/documentation
+// only; it is NOT bound — galaxyExecServiceTag() below derives a per-UID tag
+// for every bind. Its resident service record orphans until Shizuku restart
+// (daemon restart reaps).
+const val LEGACY_GALAXY_EXEC_TAG = "GalaxyDualExec-v1"
+
+// Prefix for the per-UID derived bind tag (see galaxyExecServiceTag).
+const val GALAXY_EXEC_TAG_PREFIX = "GalaxyDualExec-v1-u"
+
+// Phase C1 (P1 multi-user tag): pure per-caller bind tag. Embeds the FULL
+// caller uid (userId*100000 + appId, e.g. 1010234 for user 10), NOT just the
+// appId, so the owner (10134) and secondary users (1010234, 9510234) get
+// distinct tags and distinct Shizuku service records. Stable for a given uid
+// across binds/restarts of the app process.
+internal fun galaxyExecServiceTag(callerUid: Int): String = "GalaxyDualExec-v1-u$callerUid"
 
 // Pure error mapping for every Shizuku-side failure. Tri-state contract
 // (PR-32 P1-1 timeout, extended by P1-2 transport-unknown): the repository
@@ -423,14 +448,18 @@ interface ShizukuBindDriver {
 private class RealShizukuBindDriver(
     private val packageName: String,
     private val serviceClassName: String,
+    private val uidProvider: () -> Int = { Process.myUid() },
 ) : ShizukuBindDriver {
     override fun send(onResult: (Result<IBinder>) -> Unit): ShizukuBindDriver.Request {
+        val callerUid = uidProvider()
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
-            // Tag stays the stable service identity; SERVICE_VERSION (v3) is the
+            // Tag is per-UID derived via galaxyExecServiceTag(callerUid)
+            // (full caller uid, stable); SERVICE_VERSION (still 3 in this
+            // phase, C2 will bump it for the appId change) remains the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
-        ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")
+        ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag(galaxyExecServiceTag(callerUid))
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 if (service != null) onResult(Result.success(service))
@@ -489,11 +518,17 @@ class ShizukuCmdGateway(
     private val bindTimeoutMs: Long = ShizukuExecProtocol.BIND_TIMEOUT_MS,
     private val bindDriver: ShizukuBindDriver? = null,
     private val cleanupScope: CoroutineScope? = null,
+    // Phase C1: caller-uid provider for the per-UID bind tag (default =
+    // Process.myUid() at bind time inside RealShizukuBindDriver). Nullable
+    // trailing param with default null so existing call sites keep working
+    // and JVM construction stays stub-free (Process.myUid() is resolved
+    // lazily only when the real driver is built).
+    private val uidProvider: (() -> Int)? = null,
 ) : CmdGateway {
     override val privilege: Privilege = Privilege.SHELL
 
     private val resolvedDriver: ShizukuBindDriver by lazy {
-        bindDriver ?: RealShizukuBindDriver(packageName, serviceClassName)
+        bindDriver ?: RealShizukuBindDriver(packageName, serviceClassName, uidProvider ?: { Process.myUid() })
     }
     private val resolvedCleanupScope: CoroutineScope by lazy {
         cleanupScope ?: shizukuCleanupScope

@@ -406,7 +406,11 @@ class GatewayAssemblyTest {
     // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate (current
     // contract). bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
     // rebuilds the resident UserService on upgrade (v3 invalidates ungated v2
-    // resident services); the tag stays "GalaxyDualExec-v1".
+    // resident services); the bind tag is per-UID derived
+    // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag) and the
+    // legacy fixed tag "GalaxyDualExec-v1" record orphans until Shizuku
+    // restart (daemon restart reaps). SERVICE_VERSION stays 3 in this phase
+    // (C2 will bump it for the appId change).
     @Test fun serviceVersion_isV3() {
         assertEquals(3, ShizukuExecProtocol.SERVICE_VERSION)
     }
