@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -20,7 +21,7 @@ class ChannelPreferenceRealStoreTest {
         val prefs = ctx.getSharedPreferences(CHANNEL_PREFS_NAME, Context.MODE_PRIVATE)
         val original = LinkedHashMap(prefs.all)
         try {
-            prefs.edit().clear().commit()
+            if (!prefs.edit().clear().commit()) fail("setup clear commit failed")
             block(prefs)
         } finally {
             val editor = prefs.edit().clear()
@@ -34,7 +35,7 @@ class ChannelPreferenceRealStoreTest {
                     is Set<*> -> editor.putStringSet(k, v.filterIsInstance<String>().toMutableSet())
                 }
             }
-            editor.commit()
+            if (!editor.commit()) fail("restore commit failed")
         }
     }
 
@@ -57,7 +58,7 @@ class ChannelPreferenceRealStoreTest {
     fun realPrefs_corruptTypeFailsClosed() {
         withCleanPrefs { prefs ->
             // Store a non-String under the known key to simulate type corruption.
-            prefs.edit().putInt(CHANNEL_PREF_KEY, 42).commit()
+            if (!prefs.edit().putInt(CHANNEL_PREF_KEY, 42).commit()) fail("corrupt setup commit failed")
 
             // loadChannelPreference must not throw and must fall back to AUTO.
             assertEquals(ChannelPreference.AUTO, loadChannelPreference(prefs))
