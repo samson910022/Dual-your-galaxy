@@ -138,6 +138,56 @@ jobs:
             exit 1
           fi
           echo "PASS: ShizukuProvider present in manifest and DEX"
+      # C4: forbid android:sharedUserId (uid-equality gate would admit siblings sharing the UID).
+      # Matches attribute assignment (with =) only, so the warning comment (without =) does NOT false-positive.
+      - name: Exec service sharedUserId invariant
+        run: |
+          set -e
+          echo "== android:sharedUserId attribute forbidden (uid gate would admit siblings) =="
+          if grep -rE --include='*.xml' 'android:sharedUserId[[:space:]]*=' app/src/main; then echo "FAIL: android:sharedUserId attribute found (uid gate would admit siblings)"; exit 1; fi
+          grep -F 'Do NOT add android:sharedUserId' app/src/main/AndroidManifest.xml
+          echo "PASS: no sharedUserId attribute (warning comment present)"
+      # D3: enforce the same invariant on the shipping artifacts (merged manifest + binary APK).
+      # Why: the C4 source gate cannot catch a manifest transform or library merge
+      # that injects android:sharedUserId after source; the merged + APK artifacts shipped are what runs.
+      # must run after :app:assembleDebug
+      # Uses only shell/unzip/grep/python3 (runner built-ins); no aapt2/apkanalyzer.
+      - name: Exec service sharedUserId shipping-artifact invariant (merged + APK)
+        run: |
+          set -e
+          set -o pipefail
+          echo "== (a) merged manifest has no android:sharedUserId attribute =="
+          if [ ! -d app/build/intermediates/merged_manifests ]; then
+            echo "FAIL: app/build/intermediates/merged_manifests missing; run :app:assembleDebug first"
+            exit 1
+          fi
+          MERGED=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml | head -n 1)
+          if [ -z "$MERGED" ] || [ ! -f "$MERGED" ]; then
+            echo "FAIL: no merged AndroidManifest.xml under app/build/intermediates/merged_manifests; run :app:assembleDebug first"
+            exit 1
+          fi
+          echo "merged manifest: $MERGED"
+          if grep -E 'android:sharedUserId[[:space:]]*=' "$MERGED"; then echo "FAIL: android:sharedUserId attribute found in merged manifest $MERGED (uid gate would admit siblings)"; exit 1; fi
+          echo "== (b) APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool scan) =="
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "FAIL: $APK not found; run :app:assembleDebug first"
+            exit 1
+          fi
+          unzip -p "$APK" AndroidManifest.xml | python3 -c '
+          import sys
+          data = sys.stdin.buffer.read()
+          if not data:
+              print("FAIL: APK binary AndroidManifest.xml is empty")
+              sys.exit(1)
+          t16 = data.decode("utf-16-le", errors="ignore")
+          t8 = data.decode("utf-8", errors="ignore")
+          if "sharedUserId" in t16 or "sharedUserId" in t8:
+              print("FAIL: sharedUserId string found in APK binary AndroidManifest.xml")
+              sys.exit(1)
+          print("OK: no sharedUserId in APK binary AndroidManifest.xml")
+          '
+          echo "PASS: no sharedUserId in merged manifest or APK binary manifest"
       # D1: verify the hook entry survives into the single APK (guards packaging regressions).
       # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
       - name: APK hook entry check

@@ -46,7 +46,7 @@ hook -> XposedModule (DualHook, apiVersion 102)
 
 - Android 10+，建議三星 One UI 4.0+，`compileSdk 34`。
 - Kotlin 2.x，AGP 8.x，JDK 17。
-- 可選：LSPosed（優先）、Shizuku（降級）。
+- 可選：LSPosed（優先）、Shizuku v13+（降級；低於 v13 無 Context 構造 → -1 → EXEC 一律拒絕，本 App 綁定前明確拒絕）。
 
 ## 快速開始 (Quick Start)
 
