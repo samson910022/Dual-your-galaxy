@@ -5801,7 +5801,7 @@ class DualViewModel(
 // effective hook, so it must never grant privilege. probeChannels routes
 // through this function; HookDiagnosisTest locks the contract.
 fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
-    routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
+    routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot)
 
 // PR-7 P2 (issue #26):選取自動恢復 marker 初值 (從未恢復)。
 // 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 = 「從未恢復」哨兵。

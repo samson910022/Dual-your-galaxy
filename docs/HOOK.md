@@ -177,7 +177,7 @@ S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detec
 是目標 hook 存活證據；自家 prefs 只能證明自注入，需額外 2 scope 的
 注入面卻換來更弱的證據。hook 啟用訊號的唯一來源是 file marker，
 App 側經 `HookStateProvider` 讀取、僅顯示、永不進入路由
-（`hasLsposed` 恆 `false`，見 `DualViewModel.probeChannels`）。
+（`routePrivilege` 已無 `hasLsposed` 參數；hook 訊號不得作為授權輸入，見 `DualViewModel.probeChannels`）。
 
 Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷史證據，
 詳 [S24 調查](UX_REVIEW_S24.md) §4.4／§5）：

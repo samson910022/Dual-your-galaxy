@@ -19,7 +19,8 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 
 ```kotlin
 // Pseudocode: hook-neutral — hook signal never grants privilege (#19).
-// App side calls routePrivilege(hasLsposed = false, ...); hook state is display-only.
+// routePrivilege(hasShizuku, hasRoot) is a pure function of two probes only;
+// hook state is display-only and must never be fed as an authorization input.
 val privilege: Privilege = when {
     hasRoot -> Privilege.ROOT          // su probe passed
     shizukuAlive() -> Privilege.SHELL // Shizuku binder reachable + authorized
@@ -38,8 +39,8 @@ val privilege: Privilege = when {
 > 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
 > observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
-> 路由 hook-neutral：`routePrivilege` 以 `hasLsposed = false` 呼叫，
-> `channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
+> 路由 hook-neutral：`routePrivilege(hasShizuku, hasRoot)` 為兩探針純函數，
+> `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
 
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (su probe).
 - Router is a pure function of two probes: `hasRoot` (su) and `isShizukuAlive()`; hook signal never enters routing (hook-neutral, LSPosed mode is NoOp placeholder).

@@ -43,11 +43,11 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 
 ```kotlin
 // Pure routing logic, no side effects (see core/Privilege.kt).
-// App 端現狀（H4／#19）：hook 訊號永不進入路由（hasLsposed 恆 false：file
-// marker 是存在性證據，不是 live hook 證明）；hasRoot/hasShizuku 由
-// Su/ShizukuElevator 真通道探測填入。Hook 狀態走 UiState.hookActive／
-// hookScopes（display-only）供 LSPosed picker 行顯示。
-val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, hasRoot = hasRoot)
+// App 端現狀（H4／#19）：hook 訊號永不進入路由（`hasLsposed` 參數已移除：
+// file marker 是存在性證據，不是 live hook 證明，不得作為授權輸入）；
+// hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。Hook 狀態走
+// UiState.hookActive／hookScopes（display-only）供 LSPosed picker 行顯示。
+val privilege = routePrivilege(hasShizuku = shizukuAlive, hasRoot = hasRoot)
 val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 
