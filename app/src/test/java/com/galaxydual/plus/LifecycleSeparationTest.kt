@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -70,6 +71,28 @@ class LifecycleSeparationTest {
         override val privilege: Privilege = Privilege.ROOT
         val installCalls = mutableListOf<String>()
         val uninstallCalls = mutableListOf<String>()
+        // Command audit: every command issued is recorded; writes and any
+        // command outside the known allow-list are tracked separately so tests
+        // can assert "zero auto-resend" covers ALL command categories.
+        val allCommands = mutableListOf<String>()
+        val writeCommands = mutableListOf<String>()
+        val unexpectedCommands = mutableListOf<String>()
+
+        private fun isWrite(cmd: String): Boolean =
+            cmd.startsWith("pm install") || cmd.startsWith("pm uninstall") ||
+                cmd.contains("rm ") || cmd.contains("chmod") || cmd.contains("chown")
+
+        private fun isAllowed(cmd: String): Boolean = when {
+            cmd.trim() == "id -u" -> true
+            cmd == DualRepository.CMD_LIST_USERS -> true
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> true
+            cmd == DualRepository.CMD_DUMPSYS_USER -> true
+            cmd == DualRepository.CMD_GETPROP_DUAL -> true
+            cmd.startsWith("pm install-existing") -> false
+            cmd.startsWith("pm uninstall") -> false
+            cmd.startsWith("pm list packages") -> true
+            else -> false
+        }
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -93,7 +116,13 @@ class LifecycleSeparationTest {
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
-        override suspend fun run(cmd: String): CmdResult = when {
+        override suspend fun run(cmd: String): CmdResult {
+            allCommands.add(cmd)
+            if (isWrite(cmd)) writeCommands.add(cmd)
+            // Writes are tracked separately (writeCommands); only non-write
+            // commands outside the read allow-list count as unexpected.
+            if (!isWrite(cmd) && !isAllowed(cmd)) unexpectedCommands.add(cmd)
+            return when {
             cmd.trim() == "id -u" ->
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
@@ -125,6 +154,8 @@ class LifecycleSeparationTest {
                 )
             else -> CmdResult(exit = 0, out = "ok", err = "")
         }
+    }
+
     }
 
     private fun makeVm(
@@ -180,7 +211,14 @@ class LifecycleSeparationTest {
     }
 
     @Test
-    fun rotation_configChange_retainsPendingAndSelection() {
+    // Config change retains the same ViewModel instance (Android retains VMs
+    // across configuration changes), so pendingRemove + selectedKeys survive
+    // on the same instance with zero device writes. This does NOT exercise a
+    // real Activity.recreate(); real recreate evidence lives in the
+    // instrumentation RotationTest (pending_retainedOnSameInstance_zeroWrite /
+    // pending_discardedOnNewInstance_zeroWrite /
+    // activity_recreate_retainsPendingDialog).
+    fun sameViewModel_instance_retainsPendingAndSelection_noWrites() {
         val gw = FakeRepo()
         gw.installedForUser.add("com.example.chat")
         val clock = FakeClock()
@@ -204,6 +242,8 @@ class LifecycleSeparationTest {
         assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
         assertEquals(0, gw.installCalls.size)
         assertEquals(0, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
     }
 
     @Test
@@ -230,11 +270,8 @@ class LifecycleSeparationTest {
         vm.refresh()
         await { "0:com.example.chat" in vm.state.value.selectedKeys }
 
-        vm.restoreSelection(95)
-        await { "0:com.example.chat" in vm.state.value.selectedKeys }
-
         assertEquals(
-            "selected keys restored from snapshot",
+            "selected keys restored from snapshot (process-death recovery via refresh)",
             setOf("0:com.example.chat", "0:com.example.mail"),
             vm.state.value.selectedKeys,
         )
@@ -254,14 +291,18 @@ class LifecycleSeparationTest {
         assertTrue(vmEmpty.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwEmpty.installCalls.size)
         assertEquals(0, gwEmpty.uninstallCalls.size)
+        assertEquals(0, gwEmpty.writeCommands.size)
+        assertEquals(0, gwEmpty.unexpectedCommands.size)
 
         vmEmpty.setSourceCatalog(catalog())
         vmEmpty.refresh()
-        await { !vmEmpty.state.value.loading }
+        await { vmEmpty.state.value.inventory.targetId > 0 }
         assertNull(vmEmpty.state.value.pendingRemove)
         assertTrue(vmEmpty.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwEmpty.installCalls.size)
         assertEquals(0, gwEmpty.uninstallCalls.size)
+        assertEquals(0, gwEmpty.writeCommands.size)
+        assertEquals(0, gwEmpty.unexpectedCommands.size)
 
         val backendCorrupt = MapBackend()
         backendCorrupt.map[SELECTION_KEY] = "garbage-not-a-snapshot"
@@ -273,14 +314,250 @@ class LifecycleSeparationTest {
         assertTrue(vmCorrupt.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwCorrupt.installCalls.size)
         assertEquals(0, gwCorrupt.uninstallCalls.size)
+        assertEquals(0, gwCorrupt.writeCommands.size)
+        assertEquals(0, gwCorrupt.unexpectedCommands.size)
 
         vmCorrupt.setSourceCatalog(catalog())
         vmCorrupt.refresh()
-        await { !vmCorrupt.state.value.loading }
+        await { vmCorrupt.state.value.inventory.targetId > 0 }
         assertNull(vmCorrupt.state.value.pendingRemove)
         assertTrue(vmCorrupt.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwCorrupt.installCalls.size)
         assertEquals(0, gwCorrupt.uninstallCalls.size)
+        assertEquals(0, gwCorrupt.writeCommands.size)
+        assertEquals(0, gwCorrupt.unexpectedCommands.size)
         assertNull(backendCorrupt.map[SELECTION_KEY])
+    }
+
+    @Test
+    fun explicitRestore_isNoOpWhenSelectionNonEmpty() {
+        val backend = MapBackend()
+        backend.store().save(
+            SELECTION_SOURCE_CATALOG,
+            95,
+            setOf("0:com.example.mail"),
+            1000L,
+        )
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+
+        vm.setSourceCatalog(catalog())
+        vm.toggleSelection("0:com.example.chat")
+        await { vm.state.value.selectedKeys.contains("0:com.example.chat") }
+
+        val selectedBefore = vm.state.value.selectedKeys
+        val pendingBefore = vm.state.value.pendingRemove
+
+        // Selection is non-empty: restore must NOT overwrite (no auto-resend).
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertEquals(selectedBefore, vm.state.value.selectedKeys)
+        assertEquals(pendingBefore, vm.state.value.pendingRemove)
+        // Seeded key from store must not have been merged in.
+        assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
+        assertFalse(vm.state.value.selectedKeys.contains("0:com.example.mail"))
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
+    }
+
+    @Test
+    fun processDeath_corruptPrefs_selfClearsAndRecovers() {
+        val backend = MapBackend()
+        backend.map[SELECTION_KEY] = "garbage-not-a-snapshot"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { !vm.state.value.loading }
+        assertNull(backend.map[SELECTION_KEY])
+        assertNull(vm.state.value.pendingRemove)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+
+        // Recovery: a fresh save succeeds after self-clear.
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat"),
+                2000L,
+            ),
+        )
+        assertEquals(
+            setOf("0:com.example.chat"),
+            backend.store().loadSelected(95, null),
+        )
+    }
+
+    @Test
+    fun unverifiedTarget_restore_isNoOpAndPreservesStore() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat"),
+                1000L,
+            ),
+        )
+
+        // Device reports a different verified target (96).
+        val gw = FakeRepo(dualId = 96, dualSerial = 41)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+
+        // Deliberately no refresh: refresh would legitimately clear the
+        // foreign (95) entry for the verified 96 target. The foreign-target
+        // guard under test is the restoreSelection entry point itself, which
+        // must not touch the store when the verified inventory differs.
+        val rawBefore = backend.map[SELECTION_KEY]
+        vm.setSourceCatalog(catalog())
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertEquals(rawBefore, backend.map[SELECTION_KEY])
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
+    }
+
+    @Test
+    fun nullStore_restore_doesNotCrash() {
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, null)
+        await { vm.state.value.channelReady }
+
+        vm.setSourceCatalog(catalog())
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertNull(vm.state.value.pendingRemove)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
+    }
+
+    @Test
+    fun emptyCatalog_restore_doesNotPoisonMarker_thenRecovers() {
+        val backend = MapBackend()
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat", "0:com.example.mail"),
+                1000L,
+            ),
+        )
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+
+        // No catalog yet: restore must not burn the marker.
+        vm.restoreSelection(95)
+        Thread.sleep(300)
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+
+        // Once catalog is ready, refresh recovers the persisted selection.
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { "0:com.example.chat" in vm.state.value.selectedKeys }
+        assertEquals(
+            setOf("0:com.example.chat", "0:com.example.mail"),
+            vm.state.value.selectedKeys,
+        )
+        assertNull(vm.state.value.pendingRemove)
+    }
+
+    @Test
+    fun serialMismatch_restore_clearsStaleEntry() {
+        val backend = MapBackend()
+        // v2 snapshot bound to serial 15.
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat"),
+                1000L,
+                15,
+            ),
+        )
+        // Device reports the same id but a rebuilt serial (41).
+        val gw = FakeRepo(dualId = 95, dualSerial = 41)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+
+        vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { !vm.state.value.loading }
+        await { backend.map[SELECTION_KEY] == null }
+        // Mismatch is verified -> stale entry cleared, nothing restored.
+        assertTrue(vm.state.value.selectedKeys.isEmpty())
+        assertNull(backend.map[SELECTION_KEY])
+        assertEquals(0, gw.installCalls.size)
+        assertEquals(0, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
+    }
+
+    @Test
+    fun processDeath_vmA_to_vmB_restoresSerialBoundSelection() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vmA = makeVm(gw, clock, backend.store())
+        await { vmA.state.value.channelReady }
+
+        vmA.setSourceCatalog(catalog())
+        vmA.refresh()
+        await { vmA.state.value.inventory.targetId > 0 }
+
+        vmA.toggleSelection("0:com.example.chat")
+        await { vmA.state.value.selectedKeys.contains("0:com.example.chat") }
+
+        // Drive persistence through VM A (serial-bound to the verified target).
+        vmA.persistSelection(95)
+        await { vmA.state.value.msg.contains("已保存") }
+        // Serial-bound persistence: the on-disk entry must carry serial=15.
+        assertTrue(backend.map[SELECTION_KEY]!!.contains("serial=15"))
+
+        // Destroy VM A (cancel its scope) to simulate process death.
+        try {
+            vmA.viewModelScope.cancel()
+        } catch (_: Exception) {
+        }
+        vms.remove(vmA)
+
+        // VM B backed by the same storage must recover the serial-bound selection.
+        val gwB = FakeRepo()
+        val clockB = FakeClock()
+        val vmB = makeVm(gwB, clockB, backend.store())
+        await { vmB.state.value.channelReady }
+
+        vmB.setSourceCatalog(catalog())
+        vmB.refresh()
+        await { "0:com.example.chat" in vmB.state.value.selectedKeys }
+
+        assertEquals(
+            setOf("0:com.example.chat"),
+            vmB.state.value.selectedKeys,
+        )
+        assertEquals(15, vmB.state.value.inventory.targetSerial)
+        assertNull(vmB.state.value.pendingRemove)
+        assertEquals(0, gwB.installCalls.size)
+        assertEquals(0, gwB.uninstallCalls.size)
+        assertEquals(0, gwB.writeCommands.size)
+        assertEquals(0, gwB.unexpectedCommands.size)
     }
 }
