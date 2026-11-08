@@ -129,10 +129,10 @@ class ShizukuLegacyCleanupTest {
         val fake = FakeLegacyCleaner()
         val gw = makeGateway(fake)
         assertFalse(gw.isLegacyCleanupCompleteForTest())
-        assertTrue(gw.ensureLegacyCleanupDone())
+        assertTrue(gw.ensureLegacyCleanupDone().completed)
         assertEquals(1, fake.calls.get())
         assertTrue(gw.isLegacyCleanupCompleteForTest())
-        assertTrue(gw.ensureLegacyCleanupDone())
+        assertTrue(gw.ensureLegacyCleanupDone().completed)
         assertEquals(1, fake.calls.get())
         assertTrue(gw.isLegacyCleanupCompleteForTest())
     }
@@ -141,8 +141,11 @@ class ShizukuLegacyCleanupTest {
         val fake = FakeLegacyCleaner()
         fake.toThrow = RuntimeException("boom")
         val gw = makeGateway(fake)
-        // Phase E1 fail-closed: failure is false, flag stays incomplete.
-        assertFalse(gw.ensureLegacyCleanupDone())
+        // Phase E1 fail-closed: failure is not-completed, flag stays incomplete.
+        // Phase F2: failure detail is per-call (no shared volatile race).
+        val first = gw.ensureLegacyCleanupDone()
+        assertFalse(first.completed)
+        assertEquals("boom", first.failureDetail)
         assertEquals(1, fake.calls.get())
         assertFalse(gw.isLegacyCleanupCompleteForTest())
         // The gate returns a definite legacyCleanupFailed refusal (it
@@ -162,8 +165,25 @@ class ShizukuLegacyCleanupTest {
         assertEquals(3, fake.calls.get())
         assertTrue(gw.isLegacyCleanupCompleteForTest())
         // Third call skips (already complete).
-        assertTrue(gw.ensureLegacyCleanupDone())
+        assertTrue(gw.ensureLegacyCleanupDone().completed)
         assertEquals(3, fake.calls.get())
+    }
+
+    @Test fun failureDetail_perCall_noSharedRace() = runBlocking {
+        // Phase F2: each failed call's detail is independent; a concurrent
+        // success must not rewrite a sibling failure's detail to "unknown".
+        val fake = FakeLegacyCleaner()
+        val gw = makeGateway(fake)
+        fake.toThrow = RuntimeException("first-boom")
+        val first = gw.ensureLegacyCleanupDone()
+        assertFalse(first.completed)
+        assertTrue(first.failureDetail!!.contains("first-boom"))
+        fake.toThrow = null
+        val second = gw.ensureLegacyCleanupDone()
+        assertTrue(second.completed)
+        // The first outcome is immutable and still carries its own detail.
+        assertFalse(first.completed)
+        assertTrue(first.failureDetail!!.contains("first-boom"))
     }
 
     @Test fun cancellationPropagates_flagStaysIncomplete() = runBlocking {
@@ -187,7 +207,15 @@ class ShizukuLegacyCleanupTest {
         val results = deferred.map { it.await() }
         assertEquals(1, fake.calls.get())
         assertTrue(gw.isLegacyCleanupCompleteForTest())
-        assertTrue(results.all { it })
+        assertTrue(results.all { it.completed })
+    }
+
+    @Test fun userServiceMinimum_pinnedTo10() {
+        // Phase F1: cleanup runs only when version >= MIN_USERSERVICE_VERSION
+        // (UserService API exists from v10); <10 goes straight to unsupported
+        // without attempting cleanup.
+        assertEquals(10, ShizukuExecProtocol.MIN_USERSERVICE_VERSION)
+        assertEquals(13, ShizukuExecProtocol.MIN_SHIZUKU_VERSION)
     }
 
     @Test fun run_preV13_cleanupCalledThenUnsupportedVersion_noBind() = runBlocking {
@@ -202,6 +230,25 @@ class ShizukuLegacyCleanupTest {
         assertEquals(1, fake.calls.get())
         assertTrue(gw.isLegacyCleanupCompleteForTest())
         assertEquals(0, driver.sendCount)
+    }
+
+    @Test fun run_preUserServiceMinimum_unsupportedWithoutCleanup_noBind() = runBlocking {
+        // Phase F1: version < MIN_USERSERVICE_VERSION (10) has no UserService
+        // API, so no legacy record can exist; skip cleanup and go straight to
+        // unsupportedVersion (no meaningless cleanup attempt, no bind).
+        for (v in listOf(9, 0, -1)) {
+            val fake = FakeLegacyCleaner()
+            val driver = FakeBindDriver()
+            val gw = makeRunGateway(fake, driver, ping = true, perm = true, version = v)
+            val res = gw.run("pm list users")
+            assertNotEquals(0, res.exit)
+            assertTrue("must contain 'unsupported', got: ${res.err}", res.err.contains("unsupported"))
+            assertTrue("must echo version $v, got: ${res.err}", res.err.contains("$v"))
+            assertFalse("must not be cleanup failure, got: ${res.err}", res.err.contains("legacy cleanup failed"))
+            assertEquals(0, fake.calls.get())
+            assertFalse(gw.isLegacyCleanupCompleteForTest())
+            assertEquals(0, driver.sendCount)
+        }
     }
 
     @Test fun run_cleanupFailure_failClosed_noBind_definiteFailure() = runBlocking {
