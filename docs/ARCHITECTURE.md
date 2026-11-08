@@ -58,10 +58,12 @@ val privilege: Privilege = when {
     `GalaxyExecService` (`Shizuku#newProcess` was removed in Shizuku API
     13.1.5; the official guide mandates UserService instead -- F4a implements
     exactly that). Owner-uid gate invariant (Phase A P0, DEVICE-UNVERIFIED;
-    Phase C2 appId-normalized): only the owner app uid (appId >=
-    10000/AID_APP_START) may EXEC; privileged/shared appIds (root 0, system
-    1000, shell 2000, regardless of user offset) and resolution failure
-    fail closed; equality stays full-UID (never appId equality).
+    Phase C2 appId-normalized, Phase D2 appId upper bound): only the owner
+    app uid (appId in 10000..19999 / AID_APP_START..AID_APP_LAST) may EXEC;
+    privileged/shared appIds (root 0, system 1000, shell 2000, regardless of
+    user offset) and SDK sandbox (20000-29999) / isolated (99000-99999)
+    appIds, and resolution failure fail closed; equality stays full-UID
+    (never appId equality).
     Server gate (Phase C3): requires Shizuku v13+ (first API with the
     Context constructor); the gateway checks `Shizuku.getVersion()` pre-bind
     and refuses older servers with a definite failure before any bind.

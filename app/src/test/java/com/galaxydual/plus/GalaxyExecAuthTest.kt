@@ -80,10 +80,10 @@ class GalaxyExecAuthTest {
     @Test fun allowedCaller_intExtremes() {
         // Extreme uids: equality plus the appId gate decides (appIdOf strips
         // the user offset via remainder; no overflow surprises in the pure
-        // comparison). Int.MAX_VALUE appIdOf = 83647 (>= 10000), so the pair
-        // is true -- overflow-safe remainder property, not a realism claim
-        // (no real uid is Int.MAX_VALUE).
-        assertTrue(isAllowedCaller(Int.MAX_VALUE, Int.MAX_VALUE))
+        // comparison). Int.MAX_VALUE appIdOf = 83647 (> 19999, isolated
+        // range), so the pair is false -- overflow-safe remainder property,
+        // not a realism claim (no real uid is Int.MAX_VALUE).
+        assertFalse(isAllowedCaller(Int.MAX_VALUE, Int.MAX_VALUE))
         assertFalse(isAllowedCaller(Int.MAX_VALUE, 10234))
         assertFalse(isAllowedCaller(Int.MIN_VALUE, Int.MIN_VALUE))
     }
@@ -121,6 +121,16 @@ class GalaxyExecAuthTest {
         assertFalse(isApplicationUid(1001000)) // user 10 system
         assertFalse(isApplicationUid(1002000)) // user 10 shell
         assertFalse(isApplicationUid(1000000)) // user 10 root
+        // Upper bound (Phase D2): AID_APP_LAST is the largest application
+        // appId; SDK sandbox (20000-29999) and isolated (99000-99999)
+        // stay denied regardless of user.
+        assertTrue(isApplicationUid(19999)) // owner app last
+        assertTrue(isApplicationUid(1019999)) // user 10 app last
+        assertFalse(isApplicationUid(20000)) // owner sandbox start
+        assertFalse(isApplicationUid(29999)) // owner sandbox end
+        assertFalse(isApplicationUid(1020000)) // user 10 sandbox start
+        assertFalse(isApplicationUid(90000)) // owner isolated-ish start
+        assertFalse(isApplicationUid(99000)) // owner isolated start
         // Negatives stay false (uid >= 0 leg + remainder sign).
         assertFalse(isApplicationUid(-1))
         assertFalse(isApplicationUid(-100001))
@@ -138,6 +148,17 @@ class GalaxyExecAuthTest {
         // Secondary-user application uids succeed on exact full-uid match.
         assertTrue(isAllowedCaller(1010000, 1010000)) // user 10 app start
         assertTrue(isAllowedCaller(1010234, 1010234)) // user 10 app
+    }
+
+    @Test fun allowedCaller_upperBoundMatchingPairDenied() {
+        // Upper bound (Phase D2): exact-match pairs above 19999 are denied
+        // (SDK sandbox / isolated), while the boundary appId 19999 succeeds.
+        assertTrue(isAllowedCaller(19999, 19999)) // owner app last
+        assertTrue(isAllowedCaller(1019999, 1019999)) // user 10 app last
+        assertFalse(isAllowedCaller(20000, 20000)) // owner sandbox start
+        assertFalse(isAllowedCaller(29999, 29999)) // owner sandbox end
+        assertFalse(isAllowedCaller(99000, 99000)) // owner isolated start
+        assertFalse(isAllowedCaller(1099000, 1099000)) // user 10 isolated start (appId 99000)
     }
 
     @Test fun allowedCaller_crossUserAntiWeakening() {
@@ -160,6 +181,11 @@ class GalaxyExecAuthTest {
         assertEquals(10000, resolveExpectedAppUid(10000)) // owner app start
         assertEquals(1010000, resolveExpectedAppUid(1010000)) // user 10 app start
         assertEquals(-1, resolveExpectedAppUid(Int.MIN_VALUE)) // negative extreme
+        // Upper bound (Phase D2): appIds > 19999 resolve to -1 (fail closed).
+        assertEquals(-1, resolveExpectedAppUid(20000)) // owner sandbox start
+        assertEquals(-1, resolveExpectedAppUid(Int.MAX_VALUE)) // appIdOf 83647 > 19999
+        assertEquals(19999, resolveExpectedAppUid(19999)) // owner app last
+        assertEquals(1019999, resolveExpectedAppUid(1019999)) // user 10 app last
     }
 
     @Test fun galaxyTag_sameUidStableRepeated() {
