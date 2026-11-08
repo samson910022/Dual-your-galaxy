@@ -12,7 +12,7 @@
 
 - 在三星 One UI 裝置上啟用並管理 **Dual Messenger / Dual App** 雙開（目標，未經實機驗證）。
 - 提權策略（真通道＋手動 picker＋hook marker 顯示已接線，[待實機驗證] DEVICE-UNVERIFIED）：**LSPosed 模式（NoOp 佔位＋file marker 顯示，`HookMarker`→`HookStateProvider`→picker 行，僅顯示、永不授權，[待實機驗證]），su ROOT（`SuCmdGateway` 經 `su -c`），Shizuku 降級（Shell，`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除）**。
-- 無 ROOT、無 LSPosed 時，設計上自動降級為 Shizuku 模式執行 `pm` 指令（`core` 純函數 [已支援]；App 端 F4a 已接線 [待實機驗證]：Factory 在無 su 且 binder＋授權具備時選 `ShizukuCmdGateway`，探測通過才 `channelReady`）。
+- 無 ROOT 時（無論 LSPosed marker 是否存在），設計上自動降級為 Shizuku 模式執行 `pm` 指令（LSPosed marker 不進入路由；`core` 純函數 [已支援]；App 端 F4a 已接線 [待實機驗證]：Factory 在無 su 且 binder＋授權具備時選 `ShizukuCmdGateway`，探測通過才 `channelReady`）。
 - **不碰 Secure Folder（Knox 容器）**：不讀寫、不掛載、不繞過 Knox。
 - 模組化設計：`app`（UI）、`core`（提權抽象與命令閘道）、`hook`（LSPosed 注入）。
 
@@ -102,7 +102,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## English Summary
 
 Galaxy-Dual-app-Plus is a scaffold towards enabling Samsung Dual Messenger / Dual Apps
-via a privilege router (LSPosed display-only marker/NoOp placeholder, Shizuku fallback). It never touches Secure Folder (Knox).
+via a privilege router (su ROOT primary, Shizuku fallback, LSPosed display-only marker/NoOp placeholder (manual only)). It never touches Secure Folder (Knox).
 Modules: `app` (UI wired with Clone/Remove/Reconnect-and-refresh/permission buttons + channel picker + hook marker row + StateFlow + Shizuku lifecycle; true-channel + picker + marker display wired: ROOT via `SuCmdGateway` (`su -c`), SHELL via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5), LSPosed via NoOp placeholder (writes refused, marker display-only), `ChannelPreference` (AUTO default, `selectChannel` swaps gateway + re-probes) with `NoOp` fail-closed fallback, `channelReady` true only when the selected channel's probe passes (`channelReadyFor`, tested)), `core` (privilege abstraction, tested), `hook` (LSPosed module,
 API 102, observe-only placeholder with empty policy + file-marker writer).
 Status: routing pure function (`routePrivilege` + `channelReadyFor`), `pm` command encapsulation, channel picker + marker display, gateway assembly JVM tests, hook pure-function tests (`WhitelistPolicy`/`WhitelistPatch`/`PolicySource`/`HookMarker`), and lint/CI gates are implemented
