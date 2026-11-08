@@ -61,6 +61,13 @@ jobs:
           echo "$SIGN_STORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
           chmod 600 "$RUNNER_TEMP/signing/release.jks"
           echo "SIGN_STORE_FILE=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
+      # Run :app + :core + :hook unit tests before building release bytes.
+      # Fail fast so a broken commit never produces/publishes a release APK.
+      - name: Unit tests (app, core, hook debug)
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
       # Build release APKs with the committed wrapper (pinned Gradle 8.7); fail fast on errors.
       - name: Build release APK
         env:
@@ -70,6 +77,85 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
+      # B2 (release): verify ShizukuProvider survives into the released DEX.
+      - name: APK ShizukuProvider DEX check (release)
+        run: |
+          set -euo pipefail
+          echo "== (a) manifest declares rikka.shizuku.ShizukuProvider =="
+          grep -F "rikka.shizuku.ShizukuProvider" app/src/main/AndroidManifest.xml || { echo "::error::ShizukuProvider (rikka.shizuku.ShizukuProvider) not declared in app/src/main/AndroidManifest.xml"; exit 1; }
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No release APKs built; refusing to run DEX checks."
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            echo "--- checking $apk ---"
+            if [ ! -f "$apk" ]; then
+              echo "::error::Release APK not found: $apk"
+              exit 1
+            fi
+            FOUND=0
+            for dex in $(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex'); do
+              echo "--- scanning $dex ---"
+              if unzip -p "$apk" "$dex" | grep -q "ShizukuProvider"; then
+                echo "FOUND ShizukuProvider in $dex"
+                FOUND=1
+              fi
+            done
+            if [ "$FOUND" -eq 0 ]; then
+              echo "::error::ShizukuProvider class string not found in $apk"
+              exit 1
+            fi
+          done
+          echo "PASS: ShizukuProvider present in manifest and release DEX"
+      # D1 (release): verify the hook entry survives into the released APK.
+      - name: APK hook entry check (release)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No release APKs built; refusing to run DEX checks."
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            echo "--- checking $apk ---"
+            if [ ! -f "$apk" ]; then
+              echo "::error::Release APK not found: $apk"
+              exit 1
+            fi
+            echo "== (a) META-INF/xposed resources present in APK =="
+            for entry in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
+              if unzip -l "$apk" | grep -Fq "$entry"; then
+                echo "FOUND $entry"
+              else
+                echo "::error::$entry missing in $apk"
+                exit 1
+              fi
+            done
+            echo "== (b) java_init.list points at DualHook =="
+            if unzip -p "$apk" META-INF/xposed/java_init.list | grep -Fq "com.galaxydual.hook.DualHook"; then
+              echo "FOUND DualHook entry in java_init.list"
+            else
+              echo "::error::DualHook entry missing in META-INF/xposed/java_init.list"
+              exit 1
+            fi
+            echo "== (c) DEX contains DualHook =="
+            FOUND=0
+            for dex in $(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex'); do
+              echo "--- scanning $dex ---"
+              if unzip -p "$apk" "$dex" | grep -q "DualHook"; then
+                echo "FOUND DualHook in $dex"
+                FOUND=1
+              fi
+            done
+            if [ "$FOUND" -eq 0 ]; then
+              echo "::error::DualHook class string not found in $apk"
+              exit 1
+            fi
+          done
+          echo "PASS: hook entry (DualHook + xposed resources) present in release APK"
       # Gate: every release APK must carry a valid signature; unsigned or
       # unverifiable output stops the job before any checksum or publish step.
       - name: Verify release signatures
