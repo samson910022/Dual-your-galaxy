@@ -59,13 +59,16 @@ import rikka.shizuku.Shizuku
 // only, no independent completeness bit; adding one is a wire break, so the
 // truncated flag travels as marker text inside the streams).
 // The client re-derives truncated from the core TRUNCATION_MARKER via
-// decodeExecReply() below. Marker semantics v2 (SERVICE_VERSION = 2): the
+// decodeExecReply() below. Marker semantics v2 + v3 (SERVICE_VERSION = 3): the
 // service appends the marker whenever the capture is truncated (cap, read
 // error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
 // so every truncated=true result carries detectable text (review Phase B,
 // issue #22 P2-#3). v1 = cap-only marker (old semantics): an old service on
 // a read-error / join-expiry path returned exit=0 partial package lines (or
 // clean empty) with NO marker, which a new client decodes as truncated=false.
+// v2 = whenever-truncated marker with ungated EXEC (prior contract, kept
+// accurate here -- marker behavior unchanged in v3). v3 = v2 marker plus
+// owner-uid EXEC gate (below); v3 invalidates ungated v2 resident services.
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
@@ -80,7 +83,9 @@ import rikka.shizuku.Shizuku
 //   2. upgrade the APK WITHOUT restarting Shizuku;
 //   3. confirm the bound service runs the new capture/marker contract (an
 //      exit=0 partial read-error / join-expired reply arrives WITH marker and
-//      parses as Unknown on the new client).
+//      parses as Unknown on the new client);
+//   4. (v2 -> v3) confirm owner app uid EXEC succeeds and a foreign uid is
+//      denied (DENIED_FOREIGN_CALLER) without command execution.
 // Caller-identity gate (P0 security): the service runs under the shell/root
 // uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
 // Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
@@ -102,27 +107,34 @@ object ShizukuExecProtocol {
     // The onTransact auth gate writes it without reading/executing the cmd.
     const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
     // UserService implementation version. v1 = cap-only marker (old service
-    // semantics); v2 = whenever-truncated marker (current capture contract).
-    // Bump whenever the service-side capture/encode code changes: Shizuku
-    // requires a different version code on service-code updates so the daemon
-    // (default true) rebuilds the UserService instead of reusing the resident
-    // old one. Tag is intentionally NOT bumped ("GalaxyDualExec-v1" stays the
-    // stable service identity below).
-    const val SERVICE_VERSION = 2
+    // semantics); v2 = whenever-truncated marker (prior capture contract,
+    // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate (current
+    // contract). Bump whenever the service-side capture/encode/auth code
+    // changes: Shizuku requires a different version code on service-code
+    // updates so the daemon (default true) rebuilds the UserService instead
+    // of reusing the resident old one -- v3 therefore invalidates ungated v2
+    // resident services. Tag is intentionally NOT bumped ("GalaxyDualExec-v1"
+    // stays the stable service identity below).
+    const val SERVICE_VERSION = 3
 }
 
 /**
  * Owner-uid caller gate for [GalaxyExecService].
  *
- * [expectedAppUid] is the owner app uid (from `Context.applicationInfo.uid`
- * captured in the service's Context constructor), NOT the service process
- * uid: the service runs as shell (2000) / root (0) and those uids are shared
- * across processes, so `==` against `Process.myUid()` is NOT authentication
- * (it self-DoSes the legit app caller while letting any shell-peer through).
+ * [expectedAppUid] is the owner app uid (validated from
+ * `BuildConfig.APPLICATION_ID` via `packageManager.getPackageUid(...)` /
+ * `Context.applicationInfo.uid` in the service's Context constructor), NOT the
+ * service process uid: the service runs as shell (2000) / root (0) and those
+ * uids are shared across processes, so `==` against `Process.myUid()` is NOT
+ * authentication (it self-DoSes the legit app caller while letting any
+ * shell-peer through). Root (0), system (1000), and shell (2000) are shared
+ * privileged/system uids and are never legitimate expected owner uids, so only
+ * `expectedAppUid >= 10000` (AID_APP_START) can ever match. A negative
+ * expected uid (daemon default-constructor path, resolution failure, or a
+ * privileged/system resolution) never matches and fails closed.
  * Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
  * device), so fail closed to the owner app uid instead of trusting the bind
- * layer. A negative expected uid (daemon default-constructor path, resolution
- * failure) never matches.
+ * layer.
  *
  * Do NOT add android:sharedUserId — uid-equality gate would admit sibling
  * packages; redesign gate first.
@@ -131,8 +143,8 @@ object ShizukuExecProtocol {
  * this comparison is unit-tested -- Binder/Parcel round-trips stay
  * device-only (android.jar stubs on the JVM).
  */
-fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
-    callingUid == expectedAppUid && expectedAppUid >= 0
+internal fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
+    callingUid == expectedAppUid && expectedAppUid >= 10_000
 
 // Pure error mapping for every Shizuku-side failure. Tri-state contract
 // (PR-32 P1-1 timeout, extended by P1-2 transport-unknown): the repository
@@ -264,31 +276,55 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
 // class with both constructors: Shizuku v13 tries the Context constructor
 // first via reflection, older servers use the default one. The Context is the
-// package-scoped user context; it is intentionally unused (documented by the
-// official guide as limited: no receivers/resolvers).
+// package-scoped user context; Context used only to capture owner uid (no
+// receivers/resolvers retained; not stored beyond construction).
 // NOTE: minification is off for all build types (see app/build.gradle.kts),
 // so no -keep rule is needed today. If minify is ever enabled, add:
 //   -keep class com.galaxydual.plus.GalaxyExecService { <init>(...); }
 // DEVICE-UNVERIFIED: bind/exec round-trip never ran on a device.
 class GalaxyExecService : Binder {
     // Owner app uid captured from the Context constructor (the package-scoped
-    // user context). The default constructor (old-server daemon path) has no
-    // Context, so it stays -1 and the EXEC gate fails closed.
-    private val expectedUid: Int
+    // user context, validated against BuildConfig.APPLICATION_ID). The default
+    // constructor (old-server daemon path) has no Context, so it stays -1 and
+    // the EXEC gate fails closed.
+    private val expectedAppUid: Int
 
     constructor() : super() {
-        expectedUid = -1
+        expectedAppUid = -1
     }
 
     constructor(context: Context) : super() {
-        expectedUid = try {
-            context.applicationInfo.uid
-        } catch (_: Exception) {
-            try {
-                context.packageManager.getPackageUid(context.packageName, 0)
-            } catch (_: Exception) {
+        // Fail closed on a foreign context: do not trust a context whose
+        // package is not this app's APPLICATION_ID. Primary resolution is the
+        // current-user package uid; applicationInfo.uid is fallback only
+        // after the package match. NOTE: getPackageUidAsUser would be
+        // user-correct but is API 34+ (unavailable on minSdk 29), so
+        // getPackageUid(..., 0) is kept despite deprecation / multi-user skew:
+        // the user offset is in the same full-uid domain as
+        // Binder.getCallingUid() (both carry userId*100000 + appId), so the
+        // equality gate stays consistent. Resolved values < 10000
+        // (AID_APP_START) are privileged/shared uids (root 0, system 1000,
+        // shell 2000) and are never legitimate owners -> -1.
+        expectedAppUid = try {
+            if (context.packageName != BuildConfig.APPLICATION_ID) {
                 -1
+            } else {
+                val resolved = try {
+                    context.packageManager.getPackageUid(BuildConfig.APPLICATION_ID, 0)
+                } catch (_: Exception) {
+                    try {
+                        context.applicationInfo.uid
+                    } catch (_: Exception) {
+                        -1
+                    }
+                }
+                if (resolved < 10_000) -1 else resolved
             }
+        } catch (_: Exception) {
+            -1
+        }
+        if (expectedAppUid == -1 && BuildConfig.DEBUG) {
+            Log.w("GalaxyExec", "expectedUid=-1 context package=${context.packageName}")
         }
     }
 
@@ -308,7 +344,7 @@ class GalaxyExecService : Binder {
                 // no work for a foreign caller; Parcel position is left
                 // unread on deny -- the reply is terminal either way).
                 val callingUid = Binder.getCallingUid()
-                if (!isAllowedCaller(callingUid, expectedUid)) {
+                if (!isAllowedCaller(callingUid, expectedAppUid)) {
                     if (BuildConfig.DEBUG) Log.w("GalaxyExec", "denied code=$code callingUid=$callingUid")
                     writeDenied(reply)
                     return true
@@ -386,7 +422,7 @@ private class RealShizukuBindDriver(
     override fun send(onResult: (Result<IBinder>) -> Unit): ShizukuBindDriver.Request {
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
-            // Tag stays the stable service identity; SERVICE_VERSION (v2) is the
+            // Tag stays the stable service identity; SERVICE_VERSION (v3) is the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
         ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")

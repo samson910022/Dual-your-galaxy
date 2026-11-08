@@ -402,11 +402,13 @@ class GatewayAssemblyTest {
     }
 
     // UserService implementation version pin: v1 = cap-only marker (old
-    // service semantics), v2 = whenever-truncated marker (current contract).
-    // bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui rebuilds
-    // the resident UserService on upgrade; the tag stays "GalaxyDualExec-v1".
-    @Test fun serviceVersion_isV2() {
-        assertEquals(2, ShizukuExecProtocol.SERVICE_VERSION)
+    // service semantics), v2 = whenever-truncated marker (prior contract,
+    // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate (current
+    // contract). bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
+    // rebuilds the resident UserService on upgrade (v3 invalidates ungated v2
+    // resident services); the tag stays "GalaxyDualExec-v1".
+    @Test fun serviceVersion_isV3() {
+        assertEquals(3, ShizukuExecProtocol.SERVICE_VERSION)
     }
 
     // P1 UserService version gap -- read-only reproducible verification, OLD
@@ -414,8 +416,9 @@ class GatewayAssemblyTest {
     // partial package lines, NO marker -- v1 only marked cap) decodes as
     // truncated=false and parses as TrustedFull. This asserts the gap EXISTS
     // at the wire-mapping layer; it is closed at the deployment layer by the
-    // SERVICE_VERSION bump (v2 forces the daemon to rebuild the resident
-    // service), not by client sniffing.
+    // SERVICE_VERSION bump (v3 forces the daemon to rebuild the resident
+    // service; v2 did the same for the v1->v2 marker gap, and v3 likewise
+    // invalidates ungated v2 resident services), not by client sniffing.
     @Test fun execReply_oldServicePartialWithoutMarkerParsesTrustedFull() {
         val cli = decodeExecReply(0, "package:com.example.app\n", "")
         assertFalse(cli.truncated)
@@ -435,7 +438,9 @@ class GatewayAssemblyTest {
     // Device upgrade verification (S24 real-device item, NOT JVM-testable):
     // start the old resident service (v1), upgrade the APK without restarting
     // Shizuku, then confirm the bound service runs the new capture/marker
-    // contract (this path arrives WITH marker -> Unknown).
+    // contract (this path arrives WITH marker -> Unknown). v2 -> v3 note:
+    // ungated v2 resident services are invalidated by the v3 bump; confirm
+    // owner EXEC succeeds and a foreign uid is denied.
     @Test fun execReply_newServicePartialWithMarkerParsesUnknown() {
         val svc = buildResult(
             0, StringBuilder("package:com.example.app\n"), StringBuilder(""),
