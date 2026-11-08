@@ -293,4 +293,37 @@ class GalaxyExecAuthTest {
         assertFalse(decoded.transportUnknown)
         assertFalse(decoded.timedOut)
     }
+
+    @Test fun supportedVersion_boundary() {
+        // Phase C3 (P2 pre-v13 gate): MIN_SHIZUKU_VERSION = 13 (first server
+        // API with the Context constructor, Changelog 13.0.0); -1/0/old
+        // rejected, 13/14 accepted. Pure isSupportedShizukuVersion() seam.
+        assertEquals(13, ShizukuExecProtocol.MIN_SHIZUKU_VERSION)
+        assertFalse(isSupportedShizukuVersion(-1))
+        assertFalse(isSupportedShizukuVersion(0))
+        assertFalse(isSupportedShizukuVersion(11))
+        assertFalse(isSupportedShizukuVersion(12))
+        assertTrue(isSupportedShizukuVersion(13))
+        assertTrue(isSupportedShizukuVersion(14))
+    }
+
+    @Test fun unsupportedVersion_isDefiniteFailure() {
+        // Pre-dispatch refusal: exit != 0, echoes version + v13 requirement,
+        // neither unknown flag, and must not hit any unknown-after-send
+        // backstop nor the DENIED wire text.
+        val res = ShizukuExecErrors.unsupportedVersion(12)
+        assertNotEquals(0, res.exit)
+        assertTrue("must contain 'unsupported', got: ${res.err}", res.err.contains("unsupported"))
+        assertTrue("must contain 'v13', got: ${res.err}", res.err.contains("v13"))
+        assertTrue("must echo version 12, got: ${res.err}", res.err.contains("12"))
+        assertFalse(res.timedOut)
+        assertFalse(res.transportUnknown)
+        for (prefix in listOf("service exec failed: ", "interrupted: ", "timeout after ", "shizuku: exec timed out after ", "may have executed")) {
+            assertFalse(
+                "unsupportedVersion err must not start with backstop prefix '$prefix', got: ${res.err}",
+                res.err.startsWith(prefix),
+            )
+        }
+        assertNotEquals(ShizukuExecProtocol.DENIED_FOREIGN_CALLER, res.err)
+    }
 }

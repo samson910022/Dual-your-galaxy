@@ -105,6 +105,7 @@ class GatewayAssemblyTest {
             ShizukuExecErrors.remoteFailed("boom") to "boom",
             ShizukuExecErrors.transportUnknown("reply decode failed") to "transport unknown",
             ShizukuExecErrors.timedOut() to "timed out",
+            ShizukuExecErrors.unsupportedVersion(12) to "unsupported Shizuku version 12",
         )
         for ((res, needle) in cases) {
             assertNotEquals("exit must be != 0 for $res", 0, res.exit)
@@ -130,6 +131,7 @@ class GatewayAssemblyTest {
             ShizukuExecErrors.notAuthorized(),
             ShizukuExecErrors.bindFailed("boom"),
             ShizukuExecErrors.remoteFailed("boom"),
+            ShizukuExecErrors.unsupportedVersion(12),
         )) {
             assertTrue(!pre.timedOut)
             assertTrue(!pre.transportUnknown)

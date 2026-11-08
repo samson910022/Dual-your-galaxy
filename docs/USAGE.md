@@ -38,6 +38,7 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
      binder round-trip、未授權路徑／首次選路／binder 死引導 [待實機驗證] DEVICE-UNVERIFIED。
+   - 版本要求：需 Shizuku v13+（v13 起才有 UserService 的 Context 構造）；低於 v13 時本 App 在綁定前明確拒絕（`unsupported Shizuku version`），不綁定、不執行。
 3. **NONE（唯讀）**：選不到通道 → 不執行任何寫入，只顯示狀態（[已支援]：`NoOpGateway` 拒寫＋`channelReady` false fail-closed；不再恆 `false`——所選真通道探測通過即為 `true`）。
 
 ```kotlin
@@ -186,6 +187,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | `(NONE)` 或「通道未就緒」 | 先區分所選 gateway、探測能力與 Shizuku binder／授權。未就緒時會拒寫；點 `重新連線並更新`（probe 含 Auto 降級＋refresh 單一入口）即重探恢復。Auto probe 降級已實作（#25）；不能以標題的裝置路由代替實際通道狀態（標題列顯示的是 `execIdentity/resolvedGateway`）。 |
 | `no dual profile` | 可能是未建立、候選歧義或輸出無法解析，不能一律解讀為尚未建立。先唯讀核對平台身分；不確定即停止寫入，見 #21/#27 |
 | `Failure [INSTALL_FAILED_...]` | 來源 APK 不存在或儲存空間不足；先確認主 profile 已安裝該 App |
+| `unsupported Shizuku version` | Shizuku 低於 v13：v13 才有 UserService Context 構造，本 App 在綁定前明確拒絕；請更新 Shizuku 至 v13 或更新版本 |
 | Play 審查相關警告 | 本專案不發 Play 版，請一律使用 GitHub Release 的 APK |
 
 ## 6. 來源選取與批次建立（PR-7 P2 #26 階段 1）
