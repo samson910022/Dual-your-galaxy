@@ -62,6 +62,9 @@ val privilege: Privilege = when {
     10000/AID_APP_START) may EXEC; privileged/shared appIds (root 0, system
     1000, shell 2000, regardless of user offset) and resolution failure
     fail closed; equality stays full-UID (never appId equality).
+    Server gate (Phase C3): requires Shizuku v13+ (first API with the
+    Context constructor); the gateway checks `Shizuku.getVersion()` pre-bind
+    and refuses older servers with a definite failure before any bind.
   - `SuCmdGateway`: ROOT channel via `su -c` (core-built command passed
     verbatim as the single `-c` argument, argv form, no extra shell layer).
   - `NoOpGateway` (core): returns failure when `NONE`, prevents accidental writes.

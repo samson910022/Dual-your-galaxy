@@ -17,7 +17,9 @@
 //   (demo/.../rikka/shizuku/demo/service/UserService.java): a service class
 //   implementing IBinder (via Binder), default constructor plus the v13
 //   Context constructor, and the reserved destroy transaction that calls
-//   System.exit(0).
+//   System.exit(0). The default ctor is a fail-closed sink (-1); pre-v13
+//   servers are rejected pre-bind (Phase C3 v13 gate), not a backward-compat
+//   path.
 //
 // Command path: DualRepository builds the pm string with core builders
 // (PmOutputParser + ShellEscaper, C1-C3); the gateway ships the string
@@ -115,6 +117,12 @@ object ShizukuExecProtocol {
     const val TRANSACTION_DESTROY = 16777115
     const val BIND_TIMEOUT_MS = 10_000L
     const val EXEC_TIMEOUT_MS = 60_000L
+    // Minimum Shizuku server API supplying the Context constructor for
+    // UserService (Changelog 13.0.0). Hardcoded requirement: the gateway
+    // rejects older servers pre-bind via Shizuku.getVersion() (never
+    // getLatestServiceVersion); below v13 the default ctor is a
+    // fail-closed sink (expectedAppUid = -1, EXEC always denied).
+    const val MIN_SHIZUKU_VERSION = 13
     // Wire-frozen denied reply for foreign callers (exit=1, out="", err=this).
     // The onTransact auth gate writes it without reading/executing the cmd.
     const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
@@ -192,6 +200,11 @@ internal fun resolveExpectedAppUid(resolved: Int): Int = if (isApplicationUid(re
 internal fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
     callingUid == expectedAppUid && isApplicationUid(expectedAppUid)
 
+// Pure Shizuku server version gate (Phase C3, P2 pre-v13 gate): only v13+
+// supplies the Context constructor, so older servers are rejected pre-bind.
+// Adjacent to isAllowedCaller for JVM coverage symmetry. -1/0/old all fail.
+internal fun isSupportedShizukuVersion(version: Int): Boolean = version >= ShizukuExecProtocol.MIN_SHIZUKU_VERSION
+
 // Legacy fixed bind tag (pre-Phase C1). Retained for cleanup/documentation
 // only; it is NOT bound — galaxyExecServiceTag() below derives a per-UID tag
 // for every bind. Its resident service record orphans until Shizuku restart
@@ -218,8 +231,9 @@ internal fun galaxyExecServiceTag(callerUid: Int): String = GALAXY_EXEC_TAG_PREF
 //   2. Definitely not sent (pre-dispatch) -- the command never reached the
 //      service: noBinder / notAuthorized / bindFailed (all thrown before
 //      transactExec's binder.transact), binderDead() on the pre-transact
-//      isBinderAlive check, and remoteFailed() on the pre-bind permission
-//      check. timedOut=false, transportUnknown=false -> the repository
+//      isBinderAlive check, remoteFailed() on the pre-bind permission
+//      check, and unsupportedVersion() as pre-dispatch refusal (v13 gate).
+//      timedOut=false, transportUnknown=false -> the repository
 //      claims definite failure (InstallFailed/RemoveFailed).
 //   3. Possibly sent but reply lost (post-dispatch) -- transact threw
 //      (RemoteException/binder death), the binder died mid-call, or the
@@ -247,6 +261,14 @@ object ShizukuExecErrors {
 
     fun remoteFailed(detail: String): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: remote exec failed: $detail")
+
+    // Pre-dispatch refusal (Phase C3 pre-v13 gate): the Shizuku server API
+    // is below v13, so no Context constructor exists; definite failure.
+    // Must not start with any backstop prefix ("service exec failed: ",
+    // "interrupted: ", "timeout after ", "shizuku: exec timed out after ",
+    // "may have executed") so the repository never treats it as possibly sent.
+    fun unsupportedVersion(version: Int): CmdResult =
+        CmdResult(exit = 1, out = "", err = "shizuku: unsupported Shizuku version $version (requires v13+; update Shizuku to v13 or newer)")
 
     // Post-dispatch reply loss (PR-32 P1-2): the write was (or may have been)
     // dispatched -- transact threw, the binder died mid-call, or the reply
@@ -341,8 +363,10 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
-// class with both constructors: Shizuku v13 tries the Context constructor
-// first via reflection, older servers use the default one. The Context is the
+// class with both constructors: Shizuku v13+ tries the Context constructor
+// first via reflection; pre-v13 servers are rejected pre-bind by the gateway
+// (Phase C3 v13 gate), so the default ctor is a fail-closed sink (-1), never
+// a backward-compat path. The Context is the
 // package-scoped user context; Context used only to capture owner uid (no
 // receivers/resolvers retained; not stored beyond construction).
 // NOTE: minification is off for all build types (see app/build.gradle.kts),
@@ -352,8 +376,8 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 class GalaxyExecService : Binder {
     // Owner app uid captured from the Context constructor (the package-scoped
     // user context, validated against BuildConfig.APPLICATION_ID). The default
-    // constructor (old-server daemon path) has no Context, so it stays -1 and
-    // the EXEC gate fails closed.
+    // constructor is a fail-closed sink (no Context, stays -1, EXEC always
+    // denied); pre-v13 servers never reach here (gateway rejects pre-bind).
     private val expectedAppUid: Int
 
     constructor() : super() {
@@ -600,6 +624,9 @@ class ShizukuCmdGateway(
             }
             if (!granted) return@withContext ShizukuExecErrors.notAuthorized()
 
+            val version = try { Shizuku.getVersion() } catch (e: Exception) { if (e is CancellationException) throw e; return@withContext ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName) }
+            if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
+            // No dropBindingLocked here (nothing bound by this call; must not cache)
             val binder = try {
                 boundBinder()
             } catch (e: Exception) {
