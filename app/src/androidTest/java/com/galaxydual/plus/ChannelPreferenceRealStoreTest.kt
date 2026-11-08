@@ -19,8 +19,8 @@ class ChannelPreferenceRealStoreTest {
         val ctx = ApplicationProvider.getApplicationContext<Context>()
         val prefs = ctx.getSharedPreferences(CHANNEL_PREFS_NAME, Context.MODE_PRIVATE)
         val original = LinkedHashMap(prefs.all)
-        prefs.edit().clear().commit()
         try {
+            prefs.edit().clear().commit()
             block(prefs)
         } finally {
             val editor = prefs.edit().clear()
@@ -39,7 +39,7 @@ class ChannelPreferenceRealStoreTest {
     }
 
     @Test
-    fun realPrefs_writeThenNewClientRereads() {
+    fun realPrefs_sameProcessRoundTrip() {
         withCleanPrefs { prefs ->
             val ctx = ApplicationProvider.getApplicationContext<Context>()
             for (pref in ChannelPreference.values()) {
