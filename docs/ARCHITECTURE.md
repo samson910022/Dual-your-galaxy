@@ -110,7 +110,7 @@ val privilege: Privilege = when {
    註：`DualViewModel.refreshLocked()` 目前仍走 9 命令 resolve-then-reverify 舊路徑（`DualViewModel.kt:399-490`），遷移到 `refreshVerified()` 5 命令為 follow-up；兩者同為 fail-closed，僅命令數差異。
 
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
-   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24；`app/src/androidTest` 尚不存在，本 PR 不新建）。
+   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24；`app/src/androidTest` 現已含 7 個 test class / 8 個檔案的 harness，見 docs/ACCEPTANCE.md §5；本 PR 不新增 instrumentation）。
    本 PR 只保證 JVM 語意 + CI 綠燈。
 
 ## Non-Goals
