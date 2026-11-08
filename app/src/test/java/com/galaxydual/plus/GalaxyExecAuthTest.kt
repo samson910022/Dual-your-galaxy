@@ -14,8 +14,10 @@ import org.junit.Test
 class GalaxyExecAuthTest {
     @Test fun allowedCaller_ownerUidIsTrue() {
         assertTrue(isAllowedCaller(10234, 10234))
-        // Degenerate owner-is-root case: the == holds when expected is 0.
-        assertTrue(isAllowedCaller(0, 0))
+        // Degenerate root owner must fail closed: root (0) is a shared
+        // privileged uid and never a legitimate expected owner, so (0, 0)
+        // is denied (only expected >= 10000, AID_APP_START, can match).
+        assertFalse(isAllowedCaller(0, 0))
     }
 
     @Test fun allowedCaller_foreignAppUidIsFalse() {
@@ -28,13 +30,14 @@ class GalaxyExecAuthTest {
     }
 
     @Test fun allowedCaller_rootPeerIsFalse() {
-        // Service runs as root (0); a root-peer caller is NOT the owner
-        // unless the expected owner itself is 0.
+        // Service runs as root (0); a root-peer caller is NOT the owner,
+        // and a root expected is never legitimate (shared privileged uid,
+        // only expected >= 10000/AID_APP_START can match).
         assertFalse(isAllowedCaller(0, 10234))
     }
 
     @Test fun allowedCaller_negativeExpectedAlwaysFalse() {
-        // Daemon default-constructor path (expectedUid = -1): fail closed.
+        // Daemon default-constructor path (expectedAppUid = -1): fail closed.
         assertFalse(isAllowedCaller(10234, -1))
         assertFalse(isAllowedCaller(2000, -1))
         assertFalse(isAllowedCaller(0, -1))

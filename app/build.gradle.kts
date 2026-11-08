@@ -77,7 +77,7 @@ android {
     // SDK levels are single-sourced from gradle/libs.versions.toml.
     compileSdk = libs.versions.compileSdk.get().toInt()
 
-    // Phase F4a: BuildConfig.DEBUG gates the GalaxyExecService deny-path logs.
+    // Phase A1 P0: BuildConfig.DEBUG gates the GalaxyExecService deny-path logs.
     buildFeatures {
         buildConfig = true
     }
