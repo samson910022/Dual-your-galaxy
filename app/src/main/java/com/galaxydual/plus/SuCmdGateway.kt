@@ -864,9 +864,9 @@ internal enum class DrainStatus { EOF, CAPPED, READ_ERROR }
 // Compatibility note: service and client ship in the same APK and update
 // together, so both sides agree on whenever-truncated-append. The residual
 // NEW-client + OLD-service (v1 cap-only marker) gap is closed at the
-// deployment layer by ShizukuExecProtocol.SERVICE_VERSION (v3), which forces
-// the daemon to rebuild the resident UserService on upgrade -- v3 also
-// invalidates ungated v2 resident services (owner-uid EXEC gate).
+// deployment layer by ShizukuExecProtocol.SERVICE_VERSION (v4), which forces
+// the daemon to rebuild the resident UserService on upgrade -- v4 also
+// invalidates v3 resident services (appId-normalized owner-uid EXEC gate).
 internal fun buildResult(
     exit: Int,
     out: StringBuilder,

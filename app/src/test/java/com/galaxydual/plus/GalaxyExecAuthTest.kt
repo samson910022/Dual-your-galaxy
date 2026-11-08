@@ -78,11 +78,88 @@ class GalaxyExecAuthTest {
     }
 
     @Test fun allowedCaller_intExtremes() {
-        // Extreme uids: equality plus the >= 10000 leg decides, no overflow
-        // surprises in the pure comparison.
+        // Extreme uids: equality plus the appId gate decides (appIdOf strips
+        // the user offset via remainder; no overflow surprises in the pure
+        // comparison). Int.MAX_VALUE appIdOf = 83647 (>= 10000), so the pair
+        // is true -- overflow-safe remainder property, not a realism claim
+        // (no real uid is Int.MAX_VALUE).
         assertTrue(isAllowedCaller(Int.MAX_VALUE, Int.MAX_VALUE))
         assertFalse(isAllowedCaller(Int.MAX_VALUE, 10234))
         assertFalse(isAllowedCaller(Int.MIN_VALUE, Int.MIN_VALUE))
+    }
+
+    @Test fun appIdOf_stripsUserOffset() {
+        // Full uid = userId*100000 + appId; appIdOf keeps only appId.
+        assertEquals(10234, appIdOf(10234)) // owner, no offset
+        assertEquals(10234, appIdOf(1010234)) // user 10
+        assertEquals(10234, appIdOf(9510234)) // user 95
+        assertEquals(0, appIdOf(1000000)) // user 10 root
+        assertEquals(1000, appIdOf(1001000)) // user 10 system
+        assertEquals(2000, appIdOf(1002000)) // user 10 shell
+        assertEquals(9999, appIdOf(1009999)) // just below AID_APP_START
+        assertEquals(10000, appIdOf(1010000)) // user 10 app start
+        assertEquals(83647, appIdOf(Int.MAX_VALUE)) // overflow-safe remainder
+        // Kotlin % remainder sign follows the dividend (never floorMod):
+        // negatives stay negative and fail the appId gate (fail closed).
+        assertEquals(-1, appIdOf(-1))
+        assertEquals(-1, appIdOf(-100001))
+    }
+
+    @Test fun isApplicationUid_boundary() {
+        // Boundary (owner): AID_APP_START is the smallest application appId.
+        assertTrue(isApplicationUid(10000))
+        assertFalse(isApplicationUid(9999))
+        assertFalse(isApplicationUid(0)) // root
+        assertFalse(isApplicationUid(1000)) // system
+        assertFalse(isApplicationUid(2000)) // shell
+        // Secondary user (user 10 offset = 10*100000 = 1000000): gate strips
+        // the user offset first, so privileged appIds stay denied regardless
+        // of user while app uids succeed.
+        assertTrue(isApplicationUid(1010000)) // user 10 app start
+        assertTrue(isApplicationUid(1010234)) // user 10 app
+        assertFalse(isApplicationUid(1009999)) // user 10 just below start
+        assertFalse(isApplicationUid(1001000)) // user 10 system
+        assertFalse(isApplicationUid(1002000)) // user 10 shell
+        assertFalse(isApplicationUid(1000000)) // user 10 root
+        // Negatives stay false (uid >= 0 leg + remainder sign).
+        assertFalse(isApplicationUid(-1))
+        assertFalse(isApplicationUid(-100001))
+        assertFalse(isApplicationUid(Int.MIN_VALUE))
+    }
+
+    @Test fun allowedCaller_secondaryPrivilegedDenied() {
+        // Secondary-user (user 10) privileged/system full-uid pairs must be
+        // denied even when equal: appIds 0/1000/2000 are always < 10000
+        // regardless of user offset.
+        assertFalse(isAllowedCaller(1001000, 1001000)) // user 10 system
+        assertFalse(isAllowedCaller(1002000, 1002000)) // user 10 shell
+        assertFalse(isAllowedCaller(1000000, 1000000)) // user 10 root
+        assertFalse(isAllowedCaller(1009999, 1009999)) // just below start
+        // Secondary-user application uids succeed on exact full-uid match.
+        assertTrue(isAllowedCaller(1010000, 1010000)) // user 10 app start
+        assertTrue(isAllowedCaller(1010234, 1010234)) // user 10 app
+    }
+
+    @Test fun allowedCaller_crossUserAntiWeakening() {
+        // Equality stays full-UID (never appId equality): a same-appId uid
+        // from a different user never matches, in both directions.
+        assertFalse(isAllowedCaller(10234, 1010234)) // owner vs user 10
+        assertFalse(isAllowedCaller(1010234, 10234)) // user 10 vs owner
+        assertFalse(isAllowedCaller(10234, 9510234)) // owner vs user 95
+    }
+
+    @Test fun resolveExpectedAppUid_cases() {
+        // Fail-closed expected-uid resolution: full uid kept only when it is
+        // an application uid (non-negative, appId >= AID_APP_START).
+        assertEquals(-1, resolveExpectedAppUid(1001000)) // user 10 system
+        assertEquals(1010234, resolveExpectedAppUid(1010234)) // user 10 app
+        assertEquals(-1, resolveExpectedAppUid(-1)) // negative
+        assertEquals(-1, resolveExpectedAppUid(0)) // root
+        assertEquals(-1, resolveExpectedAppUid(2000)) // shell
+        assertEquals(-1, resolveExpectedAppUid(9999)) // just below start
+        assertEquals(10000, resolveExpectedAppUid(10000)) // owner app start
+        assertEquals(1010000, resolveExpectedAppUid(1010000)) // user 10 app start
+        assertEquals(-1, resolveExpectedAppUid(Int.MIN_VALUE)) // negative extreme
     }
 
     @Test fun galaxyTag_sameUidStableRepeated() {
