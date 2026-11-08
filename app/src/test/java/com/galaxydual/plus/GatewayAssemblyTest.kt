@@ -106,6 +106,7 @@ class GatewayAssemblyTest {
             ShizukuExecErrors.transportUnknown("reply decode failed") to "transport unknown",
             ShizukuExecErrors.timedOut() to "timed out",
             ShizukuExecErrors.unsupportedVersion(12) to "unsupported Shizuku version 12",
+            ShizukuExecErrors.legacyCleanupFailed("cleanup failed") to "legacy cleanup failed",
         )
         for ((res, needle) in cases) {
             assertNotEquals("exit must be != 0 for $res", 0, res.exit)
@@ -132,6 +133,7 @@ class GatewayAssemblyTest {
             ShizukuExecErrors.bindFailed("boom"),
             ShizukuExecErrors.remoteFailed("boom"),
             ShizukuExecErrors.unsupportedVersion(12),
+            ShizukuExecErrors.legacyCleanupFailed("cleanup failed"),
         )) {
             assertTrue(!pre.timedOut)
             assertTrue(!pre.transportUnknown)
@@ -414,8 +416,10 @@ class GatewayAssemblyTest {
     // invalidated ungated v2 resident services);
     // the bind tag is per-UID derived
     // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag) and the
-    // legacy fixed tag "GalaxyDualExec-v1" record orphans until Shizuku
-    // restart (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it
+    // legacy fixed tag "GalaxyDualExec-v1" record is removed by the D1
+    // migration on the first run (retryable); if cleanup never succeeds
+    // until restart, the orphan sits inert (daemon restart reaps).
+    // SERVICE_VERSION is 5 (D2 bumped it
     // for the appId upper bound; auth code changed so the daemon must rebuild).
     @Test fun serviceVersion_isV5() {
         assertEquals(5, ShizukuExecProtocol.SERVICE_VERSION)
