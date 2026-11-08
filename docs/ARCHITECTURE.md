@@ -6,7 +6,7 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 ## Goals
 
 - Support Samsung Dual Messenger / Dual Apps without touching Secure Folder.
-- Prefer LSPosed injection when available, fall back to Shizuku shell channel.
+- LSPosed channel is a display-only marker / NoOp placeholder (never grants privilege); routing is hook-neutral, fall back to Shizuku shell channel when su is unavailable.
 - Keep parsing and execution testable without Android framework dependencies.
 
 ## Modules

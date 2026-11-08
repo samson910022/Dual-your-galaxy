@@ -2,6 +2,8 @@
 
 調查日期：2026-11-05 UTC。原始碼基準：`b3d48432f21d8e14b3a0da9e9a6b897cd4e0b776`。
 
+> Historical snapshot at b3d4843; superseded by stacked PRs #36/#37/#43 (merged, see GitHub), HEAD f7c0c90. 本文件為當時調查紀錄，非當前狀態。
+
 ## 1. 結論與證據分級
 
 本輪由四個獨立調查方向交叉整理：profile 身分、安裝產物／UI、通道／命令契約、既有 issues 與驗收規劃。
@@ -61,7 +63,7 @@ UI 調查只開啟本 App、喚醒／收合系統遮罩及捲動；未輸入憑�
 
 資料來源為只保留目標列的 `cmd user list -v`、限定目標並最小過濾的 `dumpsys user --user 95`、property，以及 root 解碼目標 user XML 後只輸出的白名單身分 attributes。沒有公開原始 XML。
 
-`dumpsys` 的顯示 label 與 `pm list users` 不同，不能互換格式後依名稱授權。當前 `PmOutputParser.resolveDualUserId()` 仍只用非零 ID＋label contains DUAL；explicit-ID guard 又只要求存在。
+`dumpsys` 的顯示 label 與 `pm list users` 不同，不能互換格式後依名稱授權。當時（b3d4843）`PmOutputParser.resolveDualUserId()` 僅用非零 ID＋label contains DUAL；explicit-ID guard 只要求存在。
 
 > 註（2026-11-05，PR-1 stage 2 後）：上段描述的是 b3d4843（PR 前）基準，現已改為雙源 CLONE 驗證＋ explicit verified guard（見 USAGE §3）：label-only 路徑已 `@Deprecated`，explicit id 須為當下 Confirmed 目標否則 fail-closed。原文保留作歷史對照。
 
