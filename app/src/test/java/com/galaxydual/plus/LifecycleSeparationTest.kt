@@ -9,6 +9,8 @@ import com.galaxydual.core.NoOpGateway
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
@@ -45,10 +47,16 @@ class LifecycleSeparationTest {
     }
 
     private class MapBackend {
-        val map = mutableMapOf<String, String?>()
+        val map = ConcurrentHashMap<String, String?>()
+        val reads = AtomicInteger(0)
+        val writes = AtomicInteger(0)
         fun store(): SelectionStore = SelectionStore(
-            loadRaw = { map[SELECTION_KEY] },
+            loadRaw = {
+                reads.incrementAndGet()
+                map[SELECTION_KEY]
+            },
             saveRaw = { raw ->
+                writes.incrementAndGet()
                 if (raw == null) map.remove(SELECTION_KEY) else map[SELECTION_KEY] = raw
                 true
             },
@@ -80,7 +88,9 @@ class LifecycleSeparationTest {
 
         private fun hasShellSeparator(cmd: String): Boolean =
             cmd.contains(";") || cmd.contains("&&") || cmd.contains("||") ||
-                cmd.contains("\n") || cmd.contains("`") || cmd.contains("$(")
+                cmd.contains("\n") || cmd.contains("`") || cmd.contains("$(") ||
+                cmd.contains(">") || cmd.contains("<") || cmd.contains("|") ||
+                cmd.contains("&") || cmd.contains("\\")
 
         private fun isWrite(cmd: String): Boolean =
             hasShellSeparator(cmd) ||
@@ -325,9 +335,10 @@ class LifecycleSeparationTest {
         assertEquals(0, gwCorrupt.writeCommands.size)
         assertEquals(0, gwCorrupt.unexpectedCommands.size)
 
+        val writesBeforeCorrupt = backendCorrupt.writes.get()
         vmCorrupt.setSourceCatalog(catalog())
         vmCorrupt.refresh()
-        await { vmCorrupt.state.value.inventory.targetId > 0 }
+        await { backendCorrupt.writes.get() > writesBeforeCorrupt && backendCorrupt.map[SELECTION_KEY] == null }
         assertNull(vmCorrupt.state.value.pendingRemove)
         assertTrue(vmCorrupt.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwCorrupt.installCalls.size)
@@ -386,9 +397,11 @@ class LifecycleSeparationTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
+        val writesBefore = backend.writes.get()
         vm.setSourceCatalog(catalog())
         vm.refresh()
-        await { !vm.state.value.loading }
+        // Await the actual self-clear write, not just the inventory transition.
+        await { backend.writes.get() > writesBefore && backend.map[SELECTION_KEY] == null }
         assertNull(backend.map[SELECTION_KEY])
         assertNull(vm.state.value.pendingRemove)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -410,31 +423,21 @@ class LifecycleSeparationTest {
 
     @Test
     fun unverifiedTarget_restore_isNoOpAndPreservesStore() {
+        // Empty backend: no pre-existing snapshot to be cleared.
         val backend = MapBackend()
-        assertTrue(
-            backend.store().save(
-                SELECTION_SOURCE_CATALOG,
-                95,
-                setOf("0:com.example.chat"),
-                1000L,
-            ),
-        )
-
-        // Device reports a different verified target (96). Refresh against 96
-        // with an empty backend first to verify inventory without clearing a
-        // 95 snapshot, then seed the 95 snapshot and invoke restoreSelection(95).
         val gw = FakeRepo(dualId = 96, dualSerial = 41)
         val clock = FakeClock()
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
-        // Empty backend so refresh verifies 96 without clearing anything.
+        // Refresh verifies target 96; await an actual store read so the async
+        // restore/cleanup stage has completed (not just the inventory write).
         vm.setSourceCatalog(catalog())
         vm.refresh()
         await { vm.state.value.inventory.targetId > 0 }
         assertEquals(96, vm.state.value.inventory.targetId)
 
-        // Now seed a 95 snapshot; refresh is not re-run, so it survives.
+        // Seed a 95 snapshot only after refresh has fully completed.
         assertTrue(
             backend.store().save(
                 SELECTION_SOURCE_CATALOG,
@@ -443,11 +446,17 @@ class LifecycleSeparationTest {
                 1000L,
             ),
         )
+        // Reset read counter to observe the restoreSelection read.
+        val readsBeforeRestore = backend.reads.get()
         val rawBefore = backend.map[SELECTION_KEY]
+        assertNotNull(rawBefore)
 
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
+        // Foreign guard returns before any store I/O.
+        assertEquals(readsBeforeRestore, backend.reads.get())
+        // Foreign guard must not touch the store: byte-identical snapshot.
         assertEquals(rawBefore, backend.map[SELECTION_KEY])
         assertEquals(0, gw.installCalls.size)
         assertEquals(0, gw.uninstallCalls.size)
