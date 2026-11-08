@@ -360,12 +360,14 @@ class LifecycleSeparationTest {
         await { vm.state.value.inventory.targetId > 0 }
 
         val selectedBefore = vm.state.value.selectedKeys
+        val pendingBefore = vm.state.value.pendingRemove
         assertTrue(selectedBefore.contains("0:com.example.chat"))
 
         // Selection is non-empty: restore must NOT overwrite (no auto-resend).
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertEquals(selectedBefore, vm.state.value.selectedKeys)
+        assertEquals(pendingBefore, vm.state.value.pendingRemove)
         // Seeded key from store must not have been merged in.
         assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
         assertFalse(vm.state.value.selectedKeys.contains("0:com.example.mail"))
