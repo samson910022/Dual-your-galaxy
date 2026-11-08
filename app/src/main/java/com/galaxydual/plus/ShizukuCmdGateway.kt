@@ -228,11 +228,16 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
 
 // Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
 // err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
-// paths log it locally in DEBUG builds only).
+// paths log it locally in DEBUG builds only). Delegates to
+// encodeExecReply() so the frozen (int, String, String) layout stays
+// single-sourced with the service reply path.
 private fun writeDenied(reply: Parcel?) {
-    reply?.writeInt(1)
-    reply?.writeString("")
-    reply?.writeString(ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+    val (exit, out, err) = encodeExecReply(
+        CmdResult(1, "", ShizukuExecProtocol.DENIED_FOREIGN_CALLER),
+    )
+    reply?.writeInt(exit)
+    reply?.writeString(out)
+    reply?.writeString(err)
 }
 
 // Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
@@ -324,7 +329,7 @@ class GalaxyExecService : Binder {
             -1
         }
         if (expectedAppUid == -1 && BuildConfig.DEBUG) {
-            Log.w("GalaxyExec", "expectedUid=-1 context package=${context.packageName}")
+            Log.w("GalaxyExec", "expectedAppUid=-1 context package=${context.packageName}")
         }
     }
 
