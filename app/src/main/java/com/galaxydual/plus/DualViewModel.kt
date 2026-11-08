@@ -5796,10 +5796,10 @@ class DualViewModel(
 }
 
 // P1 hook-neutral routing (issue #6, 沿襲 #19, 配合 #27): privilege routing
-// always runs with hasLsposed = false, no matter what the hook diagnosis
-// says. A present marker is existence+scope evidence, not proof of a live,
-// effective hook, so it must never grant privilege. probeChannels routes
-// through this function; HookDiagnosisTest locks the contract.
+// has no hook input (`routePrivilege` signature has no `hasLsposed` parameter).
+// A present marker is existence+scope evidence, not proof of a live, effective
+// hook, so it must never grant privilege. probeChannels routes through this
+// function; HookDiagnosisTest locks the contract.
 fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
     routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot)
 
