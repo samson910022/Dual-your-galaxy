@@ -414,8 +414,9 @@ data class UiState(
 // in LSPosed mode. The LSPosed gateway stays the NoOp placeholder (whitelist
 // policy branch pending): writes under it are refused with an explicit
 // reason, never executed. The marker never feeds privilege routing
-// (hasLsposed stays false below): a present marker is not proof of a live,
-// effective hook, so it must not grant privilege.
+// (hook signal never enters routing; `routePrivilege` has no `hasLsposed`
+// parameter): a present marker is not proof of a live, effective hook, so it
+// must not grant privilege.
 //
 // PR-4 P1 (issue #23): remove is two-phase. requestRemove(pkg) only records
 // PendingRemove (verified id + serial + label + timestamp); confirmRemove()
@@ -5145,10 +5146,10 @@ class DualViewModel(
             // reusedProbe path (recheck/reconnect) degraded before this call,
             // so nothing remains to do here.
             val degradeForState = if (preference == ChannelPreference.AUTO) autoDegrade else null
-            // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
-            // the router encodes that priority, probes only feed it.
-            // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
-            // ROUTING even though the marker now feeds the UI display below
+            // Routing is hook-neutral: su ROOT -> Shizuku SHELL -> NoOp; the
+            // hook signal never enters routing (no `hasLsposed` parameter).
+            // F4b-P2 + P1 (沿襲 #19): hook signal excluded from routing even
+            // though the marker now feeds the UI display below
             // (see hookNeutralRoute). Rationale: the marker is existence+scope
             // evidence from a file that survives reboots (see HookMarker), not
             // proof of a live, effective hook, so it must never grant privilege.
