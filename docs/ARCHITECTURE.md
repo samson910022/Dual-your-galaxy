@@ -57,7 +57,16 @@ val privilege: Privilege = when {
   - `ShizukuCmdGateway`: SHELL channel via the Shizuku UserService
     `GalaxyExecService` (`Shizuku#newProcess` was removed in Shizuku API
     13.1.5; the official guide mandates UserService instead -- F4a implements
-    exactly that).
+    exactly that). Owner-uid gate invariant (Phase A P0, DEVICE-UNVERIFIED;
+    Phase C2 appId-normalized, Phase D2 appId upper bound): only the owner
+    app uid (appId in 10000..19999 / AID_APP_START..AID_APP_LAST) may EXEC;
+    privileged/shared appIds (root 0, system 1000, shell 2000, regardless of
+    user offset) and SDK sandbox (20000-29999) / isolated (99000-99999)
+    appIds, and resolution failure fail closed; equality stays full-UID
+    (never appId equality).
+    Server gate (Phase C3): requires Shizuku v13+ (first API with the
+    Context constructor); the gateway checks `Shizuku.getVersion()` pre-bind
+    and refuses older servers with a definite failure before any bind.
   - `SuCmdGateway`: ROOT channel via `su -c` (core-built command passed
     verbatim as the single `-c` argument, argv form, no extra shell layer).
   - `NoOpGateway` (core): returns failure when `NONE`, prevents accidental writes.

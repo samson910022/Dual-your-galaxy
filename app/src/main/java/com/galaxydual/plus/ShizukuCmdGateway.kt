@@ -17,7 +17,9 @@
 //   (demo/.../rikka/shizuku/demo/service/UserService.java): a service class
 //   implementing IBinder (via Binder), default constructor plus the v13
 //   Context constructor, and the reserved destroy transaction that calls
-//   System.exit(0).
+//   System.exit(0). The default ctor is a fail-closed sink (-1); pre-v13
+//   servers are rejected pre-bind (Phase C3 v13 gate), not a backward-compat
+//   path.
 //
 // Command path: DualRepository builds the pm string with core builders
 // (PmOutputParser + ShellEscaper, C1-C3); the gateway ships the string
@@ -33,6 +35,8 @@ import android.content.pm.PackageManager
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.os.Process
+import android.util.Log
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
@@ -58,42 +62,196 @@ import rikka.shizuku.Shizuku
 // only, no independent completeness bit; adding one is a wire break, so the
 // truncated flag travels as marker text inside the streams).
 // The client re-derives truncated from the core TRUNCATION_MARKER via
-// decodeExecReply() below. Marker semantics v2 (SERVICE_VERSION = 2): the
+// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 (SERVICE_VERSION = 5): the
 // service appends the marker whenever the capture is truncated (cap, read
 // error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
 // so every truncated=true result carries detectable text (review Phase B,
 // issue #22 P2-#3). v1 = cap-only marker (old semantics): an old service on
 // a read-error / join-expiry path returned exit=0 partial package lines (or
 // clean empty) with NO marker, which a new client decodes as truncated=false.
+// v2 = whenever-truncated marker with ungated EXEC (prior contract, kept
+// accurate here -- marker behavior unchanged in v3/v4/v5). v3 = v2 marker plus
+// owner-uid EXEC gate (below); v3 invalidates ungated v2 resident services.
+// v4 = v3 marker+gate with appId normalization (auth code changed; C2):
+// the gate now strips the user offset before the AID_APP_START comparison,
+// so privileged appIds (0/1000/2000) stay denied regardless of user; v4
+// invalidates v3 resident services (full-UID >=10000 gate).
+// v5 = v4 marker+gate with appId upper bound (auth code changed; D2):
+// the gate now caps appId at 19999 (AID_APP_LAST), so SDK sandbox
+// (20000-29999) and isolated (99000-99999) appIds stay denied regardless
+// of user; v5 invalidates v4 resident services.
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
 // use a different version code whenever the service code is updated; daemon
 // defaults to true), so the next bind with the new args rebuilds the
 // resident UserService instead of reusing the old one. The
-// tag stays "GalaxyDualExec-v1" for stable service identity; the version bump
-// is the invalidation signal.
+// bind tag is per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
+// galaxyExecServiceTag) so each user instance gets its own service record;
+// the legacy fixed tag "GalaxyDualExec-v1" no longer binds and its record
+// is removed by the D1 migration on the first successful run() (retryable,
+// blocking fail-closed until confirmed); if cleanup never succeeds until
+// restart, the orphan sits inert (daemon restart reaps). A normal cleanup
+// return means Shizuku accepted the removal and attempted the ONEWAY
+// DESTROY, NOT a synchronous PID-death proof (void unbind, no wait).
+// SERVICE_VERSION is
+// 5 (D2 bumped it for the appId upper bound); the version bump remains the
+// invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
 //   1. install the old APK and start the resident UserService (v1);
 //   2. upgrade the APK WITHOUT restarting Shizuku;
 //   3. confirm the bound service runs the new capture/marker contract (an
 //      exit=0 partial read-error / join-expired reply arrives WITH marker and
-//      parses as Unknown on the new client).
+//      parses as Unknown on the new client);
+//   4. (v2 -> v3) confirm owner app uid EXEC succeeds and a foreign uid is
+//      denied (DENIED_FOREIGN_CALLER) without command execution.
+//   5. (v3 -> v4) confirm secondary-user privileged uids are denied
+//      (e.g. user 10 shell 1002000) and a secondary-user app uid succeeds
+//      (e.g. user 10 app 1010234).
+//   6. (v4 -> v5) confirm appIds > 19999 are denied (e.g. 20000 SDK sandbox,
+//      99000 isolated) and appId 19999 succeeds.
+//   7. (legacy v2 -> v5, no Shizuku restart) record the old fixed-tag v2
+//      PID/binder, upgrade, trigger one run(), then verify that old PID /
+//      binder is actually dead (not only that unbind returned) before
+//      claiming the ungated daemon is revoked; include v12 (cleanup-then-
+//      unsupported) and v13+ (cleanup-then-owner-EXEC/foreign-deny) runs.
+// Caller-identity gate (P0 security): the service runs under the shell/root
+// uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
+// Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
+// device), so fail closed: only the owner app uid (captured from the Context
+// constructor, NOT the service process uid) may EXEC. Enforced in
+// GalaxyExecService.onTransact via isAllowedCaller() below (pure,
+// JVM-tested); foreign callers get the frozen denied reply and their command
+// is never read nor executed. DESTROY is intentionally left ungated (see
+// onTransact DESTROY): actual sender uid is DEVICE-UNVERIFIED, gating risks
+// orphaned resident services defeating SERVICE_VERSION, and foreign DESTROY
+// is availability-only DoS (Shizuku rebinds, no command execution). EXEC
+// remains the P0-gated vector.
 object ShizukuExecProtocol {
     const val TRANSACTION_EXEC = 1
     const val TRANSACTION_DESTROY = 16777115
     const val BIND_TIMEOUT_MS = 10_000L
     const val EXEC_TIMEOUT_MS = 60_000L
+    // Minimum Shizuku server API supplying the Context constructor for
+    // UserService (Changelog 13.0.0). Hardcoded requirement: the gateway
+    // rejects older servers pre-bind via Shizuku.getVersion() (never
+    // getLatestServiceVersion); below v13 the default ctor is a
+    // fail-closed sink (expectedAppUid = -1, EXEC always denied).
+    const val MIN_SHIZUKU_VERSION = 13
+    // Minimum Shizuku server API where the UserService API itself exists
+    // (bindUserService is API v10+). Below this no legacy UserService record
+    // can exist, so the gateway skips the legacy cleanup and goes straight
+    // to the unsupportedVersion refusal (Phase F1 compatibility).
+    const val MIN_USERSERVICE_VERSION = 10
+    // Wire-frozen denied reply for foreign callers (exit=1, out="", err=this).
+    // The onTransact auth gate writes it without reading/executing the cmd.
+    const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
     // UserService implementation version. v1 = cap-only marker (old service
-    // semantics); v2 = whenever-truncated marker (current capture contract).
-    // Bump whenever the service-side capture/encode code changes: Shizuku
-    // requires a different version code on service-code updates so the daemon
-    // (default true) rebuilds the UserService instead of reusing the resident
-    // old one. Tag is intentionally NOT bumped ("GalaxyDualExec-v1" stays the
-    // stable service identity below).
-    const val SERVICE_VERSION = 2
+    // semantics); v2 = whenever-truncated marker (prior capture contract,
+    // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
+    // marker+gate with appId normalization; v5 = v4 marker+gate with appId
+    // upper bound (current contract). Bump whenever
+    // the service-side capture/encode/auth code changes: Shizuku requires a
+    // different version code on service-code updates so the daemon (default
+    // true) rebuilds the UserService instead of reusing the resident old
+    // one -- v5 therefore invalidates v4 resident services (appId upper
+    // bound), as v4 invalidated v3 resident services (full-UID gate) and
+    // v3 invalidated ungated v2 resident services. The bind tag is
+    // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
+    // galaxyExecServiceTag); the legacy fixed tag "GalaxyDualExec-v1" is
+    // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
+    // is NOT bound. Its old service record is removed by the D1 migration
+    // on the first successful run() (retryable); if cleanup never succeeds
+    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it for the
+    // appId upper bound; auth code changed so the daemon must rebuild).
+    const val SERVICE_VERSION = 5
 }
+
+// UID decomposition consts (Phase C2). Literals, not android.os imports,
+// for JVM purity: android.os.UserHandle.PER_USER_RANGE is 100000 and
+// android.os.Process.FIRST_APPLICATION_UID (AID_APP_START) is 10000,
+// android.os.Process.LAST_APPLICATION_UID (AID_APP_LAST) is 19999.
+// Full uid = userId * UID_PER_USER_RANGE + appId.
+internal const val UID_PER_USER_RANGE = 100_000
+internal const val AID_APP_START = 10_000
+// Phase D2 (P2 appId upper bound): SDK sandbox (20000-29999) and isolated
+// (99000-99999) ranges are intentionally excluded (appIds > AID_APP_LAST
+// stay denied), so only appIds in 10000..19999 count as applications.
+internal const val AID_APP_LAST = 19_999
+
+// Strips the user offset: appId = uid % UID_PER_USER_RANGE.
+// Kotlin `%` remainder sign follows the dividend, never floorMod: a
+// negative uid yields a negative or zero remainder, which fails the
+// >= AID_APP_START check below and stays denied (fail closed).
+internal fun appIdOf(uid: Int): Int = uid % UID_PER_USER_RANGE
+
+// True iff uid is a normal application uid: non-negative and its appId
+// (full uid without the user offset) is in 10000..19999
+// (AID_APP_START..AID_APP_LAST). Privileged appIds 0 (root), 1000 (system),
+// 2000 (shell) are always < 10000 regardless of user, and SDK sandbox
+// (20000-29999) / isolated (99000-99999) appIds are always > 19999, so
+// secondary-user privileged uids (e.g. user 10 shell 1002000)
+// are denied, while secondary-user app uids (e.g. 1010234) succeed.
+internal fun isApplicationUid(uid: Int): Boolean = uid >= 0 && appIdOf(uid) in AID_APP_START..AID_APP_LAST
+
+// Fail-closed expected-uid resolution: keeps the full uid only when it is
+// an application uid, else -1 (never matches, gate fails closed).
+internal fun resolveExpectedAppUid(resolved: Int): Int = if (isApplicationUid(resolved)) resolved else -1
+
+/**
+ * Owner-uid caller gate for [GalaxyExecService].
+ *
+ * [expectedAppUid] is the owner app uid (validated from
+ * `BuildConfig.APPLICATION_ID` via `packageManager.getPackageUid(...)` /
+ * `Context.applicationInfo.uid` in the service's Context constructor), NOT the
+ * service process uid: the service runs as shell (2000) / root (0) and those
+ * uids are shared across processes, so `==` against `Process.myUid()` is NOT
+ * authentication (it self-DoSes the legit app caller while letting any
+ * shell-peer through). Root (0), system (1000), and shell (2000) are shared
+ * privileged/system uids and are never legitimate expected owner uids, so only
+ * an application uid (non-negative full uid whose appId in 10000..19999,
+ * AID_APP_START..AID_APP_LAST) can ever match. A negative expected uid (daemon
+ * default-constructor path, resolution failure, or a privileged/system
+ * resolution) never matches and fails closed. Equality stays full-UID
+ * (never appId equality): a same-appId uid from a different user (e.g.
+ * owner 10234 vs user 10 1010234) never matches; only the exact full uid
+ * plus the appId gate passes.
+ * Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
+ * device), so fail closed to the owner app uid instead of trusting the bind
+ * layer.
+ *
+ * Do NOT add android:sharedUserId — uid-equality gate would admit sibling
+ * packages; redesign gate first.
+ *
+ * Pure JVM-testable seam: [callingUid] is `Binder.getCallingUid()`; only
+ * this comparison is unit-tested -- Binder/Parcel round-trips stay
+ * device-only (android.jar stubs on the JVM).
+ */
+internal fun isAllowedCaller(callingUid: Int, expectedAppUid: Int): Boolean =
+    callingUid == expectedAppUid && isApplicationUid(expectedAppUid)
+
+// Pure Shizuku server version gate (Phase C3, P2 pre-v13 gate): only v13+
+// supplies the Context constructor, so older servers are rejected pre-bind.
+// Adjacent to isAllowedCaller for JVM coverage symmetry. -1/0/old all fail.
+internal fun isSupportedShizukuVersion(version: Int): Boolean = version >= ShizukuExecProtocol.MIN_SHIZUKU_VERSION
+
+// Legacy fixed bind tag (pre-Phase C1). Retained for cleanup/documentation
+// only; it is NOT bound — galaxyExecServiceTag() below derives a per-UID tag
+// for every bind. Its resident service record is removed by the D1 migration
+// on the first successful run() (retryable); if cleanup never succeeds until
+// restart, the orphan sits inert (daemon restart reaps).
+const val LEGACY_GALAXY_EXEC_TAG = "GalaxyDualExec-v1"
+
+// Prefix for the per-UID derived bind tag (see galaxyExecServiceTag).
+const val GALAXY_EXEC_TAG_PREFIX = "GalaxyDualExec-v1-u"
+
+// Phase C1 (P1 multi-user tag): pure per-caller bind tag. Embeds the FULL
+// caller uid (userId*100000 + appId, e.g. 1010234 for user 10), NOT just the
+// appId, so the owner (10134) and secondary users (1010234, 9510234) get
+// distinct tags and distinct Shizuku service records. Stable for a given uid
+// across binds/restarts of the app process.
+internal fun galaxyExecServiceTag(callerUid: Int): String = GALAXY_EXEC_TAG_PREFIX + callerUid
 
 // Pure error mapping for every Shizuku-side failure. Tri-state contract
 // (PR-32 P1-1 timeout, extended by P1-2 transport-unknown): the repository
@@ -105,8 +263,11 @@ object ShizukuExecProtocol {
 //   2. Definitely not sent (pre-dispatch) -- the command never reached the
 //      service: noBinder / notAuthorized / bindFailed (all thrown before
 //      transactExec's binder.transact), binderDead() on the pre-transact
-//      isBinderAlive check, and remoteFailed() on the pre-bind permission
-//      check. timedOut=false, transportUnknown=false -> the repository
+//      isBinderAlive check, remoteFailed() on the pre-bind permission
+//      check, unsupportedVersion() as pre-dispatch refusal (v13 gate),
+//      and legacyCleanupFailed() as pre-dispatch refusal (Phase E1
+//      fail-closed legacy cleanup, before bind).
+//      timedOut=false, transportUnknown=false -> the repository
 //      claims definite failure (InstallFailed/RemoveFailed).
 //   3. Possibly sent but reply lost (post-dispatch) -- transact threw
 //      (RemoteException/binder death), the binder died mid-call, or the
@@ -134,6 +295,24 @@ object ShizukuExecErrors {
 
     fun remoteFailed(detail: String): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: remote exec failed: $detail")
+
+    // Pre-dispatch refusal (Phase C3 pre-v13 gate): the Shizuku server API
+    // is below v13, so no Context constructor exists; definite failure.
+    // Must not start with any backstop prefix ("service exec failed: ",
+    // "interrupted: ", "timeout after ", "shizuku: exec timed out after ",
+    // "may have executed") so the repository never treats it as possibly sent.
+    fun unsupportedVersion(version: Int): CmdResult =
+        CmdResult(exit = 1, out = "", err = "shizuku: unsupported Shizuku version $version (requires v13+; update Shizuku to v13 or newer)")
+
+    // Pre-dispatch refusal (Phase E1 fail-closed legacy cleanup): the
+    // one-time legacy fixed-tag removal failed, so run() returns this
+    // before bind/cache/transact. Definite failure (no flags): the
+    // command never reached the service. Must not start with any backstop
+    // prefix ("service exec failed: ", "interrupted: ", "timeout after ",
+    // "shizuku: exec timed out after ", "may have executed") so the
+    // repository never treats it as possibly sent.
+    fun legacyCleanupFailed(detail: String): CmdResult =
+        CmdResult(exit = 1, out = "", err = "shizuku: legacy cleanup failed: $detail")
 
     // Post-dispatch reply loss (PR-32 P1-2): the write was (or may have been)
     // dispatched -- transact threw, the binder died mid-call, or the reply
@@ -175,6 +354,20 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
         truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
     )
 
+// Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
+// err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
+// paths log it locally in DEBUG builds only). Delegates to
+// encodeExecReply() so the frozen (int, String, String) layout stays
+// single-sourced with the service reply path.
+private fun writeDenied(reply: Parcel?) {
+    val (exit, out, err) = encodeExecReply(
+        CmdResult(1, "", ShizukuExecProtocol.DENIED_FOREIGN_CALLER),
+    )
+    reply?.writeInt(exit)
+    reply?.writeString(out)
+    reply?.writeString(err)
+}
+
 // Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
 // needs a real IBinder (synchronous binder.transact on a Parcel pair), so its
 // catch chain is not JVM-testable -- only this mapping is (GatewayAssemblyTest
@@ -214,28 +407,85 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
-// class with both constructors: Shizuku v13 tries the Context constructor
-// first via reflection, older servers use the default one. The Context is the
-// package-scoped user context; it is intentionally unused (documented by the
-// official guide as limited: no receivers/resolvers).
+// class with both constructors: Shizuku v13+ tries the Context constructor
+// first via reflection; pre-v13 servers are rejected pre-bind by the gateway
+// (Phase C3 v13 gate), so the default ctor is a fail-closed sink (-1), never
+// a backward-compat path. The Context is the
+// package-scoped user context; Context used only to capture owner uid (no
+// receivers/resolvers retained; not stored beyond construction).
 // NOTE: minification is off for all build types (see app/build.gradle.kts),
 // so no -keep rule is needed today. If minify is ever enabled, add:
 //   -keep class com.galaxydual.plus.GalaxyExecService { <init>(...); }
 // DEVICE-UNVERIFIED: bind/exec round-trip never ran on a device.
 class GalaxyExecService : Binder {
-    constructor() : super()
+    // Owner app uid captured from the Context constructor (the package-scoped
+    // user context, validated against BuildConfig.APPLICATION_ID). The default
+    // constructor is a fail-closed sink (no Context, stays -1, EXEC always
+    // denied); pre-v13 servers never reach here (gateway rejects pre-bind).
+    private val expectedAppUid: Int
 
-    @Suppress("UNUSED_PARAMETER")
-    constructor(context: Context) : super()
+    constructor() : super() {
+        expectedAppUid = -1
+    }
+
+    constructor(context: Context) : super() {
+        // Fail closed on a foreign context: do not trust a context whose
+        // package is not this app's APPLICATION_ID. Primary resolution is the
+        // current-user package uid; applicationInfo.uid is fallback only
+        // after the package match. NOTE: getPackageUidAsUser would be
+        // user-correct but is API 34+ (unavailable on minSdk 29), so
+        // getPackageUid(..., 0) is kept despite deprecation / multi-user skew:
+        // the user offset is in the same full-uid domain as
+        // Binder.getCallingUid() (both carry userId*100000 + appId), so the
+        // equality gate stays consistent. Resolved values whose appId
+        // outside 10000..19999 (AID_APP_START..AID_APP_LAST) are
+        // privileged/shared uids (root 0, system 1000, shell 2000,
+        // regardless of user offset) or sandbox/isolated appIds (> 19999)
+        // and are never legitimate owners -> -1 via resolveExpectedAppUid().
+        expectedAppUid = try {
+            if (context.packageName != BuildConfig.APPLICATION_ID) {
+                -1
+            } else {
+                val resolved = try {
+                    context.packageManager.getPackageUid(BuildConfig.APPLICATION_ID, 0)
+                } catch (_: Exception) {
+                    try {
+                        context.applicationInfo.uid
+                    } catch (_: Exception) {
+                        -1
+                    }
+                }
+                resolveExpectedAppUid(resolved)
+            }
+        } catch (_: Exception) {
+            -1
+        }
+        if (expectedAppUid == -1 && BuildConfig.DEBUG) {
+            Log.w("GalaxyExec", "expectedAppUid=-1 context package=${context.packageName}")
+        }
+    }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
         when (code) {
             ShizukuExecProtocol.TRANSACTION_DESTROY -> {
-                // Reserved destroy entry: cleanup then exit, per official guide.
+                // DESTROY is sent by Shizuku server on teardown/version-invalidation;
+                // actual sender uid is DEVICE-UNVERIFIED (could be system 1000 / shell 2000 / root 0);
+                // gating risks orphaned resident services defeating SERVICE_VERSION;
+                // foreign DESTROY impact is negligible availability-only DoS (Shizuku rebinds, no command execution),
+                // so leave ungated deliberately. EXEC remains the P0-gated vector.
                 System.exit(0)
                 return true
             }
             ShizukuExecProtocol.TRANSACTION_EXEC -> {
+                // P0 gate: auth runs BEFORE reading the cmd (fail closed, do
+                // no work for a foreign caller; Parcel position is left
+                // unread on deny -- the reply is terminal either way).
+                val callingUid = Binder.getCallingUid()
+                if (!isAllowedCaller(callingUid, expectedAppUid)) {
+                    if (BuildConfig.DEBUG) Log.w("GalaxyExec", "denied code=$code callingUid=$callingUid")
+                    writeDenied(reply)
+                    return true
+                }
                 val cmd = try {
                     data.readString() ?: ""
                 } catch (e: Exception) {
@@ -300,19 +550,73 @@ interface ShizukuBindDriver {
     fun send(onResult: (Result<IBinder>) -> Unit): Request
 }
 
+// Legacy fixed-tag migration seam (Phase D1, P1 legacy fixed-tag cleanup):
+// removes the pre-Phase-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG).
+// Contract: normal return = removed-or-already-gone idempotent (the gateway
+// marks cleanup complete and never asks again); throw = not confirmed (the
+// gateway is BLOCKING fail-closed, Phase E1: a non-cancellation failure makes
+// run() return a definite legacyCleanupFailed refusal before bind, and the
+// cleanup is retried on the next run() -- never swallow-and-continue).
+// Phase F2 note: a normal return means Shizuku accepted the removal and
+// attempted the ONEWAY DESTROY; it is NOT a synchronous PID-death proof
+// (UserServiceRecord.destroy() uses FLAG_ONEWAY, client unbind is void).
+// Device upgrade tests must verify old PID/binder death explicitly.
+// Device-only impl: the production RealShizukuLegacyCleaner below calls
+// Shizuku statics and cannot run on the JVM (android.jar stubs throw
+// "Stub!"), so JVM tests inject a fake and never construct the real one.
+interface ShizukuLegacyCleaner {
+    fun removeLegacy()
+}
+
+// Phase F2: per-call cleanup outcome (completed + failure detail). Returned
+// directly by ensureLegacyCleanupDone() so concurrent first-run callers each
+// see their own attempt's detail; never shared via a volatile field read
+// outside the mutex (which raced under concurrent retry -> one false refusal).
+internal data class LegacyCleanupOutcome(val completed: Boolean, val failureDetail: String?)
+
+// No-op connection for the legacy cleanup unbind (server-ignored when
+// remove=true: Shizuku drops the record without callbacks). A shared
+// val so the real cleaner and any test double reference the same object.
+private val legacyCleanupNoOpConnection = object : ServiceConnection {
+    override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+    }
+
+    override fun onServiceDisconnected(name: ComponentName?) {
+    }
+}
+
+// Production legacy cleaner (device-only): minimal UserServiceArgs carrying
+// ONLY the legacy fixed tag (NO processNameSuffix/version -- a minimal args
+// pair that addresses the old record; suffix/version would scope it to a
+// different identity and miss). remove=true drops the resident record so the
+// first per-UID v5 bind starts clean; unbinding an already-gone record is a
+// normal idempotent return. Throws propagate to the gateway's retry wrapper.
+private class RealShizukuLegacyCleaner(
+    private val packageName: String,
+    private val serviceClassName: String,
+) : ShizukuLegacyCleaner {
+    override fun removeLegacy() {
+        val legacyArgs = Shizuku.UserServiceArgs(ComponentName(packageName, serviceClassName)).tag(LEGACY_GALAXY_EXEC_TAG)
+        Shizuku.unbindUserService(legacyArgs, legacyCleanupNoOpConnection, true)
+    }
+}
+
 // Production driver: identical bind/unbind behavior to the pre-seam inline
 // code (same args chain, same unbindUserService(args, conn, true)).
 private class RealShizukuBindDriver(
     private val packageName: String,
     private val serviceClassName: String,
+    private val uidProvider: () -> Int = { Process.myUid() },
 ) : ShizukuBindDriver {
     override fun send(onResult: (Result<IBinder>) -> Unit): ShizukuBindDriver.Request {
+        val callerUid = uidProvider()
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
-            // Tag stays the stable service identity; SERVICE_VERSION (v2) is the
+            // Tag is per-UID derived via galaxyExecServiceTag(callerUid)
+            // (full caller uid, stable); SERVICE_VERSION (5) remains the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
-        ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag("GalaxyDualExec-v1")
+        ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag(galaxyExecServiceTag(callerUid))
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 if (service != null) onResult(Result.success(service))
@@ -371,15 +675,46 @@ class ShizukuCmdGateway(
     private val bindTimeoutMs: Long = ShizukuExecProtocol.BIND_TIMEOUT_MS,
     private val bindDriver: ShizukuBindDriver? = null,
     private val cleanupScope: CoroutineScope? = null,
+    // Phase C1: caller-uid provider for the per-UID bind tag (default =
+    // Process.myUid() at bind time inside RealShizukuBindDriver). Nullable
+    // trailing param with default null so existing call sites keep working
+    // and JVM construction stays stub-free (Process.myUid() is resolved
+    // lazily only when the real driver is built).
+    private val uidProvider: (() -> Int)? = null,
+    // Phase D1: legacy fixed-tag cleaner seam (default = real Shizuku
+    // unbind). Trailing param with default null so existing call sites keep
+    // working; the real cleaner is built lazily so JVM construction stays
+    // stub-free (Shizuku statics never touched on a test thread).
+    private val legacyCleaner: ShizukuLegacyCleaner? = null,
+    // Phase E1 JVM run() testing seams: preflight ping/permission/version
+    // lambdas so run() can be exercised on the JVM without touching Shizuku
+    // statics (android.jar stubs throw "Stub!"). Nullable trailing params
+    // with default null so existing call sites are unchanged; each real
+    // Shizuku static is resolved lazily (see resolvedPreflight* below) so
+    // JVM construction stays stub-free.
+    private val preflightPing: (() -> Boolean)? = null,
+    private val preflightPermission: (() -> Boolean)? = null,
+    private val preflightVersion: (() -> Int)? = null,
 ) : CmdGateway {
     override val privilege: Privilege = Privilege.SHELL
 
     private val resolvedDriver: ShizukuBindDriver by lazy {
-        bindDriver ?: RealShizukuBindDriver(packageName, serviceClassName)
+        bindDriver ?: RealShizukuBindDriver(packageName, serviceClassName, uidProvider ?: { Process.myUid() })
     }
     private val resolvedCleanupScope: CoroutineScope by lazy {
         cleanupScope ?: shizukuCleanupScope
     }
+    private val resolvedLegacyCleaner: ShizukuLegacyCleaner by lazy {
+        legacyCleaner ?: RealShizukuLegacyCleaner(packageName, serviceClassName)
+    }
+    private val resolvedPreflightPing: () -> Boolean by lazy { preflightPing ?: { Shizuku.pingBinder() } }
+    private val resolvedPreflightPermission: () -> Boolean by lazy { preflightPermission ?: { Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED } }
+    private val resolvedPreflightVersion: () -> Int by lazy { preflightVersion ?: { Shizuku.getVersion() } }
+    // Phase D1 single-flight for the one-time legacy cleanup. Separate from
+    // bindMutex never held together: cleanup precedes the first bind and
+    // never acquires bindMutex (see ensureLegacyCleanupDone).
+    private val legacyCleanupMutex = Mutex()
+    private val legacyCleanupComplete = AtomicBoolean(false)
 
     // Cached privileged binder + its owning request, guarded by bindMutex.
     // Bound lazily on first run(); process-lifetime cache (close() unbinds).
@@ -394,22 +729,57 @@ class ShizukuCmdGateway(
 
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
-            // Pre-flight: no binder -> explicit error, never IllegalStateException.
+            // Order (Phase F1): ping -> permission -> version read ->
+            // cleanup (fail-closed, only if the server has the UserService
+            // API) -> version reject (if <13) -> bind. Pre-flight: no
+            // binder -> explicit error, never IllegalStateException.
             val alive = try {
-                Shizuku.pingBinder()
+                resolvedPreflightPing()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 return@withContext ShizukuExecErrors.noBinder()
             }
             if (!alive) return@withContext ShizukuExecErrors.noBinder()
             val granted = try {
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                resolvedPreflightPermission()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 return@withContext ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName)
             }
             if (!granted) return@withContext ShizukuExecErrors.notAuthorized()
 
+            val version = try { resolvedPreflightVersion() } catch (e: Exception) { if (e is CancellationException) throw e; return@withContext ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName) }
+
+            // Legacy fixed-tag cleanup, BLOCKING fail-closed (Phase E1/F1):
+            // the one-time removal runs BEFORE the v13 reject and before the
+            // first per-UID v5 bind, but ONLY when the server actually has
+            // the UserService API (version >= MIN_USERSERVICE_VERSION=10).
+            // A non-cancellation failure returns a definite
+            // legacyCleanupFailed refusal here (no bind/cache/transact, cache
+            // untouched) and is retried on the next run() -- never
+            // swallow-and-continue past an ungated legacy record. Cleanup
+            // deliberately precedes the <13 reject: on a v10-v12 server the
+            // ungated v2 record must be revoked before the unsupportedVersion
+            // return, otherwise the pre-v13 gate would leave that record
+            // resident. The remove needs no Context constructor (Shizuku.
+            // unbindUserService on the minimal legacy args only), so it is
+            // safe to attempt on a v10-v12 server. On a <10 server no legacy
+            // UserService record can exist (API did not exist), so cleanup
+            // is skipped and the caller sees the accurate unsupportedVersion
+            // refusal instead of a meaningless cleanup failure.
+            // CancellationException from checkLegacyCleanupGate/
+            // ensureLegacyCleanupDone propagates (flag stays incomplete).
+            if (version >= ShizukuExecProtocol.MIN_USERSERVICE_VERSION) {
+                val cleanupFailure = try {
+                    checkLegacyCleanupGate()
+                } catch (e: CancellationException) {
+                    throw e
+                }
+                if (cleanupFailure != null) return@withContext cleanupFailure
+            }
+
+            if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
+            // No dropBindingLocked here (nothing bound by this call; must not cache)
             val binder = try {
                 boundBinder()
             } catch (e: Exception) {
@@ -477,6 +847,70 @@ class ShizukuCmdGateway(
                 }
             }
         }
+
+    // One-time legacy fixed-tag cleanup (Phase D1, P1 legacy fixed-tag
+    // migration; Phase E1 fail-closed/F2 per-call outcome): removes the
+    // pre-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG) before the
+    // first per-UID v5 bind. The run() call site sits after ping/permission/
+    // version-read and before the <13 reject (see run() for the conditional
+    // cleanup-before-reject rationale), so this assumes the caller already
+    // passed ping/permission; it runs on Dispatchers.IO (inside run()'s
+    // withContext) and never holds bindMutex (it precedes boundBinder and
+    // only takes legacyCleanupMutex), so cleanup cannot deadlock the bind
+    // lock. Single-flight via legacyCleanupMutex + legacyCleanupComplete:
+    // concurrent first calls execute removeLegacy() exactly once; later
+    // calls early-return completed. Returns a per-call outcome: completed
+    // on success/already-complete, not-completed with the failure detail
+    // on a non-cancellation failure (DEBUG log). CancellationException
+    // propagates with the flag still incomplete so a cancelled caller
+    // retries cleanly. Callers (run() via checkLegacyCleanupGate) treat
+    // not-completed as BLOCKING fail-closed: run() returns a definite
+    // legacyCleanupFailed refusal before bind and retries on the next
+    // run() -- never swallow-and-continue past the ungated legacy record.
+    // A normal return means Shizuku accepted the removal and attempted
+    // the ONEWAY DESTROY, NOT a synchronous PID-death proof; device
+    // upgrade tests must verify old PID/binder death explicitly.
+    internal suspend fun ensureLegacyCleanupDone(): LegacyCleanupOutcome {
+        if (legacyCleanupComplete.get()) return LegacyCleanupOutcome(completed = true, failureDetail = null)
+        return legacyCleanupMutex.withLock {
+            if (legacyCleanupComplete.get()) return@withLock LegacyCleanupOutcome(completed = true, failureDetail = null)
+            try {
+                resolvedLegacyCleaner.removeLegacy()
+                legacyCleanupComplete.set(true)
+                LegacyCleanupOutcome(completed = true, failureDetail = null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // DEBUG-log the retryable failure. The try/catch keeps the
+                // JVM unit-test path from failing: android.util.Log is a
+                // stub on the JVM that throws "Stub!", which must never
+                // escape as a cleanup failure (production behavior is the
+                // bare Log.w).
+                val detail = e.message ?: e.javaClass.simpleName
+                try {
+                    if (BuildConfig.DEBUG) Log.w("GalaxyExec", "legacy cleanup failed (will retry): ${e.message}")
+                } catch (_: Exception) {
+                }
+                LegacyCleanupOutcome(completed = false, failureDetail = detail)
+            }
+        }
+    }
+
+    // Fail-closed gate (Phase E1/F2, JVM-testable): null when cleanup is done
+    // (run() proceeds to the version reject and bind), else a definite
+    // legacyCleanupFailed refusal (run() returns it before bind/cache/
+    // transact). run() calls this wrapper, not ensureLegacyCleanupDone()
+    // directly, so JVM tests can pin the run()-level gate with a fake
+    // cleaner plus the preflight seams. Uses the per-call outcome detail
+    // (F2) so a concurrent retrying caller's success cannot overwrite a
+    // sibling caller's failure detail into a false "unknown" refusal.
+    internal suspend fun checkLegacyCleanupGate(): CmdResult? {
+        val outcome = ensureLegacyCleanupDone()
+        return if (outcome.completed) null else ShizukuExecErrors.legacyCleanupFailed(outcome.failureDetail ?: "unknown")
+    }
+
+    // Test seam: reports the one-time legacy cleanup completion flag.
+    internal fun isLegacyCleanupCompleteForTest(): Boolean = legacyCleanupComplete.get()
 
     // One exec round-trip with a bounded client wait. Pre-dispatch refusals
     // (dead binder on the entry liveness check) stay definite failures via
