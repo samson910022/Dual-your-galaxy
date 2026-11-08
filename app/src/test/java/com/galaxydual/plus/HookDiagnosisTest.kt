@@ -282,7 +282,7 @@ class HookDiagnosisTest {
     }
 
     // (d) Hook-neutral lock: for every probe combination and every hook
-    // status, routing still runs with hasLsposed = false, readiness ignores
+    // status, routing still runs with hook signal excluded, readiness ignores
     // the diagnosis, and the UiState mapping preserves channel/privilege/
     // channelReady while carrying the hook display fields.
     @Test fun hookNeutral_diagnosisNeverGrantsReadinessOrRouting() {

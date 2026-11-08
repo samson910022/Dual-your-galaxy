@@ -35,7 +35,7 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 
 1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
    observe-only（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗），不可描述為已能擴展包名。
-2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
+2. **AUTO 降級（SHELL）**：無可用 su ROOT（不論 LSPosed 模組／marker 是否存在），且 Shizuku 授權及能力探測通過 → `Privilege.SHELL`；明選 LSPosed 仍為 NoOp 佔位（hook 訊號不進入路由）
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
      binder round-trip、未授權路徑／首次選路／binder 死引導 [待實機驗證] DEVICE-UNVERIFIED。
    - 版本要求：需 Shizuku v13+（v13 起才有 UserService 的 Context 構造）；低於 v13 時本 App 在綁定前明確拒絕（`unsupported Shizuku version`），不綁定、不執行。
