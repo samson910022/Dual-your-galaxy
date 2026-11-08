@@ -85,7 +85,9 @@ import rikka.shizuku.Shizuku
 // bind tag is per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
 // galaxyExecServiceTag) so each user instance gets its own service record;
 // the legacy fixed tag "GalaxyDualExec-v1" no longer binds and its record
-// orphans until Shizuku restart (daemon restart reaps). SERVICE_VERSION is
+// is removed by the D1 migration on the first successful run() (retryable);
+// if cleanup never succeeds until restart, the orphan sits inert (daemon
+// restart reaps). SERVICE_VERSION is
 // 4 (C2 bumped it for the appId change); the version bump remains the
 // invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
@@ -138,8 +140,9 @@ object ShizukuExecProtocol {
     // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
     // galaxyExecServiceTag); the legacy fixed tag "GalaxyDualExec-v1" is
     // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
-    // is NOT bound. Its old service record orphans until Shizuku restart
-    // (daemon restart reaps). SERVICE_VERSION is 4 (C2 bumped it for the
+    // is NOT bound. Its old service record is removed by the D1 migration
+    // on the first successful run() (retryable); if cleanup never succeeds
+    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 4 (C2 bumped it for the
     // appId change; auth code changed so the daemon must rebuild).
     const val SERVICE_VERSION = 4
 }
@@ -207,8 +210,9 @@ internal fun isSupportedShizukuVersion(version: Int): Boolean = version >= Shizu
 
 // Legacy fixed bind tag (pre-Phase C1). Retained for cleanup/documentation
 // only; it is NOT bound — galaxyExecServiceTag() below derives a per-UID tag
-// for every bind. Its resident service record orphans until Shizuku restart
-// (daemon restart reaps).
+// for every bind. Its resident service record is removed by the D1 migration
+// on the first successful run() (retryable); if cleanup never succeeds until
+// restart, the orphan sits inert (daemon restart reaps).
 const val LEGACY_GALAXY_EXEC_TAG = "GalaxyDualExec-v1"
 
 // Prefix for the per-UID derived bind tag (see galaxyExecServiceTag).
@@ -505,6 +509,45 @@ interface ShizukuBindDriver {
     fun send(onResult: (Result<IBinder>) -> Unit): Request
 }
 
+// Legacy fixed-tag migration seam (Phase D1, P1 legacy fixed-tag cleanup):
+// removes the pre-Phase-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG).
+// Contract: normal return = removed-or-already-gone idempotent (the gateway
+// marks cleanup complete and never asks again); throw = not confirmed (the
+// gateway swallows non-cancellation failures and retries on the next run()).
+// Device-only impl: the production RealShizukuLegacyCleaner below calls
+// Shizuku statics and cannot run on the JVM (android.jar stubs throw
+// "Stub!"), so JVM tests inject a fake and never construct the real one.
+interface ShizukuLegacyCleaner {
+    fun removeLegacy()
+}
+
+// No-op connection for the legacy cleanup unbind (server-ignored when
+// remove=true: Shizuku drops the record without callbacks). A shared
+// val so the real cleaner and any test double reference the same object.
+private val legacyCleanupNoOpConnection = object : ServiceConnection {
+    override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+    }
+
+    override fun onServiceDisconnected(name: ComponentName?) {
+    }
+}
+
+// Production legacy cleaner (device-only): minimal UserServiceArgs carrying
+// ONLY the legacy fixed tag (NO processNameSuffix/version -- a minimal args
+// pair that addresses the old record; suffix/version would scope it to a
+// different identity and miss). remove=true drops the resident record so the
+// first per-UID v4 bind starts clean; unbinding an already-gone record is a
+// normal idempotent return. Throws propagate to the gateway's retry wrapper.
+private class RealShizukuLegacyCleaner(
+    private val packageName: String,
+    private val serviceClassName: String,
+) : ShizukuLegacyCleaner {
+    override fun removeLegacy() {
+        val legacyArgs = Shizuku.UserServiceArgs(ComponentName(packageName, serviceClassName)).tag(LEGACY_GALAXY_EXEC_TAG)
+        Shizuku.unbindUserService(legacyArgs, legacyCleanupNoOpConnection, true)
+    }
+}
+
 // Production driver: identical bind/unbind behavior to the pre-seam inline
 // code (same args chain, same unbindUserService(args, conn, true)).
 private class RealShizukuBindDriver(
@@ -585,6 +628,11 @@ class ShizukuCmdGateway(
     // and JVM construction stays stub-free (Process.myUid() is resolved
     // lazily only when the real driver is built).
     private val uidProvider: (() -> Int)? = null,
+    // Phase D1: legacy fixed-tag cleaner seam (default = real Shizuku
+    // unbind). Trailing param with default null so existing call sites keep
+    // working; the real cleaner is built lazily so JVM construction stays
+    // stub-free (Shizuku statics never touched on a test thread).
+    private val legacyCleaner: ShizukuLegacyCleaner? = null,
 ) : CmdGateway {
     override val privilege: Privilege = Privilege.SHELL
 
@@ -594,6 +642,14 @@ class ShizukuCmdGateway(
     private val resolvedCleanupScope: CoroutineScope by lazy {
         cleanupScope ?: shizukuCleanupScope
     }
+    private val resolvedLegacyCleaner: ShizukuLegacyCleaner by lazy {
+        legacyCleaner ?: RealShizukuLegacyCleaner(packageName, serviceClassName)
+    }
+    // Phase D1 single-flight for the one-time legacy cleanup. Separate from
+    // bindMutex never held together: cleanup precedes the first bind and
+    // never acquires bindMutex (see ensureLegacyCleanupDone).
+    private val legacyCleanupMutex = Mutex()
+    private val legacyCleanupComplete = AtomicBoolean(false)
 
     // Cached privileged binder + its owning request, guarded by bindMutex.
     // Bound lazily on first run(); process-lifetime cache (close() unbinds).
@@ -626,6 +682,8 @@ class ShizukuCmdGateway(
 
             val version = try { Shizuku.getVersion() } catch (e: Exception) { if (e is CancellationException) throw e; return@withContext ShizukuExecErrors.remoteFailed(e.message ?: e.javaClass.simpleName) }
             if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
+            // Before first per-UID v4 bind, legacy fixed-tag ungated v2 record removed; failure swallowed+retried (see ensure doc).
+            ensureLegacyCleanupDone()
             // No dropBindingLocked here (nothing bound by this call; must not cache)
             val binder = try {
                 boundBinder()
@@ -694,6 +752,43 @@ class ShizukuCmdGateway(
                 }
             }
         }
+
+    // One-time legacy fixed-tag cleanup (Phase D1, P1 legacy fixed-tag
+    // migration): removes the pre-C1 ungated v2 resident record
+    // (LEGACY_GALAXY_EXEC_TAG) before the first per-UID v4 bind. The run()
+    // call site sits after the ping/permission/v13 gate, so this assumes the
+    // caller already passed those checks; it runs on Dispatchers.IO (inside
+    // run()'s withContext) and never holds bindMutex (it precedes boundBinder
+    // and only takes legacyCleanupMutex), so cleanup cannot deadlock the bind
+    // lock. Single-flight via legacyCleanupMutex + legacyCleanupComplete:
+    // concurrent first calls execute removeLegacy() exactly once; later calls
+    // early-return. Non-cancellation failures are swallowed (DEBUG log) and
+    // retried on the next run(); CancellationException propagates with the
+    // flag still incomplete so a cancelled caller retries cleanly.
+    internal suspend fun ensureLegacyCleanupDone() {
+        if (legacyCleanupComplete.get()) return
+        legacyCleanupMutex.withLock {
+            if (legacyCleanupComplete.get()) return@withLock
+            try {
+                resolvedLegacyCleaner.removeLegacy()
+                legacyCleanupComplete.set(true)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // DEBUG log of the retryable failure. The try/catch keeps the
+                // JVM unit-test path from failing: android.util.Log is a stub
+                // on the JVM that throws "Stub!", which must never escape as
+                // a cleanup failure (production behavior is the bare Log.w).
+                try {
+                    if (BuildConfig.DEBUG) Log.w("GalaxyExec", "legacy cleanup failed (will retry): ${e.message}")
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    // Test seam: reports the one-time legacy cleanup completion flag.
+    internal fun isLegacyCleanupCompleteForTest(): Boolean = legacyCleanupComplete.get()
 
     // One exec round-trip with a bounded client wait. Pre-dispatch refusals
     // (dead binder on the entry liveness check) stay definite failures via
