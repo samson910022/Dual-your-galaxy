@@ -78,9 +78,15 @@ class LifecycleSeparationTest {
         val writeCommands = mutableListOf<String>()
         val unexpectedCommands = mutableListOf<String>()
 
+        private fun hasShellSeparator(cmd: String): Boolean =
+            cmd.contains(";") || cmd.contains("&&") || cmd.contains("||") ||
+                cmd.contains("\n") || cmd.contains("`") || cmd.contains("$(")
+
         private fun isWrite(cmd: String): Boolean =
-            cmd.startsWith("pm install") || cmd.startsWith("pm uninstall") ||
-                cmd.contains("rm ") || cmd.contains("chmod") || cmd.contains("chown")
+            hasShellSeparator(cmd) ||
+                cmd.contains("pm install") || cmd.contains("pm uninstall") ||
+                cmd.contains("rm ") || cmd.contains("chmod") || cmd.contains("chown") ||
+                cmd.contains("pm grant") || cmd.contains("pm revoke")
 
         private fun isAllowed(cmd: String): Boolean = when {
             cmd.trim() == "id -u" -> true
@@ -278,6 +284,8 @@ class LifecycleSeparationTest {
         assertNull("process-death restore starts with null pending", vm.state.value.pendingRemove)
         assertEquals("no auto-resend: zero installs", callsBeforeInstall, gw.installCalls.size)
         assertEquals("no auto-resend: zero uninstalls", callsBeforeUninstall, gw.uninstallCalls.size)
+        assertEquals(0, gw.writeCommands.size)
+        assertEquals(0, gw.unexpectedCommands.size)
     }
 
     @Test
@@ -343,18 +351,21 @@ class LifecycleSeparationTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
+        // Verify target first (inventory.targetId>0) without auto-restoring by
+        // making selection non-empty before refresh.
         vm.setSourceCatalog(catalog())
         vm.toggleSelection("0:com.example.chat")
         await { vm.state.value.selectedKeys.contains("0:com.example.chat") }
+        vm.refresh()
+        await { vm.state.value.inventory.targetId > 0 }
 
         val selectedBefore = vm.state.value.selectedKeys
-        val pendingBefore = vm.state.value.pendingRemove
+        assertTrue(selectedBefore.contains("0:com.example.chat"))
 
         // Selection is non-empty: restore must NOT overwrite (no auto-resend).
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertEquals(selectedBefore, vm.state.value.selectedKeys)
-        assertEquals(pendingBefore, vm.state.value.pendingRemove)
         // Seeded key from store must not have been merged in.
         assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
         assertFalse(vm.state.value.selectedKeys.contains("0:com.example.mail"))
@@ -407,18 +418,31 @@ class LifecycleSeparationTest {
             ),
         )
 
-        // Device reports a different verified target (96).
+        // Device reports a different verified target (96). Refresh against 96
+        // with an empty backend first to verify inventory without clearing a
+        // 95 snapshot, then seed the 95 snapshot and invoke restoreSelection(95).
         val gw = FakeRepo(dualId = 96, dualSerial = 41)
         val clock = FakeClock()
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
-        // Deliberately no refresh: refresh would legitimately clear the
-        // foreign (95) entry for the verified 96 target. The foreign-target
-        // guard under test is the restoreSelection entry point itself, which
-        // must not touch the store when the verified inventory differs.
-        val rawBefore = backend.map[SELECTION_KEY]
+        // Empty backend so refresh verifies 96 without clearing anything.
         vm.setSourceCatalog(catalog())
+        vm.refresh()
+        await { vm.state.value.inventory.targetId > 0 }
+        assertEquals(96, vm.state.value.inventory.targetId)
+
+        // Now seed a 95 snapshot; refresh is not re-run, so it survives.
+        assertTrue(
+            backend.store().save(
+                SELECTION_SOURCE_CATALOG,
+                95,
+                setOf("0:com.example.chat"),
+                1000L,
+            ),
+        )
+        val rawBefore = backend.map[SELECTION_KEY]
+
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -463,14 +487,18 @@ class LifecycleSeparationTest {
         val vm = makeVm(gw, clock, backend.store())
         await { vm.state.value.channelReady }
 
-        // No catalog yet: restore must not burn the marker.
+        // Verify target while catalog is still empty (refresh triggers no
+        // restore because sourceCatalog is empty, but inventory gets verified).
+        vm.refresh()
+        await { vm.state.value.inventory.targetId > 0 }
+
+        // Catalog still empty: explicit restore must not burn the marker.
         vm.restoreSelection(95)
         Thread.sleep(300)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
 
-        // Once catalog is ready, refresh recovers the persisted selection.
+        // Once catalog is ready, the not-burned marker allows restore.
         vm.setSourceCatalog(catalog())
-        vm.refresh()
         await { "0:com.example.chat" in vm.state.value.selectedKeys }
         assertEquals(
             setOf("0:com.example.chat", "0:com.example.mail"),
@@ -525,6 +553,12 @@ class LifecycleSeparationTest {
 
         vmA.toggleSelection("0:com.example.chat")
         await { vmA.state.value.selectedKeys.contains("0:com.example.chat") }
+        gw.installedForUser.add("com.example.chat")
+
+        // Outstanding consent must not survive process death.
+        vmA.requestRemove("com.example.chat")
+        await { vmA.state.value.pendingRemove != null }
+        assertNotNull(vmA.state.value.pendingRemove)
 
         // Drive persistence through VM A (serial-bound to the verified target).
         vmA.persistSelection(95)
