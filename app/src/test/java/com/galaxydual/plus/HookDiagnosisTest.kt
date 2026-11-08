@@ -288,10 +288,13 @@ class HookDiagnosisTest {
     @Test fun hookNeutral_diagnosisNeverGrantsReadinessOrRouting() {
         for (hasRoot in listOf(false, true)) {
             for (hasShizuku in listOf(false, true)) {
-                assertEquals(
-                    routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot),
-                    hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku),
-                )
+                // Expected privilege is a pure function of the two probes only
+                // (su ROOT -> Shizuku -> NONE); hook status must not change it.
+                val expectedPrivilege = if (hasRoot) Privilege.ROOT
+                    else if (hasShizuku) Privilege.SHELL
+                    else Privilege.NONE
+                assertEquals(expectedPrivilege, routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot))
+                assertEquals(expectedPrivilege, hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku))
                 for (status in HookStatus.values()) {
                     val diagnosis = HookDiagnosis(
                         status = status,
