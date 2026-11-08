@@ -85,6 +85,52 @@ class GalaxyExecAuthTest {
         assertFalse(isAllowedCaller(Int.MIN_VALUE, Int.MIN_VALUE))
     }
 
+    @Test fun galaxyTag_sameUidStableRepeated() {
+        // Same full uid yields the identical tag on every call (stable service
+        // identity across binds for that user instance).
+        assertEquals("GalaxyDualExec-v1-u10134", galaxyExecServiceTag(10134))
+        assertEquals("GalaxyDualExec-v1-u10134", galaxyExecServiceTag(10134))
+        assertEquals("GalaxyDualExec-v1-u10134", galaxyExecServiceTag(10134))
+        assertEquals(galaxyExecServiceTag(10134), galaxyExecServiceTag(10134))
+    }
+
+    @Test fun galaxyTag_ownerVsSecondaryDistinct() {
+        // Owner (user 0) vs secondary users must derive distinct tags so
+        // Shizuku keeps separate service records per user instance.
+        val owner = galaxyExecServiceTag(10234)
+        assertNotEquals(owner, galaxyExecServiceTag(1010234)) // user 10
+        assertNotEquals(owner, galaxyExecServiceTag(9510234)) // user 95
+        assertNotEquals(owner, galaxyExecServiceTag(10245)) // different app
+        assertNotEquals(galaxyExecServiceTag(1010234), galaxyExecServiceTag(9510234))
+    }
+
+    @Test fun galaxyTag_embedsFullUidNotAppId() {
+        // Full uid (userId*100000 + appId) is embedded, never the appId alone:
+        // user 10 uid 1010234 must not collapse to the owner appId tag.
+        assertEquals("GalaxyDualExec-v1-u1010234", galaxyExecServiceTag(1010234))
+        assertNotEquals("GalaxyDualExec-v1-u10234", galaxyExecServiceTag(1010234))
+        assertEquals("GalaxyDualExec-v1-u9510234", galaxyExecServiceTag(9510234))
+    }
+
+    @Test fun galaxyTag_legacyFixedTagNeverProduced() {
+        // The legacy fixed tag is never bound by the derived-tag path.
+        for (uid in listOf(10134, 10234, 10245, 10000, 1010234, 9510234, 2000, 0)) {
+            assertNotEquals("GalaxyDualExec-v1", galaxyExecServiceTag(uid))
+            assertNotEquals(LEGACY_GALAXY_EXEC_TAG, galaxyExecServiceTag(uid))
+        }
+    }
+
+    @Test fun galaxyTag_hasPerUidPrefix() {
+        // Every derived tag carries the per-UID prefix.
+        for (uid in listOf(10134, 10234, 1010234, 9510234, 10245)) {
+            assertTrue(
+                "tag for uid $uid must start with GalaxyDualExec-v1-u, got: ${galaxyExecServiceTag(uid)}",
+                galaxyExecServiceTag(uid).startsWith("GalaxyDualExec-v1-u"),
+            )
+            assertTrue(galaxyExecServiceTag(uid).startsWith(GALAXY_EXEC_TAG_PREFIX))
+        }
+    }
+
     @Test fun deniedReply_isFrozenExitOneEmptyOutWithPrefix() {
         assertEquals("denied: foreign caller", ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
         assertTrue(
