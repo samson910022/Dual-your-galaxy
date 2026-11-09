@@ -25,11 +25,12 @@ object CallerDeoptPlan {
         val callersToDeoptimize: List<Method>,
     )
 
-    // Dedupe (first-seen order kept), drop any entry equal to the callee
-    // itself (the callee is deoptimized by HookInstaller.install, not as a
-    // caller), never mutate the input list.
-    fun plan(callee: Method, knownCallers: List<Method>): Plan {
-        val callers = knownCallers.filter { it != callee }.distinct()
+    // Dedupe (first-seen order kept), drop nulls and any entry equal to the
+    // callee itself (the callee is deoptimized by HookInstaller.install, not as
+    // a caller), never mutate the input list. Accepts nullable elements for
+    // defensive Java interop; normal Stage1 behavior is unchanged.
+    fun plan(callee: Method, knownCallers: List<Method?>): Plan {
+        val callers = knownCallers.filterNotNull().filter { it != callee }.distinct()
         return Plan(callee, callers)
     }
 }

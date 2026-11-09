@@ -63,9 +63,12 @@ internal object HookInstaller {
         log: (String) -> Unit,
     ): Boolean {
         val plan = CallerDeoptPlan.plan(callee, knownCallers)
+        val callersAttempted = plan.callersToDeoptimize.size
+        var callersDeoptimized = 0
         for (caller in plan.callersToDeoptimize) {
             try {
                 if (deoptimize(caller)) {
+                    callersDeoptimized++
                     safeLog(log, "deoptimized caller ${caller.declaringClass.name}#${caller.name}")
                 } else {
                     safeLog(
@@ -82,6 +85,14 @@ internal object HookInstaller {
                 )
             }
         }
-        return install(callee, hookId, deoptimize, hook, log)
+        val result = install(callee, hookId, deoptimize, hook, log)
+        if (result && callersAttempted > 0 && callersDeoptimized < callersAttempted) {
+            safeLog(
+                log,
+                "caller deopt incomplete: $callersDeoptimized/$callersAttempted deoptimized; " +
+                    "hook proceeds, inline bypass may remain (effect unverified)",
+            )
+        }
+        return result
     }
 }

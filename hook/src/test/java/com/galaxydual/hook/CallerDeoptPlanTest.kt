@@ -96,4 +96,12 @@ class CallerDeoptPlanTest {
         ))
         assertTrue(plan.callersToDeoptimize.isEmpty())
     }
+
+    @Test
+    fun ignoresNullElementsForJavaInteropDefensiveHandling() {
+        val callee = method("length")
+        val caller = method("isEmpty")
+        val plan = CallerDeoptPlan.plan(callee, listOf<Method?>(null, caller, null))
+        assertEquals(listOf(caller), plan.callersToDeoptimize)
+    }
 }
