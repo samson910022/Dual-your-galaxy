@@ -2290,4 +2290,39 @@ class InventorySelectionTest {
         assertEquals(beforeInstalls, gw.installCalls.size)
         assertNull(st.batchReport)
     }
+
+    // PR64 P1：核准與 live 相符，但 pin 時 fetchDualTarget 漂移到不同目標→拒絕，零寫入。
+    @Test
+    fun cloneSelected_approvedMatchesLive_butPinResolvesDifferentTarget_refusesZeroWrites() {
+        val backend = MapBackend()
+        val gw = FakeRepo() // default: dualId=95, dualSerial=15
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.a", "A", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        vm.toggleSelection("0:com.example.a")
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 95,
+            targetSerial = 15,
+            selectedKeys = setOf("0:com.example.a"),
+        )
+        // 讓 cloneSelected pin-time 的 fetchDualTarget 解析到不同目標 (96#16)。
+        gw.dualId = 96
+        gw.dualSerial = 16
+        val beforeInstalls = gw.installCalls.size
+        vm.cloneSelected(approved)
+        await { !vm.state.value.loading && vm.state.value.msg.contains("重新確認") }
+        val st = vm.state.value
+        assertEquals(beforeInstalls, gw.installCalls.size)
+        assertNull(st.batchReport)
+        assertEquals(MsgKind.INVALID, st.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
+        assertTrue(st.msg.contains("目標已變更，請重新確認"))
+        assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
+        assertEquals(96, st.inventory.targetId)
+        assertEquals(16, st.inventory.targetSerial)
+    }
 }

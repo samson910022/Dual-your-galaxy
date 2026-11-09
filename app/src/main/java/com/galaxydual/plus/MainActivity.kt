@@ -235,10 +235,11 @@ class MainActivity : ComponentActivity() {
     // 點擊 batchBtn 只建立請求快照（世代 + 目標摘要 + 數量）並開對話框，
     // 勾選_ack 且非 busy/可寫才啟用「確認建立」；confirm 才 cloneSelected()。
     // pendingBatchRequest 為當前待確認快照（旋轉經 Bundle 保留，render 重新顯示）；
-    // shownBatchRequest 追蹤已在屏的實例，避免每輪 render 重建對話框。
+    // shownBatchRequest/shownBatchWasFresh 追蹤已在屏實例，避免無謂重建/漏更新。
     private var batchConfirmDialog: AlertDialog? = null
     private var pendingBatchRequest: BatchConfirmRequest? = null
     private var shownBatchRequest: BatchConfirmRequest? = null
+    private var shownBatchWasFresh: Boolean? = null
     private var batchAcknowledged = false
     private var batchAcknowledgedGeneration: Long? = null
     private var batchGeneration = 0L
@@ -533,6 +534,7 @@ class MainActivity : ComponentActivity() {
         batchConfirmDialog = null
         pendingBatchRequest = null
         shownBatchRequest = null
+        shownBatchWasFresh = null
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -3643,6 +3645,7 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window may already be gone.
         }
         shownBatchRequest = request
+        shownBatchWasFresh = (s.inventory.freshness == InventoryFreshness.FRESH)
         // 同世代重建（旋轉）保留勾選；跨世代已先在請求端重置。
         if (batchAcknowledgedGeneration != request.generation) {
             batchAcknowledged = false
@@ -3687,6 +3690,7 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             batchConfirmDialog = null
             shownBatchRequest = null
+            shownBatchWasFresh = null
             pendingBatchRequest = null
             return
         }
@@ -3707,9 +3711,7 @@ class MainActivity : ComponentActivity() {
             val pending = pendingBatchRequest
             val snapshotMatches = cur != null && pending != null &&
                 pending.generation == request.generation &&
-                cur.inventory.targetId == request.targetId &&
-                cur.inventory.targetSerial == request.targetSerial &&
-                cur.selectedKeys == request.selectedKeys
+                batchRequestMatchesLive(request.selectedKeys, request.targetId, request.targetSerial, cur)
             if (cur != null && snapshotMatches && canConfirmBatch(cur, batchAcknowledged)) {
                 val approved = ApprovedBatchCloneRequest(
                     targetId = request.targetId,
@@ -3728,7 +3730,7 @@ class MainActivity : ComponentActivity() {
         batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
             cancelBatchConfirm()
         }
-        updateBatchConfirmEnabled(s)
+        updateBatchConfirmEnabled(try { vm.state.value } catch (_: Exception) { s })
     }
 
     // render 每輪同步：request 為空即關閉；已顯示且同一實例只更新按鈕 enablement
@@ -3746,6 +3748,7 @@ class MainActivity : ComponentActivity() {
             }
             batchConfirmDialog = null
             shownBatchRequest = null
+            shownBatchWasFresh = null
             batchAcknowledged = false
             batchAcknowledgedGeneration = null
             return
@@ -3787,6 +3790,26 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (batchConfirmDialog?.isShowing == true && shownBatchRequest == request) {
+            // P2：freshness 跨越 FRESH/非FRESH 會改變風險文案（不得持續宣稱已驗證）；
+            // 視為新確認語境：重建並清 ack。
+            val isFresh = s.inventory.freshness == InventoryFreshness.FRESH
+            if (shownBatchWasFresh != null && shownBatchWasFresh != isFresh) {
+                val regenerated = request.copy(generation = request.generation + 1)
+                batchGeneration = regenerated.generation
+                batchAcknowledged = false
+                batchAcknowledgedGeneration = null
+                pendingBatchRequest = regenerated
+                try {
+                    batchConfirmDialog?.dismiss()
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                batchConfirmDialog = null
+                shownBatchRequest = null
+                shownBatchWasFresh = null
+                showBatchConfirmDialog(regenerated, s)
+                return
+            }
             updateBatchConfirmEnabled(s)
             return
         }
@@ -3802,6 +3825,7 @@ class MainActivity : ComponentActivity() {
         batchConfirmDialog = null
         pendingBatchRequest = null
         shownBatchRequest = null
+        shownBatchWasFresh = null
         batchAcknowledged = false
         batchAcknowledgedGeneration = null
     }
