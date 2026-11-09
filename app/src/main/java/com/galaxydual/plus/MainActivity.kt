@@ -2144,9 +2144,16 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
             }
             val appIconView = ImageView(this).apply {
-                layoutParams = FrameLayout.LayoutParams(dp(36), dp(36)).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(CLONED_ICON_DP), dp(CLONED_ICON_DP)).apply {
                     gravity = Gravity.CENTER
                 }
+                // p26-2 Phase 1：與來源列行為一致，尺寸由 layout 固定為 36dp。
+                // 選 FIT_CENTER：不中心裁切，避免 adaptive icon 安全區／圓角邊緣被
+                // CENTER_CROP 吃掉；36dp 方形框均勻容納完整圖形。禁止 view 自行繞
+                // wrap 尺寸，確保不同 intrinsic 尺寸貼進去同樣大。
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                adjustViewBounds = false
+                cropToPadding = false
                 // Phase C: the row title/switch already names the app; the icon
                 // itself is decorative.
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -3982,6 +3989,28 @@ class MainActivity : ComponentActivity() {
         cached
     }
 
+    // p26-2 Phase 1：供 CheckBox 左圖用的統一尺寸 helper。取 fresh copy
+    // （constantState.newDrawable().mutate()，不共用快取實例），再 setBounds 強制
+    // 為 sizePx x sizePx；呼叫端用 setCompoundDrawables（非 IntrinsicBounds 版），
+    // 避免直接吃各 App getApplicationIcon() 的原生 intrinsic 尺寸。
+    private fun sizedIcon(drawable: Drawable, sizePx: Int): Drawable {
+        val fresh = try {
+            drawable.constantState?.newDrawable()?.mutate()
+        } catch (_: Exception) {
+            null
+        }
+        if (fresh == null) {
+            // fallback：回傳原始 drawable 且不 setBounds，避免污染快取共用實例（尺寸雖不統一但不影響其他列）
+            return drawable
+        }
+        return try {
+            fresh.setBounds(0, 0, sizePx, sizePx)
+            fresh
+        } catch (_: Exception) {
+            fresh
+        }
+    }
+
     private fun loadIcon(pkg: String, appKey: String, onLoaded: (Drawable) -> Unit) {
         if (iconMemo.isLoaded(appKey)) return
         if (appKey in iconInflight) return
@@ -4029,18 +4058,18 @@ class MainActivity : ComponentActivity() {
         if (cached != null) {
             iconDrawables.remove(appKey)
             iconDrawables[appKey] = cached
-            box.setCompoundDrawablesWithIntrinsicBounds(freshIconDrawable(cached), null, null, null)
+            box.setCompoundDrawables(sizedIcon(cached, dp(ICON_DP)), null, null, null)
             return
         }
         loadIcon(pkg, appKey) { drawable ->
-            val fresh = freshIconDrawable(drawable)
+            val fresh = sizedIcon(drawable, dp(ICON_DP))
             // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
             // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
             //（找不到＝已過濾掉／換 catalog，不貼）。
             try {
                 if (box.tag == appKey && box.parent === sourceContainer) {
                     try {
-                        box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
+                        box.setCompoundDrawables(fresh, null, null, null)
                     } catch (_: Exception) {
                         // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
                     }
@@ -4049,11 +4078,11 @@ class MainActivity : ComponentActivity() {
                         val child = sourceContainer.getChildAt(i)
                         if (child is CheckBox && child.tag == appKey) {
                             val perView = try {
-                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
+                                sizedIcon(drawable, dp(ICON_DP))
                             } catch (_: Exception) {
                                 fresh
                             }
-                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                            child.setCompoundDrawables(perView, null, null, null)
                             break
                         }
                     }
@@ -4133,13 +4162,9 @@ class MainActivity : ComponentActivity() {
     private fun rebindClonedIcon(appKey: String, drawable: Drawable) {
         if (!::clonedAppsContainer.isInitialized) return
         val target = findImageViewWithTag(clonedAppsContainer, appKey) ?: return
-        val perView = try {
-            drawable.constantState?.newDrawable()?.mutate()
-                ?: drawable.mutate()
-        } catch (_: Exception) {
-            drawable
-        }
-        target.setImageDrawable(perView)
+        // p26-2 Phase 1：ImageView 由固定 36dp layout 統一尺寸，此處保持
+        // freshIconDrawable（不經 sizedIcon）；execute 僅取 fresh 實例避免共用。
+        target.setImageDrawable(freshIconDrawable(drawable))
     }
 
     // Phase B B2：在來源容器內按 tag 找 CheckBox 重綁（找不到丟棄）。
@@ -4148,13 +4173,8 @@ class MainActivity : ComponentActivity() {
         for (i in 0 until sourceContainer.childCount) {
             val child = sourceContainer.getChildAt(i)
             if (child is CheckBox && child.tag == appKey) {
-                val perView = try {
-                    drawable.constantState?.newDrawable()?.mutate()
-                        ?: drawable.mutate()
-                } catch (_: Exception) {
-                    drawable
-                }
-                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                val perView = sizedIcon(drawable, dp(ICON_DP))
+                child.setCompoundDrawables(perView, null, null, null)
                 break
             }
         }
@@ -4237,6 +4257,12 @@ class MainActivity : ComponentActivity() {
 
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
+
+        // p26-2 Phase 1 統一圖標尺寸：來源 CheckBox 左圖 24dp、分身 ImageView 36dp，
+        // 都經 dp() 轉 px；CheckBox 另以 setBounds 強制，避免各 App 原生 intrinsic
+        // 尺寸（density/adaptive icon）不一導致忽大忽小。
+        private const val ICON_DP = 24
+        private const val CLONED_ICON_DP = 36
 
         // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
         private const val MAX_LABEL_CACHE = 200
