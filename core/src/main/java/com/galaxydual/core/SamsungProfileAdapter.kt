@@ -252,10 +252,27 @@ object SamsungProfileAdapter {
         "guest", "demo", "restricted", "headless", "car",
     )
 
+    // Bare `Type:` values: strict ASCII-only surface (P1 #59). A complete bare
+    // type value may contain only letters, digits, `.`, `_`, `-`, space, tab,
+    // and `(` `)` (for a single trailing `(default)` note). Any Unicode
+    // whitespace/control/format char (NBSP, U+2000/U+3000/U+202F, ZWSP, controls)
+    // is disallowed so Kotlin Unicode trim can never launder a residual into an
+    // allowlisted CLONE/OTHER form. Checked on the raw (pre-trim) value.
+    private fun hasDisallowedBareChars(s: String): Boolean =
+        s.any { c ->
+            !(c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' ||
+                c == '.' || c == '_' || c == '-' || c == ' ' || c == '\t' ||
+                c == '(' || c == ')')
+        }
+
+    private fun asciiTrim(s: String): String = s.trim { it == ' ' || it == '\t' }
+
     // Strip at most one valid, sole, trailing `(default)` suffix (well-
-    // formed, whitespace-only around it). Returns the trimmed core, or null
-    // for malformed/multiple notes or empty core (fail-closed).
+    // formed, whitespace-only around it). Returns the ASCII-trimmed core, or
+    // null for disallowed chars, malformed/multiple notes, or empty core
+    // (fail-closed).
     private fun bareCore(value: String): String? {
+        if (hasDisallowedBareChars(value)) return null
         val notes = DEFAULT_NOTE.findAll(value).toList()
         if (notes.size > 1) return null
         var core = value
@@ -263,11 +280,12 @@ object SamsungProfileAdapter {
             val n = notes[0]
             val before = value.substring(0, n.range.first)
             val after = value.substring(n.range.last + 1)
-            if (before.any { !it.isWhitespace() } && after.any { !it.isWhitespace() }) return null
-            if (after.any { !it.isWhitespace() }) return null
+            // `(default)` must be sole/trailing with only ASCII space/tab around it.
+            if (before.any { it != ' ' && it != '\t' } && after.any { it != ' ' && it != '\t' }) return null
+            if (after.any { it != ' ' && it != '\t' }) return null
             core = before
         }
-        core = core.trim()
+        core = asciiTrim(core)
         if (core.isEmpty()) return null
         return core
     }
@@ -606,18 +624,23 @@ object SamsungProfileAdapter {
                 continue
             }
             val b = BARE_TYPE_LINE.find(line) ?: continue
-            val value = b.groupValues[1].trim()
+            val rawValue = b.groupValues[1]
+            // Reject any bare `Type:` value whose raw form contains disallowed
+            // Unicode whitespace/control/format chars (NBSP, U+2000/U+3000/
+            // U+202F, ZWSP, controls). Kotlin/Unicode trim must never launder
+            // these into an allowlisted CLONE/OTHER (P1 #59). ASCII space/tab
+            // only; the outer capture is not Unicode-trimmed.
+            if (hasDisallowedBareChars(rawValue)) return ProfileUserType.UNKNOWN
+            val value = asciiTrim(rawValue)
             if (value.isEmpty()) continue
-            // Bare S24 `Type:` is a single complete type declaration (P1/P2,
-            // #59 review): validate the whole value as an exact recognized
-            // CLONE or known non-clone type (optional single valid `(default)`
-            // suffix). This rejects malformed FQ prefixes, residual chars,
-            // unknown tails/categories, and multi-token/contradictory values
-            // that must fail closed to UNKNOWN (never OTHER/Absent). Demoted
-            // CLONE-shaped values (tainted/residual) are treated as OTHER,
-            // consistent with TYPE_LINE (never CLONE-authorizing). Legacy
-            // separator-less compat (`usertype profile.CLONE parentId=0`)
-            // stays on step 2 / TYPE_LINE paths.
+            // Bare S24 `Type:` accepts CLONE only as an exact complete
+            // allowlisted value (optional single valid `(default)`). Demoted/
+            // tainted or residual CLONE-shaped forms are NOT authorized here
+            // (never CLONE); unlike TYPE_LINE/step-2 compat (which may map
+            // tainted mentions to OTHER via classifyMention), the bare
+            // complete-value path fails closed below (UNKNOWN) unless the
+            // value is an exact allowlisted OTHER form. Legacy separator-less
+            // compat stays on step 2 / TYPE_LINE paths.
             if (isKnownCloneBareValue(value)) {
                 hasCloneSeg = true
                 continue
@@ -635,9 +658,7 @@ object SamsungProfileAdapter {
                 // re-review): exact known non-clone type -> OTHER; everything
                 // else (malformed/tainted CLONE, residual chars, unknown tails/
                 // tokens, repeated notes, mixed values) -> UNKNOWN (fail-closed,
-                // never OTHER/Absent). Do NOT let an extracted CLONE token
-                // override a non-allowlisted complete value. TYPE_LINE/step-2
-                // retain their own compat semantics.
+                // never OTHER/Absent). TYPE_LINE/step-2 retain their own compat.
                 if (isKnownOtherBareValue(value)) {
                     hasOtherSeg = true
                 } else {
