@@ -77,15 +77,20 @@ internal fun fitScale(srcW: Int, srcH: Int, dstPx: Int): Float {
 }
 
 // 是否需位圖快照（與 MainActivity.loadIcon 在 withContext(IO) 內
-// getApplicationIcon 後的判斷對應）：真值表四行為 hasConstantState 為真＋
-// 正方形回 false（可走既有 newDrawable，無需快照）、hasConstantState 為真＋
-// 非正方形回 true（需等比快照治 P2-2 拉伸）、hasConstantState 為真＋任一
-// <=0 回 false（尺寸未知不快照）、hasConstantState 為假＋任一回 true
-//（無 ConstantState 須快照治 P2-1 透明回歸）。呼叫端傳 normalized 後的
-// hasConstantState＝(constantState != null 安全讀取）與 intrinsicW/H
-//（讀取異常以 -1 補齊），此處僅做純決策，Android 讀取留在 Main。
-internal fun shouldUseSnapshot(hasConstantState: Boolean, intrinsicW: Int, intrinsicH: Int): Boolean {
+// getApplicationIcon 後的判斷對應）：真值表依序為 無 ConstantState 回 true
+//（須快照治 P2-1 透明回歸）、BitmapDrawable 非 FILL 重力回 true（方形 CENTER
+// 不保證 setBounds 縮放，須快照治 P2-1 方形 CENTER 漏網）、FILL 下任一 <=0
+// 回 false（尺寸未知不快照；無 CS／非 FILL 已於前行命中，屆時快照以 eff=dst
+// 兜底）、非正方形回 true（等比快照治 P2-2 拉伸）、其餘（方形＋FILL）回 false
+//（可走既有 newDrawable，無需快照）。呼叫端傳 normalized 後的
+// hasConstantState＝(constantState != null 安全讀取）、
+// intrinsicW/H（讀取異常以 -1 補齊）與 isBitmapNonFillGravity（Main 以
+// raw is BitmapDrawable && raw.gravity != Gravity.FILL 換算，安全讀取），
+// 此處僅做純決策，Android 讀取留在 Main；本檔不 import android.*，gravity
+// 不以 android.Gravity 傳入，一律以布林表示。
+internal fun shouldUseSnapshot(hasConstantState: Boolean, intrinsicW: Int, intrinsicH: Int, isBitmapNonFillGravity: Boolean): Boolean {
     if (!hasConstantState) return true
+    if (isBitmapNonFillGravity) return true
     if (intrinsicW <= 0 || intrinsicH <= 0) return false
     return intrinsicW != intrinsicH
 }

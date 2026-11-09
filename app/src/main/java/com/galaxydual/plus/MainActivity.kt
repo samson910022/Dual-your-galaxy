@@ -42,6 +42,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
@@ -4095,12 +4096,15 @@ class MainActivity : ComponentActivity() {
     // IO 執行緒把需快照的圖示以等比置中繪製到獨立方形位圖，產出普通
     // BitmapDrawable 使後續 freshIconDrawable／sizedIcon 的 newDrawable 必
     // 成功。dstPx 先以 clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX) 規範化
-    //（dp 經 dpPx，CAP 常量 192）；建 ARGB_8888 方形位圖後以 Canvas
-    // translate/scale（用 fitScale／fitCenterRect）做等比，src 以
-    // setBounds(0,0,srcW,srcH) 繪製（勿只 setBounds），最後 BitmapDrawable
-    // + setBounds(0,0,dst,dst) 回傳；全程 CE 重拋，捕 OOM 回 null+Log.w，
-    // 失敗回 null 由呼叫端快取原始 drawable（不直接透明）。Canvas draw
-    // 必須在 IO 執行緒且未掛 View，呼叫端已在 withContext(IO) 內呼叫。
+    //（dp 經 dpPx，CAP 常量 192）；intrinsic<=0 以 dst 兜底為 effW/effH（P3-1），
+    // 建 ARGB_8888 方形位圖後以 Canvas translate/scale（用 fitScale／
+    // fitCenterRect）做等比，src 以 setBounds(0,0,effW,effH) 繪製（勿只
+    // setBounds），最後 BitmapDrawable + setBounds(0,0,dst,dst) 回傳；畫前存
+    // Rect(src.bounds)，finally 一律還原（含 CE／OOM／異常，還原自帶 CE 重拋＋
+    // Log.w），成功亦不影響出口 bounds（P3-2）；全程 CE 重拋，捕 OOM 回
+    // null+Log.w，失敗回 null 由呼叫端按 hasConstantState 分流（無 CS 記占位、
+    // 其餘記 raw）。Canvas draw 必須在 IO 執行緒且未掛 View，呼叫端已在
+    // withContext(IO) 內呼叫。
     private fun bitmapSnapshotDrawable(src: Drawable, dstPx: Int): Drawable? {
         val dst = clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX)
         if (dstPx > 0 && dstPx != dp(36)) {
@@ -4122,7 +4126,8 @@ class MainActivity : ComponentActivity() {
             Log.w(TAG, "bitmapSnapshotDrawable intrinsicHeight failed", e)
             return null
         }
-        if (srcW <= 0 || srcH <= 0) return null
+        val effW = if (srcW <= 0) dst else srcW
+        val effH = if (srcH <= 0) dst else srcH
         val bmp: Bitmap = try {
             Bitmap.createBitmap(dst, dst, Bitmap.Config.ARGB_8888)
         } catch (e: CancellationException) {
@@ -4134,13 +4139,21 @@ class MainActivity : ComponentActivity() {
             Log.w(TAG, "bitmapSnapshotDrawable createBitmap failed", e)
             return null
         }
+        val savedBounds: Rect? = try {
+            Rect(src.bounds)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable bounds read failed", e)
+            null
+        }
         try {
             val canvas = Canvas(bmp)
-            val rect = fitCenterRect(srcW, srcH, dst)
-            val scale = fitScale(srcW, srcH, dst)
+            val rect = fitCenterRect(effW, effH, dst)
+            val scale = fitScale(effW, effH, dst)
             canvas.translate(rect.left.toFloat(), rect.top.toFloat())
             canvas.scale(scale, scale)
-            src.setBounds(0, 0, srcW, srcH)
+            src.setBounds(0, 0, effW, effH)
             src.draw(canvas)
             val out = BitmapDrawable(resources, bmp)
             out.setBounds(0, 0, dst, dst)
@@ -4167,6 +4180,16 @@ class MainActivity : ComponentActivity() {
                 Log.w(TAG, "bitmapSnapshotDrawable recycle failed", e2)
             }
             return null
+        } finally {
+            if (savedBounds != null) {
+                try {
+                    src.setBounds(savedBounds)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "bitmapSnapshotDrawable restore bounds failed", e)
+                }
+            }
         }
     }
 
@@ -4214,10 +4237,16 @@ class MainActivity : ComponentActivity() {
                     } else {
                         // Phase A 快照根治：IO 執行緒內以 shouldUseSnapshot(normalized)
                         // 判斷是否快照；normalized 為 hasConstantState（constantState
-                        // 安全讀取）與 intrinsicW/H（讀取異常以 -1 補齊，CE 重拋）。
+                        // 安全讀取）、intrinsicW/H（讀取異常以 -1 補齊，CE 重拋）與
+                        // isBitmapNonFillGravity（raw is BitmapDrawable && raw.gravity
+                        // != Gravity.FILL 安全讀取，CE 重拋、其餘 Log.w 以 false 補齊）。
                         // 需快照時在 IO 執行緒以 bitmapSnapshotDrawable 繪製獨立位圖
-                        //（Canvas 未掛 View）；快照成功快取快照值，快照失敗快取原始
-                        // drawable（不直接透明）。既有 evict/markLoaded/onLoaded 不變。
+                        //（Canvas 未掛 View，快照接線不改 Canvas 變換：bounds==bitmap 大小
+                        // 時 CENTER 與 FILL 同 rect）；快照成功快取快照值。取捨：無
+                        // ConstantState 的 raw 經 fresh／sized 必走占位，快照失敗記
+                        // transparentPlaceholder(dp(36)) 而非 raw，避免快取永遠無法
+                        // 複製的 raw；其餘快照失敗快取原始 drawable（不直接透明）。
+                        // 既有 evict/markLoaded/onLoaded 不變。
                         val hasConstantState = try {
                             rawDrawable.constantState != null
                         } catch (e: CancellationException) {
@@ -4242,8 +4271,16 @@ class MainActivity : ComponentActivity() {
                             Log.w(TAG, "loadIcon intrinsicHeight failed", e)
                             -1
                         }
-                        if (shouldUseSnapshot(hasConstantState, intrinsicW, intrinsicH)) {
-                            bitmapSnapshotDrawable(rawDrawable, dp(36)) ?: rawDrawable
+                        val isBitmapNonFillGravity = try {
+                            if (rawDrawable is BitmapDrawable) rawDrawable.gravity != Gravity.FILL else false
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon gravity check failed", e)
+                            false
+                        }
+                        if (shouldUseSnapshot(hasConstantState, intrinsicW, intrinsicH, isBitmapNonFillGravity)) {
+                            bitmapSnapshotDrawable(rawDrawable, dp(36)) ?: if (!hasConstantState) transparentPlaceholder(dp(36)) else rawDrawable
                         } else {
                             rawDrawable
                         }
