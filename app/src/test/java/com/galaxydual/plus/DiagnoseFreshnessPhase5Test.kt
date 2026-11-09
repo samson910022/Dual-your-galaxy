@@ -51,6 +51,7 @@ class DiagnoseFreshnessPhase5Test {
         var throwAll: Boolean = false,
         var driftAfterListUsers: Int = Int.MAX_VALUE,
         var driftId: Int = 96,
+        var driftSerial: Int = 15,
         // P2 安裝門檻適配 (新 base requestRemove/confirmRemove 經 verifyState
         // 查已安裝才開 dialog)：已卸载集合供 uninstall 成功後排除，
         // post-verify 即見 NotInstalled；failListAfterUninstall 供
@@ -69,6 +70,8 @@ class DiagnoseFreshnessPhase5Test {
         var listUsersCalls = 0
 
         private fun effId(): Int = if (listUsersCalls >= driftAfterListUsers) driftId else dualId
+
+        private fun effSerial(): Int = if (listUsersCalls >= driftAfterListUsers) driftSerial else 15
 
         private fun usersOut(id: Int): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
@@ -108,7 +111,7 @@ class DiagnoseFreshnessPhase5Test {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$id:DualApp:400} running:\n" +
-                "    Serial: 15\n" +
+                "    Serial: ${effSerial()}\n" +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -122,7 +125,7 @@ class DiagnoseFreshnessPhase5Test {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$id:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$id:DualApp:400} serialNo=${effSerial()}:\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
@@ -846,10 +849,13 @@ class DiagnoseFreshnessPhase5Test {
         // mid-refresh 95->96 rebuild cannot be spliced into a VERIFY_MISMATCH
         // (there is no second snapshot/triple to disagree with the first).
         // The 95 world publishes FRESH(95, 15) as a whole; the 96 world
-        // publishes FRESH(96, 15) as a whole on the next refresh -- never
-        // a mixed (95, ...) pair with 96's list.
+        // publishes FRESH(96, 41) as a whole on the next refresh -- never
+        // a mixed (95, ...) pair with 96's list or (96, 15) spliced from
+        // the old serial. Distinct serials (15 -> 41) prove the whole
+        // (id, serial) lands together (see also
+        // RefreshSpliceNegativeTest.splice_sequentialTwoRefresh_wholeWorld).
         // 計數在 ready 後歸零（init probe 的 listUsers 不計入）。
-        val gw = FakeRepo(driftAfterListUsers = 2, driftId = 96)
+        val gw = FakeRepo(driftAfterListUsers = 2, driftId = 96, driftSerial = 41)
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
@@ -863,7 +869,7 @@ class DiagnoseFreshnessPhase5Test {
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.inventory.targetId == 96 }
         assertEquals(InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
-        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertEquals(41, vm.state.value.inventory.targetSerial)
         assertTrue(vm.state.value.cloned.contains("com.example.chat"))
     }
 

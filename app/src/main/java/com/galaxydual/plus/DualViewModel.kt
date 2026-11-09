@@ -1052,7 +1052,7 @@ class DualViewModel(
                             ),
                             diagnose = diagnoseEvent(
                                 DiagnoseCode.CHANNEL_ERROR,
-                                techDetail = "profiles snapshot channel failed: ${outcome.detail.take(200)}",
+                                techDetail = "profiles snapshot channel failed: ${sanitizeForDisplay(outcome.detail).take(200)}",
                             ),
                             msg = combinedMsg,
                             msgKind = combinedKind,
@@ -1148,7 +1148,7 @@ class DualViewModel(
                             diagnose = diagnoseEvent(
                                 DiagnoseCode.CHANNEL_ERROR,
                                 techDetail = if (outcome.detail.isNotBlank()) {
-                                    "verified dual id unknown: " + outcome.detail.take(200)
+                                    "verified dual id unknown: " + sanitizeForDisplay(outcome.detail).take(200)
                                 } else {
                                     "verified dual id unknown"
                                 },
