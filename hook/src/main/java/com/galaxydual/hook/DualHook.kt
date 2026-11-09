@@ -269,16 +269,28 @@ class DualHook : XposedModule() {
     // identically to hookWithDeoptimize(). Call sites stay on
     // hookWithDeoptimize() until per-ROM caller evidence exists, so behavior
     // is unchanged today. Callers may be methods or constructors (Executables).
+    // Planning/resolver failures (including knownCallersFor or installWithCallers
+    // throwing) fall back to callee-only hookWithDeoptimize(); the callee hook
+    // is still attempted (best-effort, honest diagnostics).
     @Suppress("unused")
     private fun hookWithCallerDeoptimize(method: Method, hookId: String): Boolean =
-        HookInstaller.installWithCallers(
-            method,
-            hookId,
-            knownCallersFor(method),
-            ::deoptimize,
-            ::installInterceptHook,
-            ::logi,
-        )
+        try {
+            HookInstaller.installWithCallers(
+                method,
+                hookId,
+                knownCallersFor(method),
+                ::deoptimize,
+                ::installInterceptHook,
+                ::logi,
+            )
+        } catch (t: Throwable) {
+            logi(
+                "caller plan failed [$hookId] ${method.toGenericString()}: " +
+                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                    "falling back to callee-only hook, effect unverified",
+            )
+            hookWithDeoptimize(method, hookId)
+        }
 
     // Shared hook builder config (behavior-preserving): used by both callee-only
     // and caller-aware install paths so the intercept setup stays identical.

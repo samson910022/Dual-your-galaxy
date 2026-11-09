@@ -449,4 +449,75 @@ class HookInstallerCallerTest {
             host.logs,
         )
     }
+
+    // Phase 5 (P3 #3): planning/resolver traversal errors must not abort before
+    // callee hook installation; fall back to callee-only best-effort.
+    private class ThrowingCallersList(
+        private val failure: RuntimeException = RuntimeException("resolver boom"),
+    ) : java.util.AbstractList<Executable?>() {
+        override val size: Int get() = throw failure
+        override fun get(index: Int): Executable? = throw failure
+        override fun iterator(): MutableIterator<Executable?> =
+            throw RuntimeException(failure.message, failure)
+    }
+
+    @Test
+    fun planningFailureFallsBackToCalleeOnlyHookStillSucceeds() {
+        val callee = method("length")
+        val id = "galaxydual:planfail"
+        val host = Host()
+        assertTrue(host.installWithCallers(callee, ThrowingCallersList(), id))
+        assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
+        host.events.forEach { assertSame(callee, it.second) }
+        assertEquals(listOf(id), host.ids)
+        assertEquals(
+            "caller plan failed [$id] ${callee.toGenericString()}: java.lang.RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
+            host.logs.first(),
+        )
+        assertEquals("deoptimized java.lang.String#length", host.logs[1])
+        assertEquals("hooked java.lang.String#length", host.logs[2])
+        assertEquals(3, host.logs.size)
+        assertFalse(host.logs.any {
+            it.contains("not needed", ignoreCase = true) ||
+                it.contains("no-op", ignoreCase = true) ||
+                it.contains("不需要")
+        })
+    }
+
+    @Test
+    fun planningFailureWithNullMessageOmitsNullAndHookStillSucceeds() {
+        val callee = method("length")
+        val id = "id"
+        val host = Host()
+        assertTrue(host.installWithCallers(callee, ThrowingCallersList(RuntimeException()), id))
+        assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
+        assertEquals(listOf(id), host.ids)
+        assertTrue(host.logs.any {
+            it == "caller plan failed [$id] ${callee.toGenericString()}: java.lang.RuntimeException; falling back to callee-only hook, effect unverified"
+        })
+        assertTrue(host.logs.last().startsWith("hooked "))
+        assertFalse(host.logs.any { it.contains("null") && it.contains("caller plan failed") })
+    }
+
+    @Test
+    fun planningFailureFallsBackToCalleeOnlyHookFailureStillReturnsFalse() {
+        val callee = method("length")
+        val id = "galaxydual:planfail-hookfail"
+        val host = Host(hookResult = { throw Error("install error") })
+        assertFalse(host.installWithCallers(callee, ThrowingCallersList(), id))
+        assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
+        host.events.forEach { assertSame(callee, it.second) }
+        assertEquals(listOf(id), host.ids)
+        assertEquals(
+            "caller plan failed [$id] ${callee.toGenericString()}: java.lang.RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
+            host.logs[0],
+        )
+        assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
+        assertFalse(host.logs.any { it.startsWith("caller deopt incomplete") })
+        assertFalse(host.logs.any {
+            it.contains("not needed", ignoreCase = true) ||
+                it.contains("no-op", ignoreCase = true) ||
+                it.contains("不需要")
+        })
+    }
 }

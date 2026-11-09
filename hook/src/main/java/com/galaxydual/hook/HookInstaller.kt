@@ -53,9 +53,12 @@ internal object HookInstaller {
     // preserved per caller with hookId and full signature), then run the
     // standard callee install above (callee deopt + hook). Caller failures
     // never block the callee hook; only the callee hook result decides the
-    // return value. Pure orchestration over CallerDeoptPlan -- framework ops
-    // stay injected, so JVM tests lock ordering/identity/failure handling
-    // while the ART effect remains DEVICE-UNVERIFIED.
+    // return value. Planning/resolver input failures (e.g. ROM mapping lookup
+    // or traversal errors) also never block the callee hook: fall back to
+    // callee-only best-effort (hook still attempted). Pure orchestration over
+    // CallerDeoptPlan -- framework ops stay injected, so JVM tests lock
+    // ordering/identity/failure handling while the ART effect remains
+    // DEVICE-UNVERIFIED.
     fun installWithCallers(
         callee: Method,
         hookId: String,
@@ -64,7 +67,17 @@ internal object HookInstaller {
         hook: (Method, String) -> Unit,
         log: (String) -> Unit,
     ): Boolean {
-        val plan = CallerDeoptPlan.plan(callee, knownCallers)
+        val plan = try {
+            CallerDeoptPlan.plan(callee, knownCallers)
+        } catch (t: Throwable) {
+            safeLog(
+                log,
+                "caller plan failed [$hookId] ${callee.toGenericString()}: " +
+                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                    "falling back to callee-only hook, effect unverified",
+            )
+            return install(callee, hookId, deoptimize, hook, log)
+        }
         val callersAttempted = plan.callersToDeoptimize.size
         var callersDeoptimized = 0
         for (caller in plan.callersToDeoptimize) {
