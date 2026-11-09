@@ -609,10 +609,65 @@ object SamsungProfileAdapter {
         // fails closed to OTHER via the residual check instead of being cut.
         val text = UNICODE_LINE_END.replace(body, "?")
         // Step 1: explicit `user type :/= value` lines, token-level, plus
-        // bare S24 `Type:` lines (issue #58). `User type:` matches TYPE_LINE
-        // anywhere; bare `Type:` matches only at line start (BARE_TYPE_LINE)
-        // so `superuser type:` stays UNKNOWN.
+        // bare S24 `Type:` lines (issue #58). A line-start bare `Type:`
+        // (BARE_TYPE_LINE) is handled FIRST and parsed ONLY with the strict
+        // bare complete-value validator (P1 #59 re-review): an embedded
+        // `userType=` / `User type:` / `user_type=` inside its value must
+        // never be matched by TYPE_LINE.find() and override the bare
+        // declaration. The FULL bare-captured value (including embedded
+        // keyword text) is validated; disallowed chars / non-exact/unknown
+        // tails fail closed to UNKNOWN (never CLONE, never OTHER/Absent).
+        // `User type:` lines do not start with bare `Type:` so BARE_TYPE_LINE
+        // does not match them; they keep the TYPE_LINE path below.
         for (line in text.lines()) {
+            val b = BARE_TYPE_LINE.find(line)
+            if (b != null) {
+                val rawValue = b.groupValues[1]
+                // Reject any bare `Type:` value whose raw form contains disallowed
+                // Unicode whitespace/control/format chars (NBSP, U+2000/U+3000/
+                // U+202F, ZWSP, controls). Kotlin/Unicode trim must never launder
+                // these into an allowlisted CLONE/OTHER (P1 #59). ASCII space/tab
+                // only; the outer capture is not Unicode-trimmed.
+                if (hasDisallowedBareChars(rawValue)) return ProfileUserType.UNKNOWN
+                val value = asciiTrim(rawValue)
+                if (value.isEmpty()) continue
+                // Bare S24 `Type:` accepts CLONE only as an exact complete
+                // allowlisted value (optional single valid `(default)`). Demoted/
+                // tainted or residual CLONE-shaped forms are NOT authorized here
+                // (never CLONE); unlike TYPE_LINE/step-2 compat (which may map
+                // tainted mentions to OTHER via classifyMention), the bare
+                // complete-value path fails closed below (UNKNOWN) unless the
+                // value is an exact allowlisted OTHER form. Legacy separator-less
+                // compat stays on step 2 / TYPE_LINE paths.
+                if (isKnownCloneBareValue(value)) {
+                    hasCloneSeg = true
+                    continue
+                }
+                val (segClone, segOther) = classifyMention(value)
+                if (segClone && segOther) return ProfileUserType.UNKNOWN
+                if (segClone && !segOther) {
+                    // Clean CLONE by token/residual rules but not an exact bare
+                    // CLONE form (e.g. doubled/misplaced FQ prefix, extra text
+                    // tolerated as residual by the generic path) -> fail closed.
+                    return ProfileUserType.UNKNOWN
+                }
+                if (!segClone && segOther) {
+                    // Bare `Type:` uses only the complete-value allowlist (P1 #59
+                    // re-review): exact known non-clone type -> OTHER; everything
+                    // else (malformed/tainted CLONE, residual chars, unknown tails/
+                    // tokens, repeated notes, mixed values) -> UNKNOWN (fail-closed,
+                    // never OTHER/Absent). TYPE_LINE/step-2 retain their own compat.
+                    if (isKnownOtherBareValue(value)) {
+                        hasOtherSeg = true
+                    } else {
+                        return ProfileUserType.UNKNOWN
+                    }
+                    continue
+                }
+                // Unreachable: classifyMention never returns (false, false).
+                // Kept as fail-closed UNKNOWN.
+                return ProfileUserType.UNKNOWN
+            }
             val m = TYPE_LINE.find(line)
             if (m != null) {
                 val value = m.groupValues[1].trim()
@@ -623,52 +678,6 @@ object SamsungProfileAdapter {
                 if (segOther) hasOtherSeg = true
                 continue
             }
-            val b = BARE_TYPE_LINE.find(line) ?: continue
-            val rawValue = b.groupValues[1]
-            // Reject any bare `Type:` value whose raw form contains disallowed
-            // Unicode whitespace/control/format chars (NBSP, U+2000/U+3000/
-            // U+202F, ZWSP, controls). Kotlin/Unicode trim must never launder
-            // these into an allowlisted CLONE/OTHER (P1 #59). ASCII space/tab
-            // only; the outer capture is not Unicode-trimmed.
-            if (hasDisallowedBareChars(rawValue)) return ProfileUserType.UNKNOWN
-            val value = asciiTrim(rawValue)
-            if (value.isEmpty()) continue
-            // Bare S24 `Type:` accepts CLONE only as an exact complete
-            // allowlisted value (optional single valid `(default)`). Demoted/
-            // tainted or residual CLONE-shaped forms are NOT authorized here
-            // (never CLONE); unlike TYPE_LINE/step-2 compat (which may map
-            // tainted mentions to OTHER via classifyMention), the bare
-            // complete-value path fails closed below (UNKNOWN) unless the
-            // value is an exact allowlisted OTHER form. Legacy separator-less
-            // compat stays on step 2 / TYPE_LINE paths.
-            if (isKnownCloneBareValue(value)) {
-                hasCloneSeg = true
-                continue
-            }
-            val (segClone, segOther) = classifyMention(value)
-            if (segClone && segOther) return ProfileUserType.UNKNOWN
-            if (segClone && !segOther) {
-                // Clean CLONE by token/residual rules but not an exact bare
-                // CLONE form (e.g. doubled/misplaced FQ prefix, extra text
-                // tolerated as residual by the generic path) -> fail closed.
-                return ProfileUserType.UNKNOWN
-            }
-            if (!segClone && segOther) {
-                // Bare `Type:` uses only the complete-value allowlist (P1 #59
-                // re-review): exact known non-clone type -> OTHER; everything
-                // else (malformed/tainted CLONE, residual chars, unknown tails/
-                // tokens, repeated notes, mixed values) -> UNKNOWN (fail-closed,
-                // never OTHER/Absent). TYPE_LINE/step-2 retain their own compat.
-                if (isKnownOtherBareValue(value)) {
-                    hasOtherSeg = true
-                } else {
-                    return ProfileUserType.UNKNOWN
-                }
-                continue
-            }
-            // Unreachable: classifyMention never returns (false, false).
-            // Kept as fail-closed UNKNOWN.
-            return ProfileUserType.UNKNOWN
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
         // Same token rule applied to the remainder after the keyword.
