@@ -35,6 +35,21 @@ object WhitelistHookEligibility {
     fun evaluate(method: Method): Decision =
         evaluate(method.name, method.parameterTypes, method.returnType)
 
+    // Stage 1 fuzzy sweep is diagnose-only (no hook installs). This helper
+    // captures the safety invariant: mutation-shaped methods are never eligible
+    // for fuzzy sweep hook install even if signature looks ok (fail-closed).
+    fun isSafeForFuzzySweepHookInstall(method: Method): Boolean =
+        isSafeForFuzzySweepHookInstall(method.name, method.parameterTypes, method.returnType)
+
+    fun isSafeForFuzzySweepHookInstall(
+        methodName: String,
+        parameterTypes: Array<out Class<*>>,
+        returnType: Class<*>,
+    ): Boolean {
+        if (WhitelistSignatureGuard.isPotentialMutationMethod(methodName)) return false
+        return evaluate(methodName, parameterTypes, returnType) is Eligible
+    }
+
     fun evaluate(
         methodName: String,
         parameterTypes: Array<out Class<*>>,

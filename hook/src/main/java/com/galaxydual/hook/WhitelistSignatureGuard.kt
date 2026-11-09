@@ -48,6 +48,29 @@ object WhitelistSignatureGuard {
         methodName.contains("installed", ignoreCase = true) &&
             methodName.contains("whitelist", ignoreCase = true)
 
+    // Mutation/action tokens that must not be hook-installed by the Stage 1
+    // fuzzy *hitelist* sweep (diagnose-only). Conservative/camelCase-segment
+    // match: token at start, or after lower->upper boundary, or after '_', and
+    // followed by end, upper, '_', or digit (complete segment/verb) so names
+    // like getSettings are not misclassified. Fail-closed for hooking safety.
+    private val MUTATION_TOKENS = listOf(
+        "add", "remove", "delete", "clear", "set", "put", "insert",
+        "update", "write", "reset", "revoke", "grant", "enable",
+        "disable", "install", "uninstall",
+    )
+
+    fun isPotentialMutationMethod(methodName: String): Boolean {
+        if (methodName.isEmpty()) return false
+        for (token in MUTATION_TOKENS) {
+            val pattern = Regex(
+                "(^|(?<=[a-z])(?=[A-Z])|_)${Regex.escape(token)}($|(?=[A-Z_0-9]))",
+                RegexOption.IGNORE_CASE,
+            )
+            if (pattern.containsMatchIn(methodName)) return true
+        }
+        return false
+    }
+
     private fun isStringParam(type: Class<*>): Boolean = type == String::class.java
 
     private fun isIdSlot(type: Class<*>): Boolean = type in ID_SLOT_TYPES
