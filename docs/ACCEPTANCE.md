@@ -52,7 +52,8 @@
 
 ## 5. Harness 對照（免裝置可跑）
 
-Harness 共 20 個自動化測試（`app/src/androidTest`，5 個 test class）。
+Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 test class：20 個 JUnit4 `@Test` + 7 個 JUnit3 `test*` 方法；`HarnessFakes.kt` 僅提供 fake，不含測試）。
+其中 `LocaleResourceSelectionTest`（locale-aware remove-confirm 標題/訊息）與 `RemoveConfirmationUiTest`（ack 詳情/busy/替換 + blocked-channel gating）為輔助 harness，未對應單一人工列。
 這些測試在每次 PR 的 `locale-instrumentation` job（API 29 emulator）自動執行，
 並於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行；
 並非僅手動執行。
