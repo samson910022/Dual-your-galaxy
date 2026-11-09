@@ -1883,13 +1883,13 @@ class ProfileIdentityTest {
     // ---- PR #59 review hardening: taint/category/interaction regressions ----
 
     @Test
-    fun s24BareType_taintedCloneFailsClosedAsOther() {
-        // Tainted/residual-demoted CLONE token on a bare `Type:` line must
-        // fail closed (never CLONE) and, by the established TYPE_LINE
-        // contract (cloneSlashTail_isOtherNotClone / trailing-punct), resolve
-        // as OTHER for that mention -- not UNKNOWN. The bare path detects a
-        // supported clone token demoted by classifyMention and treats it as
-        // OTHER, consistent with the TYPE_LINE path.
+    fun s24BareType_taintedCloneFailsClosedAsUnknown() {
+        // Re-review P1 (#59): malformed/tainted CLONE on a bare `Type:` line
+        // must fail closed to UNKNOWN (never OTHER/Absent, never CLONE). The
+        // bare path uses only the complete-value allowlist and must NOT let an
+        // extracted CLONE token override a non-allowlisted value. TYPE_LINE/
+        // separator-less paths retain their own taint->OTHER compat (checked
+        // below) and are not regressed.
         val cases = listOf(
             "profile.CLONE/evil",
             "android.os.usertype.profile.CLONE/evil",
@@ -1900,17 +1900,55 @@ class ProfileIdentityTest {
             "android.os.usertype.profile.CLONE!evil",
             "profile_CLONE!evil",
             "profile-CLONE!evil",
+            "profile.CLONE (default) (default)",
+            "profile.CLONE (default) trailing",
+            "x.profile.CLONE!garbage",
         )
         for (value in cases) {
             assertEquals(
-                "tainted bare Type must be OTHER (fail-closed, never CLONE): $value",
-                ProfileUserType.OTHER,
+                "malformed/tainted bare Type must be UNKNOWN (never OTHER/CLONE): $value",
+                ProfileUserType.UNKNOWN,
                 parseSingleBareType(value),
             )
         }
-        // Parity: same tainted value on explicit TYPE_LINE path stays OTHER.
+        // TYPE_LINE/separator-less compat is preserved on non-bare paths.
         assertEquals(ProfileUserType.OTHER, parseSingleVerboseType("profile.CLONE/evil"))
         assertEquals(ProfileUserType.OTHER, parseSingleVerboseType("android.os.usertype.profile.CLONE/evil"))
+    }
+
+    @Test
+    fun s24BareType_malformedCloneOnBothSources_typedUnknownNeverAbsent() {
+        // Re-review P1 integration: malformed CLONE evidence on both channels,
+        // consistent IDs, clean no-claim property -> typed Unknown (both typed
+        // APIs), never Absent/NoDual.
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                Type: profile.CLONE/evil
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                Type: profile.CLONE/evil
+        """.trimIndent()
+        val parsedV = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        val parsedD = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(ProfileUserType.UNKNOWN, parsedV.single { it.userId == 95 }.userType)
+        assertEquals(ProfileUserType.UNKNOWN, parsedD.single { it.userId == 95 }.userType)
+        val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+        val repo = DualRepository(gateway)
+        val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("malformed CLONE must be Unknown (never Absent), got: $idRes", idRes is DualIdResolution.Unknown)
+        val targetRes = runSuspend { repo.resolveDualTargetTyped() }
+        assertTrue("malformed CLONE target must be Unknown, got: $targetRes", targetRes is DualTargetResolution.Unknown)
     }
 
     @Test
@@ -2138,6 +2176,39 @@ class ProfileIdentityTest {
     // ---- P2 (#59 review): bare Type CLONE strict full-value form ----
 
     @Test
+    fun s24BareType_p3SeparatorVariantsAcceptedWithoutResidual() {
+        // P2 compat (re-review #3): bare `Type:` accepts canonical dot and the
+        // legacy separator variants the parser historically supports
+        // (`profile_CLONE`/`profile-CLONE`/`profile CLONE`) when the value is
+        // complete with no residual. Malformed values with extra text remain
+        // UNKNOWN (covered by P1/P2 cases).
+        val cloneCases = listOf(
+            "profile_CLONE",
+            "profile-CLONE",
+            "profile CLONE",
+            "profile  CLONE",
+            "profile_clone",
+            "profile_clone (default)",
+        )
+        for (value in cloneCases) {
+            assertEquals("bare separator-variant CLONE must be CLONE: $value", ProfileUserType.CLONE, parseSingleBareType(value))
+        }
+        val otherCases = listOf(
+            "profile_MANAGED",
+            "profile-PRIVATE",
+            "profile COMMUNAL",
+            "profile_test",
+            "profile  MANAGED",
+        )
+        for (value in otherCases) {
+            assertEquals("bare separator-variant non-clone must be OTHER: $value", ProfileUserType.OTHER, parseSingleBareType(value))
+        }
+        // Separator variant with residual/garbage is NOT a complete value.
+        assertEquals(ProfileUserType.UNKNOWN, parseSingleBareType("profile_CLONE extra"))
+        assertEquals(ProfileUserType.UNKNOWN, parseSingleBareType("profile_MANAGED/evil"))
+    }
+
+    @Test
     fun s24BareType_p2MalformedClonePrefixFailsClosed() {
         // Doubled/misplaced FQ prefix or trailing FQ residue is not a
         // complete valid CLONE type name. Bare Type must not accept it as
@@ -2258,10 +2329,12 @@ class ProfileIdentityTest {
                 parentId=0
                 Type: android.os.usertype.profile.COMMUNAL
         """.trimIndent()
-        val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose) +
-            SamsungProfileAdapter.parseDumpsysUser(dumpsys)
-        assertTrue(parsed.none { it.userType == ProfileUserType.CLONE })
-        assertEquals(ProfileUserType.OTHER, parsed.single { it.userId == 95 }.userType)
+        val parsedV = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        val parsedD = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        val combined = parsedV + parsedD
+        assertTrue(combined.none { it.userType == ProfileUserType.CLONE })
+        assertEquals(ProfileUserType.OTHER, parsedV.single { it.userId == 95 }.userType)
+        assertEquals(ProfileUserType.OTHER, parsedD.single { it.userId == 95 }.userType)
         val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
         val repo = DualRepository(gateway)
         assertEquals(DualIdResolution.Absent, runSuspend { repo.resolveDualUserIdTyped() })
@@ -2291,10 +2364,12 @@ class ProfileIdentityTest {
                 parentId=0
                 Type: android.os.usertype.profile.SUPERVISING
         """.trimIndent()
-        val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose) +
-            SamsungProfileAdapter.parseDumpsysUser(dumpsys)
-        assertTrue(parsed.none { it.userType == ProfileUserType.CLONE })
-        assertEquals(ProfileUserType.OTHER, parsed.single { it.userId == 95 }.userType)
+        val parsedV = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        val parsedD = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        val combined = parsedV + parsedD
+        assertTrue(combined.none { it.userType == ProfileUserType.CLONE })
+        assertEquals(ProfileUserType.OTHER, parsedV.single { it.userId == 95 }.userType)
+        assertEquals(ProfileUserType.OTHER, parsedD.single { it.userId == 95 }.userType)
         val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
         val repo = DualRepository(gateway)
         assertEquals(DualIdResolution.Absent, runSuspend { repo.resolveDualUserIdTyped() })
