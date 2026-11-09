@@ -1542,7 +1542,7 @@ class MainActivity : ComponentActivity() {
         navTabEngine = createNavItem(R.drawable.ic_nav_engine, getString(R.string.tab_core_engine)) {
             switchTab(TAB_CORE_ENGINE)
         }
-        navTabSettings = createNavItem(R.drawable.ic_nav_settings, getString(R.string.tab_settings)) {
+        navTabSettings = createNavItem(R.drawable.ic_nav_about, getString(R.string.tab_settings)) {
             showSettingsDialog()
         }
 
