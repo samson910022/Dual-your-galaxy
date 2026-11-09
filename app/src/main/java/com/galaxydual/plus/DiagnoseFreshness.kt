@@ -250,8 +250,7 @@ internal fun HookEvidence.timeEvidenceText(): String {
 // - "verified dual id unknown: profiles snapshot empty despite typed absent"
 //   (refresh Absent 但快照空；repo detail 為 "profiles snapshot empty
 //   despite typed absent"，VM 以 "verified dual id unknown: " 前綴呈現)；
-// - "profiles snapshot channel failed: <detail>"
-//   (listCloned null 鑑別重查通道失敗)；
+// - "profiles snapshot channel failed: <detail>"；
 // - "LSPOSED placeholder / writes unsupported ..."
 //   (使用者明確寫入遭 NoOp/LSPOSED 政策拒絕，非探測失敗；僅
 //   isWritable 寫入拒絕路徑使用，零探測 probeChannels 永不寫此碼)；

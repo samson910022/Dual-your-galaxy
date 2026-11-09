@@ -182,11 +182,11 @@ sealed interface RemoveOutcome {
     data object Cancelled : RemoveOutcome
 }
 
-// Outcome of a single-target refresh (Phase D P2-D, issue #21): one
-// `pm list users` snapshot plus one verified-target fetch, then a list
-// probe on that same id (no re-resolution). GroundTruth carries the pinned
-// target so callers display the same id they listed; cloned == null means
-// the list channel failed (unknown, keep the old display list).
+// Outcome of a single-target refresh (Phase D P2-D, issue #21): 1 snapshot
+// + 3 triple + 1 list + 3 re-verify (strict-equality fence). GroundTruth
+// carries the pinned target so callers display the same id they listed;
+// cloned == null means the list channel failed (unknown, keep the old
+// display list).
 sealed interface RefreshOutcome {
     data class ChannelError(val detail: String) : RefreshOutcome
     data class NoDual(val profiles: List<DualProfile>) : RefreshOutcome
