@@ -2159,7 +2159,8 @@ class MainActivity : ComponentActivity() {
                 // p26-2 Phase 1 / Phase 3 註解修正：ImageView 預設即 FIT_CENTER /
                 // adjustViewBounds=false / cropToPadding=false，三行顯式聲明防未來誤改 wrap；
                 // layout 固定 36dp 方形框。方形 view + 方形 intrinsic 時 FIT==CROP，本處無裁切；
-                // mask／圓角不自動套用；adaptive safe zone 由 bounds 內等比縮放保證。
+                // mask／圓角不自動套用；adaptive 安全區名義上約 SAFEZONE_SCALE=66/72
+                // （24dp 外框約 22dp），可見 glyph 大小仍須視覺驗證，不宜一律放大。
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 adjustViewBounds = false
                 cropToPadding = false
@@ -4060,8 +4061,10 @@ class MainActivity : ComponentActivity() {
     // setBounds 拋出時直接回 sizePx 透明占位（保持統一尺寸），絕不回傳 0 尺寸不可見圖。
     // 為何不快取 sized 版：需 appKey+sizePx 聯合鍵，避免雙尺寸共用實例覆蓋 bounds；
     // 目前每次 newDrawable 共享 Bitmap 不翻倍，故不快取。
-    // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 108dp 安全區 66%，
-    // 24dp bounds 實際 glyph 約 16dp，與 legacy 仍差約 33%；若需 glyph 等大需對 adaptive 特殊放大。
+    // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 以
+    // SAFEZONE_SCALE=66/72 把 108dp 圖層縮到 viewport 內，24dp 外框對應安全區名義上約 22dp；
+    // 可見 glyph 仍由圖檔、留白與 mask 決定，不能由此固定折算成更小的確定百分比，
+    // 也不宜一律額外放大。保留「統一 bounds 不保證可見 glyph 等大，需視覺驗證」，
     // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
     // 行高 48dp／44dp 容器兜底。
     private fun sizedIcon(drawable: Drawable, sizePx: Int): Drawable {
@@ -4513,8 +4516,10 @@ class MainActivity : ComponentActivity() {
         // ICON_CONTAINER_DP = 2144 行分身列左圖外框 FrameLayout 44dp（容器，非圖形）。
         // 圖形尺寸都經 dp() 轉 px；CheckBox 另以 setBounds 強制，避免各 App 原生
         // intrinsic 尺寸（density/adaptive icon）不一導致忽大忽小。
-        // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 108dp 安全區 66%，
-        // 24dp bounds 實際 glyph 約 16dp，與 legacy 仍差約 33%；若需 glyph 等大需對 adaptive 特殊放大。
+        // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 以
+        // SAFEZONE_SCALE=66/72 把 108dp 圖層縮到 viewport 內，24dp 外框對應安全區名義上約 22dp；
+        // 可見 glyph 仍由圖檔、留白與 mask 決定，不能由此固定折算成更小的確定百分比，
+        // 也不宜一律額外放大。保留「統一 bounds 不保證可見 glyph 等大，需視覺驗證」，
         // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
         // 行高 48dp／44dp 容器兜底。
         private const val SOURCE_ICON_DP = 24
