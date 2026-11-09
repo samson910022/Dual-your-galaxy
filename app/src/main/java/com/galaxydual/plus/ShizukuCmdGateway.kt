@@ -63,7 +63,7 @@ import rikka.shizuku.Shizuku
 // only, no independent completeness bit; adding one is a wire break, so the
 // truncated flag travels as marker text inside the streams).
 // The client re-derives truncated from the core TRUNCATION_MARKER via
-// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 (SERVICE_VERSION = 5): the
+// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 + v6 (SERVICE_VERSION = 6): the
 // service appends the marker whenever the capture is truncated (cap, read
 // error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
 // so every truncated=true result carries detectable text (review Phase B,
@@ -81,6 +81,7 @@ import rikka.shizuku.Shizuku
 // the gate now caps appId at 19999 (AID_APP_LAST), so SDK sandbox
 // (20000-29999) and isolated (99000-99999) appIds stay denied regardless
 // of user; v5 invalidates v4 resident services.
+// v6 = v5 marker+gate + EXEC concurrency semaphore gate (SERVICE_EXEC_MAX_CONCURRENT=4, fair semaphore, non-blocking tryAcquire fail-fast via serviceBusy pre-dispatch definite) + synchronized drain (snapshot/drainCapped under synchronized(sink)); v6 invalidates v5 resident services (ungated + unsynchronized drain).
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
@@ -95,8 +96,7 @@ import rikka.shizuku.Shizuku
 // restart, the orphan sits inert (daemon restart reaps). A normal cleanup
 // return means Shizuku accepted the removal and attempted the ONEWAY
 // DESTROY, NOT a synchronous PID-death proof (void unbind, no wait).
-// SERVICE_VERSION is
-// 5 (D2 bumped it for the appId upper bound); the version bump remains the
+// SERVICE_VERSION is 6 (#54 bumped it for concurrency gate + drain sync; service code changed so daemon must rebuild); the version bump remains the
 // invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
@@ -117,6 +117,7 @@ import rikka.shizuku.Shizuku
 //      binder is actually dead (not only that unbind returned) before
 //      claiming the ungated daemon is revoked; include v12 (cleanup-then-
 //      unsupported) and v13+ (cleanup-then-owner-EXEC/foreign-deny) runs.
+//   8. (v5 -> v6) confirm EXEC concurrency gate: with 4 concurrent EXECs holding the gate a 5th EXEC returns pre-dispatch "resource exhausted: service exec concurrency limit" definite failure (exit=1, timedOut=false, transportUnknown=false, no truncation marker, pm never spawned); confirm owner-uid EXEC succeeds under cap, foreign uid denied without consuming permit, DESTROY rebinds when gate full (ungated reap, no orphan); include legacy v2->v6 PID/binder death check as in step 7 (no Shizuku restart).
 // Caller-identity gate (P0 security): the service runs under the shell/root
 // uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
 // Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
@@ -152,11 +153,11 @@ object ShizukuExecProtocol {
     // semantics); v2 = whenever-truncated marker (prior capture contract,
     // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
     // marker+gate with appId normalization; v5 = v4 marker+gate with appId
-    // upper bound (current contract). Bump whenever
+    // upper bound; v6 = v5 + concurrency gate (current contract). Bump whenever
     // the service-side capture/encode/auth code changes: Shizuku requires a
     // different version code on service-code updates so the daemon (default
     // true) rebuilds the UserService instead of reusing the resident old
-    // one -- v5 therefore invalidates v4 resident services (appId upper
+    // one -- v6 therefore invalidates v5 resident services (concurrency gate + drain sync), as v5 invalidated v4 resident services (appId upper
     // bound), as v4 invalidated v3 resident services (full-UID gate) and
     // v3 invalidated ungated v2 resident services. The bind tag is
     // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
@@ -164,9 +165,8 @@ object ShizukuExecProtocol {
     // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
     // is NOT bound. Its old service record is removed by the D1 migration
     // on the first successful run() (retryable); if cleanup never succeeds
-    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it for the
-    // appId upper bound; auth code changed so the daemon must rebuild).
-    const val SERVICE_VERSION = 5
+    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 6 (#54 bumped it for concurrency gate + drain sync; service code changed so daemon must rebuild).
+    const val SERVICE_VERSION = 6
 }
 
 // UID decomposition consts (Phase C2). Literals, not android.os imports,
@@ -514,7 +514,7 @@ class GalaxyExecService : Binder {
                 // actual sender uid is DEVICE-UNVERIFIED (could be system 1000 / shell 2000 / root 0);
                 // gating risks orphaned resident services defeating SERVICE_VERSION;
                 // foreign DESTROY impact is negligible availability-only DoS (Shizuku rebinds, no command execution),
-                // so leave ungated deliberately. EXEC remains the P0-gated vector.
+                // so leave ungated deliberately. EXEC remains the P0-gated vector. v6 DESTROY stays ungated so stale v5/v6 records can be reaped when gate is full.
                 System.exit(0)
                 return true
             }
@@ -649,7 +649,7 @@ private val legacyCleanupNoOpConnection = object : ServiceConnection {
 // ONLY the legacy fixed tag (NO processNameSuffix/version -- a minimal args
 // pair that addresses the old record; suffix/version would scope it to a
 // different identity and miss). remove=true drops the resident record so the
-// first per-UID v5 bind starts clean; unbinding an already-gone record is a
+// first per-UID v6 bind starts clean; unbinding an already-gone record is a
 // normal idempotent return. Throws propagate to the gateway's retry wrapper.
 private class RealShizukuLegacyCleaner(
     private val packageName: String,
@@ -673,7 +673,7 @@ private class RealShizukuBindDriver(
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
             // Tag is per-UID derived via galaxyExecServiceTag(callerUid)
-            // (full caller uid, stable); SERVICE_VERSION (5) remains the
+            // (full caller uid, stable); SERVICE_VERSION (6) remains the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
         ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag(galaxyExecServiceTag(callerUid))
@@ -812,7 +812,7 @@ class ShizukuCmdGateway(
 
             // Legacy fixed-tag cleanup, BLOCKING fail-closed (Phase E1/F1):
             // the one-time removal runs BEFORE the v13 reject and before the
-            // first per-UID v5 bind, but ONLY when the server actually has
+            // first per-UID v6 bind, but ONLY when the server actually has
             // the UserService API (version >= MIN_USERSERVICE_VERSION=10).
             // A non-cancellation failure returns a definite
             // legacyCleanupFailed refusal here (no bind/cache/transact, cache
@@ -911,7 +911,7 @@ class ShizukuCmdGateway(
     // One-time legacy fixed-tag cleanup (Phase D1, P1 legacy fixed-tag
     // migration; Phase E1 fail-closed/F2 per-call outcome): removes the
     // pre-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG) before the
-    // first per-UID v5 bind. The run() call site sits after ping/permission/
+    // first per-UID v6 bind. The run() call site sits after ping/permission/
     // version-read and before the <13 reject (see run() for the conditional
     // cleanup-before-reject rationale), so this assumes the caller already
     // passed ping/permission; it runs on Dispatchers.IO (inside run()'s

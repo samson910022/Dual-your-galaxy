@@ -409,20 +409,20 @@ class GatewayAssemblyTest {
     // service semantics), v2 = whenever-truncated marker (prior contract,
     // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate, v4 = v3
     // marker+gate with appId normalization, v5 = v4 marker+gate with appId
-    // upper bound (current contract).
+    // upper bound; v6 = v5 + concurrency gate (current contract).
     // bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
-    // rebuilds the resident UserService on upgrade (v5 invalidates v4
-    // resident services, as v4 invalidated v3 resident services and v3
+    // rebuilds the resident UserService on upgrade (v6 invalidates v5
+    // resident services, as v5 invalidated v4 resident services and v4 invalidated v3 resident services and v3
     // invalidated ungated v2 resident services);
     // the bind tag is per-UID derived
     // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag) and the
     // legacy fixed tag "GalaxyDualExec-v1" record is removed by the D1
     // migration on the first run (retryable); if cleanup never succeeds
     // until restart, the orphan sits inert (daemon restart reaps).
-    // SERVICE_VERSION is 5 (D2 bumped it
-    // for the appId upper bound; auth code changed so the daemon must rebuild).
-    @Test fun serviceVersion_isV5() {
-        assertEquals(5, ShizukuExecProtocol.SERVICE_VERSION)
+    // SERVICE_VERSION is 6 (#54 bumped it
+    // for concurrency gate + drain sync; service code changed so daemon must rebuild).
+    @Test fun serviceVersion_isV6() {
+        assertEquals(6, ShizukuExecProtocol.SERVICE_VERSION)
     }
 
     // P1 UserService version gap -- read-only reproducible verification, OLD
@@ -454,7 +454,7 @@ class GatewayAssemblyTest {
     // Shizuku, then confirm the bound service runs the new capture/marker
     // contract (this path arrives WITH marker -> Unknown). v2 -> v3 note:
     // ungated v2 resident services are invalidated by the v3 bump; confirm
-    // owner EXEC succeeds and a foreign uid is denied.
+    // owner EXEC succeeds and a foreign uid is denied. v5 -> v6 note: v5 resident services are invalidated by the v6 bump; confirm EXEC concurrency gate (4 concurrent EXECs hold gate, 5th returns serviceBusy definite failure, foreign uid denied without consuming permit, DESTROY rebinds when gate full).
     @Test fun execReply_newServicePartialWithMarkerParsesUnknown() {
         val svc = buildResult(
             0, StringBuilder("package:com.example.app\n"), StringBuilder(""),
