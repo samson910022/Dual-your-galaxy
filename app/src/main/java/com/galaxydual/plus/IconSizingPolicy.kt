@@ -42,3 +42,57 @@ internal fun placeholderDim(intrinsicW: Int, intrinsicH: Int): Int =
 // Android 層只負責 newDrawable／mutate 與 Drawable 生命週期。
 internal fun shouldUsePlaceholder(newDrawableAvailable: Boolean): Boolean =
     !newDrawableAvailable
+
+// 等比置中矩形（與 MainActivity.bitmapSnapshotDrawable 的 Canvas 變換對應）：
+// 表達來源圖示以等比縮放後置中於 dst 方框內的目標矩形（left/top/right/bottom）。
+// Review P2-2 拉伸回歸即指只 setBounds 方形會使 48x24 被拉成 24x24，
+// 本矩形配合 fitScale 的 Canvas translate/scale 保證 48x24 在 24 方框內
+// 為置中 24x12（等比、不拉伸）。left/right/top/bottom 為像素座標。
+internal data class FitRect(val left: Int, val top: Int, val right: Int, val bottom: Int)
+
+// 等比置中矩形計算（與 MainActivity.bitmapSnapshotDrawable 對應）：
+// dstPx 為方形外框邊長，dst<=0 先經 safeIconPx 收斂為 1；
+// srcW/srcH 任一 <=0 時未知尺寸回方形填滿 FitRect(0, 0, dst, dst)；
+// 寬高經 fitScale 縮放後以 clamp [1, dst] 收斂並置中，
+// 呼叫端以此矩形的 left/top 做 Canvas.translate、scale 做縮放。
+internal fun fitCenterRect(srcW: Int, srcH: Int, dstPx: Int): FitRect {
+    val dst = safeIconPx(dstPx)
+    if (srcW <= 0 || srcH <= 0) return FitRect(0, 0, dst, dst)
+    val scale = fitScale(srcW, srcH, dst)
+    val w = (srcW * scale).toInt().coerceIn(1, dst)
+    val h = (srcH * scale).toInt().coerceIn(1, dst)
+    val left = (dst - w) / 2
+    val top = (dst - h) / 2
+    return FitRect(left, top, left + w, top + h)
+}
+
+// 等比縮放係數（與 MainActivity.bitmapSnapshotDrawable 的 Canvas.scale 對應）：
+// 回 min(dst/srcW, dst/srcH)，保證來源圖示完整置入 dst 方框且不拉伸
+// （Review P2-2）；dst<=0 先經 safeIconPx 收斂；src 任一 <=0 時回 1f
+//（不縮放，由 fitCenterRect 方形填滿兜底，快照呼叫端據此決定是否回 null）。
+internal fun fitScale(srcW: Int, srcH: Int, dstPx: Int): Float {
+    val dst = safeIconPx(dstPx)
+    if (srcW <= 0 || srcH <= 0) return 1f
+    return minOf(dst.toFloat() / srcW.toFloat(), dst.toFloat() / srcH.toFloat())
+}
+
+// 是否需位圖快照（與 MainActivity.loadIcon 在 withContext(IO) 內
+// getApplicationIcon 後的判斷對應）：真值表四行為 hasConstantState 為真＋
+// 正方形回 false（可走既有 newDrawable，無需快照）、hasConstantState 為真＋
+// 非正方形回 true（需等比快照治 P2-2 拉伸）、hasConstantState 為真＋任一
+// <=0 回 false（尺寸未知不快照）、hasConstantState 為假＋任一回 true
+//（無 ConstantState 須快照治 P2-1 透明回歸）。呼叫端傳 normalized 後的
+// hasConstantState＝(constantState != null 安全讀取）與 intrinsicW/H
+//（讀取異常以 -1 補齊），此處僅做純決策，Android 讀取留在 Main。
+internal fun shouldUseSnapshot(hasConstantState: Boolean, intrinsicW: Int, intrinsicH: Int): Boolean {
+    if (!hasConstantState) return true
+    if (intrinsicW <= 0 || intrinsicH <= 0) return false
+    return intrinsicW != intrinsicH
+}
+
+// 快照 px 限位（與 MainActivity.bitmapSnapshotDrawable 的 dst Px 計算對應）：
+// 以 min(safeIconPx(sizePx), maxOf(1, capPx)) 限位，防 OOM 全尺寸位圖
+//（如 512 原圖直接建位圖）；sizePx 經 safeIconPx 保 1 可見，capPx 經
+// maxOf(1, capPx) 保底，避免 cap 傳 0／負值致非法尺寸。
+internal fun clampSnapshotPx(sizePx: Int, capPx: Int): Int =
+    minOf(safeIconPx(sizePx), maxOf(1, capPx))

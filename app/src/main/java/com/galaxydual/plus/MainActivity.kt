@@ -40,7 +40,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
@@ -4084,6 +4087,86 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Phase A（P2-1/P2-2 快照根治，Hybrid）：以受控尺寸位圖快照根治
+    // 「無 ConstantState 直接透明」（P2-1）與「只 setBounds 拉伸」（P2-2）：在
+    // IO 執行緒把需快照的圖示以等比置中繪製到獨立方形位圖，產出普通
+    // BitmapDrawable 使後續 freshIconDrawable／sizedIcon 的 newDrawable 必
+    // 成功。dstPx 先以 clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX) 規範化
+    //（dp 經 dpPx，CAP 常量 192）；建 ARGB_8888 方形位圖後以 Canvas
+    // translate/scale（用 fitScale／fitCenterRect）做等比，src 以
+    // setBounds(0,0,srcW,srcH) 繪製（勿只 setBounds），最後 BitmapDrawable
+    // + setBounds(0,0,dst,dst) 回傳；全程 CE 重拋，捕 OOM 回 null+Log.w，
+    // 失敗回 null 由呼叫端快取原始 drawable（不直接透明）。Canvas draw
+    // 必須在 IO 執行緒且未掛 View，呼叫端已在 withContext(IO) 內呼叫。
+    private fun bitmapSnapshotDrawable(src: Drawable, dstPx: Int): Drawable? {
+        val dst = clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX)
+        if (dstPx > 0 && dstPx != dp(36)) {
+            Log.w(TAG, "bitmapSnapshotDrawable dstPx drift")
+        }
+        val srcW = try {
+            src.intrinsicWidth
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable intrinsicWidth failed", e)
+            return null
+        }
+        val srcH = try {
+            src.intrinsicHeight
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable intrinsicHeight failed", e)
+            return null
+        }
+        if (srcW <= 0 || srcH <= 0) return null
+        val bmp: Bitmap = try {
+            Bitmap.createBitmap(dst, dst, Bitmap.Config.ARGB_8888)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "bitmapSnapshotDrawable OOM", e)
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable createBitmap failed", e)
+            return null
+        }
+        try {
+            val canvas = Canvas(bmp)
+            val rect = fitCenterRect(srcW, srcH, dst)
+            val scale = fitScale(srcW, srcH, dst)
+            canvas.translate(rect.left.toFloat(), rect.top.toFloat())
+            canvas.scale(scale, scale)
+            src.setBounds(0, 0, srcW, srcH)
+            src.draw(canvas)
+            val out = BitmapDrawable(resources, bmp)
+            out.setBounds(0, 0, dst, dst)
+            return out
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "bitmapSnapshotDrawable OOM", e)
+            try {
+                bmp.recycle()
+            } catch (e2: CancellationException) {
+                throw e2
+            } catch (e2: Exception) {
+                Log.w(TAG, "bitmapSnapshotDrawable recycle failed", e2)
+            }
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable draw failed", e)
+            try {
+                bmp.recycle()
+            } catch (e2: CancellationException) {
+                throw e2
+            } catch (e2: Exception) {
+                Log.w(TAG, "bitmapSnapshotDrawable recycle failed", e2)
+            }
+            return null
+        }
+    }
+
     // p26-2 Phase 2：合併 loadIcon acquire 失敗雙分支共用的 inflight 清理
     // （CE 重拋供協作取消、其餘 Log.w 不吞），避免兩份 try/catch 重複。
     private fun removeIconInflight(appKey: String) {
@@ -4115,13 +4198,52 @@ class MainActivity : ComponentActivity() {
             }
             try {
                 val drawable = withContext(Dispatchers.IO) {
-                    try {
+                    val rawDrawable = try {
                         packageManager.getApplicationIcon(pkg)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "loadIcon getApplicationIcon failed", e)
                         null
+                    }
+                    if (rawDrawable == null) {
+                        null
+                    } else {
+                        // Phase A 快照根治：IO 執行緒內以 shouldUseSnapshot(normalized)
+                        // 判斷是否快照；normalized 為 hasConstantState（constantState
+                        // 安全讀取）與 intrinsicW/H（讀取異常以 -1 補齊，CE 重拋）。
+                        // 需快照時在 IO 執行緒以 bitmapSnapshotDrawable 繪製獨立位圖
+                        //（Canvas 未掛 View）；快照成功快取快照值，快照失敗快取原始
+                        // drawable（不直接透明）。既有 evict/markLoaded/onLoaded 不變。
+                        val hasConstantState = try {
+                            rawDrawable.constantState != null
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon constantState check failed", e)
+                            false
+                        }
+                        val intrinsicW = try {
+                            rawDrawable.intrinsicWidth
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon intrinsicWidth failed", e)
+                            -1
+                        }
+                        val intrinsicH = try {
+                            rawDrawable.intrinsicHeight
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon intrinsicHeight failed", e)
+                            -1
+                        }
+                        if (shouldUseSnapshot(hasConstantState, intrinsicW, intrinsicH)) {
+                            bitmapSnapshotDrawable(rawDrawable, dp(36)) ?: rawDrawable
+                        } else {
+                            rawDrawable
+                        }
                     }
                 }
                 if (drawable == null) return@launch
@@ -4398,6 +4520,10 @@ class MainActivity : ComponentActivity() {
         private const val SOURCE_ICON_DP = 24
         private const val CLONED_ICON_DP = 36
         private const val ICON_CONTAINER_DP = 44
+
+        // Phase A 快照 OOM cap：位圖快照獨立位圖以 36dp 規範化後上限 192px，
+        // 避免高密度下建全尺寸位圖致 OOM（實際尺寸經 clampSnapshotPx 限位）。
+        private const val ICON_SNAPSHOT_CAP_PX = 192
 
         // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
         private const val MAX_LABEL_CACHE = 200
