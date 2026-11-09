@@ -377,7 +377,7 @@ internal fun badRequestForBlankCommand(raw: String?): CmdResult? =
 // null out/err -> transportUnknown and non-null marker round-trip.
 internal fun decodeExecReplyNullable(exit: Int, out: String?, err: String?): CmdResult =
     if (out == null || err == null) {
-        ShizukuExecErrors.transportUnknown("null reply string (outNull=${out == null}, errNull=${err == null})")
+        ShizukuExecErrors.transportUnknown("null reply string (exit=$exit, outNull=${out == null}, errNull=${err == null})")
     } else {
         decodeExecReply(exit, out, err)
     }
@@ -517,14 +517,22 @@ class GalaxyExecService : Binder {
                 val rawCmd = try {
                     data.readString()
                 } catch (e: Exception) {
-                    reply?.writeInt(1)
-                    reply?.writeString("")
-                    reply?.writeString("bad request: ${(e.message ?: e.javaClass.simpleName)}")
+                    val (readExit, readOut, readErr) = encodeExecReply(
+                        CmdResult(exit = 1, out = "", err = "bad request: ${(e.message ?: e.javaClass.simpleName)}")
+                    )
+                    reply?.writeInt(readExit)
+                    reply?.writeString(readOut)
+                    reply?.writeString(readErr)
                     return true
                 }
                 // Null/blank wire cmd must never spawn `sh -c ""`: reply the
                 // same frozen bad-request shape as the read-failure path
                 // above (exit=1, no flags, pre-spawn definite failure).
+                // No SERVICE_VERSION bump: wire layout stays int+String+String,
+                // the client never sends blank, and blank only arrives via a corrupt/malicious
+                // Parcel. Like the truncated unification below, which is wire-neutral on the
+                // wire (encode discards the local truncated dead-flag; the client re-derives
+                // truncated from marker text), this is service-side-only hardening.
                 val badRequest = badRequestForBlankCommand(rawCmd)
                 if (badRequest != null) {
                     val (badExit, badOut, badErr) = encodeExecReply(badRequest)
@@ -533,8 +541,20 @@ class GalaxyExecService : Binder {
                     reply?.writeString(badErr)
                     return true
                 }
-                // Safe: badRequest == null implies rawCmd is non-null non-blank.
-                val cmd = rawCmd!!
+                // Double guard: if the helper contract ever changes, never NPE the
+                // binder thread via rawCmd!! -- fall back to the same bad-request
+                // shape instead (pre-spawn definite failure).
+                val cmd = if (rawCmd.isNullOrBlank()) {
+                    val (guardExit, guardOut, guardErr) = encodeExecReply(
+                        CmdResult(exit = 1, out = "", err = "bad request: blank command")
+                    )
+                    reply?.writeInt(guardExit)
+                    reply?.writeString(guardOut)
+                    reply?.writeString(guardErr)
+                    return true
+                } else {
+                    rawCmd
+                }
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
                 // (binder thread), so call it directly.
@@ -561,11 +581,12 @@ class GalaxyExecService : Binder {
                     // Unified truncated=true with the Interrupted branch above:
                     // both are post-spawn unknown captures (partial output
                     // possible), so fail closed to Unknown, never TrustedFull.
-                    // The flag itself is lost on the wire either way
-                    // (encodeExecReply carries only exit/out/err; the client
-                    // re-derives truncated from marker text and transportUnknown
-                    // from the "service exec failed: " backstop), so unifying
-                    // is wire-neutral and only fixes local semantic asymmetry.
+                    // Wire-neutral is limited to the truncated-flag loss itself:
+                    // the flag is dropped on the wire either way (encodeExecReply
+                    // carries only exit/out/err; the client re-derives truncated
+                    // from marker text). True fail-closed rests on exit!=0 plus the
+                    // "service exec failed: " backstop, which the repository
+                    // anchors to via isPostSpawnTransportText.
                     CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
@@ -1049,7 +1070,10 @@ class ShizukuCmdGateway(
             // a transport-loss failure path like the catch branches below:
             // drop the stale cache so the next run() rebinds fresh. Only
             // this path returns transportUnknown from inside the block, so
-            // this check never drops on a normal reply.
+            // this check never drops on a normal reply. Invariant: decodeExecReply
+            // never sets transportUnknown, so this drop fires only for a null
+            // reply; a post-spawn service reply arriving over the wire means the
+            // binder is already alive and never drops here.
             if (result.transportUnknown) {
                 bindMutex.withLock { dropBindingLocked() }
             }
