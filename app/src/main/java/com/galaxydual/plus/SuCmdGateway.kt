@@ -285,66 +285,91 @@ internal fun captureProcess(
         }
         throw t
     }
-    val exited = try {
-        proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-    } catch (e: InterruptedException) {
-        Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        // Post-spawn unknown (Phase A1): the process was spawned, so the
-        // remote pm may have executed before the kill -- unknown-after-send
-        // by construction. transportUnknown=true forces the repository onto
-        // the read-only verify probe instead of claiming definite failure
-        // (exit/out untrusted either way). Pre-spawn spawn failures
-        // ("spawn failed: ...", exec threw, process never started) stay
-        // definite -- only this post-spawn interrupt carries the flag.
-        // The "interrupted: " text prefix is the wire-frozen backstop: the
-        // service-side capture shares this helper and its flag is lost on
-        // the (exit, out, err) parcel, so DualRepository also matches the
-        // anchored text via isPostSpawnTransportText.
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
-    }
-    if (!exited) {
-        proc.destroyForcibly()
-        try {
-            drainOut.join(2_000)
-            drainErr.join(2_000)
-        } catch (e: InterruptedException) {
-            // Post-spawn unknown (Phase A1): the timeout already abandoned
-            // the wait (timedOut=true below covers it), but the drain-join
-            // interrupt itself proves the capture is incomplete after spawn.
-            // Restore the flag and stay unknown-after-send either way.
-            Thread.currentThread().interrupt()
-            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
-        }
-        // Same honest-flag reasoning as the interrupt path above: killed
-        // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
-        // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
-        // remote pm may still have executed, so timedOut=true forces the
-        // repository onto the read-only verify probe instead of claiming
-        // definite failure (exit/out untrusted either way).
-        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
-    }
+    // Phase 3 post-spawn Error-escape guard: an Error from waitFor/join/exitValue
+    // must not escape without destroyForcibly/pipe-close. The catches below map
+    // only CE/IE paths to CmdResult; this outer catch rethrows after best-effort
+    // cleanup (mirrors the spawn-setup inner path) and never converts to a result.
+    // Behavior for CE/IE/Exception + timeout/interrupt returns stays byte-identical.
     try {
-        drainOut.join(5_000)
-        drainErr.join(5_000)
-    } catch (e: InterruptedException) {
-        // Post-spawn unknown (Phase A1): spawn succeeded and the steady
-        // drain was interrupted -- the remote pm may have executed while
-        // this client holds only a partial capture. Destroy, restore the
-        // flag, and force read-only reconciliation via transportUnknown
-        // (same rule as the wait-interrupt above). The "interrupted: "
-        // prefix is the wire-frozen backstop for the service side.
-        Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        val exited = try {
+            proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            proc.destroyForcibly()
+            // Post-spawn unknown (Phase A1): the process was spawned, so the
+            // remote pm may have executed before the kill -- unknown-after-send
+            // by construction. transportUnknown=true forces the repository onto
+            // the read-only verify probe instead of claiming definite failure
+            // (exit/out untrusted either way). Pre-spawn spawn failures
+            // ("spawn failed: ...", exec threw, process never started) stay
+            // definite -- only this post-spawn interrupt carries the flag.
+            // The "interrupted: " text prefix is the wire-frozen backstop: the
+            // service-side capture shares this helper and its flag is lost on
+            // the (exit, out, err) parcel, so DualRepository also matches the
+            // anchored text via isPostSpawnTransportText.
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
+        }
+        if (!exited) {
+            proc.destroyForcibly()
+            try {
+                drainOut.join(2_000)
+                drainErr.join(2_000)
+            } catch (e: InterruptedException) {
+                // Post-spawn unknown (Phase A1): the timeout already abandoned
+                // the wait (timedOut=true below covers it), but the drain-join
+                // interrupt itself proves the capture is incomplete after spawn.
+                // Restore the flag and stay unknown-after-send either way.
+                Thread.currentThread().interrupt()
+                return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+            }
+            // Same honest-flag reasoning as the interrupt path above: killed
+            // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
+            // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
+            // remote pm may still have executed, so timedOut=true forces the
+            // repository onto the read-only verify probe instead of claiming
+            // definite failure (exit/out untrusted either way).
+            return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
+        }
+        try {
+            drainOut.join(5_000)
+            drainErr.join(5_000)
+        } catch (e: InterruptedException) {
+            // Post-spawn unknown (Phase A1): spawn succeeded and the steady
+            // drain was interrupted -- the remote pm may have executed while
+            // this client holds only a partial capture. Destroy, restore the
+            // flag, and force read-only reconciliation via transportUnknown
+            // (same rule as the wait-interrupt above). The "interrupted: "
+            // prefix is the wire-frozen backstop for the service side.
+            Thread.currentThread().interrupt()
+            proc.destroyForcibly()
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        }
+        // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
+        // is the expiry signal. A still-alive drain means the capture may be
+        // incomplete even when nothing hit the cap -- fail closed via truncated.
+        // I1: drains always started here (pair reserved pre-spawn), so no null
+        // case remains; READ_ERROR defaults still fail closed via buildResult.
+        val joinExpired = drainOut.isAlive || drainErr.isAlive
+        return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
+    } catch (t: Throwable) {
+        // Error escape (incl. Error + any unhandled Exception): best-effort
+        // cleanup mirroring the spawn-setup inner path, then rethrow. Never
+        // converts to CmdResult: CE propagates, and IE/Exception paths above
+        // already returned (timeout/interrupt values unchanged).
+        try {
+            proc.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Throwable) {
+        }
+        throw t
     }
-    // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
-    // is the expiry signal. A still-alive drain means the capture may be
-    // incomplete even when nothing hit the cap -- fail closed via truncated.
-    // I1: drains always started here (pair reserved pre-spawn), so no null
-    // case remains; READ_ERROR defaults still fail closed via buildResult.
-    val joinExpired = drainOut.isAlive || drainErr.isAlive
-    return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
 }
 
 // Cancellable wait for process exit: polls waitFor(SU_WAIT_POLL_MS) and
@@ -851,6 +876,37 @@ internal suspend fun captureProcessCancellable(
             Thread.currentThread().interrupt()
         }
         return CmdResult(exit = 1, out = capped(out, true), err = "su failed post-spawn: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
+    } catch (t: Throwable) {
+        // Phase 3 Error escape (Error is not an Exception, so the guards above
+        // missed it: waitFor/exitValue Error would otherwise leak proc + pipes
+        // without destroyForcibly/close). Mirror the spawn-setup inner path:
+        // best-effort destroy + stream closes (each try/catch best-effort so a
+        // cleanup throw cannot mask the original), then rethrow. Never
+        // converts to CmdResult, so CE is never swallowed here (CE is an
+        // Exception caught above and rethrown there); this catch only sees
+        // Error + any non-Exception Throwable. Do not add reclaim joins:
+        // close alone lets drains die async without delaying the rethrow.
+        try {
+            proc.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        try {
+            openIn?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            openErr?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Throwable) {
+        }
+        throw t
     }
 }
 

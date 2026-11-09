@@ -341,7 +341,10 @@ object ShizukuExecErrors {
     // Pre-dispatch definite (no flags): must not start with any backstop
     // prefix ("service exec failed: ", "interrupted: ", "timeout after ",
     // "shizuku: exec timed out after ", "may have executed"). Same bucket as
-    // the drain-exhaustion "resource exhausted: ..." reply.
+    // the drain-exhaustion "resource exhausted: ..." reply. Shares the
+    // 'resource exhausted:' prefix with pre-spawn drain exhaustion but
+    // truncated=false (no capture, no truncation; drain path uses
+    // truncated=true only for the drain path).
     fun serviceBusy(): CmdResult =
         CmdResult(exit = 1, out = "", err = "resource exhausted: service exec concurrency limit (max=$SERVICE_EXEC_MAX_CONCURRENT)")
 }
@@ -421,12 +424,17 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 // (EXEC_TIMEOUT_MS 60s + up to ~12s of drain joins) on a Binder-pool thread.
 // Without a cap, concurrent transacts each pin a Binder thread for that whole
 // window and can exhaust the Binder pool, starving even DESTROY / fresh binds.
-// The gate caps concurrent execs at SERVICE_EXEC_MAX_CONCURRENT (mirrors the
-// client transactPermits TRANSACT_MAX_THREADS=4, leaving Binder-pool headroom
-// for non-EXEC calls). Excess calls fail fast pre-dispatch via
-// serviceBusy() -- never queued, since queueing would still hold a Binder
+// The gate caps at 4 (= TRANSACT_MAX_THREADS); binder pool default 16 leaves
+// headroom for DESTROY/callbacks even at full gate (4 long EXECs = 60s
+// EXEC_TIMEOUT + ~12s joins pin 4/16 threads), DEVICE-UNVERIFIED on device;
+// 4×2=8 drains fits MAX_ACTIVE_DRAINS=16. Excess calls fail fast pre-dispatch
+// via serviceBusy() -- never queued, since queueing would still hold a Binder
 // thread. java.util.concurrent.Semaphore is used (blocking binder thread,
-// non-suspend; tryAcquire is non-blocking so the wait never holds the pool).
+// non-suspend; tryAcquire is non-blocking so the wait never holds the pool)
+// (fair flag only affects blocking waiters; tryAcquire-only usage never queues
+// so admission order is a scheduler race to tryAcquire, not transact arrival -
+// harmless because excess callers get definite serviceBusy and can retry;
+// production traffic is serialized by opMutex).
 // The client side is unchanged: EXEC_TIMEOUT_MS + awaitBounded + stale-cache
 // dropBindingLocked on timeout stay as they are; this gate only sheds excess
 // server-side concurrency.
@@ -539,6 +547,8 @@ class GalaxyExecService : Binder {
                 // gating risks orphaned resident services defeating SERVICE_VERSION;
                 // foreign DESTROY impact is negligible availability-only DoS (Shizuku rebinds, no command execution),
                 // so leave ungated deliberately. EXEC remains the P0-gated vector. v6 DESTROY stays ungated so stale v5/v6 records can be reaped when gate is full.
+                // DESTROY dispatch promptness during 4× hung EXECs is
+                // DEVICE-UNVERIFIED, bounded delay ≤ ~72s worst case.
                 System.exit(0)
                 return true
             }
@@ -568,7 +578,12 @@ class GalaxyExecService : Binder {
                 // plus drain joins). Gate admission is non-blocking BEFORE
                 // dispatch: excess calls get a fast pre-dispatch definite
                 // refusal (serviceBusy, never sent, never spawned) instead of
-                // piling onto Binder threads. The client wait stays bounded
+                // piling onto Binder threads. Gate after auth so foreign
+                // callers cannot consume permits; gate after readString so
+                // malformed parcels cannot consume permits either. DESTROY
+                // (ungated, System.exit) is not a gate bypass: it holds no
+                // binder thread for 60s and gating it would leave stale v5/v6
+                // records resident when gate full. The client wait stays bounded
                 // via EXEC_TIMEOUT_MS + awaitBounded + dropBindingLocked
                 // (unchanged); this gate only protects the server pool.
                 if (!serviceExecGate.tryAcquire()) {
