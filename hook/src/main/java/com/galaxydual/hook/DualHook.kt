@@ -285,13 +285,21 @@ class DualHook : XposedModule() {
     // unchanged; non-Boolean results return early without unknown-shape logging
     // when the policy is empty. Boolean true returns immediately; unexpected
     // arguments for Boolean false are logged best-effort even with empty policy.
+    // For Boolean false rewrites, DualHook resolves the package argument only
+    // for allowlisted signatures (WhitelistSignatureGuard) and uses strict
+    // signature mode so unverified overloads remain observe-only.
     // H2: the effective set is PolicySource.effective(seed + remote). No remote
     // source is wired, so behavior today is identical to the static seed
     // (observe-only when empty).
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
+        val executable = try {
+            chain.executable
+        } catch (_: Throwable) {
+            null
+        }
         val desc = try {
-            WhitelistPolicy.describe(chain.executable)
+            executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
         } catch (_: Throwable) {
             "unknown-method"
         }
@@ -300,7 +308,32 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             emptyList()
         }
-        return WhitelistPolicy.apply(result, args, effectivePolicy(), desc, ::logi)
+        return try {
+            val packageArgIndex = executable?.let {
+                WhitelistSignatureGuard.resolveBooleanPackageArgIndex(it)
+            }
+            val declaredReturnType = (executable as? Method)?.returnType
+            WhitelistPolicy.apply(
+                result = result,
+                args = args,
+                extra = effectivePolicy(),
+                methodDesc = desc,
+                onLog = ::logi,
+                packageArgIndex = packageArgIndex,
+                declaredReturnType = declaredReturnType,
+                strictSignature = true,
+            )
+        } catch (t: Throwable) {
+            try {
+                logi(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: policy apply failed " +
+                        "(${t.javaClass.name}); returning original",
+                )
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            result
+        }
     }
 
     // Effective policy for this process: static seed (+ a RemotePreferences

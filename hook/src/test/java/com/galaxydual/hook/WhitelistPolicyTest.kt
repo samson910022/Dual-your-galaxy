@@ -164,4 +164,102 @@ class WhitelistPolicyTest {
         val m = String::class.java.getMethod("length")
         assertEquals("java.lang.String#length()", WhitelistPolicy.describe(m))
     }
+
+    @Test
+    fun listWithNonStringElementsIsObserveOnly() {
+        val original = listOf(1, 2)
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("x"), "m", log)
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun mutableListWithMixedNonStringElementsIsObserveOnly() {
+        val original = mutableListOf<Any>("a", 1)
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("x"), "m", log)
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun treeSetIsObserveOnlyPreservingSortedContract() {
+        val original = java.util.TreeSet(listOf("a"))
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("b"), "m", log)
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun linkedHashSetStillMergesAsSet() {
+        val original = linkedSetOf("a")
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("a", "b"), "m", log)
+        assertTrue("expected Set, got ${out?.javaClass?.name}", out is Set<*>)
+        assertEquals(setOf("a", "b"), out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanStrictSignatureWithoutIndexIsObserveOnly() {
+        val out = WhitelistPolicy.apply(
+            false,
+            listOf("com.listed.app"),
+            setOf("com.listed.app"),
+            "m",
+            log,
+            packageArgIndex = null,
+            strictSignature = true,
+        )
+        assertEquals(false, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun booleanExplicitPackageArgIndexZeroFlipsWhenInExtra() {
+        val out = WhitelistPolicy.apply(
+            false,
+            listOf("com.listed.app", 0),
+            setOf("com.listed.app"),
+            "m",
+            log,
+            packageArgIndex = 0,
+            strictSignature = true,
+        )
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanExplicitPackageArgIndexOneFlipsWhenInExtra() {
+        val out = WhitelistPolicy.apply(
+            false,
+            listOf(0, "com.listed.app"),
+            setOf("com.listed.app"),
+            "m",
+            log,
+            packageArgIndex = 1,
+            strictSignature = true,
+        )
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun declaredReturnTypeIncompatibleIsObserveOnly() {
+        val original = listOf("a")
+        val out = WhitelistPolicy.apply(
+            original,
+            emptyList(),
+            setOf("b"),
+            "m",
+            log,
+            declaredReturnType = java.util.TreeSet::class.java,
+        )
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
 }
