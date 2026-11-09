@@ -40,7 +40,12 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Rect
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.app.AlertDialog
@@ -87,6 +92,7 @@ import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -515,7 +521,11 @@ class MainActivity : ComponentActivity() {
         updateShizukuLine()
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    // WHY 四捨五入：非標準 density（如 2.625）下直接 toInt() 截斷系統性偏小約 1px；
+    // v 均為正數，+0.5f 等價 roundToInt，阈值僅 ±1px。已 grep 全檔 dp() 約 160 處
+    // （最小 dp(1) 分隔線除外皆 >=2dp），無 Math 依賴需同步，無行為陷阱。
+    // Phase 4：換算委派 IconSizingPolicy.dpPx（公式一字不差，見該檔，JVM 可測）。
+    private fun dp(v: Int): Int = dpPx(v, resources.displayMetrics.density)
 
     // Phase D: 內聯 divider 共用建構（hook 卡片 12dp／診斷清單預設 4dp 上下邊距）。
     private fun makeDivider(topDp: Int = 4, bottomDp: Int = 4): View = View(this).apply {
@@ -2141,12 +2151,20 @@ class MainActivity : ComponentActivity() {
 
             // Left icon container with #2 badge overlay
             val iconContainer = FrameLayout(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+                layoutParams = LinearLayout.LayoutParams(dp(ICON_CONTAINER_DP), dp(ICON_CONTAINER_DP))
             }
             val appIconView = ImageView(this).apply {
-                layoutParams = FrameLayout.LayoutParams(dp(36), dp(36)).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(CLONED_ICON_DP), dp(CLONED_ICON_DP)).apply {
                     gravity = Gravity.CENTER
                 }
+                // p26-2 Phase 1 / Phase 3 註解修正：ImageView 預設即 FIT_CENTER /
+                // adjustViewBounds=false / cropToPadding=false，三行顯式聲明防未來誤改 wrap；
+                // layout 固定 36dp 方形框。方形 view + 方形 intrinsic 時 FIT==CROP，本處無裁切；
+                // mask／圓角不自動套用；adaptive 安全區名義上約 SAFEZONE_SCALE=66/72
+                // （24dp 外框約 22dp），可見 glyph 大小仍須視覺驗證，不宜一律放大。
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                adjustViewBounds = false
+                cropToPadding = false
                 // Phase C: the row title/switch already names the app; the icon
                 // itself is decorative.
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -3926,6 +3944,11 @@ class MainActivity : ComponentActivity() {
                     // Phase 3 P2 a11y: 48dp touch target via minimumHeight
                     // (height stays WRAP_CONTENT so large fonts grow).
                     minimumHeight = dp(48)
+                    // p26-2 Phase 3：顯式 8dp compound padding，固定 24dp 圖示與文字／勾選框間距，
+                    // 避免 OEM 預設漂移；只改 compound padding，不動行高／基線。
+                    setCompoundDrawablePadding(dp(8))
+                    // TODO(RTL, pre-existing)：現用絕對 setCompoundDrawables（左圖），未來如需鏡像可改
+                    // setCompoundDrawablesRelative；本 PR 不改。
                 }
                 requestIcon(entry.packageName, entry.appKey, box)
                 box.setOnCheckedChangeListener { _, checked ->
@@ -3976,10 +3999,210 @@ class MainActivity : ComponentActivity() {
     //（memo/inflight/淘汰/回填），完成經 onLoaded 回主執行緒綁定。
     // LRU：命中移尾（LinkedHashMap 插入序，首項＝最久未用，
     // pickIconEvictionKey 照舊淘汰首項）。
-    private fun freshIconDrawable(cached: Drawable): Drawable = try {
-        cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
-    } catch (_: Exception) {
-        cached
+    // p26-2 Phase 1（4106 修補）：透明占位，永不回傳快取實例本身；新 ColorDrawable
+    // 本身即獨立實例（每次新建 ColorDrawable 即獨立實例，無需 mutate），sizePx 經 maxOf 1 保證可見（非 0 尺寸）。
+    private fun transparentPlaceholder(sizePx: Int): Drawable {
+        val safePx = safeIconPx(sizePx)
+        val ph = ColorDrawable(0) // 0 = 完全透明。
+        try {
+            ph.setBounds(0, 0, safePx, safePx)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "transparentPlaceholder bounds failed", e)
+        }
+        return ph
+    }
+
+    // p26-2 Phase 1（4106 修補）：取 fresh copy（constantState.newDrawable().mutate()，
+    // mutate 僅在 newDrawable 新實例上做狀態解離；newDrawable 失敗直接佔位，
+    // 不經 mutate 共用實例）。永不回傳快取實例本身，失敗直接以透明占位兜底；
+    // ImageView 呼叫端由固定 layout 尺寸縮放，不經 sizedIcon setBounds。
+    // 為何不快取 sized 版：快取 sized 結果需 appKey+sizePx 聯合鍵，避免雙尺寸（如 24/36）
+    // 共用實例覆蓋 bounds；目前每次 newDrawable 共享 Bitmap 不翻倍，無需快取。
+    private fun freshIconDrawable(cached: Drawable): Drawable {
+        val fresh: Drawable? = try {
+            cached.constantState?.newDrawable()?.mutate()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable failed", e)
+            null
+        }
+        if (!shouldUsePlaceholder(fresh != null)) return fresh!!
+        // 最後防線：方形 max(w,h) 透明占位（intrinsic 尺寸，maxOf 1；讀取異常以 -1
+        // 補齊（舊以 1 補齊，經 placeholderDim 的 maxOf(1,…) 後等價）；
+        // 每次新建 ColorDrawable 即獨立實例，無需 mutate）。尺寸委派
+        // IconSizingPolicy.placeholderDim（方形 max 保底，JVM 可測）。
+        val w = try {
+            cached.intrinsicWidth
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable intrinsicWidth failed", e)
+            -1
+        }
+        val h = try {
+            cached.intrinsicHeight
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable intrinsicHeight failed", e)
+            -1
+        }
+        return transparentPlaceholder(placeholderDim(w, h)) // 方形 max(w,h) 占位。
+    }
+
+    // p26-2 Phase 1：供 CheckBox 左圖用的統一尺寸 helper。取 fresh copy
+    // （constantState.newDrawable().mutate()，mutate 僅在 newDrawable 新實例上做狀態解離；
+    // newDrawable 失敗直接佔位，不經 mutate 共用實例），再 setBounds 強制
+    // 為 sizePx x sizePx；呼叫端用 setCompoundDrawables（非 IntrinsicBounds 版），
+    // 避免直接吃各 App getApplicationIcon() 的原生 intrinsic 尺寸。
+    // fallback 語義：永不回傳快取實例本身——copy 失敗回 sizePx x sizePx 透明占位；
+    // setBounds 拋出時直接回 sizePx 透明占位（保持統一尺寸），絕不回傳 0 尺寸不可見圖。
+    // 為何不快取 sized 版：需 appKey+sizePx 聯合鍵，避免雙尺寸共用實例覆蓋 bounds；
+    // 目前每次 newDrawable 共享 Bitmap 不翻倍，故不快取。
+    // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 以
+    // SAFEZONE_SCALE=66/72 把 108dp 圖層縮到 viewport 內，24dp 外框對應安全區名義上約 22dp；
+    // 可見 glyph 仍由圖檔、留白與 mask 決定，不能由此固定折算成更小的確定百分比，
+    // 也不宜一律額外放大。保留「統一 bounds 不保證可見 glyph 等大，需視覺驗證」，
+    // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
+    // 行高 48dp／44dp 容器兜底。
+    private fun sizedIcon(drawable: Drawable, sizePx: Int): Drawable {
+        if (sizePx <= 0) return freshIconDrawable(drawable)
+        val copied: Drawable? = try {
+            drawable.constantState?.newDrawable()?.mutate()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "sizedIcon copy failed", e)
+            null
+        }
+        if (shouldUsePlaceholder(copied != null)) return transparentPlaceholder(sizePx)
+        val fresh: Drawable = copied!!
+        return try {
+            fresh.setBounds(0, 0, sizePx, sizePx)
+            fresh
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "sizedIcon setBounds failed", e)
+            transparentPlaceholder(sizePx)
+        }
+    }
+
+    // Phase A（P2-1/P2-2 快照根治，Hybrid）：以受控尺寸位圖快照根治
+    // 「無 ConstantState 直接透明」（P2-1）與「只 setBounds 拉伸」（P2-2）：在
+    // IO 執行緒把需快照的圖示以等比置中繪製到獨立方形位圖，產出普通
+    // BitmapDrawable 使後續 freshIconDrawable／sizedIcon 的 newDrawable 必
+    // 成功。dstPx 先以 clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX) 規範化
+    //（dp 經 dpPx，CAP 常量 192）；intrinsic<=0 以 dst 兜底為 effW/effH（P3-1），
+    // 建 ARGB_8888 方形位圖後以 Canvas translate/scale（用 fitScale／
+    // fitCenterRect）做等比，src 以 setBounds(0,0,effW,effH) 繪製（勿只
+    // setBounds），最後 BitmapDrawable + setBounds(0,0,dst,dst) 回傳；畫前存
+    // Rect(src.bounds)，finally 一律還原（含 CE／OOM／異常，還原自帶 CE 重拋＋
+    // Log.w），成功亦不影響出口 bounds（P3-2）；全程 CE 重拋，捕 OOM 回
+    // null+Log.w，失敗回 null 由呼叫端按 hasConstantState 分流（無 CS 記占位、
+    // 其餘記 raw）。Canvas draw 必須在 IO 執行緒且未掛 View，呼叫端已在
+    // withContext(IO) 內呼叫。
+    private fun bitmapSnapshotDrawable(src: Drawable, dstPx: Int): Drawable? {
+        val dst = clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX)
+        if (dstPx > 0 && dstPx != dp(36)) {
+            Log.w(TAG, "bitmapSnapshotDrawable dstPx drift")
+        }
+        val srcW = try {
+            src.intrinsicWidth
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable intrinsicWidth failed", e)
+            return null
+        }
+        val srcH = try {
+            src.intrinsicHeight
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable intrinsicHeight failed", e)
+            return null
+        }
+        val effW = if (srcW <= 0) dst else srcW
+        val effH = if (srcH <= 0) dst else srcH
+        val bmp: Bitmap = try {
+            Bitmap.createBitmap(dst, dst, Bitmap.Config.ARGB_8888)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "bitmapSnapshotDrawable OOM", e)
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable createBitmap failed", e)
+            return null
+        }
+        val savedBounds: Rect? = try {
+            Rect(src.bounds)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable bounds read failed", e)
+            null
+        }
+        try {
+            val canvas = Canvas(bmp)
+            val rect = fitCenterRect(effW, effH, dst)
+            val scale = fitScale(effW, effH, dst)
+            canvas.translate(rect.left.toFloat(), rect.top.toFloat())
+            canvas.scale(scale, scale)
+            src.setBounds(0, 0, effW, effH)
+            src.draw(canvas)
+            val out = BitmapDrawable(resources, bmp)
+            out.setBounds(0, 0, dst, dst)
+            return out
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "bitmapSnapshotDrawable OOM", e)
+            try {
+                bmp.recycle()
+            } catch (e2: CancellationException) {
+                throw e2
+            } catch (e2: Exception) {
+                Log.w(TAG, "bitmapSnapshotDrawable recycle failed", e2)
+            }
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "bitmapSnapshotDrawable draw failed", e)
+            try {
+                bmp.recycle()
+            } catch (e2: CancellationException) {
+                throw e2
+            } catch (e2: Exception) {
+                Log.w(TAG, "bitmapSnapshotDrawable recycle failed", e2)
+            }
+            return null
+        } finally {
+            if (savedBounds != null) {
+                try {
+                    src.setBounds(savedBounds)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "bitmapSnapshotDrawable restore bounds failed", e)
+                }
+            }
+        }
+    }
+
+    // p26-2 Phase 2：合併 loadIcon acquire 失敗雙分支共用的 inflight 清理
+    // （CE 重拋供協作取消、其餘 Log.w 不吞），避免兩份 try/catch 重複。
+    private fun removeIconInflight(appKey: String) {
+        try {
+            iconInflight.remove(appKey)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "loadIcon inflight remove failed", e)
+        }
     }
 
     private fun loadIcon(pkg: String, appKey: String, onLoaded: (Drawable) -> Unit) {
@@ -3991,20 +4214,76 @@ class MainActivity : ComponentActivity() {
             // 即清 inflight 返回，允許下次列表重建時重試。
             try {
                 iconLoadSemaphore.acquire()
-            } catch (_: Exception) {
-                try {
-                    iconInflight.remove(appKey)
-                } catch (_: Exception) {
-                    // Best effort.
-                }
+            } catch (e: CancellationException) {
+                removeIconInflight(appKey)
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "loadIcon acquire failed", e)
+                removeIconInflight(appKey)
                 return@launch
             }
             try {
                 val drawable = withContext(Dispatchers.IO) {
-                    try {
+                    val rawDrawable = try {
                         packageManager.getApplicationIcon(pkg)
-                    } catch (_: Exception) {
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "loadIcon getApplicationIcon failed", e)
                         null
+                    }
+                    if (rawDrawable == null) {
+                        null
+                    } else {
+                        // Phase A 快照根治：IO 執行緒內以 shouldUseSnapshot(normalized)
+                        // 判斷是否快照；normalized 為 hasConstantState（constantState
+                        // 安全讀取）、intrinsicW/H（讀取異常以 -1 補齊，CE 重拋）與
+                        // isBitmapNonFillGravity（raw is BitmapDrawable && raw.gravity
+                        // != Gravity.FILL 安全讀取，CE 重拋、其餘 Log.w 以 false 補齊）。
+                        // 需快照時在 IO 執行緒以 bitmapSnapshotDrawable 繪製獨立位圖
+                        //（Canvas 未掛 View，快照接線不改 Canvas 變換：bounds==bitmap 大小
+                        // 時 CENTER 與 FILL 同 rect）；快照成功快取快照值。取捨：無
+                        // ConstantState 的 raw 經 fresh／sized 必走占位，快照失敗記
+                        // transparentPlaceholder(dp(36)) 而非 raw，避免快取永遠無法
+                        // 複製的 raw；其餘快照失敗快取原始 drawable（不直接透明）。
+                        // 既有 evict/markLoaded/onLoaded 不變。
+                        val hasConstantState = try {
+                            rawDrawable.constantState != null
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon constantState check failed", e)
+                            false
+                        }
+                        val intrinsicW = try {
+                            rawDrawable.intrinsicWidth
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon intrinsicWidth failed", e)
+                            -1
+                        }
+                        val intrinsicH = try {
+                            rawDrawable.intrinsicHeight
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon intrinsicHeight failed", e)
+                            -1
+                        }
+                        val isBitmapNonFillGravity = try {
+                            if (rawDrawable is BitmapDrawable) rawDrawable.gravity != Gravity.FILL else false
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "loadIcon gravity check failed", e)
+                            false
+                        }
+                        if (shouldUseSnapshot(hasConstantState, intrinsicW, intrinsicH, isBitmapNonFillGravity)) {
+                            bitmapSnapshotDrawable(rawDrawable, dp(36)) ?: if (!hasConstantState) transparentPlaceholder(dp(36)) else rawDrawable
+                        } else {
+                            rawDrawable
+                        }
                     }
                 }
                 if (drawable == null) return@launch
@@ -4016,8 +4295,10 @@ class MainActivity : ComponentActivity() {
             } finally {
                 try {
                     iconLoadSemaphore.release()
-                } catch (_: Exception) {
-                    // Best effort.
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "loadIcon release failed", e)
                 }
                 iconInflight.remove(appKey)
             }
@@ -4029,44 +4310,62 @@ class MainActivity : ComponentActivity() {
         if (cached != null) {
             iconDrawables.remove(appKey)
             iconDrawables[appKey] = cached
-            box.setCompoundDrawablesWithIntrinsicBounds(freshIconDrawable(cached), null, null, null)
+            try {
+                box.setCompoundDrawables(sizedIcon(cached, dp(SOURCE_ICON_DP)), null, null, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon checkbox paste failed", e)
+            }
             return
         }
         loadIcon(pkg, appKey) { drawable ->
-            val fresh = freshIconDrawable(drawable)
-            // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
-            // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
-            //（找不到＝已過濾掉／換 catalog，不貼）。
+            // 先定位目標列，再產生 sizedIcon（sizedIcon 內部保證永不回傳快取實例／非空）；
+            // 發起列仍掛載（tag＋parent 雙符合）則直貼；直貼拋出或該列已重建時，
+            // 都在當前容器內按 tag 找同一 key 的可見列重繪（找不到＝已過濾掉／換 catalog，不貼）。
+            var attached = false
             try {
                 if (box.tag == appKey && box.parent === sourceContainer) {
                     try {
-                        box.setCompoundDrawablesWithIntrinsicBounds(fresh, null, null, null)
-                    } catch (_: Exception) {
-                        // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
+                        box.setCompoundDrawables(sizedIcon(drawable, dp(SOURCE_ICON_DP)), null, null, null)
+                        attached = true
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "requestIcon direct paste failed", e)
+                        // 直貼失敗繼續走容器掃描找新行補圖，不吞掉。
                     }
-                } else {
+                }
+                if (!attached) {
                     for (i in 0 until sourceContainer.childCount) {
                         val child = sourceContainer.getChildAt(i)
                         if (child is CheckBox && child.tag == appKey) {
-                            val perView = try {
-                                drawable.constantState?.newDrawable()?.mutate() ?: fresh
-                            } catch (_: Exception) {
-                                fresh
+                            // sizedIcon 自帶 fallback，無需呼叫端再包 dead try/catch。
+                            try {
+                                child.setCompoundDrawables(sizedIcon(drawable, dp(SOURCE_ICON_DP)), null, null, null)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "requestIcon container paste failed", e)
                             }
-                            child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
                             break
                         }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon refill failed", e)
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
             // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
             // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
             try {
                 rebindClonedIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindCloned failed", e)
             }
         }
     }
@@ -4082,8 +4381,10 @@ class MainActivity : ComponentActivity() {
     private fun requestIcon(pkg: String, appKey: String, imageView: ImageView, gen: Int) {
         try {
             imageView.tag = appKey
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "requestIcon tag failed", e)
         }
         val cached = iconDrawables[appKey]
         if (cached != null) {
@@ -4091,8 +4392,10 @@ class MainActivity : ComponentActivity() {
             iconDrawables[appKey] = cached
             try {
                 imageView.setImageDrawable(freshIconDrawable(cached))
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon image paste failed", e)
             }
             return
         }
@@ -4101,27 +4404,38 @@ class MainActivity : ComponentActivity() {
             // Phase I I3：先跨容器/同容器重綁（tag 精確，找不到丟棄），再做 gen 門。
             try {
                 rebindClonedIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindCloned failed", e)
             }
             // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
             try {
                 rebindSourceIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindSource failed", e)
             }
             if (capturedGen != clonedGen) return@loadIcon
-            val fresh = freshIconDrawable(drawable)
             try {
                 if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
+                    // 僅在 attach 時複製，避免 detach 時浪費一次複製。
+                    val fresh = freshIconDrawable(drawable)
                     try {
                         imageView.setImageDrawable(fresh)
-                    } catch (_: Exception) {
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "requestIcon image paste failed", e)
                         // Best effort: 舊行 detach 後已由上重綁覆蓋。
                     }
                 }
                 // else 分支已由上重綁覆蓋（容器內按 tag 找同 key 行），此處不再重複。
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon refill failed", e)
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
         }
@@ -4133,13 +4447,9 @@ class MainActivity : ComponentActivity() {
     private fun rebindClonedIcon(appKey: String, drawable: Drawable) {
         if (!::clonedAppsContainer.isInitialized) return
         val target = findImageViewWithTag(clonedAppsContainer, appKey) ?: return
-        val perView = try {
-            drawable.constantState?.newDrawable()?.mutate()
-                ?: drawable.mutate()
-        } catch (_: Exception) {
-            drawable
-        }
-        target.setImageDrawable(perView)
+        // p26-2 Phase 1：ImageView 由固定 36dp layout 統一尺寸，此處保持
+        // freshIconDrawable（不經 sizedIcon）；rebind/呼叫端僅取 fresh 實例避免共用。
+        target.setImageDrawable(freshIconDrawable(drawable))
     }
 
     // Phase B B2：在來源容器內按 tag 找 CheckBox 重綁（找不到丟棄）。
@@ -4148,13 +4458,8 @@ class MainActivity : ComponentActivity() {
         for (i in 0 until sourceContainer.childCount) {
             val child = sourceContainer.getChildAt(i)
             if (child is CheckBox && child.tag == appKey) {
-                val perView = try {
-                    drawable.constantState?.newDrawable()?.mutate()
-                        ?: drawable.mutate()
-                } catch (_: Exception) {
-                    drawable
-                }
-                child.setCompoundDrawablesWithIntrinsicBounds(perView, null, null, null)
+                val perView = sizedIcon(drawable, dp(SOURCE_ICON_DP))
+                child.setCompoundDrawables(perView, null, null, null)
                 break
             }
         }
@@ -4169,8 +4474,10 @@ class MainActivity : ComponentActivity() {
                     if (found != null) return found
                 }
             }
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "findImageViewWithTag failed", e)
         }
         return null
     }
@@ -4183,8 +4490,10 @@ class MainActivity : ComponentActivity() {
                 if (p === clonedAppsContainer) return true
                 p = (p as? View)?.parent
             }
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "isUnderClonedContainer failed", e)
         }
         return false
     }
@@ -4237,6 +4546,26 @@ class MainActivity : ComponentActivity() {
 
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
+
+        // p26-2 統一圖示尺寸（圖形尺寸與容器尺寸分開定義，勿混用）：
+        // SOURCE_ICON_DP = 來源 CheckBox 左圖圖形 24dp（setBounds 強制）、
+        // CLONED_ICON_DP = 分身 ImageView 圖形 36dp（layout 固定）、
+        // ICON_CONTAINER_DP = 2144 行分身列左圖外框 FrameLayout 44dp（容器，非圖形）。
+        // 圖形尺寸都經 dp() 轉 px；CheckBox 另以 setBounds 強制，避免各 App 原生
+        // intrinsic 尺寸（density/adaptive icon）不一導致忽大忽小。
+        // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 以
+        // SAFEZONE_SCALE=66/72 把 108dp 圖層縮到 viewport 內，24dp 外框對應安全區名義上約 22dp；
+        // 可見 glyph 仍由圖檔、留白與 mask 決定，不能由此固定折算成更小的確定百分比，
+        // 也不宜一律額外放大。保留「統一 bounds 不保證可見 glyph 等大，需視覺驗證」，
+        // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
+        // 行高 48dp／44dp 容器兜底。
+        private const val SOURCE_ICON_DP = 24
+        private const val CLONED_ICON_DP = 36
+        private const val ICON_CONTAINER_DP = 44
+
+        // Phase A 快照 OOM cap：位圖快照獨立位圖以 36dp 規範化後上限 192px，
+        // 避免高密度下建全尺寸位圖致 OOM（實際尺寸經 clampSnapshotPx 限位）。
+        private const val ICON_SNAPSHOT_CAP_PX = 192
 
         // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
         private const val MAX_LABEL_CACHE = 200

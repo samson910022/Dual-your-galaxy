@@ -87,9 +87,10 @@ data class CmdResult(
 // - "shizuku: bind failed: bind timed out after ..." (bind wrapper: the
 //   command never reached the service -- different knowledge state);
 // - "interrupted: ...", "spawn failed: ...", "service exec failed: ...",
-//   and any mid-line "timeout" word inside pm out/err. "interrupted: " and
-//   "service exec failed: " are owned by the post-spawn backstop below
-//   (isPostSpawnTransportText), NOT here: "interrupted:"/"service exec failed:" are post-spawn unknown
+//   "su failed post-spawn: ...", and any mid-line "timeout" word inside pm
+//   out/err. "interrupted: ", "service exec failed: " and "su failed
+//   post-spawn: " are owned by the post-spawn backstop below
+//   (isPostSpawnTransportText), NOT here: they are post-spawn unknown
 //   (may have executed), while "spawn failed:" is pre-spawn definite
 //   (process never started).
 // Both prefixes contain a space, which a package name can never contain, so
@@ -111,23 +112,34 @@ internal fun isServiceTimeoutText(err: String): Boolean =
 // - Post-spawn unknown (spawn succeeded, pm may have executed, reply lost):
 //   "interrupted: ..." (su/service wait or drain join interrupted after
 //   spawn -- captureProcess wait-interrupt and drain-join-interrupt paths,
-//   plus the SuCmdGateway.run InterruptedException catch) and
+//   plus the SuCmdGateway.run InterruptedException catch),
 //   "service exec failed: ..." (GalaxyExecService.onTransact catch around
 //   captureProcess -- any exception escaping the service-side capture after
-//   spawn started). Both arrive over the frozen (exit, out, err) wire with
+//   spawn started), and
+//   "su failed post-spawn: ..." (SuCmdGateway.captureProcess drain-setup
+//   failure or outer guard after Runtime.exec() already started the
+//   process). All three arrive over the frozen (exit, out, err) wire with
 //   flags lost, so DualRepository.isUnknownAfterSend matches them by these
 //   anchored prefixes (fail closed: read-only verifyListProbe, no resend).
 // Anchoring is exact (startsWith, case-exact, trailing ": " included) so
 // normal pm outputs -- including "Failure [...]" lines, which start with a
-// capital F -- can never hit. Mid-line "interrupted"/"service exec failed"
-// words inside pm out/err are excluded by the same anchoring.
+// capital F -- can never hit. Mid-line occurrences inside pm out/err are
+// excluded by the same anchoring.
 // Wire layout stays frozen: no new parcel field, old payloads compatible.
 // Pure, no I/O -- covered by VerifyRetryTest predicate locks.
 private const val INTERRUPTED_PREFIX = "interrupted: "
 private const val SERVICE_EXEC_FAILED_PREFIX = "service exec failed: "
+// SuCmdGateway.captureProcess post-spawn catch (drain-setup failure or outer
+// guard after Runtime.exec() already started the process): the process may
+// have executed, so the frozen-wire reply (flags lost) must be treated as
+// unknown-after-send. Anchored startsWith so mid-line occurrences inside pm
+// output cannot trigger a false positive.
+private const val SU_FAILED_POST_SPAWN_PREFIX = "su failed post-spawn: "
 
 internal fun isPostSpawnTransportText(err: String): Boolean =
-    err.startsWith(INTERRUPTED_PREFIX) || err.startsWith(SERVICE_EXEC_FAILED_PREFIX)
+    err.startsWith(INTERRUPTED_PREFIX) ||
+    err.startsWith(SERVICE_EXEC_FAILED_PREFIX) ||
+    err.startsWith(SU_FAILED_POST_SPAWN_PREFIX)
 
 // Abstraction over SHELL (Shizuku) and ROOT (su/hook) execution channels.
 // Implementations must never throw for command failure; report via CmdResult.
