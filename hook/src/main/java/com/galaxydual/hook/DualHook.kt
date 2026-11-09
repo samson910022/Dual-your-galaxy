@@ -240,7 +240,13 @@ class DualHook : XposedModule() {
                 if (overloads.isEmpty()) {
                     continue
                 }
-                overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) classInstalled++ }
+                overloads.forEach {
+                    try {
+                        if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) classInstalled++
+                    } catch (t: Throwable) {
+                        logi("hook install failed: ${target.name}#${methodName}: ${t.message}")
+                    }
+                }
             }
             if (classInstalled > 0) {
                 logi("using ${target.name} for daagent query hooks (+$classInstalled)")
@@ -423,7 +429,8 @@ class DualHook : XposedModule() {
         // layout, so subpackage variants are all tried; first hit does NOT
         // win -- every loadable class is hooked. Query methods only;
         // install/remove paths are never listed here.
-        private val DAAGENT_QUERY_CLASS_CANDIDATES = listOf(
+        // internal for contract tests; read-query candidates only.
+        internal val DAAGENT_QUERY_CLASS_CANDIDATES = listOf(
             "com.samsung.android.da.daagent.provider.DualAppDBHelper",
             "com.samsung.android.da.daagent.db.DualAppDBHelper",
             "com.samsung.android.da.daagent.DualAppDBHelper",
@@ -435,7 +442,8 @@ class DualHook : XposedModule() {
         )
 
         // Read-query method names only (extend-only WhitelistPolicy.apply).
-        private val DAAGENT_QUERY_METHOD_NAMES = listOf(
+        // internal for contract tests; read-query candidates only.
+        internal val DAAGENT_QUERY_METHOD_NAMES = listOf(
             "getAllInstalledWhitelistedPackages",
             "getWhitelistedPackages",
             "getWhitelistPackages",

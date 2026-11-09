@@ -79,7 +79,7 @@ class DaagentQueryPolicyTest {
     }
 
     @Test
-    fun staticFinalHolderPatchStaysObserveOnlySoMethodHookIsRequired() {
+    fun staticFinalHolderPatchIsObserveOnly_methodLevelHookRequiredForPolicy() {
         // Static-final bypass evaluation: even with a non-empty policy the
         // holder patch must NOT write -- the method-level query hook above
         // is the only path that can carry the policy.
