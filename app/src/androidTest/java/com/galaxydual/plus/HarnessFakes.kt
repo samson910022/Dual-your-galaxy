@@ -168,6 +168,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
 fun newHarnessViewModel(
     gw: FakeHarnessGateway,
     preference: ChannelPreference = ChannelPreference.AUTO,
+    selectionStore: SelectionStore? = null,
 ): DualViewModel =
     DualViewModel(
         repo = DualRepository(gw),
@@ -185,6 +186,7 @@ fun newHarnessViewModel(
         currentChannel = ResolvedChannel.ROOT,
         hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
         hookDiagnosticGateways = { emptyList() },
+        selectionStore = selectionStore,
     )
 
 fun awaitHarnessReady(vm: DualViewModel, timeoutMs: Long = 15_000L) {
