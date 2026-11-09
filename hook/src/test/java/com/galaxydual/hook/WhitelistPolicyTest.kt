@@ -303,4 +303,245 @@ class WhitelistPolicyTest {
         assertEquals(1, logs.size)
         assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
     }
+
+    // A4: boxed Boolean runtime with ambiguous/non-Boolean declared return must not
+    // trigger Boolean rewrite (fail-closed), even when index/signature/extra match.
+    @Test
+    fun booleanFalseDeclaredObjectIsObserveOnlyEvenWithValidIndexAndExtra() {
+        val original = java.lang.Boolean.valueOf(false)
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = listOf("com.listed.app"),
+            extra = setOf("com.listed.app"),
+            methodDesc = "m",
+            onLog = log,
+            packageArgIndex = 0,
+            declaredReturnType = Any::class.java,
+            strictSignature = true,
+        )
+
+        assertSame(original, out)
+        assertEquals(false, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+        assertTrue(
+            "expected non-Boolean declared return marker, was: ${logs.single()}",
+            logs.single().contains("non-Boolean declared return"),
+        )
+    }
+
+    @Test
+    fun booleanFalseDeclaredJavaObjectIsObserveOnlyEvenWithValidIndexAndExtra() {
+        val out = WhitelistPolicy.apply(
+            result = java.lang.Boolean.valueOf(false),
+            args = listOf("com.listed.app"),
+            extra = setOf("com.listed.app"),
+            methodDesc = "m",
+            onLog = log,
+            packageArgIndex = 0,
+            declaredReturnType = java.lang.Object::class.java,
+            strictSignature = true,
+        )
+
+        assertEquals(false, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun booleanFalseDeclaredJavaLangBooleanStillAllowsRewrite() {
+        val out = WhitelistPolicy.apply(
+            result = java.lang.Boolean.valueOf(false),
+            args = listOf("com.listed.app"),
+            extra = setOf("com.listed.app"),
+            methodDesc = "m",
+            onLog = log,
+            packageArgIndex = 0,
+            declaredReturnType = java.lang.Boolean::class.java,
+            strictSignature = true,
+        )
+
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanFalseDeclaredPrimitiveBooleanStillAllowsRewrite() {
+        val out = WhitelistPolicy.apply(
+            result = java.lang.Boolean.valueOf(false),
+            args = listOf("com.listed.app"),
+            extra = setOf("com.listed.app"),
+            methodDesc = "m",
+            onLog = log,
+            packageArgIndex = 0,
+            declaredReturnType = java.lang.Boolean.TYPE,
+            strictSignature = true,
+        )
+
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    // A2: empty generic collections must not be poisoned when merge would add
+    // elements and element type is not verified as String.
+    private interface GenericFixtures {
+        fun stringList(): List<String>
+        fun intList(): List<Int>
+        fun stringSet(): Set<String>
+        fun intSet(): Set<Int>
+        @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+        fun rawList(): java.util.List<*>
+    }
+
+    @Test
+    fun emptyIntListWithIntGenericAndExtraIsObserveOnly() {
+        val original = ArrayList<Int>() as List<*>
+        val generic = GenericFixtures::class.java.getMethod("intList").genericReturnType
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+            genericReturnType = generic,
+        )
+
+        assertSame(original, out)
+        assertEquals(emptyList<Any?>(), out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+        assertTrue(
+            "expected unverified/generic marker, was: ${logs.single()}",
+            logs.single().contains("unverified collection element type/generic"),
+        )
+    }
+
+    @Test
+    fun emptyIntSetWithIntGenericAndExtraIsObserveOnly() {
+        val original = HashSet<Int>() as Set<*>
+        val generic = GenericFixtures::class.java.getMethod("intSet").genericReturnType
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.Set::class.java,
+            genericReturnType = generic,
+        )
+
+        assertSame(original, out)
+        assertEquals(emptySet<Any?>(), out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun emptyListWithVerifiedStringGenericAndExtraMerges() {
+        val original = ArrayList<String>() as List<*>
+        val generic = GenericFixtures::class.java.getMethod("stringList").genericReturnType
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+            genericReturnType = generic,
+        )
+
+        assertEquals(listOf("com.x"), out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun emptySetWithVerifiedStringGenericAndExtraMerges() {
+        val original = LinkedHashSet<String>() as Set<*>
+        val generic = GenericFixtures::class.java.getMethod("stringSet").genericReturnType
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.Set::class.java,
+            genericReturnType = generic,
+        )
+
+        assertTrue(out is Set<*>)
+        assertEquals(setOf("com.x"), out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun emptyListWithNullGenericAndExtraIsObserveOnly() {
+        val original = ArrayList<String>() as List<*>
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+            genericReturnType = null,
+        )
+
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun emptyListWithRawClassGenericAndExtraIsObserveOnly() {
+        val original = ArrayList<String>() as List<*>
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("com.x"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+            genericReturnType = java.util.List::class.java,
+        )
+
+        assertSame(original, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun nonEmptyAllStringListStillMergesWithNullGenericCompat() {
+        val original = ArrayList(listOf("a")) as List<*>
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("b"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+            genericReturnType = null,
+        )
+
+        assertEquals(listOf("a", "b"), out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun nonEmptyAllStringSetStillMergesWithNullGenericCompat() {
+        val original = LinkedHashSet(listOf("a")) as Set<*>
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("b"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.Set::class.java,
+            genericReturnType = null,
+        )
+
+        assertTrue(out is Set<*>)
+        assertEquals(setOf("a", "b"), out)
+        assertTrue(logs.isEmpty())
+    }
 }

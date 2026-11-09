@@ -2,6 +2,10 @@
 package com.galaxydual.hook
 
 import java.lang.reflect.Executable
+import java.lang.reflect.ParameterizedType
+import java.lang.reflect.Type
+import java.lang.reflect.TypeVariable
+import java.lang.reflect.WildcardType
 
 import java.util.NavigableSet
 import java.util.SortedSet
@@ -38,9 +42,20 @@ object WhitelistPolicy {
     // [strictSignature] is true, an unverified index is observe-only. Empty
     // [extra] never rewrites.
     //
+    // A4 (fail-closed): runtime Boolean results are rewritten only when
+    // [declaredReturnType] is absent/null or boolean-like (`boolean`/`java.lang.Boolean`).
+    // If a declared non-Boolean return is provided (e.g. `Object`/`Any`), a boxed
+    // Boolean runtime result stays observe-only and the original is returned.
+    //
     // Collections/arrays are extended only when element types are safe and the
     // merged value is compatible with [declaredReturnType] (when provided).
     // Sorted/Navigable sets and non-String containers stay observe-only.
+    // A2 (fail-closed): for `List`/`Set`, non-empty containers with any non-String
+    // element are observe-only. Empty containers (or cases where merge would add
+    // elements) require a verified String element generic via [genericReturnType]
+    // when merge would add elements; runtime-all-String non-empty containers remain
+    // mergeable for compatibility. Unverified/raw/generic-mismatch => observe-only
+    // when merge would add elements.
     // Anything unrecognized is observe-only: returned unchanged plus one
     // diagnosable log line.
     fun apply(
@@ -52,8 +67,17 @@ object WhitelistPolicy {
         packageArgIndex: Int? = null,
         declaredReturnType: Class<*>? = null,
         strictSignature: Boolean = false,
+        genericReturnType: Type? = null,
     ): Any? {
         if (result is Boolean) {
+            if (declaredReturnType != null && !isBooleanLikeDeclaredReturn(declaredReturnType)) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
+                        "result with non-Boolean declared return ${declaredReturnType.name}; " +
+                        "returning original",
+                )
+                return result
+            }
             if (result) return true
             if (extra.isEmpty()) return false
             val effectiveIndex = packageArgIndex ?: if (strictSignature) {
@@ -89,6 +113,14 @@ object WhitelistPolicy {
                 )
                 return result
             }
+            val wouldAddElements = extra.any { !result.contains(it) }
+            if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "unverified collection element type/generic for list; returning original",
+                )
+                return result
+            }
             val merged = result + extra.filter { !result.contains(it) }
             return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
@@ -104,6 +136,14 @@ object WhitelistPolicy {
                 onLog(
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                         "set with non-String elements; returning original",
+                )
+                return result
+            }
+            val wouldAddElements = extra.any { !result.contains(it) }
+            if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "unverified collection element type/generic for set; returning original",
                 )
                 return result
             }
@@ -138,6 +178,42 @@ object WhitelistPolicy {
                 "returning original",
         )
         return result
+    }
+
+    // A4: declared returns that are boolean-like keep Boolean rewrite behavior.
+    // A boxed Boolean runtime result with an ambiguous/non-Boolean declared type
+    // (e.g. Object/Any) must stay observe-only (fail-closed).
+    private fun isBooleanLikeDeclaredReturn(declaredReturnType: Class<*>): Boolean =
+        declaredReturnType == java.lang.Boolean.TYPE ||
+            declaredReturnType == java.lang.Boolean::class.java
+
+    // A2: when merge would add String extras to a List/Set, require evidence that
+    // the container's element type is String. Non-empty containers that have
+    // already passed runtime "all elements are String" checks are treated as
+    // runtime-verified (safe). Empty containers have no runtime element evidence,
+    // so require a verified String generic; raw/unparameterized/null/unverifiable
+    // generics are fail-closed when adding.
+    private fun isVerifiedStringCollectionGeneric(
+        genericReturnType: Type?,
+        runtimeResult: Collection<*>,
+    ): Boolean {
+        if (runtimeResult.isNotEmpty()) return true
+        if (genericReturnType == null) return false
+        if (genericReturnType is Class<*>) {
+            // Raw class (not parameterized) - cannot verify element type.
+            return false
+        }
+        if (genericReturnType is ParameterizedType) {
+            val args = genericReturnType.actualTypeArguments
+            if (args.isEmpty()) return false
+            val elementArg = args[0]
+            return elementArg is Class<*> && elementArg == String::class.java
+        }
+        // TypeVariable, WildcardType, GenericArrayType, etc. - not verified.
+        if (genericReturnType is TypeVariable<*> || genericReturnType is WildcardType) {
+            return false
+        }
+        return false
     }
 
     // Conservative/limited legacy heuristic (non-strict callers only): returns an
