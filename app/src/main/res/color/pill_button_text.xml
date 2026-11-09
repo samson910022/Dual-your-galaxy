@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- Phase UI P1: primary pill-button text follows the view enabled state so a
+     disabled button gets the gray token instead of staying white-on-primary. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:state_enabled="false"
+        android:color="@color/oneui_disabled_text" />
+    <item android:color="@color/oneui_button_text" />
+</selector>
