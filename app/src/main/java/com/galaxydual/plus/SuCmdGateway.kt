@@ -219,13 +219,12 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     }
     // Drain both pipes on daemon threads: reading stdout to EOF while stderr
     // sits unfilled can deadlock once the stderr pipe buffer fills.
-    // Known limitation (PR-2 Phase 3, R8): each StringBuilder has exactly one
-    // writer thread and the steady path joins both drains before reading, but
-    // StringBuilder itself is unsynchronized, and on the timeout path
-    // join(2_000) can expire while a drain thread is still appending, racing
-    // with the buildResult read below. Accepted as extremely low risk (2 s
-    // grace on kilobyte-scale pm output; worst case is a torn tail that the
-    // trusted parse already treats as untrusted), never silently trusted.
+    // Concurrency (#54 Phase1): out/err are StringBuilder guarded by
+    // synchronized(sink) -- drainCapped appends under the same lock and
+    // capped()/snapshot copy under it too, so the timeout path's
+    // join(2_000) expiry read is an atomic snapshot, never a torn
+    // StringBuilder (writer append vs reader toString race). The blocking
+    // read() itself stays outside the lock, so a snapshot never waits on I/O.
     val out = StringBuilder()
     val err = StringBuilder()
     // Per-stream drain outcomes (Phase B, issue #22 P1-#2): AtomicReferences
@@ -884,37 +883,49 @@ internal fun buildResult(
     return CmdResult(exit = exit, out = capped(out, outTrunc), err = capped(err, errTrunc), truncated = truncated)
 }
 
+// Snapshot copy of a drain sink: the toString() copy runs under the same
+// synchronized(sink) lock drainCapped appends with, so a join-expiry /
+// timeout-path read racing a still-appending drain returns an atomic
+// snapshot, never a torn StringBuilder (count vs backing-array mismatch).
+internal fun snapshot(sink: StringBuilder): String = synchronized(sink) { sink.toString() }
+
 // Reads all of input into sink up to MAX_CAPTURE_CHARS; closes the stream.
 // Returns the drain outcome; already-appended characters are preserved on
 // every path, including READ_ERROR. Internal (not private) so JVM unit tests
 // cover it with an injectable failing-stream fixture (GatewayAssemblyTest).
+// Synchronized writes (#54 Phase1): the length check + room computation +
+// append are one synchronized(sink) critical section, so concurrent drains
+// hammering one sink never overflow the cap and a snapshot racing an append
+// is never torn. The blocking reader.read() stays outside the lock.
 internal fun drainCapped(input: java.io.InputStream, sink: StringBuilder): DrainStatus {
     return try {
         input.bufferedReader().use { reader ->
             val buf = CharArray(8_192)
             var outcome: DrainStatus? = null
             while (outcome == null) {
-                if (sink.length >= MAX_CAPTURE_CHARS) {
+                if (synchronized(sink) { sink.length } >= MAX_CAPTURE_CHARS) {
                     outcome = DrainStatus.CAPPED
                 } else {
                     val n = reader.read(buf, 0, buf.size)
                     if (n < 0) {
                         outcome = DrainStatus.EOF
                     } else {
-                        val room = MAX_CAPTURE_CHARS - sink.length
-                        if (n > room) {
-                            // The cap cuts inside this chunk: bytes were
-                            // dropped, so report CAPPED even if the stream
-                            // ends right after. A stream ending EXACTLY on
-                            // the cap boundary also reports CAPPED (next loop
-                            // pass sees sink.length >= MAX): a conservative
-                            // false-positive, fail-closed and consistent with
-                            // the old isCapped semantics -- never a missed
-                            // truncation.
-                            sink.append(buf, 0, room)
-                            outcome = DrainStatus.CAPPED
-                        } else {
-                            sink.append(buf, 0, n)
+                        synchronized(sink) {
+                            val room = MAX_CAPTURE_CHARS - sink.length
+                            if (n > room) {
+                                // The cap cuts inside this chunk: bytes were
+                                // dropped, so report CAPPED even if the stream
+                                // ends right after. A stream ending EXACTLY on
+                                // the cap boundary also reports CAPPED (next loop
+                                // pass sees sink.length >= MAX): a conservative
+                                // false-positive, fail-closed and consistent with
+                                // the old isCapped semantics -- never a missed
+                                // truncation.
+                                sink.append(buf, 0, room)
+                                outcome = DrainStatus.CAPPED
+                            } else {
+                                sink.append(buf, 0, n)
+                            }
                         }
                     }
                 }
@@ -934,8 +945,11 @@ internal fun drainCapped(input: java.io.InputStream, sink: StringBuilder): Drain
 // read error, join expiry, or kill path) so text-sniffing consumers (trusted
 // parser fallback, Shizuku client via decodeExecReply) observe the same flag
 // the producer sets. Internal for the same testability reason as above.
-internal fun capped(sink: StringBuilder, truncated: Boolean): String =
-    if (truncated) sink.toString() + "\n$TRUNCATION_MARKER" else sink.toString()
+// Uses snapshot() so the copy is atomic vs a still-appending drain (#54).
+internal fun capped(sink: StringBuilder, truncated: Boolean): String {
+    val snap = snapshot(sink)
+    return if (truncated) snap + "\n$TRUNCATION_MARKER" else snap
+}
 
 // ROOT gateway: executes core-built pm commands via `su -c`.
 // DEVICE-UNVERIFIED: su presence/behavior varies by ROM; verified only by
