@@ -99,8 +99,13 @@ class LifecycleSeparationTest {
                 cmd.contains(">") || cmd.contains("<") || cmd.contains("|") ||
                 cmd.contains("&") || cmd.contains("\\")
 
+        private val LIST_PACKAGES = Regex("""pm list packages --user \d+""")
+        private val INSTALL_RE = Regex("""pm install-existing --user \d+ [A-Za-z0-9._-]+""")
+        private val UNINSTALL_RE = Regex("""pm uninstall --user \d+ [A-Za-z0-9._-]+""")
+
         private fun isWrite(cmd: String): Boolean =
             hasShellSeparator(cmd) ||
+                INSTALL_RE.matches(cmd) || UNINSTALL_RE.matches(cmd) ||
                 cmd.contains("pm install") || cmd.contains("pm uninstall") ||
                 cmd.contains("rm ") || cmd.contains("chmod") || cmd.contains("chown") ||
                 cmd.contains("pm grant") || cmd.contains("pm revoke")
@@ -111,9 +116,7 @@ class LifecycleSeparationTest {
             cmd == DualRepository.CMD_USER_LIST_VERBOSE -> true
             cmd == DualRepository.CMD_DUMPSYS_USER -> true
             cmd == DualRepository.CMD_GETPROP_DUAL -> true
-            cmd.startsWith("pm install-existing") -> false
-            cmd.startsWith("pm uninstall") -> false
-            cmd.startsWith("pm list packages") -> true
+            LIST_PACKAGES.matches(cmd) -> true
             else -> false
         }
 
@@ -169,13 +172,13 @@ class LifecycleSeparationTest {
                 installedForUser.remove(pkg)
                 CmdResult(exit = 0, out = "Success", err = "")
             }
-            cmd.startsWith("pm list packages") ->
+            LIST_PACKAGES.matches(cmd) ->
                 CmdResult(
                     exit = 0,
                     out = installedForUser.map { "package:$it" }.joinToString("\n"),
                     err = "",
                 )
-            else -> CmdResult(exit = 0, out = "ok", err = "")
+            else -> CmdResult(exit = 127, out = "", err = "unexpected command: $cmd")
         }
     }
 
@@ -612,7 +615,13 @@ class LifecycleSeparationTest {
         // Serial-bound persistence: the on-disk entry must carry serial=15.
         assertTrue(backend.map[SELECTION_KEY]!!.contains("serial=15"))
 
-        // Destroy VM A (cancel its scope) to simulate process death.
+        // Pending consent must survive persistence until the restart boundary:
+        // re-check immediately before destroy so the VM-B null proof is real.
+        val pendingBeforeDestroy = vmA.state.value.pendingRemove
+        assertNotNull("VM-A pending must survive persist until destroy", pendingBeforeDestroy)
+
+        // Destroy VM A (cancel its scope) to simulate VM recreation (same
+        // process; a real process-kill is covered by instrumentation below).
         try {
             vmA.viewModelScope.cancel()
         } catch (_: Exception) {
