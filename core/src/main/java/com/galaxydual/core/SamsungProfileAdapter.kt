@@ -201,23 +201,76 @@ object SamsungProfileAdapter {
     private const val FQ_PREFIX_DOT = "android.os.usertype."
 
     // `user type` keyword core shared by TYPE_LINE/TYPE_KEYWORD/EXPLICIT_SEP.
+    // FQ guard (superuser/note FQ fix): the keyword must not sit inside a
+    // dotted path (`android.os.usertype.profile.CLONE`). The lookbehind
+    // blocks both `superuser`-embedded (`...suser type`, alnum) and
+    // FQ-internal (`.usertype`, dot) hits; TYPE_KEYWORD additionally
+    // rejects a trailing `.` so FQ-internal `usertype.` never counts as a
+    // separator-less keyword (otherwise the fallback remainder
+    // `... android.os..profile.CLONE` fails closed to OTHER instead of
+    // staying UNKNOWN).
     private const val USER_TYPE_PREFIX = "user[\\s_\\-]*type"
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
     private val TYPE_LINE =
-        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+
+    // Bare S24 `Type:` lines (issue #58, Android 17 dumpsys user): e.g.
+    // `Type: android.os.usertype.profile.CLONE`. Anchored to line start
+    // (after whitespace) so mid-line `superuser type:` never matches --
+    // that shape must stay UNKNOWN via the existing left-boundary guard.
+    // Case-insensitive, `:`/`=` with surrounding spaces tolerated.
+    // Value is group 1; classification reuses classifyMention plus the
+    // fail-closed known-OTHER gate below (unknown tail -> block UNKNOWN,
+    // never OTHER/Absent).
+    private val BARE_TYPE_LINE =
+        Regex("^\\s*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+
+    // Known non-clone tails for bare `Type:` values (fail-closed gate):
+    // FQ `full.`/`system.` prefixes are known categories (direct OTHER);
+    // `profile.` MUST still validate the tail (a non-clone unknown profile
+    // tail -> UNKNOWN, never OTHER). Bare tails below are known Android
+    // user-type tails. Anything else with no recognized token is unknown ->
+    // block UNKNOWN (never OTHER, so typed Absent can never converge on it;
+    // resolveDual stays Unknown/Refused).
+    // BARE example: `  superuser type: profile.CLONE` (leading spaces, but
+    // `type` not at line start) never matches BARE_TYPE_LINE -> UNKNOWN via
+    // the existing left-boundary guard, same as mid-line `note=Type: ...`.
+    private val KNOWN_OTHER_TAILS = setOf(
+        "other", "private", "managed", "secondary", "system",
+        "guest", "demo", "restricted", "headless", "car",
+    )
+
+    private fun isKnownOtherBareValue(value: String): Boolean {
+        val low = value.lowercase(java.util.Locale.ROOT)
+        // `full.`/`system.` are known categories: direct OTHER (fail-closed
+        // short-circuit is safe here because no unknown `full.`/`system.`
+        // tail may authorize a write; they can only ever be OTHER).
+        if (low.contains("full.") || low.contains("system.")) return true
+        // `profile.` must NOT short-circuit: an unknown profile tail
+        // (e.g. `android.os.usertype.profile.FOO_BAR`) is UNKNOWN, never
+        // OTHER. Fall through to the tail allowlist check below.
+        val tail = low.substringAfterLast('.').trim()
+            .split(Regex("[^a-z0-9]+")).lastOrNull { it.isNotEmpty() } ?: ""
+        return tail in KNOWN_OTHER_TAILS
+    }
 
     // Fallback keyword for separator-less ROM forms such as
     // `usertype profile.MANAGED` (no `:`/`=`). Any body line carrying the
     // keyword counts as an explicit type statement. Left boundary guards
-    // against mid-token hits (PmOutputParser convention).
+    // against mid-token hits (PmOutputParser convention); the dot guards
+    // additionally exclude FQ-internal `usertype` (see above) so lines like
+    // `superuser type: android.os.usertype.profile.CLONE` or
+    // `note=Type: android.os.usertype.profile.CLONE` carry no keyword and
+    // stay UNKNOWN instead of falling back to OTHER.
     private val TYPE_KEYWORD =
-        Regex("(?<![A-Za-z0-9])$USER_TYPE_PREFIX", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])$USER_TYPE_PREFIX(?!\\.)", RegexOption.IGNORE_CASE)
 
     // Explicit `:`/`=` separator after the keyword: lines matching this take
     // the explicit-value path, never the separator-less fallback path.
+    // Same dotted-path lookbehind as TYPE_LINE (FQ-internal never explicit).
     private val EXPLICIT_SEP =
-        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
 
     // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
     // Left boundary so `transparentId`/`grandparentId` never match.
@@ -481,20 +534,48 @@ object SamsungProfileAdapter {
         // to `?` (never allowlisted, never a separator) so a smuggled tail
         // fails closed to OTHER via the residual check instead of being cut.
         val text = UNICODE_LINE_END.replace(body, "?")
-        // Step 1: explicit `user type :/= value` lines, token-level.
+        // Step 1: explicit `user type :/= value` lines, token-level, plus
+        // bare S24 `Type:` lines (issue #58). `User type:` matches TYPE_LINE
+        // anywhere; bare `Type:` matches only at line start (BARE_TYPE_LINE)
+        // so `superuser type:` stays UNKNOWN.
         for (line in text.lines()) {
-            val m = TYPE_LINE.find(line) ?: continue
-            val value = m.groupValues[1].trim()
+            val m = TYPE_LINE.find(line)
+            if (m != null) {
+                val value = m.groupValues[1].trim()
+                if (value.isEmpty()) continue
+                val (segClone, segOther) = classifyMention(value)
+                if (segClone && segOther) return ProfileUserType.UNKNOWN
+                if (segClone) hasCloneSeg = true
+                if (segOther) hasOtherSeg = true
+                continue
+            }
+            val b = BARE_TYPE_LINE.find(line) ?: continue
+            val value = b.groupValues[1].trim()
             if (value.isEmpty()) continue
             val (segClone, segOther) = classifyMention(value)
             if (segClone && segOther) return ProfileUserType.UNKNOWN
-            if (segClone) hasCloneSeg = true
-            if (segOther) hasOtherSeg = true
+            if (segClone && !segOther) {
+                hasCloneSeg = true
+                continue
+            }
+            if (!segClone && segOther) {
+                if (isKnownOtherBareValue(value)) {
+                    hasOtherSeg = true
+                } else {
+                    return ProfileUserType.UNKNOWN
+                }
+                continue
+            }
+            // Unreachable: classifyMention never returns (false, false) --
+            // empty token list yields (false, true), and a non-empty token
+            // list yields at least one of (clone, other) true (taint only
+            // forces segOther true). Kept as fail-closed UNKNOWN.
+            return ProfileUserType.UNKNOWN
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
         // Same token rule applied to the remainder after the keyword.
         for (line in text.lines()) {
-            if (TYPE_LINE.find(line) != null) continue
+            if (TYPE_LINE.find(line) != null || BARE_TYPE_LINE.find(line) != null) continue
             if (!TYPE_KEYWORD.containsMatchIn(line)) continue
             if (EXPLICIT_SEP.containsMatchIn(line)) continue
             val remainder = TYPE_KEYWORD.replaceFirst(line, "").trim()
