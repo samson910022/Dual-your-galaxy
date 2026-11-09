@@ -3631,7 +3631,8 @@ class MainActivity : ComponentActivity() {
                 .setTitle(getString(R.string.batch_confirm_title))
                 .setMessage(message)
                 .setView(acknowledgement)
-                .setCancelable(!s.loading)
+                // 預確認請求可隨時中止（避免 busy/loading 卡死）；確認仍受 canConfirmBatch 門控。
+                .setCancelable(true)
                 .setPositiveButton(getString(R.string.batch_confirm_positive), null)
                 .setNegativeButton(getString(R.string.dialog_cancel), null)
                 .setOnCancelListener { cancelBatchConfirm() }
@@ -3685,9 +3686,9 @@ class MainActivity : ComponentActivity() {
             batchAcknowledgedGeneration = null
             return
         }
-        // 目標不再可確認（refresh 降級/漂移）：請求失效，關閉對話框；
-        // 禁用原因由 batchResultView 顯示（不可靜默）。
-        if (!verifiedTargetAvailable(s)) {
+        // 目標/勾選不再可確認（refresh 降級/漂移、勾選清空）：請求失效，關閉對話框；
+        // 禁用/目標原因由 batchResultView 顯示（不可靜默），不得殘留「建立 0 個」摘要。
+        if (!verifiedTargetAvailable(s) || s.selectedKeys.isEmpty()) {
             cancelBatchConfirm()
             return
         }
@@ -3696,10 +3697,12 @@ class MainActivity : ComponentActivity() {
             liveSerial != request.targetSerial ||
             s.selectedKeys.size != request.count
         ) {
+            // verifiedTargetAvailable 已保證 serial 非 null 且勾選非空；此處顯式不變式。
+            val verifiedSerial = checkNotNull(liveSerial) { "verified target missing serial" }
             val regenerated = request.copy(
                 count = s.selectedKeys.size,
                 targetId = s.inventory.targetId,
-                targetSerial = liveSerial ?: request.targetSerial,
+                targetSerial = verifiedSerial,
                 generation = request.generation + 1,
             )
             batchGeneration = regenerated.generation
@@ -3741,9 +3744,10 @@ class MainActivity : ComponentActivity() {
         try {
             batchConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
                 canConfirmBatch(s, batchAcknowledged)
-            batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !s.loading
-            batchConfirmDialog?.setCancelable(!s.loading)
-            batchConfirmDialog?.setCanceledOnTouchOutside(!s.loading)
+            // 預確認請求可隨時中止（避免 busy/loading 卡死）；確認仍受 canConfirmBatch 門控。
+            batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+            batchConfirmDialog?.setCancelable(true)
+            batchConfirmDialog?.setCanceledOnTouchOutside(true)
         } catch (_: Exception) {
             // Best effort: 無障礙屬性失敗不影響顯示。
         }
