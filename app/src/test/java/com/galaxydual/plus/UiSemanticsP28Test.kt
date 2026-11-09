@@ -412,6 +412,7 @@ class UiSemanticsP28Test {
             en.getValue("batch_target_unavailable").contains("Reconnect and refresh"),
         )
         // Stage1 批次建立兩步確認：sticky 勾選數（plural）＋確認對話框字串雙語齊備。
+        val hant = stringMap(resFile("values-b+zh+Hant/strings.xml"))
         assertTrue(
             "zh batch confirm message must name 警告/已驗證目標/勾選下方確認框",
             zh.getValue("batch_confirm_message").contains("警告") &&
@@ -424,6 +425,13 @@ class UiSemanticsP28Test {
                 en.getValue("batch_confirm_message").contains("Verified target") &&
                 en.getValue("batch_confirm_message").contains("check the confirmation box below"),
         )
+        // 格式佔位：batch_confirm_message 依序帶入 count/userId/serial（Locale.ROOT）。
+        for ((locale, map) in listOf("zh" to zh, "en" to en, "hant" to hant)) {
+            val msg = map.getValue("batch_confirm_message")
+            assertTrue("$locale batch_confirm_message needs %1\$d", msg.contains("%1\$d"))
+            assertTrue("$locale batch_confirm_message needs %2\$d", msg.contains("%2\$d"))
+            assertTrue("$locale batch_confirm_message needs %3\$d", msg.contains("%3\$d"))
+        }
         assertTrue(
             "batch_selected_count plural must exist in zh/en",
             pluralNames(resFile("values/strings.xml")).contains("batch_selected_count") &&
