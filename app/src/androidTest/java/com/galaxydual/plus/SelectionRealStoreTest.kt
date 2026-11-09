@@ -130,6 +130,16 @@ class SelectionRealStoreTest {
                 assertEquals(15, vmB.state.value.inventory.targetSerial)
                 assertNull(vmB.state.value.pendingRemove)
                 assertEquals(0, gwB.writeCalls)
+                assertEquals(0, gwB.installCalls)
+                assertEquals(0, gwB.uninstallCalls)
+                assertTrue(gwB.writeCommands.isEmpty())
+                assertTrue(gwB.unexpectedCommands.isEmpty())
+                // VM-A save path also issues zero device writes.
+                assertEquals(0, gw.writeCalls)
+                assertEquals(0, gw.installCalls)
+                assertEquals(0, gw.uninstallCalls)
+                assertTrue(gw.writeCommands.isEmpty())
+                assertTrue(gw.unexpectedCommands.isEmpty())
             } finally {
                 vmB.dispose()
             }
