@@ -2,7 +2,7 @@
 //
 // Phase D1 (P1 legacy fixed-tag migration cleanup): JVM unit tests for the
 // one-time legacy record removal. The run() call site (after ping/permission,
-// before the v13 gate, before the first per-UID v5 bind) is
+// before the v13 gate, before the first per-UID v6 bind) is
 // device-only: Shizuku statics and Parcels throw "Stub!" on the JVM, so
 // these tests drive ensureLegacyCleanupDone() directly through a fake
 // ShizukuLegacyCleaner. The production RealShizukuLegacyCleaner is never
