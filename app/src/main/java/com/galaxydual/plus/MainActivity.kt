@@ -1202,8 +1202,8 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            addView(cloneBtn, rowParams())
-            addView(removeBtn, rowParams())
+            addView(cloneBtn, spacedRowButtonParams())
+            addView(removeBtn, spacedRowButtonParams())
         }
         manualCard.addView(writeRow)
         tabAppsLayout.addView(manualCard)
@@ -1481,8 +1481,8 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(16)
             }
-            addView(refreshBtn, rowParams())
-            addView(exportBtn, rowParams())
+            addView(refreshBtn, spacedRowButtonParams())
+            addView(exportBtn, spacedRowButtonParams())
         }
         tabEngineLayout.addView(engineActionRow)
 
@@ -2204,6 +2204,7 @@ class MainActivity : ComponentActivity() {
             // Center details
             val textContainer = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
+                minimumWidth = dp(96)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     marginStart = dp(10)
                     marginEnd = dp(8)
@@ -2284,6 +2285,10 @@ class MainActivity : ComponentActivity() {
                 setTextColor(getColorStateList(R.color.pill_button_secondary_text))
                 textSize = 12f
                 maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                // PR #63 review: cap growth on small width/large font so the app-name
+                // column (weight=1 + minWidth) keeps readable space.
+                maxWidth = dp(132)
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
@@ -2301,7 +2306,10 @@ class MainActivity : ComponentActivity() {
                     vm.requestRemove(pkg)
                 }
             }
-            row.addView(removeRowBtn)
+            row.addView(
+                removeRowBtn,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
             clonedAppsContainer.addView(row)
             // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
             // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。
@@ -2411,8 +2419,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-            // Phase UI P1：併排按鈕（建立/移除、重新連線/匯出）間距，避免 pill 相貼。
+        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+    // PR #63 review: spacing only for paired pill-button rows. Leaking margins
+    // from rowParams() inset single-button rows (hookDiag) and added extra width.
+    private fun spacedRowButtonParams(): LinearLayout.LayoutParams =
+        rowParams().apply {
             val m = dp(6)
             marginStart = m
             marginEnd = m
