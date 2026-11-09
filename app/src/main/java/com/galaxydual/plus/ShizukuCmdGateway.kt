@@ -354,6 +354,34 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
         truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
     )
 
+// Pure request-side validation (JVM-testable): Parcel.readString() is nullable
+// and a null/blank wire cmd must never spawn `sh -c ""` (empty shell would
+// exit 0 and be misjudged as a successful empty command). Returns a definite
+// bad-request CmdResult (exit=1, no timedOut/transportUnknown: pre-spawn,
+// never sent) for null/blank, null for a usable command. GatewayAssemblyTest
+// pins null/blank -> bad request.
+internal fun badRequestForBlankCommand(raw: String?): CmdResult? =
+    if (raw == null || raw.isBlank()) {
+        CmdResult(exit = 1, out = "", err = "bad request: blank command")
+    } else {
+        null
+    }
+
+// Pure nullable-reply decode (JVM-testable): Parcel.readString() is nullable;
+// folding null to "" would forge a clean-empty reply (exit 0 + empty streams
+// parses as TrustedFull) for a post-dispatch reply loss, so null is
+// transportUnknown (timedOut=false, transportUnknown=true -> repository
+// reconciles read-only via verifyListProbe, never a definite failure or
+// auto resend). Non-null delegates verbatim to decodeExecReply(), so the
+// marker -> truncated logic above is unaffected. GatewayAssemblyTest pins
+// null out/err -> transportUnknown and non-null marker round-trip.
+internal fun decodeExecReplyNullable(exit: Int, out: String?, err: String?): CmdResult =
+    if (out == null || err == null) {
+        ShizukuExecErrors.transportUnknown("null reply string (outNull=${out == null}, errNull=${err == null})")
+    } else {
+        decodeExecReply(exit, out, err)
+    }
+
 // Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
 // err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
 // paths log it locally in DEBUG builds only). Delegates to
@@ -486,14 +514,27 @@ class GalaxyExecService : Binder {
                     writeDenied(reply)
                     return true
                 }
-                val cmd = try {
-                    data.readString() ?: ""
+                val rawCmd = try {
+                    data.readString()
                 } catch (e: Exception) {
                     reply?.writeInt(1)
                     reply?.writeString("")
                     reply?.writeString("bad request: ${(e.message ?: e.javaClass.simpleName)}")
                     return true
                 }
+                // Null/blank wire cmd must never spawn `sh -c ""`: reply the
+                // same frozen bad-request shape as the read-failure path
+                // above (exit=1, no flags, pre-spawn definite failure).
+                val badRequest = badRequestForBlankCommand(rawCmd)
+                if (badRequest != null) {
+                    val (badExit, badOut, badErr) = encodeExecReply(badRequest)
+                    reply?.writeInt(badExit)
+                    reply?.writeString(badOut)
+                    reply?.writeString(badErr)
+                    return true
+                }
+                // Safe: badRequest == null implies rawCmd is non-null non-blank.
+                val cmd = rawCmd!!
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
                 // (binder thread), so call it directly.
@@ -517,7 +558,15 @@ class GalaxyExecService : Binder {
                     Thread.currentThread().interrupt()
                     CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
                 } catch (e: Exception) {
-                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
+                    // Unified truncated=true with the Interrupted branch above:
+                    // both are post-spawn unknown captures (partial output
+                    // possible), so fail closed to Unknown, never TrustedFull.
+                    // The flag itself is lost on the wire either way
+                    // (encodeExecReply carries only exit/out/err; the client
+                    // re-derives truncated from marker text and transportUnknown
+                    // from the "service exec failed: " backstop), so unifying
+                    // is wire-neutral and only fixes local semantic asymmetry.
+                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
@@ -977,18 +1026,34 @@ class ShizukuCmdGateway(
                     // so parsers can tell "clean empty" from "cut off"
                     // without changing any caller.
                     val execExit = reply.readInt()
-                    val execOut = reply.readString() ?: ""
-                    val execErr = reply.readString() ?: ""
-                    decodeExecReply(execExit, execOut, execErr)
+                    // Null reply strings are post-dispatch reply loss, NOT
+                    // clean-empty: decodeExecReplyNullable maps them to
+                    // transportUnknown (timedOut=false, transportUnknown=true
+                    // -> read-only verifyListProbe). Never fold to "" here,
+                    // which would forge exit=0 + empty as TrustedFull.
+                    // Non-null still delegates to decodeExecReply(), so the
+                    // marker -> truncated logic is unaffected.
+                    val execOut = reply.readString()
+                    val execErr = reply.readString()
+                    decodeExecReplyNullable(execExit, execOut, execErr)
                 } finally {
                     reply.recycle()
                     data.recycle()
                 }
             }
-            out ?: run {
+            val result = out ?: run {
                 bindMutex.withLock { dropBindingLocked() }
                 ShizukuExecErrors.timedOut()
             }
+            // Null-reply transportUnknown (decodeExecReplyNullable above) is
+            // a transport-loss failure path like the catch branches below:
+            // drop the stale cache so the next run() rebinds fresh. Only
+            // this path returns transportUnknown from inside the block, so
+            // this check never drops on a normal reply.
+            if (result.transportUnknown) {
+                bindMutex.withLock { dropBindingLocked() }
+            }
+            result
         } catch (e: CancellationException) {
             // Intentionally no dropBindingLocked() on the cancel path: the
             // orphan transact still owns the old handle but the driver serves
