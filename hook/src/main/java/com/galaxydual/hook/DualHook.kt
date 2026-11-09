@@ -5,6 +5,7 @@ import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
@@ -253,20 +254,21 @@ class DualHook : XposedModule() {
     // Caller-side wiring point (issue #10 Stage1, DEVICE-UNVERIFIED).
     //
     // Future device work resolves the inlined callers of [callee] for the
-    // running ROM/version (ART evidence required) and returns them here so
-    // hookWithCallerDeoptimize() can deoptimize callers + hook callee via
+    // running ROM/version (ART evidence required) and returns them here as
+    // Executables (methods or constructors) so hookWithCallerDeoptimize() can
+    // deoptimize callers + hook callee via
     // CallerDeoptPlan/HookInstaller.installWithCallers. Returns empty today,
     // which is exactly the current callee-only best-effort behavior -- no
     // blanket deoptimization of system_server. Not covered by JVM tests
     // beyond the empty default (instantiating DualHook needs the framework).
     @Suppress("UNUSED_PARAMETER")
-    internal fun knownCallersFor(callee: Method): List<Method> = emptyList()
+    internal fun knownCallersFor(callee: Method): List<Executable> = emptyList()
 
     // Caller-aware install seam (issue #10 Stage1, DEVICE-UNVERIFIED).
     // Wired to knownCallersFor(); with the current empty list it behaves
     // identically to hookWithDeoptimize(). Call sites stay on
     // hookWithDeoptimize() until per-ROM caller evidence exists, so behavior
-    // is unchanged today.
+    // is unchanged today. Callers may be methods or constructors (Executables).
     @Suppress("unused")
     private fun hookWithCallerDeoptimize(method: Method, hookId: String): Boolean =
         HookInstaller.installWithCallers(
