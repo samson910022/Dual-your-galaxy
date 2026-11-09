@@ -231,6 +231,13 @@ class UiSemanticsP28P2Test {
             inventory = InventorySnapshot.unknown(),
         )
         assertFalse(canConfirmBatch(noTarget, acknowledged = true))
+        val serialMissing = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            inventory = writableState().inventory.copy(targetSerial = null),
+        )
+        assertFalse(canConfirmBatch(serialMissing, acknowledged = true))
+        val emptySelection = writableState().copy(selectedKeys = emptySet())
+        assertFalse(canConfirmBatch(emptySelection, acknowledged = true))
     }
 
     @Test
