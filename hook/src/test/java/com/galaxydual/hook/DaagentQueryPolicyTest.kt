@@ -8,13 +8,16 @@ import org.junit.Test
 
 // Stage1 method-level apply path (JVM-testable pure-logic part).
 //
-// Models the daagent read queries named in docs/HOOK.md §1.3
-// (DualAppDBHelper.getAllInstalledWhitelistedPackages -> String[],
-// DAUtility.getWhiteListPkgs[*] -> List/Set<String>,
-// DualAppManager.*WhitelistPackage* -> Boolean) through the shared
-// WhitelistPolicy.apply decision plus the WhitelistPatch static-final
-// ObserveOnly rule. The DualHook install/callback itself needs an LSPosed
-// daagent process and is DEVICE-UNVERIFIED (not covered here).
+// Pure WhitelistPolicy merge/helper fixtures (policy shapes only; not proof of
+// actual Stage 1 hook targets). Models read-query result shapes through the
+// shared WhitelistPolicy.apply decision plus the WhitelistPatch static-final
+// ObserveOnly rule (DAUtility.getWhiteListPkgs[*] -> List/Set<String>,
+// DualAppManager.*WhitelistPackage* -> Boolean; String[] union fixture is
+// shape-only). Installed+whitelist composite queries (e.g.
+// getAllInstalledWhitelistedPackages) are excluded from Stage 1 hook
+// candidates (fail-closed; see docs/HOOK.md §1.3/§1.4). The DualHook
+// install/callback itself needs an LSPosed daagent process and is
+// DEVICE-UNVERIFIED (not covered here).
 class DaagentQueryPolicyTest {
 
     private val logs = mutableListOf<String>()
@@ -40,7 +43,8 @@ class DaagentQueryPolicyTest {
 
     @Test
     fun stringArrayQueryMergesExtrasOriginalUntouched() {
-        // getAllInstalledWhitelistedPackages shape: String[] union.
+        // String[] merge helper fixture (policy shape only; not a Stage 1 hook
+        // target; installed+whitelist composites excluded).
         val current = arrayOf("com.samsung.a")
         val out = WhitelistPolicy.apply(current, emptyList(), setOf("com.samsung.a", "com.listed.app"), "m", log)
         assertTrue(out is Array<*>)

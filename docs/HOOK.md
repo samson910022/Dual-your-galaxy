@@ -182,6 +182,11 @@ hook 是否真的安裝、攔截器 callback 是否被命中、符合 eligibilit
 LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPosed 執行行為、ART 內聯／
 去最佳化效果亦不在 JVM 測試範圍（見 §1.2 反內聯待辦）。
 
+**程式碼層級非空政策閘門（code gate，非裝置驗證）：** `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`
+（預設 `false`）關閉時，`PolicySource.effective(...)` 即使在 sanitized 合併後產生非空集合，也會
+**fail-closed 回傳空集合**（Stage 1 預設 observe-only 不變）。此閘門僅為程式碼層級阻擋，必須保持
+`false`，直到下列裝置硬閘門（hard gate）以裝置證據滿足後才考慮開啟；開啟本身不構成裝置驗證。
+
 **啟用任何非空政策前的硬閘門（hard gate，缺一不可）：**
 
 1. 裝置驗證每個欲 hook 查詢的**完整方法簽名＋宣告回傳型別**（dexdump／反編譯／framework 證據）。
@@ -330,6 +335,9 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   are hit on Samsung DAAgent/LSPosed). Before enabling any non-empty policy, meet the hard gate
   in §1.4 (device-verified signatures/return types, hook-install counts, callback-hit evidence,
   user/profile/install-state semantics, controlled empty vs non-empty comparison on target ROM).
+  A code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
+  `effective(...)` fail-closed (returns empty when closed) until that hard gate is satisfied;
+  this is a code gate, not device verification, and Stage 1 defaults remain unchanged.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>observe-only;
