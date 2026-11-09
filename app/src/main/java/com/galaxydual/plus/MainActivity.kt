@@ -75,7 +75,6 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
@@ -607,7 +606,7 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (light #FFFFFF 5.42 on primary; night
             // #002958 4.52 on primary_container via drawable-night).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener { vm.clone(pkgInput.text.toString()) }
@@ -616,7 +615,7 @@ class MainActivity : ComponentActivity() {
             id = R.id.remove_btn
             text = getString(R.string.action_remove)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             contentDescription = getString(R.string.remove_cd)
             minimumHeight = dp(48)
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
@@ -626,7 +625,7 @@ class MainActivity : ComponentActivity() {
             text = getString(R.string.action_reconnect)
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (see cloneBtn).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener {
@@ -638,7 +637,7 @@ class MainActivity : ComponentActivity() {
             id = R.id.perm_btn
             text = getString(R.string.action_request_shizuku)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             minimumHeight = dp(48)
             setOnClickListener { requestShizukuPermission() }
         }
@@ -699,7 +698,7 @@ class MainActivity : ComponentActivity() {
         hookDiagBtn = Button(this).apply {
             text = getString(R.string.action_diagnose_hook)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             contentDescription = getString(R.string.diagnose_hook_cd)
             minimumHeight = dp(48)
             setOnClickListener { vm.requestHookRedDiagnosis() }
@@ -750,7 +749,7 @@ class MainActivity : ComponentActivity() {
         exportBtn = Button(this).apply {
             text = getString(R.string.action_export_diagnosis)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             minimumHeight = dp(48)
             setOnClickListener { showDiagnosticExport() }
         }
@@ -787,7 +786,7 @@ class MainActivity : ComponentActivity() {
         systemToggleBtn = Button(this).apply {
             text = getString(R.string.system_apps_hidden)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (height is
             // WRAP_CONTENT so large fonts grow instead of clipping).
@@ -798,7 +797,7 @@ class MainActivity : ComponentActivity() {
         selectAllBtn = Button(this).apply {
             text = getString(R.string.action_select_visible)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -812,7 +811,7 @@ class MainActivity : ComponentActivity() {
         clearSelBtn = Button(this).apply {
             text = getString(R.string.action_clear_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -822,7 +821,7 @@ class MainActivity : ComponentActivity() {
         saveSelBtn = Button(this).apply {
             text = getString(R.string.action_save_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -832,7 +831,7 @@ class MainActivity : ComponentActivity() {
         cancelSaveBtn = Button(this).apply {
             text = getString(R.string.action_unsave_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -853,7 +852,7 @@ class MainActivity : ComponentActivity() {
             text = resources.getQuantityString(R.plurals.batch_create, 0, 0)
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (see cloneBtn).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
@@ -2089,11 +2088,11 @@ class MainActivity : ComponentActivity() {
     }
 
     // Phase B B1/B2/B4：分身列表渲染。
-    // B1：Switch 為 momentary action（彈回 checked，防視覺翻轉）＋門控
+    // B1：明確「移除」文字鈕（48dp）為 momentary action＋門控
     // isEnabled = !loading && blockKey == null（呼叫端傳 render 已算好的 blockKey，
     // 與 clone/remove/batch 同源）＋48dp 觸控目標＋移除語意 contentDescription。
     // B2：ImageView 先設 tag=appKey；coroutine capture clonedGen，過期丟棄。
-    // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
+    // B4：指紋未變只同步移除鈕 enabled，不重建（比照 renderSourceList）。
     private fun renderClonedApps(s: UiState, blockKey: BlockReason?, catalogKey: Int) {
         if (!::clonedAppsContainer.isInitialized) return
         // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook live 證據驅動（與徽章區同源
@@ -2110,7 +2109,8 @@ class MainActivity : ComponentActivity() {
                 val row = clonedAppsContainer.getChildAt(i) as? LinearLayout ?: continue
                 for (j in 0 until row.childCount) {
                     val child = row.getChildAt(j)
-                    if (child is Switch) child.isEnabled = !s.loading && writable
+                    // Phase UI P1：分身列移除鈕（明確文字鈕，tag=remove:pkg）同步門控。
+                    if (child is Button) child.isEnabled = !s.loading && writable
                 }
             }
             return
@@ -2275,16 +2275,19 @@ class MainActivity : ComponentActivity() {
             textContainer.addView(subtitleView)
             row.addView(textContainer)
 
-            // Switch toggle: momentary removal action, always visually checked.
-            // Toggling initiates safe two-phase removal (dialog), never a direct
-            // on/off state flip; disabled while busy or channel unwritable.
-            val toggleSwitch = Switch(this).apply {
-                isChecked = true
+            // 明確「移除」文字鈕（48dp）：點按仍走 requestRemove 二階段確認
+            // （對話框），行為與原 Switch 相同；不再以 Switch 偽裝成「開關」
+            // （取消勾選 ≠ 移除）。disabled while busy or channel unwritable.
+            val removeRowBtn = Button(this).apply {
+                text = getString(R.string.action_remove)
+                background = getDrawable(R.drawable.bg_pill_button_secondary)
+                setTextColor(getColorStateList(R.color.pill_button_secondary_text))
+                textSize = 12f
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
                 // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
-                tag = "switch:$pkg"
+                tag = "remove:$pkg"
                 // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
                 contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
@@ -2294,15 +2297,10 @@ class MainActivity : ComponentActivity() {
                     // 會誤擋有效點按；VM requestRemove 內含 fail-closed isWritable() 複查
                     // （權威門控，與 a28b56c 行為一致），此處不再用 captured 值攔截。
                     if (v?.isEnabled != true) return@setOnClickListener
-                    try {
-                        (v as? Switch)?.isChecked = true
-                    } catch (_: Exception) {
-                        // Best effort: 彈回失敗不阻塞移除請求。
-                    }
                     vm.requestRemove(pkg)
                 }
             }
-            row.addView(toggleSwitch)
+            row.addView(removeRowBtn)
             clonedAppsContainer.addView(row)
             // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
             // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。
@@ -2329,7 +2327,7 @@ class MainActivity : ComponentActivity() {
                         }
                         try {
                             // Phase G: full-width colon via remove_row_cd.
-                            toggleSwitch.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
+                            removeRowBtn.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
                         } catch (_: Exception) {
                             // Best effort.
                         }
@@ -2412,7 +2410,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun rowParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            // Phase UI P1：併排按鈕（建立/移除、重新連線/匯出）間距，避免 pill 相貼。
+            val m = dp(6)
+            marginStart = m
+            marginEnd = m
+        }
 
     // p28-1 通道 RadioButton 佈局（窄螢幕安全）：HorizontalScrollView 量測為
     // UNSPECIFIED，weight 權重（0 寬）在橫滑容器內會塌陷為零寬；此處改
@@ -3743,9 +3746,9 @@ class MainActivity : ComponentActivity() {
 
     // Phase F F1：分身行 label 回填 fallback（發起行已 detach 時走容器按 tag 查找）。
     // 同行內按 tag 更新：title（tag=pkg）設文字，badge（tag=badge:pkg）與
-    // Switch（tag=switch:pkg）更新 contentDescription；找不到丟棄（快取保留）。
-    // Switch 亦為 TextView 子類，故 title 查找另加型別守衛（title 建時只給純 TextView
-    // 設 tag=pkg，Switch 的 tag 為 switch:pkg）。
+    // 移除鈕（tag=remove:pkg）更新 contentDescription；找不到丟棄（快取保留）。
+    // 移除鈕為 Button（TextView 子類），故 title 查找另加型別守衛（title 建時只給
+    // 純 TextView 設 tag=pkg，移除鈕的 tag 為 remove:pkg）。
     private fun rebindClonedLabel(pkg: String, label: String) {
         try {
             if (!::clonedAppsContainer.isInitialized) return
@@ -3756,7 +3759,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     null
                 } ?: continue
-                if (title is Switch) continue
+                if (title is Button) continue
                 try {
                     title.text = label
                 } catch (_: Exception) {
@@ -3770,7 +3773,7 @@ class MainActivity : ComponentActivity() {
                 }
                 try {
                     // Phase G: full-width colon via remove_row_cd.
-                    row.findViewWithTag<Switch>("switch:$pkg")?.contentDescription =
+                    row.findViewWithTag<Button>("remove:$pkg")?.contentDescription =
                         getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 } catch (_: Exception) {
                     // Best effort.
