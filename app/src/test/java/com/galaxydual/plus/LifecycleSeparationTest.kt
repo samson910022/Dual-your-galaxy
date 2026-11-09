@@ -248,7 +248,7 @@ class LifecycleSeparationTest {
         val scopeJob = vm.viewModelScope.coroutineContext[Job]
             ?: throw AssertionError("viewModelScope has no Job")
         try {
-            await(timeoutMs) { scopeJob.children.none { it.isActive } }
+            await(timeoutMs) { scopeJob.children.all { it.isCompleted } }
         } catch (e: AssertionError) {
             throw AssertionError("timeout draining viewModelScope; state=${vm.state.value}")
         }
@@ -313,6 +313,7 @@ class LifecycleSeparationTest {
         vm.setSourceCatalog(catalog())
         vm.refresh()
         await { "0:com.example.chat" in vm.state.value.selectedKeys }
+        awaitScopeDrained(vm)
 
         assertEquals(
             "selected keys restored from snapshot (process-death recovery via refresh)",
@@ -343,6 +344,7 @@ class LifecycleSeparationTest {
         vmEmpty.setSourceCatalog(catalog())
         vmEmpty.refresh()
         await { vmEmpty.state.value.inventory.targetId > 0 }
+        awaitScopeDrained(vmEmpty)
         assertNull(vmEmpty.state.value.pendingRemove)
         assertTrue(vmEmpty.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwEmpty.installCalls.size)
@@ -368,6 +370,7 @@ class LifecycleSeparationTest {
         vmCorrupt.setSourceCatalog(catalog())
         vmCorrupt.refresh()
         await { backendCorrupt.writes.get() > writesBeforeCorrupt && backendCorrupt.map[SELECTION_KEY] == null }
+        awaitScopeDrained(vmCorrupt)
         assertNull(vmCorrupt.state.value.pendingRemove)
         assertTrue(vmCorrupt.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwCorrupt.installCalls.size)
@@ -435,6 +438,7 @@ class LifecycleSeparationTest {
         vm.refresh()
         // Await the actual self-clear write, not just the inventory transition.
         await { backend.writes.get() > writesBefore && backend.map[SELECTION_KEY] == null }
+        awaitScopeDrained(vm)
         assertNull(backend.map[SELECTION_KEY])
         assertNull(vm.state.value.pendingRemove)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
@@ -579,6 +583,7 @@ class LifecycleSeparationTest {
         vm.refresh()
         await { !vm.state.value.loading }
         await { backend.map[SELECTION_KEY] == null }
+        awaitScopeDrained(vm)
         // Mismatch is verified -> stale entry cleared, nothing restored.
         assertTrue(vm.state.value.selectedKeys.isEmpty())
         assertNull(backend.map[SELECTION_KEY])
@@ -599,6 +604,7 @@ class LifecycleSeparationTest {
         vmA.setSourceCatalog(catalog())
         vmA.refresh()
         await { vmA.state.value.inventory.targetId > 0 }
+        awaitScopeDrained(vmA)
 
         vmA.toggleSelection("0:com.example.chat")
         await { vmA.state.value.selectedKeys.contains("0:com.example.chat") }
@@ -638,6 +644,7 @@ class LifecycleSeparationTest {
         vmB.setSourceCatalog(catalog())
         vmB.refresh()
         await { "0:com.example.chat" in vmB.state.value.selectedKeys }
+        awaitScopeDrained(vmB)
 
         assertEquals(
             setOf("0:com.example.chat"),
