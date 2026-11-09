@@ -415,7 +415,11 @@ internal fun badRequestForCommand(raw: String?): CmdResult? {
     badRequestForBlankCommand(raw)?.let { return it }
     // raw is non-null/non-blank here by the check above; use a smart-cast
     // local instead of `!!` so a helper-contract regression cannot NPE.
-    val nonBlank = raw ?: return null
+    // Fail-closed on a helper-contract regression: never return null (which
+    // would let a null/blank/oversize command pass as "no bad request") --
+    // mirror the blank bad-request shape with a self-contained CmdResult so
+    // the guard does not depend on badRequestForBlankCommand's contract.
+    val nonBlank = raw ?: return CmdResult(exit = 1, out = "", err = "bad request: blank command")
     if (nonBlank.length > ShizukuExecProtocol.MAX_CMD_CHARS) {
         return CmdResult(
             exit = 1,
