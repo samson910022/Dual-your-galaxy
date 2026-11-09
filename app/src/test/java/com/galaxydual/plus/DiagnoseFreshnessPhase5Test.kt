@@ -841,23 +841,30 @@ class DiagnoseFreshnessPhase5Test {
     }
 
     @Test
-    fun refresh_verifiedDrift_mapsVerifyMismatch() {
-        // 分代 fake：refresh 內 listUsers #1/#2 走 95 世界，#3 起（null
-        // 複查）走 96 世界 → resolve 95 但複查 96 → VERIFY_MISMATCH。
+    fun refresh_singleSnapshot_driftLandsWholeNextRefresh() {
+        // Single-snapshot #53: refresh takes ONE listUsers snapshot, so a
+        // mid-refresh 95->96 rebuild cannot be spliced into a VERIFY_MISMATCH
+        // (there is no second snapshot/triple to disagree with the first).
+        // The 95 world publishes FRESH(95, 15) as a whole; the 96 world
+        // publishes FRESH(96, 15) as a whole on the next refresh -- never
+        // a mixed (95, ...) pair with 96's list.
         // 計數在 ready 後歸零（init probe 的 listUsers 不計入）。
-        val gw = FakeRepo(failListPackages = true, driftAfterListUsers = 3, driftId = 96)
+        val gw = FakeRepo(driftAfterListUsers = 2, driftId = 96)
         val clock = JumpClock()
         val vm = makeVm(gw, clock)
         await { vm.state.value.channelReady }
         gw.listUsersCalls = 0
         vm.refresh()
-        await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_MISMATCH }
-        assertEquals(
-            "drift inventory carries the new target",
-            96,
-            vm.state.value.inventory.targetId,
-        )
-        assertTrue("drift msg names the mismatch, got: ${vm.state.value.msg}", vm.state.value.msg.contains("mismatch"))
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
+        // Refresh #2 takes its own single snapshot, now in the 96 world.
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 96 }
+        assertEquals(InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertTrue(vm.state.value.cloned.contains("com.example.chat"))
     }
 
     // ---- 10. hook ----

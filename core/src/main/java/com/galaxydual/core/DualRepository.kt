@@ -42,7 +42,10 @@ sealed interface DualTargetResolution {
     data class Confirmed(val target: VerifiedDualTarget) : DualTargetResolution
 
     // The id is confirmed but no single agreed serial exists for it.
-    data class SerialUnavailable(val userId: Int) : DualTargetResolution
+    // Carries the resolver's agreed parentId alongside the id (#53) so the
+    // pinned pair (id, serial?, parentId) keeps a real parent instead of
+    // falling back to null at the call site.
+    data class SerialUnavailable(val userId: Int, val parentId: Int) : DualTargetResolution
 
     // Clean typed channels parsed fine but claim no dual profile.
     data object Absent : DualTargetResolution
@@ -186,6 +189,16 @@ sealed interface RemoveOutcome {
 sealed interface RefreshOutcome {
     data class ChannelError(val detail: String) : RefreshOutcome
     data class NoDual(val profiles: List<DualProfile>) : RefreshOutcome
+    // Snapshot parsed but the verified identity stays unconfirmable
+    // (Unknown/refused typed resolution: truncated/failed channels,
+    // conflicting serial/parent, missing property, pm veto, and similar).
+    // Fail closed like ChannelError for writes, but it is NOT a confirmed
+    // absence: callers must keep the old display list (NoDual's clearing
+    // must never be reused here). Detail names the typed refusal reason.
+    data class Unknown(
+        val profiles: List<DualProfile>,
+        val detail: String = "",
+    ) : RefreshOutcome
     data class GroundTruth(
         val profiles: List<DualProfile>,
         val target: VerifiedTarget,
@@ -580,7 +593,14 @@ class DualRepository(
                 // cannot be pinned.
                 val target = SamsungProfileAdapter.resolveDualTarget(candidates, propertyId)
                 if (target != null) DualTargetResolution.Confirmed(target)
-                else DualTargetResolution.SerialUnavailable(resolution.userId)
+                else {
+                    // Carry the agreed parentId (#53); resolveDual requires
+                    // it non-null equal-0 before Confirming, so a null here
+                    // fails closed to Unknown rather than guessing a parent.
+                    val parentId = resolution.parentId
+                        ?: return DualTargetResolution.Unknown("confirmed id without parent evidence")
+                    DualTargetResolution.SerialUnavailable(resolution.userId, parentId)
+                }
             }
             is DualResolution.Refused -> DualTargetResolution.Unknown(resolution.reason)
             is DualResolution.Unknown -> {
@@ -1755,24 +1775,61 @@ class DualRepository(
         is TrustedList.Unknown -> null
     }
 
-    // Single-target refresh (Phase D P2-D, issue #21): exactly one
-    // profilesSnapshot() (1 cmd) then one fetchVerifiedTarget() (3 cmds:
-    // verbose + dumpsys + property) then one listProbe(target.userId)
-    // (1 cmd, no re-resolution) = 5 commands total (was 9 via the old
-    // resolve-then-reverify listing path). Single target throughout, so
-    // resolve-to-list drift is inexpressible in this API: the listed id is
-    // always the resolved id. ChannelError early-returns; a null target or
-    // a target absent from the snapshot maps to NoDual(profiles) (profiles
-    // still carried for display); otherwise GroundTruth with cloned null
-    // when the list channel fails.
+    // Single-target refresh (Phase D P2-D, issue #21; single-snapshot
+    // rule #53): exactly one profilesSnapshot() (1 cmd) then one
+    // resolveDualTargetTyped() (3 cmds: verbose + dumpsys + property) then
+    // one listProbe(target.userId) (1 cmd, no re-resolution) = 5 commands
+    // total (was 9 via the old resolve-then-reverify listing path). Single
+    // snapshot + single triple + single listing throughout, so the VM sees
+    // one consistent (id, serial, parentId) pin: a 95->96 rebuild or a
+    // same-id new-serial splice can never be published as a fictional
+    // FRESH pair, because there is no second snapshot/triple to splice
+    // with. ChannelError early-returns; a typed Absent maps to NoDual
+    // (profiles still carried for display), except an empty snapshot
+    // (Absent + empty -> Unknown: a bare absence is never NoDual from an
+    // untrustworthy empty snapshot). A typed Unknown (refused /
+    // unconfirmable identity, incl. parent or serial conflicts and the pm
+    // veto) maps to Unknown (fail closed, keep the old list); likewise a
+    // Confirmed or SerialUnavailable id missing from the pm snapshot
+    // (not-in-snapshot -> Unknown, never NoDual) keeps the old list.
+    // Otherwise GroundTruth with cloned null when the list channel fails. The
+    // GroundTruth target always carries the resolver's true parentId
+    // (== 0 by policy, never a hardcoded null), so a disagreeing parent
+    // can only surface as Unknown here -- never as a FRESH listing on a
+    // drifted identity.
     suspend fun refreshVerified(): RefreshOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RefreshOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        val target = fetchVerifiedTarget() ?: return RefreshOutcome.NoDual(profiles)
-        if (profiles.none { it.userId == target.userId }) return RefreshOutcome.NoDual(profiles)
-        val cloned = listProbe(target.userId)
-        return RefreshOutcome.GroundTruth(profiles, target, cloned)
+        return when (val resolution = resolveDualTargetTyped(pmIds = profiles.map { it.userId }.toSet())) {
+            is DualTargetResolution.Confirmed -> {
+                val typed = resolution.target
+                if (profiles.none { it.userId == typed.userId }) {
+                    RefreshOutcome.Unknown(profiles, "confirmed id missing from pm snapshot")
+                } else {
+                    val target = VerifiedTarget(typed.userId, typed.serial, typed.parentId)
+                    RefreshOutcome.GroundTruth(profiles, target, listProbe(typed.userId))
+                }
+            }
+            is DualTargetResolution.SerialUnavailable -> {
+                if (profiles.none { it.userId == resolution.userId }) {
+                    RefreshOutcome.Unknown(profiles, "confirmed id missing from pm snapshot")
+                } else {
+                    // Serial not pinnable: pin (id, null, true parentId);
+                    // the listing still runs on this single id only.
+                    val target = VerifiedTarget(resolution.userId, null, resolution.parentId)
+                    RefreshOutcome.GroundTruth(profiles, target, listProbe(resolution.userId))
+                }
+            }
+            is DualTargetResolution.Absent -> {
+                // An empty snapshot is untrustworthy even with a clean typed
+                // absence (same rule as the old refreshLocked Absent gate):
+                // keep the identity unknown instead of claiming NoDual.
+                if (profiles.isEmpty()) RefreshOutcome.Unknown(profiles, "profiles snapshot empty despite typed absent")
+                else RefreshOutcome.NoDual(profiles)
+            }
+            is DualTargetResolution.Unknown -> RefreshOutcome.Unknown(profiles, resolution.detail)
+        }
     }
 
     // Unknown-after-send discriminator (PR-32 P1-1 timeout, extended by P1-2

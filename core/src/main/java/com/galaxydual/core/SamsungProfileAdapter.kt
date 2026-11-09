@@ -692,8 +692,14 @@ object SamsungProfileAdapter {
         candidates: Collection<ProfileIdentity>,
         propertyId: Int? = null,
     ): VerifiedDualTarget? {
-        val id = (resolveDual(candidates, propertyId) as? DualResolution.Confirmed)?.userId
+        val confirmed = resolveDual(candidates, propertyId) as? DualResolution.Confirmed
             ?: return null
+        val id = confirmed.userId
+        // Carry the resolver's agreed parentId (#53): resolveDual requires
+        // both verbose channels to carry it, equal and == 0, so a Confirmed
+        // target always bears a non-null parent; a null here (policy change
+        // elsewhere) still fails closed rather than guessing an owner parent.
+        val parentId = confirmed.parentId ?: return null
         // Pooled non-empty consensus: at least one verbose channel must
         // carry a serial, and every carried serial must agree; none (both
         // sides missing) or disagreement both map to null (fail closed).
@@ -705,6 +711,6 @@ object SamsungProfileAdapter {
             .mapNotNull { it.serial }
             .toSet()
         if (serials.size != 1) return null
-        return VerifiedDualTarget(userId = id, serial = serials.single())
+        return VerifiedDualTarget(userId = id, serial = serials.single(), parentId = parentId)
     }
 }

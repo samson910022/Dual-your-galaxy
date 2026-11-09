@@ -118,10 +118,11 @@ class RefreshVerifiedTest {
     }
 
     // Serial conflict across verbose channels (verbose serial 15 vs dumpsys
-    // serialNo 99): resolver Refuses -> fetchVerifiedTarget null -> NoDual,
-    // but the pm-list snapshot is still carried for display.
+    // serialNo 99): resolver Refuses -> typed Unknown -> RefreshOutcome
+    // Unknown (fail closed: keep the old list, never claim NoDual / never
+    // publish FRESH). The pm-list snapshot is still carried for display.
     @Test
-    fun serialConflict_returnsNoDualWithProfiles() {
+    fun serialConflict_returnsUnknownWithProfiles() {
         val dumpsysSerial99 =
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
@@ -131,14 +132,152 @@ class RefreshVerifiedTest {
                 "    userType=android.os.usertype.profile.CLONE\n"
         val gateway = FakeGateway(dumpsysOutput = dumpsysSerial99)
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
-        assertTrue("serial conflict must be NoDual, got: $outcome", outcome is RefreshOutcome.NoDual)
-        val noDual = outcome as RefreshOutcome.NoDual
+        assertTrue("serial conflict must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
         assertTrue(
-            "profiles must still be carried for display, got: ${noDual.profiles}",
-            noDual.profiles.any { it.userId == 95 },
+            "profiles must still be carried for display, got: ${unknown.profiles}",
+            unknown.profiles.any { it.userId == 95 },
+        )
+        assertTrue(
+            "detail must name the serial conflict, got: ${unknown.detail}",
+            unknown.detail.contains("serial"),
         )
         assertEquals(
             "no list probe may run once the target refuses, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+    }
+
+    // Parent drift across verbose channels (verbose parentId=0 vs dumpsys
+    // parentId=1): the resolver refuses the conflicting parent (#53), so
+    // the single snapshot can never publish a FRESH listing on the drifted
+    // identity -- it fails closed to Unknown with zero list probes. The
+    // pinned target carries its true parentId (== 0 by policy) on the
+    // happy path instead of a hardcoded null.
+    @Test
+    fun parentDrift_returnsUnknownAndNeverLists() {
+        val dumpsysParent1 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                "    parentId=1\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val gateway = FakeGateway(dumpsysOutput = dumpsysParent1)
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("parent drift must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue(
+            "detail must name the parent conflict, got: ${unknown.detail}",
+            unknown.detail.contains("parent"),
+        )
+        assertEquals(
+            "parent drift must never reach the list probe, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // Happy-path pin carries the resolver's true parentId (0, never null):
+    // a later expected-vs-fresh continuity comparison can see parent drift
+    // instead of skipping it with a null parent.
+    @Test
+    fun groundTruthTarget_carriesTrueParentId() {
+        val gateway = FakeGateway()
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("expected GroundTruth, got: $outcome", outcome is RefreshOutcome.GroundTruth)
+        assertEquals(0, (outcome as RefreshOutcome.GroundTruth).target.parentId)
+    }
+
+    // An empty snapshot with a clean typed absence stays Unknown (empty
+    // `pm list users` is untrustworthy -- same gate as the old
+    // refreshLocked Absent check): a bare absence must never be claimed
+    // as NoDual from an empty snapshot.
+    @Test
+    fun emptySnapshotTypedAbsent_mapsUnknown() {
+        val ownerVerbose =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n"
+        val ownerDumpsys =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n"
+        val gateway = FakeGateway(
+            listUsersOutput = "Users:\n",
+            userListVerboseOutput = ownerVerbose,
+            dumpsysOutput = ownerDumpsys,
+            propOutput = "",
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("empty snapshot must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        assertEquals(
+            "no list probe may run without a target, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+    }
+
+    // A confirmed id missing from the pm snapshot (typed channels confirm
+    // 95, but `pm list users` only lists 0) must stay Unknown -- never
+    // NoDual -- so the VM keeps the old cloned table instead of clearing
+    // it. Same fail-closed shape as Absent + empty snapshot above. Zero
+    // list probes may run once the id is missing from the snapshot.
+    @Test
+    fun confirmedNotInSnapshot_mapsUnknown() {
+        val gateway = FakeGateway(
+            listUsersOutput = "Users:\n\tUserInfo{0:Owner:13} running\n",
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("confirmed id missing from snapshot must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertEquals("confirmed id missing from pm snapshot", unknown.detail)
+        assertTrue(
+            "profiles snapshot must still be carried for display, got: ${unknown.profiles}",
+            unknown.profiles.any { it.userId == 0 } && unknown.profiles.none { it.userId == 95 },
+        )
+        assertEquals(
+            "no list probe may run once the confirmed id is missing from the snapshot, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+    }
+
+    // A serial-unavailable id missing from the pm snapshot (typed channels
+    // confirm 95 with no agreed serial, but `pm list users` only lists 0)
+    // must stay Unknown -- never NoDual -- so the VM keeps the old cloned
+    // table instead of clearing it. 保舊表語意由 VM 保證：此處只斷言 outcome
+    // Unknown 且零 list 探測。Same snapshot gate shape as Confirmed above.
+    @Test
+    fun serialUnavailableNotInSnapshot_mapsUnknown() {
+        val verboseNoSerial95 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} running:\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.CLONE\n"
+        val dumpsysNoSerial95 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400}:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val gateway = FakeGateway(
+            listUsersOutput = "Users:\n\tUserInfo{0:Owner:13} running\n",
+            userListVerboseOutput = verboseNoSerial95,
+            dumpsysOutput = dumpsysNoSerial95,
+            propOutput = "95\n",
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial-unavailable id missing from snapshot must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        assertEquals(
+            "no list probe may run once the serial-unavailable id is missing from the snapshot, got: ${gateway.commands}",
             0,
             gateway.listPackagesCount,
         )
