@@ -4,6 +4,7 @@ package com.galaxydual.core
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -26,10 +27,12 @@ class RefreshVerifiedTest {
         var listUsersErr: String = "",
         var userListVerboseOutput: String = DEFAULT_VERBOSE_95,
         var userListVerboseExit: Int = 0,
+        var userListVerboseTruncated: Boolean = false,
         var dumpsysOutput: String = DEFAULT_DUMPSYS_95,
         var dumpsysExit: Int = 0,
         var propOutput: String = DEFAULT_PROP_95,
         var propExit: Int = 0,
+        var verboseThrows: Boolean = false,
         var listPackagesOutput: String = "package:com.example.chat\npackage:com.example.mail\n",
         var listPackagesExit: Int = 0,
         var listPackagesErr: String = "",
@@ -59,13 +62,14 @@ class RefreshVerifiedTest {
                 }
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
                     verboseCount++
+                    if (verboseThrows) throw IOException("boom: $cmd")
                     val second = secondUserListVerboseOutput
                     val out = if (verboseCount > verboseFlipAfter && second != null) {
                         second
                     } else {
                         userListVerboseOutput
                     }
-                    CmdResult(exit = userListVerboseExit, out = out, err = "")
+                    CmdResult(exit = userListVerboseExit, out = out, err = "", truncated = userListVerboseTruncated)
                 }
                 cmd == DualRepository.CMD_DUMPSYS_USER -> {
                     dumpsysCount++
@@ -653,5 +657,94 @@ class RefreshVerifiedTest {
         assertEquals(0, gateway.dumpsysCount)
         assertEquals(0, gateway.propCount)
         assertEquals(0, gateway.listPackagesCount)
+    }
+
+    // B1: SerialUnavailable in the snapshot returns GroundTruth with a null
+    // serial and the true parentId 0. Both triples see the no-serial world
+    // (first triple AND post-list re-verify), so the strict null-sensitive
+    // fence matches: GroundTruth(95, null, 0) with the listed cloned.
+    // Budget is 1 snapshot + 2x triples + 1 list = 8 commands, never FRESH
+    // on a fictional serial spliced from another window.
+    @Test
+    fun serialUnavailableInSnapshot_returnsGroundTruthWithNullSerialAndParent0() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.VERBOSE_NO_SERIAL_95,
+            dumpsysOutput = FakeGateway.DUMPSYS_NO_SERIAL_95,
+            propOutput = "95\n",
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial-unavailable in snapshot must be GroundTruth, got: $outcome", outcome is RefreshOutcome.GroundTruth)
+        val ground = outcome as RefreshOutcome.GroundTruth
+        assertEquals(95, ground.target.userId)
+        assertNull("serial must stay null, never a fictional spliced serial, got: ${ground.target}", ground.target.serial)
+        assertEquals(0, ground.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), ground.cloned)
+        assertTrue("profiles must contain the target for display", ground.profiles.any { it.userId == 95 })
+        assertEquals(1, gateway.listUsersCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(8, gateway.commands.size)
+    }
+
+    // S3(a): Truncated identity evidence refuses the first triple. A
+    // truncated `cmd user list -v` capture is untrusted, never
+    // absence/presence evidence: RefreshOutcome.Unknown with the pm
+    // profiles carried, zero list probes, never FRESH (and never
+    // NoDual). Non-Refused Unknown-through-refreshVerified path.
+    @Test
+    fun truncatedIdentity_returnsUnknownWithProfilesAndZeroProbes() {
+        val gateway = FakeGateway(userListVerboseTruncated = true)
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("truncated identity must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue(
+            "profiles must still be carried for display, got: ${unknown.profiles}",
+            unknown.profiles.any { it.userId == 95 },
+        )
+        assertTrue(
+            "detail must name the truncated channel, got: ${unknown.detail}",
+            unknown.detail.contains("truncated"),
+        )
+        assertEquals(
+            "no list probe may run once the identity refuses, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+        assertEquals(1, gateway.listUsersCount)
+        assertEquals(1, gateway.verboseCount)
+        assertEquals(1, gateway.dumpsysCount)
+        assertEquals(0, gateway.propCount)
+    }
+
+    // S3(b): Throwing identity gateway refuses the first triple. A gateway
+    // that throws on an identity channel (spawn failure / binder death)
+    // maps to Unknown (fail closed), never a crash: RefreshOutcome.Unknown
+    // with the pm profiles carried, zero list probes, never FRESH.
+    // Non-Refused Unknown-through-refreshVerified path.
+    @Test
+    fun throwingIdentityGateway_returnsUnknownWithProfilesAndZeroProbes() {
+        val gateway = FakeGateway(verboseThrows = true)
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("throwing identity gateway must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue(
+            "profiles must still be carried for display, got: ${unknown.profiles}",
+            unknown.profiles.any { it.userId == 95 },
+        )
+        assertTrue(
+            "detail must name the throw, got: ${unknown.detail}",
+            unknown.detail.contains("threw"),
+        )
+        assertEquals(
+            "no list probe may run once the identity throws, got: ${gateway.commands}",
+            0,
+            gateway.listPackagesCount,
+        )
+        assertEquals(1, gateway.listUsersCount)
+        assertEquals(1, gateway.verboseCount)
+        assertEquals(0, gateway.dumpsysCount)
+        assertEquals(0, gateway.propCount)
     }
 }

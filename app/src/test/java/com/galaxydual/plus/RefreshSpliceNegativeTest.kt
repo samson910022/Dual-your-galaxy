@@ -57,6 +57,15 @@ class RefreshSpliceNegativeTest {
         var listPackagesCalls: Int = 0
         var installCalls: Int = 0
         var uninstallCalls: Int = 0
+        var failListPackages: Boolean = false
+        var listUsersExit: Int = 0
+        var listUsersErr: String = ""
+        // Minimal malformed-prop hook: when non-null, every identity (getprop)
+        // call returns this output verbatim (still consuming one ident per
+        // call so triple budgets stay honest). Used to drive
+        // Unknown("typed property channel malformed: ...") with untrusted
+        // text (e.g. an email) through resolveDualTargetTyped.
+        var propOverride: String? = null
 
         private fun nextSnap(): Int = if (snaps.size > 1) snaps.removeFirst() else snaps.first()
         private fun nextIdent(): IdentSpec =
@@ -94,7 +103,11 @@ class RefreshSpliceNegativeTest {
             cmd.trim() == "id -u" -> CmdResult(exit = 0, out = "0\n", err = "")
             cmd == DualRepository.CMD_LIST_USERS -> {
                 listUsersCalls++
-                CmdResult(exit = 0, out = usersOut(nextSnap()), err = "")
+                if (listUsersExit != 0 || listUsersErr.isNotEmpty()) {
+                    CmdResult(exit = listUsersExit, out = "", err = listUsersErr)
+                } else {
+                    CmdResult(exit = 0, out = usersOut(nextSnap()), err = "")
+                }
             }
             cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
                 identCalls++
@@ -107,13 +120,18 @@ class RefreshSpliceNegativeTest {
             cmd == DualRepository.CMD_GETPROP_DUAL -> {
                 val spec = nextIdent()
                 identCalls++
-                CmdResult(exit = 0, out = if (spec.id < 0) "" else "${spec.id}\n", err = "")
+                val out = propOverride ?: (if (spec.id < 0) "" else "${spec.id}\n")
+                CmdResult(exit = 0, out = out, err = "")
             }
             cmd.startsWith("pm list packages") -> {
                 val uid = userOfListCmd(cmd)
                 listPackagesCalls++
-                val pkgs = pkgsByUser[uid] ?: emptySet()
-                CmdResult(exit = 0, out = pkgs.map { "package:$it" }.joinToString("\n"), err = "")
+                if (failListPackages) {
+                    CmdResult(exit = 1, out = "", err = "Failure [list failed]")
+                } else {
+                    val pkgs = pkgsByUser[uid] ?: emptySet()
+                    CmdResult(exit = 0, out = pkgs.map { "package:$it" }.joinToString("\n"), err = "")
+                }
             }
             cmd.startsWith("pm install-existing") -> {
                 installCalls++
@@ -291,6 +309,8 @@ class RefreshSpliceNegativeTest {
         gw.idents.clear()
         gw.idents.addAll(ArrayDeque(List(30) { IdentSpec(-1, 0) }))
         val listProbesBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
         vm.refresh()
         awaitVm(vm) { !vm.state.value.loading && vm.state.value.msg.contains("cannot confirm dual profile") }
 
@@ -310,6 +330,12 @@ class RefreshSpliceNegativeTest {
             "unknown target must not probe the list, got: ${gw.listPackagesCalls}",
             listProbesBefore, gw.listPackagesCalls,
         )
+        // S2: refresh-driven Unknown = 1 snapshot + 1 triple + 0 list.
+        // The post-list fence Unknown (mid-refresh flip) runs both triples
+        // (6 idents + 1 list) -- the two shapes must stay distinguished.
+        assertEquals("refresh Unknown must take exactly one snapshot", 1, gw.listUsersCalls - listUsersBefore)
+        assertEquals("refresh Unknown must take one triple only (no re-verify)", 3, gw.identCalls - identsBefore)
+        assertEquals("refresh Unknown must take zero list probes", 0, gw.listPackagesCalls - listProbesBefore)
         assertEquals(0, gw.installCalls)
         assertEquals(0, gw.uninstallCalls)
     }
@@ -336,6 +362,8 @@ class RefreshSpliceNegativeTest {
         gw.idents.clear()
         gw.idents.addAll(ArrayDeque(List(30) { IdentSpec(95, 15, dumpsysParent = 1) }))
         val listProbesBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
         vm.refresh()
         awaitVm(vm) { !vm.state.value.loading && vm.state.value.msg.contains("cannot confirm dual profile") }
 
@@ -354,6 +382,12 @@ class RefreshSpliceNegativeTest {
             "parent drift must not probe the list, got: ${gw.listPackagesCalls}",
             listProbesBefore, gw.listPackagesCalls,
         )
+        // S2: refresh-driven Unknown = 1 snapshot + 1 triple + 0 list.
+        // The post-list fence Unknown (mid-refresh flip) runs both triples
+        // (6 idents + 1 list) -- the two shapes must stay distinguished.
+        assertEquals("refresh Unknown must take exactly one snapshot", 1, gw.listUsersCalls - listUsersBefore)
+        assertEquals("refresh Unknown must take one triple only (no re-verify)", 3, gw.identCalls - identsBefore)
+        assertEquals("refresh Unknown must take zero list probes", 0, gw.listPackagesCalls - listProbesBefore)
         assertEquals("zero installs on parent drift, got: ${gw.installCalls}", 0, gw.installCalls)
         assertEquals("zero uninstalls on parent drift, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
     }
@@ -514,6 +548,353 @@ class RefreshSpliceNegativeTest {
         assertEquals(95, s.inventory.targetId)
         assertEquals(null, s.inventory.targetSerial)
         assertTrue("serial-unavailable target must stay listed, got: ${s.cloned}", s.cloned.contains("com.example.chat"))
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // B2(a): Confirmed id missing from the pm snapshot (typed channels
+    // confirm 95, snapshot lists owner-only {0}): fail closed with CHANNEL
+    // + CHANNEL_ERROR (never NoDual, never FRESH), old cloned kept, the old
+    // inventory target (95, 15) kept, zero list probes, zero writes. The
+    // snapshot gate runs before the list probe, so the refresh consumes
+    // 1 snapshot + 1 triple + 0 list.
+    @Test
+    fun confirmedNotInSnapshot_keepsOldClonedAndNeverNoDual() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Phase 2: snapshot owner-only (-1), idents stay confirmed 95/15.
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(-1))
+        gw.idents.clear()
+        gw.idents.addAll(stable95(15))
+        val listBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, s.diagnose?.code)
+        assertFalse("missing-from-snapshot must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertTrue(
+            "must keep the old cloned list, never NoDual-clear, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertEquals(0, gw.listPackagesCalls - listBefore)
+        assertEquals(1, gw.listUsersCalls - listUsersBefore)
+        assertEquals(3, gw.identCalls - identsBefore)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // B2(b): SerialUnavailable id missing from the pm snapshot (typed
+    // channels confirm 95 with no serial, snapshot lists owner-only {0}):
+    // same fail-closed shape as B2(a) -- CHANNEL + CHANNEL_ERROR, old
+    // cloned kept, old target (95, 15) kept, zero list probes, zero
+    // writes. Never NoDual, never FRESH.
+    @Test
+    fun serialUnavailableNotInSnapshot_keepsOldCloned() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Phase 2: snapshot owner-only (-1), idents stay 95 with no serial.
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(-1))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(30) { IdentSpec(95, null) }))
+        val listBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, s.diagnose?.code)
+        assertFalse("missing-from-snapshot must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertTrue(
+            "must keep the old cloned list, never NoDual-clear, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertEquals(0, gw.listPackagesCalls - listBefore)
+        assertEquals(1, gw.listUsersCalls - listUsersBefore)
+        assertEquals(3, gw.identCalls - identsBefore)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // B3: List failure on the pinned target keeps the old cloned list and
+    // reports VERIFY_UNKNOWN (never FRESH). The pinned target (95, 15) is
+    // marked STALE, pmReadable stays true (`pm list users` was readable;
+    // only the clone listing is unknown), msg names "cannot list clones".
+    // Refresh consumes 1 snapshot + 2 triples + 1 list (the list ran, then
+    // the post-list fence passed on the same pinned target).
+    @Test
+    fun refresh_listFailure_keepsOldClonedAndVerifyUnknown() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        gw.failListPackages = true
+        val listBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_UNKNOWN }
+
+        val s = vm.state.value
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, s.diagnose?.code)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertTrue(
+            "list failure must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(true, s.pmReadable)
+        assertTrue(
+            "msg must name the list failure, got: ${s.msg}",
+            s.msg.contains("cannot list clones"),
+        )
+        assertEquals(1, gw.listPackagesCalls - listBefore)
+        assertEquals(1, gw.listUsersCalls - listUsersBefore)
+        assertEquals(6, gw.identCalls - identsBefore)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // S1: Refresh into Unknown keeps the user's selection (documented
+    // retention). The Unknown branch keeps the old cloned list and the old
+    // inventory target, so the selection stays bound to the same
+    // (95, 15) and must not be cleared; only a proven target move clears
+    // it (see splice_worldSwitch / splice_sameIdSerialRebuild).
+    @Test
+    fun unknown_keepsSelection() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        vm.setSourceCatalog(
+            listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+        )
+        vm.toggleSelection("0:com.example.chat")
+        assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
+
+        // Phase 2: verified identity vanishes (owner-only on all channels).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(30) { IdentSpec(-1, 0) }))
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.msg.contains("cannot confirm dual profile") }
+
+        val s = vm.state.value
+        assertFalse("unknown must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertTrue(
+            "Unknown must retain the selection (same bound target), got: ${s.selectedKeys}",
+            s.selectedKeys.contains("0:com.example.chat"),
+        )
+        assertTrue(
+            "Unknown must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // P2: ChannelError techDetail must be sanitized before truncation. A
+    // gateway detail carrying a raw email (foo@example.com) must never
+    // surface verbatim in techDetail; it is redacted to the <email> marker
+    // by sanitizeForDisplay (same rule as the same-branch msg and the
+    // diagnoseEvent sites at L1319/1727/2150). capDetail stays the second
+    // bound upstream.
+    @Test
+    fun channelError_techDetailRedactsEmail() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        gw.listUsersExit = 1
+        gw.listUsersErr = "connect to foo@example.com failed"
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        val tech = s.diagnose?.techDetail ?: ""
+        assertFalse(
+            "techDetail must not leak the raw email, got: $tech",
+            tech.contains("foo@example.com"),
+        )
+        assertTrue(
+            "techDetail must carry the <email> redaction marker, got: $tech",
+            tech.contains("<email>"),
+        )
+        assertTrue(
+            "techDetail must keep the channel-failure prefix, got: $tech",
+            tech.startsWith("profiles snapshot channel failed"),
+        )
+        assertFalse("channel error must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // Security (SHOULD): Unknown techDetail must be sanitized before
+    // truncation. A malformed property-channel payload carrying a raw email
+    // (foo@example.com) drives resolveDualTargetTyped to
+    // Unknown("typed property channel malformed: x foo@example.com"), and
+    // the VM Unknown branch (DualViewModel sanitizeForDisplay + take(200))
+    // must redact it to <email> -- the raw address must never surface in
+    // techDetail. Mirrors channelError_techDetailRedactsEmail for the
+    // Unknown arm (DualViewModel.kt:1151). Fail closed: never FRESH, the
+    // previously FRESH cloned list is kept.
+    @Test
+    fun unknown_techDetailRedactsEmail() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Phase 2: same (95, 15) world, but the property channel answers
+        // malformed text carrying an email. First triple refuses -> Unknown,
+        // zero list probes (1 snapshot + 1 triple + 0 list).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95))
+        gw.idents.clear()
+        gw.idents.addAll(stable95(15))
+        gw.propOverride = "x foo@example.com"
+        val listBefore = gw.listPackagesCalls
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        val tech = s.diagnose?.techDetail ?: ""
+        assertFalse(
+            "techDetail must not leak the raw email, got: $tech",
+            tech.contains("foo@example.com"),
+        )
+        assertTrue(
+            "techDetail must carry the <email> redaction marker, got: $tech",
+            tech.contains("<email>"),
+        )
+        assertTrue(
+            "techDetail must keep the unknown-identity prefix, got: $tech",
+            tech.startsWith("verified dual id unknown"),
+        )
+        assertTrue(
+            "techDetail must name the malformed property channel, got: $tech",
+            tech.contains("typed property channel malformed"),
+        )
+        assertFalse("unknown must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, s.diagnose?.code)
+        assertTrue(
+            "unknown must keep the previously fresh cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertEquals("refresh Unknown must take exactly one snapshot", 1, gw.listUsersCalls - listUsersBefore)
+        assertEquals("refresh Unknown must take one triple only (no re-verify)", 3, gw.identCalls - identsBefore)
+        assertEquals("refresh Unknown must take zero list probes", 0, gw.listPackagesCalls - listBefore)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+    }
+
+    // S5: Sequential two-refresh whole-world. Gen1 (95, 15) publishes
+    // FRESH whole; gen2 (96, 41) publishes FRESH whole on the next refresh.
+    // The final FRESH is gen2 whole -- never a spliced pair mixing either
+    // world's id/serial/list. Each refresh takes exactly one snapshot, so
+    // listUsers delta == number of refreshes (2), idents 12 (6 per
+    // refresh), list 2 (1 per refresh). Sequential only: the concurrent
+    // variant would be flake-prone, so no threads / no Thread.sleep are
+    // introduced here beyond the existing awaitVm harness poll.
+    @Test
+    fun splice_sequentialTwoRefresh_wholeWorld() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(
+                95 to mutableSetOf("com.example.chat"),
+                96 to mutableSetOf("com.example.chat"),
+            ),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        val listUsersBefore = gw.listUsersCalls
+        val identsBefore = gw.identCalls
+        val listBefore = gw.listPackagesCalls
+
+        // Refresh #1: gen1 whole (95, 15).
+        reachFresh95(gw, vm, serial = 15)
+        assertEquals(InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        // Refresh #2: gen2 whole (96, 41).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(96))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(30) { IdentSpec(96, 41) }))
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.inventory.targetId == 96 }
+
+        val s = vm.state.value
+        assertEquals(InventoryFreshness.FRESH, s.inventory.freshness)
+        assertEquals(96, s.inventory.targetId)
+        assertEquals(41, s.inventory.targetSerial)
+        assertTrue("gen2 chat must be listed whole, got: ${s.cloned}", s.cloned.contains("com.example.chat"))
+        assertFalse(
+            "must never publish a spliced pair (95,41), got: $s",
+            s.inventory.targetId == 95 && s.inventory.targetSerial == 41,
+        )
+        assertFalse(
+            "must never publish a spliced pair (96,15), got: $s",
+            s.inventory.targetId == 96 && s.inventory.targetSerial == 15,
+        )
+        assertEquals("two refreshes must take two snapshots", 2, gw.listUsersCalls - listUsersBefore)
+        assertEquals("two refreshes must take twelve idents (two triples each)", 12, gw.identCalls - identsBefore)
+        assertEquals("two refreshes must take two list probes", 2, gw.listPackagesCalls - listBefore)
         assertEquals(0, gw.installCalls)
         assertEquals(0, gw.uninstallCalls)
     }
