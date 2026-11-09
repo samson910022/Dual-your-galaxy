@@ -41,6 +41,7 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -333,6 +334,15 @@ object ShizukuExecErrors {
 
     fun timedOut(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms", timedOut = true)
+
+    // Service-side concurrency refusal (#54 Phase1): the exec gate in
+    // GalaxyExecService was full, so pm was never dispatched / never spawned.
+    // Pre-dispatch definite (no flags): must not start with any backstop
+    // prefix ("service exec failed: ", "interrupted: ", "timeout after ",
+    // "shizuku: exec timed out after ", "may have executed"). Same bucket as
+    // the drain-exhaustion "resource exhausted: ..." reply.
+    fun serviceBusy(): CmdResult =
+        CmdResult(exit = 1, out = "", err = "resource exhausted: service exec concurrency limit (max=$SERVICE_EXEC_MAX_CONCURRENT)")
 }
 
 // Pure wire mapping for the exec reply (JVM-testable): the Binder Parcel
@@ -404,6 +414,38 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
     if (e is InterruptedException) return ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
     return ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
 }
+
+// Service-side exec concurrency gate (#54 Phase1, binder-pool protection):
+// GalaxyExecService.onTransact runs the BLOCKING captureProcess
+// (EXEC_TIMEOUT_MS 60s + up to ~12s of drain joins) on a Binder-pool thread.
+// Without a cap, concurrent transacts each pin a Binder thread for that whole
+// window and can exhaust the Binder pool, starving even DESTROY / fresh binds.
+// The gate caps concurrent execs at SERVICE_EXEC_MAX_CONCURRENT (mirrors the
+// client transactPermits TRANSACT_MAX_THREADS=4, leaving Binder-pool headroom
+// for non-EXEC calls). Excess calls fail fast pre-dispatch via
+// serviceBusy() -- never queued, since queueing would still hold a Binder
+// thread. java.util.concurrent.Semaphore is used (blocking binder thread,
+// non-suspend; tryAcquire is non-blocking so the wait never holds the pool).
+// The client side is unchanged: EXEC_TIMEOUT_MS + awaitBounded + stale-cache
+// dropBindingLocked on timeout stay as they are; this gate only sheds excess
+// server-side concurrency.
+// Pure JVM-testable seam: tests instantiate an isolated ServiceExecGate and
+// pin tryAcquire/release/peak-cap behavior without Binder/Parcel.
+internal const val SERVICE_EXEC_MAX_CONCURRENT = 4
+
+internal class ServiceExecGate(
+    permits: Int = SERVICE_EXEC_MAX_CONCURRENT,
+) {
+    private val semaphore = Semaphore(permits, true)
+    fun tryAcquire(): Boolean = semaphore.tryAcquire()
+    fun release() {
+        semaphore.release()
+    }
+
+    fun availablePermits(): Int = semaphore.availablePermits()
+}
+
+internal val serviceExecGate = ServiceExecGate()
 
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
@@ -497,6 +539,21 @@ class GalaxyExecService : Binder {
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
                 // (binder thread), so call it directly.
+                // Concurrency gate (#54 Phase1): the Binder-pool thread is
+                // held for the whole synchronous capture (60s EXEC timeout
+                // plus drain joins). Gate admission is non-blocking BEFORE
+                // dispatch: excess calls get a fast pre-dispatch definite
+                // refusal (serviceBusy, never sent, never spawned) instead of
+                // piling onto Binder threads. The client wait stays bounded
+                // via EXEC_TIMEOUT_MS + awaitBounded + dropBindingLocked
+                // (unchanged); this gate only protects the server pool.
+                if (!serviceExecGate.tryAcquire()) {
+                    val (busyExit, busyOut, busyErr) = encodeExecReply(ShizukuExecErrors.serviceBusy())
+                    reply?.writeInt(busyExit)
+                    reply?.writeString(busyOut)
+                    reply?.writeString(busyErr)
+                    return true
+                }
                 // Pre-spawn vs post-spawn (Phase A1): spawn failures
                 // ("spawn failed: ...", exec threw, process never started)
                 // are already returned INSIDE captureProcess as definite
@@ -518,6 +575,9 @@ class GalaxyExecService : Binder {
                     CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
                 } catch (e: Exception) {
                     CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
+                } finally {
+                    // Release exactly once per acquire, even on Error escape.
+                    serviceExecGate.release()
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
