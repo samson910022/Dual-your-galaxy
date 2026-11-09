@@ -413,12 +413,14 @@ internal fun badRequestForBlankCommand(raw: String?): CmdResult? =
 // the 4096-pass / 4097-reject boundary.
 internal fun badRequestForCommand(raw: String?): CmdResult? {
     badRequestForBlankCommand(raw)?.let { return it }
-    // raw is non-null/non-blank here by the check above.
-    if (raw!!.length > ShizukuExecProtocol.MAX_CMD_CHARS) {
+    // raw is non-null/non-blank here by the check above; use a smart-cast
+    // local instead of `!!` so a helper-contract regression cannot NPE.
+    val nonBlank = raw ?: return null
+    if (nonBlank.length > ShizukuExecProtocol.MAX_CMD_CHARS) {
         return CmdResult(
             exit = 1,
             out = "",
-            err = "bad request: command too long (length ${raw.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})",
+            err = "bad request: command too long (length ${nonBlank.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})",
         )
     }
     return null
