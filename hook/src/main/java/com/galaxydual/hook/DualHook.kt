@@ -166,7 +166,8 @@ class DualHook : XposedModule() {
     }
 
     // Hooks the daagent-side whitelist holder reflectively. Returns the
-    // number of installed hooks (clinit patch hook + query-method hooks);
+    // number of installed hooks (<clinit> patch hook only from this holder;
+    // query-method hooks are installed by hookDaagentQueryMethods);
     // 0 keeps the caller from writing the active marker.
     //
     // Device evidence (S24 OneUI 9, DAAgent v3.7.00.0, dexdump-verified):
@@ -174,13 +175,15 @@ class DualHook : XposedModule() {
     // (3 static-final String[] + <clinit> + Base64 helper, zero query
     // methods), so the <clinit> patch is install evidence only
     // (static-final => ObserveOnly, never force-written; see
-    // WhitelistPatch.apply isFinal branch) and the fuzzy *hitelist* sweep
-    // correctly installs nothing here. The effective policy path is the
-    // method-level query hooks in hookDaagentQueryMethods below: when one
-    // of those query methods is hit, WhitelistPolicy.apply carries a
-    // non-empty policy (false->true for a listed package, collection/array
-    // union); when none is hit -- or the policy is empty -- behavior stays
-    // observe-only. This holder stays as the <clinit> patch point only.
+    // WhitelistPatch.apply isFinal branch). The fuzzy *hitelist* sweep is
+    // Stage 1 diagnose-only (no hook installs) due to mutation/read-only
+    // ambiguity on ROM variants (S24 has zero query methods; no functional
+    // loss). The effective policy path is the method-level query hooks in
+    // hookDaagentQueryMethods below: when one of those query methods is hit,
+    // WhitelistPolicy.apply carries a non-empty policy (false->true for a
+    // listed package, collection/array union); when none is hit -- or the
+    // policy is empty -- behavior stays observe-only. This holder stays as
+    // the <clinit> patch point only.
     private fun hookWhiteListApps(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, WHITE_LIST_APPS_CLASS_CANDIDATES)
         if (target == null) {
@@ -236,13 +239,12 @@ class DualHook : XposedModule() {
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }
-        // Hook any *hitelist* query methods (e.g. isWhitelisted) if they exist.
-        // Deliberately fuzzy: without on-device evidence the exact Samsung
-        // method names are unknown, so narrowing the match could miss the real
-        // query. Eligibility gating (WhitelistHookEligibility) is applied as a
-        // security backstop so installed-composite queries on ROM variants are
-        // not hooked; unknown/ambiguous signatures are skipped fail-closed.
-        // Install logging is best-effort.
+        // Stage 1 diagnose-only *hitelist* sweep (no hook installs): mutation/
+        // read-only ambiguity on ROM variants makes fuzzy install unsafe (e.g.
+        // removeWhitelistedPackage/addWhitelist*/setWhitelist*/clearWhitelist).
+        // S24 WhiteListApps has zero query methods, so no functional loss.
+        // Named read-query hooks use explicit allowlists/eligibility elsewhere
+        // (hookDaagentQueryMethods). <clinit> hook/count unchanged. Best-effort.
         try {
             target.declaredMethods
                 .filter { it.name.contains("hitelist", ignoreCase = true) }
@@ -251,30 +253,37 @@ class DualHook : XposedModule() {
                         WhitelistHookEligibility.evaluate(method)
                     } catch (t: Throwable) {
                         try {
-                            logi("skip hook ${target.name}#${method.name}: eligibility evaluation failed (${t.message})")
+                            logi(
+                                "diagnose-only sweep ${target.name}#${method.name}: " +
+                                    "eligibility evaluation failed (${t.message}); " +
+                                    "no hook installed (Stage 1 fail-closed)",
+                            )
                         } catch (_: Throwable) {
                         }
                         return@forEach
                     }
-                    if (decision is WhitelistHookEligibility.Skip) {
-                        try {
-                            logi("skip hook ${target.name}#${method.name}: ${decision.reason}")
-                        } catch (_: Throwable) {
-                        }
-                        return@forEach
+                    val mutationShaped = try {
+                        WhitelistSignatureGuard.isPotentialMutationMethod(method.name)
+                    } catch (_: Throwable) {
+                        true // fail-closed classification for diagnosis safety
                     }
+                    val safety = if (mutationShaped) "mutation-shaped/unsafe-to-hook" else "read-like-name"
                     try {
-                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name)) installed++
-                    } catch (t: Throwable) {
-                        try {
-                            logi("hook install failed: ${target.name}#${method.name}: ${t.message}")
-                        } catch (_: Throwable) {
+                        val reason = when (decision) {
+                            is WhitelistHookEligibility.Eligible -> decision.reason
+                            is WhitelistHookEligibility.Skip -> decision.reason
                         }
+                        logi(
+                            "diagnose-only sweep ${target.name}#${method.name}: " +
+                                "safety=$safety, eligibility=${reason}; " +
+                                "no hook installed (Stage 1 fail-closed, diagnose-only)",
+                        )
+                    } catch (_: Throwable) {
                     }
                 }
         } catch (t: Throwable) {
             try {
-                logi("hook *hitelist* sweep failed on ${target.name}: ${t.message}")
+                logi("diagnose-only *hitelist* sweep failed on ${target.name}: ${t.message}")
             } catch (_: Throwable) {
             }
         }

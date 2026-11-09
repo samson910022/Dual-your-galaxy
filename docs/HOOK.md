@@ -114,8 +114,11 @@ Hook Builder 統一使用
 該類為 `PUBLIC ABSTRACT` 純常量持有者（3 個 `static final String[]`：
 `DUAL_APP_WHITELIST_PACKAGES`、`..._FOR_CHINA`、`CHINA_SALES_CODES`，
 僅 `<clinit>`＋Base64 helper，**零查詢方法**）——故 `<clinit>` patch 僅為
-安裝證據（`static final` ⇒ `ObserveOnly`，不寫入），模糊 `*hitelist*`
-掃描在此類正確掛上零方法；讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
+安裝證據（`static final` ⇒ `ObserveOnly`，不寫入）。`*hitelist*` 名稱掃描在
+`WhiteListApps` 上為 **Stage 1 diagnose-only（不安裝 hook）**：ROM 變體存在
+mutation／read-only 歧義（如 `removeWhitelistedPackage`、`addWhitelist*`、
+`setWhitelist*`、`clearWhitelist`），S24 此類零查詢方法，故現階段無功能損失；
+讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
 `DAUtility.getWhiteListPkgs`／`*InSystemServer`、`DualAppManager.*WhitelistPackage*`
 （Stage1 方法級 hook 候選，見 `DualHook.hookDaagentQueryMethods`，[待實機驗證]）。lspd 日誌已確認 daagent 行程載入
 含該欄位的類（`found ... static=true` 跨多代行程）；
@@ -147,13 +150,13 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     見 `DualHook.patchWhitelistField` 與 `WhitelistPatch.patchFields`／`apply`，
     故僅觀察；政策生效需命中方法級查詢 hook（`WhitelistPolicy.apply`），否則仍 observe-only）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
-- 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者會掃描，但 hook 安裝路徑採
-  **eligibility gating**（`WhitelistHookEligibility`／`WhitelistSignatureGuard`）為安全兜底：
-  Stage 1 排除 `*Installed*Whitelist*` 複合查詢（install-state／userId 語義未驗證，fail-closed），
-  Boolean 改寫僅限 allowlisted 套件參數索引簽名（例如 `(String)`、`(String,idSlot)`、
-  `(idSlot,String)`，idSlot 為 int/Integer/long/Long），未知／歧義簽名不安裝 hook（fail-closed），
-  void 回傳略過。攔截器（`DualHook.interceptWhitelistCall`）對 Boolean 改寫使用 strict signature
-  與已驗證 `packageArgIndex`；不再以「參數中恰有一個 String」作為未知 overload 的安全依據。
+- `WhiteListApps` 上方法名含 `hitelist`（大小寫不敏感）的 **fuzzy sweep 為 Stage 1
+  diagnose-only（不安裝 hook）**：因 ROM 變體存在 mutation／read-only 歧義，掃描僅做
+  診斷記錄（`WhitelistSignatureGuard.isPotentialMutationMethod` mutation 分類 +
+  `WhitelistHookEligibility` 評估）並 fail-closed，不呼叫 `hookWithDeoptimize`、不計入
+  installed；`<clinit>` hook 行為與計數不變。明確命名的讀查詢 hook 走 `hookDaagentQueryMethods`
+  的顯式 allowlist（`DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES`）＋
+  `WhitelistHookEligibility`／`WhitelistSignatureGuard`，不依賴 fuzzy sweep。
 - Collection／array 合併由 `WhitelistPolicy.apply` 做型別守衛：僅合併 String 元素的 `List`／
   `String[]` 與**非 `SortedSet`／`NavigableSet` 的** `Set`（保留 Set 語意，不降級為 `List`；
   合併結果不保證原排序／具體實作）；`SortedSet`／`NavigableSet`、
@@ -305,7 +308,9 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   `getAllWhitelistedPackages()` when eligible. Daagent hooks 6 named read queries
   (`getWhitelistedPackages`/`getWhitelistPackages`, `getWhiteListPkgs`/
   `getWhiteListPkgsInSystemServer`, `isWhitelistedPackage`/`isWhiteListedPackage`)
-  plus a fuzzy `*hitelist*` sweep, all eligibility-gated.
+  plus a `*hitelist*` sweep on `WhiteListApps` that is **Stage 1 diagnose-only (no hook installs)**
+  due to mutation/read-only ambiguity on ROM variants (mutation classification +
+  eligibility logged, fail-closed).
 - Hook install paths use `WhitelistHookEligibility`/`WhitelistSignatureGuard`;
   Boolean rewrites use strict allowlisted package-arg indices only (unknown/ambiguous
   signatures stay observe-only/fail-closed). Interceptors use a lazy/empty-policy fast path
