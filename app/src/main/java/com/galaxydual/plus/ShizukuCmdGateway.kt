@@ -41,9 +41,9 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
+import java.io.Closeable
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -439,42 +439,31 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 // dropBindingLocked on timeout stay as they are; this gate only sheds excess
 // server-side concurrency.
 // Pure JVM-testable seam: tests instantiate an isolated ServiceExecGate and
-// pin tryAcquire/release/peak-cap behavior without Binder/Parcel.
+// pin tryAcquireLease/Lease-close/peak-cap behavior without Binder/Parcel.
 internal const val SERVICE_EXEC_MAX_CONCURRENT = 4
 
 /**
- * Over-release guard: [release] must be called exactly once per successful
- * [tryAcquire]; extra releases are no-ops (never inflate cap). [held]
- * tracks successful acquires clamped at zero (mirror releaseDrainSlot
- * style), so an unmatched release never returns a permit to the semaphore.
- * The production onTransact path releases exactly once in a single finally
- * per acquire, so the guard never triggers there. held vs availablePermits
- * are consistent at quiescence only (not under concurrent acquire/release).
+ * Lease gate: each successful [tryAcquireLease] returns an independent
+ * [Lease] owning exactly one permit. [Lease.close] is idempotent via
+ * AtomicBoolean CAS: only the first close returns the permit; every
+ * subsequent close (including concurrent closes of the same lease with 2+
+ * holders live) is a no-op, so the cap can never be inflated even under
+ * misuse. A null return means the cap is full and no permit was consumed.
+ * Permit restoration is guaranteed for try/finally/use including Error
+ * escapes. Callers must not retain the lease beyond dispatch scope.
  */
 internal class ServiceExecGate(
     val permits: Int = SERVICE_EXEC_MAX_CONCURRENT,
 ) {
     private val semaphore = Semaphore(permits, true)
-    private val held = AtomicInteger(0)
-    fun tryAcquire(): Boolean =
-        if (semaphore.tryAcquire()) {
-            held.incrementAndGet()
-            true
-        } else {
-            false
-        }
-
-    fun release() {
-        // getAndUpdate returns the previous value; only a positive previous
-        // value means a real held permit was returned (CAS-correct clamp at
-        // 0, mirror releaseDrainSlot style). A zero previous value is an
-        // extra release: no-op, never inflate the cap.
-        if (held.getAndUpdate { cur -> if (cur > 0) cur - 1 else 0 } > 0) {
-            semaphore.release()
+    fun tryAcquireLease(): Lease? = if (semaphore.tryAcquire()) Lease(semaphore) else null
+    fun availablePermits(): Int = semaphore.availablePermits()
+    internal class Lease(private val semaphore: Semaphore) : Closeable {
+        private val closed = AtomicBoolean(false)
+        override fun close() {
+            if (closed.compareAndSet(false, true)) semaphore.release()
         }
     }
-
-    fun availablePermits(): Int = semaphore.availablePermits()
 }
 
 internal val serviceExecGate = ServiceExecGate()
@@ -586,7 +575,7 @@ class GalaxyExecService : Binder {
                 // records resident when gate full. The client wait stays bounded
                 // via EXEC_TIMEOUT_MS + awaitBounded + dropBindingLocked
                 // (unchanged); this gate only protects the server pool.
-                if (!serviceExecGate.tryAcquire()) {
+                val lease = serviceExecGate.tryAcquireLease() ?: run {
                     val (busyExit, busyOut, busyErr) = encodeExecReply(ShizukuExecErrors.serviceBusy())
                     reply?.writeInt(busyExit)
                     reply?.writeString(busyOut)
@@ -615,8 +604,8 @@ class GalaxyExecService : Binder {
                 } catch (e: Exception) {
                     CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
                 } finally {
-                    // Release exactly once per acquire, even on Error escape.
-                    serviceExecGate.release()
+                    // Close the lease (idempotent, even on Error escape).
+                    lease.close()
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
