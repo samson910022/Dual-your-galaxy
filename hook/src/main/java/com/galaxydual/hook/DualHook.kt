@@ -466,10 +466,10 @@ class DualHook : XposedModule() {
                 } catch (_: Throwable) {
                     // Logging must never break the hook path.
                 }
-                return@try result
+                return result
             }
             if (extra.isEmpty()) {
-                return@try result
+                return result
             }
             val desc = try {
                 executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
