@@ -23,12 +23,18 @@ object WhitelistPolicy {
     // Shared whitelist policy: extend-only, never shrink.
     //
     // Booleans keep an original "true". A "false" is flipped only when the
-    // package argument is identified safely: callers should pass a verified
-    // [packageArgIndex] (resolved via WhitelistSignatureGuard). For backward
-    // compatibility, when [packageArgIndex] is null and [strictSignature] is
-    // false, a conservative legacy scan accepts only args containing exactly
-    // one String. When [strictSignature] is true, an unverified index is
-    // observe-only (no rewrite). Empty [extra] never rewrites.
+    // package argument is identified safely. Guarded callers (DualHook) resolve
+    // [packageArgIndex] via WhitelistSignatureGuard for allowlisted signatures and
+    // use [strictSignature]=true so unknown/ambiguous overloads remain observe-only
+    // (no rewrite). The presence of a single String argument is NOT used as a
+    // safety basis for unverified/device-unverified overloads.
+    //
+    // Backward compatibility: when [packageArgIndex] is null and [strictSignature]
+    // is false, a conservative/limited legacy scan returns an index only if args
+    // contain exactly one String value; this is a heuristic for legacy callers and
+    // must not be treated as proof that the String is the packageName. When
+    // [strictSignature] is true, an unverified index is observe-only. Empty
+    // [extra] never rewrites.
     //
     // Collections/arrays are extended only when element types are safe and the
     // merged value is compatible with [declaredReturnType] (when provided).
@@ -132,6 +138,10 @@ object WhitelistPolicy {
         return result
     }
 
+    // Conservative/limited legacy heuristic (non-strict callers only): returns an
+    // index only when exactly one String argument value is present. Not proof that
+    // the String is packageName for device-unverified overloads; strict/guarded
+    // callers must use WhitelistSignatureGuard-resolved packageArgIndex instead.
     private fun legacyBooleanPackageArgIndex(args: List<Any?>): Int? {
         var found: Int? = null
         for ((i, arg) in args.withIndex()) {

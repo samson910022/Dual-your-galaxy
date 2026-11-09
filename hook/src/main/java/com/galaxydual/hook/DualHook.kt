@@ -415,19 +415,22 @@ class DualHook : XposedModule() {
                 .intercept { chain -> interceptWhitelistCall(chain) }
         }, ::logi)
 
-    // Thin interceptor: runs the original, then applies the shared
-    // extend-only policy (WhitelistPolicy, unit-tested). Unknown shapes stay
-    // unchanged. Stage 1 (empty effective policy, default): composite queries
-    // still hit the runtime fail-closed backstop, but all other calls return
-    // the original without describe/args/guard/apply overhead (chain.proceed
-    // already ran). Boolean true returns immediately when policy is applied;
-    // unexpected arguments for Boolean false are logged best-effort by apply.
-    // For Boolean false rewrites, DualHook resolves the package argument only
-    // for allowlisted signatures (WhitelistSignatureGuard) and uses strict
-    // signature mode so unverified overloads remain observe-only.
-    // H2: the effective set is PolicySource.effective(seed + remote). No remote
-    // source is wired, so behavior today is identical to the static seed
-    // (observe-only when empty).
+    // Thin interceptor: runs the original, then applies the shared extend-only
+    // policy (WhitelistPolicy, unit-tested). Unknown shapes stay unchanged.
+    //
+    // Phase 4 fast paths / fail-closed guards:
+    // - Installed-whitelist composite queries (WhitelistSignatureGuard) are
+    //   excluded at runtime regardless of policy (Stage 1 fail-closed backstop;
+    //   install paths also gate these) and return the original.
+    // - Empty effective policy (Stage 1 default): returns original with lazy
+    //   desc/args/guard/apply overhead avoided for non-composite calls
+    //   (chain.proceed already ran).
+    // - Non-empty policy: resolves method desc/args lazily, uses strict
+    //   allowlisted package-arg index (WhitelistSignatureGuard) for Boolean
+    //   rewrites so unverified overloads remain observe-only.
+    //
+    // H2: effective set = PolicySource.effective(seed + remote); no remote
+    // source wired, so behavior today is identical to the static seed.
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         return try {
