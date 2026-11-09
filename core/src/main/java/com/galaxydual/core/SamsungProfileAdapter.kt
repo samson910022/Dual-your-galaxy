@@ -241,6 +241,7 @@ object SamsungProfileAdapter {
         "android.os.usertype.profile.private", "profile.private",
         "android.os.usertype.profile.communal", "profile.communal",
         "android.os.usertype.profile.test", "profile.test",
+        "android.os.usertype.profile.supervising", "profile.supervising",
         "android.os.usertype.full.system", "full.system",
         "android.os.usertype.full.secondary", "full.secondary",
         "android.os.usertype.full.guest", "full.guest",

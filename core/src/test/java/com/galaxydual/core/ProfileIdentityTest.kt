@@ -2183,17 +2183,22 @@ class ProfileIdentityTest {
 
     @Test
     fun s24BareType_p3KnownAospNonCloneProfilesAreOther() {
-        // Official AOSP non-clone profile user types (UserManager constants)
-        // must be recognized as OTHER, never CLONE and never UNKNOWN.
+        // Official AOSP non-clone profile user types (UserManager constants
+        // and review-requested non-clone profiles, e.g. COMMUNAL/TEST;
+        // SUPERVISING included defensively as a non-clone profile name per
+        // #59 review) must be recognized as OTHER, never CLONE/UNKNOWN.
         val cases = listOf(
             "android.os.usertype.profile.COMMUNAL",
             "profile.COMMUNAL",
             "android.os.usertype.profile.TEST",
             "profile.TEST",
+            "android.os.usertype.profile.SUPERVISING",
+            "profile.SUPERVISING",
             "android.os.usertype.system.headless",
             "system.headless",
             "Type: android.os.usertype.profile.COMMUNAL",
             "Type: profile.test",
+            "Type: android.os.usertype.profile.SUPERVISING",
             "Type: android.os.usertype.system.headless",
         )
         for (value in cases) {
@@ -2252,6 +2257,39 @@ class ProfileIdentityTest {
               UserInfo{95:Communal:400} serialNo=15:
                 parentId=0
                 Type: android.os.usertype.profile.COMMUNAL
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose) +
+            SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertTrue(parsed.none { it.userType == ProfileUserType.CLONE })
+        assertEquals(ProfileUserType.OTHER, parsed.single { it.userId == 95 }.userType)
+        val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+        val repo = DualRepository(gateway)
+        assertEquals(DualIdResolution.Absent, runSuspend { repo.resolveDualUserIdTyped() })
+    }
+
+    @Test
+    fun s24BareType_p3SupervisingOnBothSources_typedAbsentNotUnknown() {
+        // Review-requested non-clone profile name: if reported, it must be
+        // recognized as OTHER and (with no clone evidence) may converge to
+        // typed Absent - never CLONE, never Unknown-as-false-negative when
+        // channels are clean/consistent.
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Supervised:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.SUPERVISING
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Supervised:400} serialNo=15:
+                parentId=0
+                Type: android.os.usertype.profile.SUPERVISING
         """.trimIndent()
         val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose) +
             SamsungProfileAdapter.parseDumpsysUser(dumpsys)
