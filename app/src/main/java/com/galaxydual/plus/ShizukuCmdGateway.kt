@@ -607,6 +607,18 @@ class GalaxyExecService : Binder {
     // denied); pre-v13 servers never reach here (gateway rejects pre-bind).
     private val expectedAppUid: Int
 
+    // Phase B §2 instrumentation injection point (wire-neutral, no
+    // SERVICE_VERSION bump -- still 6): the sole spawn call in onTransact
+    // goes through this fn (the exec lambda passed to handleExecRequest
+    // below wraps it as `sh -c <cmd>`). Production default is the real
+    // blocking captureProcess; androidTest replaces it with a counting
+    // fake so Parcel-level tests can prove spawn==0/1 without ever
+    // spawning a process. Internal: same-module androidTest can see it.
+    // Constructors are unchanged (both must stay public for Shizuku
+    // reflection: Context ctor tried first v13+, default ctor is the
+    // fail-closed sink) -- this var adds no constructor.
+    @Volatile internal var captureProcessFn: (Array<String>, Long) -> CmdResult = ::captureProcess
+
     constructor() : super() {
         expectedAppUid = -1
     }
@@ -718,7 +730,7 @@ class GalaxyExecService : Binder {
                 // unknown-after-send by construction ("service exec failed: "
                 // backstop + trailing marker, truncated/transportUnknown).
                 val res = handleExecRequest(callingUid, expectedAppUid, rawCmd) { cmd ->
-                    captureProcess(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
+                    captureProcessFn(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
