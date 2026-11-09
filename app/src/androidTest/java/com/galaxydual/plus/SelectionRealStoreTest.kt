@@ -110,6 +110,7 @@ class SelectionRealStoreTest {
                 HarnessPoll.await { vmA.state.value.selectedKeys.isNotEmpty() }
                 vmA.persistSelection(95)
                 HarnessPoll.await { vmA.state.value.msg.contains("已保存") }
+                awaitHarnessDrained(vmA)
             } finally {
                 vmA.dispose()
             }
@@ -127,6 +128,7 @@ class SelectionRealStoreTest {
                 )
                 vmB.refresh()
                 HarnessPoll.await { sourceAppKey(0, "com.example.chat") in vmB.state.value.selectedKeys }
+                awaitHarnessDrained(vmB)
                 assertEquals(15, vmB.state.value.inventory.targetSerial)
                 assertNull(vmB.state.value.pendingRemove)
                 assertEquals(0, gwB.writeCalls)

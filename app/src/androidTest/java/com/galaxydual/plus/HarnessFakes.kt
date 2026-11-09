@@ -25,6 +25,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 
 import android.app.AlertDialog
+import androidx.lifecycle.viewModelScope
 
 // Bounded poll helper for instrumentation threads (UI thread must never
 // block on it; call from the test thread only).
@@ -213,6 +214,13 @@ fun newHarnessViewModel(
 
 fun awaitHarnessReady(vm: DualViewModel, timeoutMs: Long = 15_000L) {
     HarnessPoll.await(timeoutMs) { vm.state.value.channelReady }
+}
+
+// Quiescence fence for instrumentation: returns only when every child of
+// vm.viewModelScope is completed (mutex wait + onIo + state commit).
+// Mirrors LifecycleSeparationTest.awaitScopeDrained for the harness.
+fun awaitHarnessDrained(vm: DualViewModel, timeoutMs: Long = 15_000L) {
+    HarnessPoll.await(timeoutMs) { vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]?.children?.all { it.isCompleted } == true }
 }
 
 // Reflection helper: whether the remove-confirmation dialog is currently showing.
