@@ -2374,4 +2374,125 @@ class ProfileIdentityTest {
         val repo = DualRepository(gateway)
         assertEquals(DualIdResolution.Absent, runSuspend { repo.resolveDualUserIdTyped() })
     }
+
+    // ---- P1 (#59 re-review): Unicode whitespace must not launder bare Type ----
+
+    @Test
+    fun s24BareType_p1UnicodeWhitespaceBeforeDefaultFailsClosedUnknown() {
+        // Disallowed Unicode whitespace/control chars in a bare `Type:` value
+        // (raw, pre-trim) must fail closed to UNKNOWN (never CLONE, never
+        // OTHER). Kotlin/Unicode trim must not launder NBSP/U+2000/U+3000/
+        // U+202F (or any disallowed char) into an allowlisted form.
+        val cases = listOf(
+            "android.os.usertype.profile.CLONE\u2000(default)", // EN QUAD
+            "android.os.usertype.profile.CLONE\u3000(default)", // IDEOGRAPHIC SPACE
+            "android.os.usertype.profile.CLONE\u00A0(default)", // NBSP
+            "android.os.usertype.profile.CLONE\u202F(default)", // NNBSP
+            "profile.CLONE\u2000(default)",
+            "profile.CLONE\u00A0(default)",
+            "profile_CLONE\u00A0(default)",
+            "android.os.usertype.profile.CLONE\u2009(default)", // THIN SPACE
+            "\u00A0android.os.usertype.profile.CLONE",          // leading NBSP
+        )
+        for (value in cases) {
+            assertEquals(
+                "Unicode whitespace in bare CLONE must be UNKNOWN (never CLONE): [$value]",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+        // ZWSP is a format char (not whitespace) and was already rejected;
+        // keep it fail-closed (regression guard).
+        assertEquals(ProfileUserType.UNKNOWN, parseSingleBareType("profile.PRIVATE\u200B"))
+        // Normal ASCII forms remain valid.
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE"))
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("profile.CLONE (default)"))
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE (default)"))
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("profile_CLONE (default)"))
+        assertEquals(ProfileUserType.OTHER, parseSingleBareType("android.os.usertype.profile.PRIVATE (default)"))
+        assertEquals(ProfileUserType.OTHER, parseSingleBareType("profile.PRIVATE"))
+    }
+
+    @Test
+    fun s24BareType_p1UnicodeWhitespaceClone_neverConfirmsEvenWithAgreement() {
+        // Identity escalation regression: verbose normal CLONE + dumpsys bare
+        // `Type:` with Unicode whitespace before `(default)` + property=95 +
+        // parentId=0 must NOT produce Confirmed/resolveDualTarget. The
+        // malformed dumpsys value is not valid CLONE evidence (ASCII residual
+        // policy) and must parse as UNKNOWN.
+        val verbose = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        // Build dumpsys with an actual U+2000 (EN QUAD) in the bare Type value.
+        val dumpsys = "Users:\n" +
+            "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+            "    parentId=0\n" +
+            "    Type: android.os.usertype.profile.CLONE\u2000(default)\n"
+        val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(1, dumpsysParsed.size)
+        assertEquals(
+            "malformed Unicode-whitespace dumpsys Type must be UNKNOWN (never CLONE)",
+            ProfileUserType.UNKNOWN,
+            dumpsysParsed.single { it.userId == 95 }.userType,
+        )
+        val candidates = SamsungProfileAdapter.parseUserListVerbose(verbose) + dumpsysParsed
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("Unicode-whitespace CLONE must not Confirm, got: $res", res !is DualResolution.Confirmed)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+        assertTrue(
+            "verified dual id must not resolve to 95",
+            PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95) != 95,
+        )
+    }
+
+    @Test
+    fun s24BareType_p1KnownOtherWithUnicodeWhitespaceFailsClosedUnknown() {
+        // Known-OTHER bare values carrying disallowed Unicode whitespace must
+        // NOT be misclassified as OTHER (which could wrongly drive typed
+        // Absent). They fail closed to UNKNOWN.
+        val cases = listOf(
+            "android.os.usertype.profile.PRIVATE\u00A0(default)",
+            "profile.PRIVATE\u2000",
+            "android.os.usertype.profile.MANAGED\u202F(default)",
+            "profile.COMMUNAL\u3000(default)",
+        )
+        for (value in cases) {
+            assertEquals(
+                "Unicode whitespace in known-OTHER bare value must be UNKNOWN: [$value]",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+        // Integration: malformed Unicode whitespace in an otherwise-known OTHER
+        // on both channels + clean no-claim property => typed Unknown, never
+        // Absent (must not clear/select NoDual).
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Comm:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.COMMUNAL
+        """.trimIndent()
+        val dumpsys = "Users:\n" +
+            "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+            "    Type: android.os.usertype.full.SYSTEM\n" +
+            "  UserInfo{95:Comm:400} serialNo=15:\n" +
+            "    parentId=0\n" +
+            "    Type: android.os.usertype.profile.COMMUNAL\u00A0(default)\n"
+        val parsedV = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        val parsedD = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(ProfileUserType.OTHER, parsedV.single { it.userId == 95 }.userType)
+        assertEquals(ProfileUserType.UNKNOWN, parsedD.single { it.userId == 95 }.userType)
+        val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+        val repo = DualRepository(gateway)
+        val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("Unicode-whitespace OTHER must yield typed Unknown (never Absent), got: $idRes", idRes is DualIdResolution.Unknown)
+    }
 }
