@@ -2495,4 +2495,109 @@ class ProfileIdentityTest {
         val idRes = runSuspend { repo.resolveDualUserIdTyped() }
         assertTrue("Unicode-whitespace OTHER must yield typed Unknown (never Absent), got: $idRes", idRes is DualIdResolution.Unknown)
     }
+
+
+    // ---- P1 (#59 re-review): BARE_TYPE_LINE must own line-start Type: ----
+    // TYPE_LINE.find() must never match an embedded userType=/User type:/user_type=
+    // inside a line-start bare `Type:` and override the strict bare complete-value
+    // validator. The FULL bare value is validated; embedded keywords / Unicode /
+    // contradictions fail closed to UNKNOWN (never CLONE, never OTHER/Absent).
+
+    @Test
+    fun s24BareType_p1EmbeddedUserTypeKeyword_neverOverridesBare() {
+        val cases = listOf(
+            "profile.PRIVATE userType=profile.CLONE",
+            "profile.CLONE userType=profile.PRIVATE",
+            "userType=profile.CLONE",
+            "profile.CLONE\u2000(default) userType=profile.CLONE",
+            "profile.PRIVATE User type: profile.CLONE",
+            "profile.PRIVATE user_type=profile.CLONE",
+            "profile.PRIVATE user-type=profile.CLONE",
+            "profile.PRIVATE USERTYPE=profile.CLONE",
+            "android.os.usertype.profile.PRIVATE userType=android.os.usertype.profile.CLONE",
+            "android.os.usertype.profile.CLONE userType=android.os.usertype.profile.PRIVATE",
+            "user_type=android.os.usertype.profile.CLONE",
+            "profile.PRIVATE User   type: profile.CLONE",
+            "profile.CLONE\tuserType=profile.PRIVATE",
+            "android.os.usertype.profile.CLONE userType=profile.CLONE",
+        )
+        for (value in cases) {
+            val t = parseSingleBareType(value)
+            assertEquals("embedded keyword in bare Type must be UNKNOWN: [$value]", ProfileUserType.UNKNOWN, t)
+            assertTrue("must never classify as CLONE: [$value]", t != ProfileUserType.CLONE)
+            assertTrue("must never classify as OTHER: [$value]", t != ProfileUserType.OTHER)
+        }
+        // Preservation: normal bare Type and legacy User type still classify correctly.
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE"))
+        assertEquals(ProfileUserType.CLONE, parseSingleVerboseType("android.os.usertype.profile.CLONE"))
+        assertEquals(ProfileUserType.OTHER, parseSingleBareType("profile.PRIVATE"))
+    }
+
+    @Test
+    fun s24BareType_p1EmbeddedUserType_contradictoryDumpsys_neverConfirmsOrVerifies() {
+        val verbose = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                Type: profile.PRIVATE userType=profile.CLONE
+        """.trimIndent()
+        val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+        val candidates = SamsungProfileAdapter.parseUserListVerbose(verbose) + dumpsysParsed
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("contradictory embedded dumpsys must not Confirm, got: $res", res !is DualResolution.Confirmed)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+        assertTrue(PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95) != 95)
+    }
+
+    @Test
+    fun s24BareType_p1EmbeddedUserType_propertyNoClaim_typedUnknownNotAbsent_bothApis() {
+        // Each case is a full line-start bare `Type:` line (exercises BARE_TYPE_LINE
+        // ownership; TYPE_LINE must not override it).
+        val embeddedCases = listOf(
+            "Type: profile.PRIVATE userType=profile.CLONE",
+            "Type: profile.CLONE userType=profile.PRIVATE",
+            "Type: profile.PRIVATE User type: profile.CLONE",
+            "Type: profile.CLONE\u2000(default) userType=profile.CLONE",
+            "Type: userType=profile.CLONE",
+        )
+        for (embedded in embeddedCases) {
+            val verbose = """
+                Users:
+                  UserInfo{0:Owner:13} running:
+                    Serial number: 0
+                    User type: android.os.usertype.full.SYSTEM
+                  UserInfo{95:Work:400} running:
+                    Serial: 15
+                    parentId=0
+                    User type: android.os.usertype.profile.PRIVATE
+            """.trimIndent()
+            val dumpsys = """
+                Users:
+                  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                    Type: android.os.usertype.full.SYSTEM
+                  UserInfo{95:Work:400} serialNo=15:
+                    parentId=0
+                    $embedded
+            """.trimIndent()
+            val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+            assertEquals("embedded [$embedded] => dumpsys parsed UNKNOWN", ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+            val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+            val repo = DualRepository(gateway)
+            val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+            assertTrue("embedded [$embedded] => typed id Unknown (never Absent/Confirmed), got: $idRes", idRes is DualIdResolution.Unknown)
+            assertTrue("embedded [$embedded] must not be Absent", idRes !is DualIdResolution.Absent)
+            val targetRes = runSuspend { repo.resolveDualTargetTyped() }
+            assertTrue("embedded [$embedded] => typed target Unknown (never Absent/Confirmed), got: $targetRes", targetRes is DualTargetResolution.Unknown)
+            assertTrue("embedded [$embedded] must not be Absent", targetRes !is DualTargetResolution.Absent)
+        }
+    }
+
 }
