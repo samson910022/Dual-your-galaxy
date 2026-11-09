@@ -276,6 +276,7 @@ class LifecycleSeparationTest {
 
         vm.requestRemove("com.example.chat")
         awaitVm(vm) { vm.state.value.pendingRemove != null }
+        awaitScopeDrained(vm)
 
         val pendingBefore = vm.state.value.pendingRemove
         val selectedBefore = vm.state.value.selectedKeys
@@ -334,6 +335,7 @@ class LifecycleSeparationTest {
         val clockEmpty = FakeClock()
         val vmEmpty = makeVm(gwEmpty, clockEmpty, backendEmpty.store())
         await { vmEmpty.state.value.channelReady }
+        awaitScopeDrained(vmEmpty)
         assertNull(vmEmpty.state.value.pendingRemove)
         assertTrue(vmEmpty.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwEmpty.installCalls.size)
@@ -359,6 +361,7 @@ class LifecycleSeparationTest {
         val clockCorrupt = FakeClock()
         val vmCorrupt = makeVm(gwCorrupt, clockCorrupt, backendCorrupt.store())
         await { vmCorrupt.state.value.channelReady }
+        awaitScopeDrained(vmCorrupt)
         assertNull(vmCorrupt.state.value.pendingRemove)
         assertTrue(vmCorrupt.state.value.selectedKeys.isEmpty())
         assertEquals(0, gwCorrupt.installCalls.size)
