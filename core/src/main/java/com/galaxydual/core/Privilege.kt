@@ -23,7 +23,7 @@ data class ProbeResult(
 // Pure privilege selector, no side effects.
 // su root grants ROOT; Shizuku grants SHELL. LSPosed is display-only and never
 // grants privilege (hook signal must never be fed as an authorization input).
-fun routePrivilege(hasShizuku: Boolean, hasRoot: Boolean): Privilege {
+fun routePrivilegeFromProbes(hasShizuku: Boolean, hasRoot: Boolean): Privilege {
     return if (hasRoot) {
         Privilege.ROOT
     } else if (hasShizuku) {

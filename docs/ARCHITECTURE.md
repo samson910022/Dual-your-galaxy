@@ -19,7 +19,7 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 
 ```kotlin
 // Pseudocode: hook-neutral — hook signal never grants privilege (#19).
-// routePrivilege(hasShizuku, hasRoot) is a pure function of two probes only;
+// routePrivilegeFromProbes(hasShizuku, hasRoot) is a pure function of two probes only;
 // hook state is display-only and must never be fed as an authorization input.
 val privilege: Privilege = when {
     hasRoot -> Privilege.ROOT          // su probe passed
@@ -39,12 +39,26 @@ val privilege: Privilege = when {
 > 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
 > observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
-> 路由 hook-neutral：`routePrivilege(hasShizuku, hasRoot)` 為兩探針純函數，
+> 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
 
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (su probe).
 - Router is a pure function of two probes: `hasRoot` (su) and `isShizukuAlive()`; hook signal never enters routing (hook-neutral, LSPosed mode is NoOp placeholder).
 - UI disables write actions when privilege is `NONE`.
+
+> Binary-compatibility note: `core` is an in-repo Gradle module (not
+> published) with **NO binary compatibility guarantee** for precompiled
+> consumers — all in-repo callers rebuild from source. The router was renamed
+> from `routePrivilege` to `routePrivilegeFromProbes` specifically to avoid a
+> silent JVM semantic collision: the removed old form took hook-active plus
+> shizuku-alive Booleans, while the current form takes hasShizuku plus hasRoot,
+> yet both share the same two-Boolean JVM descriptor `routePrivilege(ZZ)`. A
+> previously compiled caller passing false, then true (old Shizuku-only =>
+> `SHELL`) would have bound to the new method as hasShizuku false, hasRoot
+> true => `ROOT` (silent privilege escalation); the symmetric call (old hook
+> plus no Shizuku => `ROOT`) would have become hasShizuku true, hasRoot false
+> => `SHELL` (silent de-escalation). The rename changes the JVM method
+> identity so old binaries fail to bind instead of silently changing meaning.
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 

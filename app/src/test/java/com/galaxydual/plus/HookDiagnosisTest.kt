@@ -14,7 +14,7 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.channelReadyFor
-import com.galaxydual.core.routePrivilege
+import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -293,7 +293,7 @@ class HookDiagnosisTest {
                 val expectedPrivilege = if (hasRoot) Privilege.ROOT
                     else if (hasShizuku) Privilege.SHELL
                     else Privilege.NONE
-                assertEquals(expectedPrivilege, routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot))
+                assertEquals(expectedPrivilege, routePrivilegeFromProbes(hasShizuku = hasShizuku, hasRoot = hasRoot))
                 assertEquals(expectedPrivilege, hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku))
                 for (status in HookStatus.values()) {
                     val diagnosis = HookDiagnosis(
