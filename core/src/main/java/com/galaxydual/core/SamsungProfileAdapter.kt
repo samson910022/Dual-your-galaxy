@@ -222,9 +222,31 @@ object SamsungProfileAdapter {
     // Case-insensitive, `:`/`=` with surrounding spaces tolerated.
     // Value is group 1; classification reuses classifyMention plus the
     // fail-closed known-OTHER gate below (unknown tail -> block UNKNOWN,
-    // never OTHER/Absent).
+    // never OTHER/Absent). Strict ASCII whitespace only (P1 #59): a Unicode
+    // whitespace char in the key/indent/separator position (NBSP, U+2000,
+    // U+3000, etc.) must NOT be normalized into a valid bare declaration --
+    // see BARE_TYPE_LIKE_KEY.
     private val BARE_TYPE_LINE =
         Regex("^\\s*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+
+    // Tolerant detector for a line-start bare `Type`-like declaration where
+    // Unicode whitespace/separator/format/control chars (\p{Z}, whitespace,
+    // \p{Cf} e.g. ZWSP/BOM, \p{Cc} controls) may appear in indentation or
+    // around the `type` keyword/separator (P1 #59). If this matches but
+    // strict BARE_TYPE_LINE does not, the key surface is malformed and must
+    // fail closed to UNKNOWN -- never fall through to TYPE_LINE.find(), which
+    // could trust an embedded `userType=`. Does NOT match `User type:` /
+    // `userType=` / `usertype` legacy forms (they do not start with the bare
+    // `type` token).
+    private val BARE_TYPE_LIKE_KEY =
+        Regex("^[\\p{Z}\\s\\p{Cf}\\p{Cc}]*type[\\p{Z}\\s\\p{Cf}\\p{Cc}]*[:=]", RegexOption.IGNORE_CASE)
+
+    // ASCII-only bare `type` key+separator (no Unicode in indent/keyword/
+    // separator position). Used to distinguish "Unicode key surface" (fail
+    // closed UNKNOWN) from "ASCII bare-Type key but strict BARE_TYPE_LINE
+    // did not fully match, e.g. empty value" (ignore, never fall through).
+    private val ASCII_BARE_TYPE_KEY =
+        Regex("^\\s*type\\s*[:=]", RegexOption.IGNORE_CASE)
 
     // Known complete non-clone Android user type names (fail-closed allowlist)
     // for bare S24 `Type:` values (P1 #59 review). Only an exact, complete,
@@ -667,6 +689,19 @@ object SamsungProfileAdapter {
                 // Unreachable: classifyMention never returns (false, false).
                 // Kept as fail-closed UNKNOWN.
                 return ProfileUserType.UNKNOWN
+            }
+            // Line-start bare `Type`-like declaration (P1 #59): tolerant
+            // detector matches but strict BARE_TYPE_LINE did not. If the key/
+            // indent/separator surface has disallowed Unicode whitespace, fail
+            // closed to UNKNOWN (never fall through to TYPE_LINE.find(), which
+            // could trust an embedded `userType=`). If the key surface is
+            // ASCII-valid but strict BARE did not fully match (e.g. empty
+            // value), ignore the declaration without falling through.
+            if (BARE_TYPE_LIKE_KEY.containsMatchIn(line)) {
+                if (!ASCII_BARE_TYPE_KEY.containsMatchIn(line)) {
+                    return ProfileUserType.UNKNOWN
+                }
+                continue
             }
             val m = TYPE_LINE.find(line)
             if (m != null) {
