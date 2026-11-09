@@ -210,28 +210,28 @@ class DualHook : XposedModule() {
     // Stage1 method-level candidates (DEVICE-UNVERIFIED): S24 dexdump names
     // the holder (WhiteListApps, static-final String[] => ObserveOnly) but
     // does not pin the query-holder package layout, so every class in
-    // DAAGENT_QUERY_CLASS_CANDIDATES that loads is tried and every
-    // DAAGENT_QUERY_METHOD_NAMES entry present on it is hooked with the
-    // shared extend-only WhitelistPolicy.apply interceptor
-    // (interceptWhitelistCall). Read queries only -- install/remove paths
-    // are never hooked. With a non-empty policy a hit flips/adds the
-    // listed packages; with an empty policy (today) the interceptor
-    // returns the original result unchanged (observe-only). If no
-    // candidate class/method exists on this ROM, this returns 0 and the
+    // DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES that loads is tried
+    // and every DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES entry present
+    // on it is hooked with the shared extend-only WhitelistPolicy.apply
+    // interceptor (interceptWhitelistCall). Read queries only --
+    // install/remove paths are never hooked. With a non-empty policy a hit
+    // flips/adds the listed packages; with an empty policy (today) the
+    // interceptor returns the original result unchanged (observe-only). If
+    // no candidate class/method exists on this ROM, this returns 0 and the
     // daagent side stays observe-only via the holder patch above.
     // JVM tests cover only the WhitelistPolicy.apply decision; install and
     // callback behavior require an LSPosed daagent process and are NOT
     // covered by JVM tests.
     private fun hookDaagentQueryMethods(classLoader: ClassLoader): Int {
         var installed = 0
-        for (className in DAAGENT_QUERY_CLASS_CANDIDATES) {
+        for (className in DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES) {
             val target = try {
                 classLoader.loadClass(className)
             } catch (_: Throwable) {
                 continue
             }
             var classInstalled = 0
-            for (methodName in DAAGENT_QUERY_METHOD_NAMES) {
+            for (methodName in DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES) {
                 val overloads = try {
                     target.declaredMethods.filter { it.name == methodName }
                 } catch (_: Throwable) {
@@ -422,37 +422,9 @@ class DualHook : XposedModule() {
             "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA",
         )
 
-        // Stage1 daagent read-query candidates (DEVICE-UNVERIFIED).
-        // S24 evidence pins the holder above (static-final => ObserveOnly)
-        // and names these query holders (DualAppDBHelper /
-        // DAUtility / DualAppManager) without pinning their package
-        // layout, so subpackage variants are all tried; first hit does NOT
-        // win -- every loadable class is hooked. Query methods only;
-        // install/remove paths are never listed here.
-        // internal for contract tests; read-query candidates only.
-        internal val DAAGENT_QUERY_CLASS_CANDIDATES = listOf(
-            "com.samsung.android.da.daagent.provider.DualAppDBHelper",
-            "com.samsung.android.da.daagent.db.DualAppDBHelper",
-            "com.samsung.android.da.daagent.DualAppDBHelper",
-            "com.samsung.android.da.daagent.provider.DAUtility",
-            "com.samsung.android.da.daagent.util.DAUtility",
-            "com.samsung.android.da.daagent.DAUtility",
-            "com.samsung.android.da.daagent.provider.DualAppManager",
-            "com.samsung.android.da.daagent.DualAppManager",
-        )
-
-        // Read-query method names only (extend-only WhitelistPolicy.apply).
-        // internal for contract tests; read-query candidates only.
-        internal val DAAGENT_QUERY_METHOD_NAMES = listOf(
-            "getAllInstalledWhitelistedPackages",
-            "getWhitelistedPackages",
-            "getWhitelistPackages",
-            "getWhiteListPkgs",
-            "getWhiteListPkgsInSystemServer",
-            "isWhitelistedPackage",
-            "isWhiteListedPackage",
-            "isInstalledWhitelistedPackage",
-        )
+        // Stage1 daagent read-query candidates moved to
+        // DaagentQueryHooks (framework-free) so JVM contract tests can lock
+        // them without loading DualHook/Xposed. See DaagentQueryHooks.
 
         private const val HOOK_ID_PREFIX = "galaxydual:"
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"

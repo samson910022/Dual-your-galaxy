@@ -6,17 +6,18 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// Hook contract test (JVM, framework-free constants in companion object).
+// Hook contract test (JVM, framework-free constants in DaagentQueryHooks).
 //
 // Locks the Stage1 daagent read-query hook candidates to the docs/S24 contract:
 // read-query names only, and every candidate class in the daagent package family.
-// The DualHook install/callback needs an LSPosed daagent process and is
-// DEVICE-UNVERIFIED (not covered here).
+// Constants live in DaagentQueryHooks (pure object) so tests run without loading
+// DualHook/Xposed (compileOnly at unit test runtime). DualHook install/callback
+// remains DEVICE-UNVERIFIED (not covered here).
 class DaagentQueryHookContractTest {
 
     @Test
     fun queryMethodNames_areNonEmptyAndContainKeyS24ReadQueries() {
-        val names = DualHook.DAAGENT_QUERY_METHOD_NAMES
+        val names = DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES
         assertTrue("DAAGENT_QUERY_METHOD_NAMES must not be empty", names.isNotEmpty())
         // Lock the full doc-aligned candidate set (Stage 1). Update intentionally
         // when candidates change with device evidence.
@@ -42,7 +43,7 @@ class DaagentQueryHookContractTest {
         // install/action mutations and other typical whitelist mutation verbs.
         val forbiddenSubstrings = listOf("remove", "delete", "clear", "uninstall", "revoke", "insert", "update")
         val forbiddenPrefixes = listOf("add", "set", "put", "write")
-        for (name in DualHook.DAAGENT_QUERY_METHOD_NAMES) {
+        for (name in DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES) {
             val lower = name.lowercase()
             for (token in forbiddenSubstrings) {
                 assertFalse(
@@ -68,7 +69,7 @@ class DaagentQueryHookContractTest {
     @Test
     fun queryClassCandidates_areInDaagentPackageFamily() {
         val daagentPrefix = "com.samsung.android.da.daagent"
-        val classes = DualHook.DAAGENT_QUERY_CLASS_CANDIDATES
+        val classes = DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES
         assertTrue("DAAGENT_QUERY_CLASS_CANDIDATES must not be empty", classes.isNotEmpty())
         for (className in classes) {
             assertTrue(
