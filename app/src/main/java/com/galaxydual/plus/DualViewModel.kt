@@ -22,7 +22,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.PmOutputParser
-import com.galaxydual.core.routePrivilege
+import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -414,8 +414,9 @@ data class UiState(
 // in LSPosed mode. The LSPosed gateway stays the NoOp placeholder (whitelist
 // policy branch pending): writes under it are refused with an explicit
 // reason, never executed. The marker never feeds privilege routing
-// (hasLsposed stays false below): a present marker is not proof of a live,
-// effective hook, so it must not grant privilege.
+// (hook signal never enters routing; `routePrivilegeFromProbes` has no `hasLsposed`
+// parameter): a present marker is not proof of a live, effective hook, so it
+// must not grant privilege.
 //
 // PR-4 P1 (issue #23): remove is two-phase. requestRemove(pkg) only records
 // PendingRemove (verified id + serial + label + timestamp); confirmRemove()
@@ -5145,10 +5146,10 @@ class DualViewModel(
             // reusedProbe path (recheck/reconnect) degraded before this call,
             // so nothing remains to do here.
             val degradeForState = if (preference == ChannelPreference.AUTO) autoDegrade else null
-            // LSPosed hook (ROOT) outranks su (ROOT) outranks Shizuku (SHELL);
-            // the router encodes that priority, probes only feed it.
-            // F4b-P2 + P1 (沿襲 #19): hasLsposed stays conservatively false for
-            // ROUTING even though the marker now feeds the UI display below
+            // Routing is hook-neutral: su ROOT -> Shizuku SHELL -> NoOp; the
+            // hook signal never enters routing (no `hasLsposed` parameter).
+            // F4b-P2 + P1 (沿襲 #19): hook signal excluded from routing even
+            // though the marker now feeds the UI display below
             // (see hookNeutralRoute). Rationale: the marker is existence+scope
             // evidence from a file that survives reboots (see HookMarker), not
             // proof of a live, effective hook, so it must never grant privilege.
@@ -5796,12 +5797,12 @@ class DualViewModel(
 }
 
 // P1 hook-neutral routing (issue #6, 沿襲 #19, 配合 #27): privilege routing
-// always runs with hasLsposed = false, no matter what the hook diagnosis
-// says. A present marker is existence+scope evidence, not proof of a live,
-// effective hook, so it must never grant privilege. probeChannels routes
-// through this function; HookDiagnosisTest locks the contract.
+// has no hook input (`routePrivilegeFromProbes` signature has no `hasLsposed` parameter).
+// A present marker is existence+scope evidence, not proof of a live, effective
+// hook, so it must never grant privilege. probeChannels routes through this
+// function; HookDiagnosisTest locks the contract.
 fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
-    routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot)
+    routePrivilegeFromProbes(hasShizuku = hasShizuku, hasRoot = hasRoot)
 
 // PR-7 P2 (issue #26):選取自動恢復 marker 初值 (從未恢復)。
 // 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 = 「從未恢復」哨兵。

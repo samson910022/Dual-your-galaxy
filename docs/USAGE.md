@@ -28,14 +28,14 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 但不改變任何行為、不放寬任何包名；接上政策來源前，本文凡提及「hook 通道／白名單放寬」
 皆指設計意圖，不是現有效果。
 
-## 1. 提權優先順序（`core` 純函數 [已支援]＋真通道已接線（ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
+## 1. 通道選擇與優先順序（`core` 純函數 [已支援]＋真通道已接線（ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）；自動路由順序為 su ROOT → Shizuku → NONE，下列為手動 picker 表面）
 
 路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`／`selectChannel`＋Shizuku 生命週期）已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`；SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；hook 訊號為 file marker 存在性證據，僅顯示、永不進入路由，[待實機驗證]；`ChannelPreference` 手動選擇 AUTO 預設，`selectChannel` 動態換 gateway；選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，`channelReadyFor` [已支援]），
 以下順序為接線後預期行為，App 內 Shizuku 切換（未授權路徑／首次選路／marker gateway-`cat` 顯示 [待實機驗證]；已授權一鍵、ROOT 一鍵／su／uninstall 已驗，見 §0）：
 
 1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
    observe-only（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗），不可描述為已能擴展包名。
-2. **Shizuku 降級（SHELL）**：無 LSPosed 但 Shizuku binder 可達 → `Privilege.SHELL`
+2. **AUTO 降級（SHELL）**：無可用 su ROOT（不論 LSPosed 模組／marker 是否存在），且 Shizuku 授權及能力探測通過 → `Privilege.SHELL`；明選 LSPosed 仍為 NoOp 佔位（hook 訊號不進入路由）
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
      binder round-trip、未授權路徑／首次選路／binder 死引導 [待實機驗證] DEVICE-UNVERIFIED。
    - 版本要求：需 Shizuku v13+（v13 起才有 UserService 的 Context 構造）；低於 v13 時本 App 在綁定前明確拒絕（`unsupported Shizuku version`），不綁定、不執行。
@@ -43,11 +43,11 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 
 ```kotlin
 // Pure routing logic, no side effects (see core/Privilege.kt).
-// App 端現狀（H4／#19）：hook 訊號永不進入路由（hasLsposed 恆 false：file
-// marker 是存在性證據，不是 live hook 證明）；hasRoot/hasShizuku 由
-// Su/ShizukuElevator 真通道探測填入。Hook 狀態走 UiState.hookActive／
-// hookScopes（display-only）供 LSPosed picker 行顯示。
-val privilege = routePrivilege(hasLsposed = false, hasShizuku = shizukuAlive, hasRoot = hasRoot)
+// App 端現狀（H4／#19）：hook 訊號永不進入路由（`hasLsposed` 參數已移除：
+// file marker 是存在性證據，不是 live hook 證明，不得作為授權輸入）；
+// hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。Hook 狀態走
+// UiState.hookActive／hookScopes（display-only）供 LSPosed picker 行顯示。
+val privilege = routePrivilegeFromProbes(hasShizuku = shizukuAlive, hasRoot = hasRoot)
 val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 

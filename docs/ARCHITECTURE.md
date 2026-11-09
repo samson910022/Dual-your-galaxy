@@ -6,7 +6,7 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 ## Goals
 
 - Support Samsung Dual Messenger / Dual Apps without touching Secure Folder.
-- Prefer LSPosed injection when available, fall back to Shizuku shell channel.
+- LSPosed channel is a display-only marker / NoOp placeholder (never grants privilege); routing is hook-neutral, fall back to Shizuku shell channel when su is unavailable.
 - Keep parsing and execution testable without Android framework dependencies.
 
 ## Modules
@@ -19,7 +19,8 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 
 ```kotlin
 // Pseudocode: hook-neutral — hook signal never grants privilege (#19).
-// App side calls routePrivilege(hasLsposed = false, ...); hook state is display-only.
+// routePrivilegeFromProbes(hasShizuku, hasRoot) is a pure function of two probes only;
+// hook state is display-only and must never be fed as an authorization input.
 val privilege: Privilege = when {
     hasRoot -> Privilege.ROOT          // su probe passed
     shizukuAlive() -> Privilege.SHELL // Shizuku binder reachable + authorized
@@ -38,12 +39,26 @@ val privilege: Privilege = when {
 > 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
 > observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
-> 路由 hook-neutral：`routePrivilege` 以 `hasLsposed = false` 呼叫，
-> `channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
+> 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
+> `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
 
 - `Privilege` enum: `NONE` (no write), `SHELL` (Shizuku / ADB shell), `ROOT` (su probe).
 - Router is a pure function of two probes: `hasRoot` (su) and `isShizukuAlive()`; hook signal never enters routing (hook-neutral, LSPosed mode is NoOp placeholder).
 - UI disables write actions when privilege is `NONE`.
+
+> Binary-compatibility note: `core` is an in-repo Gradle module (not
+> published) with **NO binary compatibility guarantee** for precompiled
+> consumers — all in-repo callers rebuild from source. The router was renamed
+> from `routePrivilege` to `routePrivilegeFromProbes` specifically to avoid a
+> silent JVM semantic collision: the removed old form took hook-active plus
+> shizuku-alive Booleans, while the current form takes hasShizuku plus hasRoot,
+> yet both share the same two-Boolean JVM descriptor `routePrivilege(ZZ)`. A
+> previously compiled caller passing false, then true (old Shizuku-only =>
+> `SHELL`) would have bound to the new method as hasShizuku false, hasRoot
+> true => `ROOT` (silent privilege escalation); the symmetric call (old hook
+> plus no Shizuku => `ROOT`) would have become hasShizuku true, hasRoot false
+> => `SHELL` (silent de-escalation). The rename changes the JVM method
+> identity so old binaries fail to bind instead of silently changing meaning.
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
@@ -98,7 +113,7 @@ val privilege: Privilege = when {
 2. UI builds a `CmdGateway` matching that level.
 3. Gateway runs `pm` / `dumpsys` commands.
 4. Raw stdout goes through `PmOutputParser` into UI state.
-5. Hook path (ROOT) may bypass shell by calling the dual-app service directly.
+5. LSPosed / hook path (display-only): marker presence and hook registration are existence+scope evidence only; they never grant write capability. No direct service-backed executable hook gateway is wired in the selected path — `ChannelPreference.assembleChannel(ChannelPreference.LSPOSED, …)` constructs `NoOpGateway` (writes refused). LSPosed channel remains a NoOp placeholder.
 6. Concurrency boundary (#24; busy = `UiState.loading`, merge = coalesce):
    `opMutex` serializes probe/refresh/clone/remove; rapid refresh taps coalesce
    into one trailing run, clone/request-remove/confirm dedup by op key (`already in progress`,
@@ -110,8 +125,8 @@ val privilege: Privilege = when {
    註：`DualViewModel.refreshLocked()` 目前仍走 9 命令 resolve-then-reverify 舊路徑（`DualViewModel.kt:399-490`），遷移到 `refreshVerified()` 5 命令為 follow-up；兩者同為 fail-closed，僅命令數差異。
 
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
-   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24；`app/src/androidTest` 現已含 7 個 test class / 8 個檔案的 harness，見 docs/ACCEPTANCE.md §5；本 PR 不新增 instrumentation）。
-   本 PR 只保證 JVM 語意 + CI 綠燈。
+   #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
+   `app/src/androidTest/` 現已含 8 個檔案 / 7 個 test class 的 harness（27 個自動化測試：20 JUnit4 + 7 JUnit3，見 docs/ACCEPTANCE.md §5）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
 
 ## Non-Goals
 

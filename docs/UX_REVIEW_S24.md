@@ -2,6 +2,8 @@
 
 調查日期：2026-11-05 UTC。原始碼基準：`b3d48432f21d8e14b3a0da9e9a6b897cd4e0b776`。
 
+> Historical snapshot at b3d4843; superseded by stacked PRs #36/#37/#43 (merged, see GitHub), base HEAD f7c0c90 (parent of this docs PR). 本文件為當時調查紀錄，非當前狀態。
+
 ## 1. 結論與證據分級
 
 本輪由四個獨立調查方向交叉整理：profile 身分、安裝產物／UI、通道／命令契約、既有 issues 與驗收規劃。
@@ -61,7 +63,7 @@ UI 調查只開啟本 App、喚醒／收合系統遮罩及捲動；未輸入憑�
 
 資料來源為只保留目標列的 `cmd user list -v`、限定目標並最小過濾的 `dumpsys user --user 95`、property，以及 root 解碼目標 user XML 後只輸出的白名單身分 attributes。沒有公開原始 XML。
 
-`dumpsys` 的顯示 label 與 `pm list users` 不同，不能互換格式後依名稱授權。當前 `PmOutputParser.resolveDualUserId()` 仍只用非零 ID＋label contains DUAL；explicit-ID guard 又只要求存在。
+`dumpsys` 的顯示 label 與 `pm list users` 不同，不能互換格式後依名稱授權。當時（b3d4843）`PmOutputParser.resolveDualUserId()` 僅用非零 ID＋label contains DUAL；explicit-ID guard 只要求存在。
 
 > 註（2026-11-05，PR-1 stage 2 後）：上段描述的是 b3d4843（PR 前）基準，現已改為雙源 CLONE 驗證＋ explicit verified guard（見 USAGE §3）：label-only 路徑已 `@Deprecated`，explicit id 須為當下 Confirmed 目標否則 fail-closed。原文保留作歷史對照。
 
@@ -118,6 +120,8 @@ Auto 依 su 存在優先、失敗不降級的分支可由原碼確認；本輪�
 - XML input focus 不等於 TalkBack 焦點；未實測 TalkBack、旋轉、字級、鍵盤或亮暗主題。
 - 沒有觸發寫入；enabled=true 不能解讀為 ViewModel guard 失效。
 
+> As-of b3d4843 snapshot: section below reflects 2026-11-05 evidence review.
+
 ## 5. 修正「全部未經實機驗證」的舊敘述
 
 既有公開紀錄已包含正常 S24 寫入成功，不應忽略：
@@ -129,6 +133,8 @@ Auto 依 su 存在優先、失敗不降級的分支可由原碼確認；本輪�
 | [#6／PR19 手動通道紀錄](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/6#issuecomment-6627423091) | 手動切換、偏好保存及動態重選曾測試 | App 勾選已保存、Auto 拒絕降級或 live LSPosed 已完成 |
 
 這些是歷史證據，不是本輪重新做 clone／remove。#2 的 owner／歧義／不存在ID防護和 #9 的 verify／refresh 已實作，follow-up 應針對殘留契約，不重開成「完全沒做」。
+
+> As-of b3d4843 snapshot: the tracking and test-status sections below reflect 2026-11-05 state; current CI/USAGE status see `docs/USAGE.md` §1 and `.github/workflows/android.yml`.
 
 ## 6. GitHub 追蹤與交付順序
 
