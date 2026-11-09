@@ -25,6 +25,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 
 import android.app.AlertDialog
+import androidx.lifecycle.viewModelScope
 
 // Bounded poll helper for instrumentation threads (UI thread must never
 // block on it; call from the test thread only).
@@ -83,16 +84,45 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
         return if (idx >= 0 && idx + 1 < tokens.size) tokens[idx + 1] else null
     }
 
+    private fun hasShellSeparator(cmd: String): Boolean =
+        cmd.contains(";") || cmd.contains("&&") || cmd.contains("||") ||
+            cmd.contains("\n") || cmd.contains("`") || cmd.contains("$(") ||
+            cmd.contains(">") || cmd.contains("<") || cmd.contains("|") ||
+            cmd.contains("&") || cmd.contains("\\")
+
+    private val LIST_PACKAGES = Regex("""pm list packages --user \d+""")
+
+    private fun isWrite(cmd: String): Boolean =
+        hasShellSeparator(cmd) ||
+            cmd.startsWith("pm uninstall") || cmd.startsWith("pm install") ||
+            cmd.startsWith("pm grant") || cmd.startsWith("appops set") ||
+            cmd.startsWith("am ") ||
+            (cmd.startsWith("cmd ") && !cmd.startsWith("cmd user list"))
+
+    private fun isAllowed(cmd: String): Boolean = when {
+        cmd.trim() == "id -u" -> true
+        cmd == DualRepository.CMD_LIST_USERS -> true
+        cmd == DualRepository.CMD_USER_LIST_VERBOSE -> true
+        cmd == DualRepository.CMD_DUMPSYS_USER -> true
+        cmd == DualRepository.CMD_GETPROP_DUAL -> true
+        LIST_PACKAGES.matches(cmd) -> true
+        else -> false
+    }
+
+    val writeCommands = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    val unexpectedCommands = java.util.concurrent.ConcurrentLinkedQueue<String>()
+
     override suspend fun run(cmd: String): CmdResult {
         commandLog.add(cmd)
         commandCounter.incrementAndGet()
         // Read-only commands (pm list, cmd user list -v, dumpsys, id) are
-        // NOT counted; only known write verbs are.
-        if (cmd.startsWith("pm uninstall") || cmd.startsWith("pm install") ||
-            cmd.startsWith("pm grant") || cmd.startsWith("appops set") ||
-            cmd.startsWith("am ") ||
-            (cmd.startsWith("cmd ") && !cmd.startsWith("cmd user list"))) {
+        // NOT counted; only known write verbs and shell compounds are.
+        if (isWrite(cmd)) {
             writeCalls++
+            writeCommands.add(cmd)
+        }
+        if (!isWrite(cmd) && !isAllowed(cmd)) {
+            unexpectedCommands.add(cmd)
         }
         return when {
             cmd.trim() == "id -u" ->
@@ -137,15 +167,8 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
                     CmdResult(exit = 0, out = "Success", err = "")
                 }
             }
-            cmd.startsWith("pm list packages") -> {
-                val tokens = cmd.trim().split("\\s+".toRegex())
-                val user = parseUser(tokens)
-                if (user == null || user != dualId.toString()) {
-                    CmdResult(exit = 1, out = "", err = "wrong user")
-                } else {
-                    val base = installedPkgs.map { "package:$it" }.joinToString("\n")
-                    CmdResult(exit = 0, out = base, err = "")
-                }
+            LIST_PACKAGES.matches(cmd) -> {
+                CmdResult(exit = 0, out = installedPkgs.map { "package:$it" }.joinToString("\n"), err = "")
             }
             cmd.startsWith("appops set") -> {
                 val tokens = cmd.trim().split("\\s+".toRegex())
@@ -156,7 +179,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
                     CmdResult(exit = 0, out = "Success", err = "")
                 }
             }
-            else -> CmdResult(exit = 1, out = "", err = "unknown command")
+            else -> CmdResult(exit = 127, out = "", err = "unknown command: $cmd")
         }
     }
 }
@@ -168,6 +191,7 @@ class FakeHarnessGateway(var dualId: Int = 95) : CmdGateway {
 fun newHarnessViewModel(
     gw: FakeHarnessGateway,
     preference: ChannelPreference = ChannelPreference.AUTO,
+    selectionStore: SelectionStore? = null,
 ): DualViewModel =
     DualViewModel(
         repo = DualRepository(gw),
@@ -185,10 +209,18 @@ fun newHarnessViewModel(
         currentChannel = ResolvedChannel.ROOT,
         hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
         hookDiagnosticGateways = { emptyList() },
+        selectionStore = selectionStore,
     )
 
 fun awaitHarnessReady(vm: DualViewModel, timeoutMs: Long = 15_000L) {
     HarnessPoll.await(timeoutMs) { vm.state.value.channelReady }
+}
+
+// Quiescence fence for instrumentation: returns only when every child of
+// vm.viewModelScope is completed (mutex wait + onIo + state commit).
+// Mirrors LifecycleSeparationTest.awaitScopeDrained for the harness.
+fun awaitHarnessDrained(vm: DualViewModel, timeoutMs: Long = 15_000L) {
+    HarnessPoll.await(timeoutMs) { vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]?.children?.all { it.isCompleted } == true }
 }
 
 // Reflection helper: whether the remove-confirmation dialog is currently showing.

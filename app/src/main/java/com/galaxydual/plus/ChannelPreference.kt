@@ -76,11 +76,25 @@ fun channelPreferenceFromStored(raw: String?): ChannelPreference =
 
 // Reads the persisted choice (default AUTO). Thin wrapper over the pure
 // mapping above; never called on JVM tests (Android stub would throw).
+// Corrupt-data policy: a stored value of the wrong type (or any other read
+// failure) is treated as unrecoverable and falls back to AUTO (fail-closed),
+// rather than propagating ClassCastException to the caller. This keeps a
+// mistyped platform entry from crashing startup; the entry itself is left
+// untouched (no self-clear) because the type cannot be safely rewritten here.
 fun loadChannelPreference(prefs: SharedPreferences): ChannelPreference =
-    channelPreferenceFromStored(prefs.getString(CHANNEL_PREF_KEY, null))
+    try {
+        channelPreferenceFromStored(prefs.getString(CHANNEL_PREF_KEY, null))
+    } catch (_: Exception) {
+        ChannelPreference.AUTO
+    }
 
 // Persists the choice so a process restart remembers it. Async apply: the
 // in-memory preference is already updated by the caller.
+// Durability note: apply() updates in-memory state synchronously but flushes
+// to disk asynchronously, so a process killed in the flush window reverts to
+// the previous on-disk value on next start. This is an accepted best-effort
+// trade-off for a UI preference; see SelectionStore for the synchronous
+// commit() rationale used where restart-safety is required.
 fun SharedPreferences.saveChannelPreference(pref: ChannelPreference) {
     edit().putString(CHANNEL_PREF_KEY, pref.toStored()).apply()
 }
