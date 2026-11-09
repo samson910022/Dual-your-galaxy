@@ -1209,9 +1209,9 @@ class DualRepository(
         } catch (e: Exception) {
             return CloneOutcome.ChannelError("channel error: ${e.message ?: e.javaClass.simpleName}")
         }
-        // Unknown-after-send (same rule as cloneVerified:812-827): an
+        // Unknown-after-send (same rule as cloneVerified:1219-1234): an
         // abandoned or lost reply (timedOut / transportUnknown /
-        // isServiceTimeoutText) leaves exit/out/err untrusted -- NEVER map to
+        // isServiceTimeoutText / isPostSpawnTransportText) leaves exit/out/err untrusted -- NEVER map to
         // InstallFailed. One bounded read-only verifyListProbe (no write
         // resend) with an after-pin first: Installed -> Success,
         // clean-but-absent -> VerifyUnknown (reverse, write may still land),
