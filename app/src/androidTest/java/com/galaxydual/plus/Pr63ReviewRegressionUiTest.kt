@@ -164,11 +164,10 @@ class Pr63ReviewRegressionUiTest {
                     var sawAboutIcon = false
                     fun walk(v: android.view.View) {
                         if (v is TextView && v.text?.toString() == expectedLabel) sawLabel = true
-                        if (v is ImageView) {
-                            val cs = v.drawable?.constantState
-                            val expectedCs = activity.getDrawable(R.drawable.ic_nav_about)?.constantState
-                            if (cs != null && expectedCs != null && cs == expectedCs) sawAboutIcon = true
-                        }
+                        // ConstantState equality is flaky across tinted/wrapped vector
+                        // drawables on API 29 emulators; createNavItem tags the icon with
+                        // its source resource id for a stable identity check.
+                        if (v is ImageView && (v.tag as? Int) == R.drawable.ic_nav_about) sawAboutIcon = true
                         if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
                     }
                     walk(nav)
