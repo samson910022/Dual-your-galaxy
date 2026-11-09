@@ -350,6 +350,47 @@ class ShizukuTeardownTest {
     private fun makeGateway(driver: FakeBindDriver, timeoutMs: Long = 5_000L): ShizukuCmdGateway =
         ShizukuCmdGateway("com.example.test", bindTimeoutMs = timeoutMs, bindDriver = driver)
 
+    // Phase C1 (drop identity): dropBindingIfSameLocked only clears the
+    // cache when the passed binder is still the exact cached instance
+    // (===). A stale transact failure for an old binder must not clear (or
+    // release) a newer binding bound by a concurrent call. Quiescent
+    // calls here (the production contract is caller-holds-bindMutex, as
+    // with dropBindingLocked). close()/releaseBinding() stay unconditional
+    // and are covered by the existing teardown tests.
+    @Test
+    fun gateway_dropBindingIfSameLocked_onlyDropsSameBinder() = runBlocking {
+        val driver = FakeBindDriver()
+        val gw = makeGateway(driver)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val job = scope.async { gw.boundBinder() }
+            await { driver.sendCount == 1 }
+            val binder = fakeBinder()
+            driver.completeLatestWith(binder)
+            assertTrue(job.await() === binder)
+            assertTrue(gw.hasCachedBindingForTest())
+            // Stale (different) binder: cache and its request stay intact.
+            val stale = fakeBinder()
+            gw.dropBindingIfSameLocked(stale)
+            assertTrue("stale binder must not clear a newer binding", gw.hasCachedBindingForTest())
+            assertEquals("stale binder must not release the cached request", 0, driver.totalReleases)
+            // Null binder: likewise not the cached instance, must not clear.
+            gw.dropBindingIfSameLocked(null)
+            assertTrue(gw.hasCachedBindingForTest())
+            assertEquals(0, driver.totalReleases)
+            // Same binder: drops exactly once.
+            gw.dropBindingIfSameLocked(binder)
+            assertFalse(gw.hasCachedBindingForTest())
+            assertEquals(1, driver.totalReleases)
+            // Repeat with the same (now uncached) binder: idempotent no-op.
+            gw.dropBindingIfSameLocked(binder)
+            assertFalse(gw.hasCachedBindingForTest())
+            assertEquals("repeat identity drop must not double-release", 1, driver.totalReleases)
+        } finally {
+            scope.cancel()
+        }
+    }
+
     // Phase B P2-2 (a): cancel-during-bind (no abandon) releases the sent
     // request exactly once, caches nothing, and leaves the gateway usable --
     // the next bind completes normally and close() releases it once.

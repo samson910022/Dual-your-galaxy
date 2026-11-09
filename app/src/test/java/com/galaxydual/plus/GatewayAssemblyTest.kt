@@ -276,6 +276,41 @@ class GatewayAssemblyTest {
         assertEquals(null, badRequestForBlankCommand("  pm list packages  "))
     }
 
+    // Phase C1 (4KB bound, pure helper): badRequestForCommand pins
+    // null/blank -> blank bad request, 4096 chars -> pass (null), 4097 ->
+    // "command too long" bad request (exit=1, no flags, no backstop).
+    // badRequestForBlankCommand stays blank-only (8000-char pass-through
+    // retained) so its existing pins do not silently change meaning;
+    // production gates use badRequestForCommand.
+    @Test fun execRequest_commandLengthBound_4096passes_4097rejects() {
+        assertEquals(4096, ShizukuExecProtocol.MAX_CMD_CHARS)
+        assertEquals(null, badRequestForCommand("x".repeat(4096)))
+        assertEquals(null, badRequestForCommand("pm list packages"))
+        // Blank helper preserved: an 8000-char cmd is still not a blank
+        // bad request (validEdgeCases pin), only a length bad request.
+        assertEquals(null, badRequestForBlankCommand("x".repeat(8000)))
+        for (raw in listOf<String?>(null, "", "   ", "x".repeat(4097), "x".repeat(8000))) {
+            val res = badRequestForCommand(raw)
+            assertTrue("raw len=${raw?.length} must be bad request, got: $res", res != null)
+            assertEquals(1, res!!.exit)
+            assertEquals("", res.out)
+            assertTrue("err must contain 'bad request', got: \"${res.err}\"", res.err.contains("bad request"))
+            assertFalse("bad request must not carry truncated, got: $res", res.truncated)
+            assertFalse("bad request must not carry timedOut, got: $res", res.timedOut)
+            assertFalse("bad request must not carry transportUnknown, got: $res", res.transportUnknown)
+            for (prefix in listOf("interrupted: ", "service exec failed: ", "timeout after ", "shizuku: exec timed out after ")) {
+                assertFalse(
+                    "bad request err must not start with backstop prefix '$prefix', got: \"${res.err}\"",
+                    res.err.startsWith(prefix),
+                )
+            }
+        }
+        val tooLong = badRequestForCommand("x".repeat(4097))
+        assertTrue("too-long err must name the bound, got: \"${tooLong!!.err}\"", tooLong.err.contains("too long") && tooLong.err.contains("4096"))
+        assertEquals("bad request: blank command", badRequestForCommand(null)!!.err)
+        assertEquals("bad request: blank command", badRequestForCommand("  ")!!.err)
+    }
+
     // Parcel-null P0: a null reply string is post-dispatch reply loss, NOT
     // clean-empty. Pure helper decodeExecReplyNullable is what transactExec
     // feeds reply.readString() into; folding null to "" would forge a
