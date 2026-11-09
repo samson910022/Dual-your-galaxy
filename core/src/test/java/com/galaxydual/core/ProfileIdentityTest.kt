@@ -1879,4 +1879,197 @@ class ProfileIdentityTest {
         val res = runSuspend { repo.resolveDualUserIdTyped() }
         assertTrue("unknown bare Type must be Unknown (never Absent/NoDual), got: $res", res is DualIdResolution.Unknown)
     }
+
+    // ---- PR #59 review hardening: taint/category/interaction regressions ----
+
+    @Test
+    fun s24BareType_taintedCloneFailsClosedAsOther() {
+        // Tainted/residual-demoted CLONE token on a bare `Type:` line must
+        // fail closed (never CLONE) and, by the established TYPE_LINE
+        // contract (cloneSlashTail_isOtherNotClone / trailing-punct), resolve
+        // as OTHER for that mention -- not UNKNOWN. The bare path detects a
+        // supported clone token demoted by classifyMention and treats it as
+        // OTHER, consistent with the TYPE_LINE path.
+        val cases = listOf(
+            "profile.CLONE/evil",
+            "android.os.usertype.profile.CLONE/evil",
+            "profile.CLONE/",
+            "android.os.usertype.profile.CLONE/",
+            "profile.CLONE / evil",
+            "profile.CLONE!evil",
+            "android.os.usertype.profile.CLONE!evil",
+            "profile_CLONE!evil",
+            "profile-CLONE!evil",
+        )
+        for (value in cases) {
+            assertEquals(
+                "tainted bare Type must be OTHER (fail-closed, never CLONE): $value",
+                ProfileUserType.OTHER,
+                parseSingleBareType(value),
+            )
+        }
+        // Parity: same tainted value on explicit TYPE_LINE path stays OTHER.
+        assertEquals(ProfileUserType.OTHER, parseSingleVerboseType("profile.CLONE/evil"))
+        assertEquals(ProfileUserType.OTHER, parseSingleVerboseType("android.os.usertype.profile.CLONE/evil"))
+    }
+
+    @Test
+    fun s24BareType_embeddedFullSystemSubstringIsUnknown() {
+        // Regression for prefix/boundary-anchored full/system category check:
+        // an embedded `full.`/`system.` substring (not at category boundary)
+        // must NOT classify as OTHER; with an unknown tail it fails closed
+        // to UNKNOWN (never CLONE).
+        val cases = listOf(
+            "subfull.UNKNOWN",
+            "mysystem.WEIRD",
+            "xandroid.os.usertype.full.SECONDARY",
+        )
+        for (value in cases) {
+            assertEquals(
+                "embedded full/system substring must not be OTHER: $value",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+    }
+
+    @Test
+    fun s24BareType_fullAndSystemUnknownTailsAreOtherByCategory() {
+        // `full.*`/`system.*` are known non-clone usertype categories: any
+        // tail under these categories is OTHER (never CLONE). Pins the
+        // intentional category short-circuit (authorization-safe); absence
+        // certainty for an unknown tail in these categories is traded for
+        // availability, as documented in isKnownOtherBareValue.
+        val cases = listOf(
+            "android.os.usertype.full.FOO_UNKNOWN",
+            "full.WHATEVER",
+            "system.weird",
+            "android.os.usertype.system.STRANGE",
+        )
+        for (value in cases) {
+            assertEquals(
+                "full/system category tail must be OTHER (never CLONE): $value",
+                ProfileUserType.OTHER,
+                parseSingleBareType(value),
+            )
+        }
+    }
+
+    @Test
+    fun s24BareType_knownBareTailsAndShortProfileForms() {
+        // Bare known tails (no dots) resolve via tail allowlist; short
+        // profile.* forms exercise classifyMention on the bare path.
+        val otherValues = listOf(
+            "GUEST", "demo", "restricted", "HEADLESS", "car",
+            "profile.PRIVATE", "profile.private", "profile.MANAGED",
+            "android.os.usertype.profile.PRIVATE (default)",
+        )
+        for (value in otherValues) {
+            assertEquals(
+                "known bare/short form must be OTHER: $value",
+                ProfileUserType.OTHER,
+                parseSingleBareType(value),
+            )
+        }
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("profile.CLONE"))
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("profile.clone"))
+        assertEquals(
+            ProfileUserType.CLONE,
+            parseSingleBareType("android.os.usertype.profile.CLONE (default)"),
+        )
+    }
+
+    @Test
+    fun s24BareType_mixedCloneAndManagedInOneLineIsUnknown() {
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            parseSingleBareType("android.os.usertype.profile.MANAGED android.os.usertype.profile.CLONE"),
+        )
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            parseSingleBareType("profile.MANAGED, profile.CLONE"),
+        )
+    }
+
+    @Test
+    fun repeatedBareTypeLinesWithCloneAndPrivate_isUnknown() {
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.CLONE
+                Type: android.os.usertype.profile.PRIVATE
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed[0].userType)
+    }
+
+    @Test
+    fun mixedTypeLineAndBareType_contradictionIsUnknown() {
+        // Step 1 accumulates across TYPE_LINE and BARE_TYPE_LINE: a CLONE on
+        // one and a known-non-clone on the other is a cross-mention
+        // contradiction -> UNKNOWN.
+        val verboseThenBare = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+                Type: android.os.usertype.profile.PRIVATE
+        """.trimIndent()
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            SamsungProfileAdapter.parseUserListVerbose(verboseThenBare).single().userType,
+        )
+        val bareThenVerbose = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.CLONE
+                User type: android.os.usertype.profile.PRIVATE
+        """.trimIndent()
+        assertEquals(
+            ProfileUserType.UNKNOWN,
+            SamsungProfileAdapter.parseUserListVerbose(bareThenVerbose).single().userType,
+        )
+        // Agreement across forms is still consistent.
+        val agree = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+                Type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        assertEquals(ProfileUserType.CLONE, SamsungProfileAdapter.parseUserListVerbose(agree).single().userType)
+    }
+
+    @Test
+    fun separatorLessClone_withFqRemainder_yieldsClone() {
+        // Regression for TYPE_KEYWORD dot-guard / FQ handling: separator-less
+        // `usertype` keyword (step 2) with an FQ CLONE remainder must still
+        // classify CLONE; the FQ-internal `usertype.` must not be re-matched.
+        val text = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                usertype android.os.usertype.profile.CLONE
+                parentId=0
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed[0].userType)
+        assertEquals(0, parsed[0].parentId)
+        val managed = """
+            Users:
+              UserInfo{10:Work:1030} running:
+                usertype android.os.usertype.profile.MANAGED
+        """.trimIndent()
+        assertEquals(
+            ProfileUserType.OTHER,
+            SamsungProfileAdapter.parseUserListVerbose(managed).single().userType,
+        )
+    }
 }
