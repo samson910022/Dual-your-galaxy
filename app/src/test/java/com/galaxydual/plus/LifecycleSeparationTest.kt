@@ -621,7 +621,8 @@ class LifecycleSeparationTest {
         assertNotNull("VM-A pending must survive persist until destroy", pendingBeforeDestroy)
 
         // Destroy VM A (cancel its scope) to simulate VM recreation (same
-        // process; a real process-kill is covered by instrumentation below).
+        // process; platform commit() durability is covered by
+        // SelectionRealStoreTest).
         try {
             vmA.viewModelScope.cancel()
         } catch (_: Exception) {
