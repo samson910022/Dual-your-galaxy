@@ -80,6 +80,7 @@ class HookInstallerCallerTest {
                 "deoptimize caller returned false java.lang.String#isEmpty (hook proceeds, effect unverified)",
                 "deoptimize returned false java.lang.String#length (hook proceeds, effect unverified)",
                 "hooked java.lang.String#length",
+                "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
             ),
             host.logs,
         )
@@ -97,6 +98,7 @@ class HookInstallerCallerTest {
                 "deoptimize caller failed java.lang.String#isEmpty: art unavailable; hook proceeds, effect unverified",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
+                "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
             ),
             host.logs,
         )
@@ -106,18 +108,34 @@ class HookInstallerCallerTest {
     fun failureDiagnosticsNeverClaimNotNeeded() {
         // Issue #10: false must not read as "not needed"/no-op. Lock exact
         // wording on both caller and callee paths across all outcomes.
-        val outcomes: List<(Method) -> Boolean> = listOf({ true }, { false }, { throw Error("x") })
-        outcomes.forEach { deopt ->
+        // A caller deopt incomplete summary (added for diagnostics) may follow
+        // the hooked entry when callers did not all deoptimize; it must also
+        // never claim not-needed/no-op/不需要.
+        val outcomes: List<Pair<String, (Method) -> Boolean>> = listOf(
+            "true" to { true },
+            "false" to { false },
+            "throw" to { throw Error("x") },
+        )
+        outcomes.forEach { (label, deopt) ->
             val host = Host(deopt = deopt)
             assertTrue(host.installWithCallers(method("length"), listOf(method("isEmpty")), "id"))
-            assertFalse(host.logs.any {
+            assertFalse("$label: claimed not needed", host.logs.any {
                 it.contains("not needed", ignoreCase = true) ||
                     it.contains("no-op", ignoreCase = true) ||
                     it.contains("不需要")
             })
             // Every deoptimize attempt (caller + callee) leaves a diagnostic.
-            assertEquals(3, host.logs.size)
-            assertTrue(host.logs.last().startsWith("hooked "))
+            assertTrue("$label: missing hooked entry", host.logs.any { it.startsWith("hooked ") })
+            if (label == "true") {
+                assertEquals("$label: unexpected log count", 3, host.logs.size)
+                assertTrue(host.logs.last().startsWith("hooked "))
+            } else {
+                assertEquals("$label: unexpected log count", 4, host.logs.size)
+                assertTrue(
+                    "$label: expected incomplete summary",
+                    host.logs.last().startsWith("caller deopt incomplete: 0/1 deoptimized;"),
+                )
+            }
         }
     }
 
@@ -134,6 +152,34 @@ class HookInstallerCallerTest {
         assertEquals(listOf("galaxydual:custom"), host.ids)
         assertEquals(3, host.logs.size)
         assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
+    }
+
+    @Test
+    fun incompleteCallersAndHookFailureReportsFailureWithoutMisleadingSummary() {
+        // Issue #10 review: caller mitigation is moot when the callee hook
+        // fails, so no "caller deopt incomplete ... hook proceeds" summary.
+        val callee = method("length")
+        val caller = method("isEmpty")
+        val host = Host(
+            deopt = { false },
+            hookResult = { throw Error("install error") },
+        )
+        assertFalse(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
+        assertSame(caller, host.events[0].second)
+        assertSame(callee, host.events[1].second)
+        assertSame(callee, host.events[2].second)
+        assertEquals(listOf("galaxydual:custom"), host.ids)
+        // Caller + callee deopt attempts logged (each "returned false"),
+        // then hook-failure diagnostic from install(); no incomplete summary.
+        assertTrue(host.logs.any { it == "hook failed java.lang.String#length: install error" })
+        assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
+        assertFalse(host.logs.any { it.startsWith("caller deopt incomplete") })
+        assertFalse(host.logs.any {
+            it.contains("not needed", ignoreCase = true) ||
+                it.contains("no-op", ignoreCase = true) ||
+                it.contains("不需要")
+        })
     }
 
     @Test
@@ -176,6 +222,7 @@ class HookInstallerCallerTest {
                 "deoptimize caller returned false java.lang.String#isEmpty (hook proceeds, effect unverified)",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
+                "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
             ),
             host.logs,
         )
@@ -200,6 +247,7 @@ class HookInstallerCallerTest {
                 "deoptimize caller failed java.lang.String#isEmpty: art unavailable; hook proceeds, effect unverified",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
+                "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
             ),
             host.logs,
         )
@@ -253,6 +301,7 @@ class HookInstallerCallerTest {
                 "deoptimized caller java.lang.String#toString",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
+                "caller deopt incomplete: 1/3 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
             ),
             host.logs,
         )
@@ -292,5 +341,36 @@ class HookInstallerCallerTest {
             ),
             host.logs,
         )
+    }
+
+    @Test
+    fun summaryLoggedWhenCallersIncompleteAndOmittedWhenAllSucceedOrEmpty() {
+        val callee = method("length")
+        val a = method("isEmpty")
+        val b = method("hashCode")
+
+        val partial = Host(deopt = { target -> target != a })
+        assertTrue(partial.installWithCallers(callee, listOf(a, b), "id"))
+        assertEquals(
+            "caller deopt incomplete: 1/2 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
+            partial.logs.last(),
+        )
+
+        val total = Host(deopt = { target -> target == callee })
+        assertTrue(total.installWithCallers(callee, listOf(a, b), "id"))
+        assertEquals(
+            "caller deopt incomplete: 0/2 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
+            total.logs.last(),
+        )
+
+        val allSucceed = Host(deopt = { true })
+        assertTrue(allSucceed.installWithCallers(callee, listOf(a, b), "id"))
+        assertFalse(allSucceed.logs.any { it.startsWith("caller deopt incomplete:") })
+        assertTrue(allSucceed.logs.last().startsWith("hooked "))
+
+        val empty = Host(deopt = { true })
+        assertTrue(empty.installWithCallers(callee, emptyList(), "id"))
+        assertFalse(empty.logs.any { it.startsWith("caller deopt incomplete:") })
+        assertTrue(empty.logs.last().startsWith("hooked "))
     }
 }
