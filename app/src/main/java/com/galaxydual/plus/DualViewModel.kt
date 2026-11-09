@@ -8,7 +8,6 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualIdResolution
 import com.galaxydual.core.DualRepository
-import com.galaxydual.core.DualTargetResolution
 import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
@@ -16,7 +15,6 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
-import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.VerifyState
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
@@ -266,8 +264,8 @@ data class UiState(
     // returns hasRoot=true on `id -u == 0` even when its `pm list users`
     // fails (dualUserId=-1), so anyProbePassed is true while refresh reports
     // ChannelError. True PM readability is decided by refresh
-    // (profilesSnapshot Loaded vs ChannelError, listClonedPackages null vs
-    // list), not by this flag.
+    // (RefreshOutcome ChannelError vs Loaded variants NoDual/Unknown/
+    // GroundTruth), not by this flag.
     // AUTO probes all, so this is device-wide; explicit probes only its own
     // channel (P25 Item 3), so for explicit anyProbePassed == writeReady by
     // construction (unrelated channels intentionally unprobed, never reported).
@@ -826,8 +824,9 @@ class DualViewModel(
 
     // Reloads profiles AND rebuilds `cloned` from the dual user's actual
     // packages via the single-target refresh (Phase D P2-D): one
-    // profilesSnapshot (1 cmd) + one verified-target fetch (3 cmds) + one
-    // list probe on that same id (1 cmd) + post-list re-verify triple (3 cmds) = 8 commands (second triple is the strict-equality fence). Four states are told
+    // profilesSnapshot (1 cmd) + one typed triple via resolveDualTargetTyped
+    // (3 cmds) + one list probe on that same id (1 cmd) + post-list re-verify
+    // triple (3 cmds) = 8 commands (second triple is the strict-equality fence). Four states are told
     // apart explicitly (issue #9):
     // - ChannelError: `pm list users` itself failed -> "channel error: ...".
     // - NoDual: channel ok but no single DUAL profile -> "no dual profile".
@@ -1002,6 +1001,12 @@ class DualViewModel(
     }
 
     private suspend fun refreshLocked() {
+        // NOTE (Phase 3): the pendingRemove-preserve guard below is
+        // intentionally duplicated per RefreshOutcome branch (no helper
+        // extracted). Only the GroundTruth listed branch can actually
+        // trigger it (msgKind NONE/INFO); the ChannelError/NoDual/Unknown/
+        // GroundTruth-null/catch branches set CHANNEL/NO_DUAL/FAILED, so
+        // their guards are dead but kept for symmetry.
         // Mark busy first so the UI can render a spinner. Dialog 開著時狀態列
         // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
         // loading=true（refresh 不應驅散確認對話框的提示）。
@@ -1164,8 +1169,8 @@ class DualViewModel(
                             next
                         }
                     }
-                    // Phase B #1：未知時亦跑綁定檢查：bound 舊≠新（-1）
-                    // 即清空舊勾選（防 95 勾選殘留到舊目標外的空窗）。
+                    // Phase B #1：未知時亦跑綁定檢查：保留舊 targetId，
+                    // 故 bound 一致即 no-op（不清勾選）。
                     handleSelectionTargetChangeLocked()
                 }
                 is RefreshOutcome.GroundTruth -> {

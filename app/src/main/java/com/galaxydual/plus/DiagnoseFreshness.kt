@@ -247,8 +247,9 @@ internal fun HookEvidence.timeEvidenceText(): String {
 //   "verified dual id unknown for listed target <id>"；
 // - "verified dual id <id> absent and profiles snapshot empty"
 //   (空快照不可信，CHANNEL_ERROR，非 NO_DUAL)；
-// - "profiles snapshot empty despite typed absent"
-//   (refresh 首跳 Absent 但快照空)；
+// - "verified dual id unknown: profiles snapshot empty despite typed absent"
+//   (refresh Absent 但快照空；repo detail 為 "profiles snapshot empty
+//   despite typed absent"，VM 以 "verified dual id unknown: " 前綴呈現)；
 // - "profiles snapshot channel failed: <detail>"
 //   (listCloned null 鑑別重查通道失敗)；
 // - "LSPOSED placeholder / writes unsupported ..."
@@ -260,7 +261,8 @@ internal fun HookEvidence.timeEvidenceText(): String {
 // - "serial unavailable ..." / "serial <a> != <b> ..." 一律 VERIFY_MISMATCH
 //   (身份不可驗證，Stage C C1 與 confirm 一致)，絕非 E_CHANNEL；
 // - "verified id <a> != <b>" / "verified id drifted: ..." 一律 VERIFY_MISMATCH；
-// - "typed resolution absent" 一律 NO_DUAL (Absent+快照可用才報)。
+// - "typed resolution absent" 一律 NO_DUAL (Absent+快照可用才報；非 refresh
+//   的 typed 路徑)；refresh 的 NoDual 用 "no verified dual target"。
 enum class DiagnoseCode(val stableId: String) {
     OK("OK"),
     CHANNEL_ERROR("E_CHANNEL"),
