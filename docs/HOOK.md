@@ -76,15 +76,15 @@ caller-inline fixture 尚未建立，相關裝置驗證尚未完成；驗收待�
 
 #### Caller-side 研究註記（issue #10 Stage1，不改行為）
 - callee-only best-effort 維持現狀：真正的反內聯修正需要 **(a)** 按支援
-  ROM／版本辨識已內聯 callee 的 caller 並對**那些 caller**做 deoptimize，
-  或 **(b)** 選擇內聯副本無法繞過的 hook point。
+  ROM／版本辨識已內聯 callee 的 caller（方法或建構子，`Executable`）並對
+  **那些 caller** 做 deoptimize，或 **(b)** 選擇內聯副本無法繞過的 hook point。
 - **不無差別 deoptimize 整個 system_server**：只維持已證據的最小範圍
  （已知 callers＋被 hook 的 callee）。
 - JVM 可測部分已落地：`CallerDeoptPlan.plan(callee, knownCallers)`
   純函數決策（去重、保序、排除 callee 本體、不改輸入）＋
   `HookInstaller.installWithCallers` 編排（先逐一 best-effort deoptimize
-  callers 並逐條保留 false／例外診斷，再走既有 callee deopt＋hook；
-  caller 失敗不擋 hook），由 `CallerDeoptPlanTest`／
+  callers 並逐條保留 false／例外診斷（含 hookId 與完整簽名），再走既有
+  callee deopt＋hook；caller 失敗不擋 hook），由 `CallerDeoptPlanTest`／
   `HookInstallerCallerTest` 鎖定（含 false 不得寫成「不需要」／no-op）。
 - `DualHook.knownCallersFor()` 為 DEVICE-UNVERIFIED 接線點，目前回空
   （＝今日 callee-only 行為，呼叫點仍走 `hookWithDeoptimize()`，行為不變）；

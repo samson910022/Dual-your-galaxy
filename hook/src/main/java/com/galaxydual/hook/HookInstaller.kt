@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 
 // Framework-free orchestration; the caller supplies the actual framework operations.
@@ -48,7 +49,8 @@ internal object HookInstaller {
     }
 
     // Caller-aware variant (issue #10 Stage1): deoptimize each known caller
-    // first (best-effort, diagnostics preserved per caller), then run the
+    // (Method or Constructor, as Executable) first (best-effort, diagnostics
+    // preserved per caller with hookId and full signature), then run the
     // standard callee install above (callee deopt + hook). Caller failures
     // never block the callee hook; only the callee hook result decides the
     // return value. Pure orchestration over CallerDeoptPlan -- framework ops
@@ -57,8 +59,8 @@ internal object HookInstaller {
     fun installWithCallers(
         callee: Method,
         hookId: String,
-        knownCallers: List<Method>,
-        deoptimize: (Method) -> Boolean,
+        knownCallers: List<Executable?>,
+        deoptimize: (Executable) -> Boolean,
         hook: (Method, String) -> Unit,
         log: (String) -> Unit,
     ): Boolean {
@@ -66,22 +68,24 @@ internal object HookInstaller {
         val callersAttempted = plan.callersToDeoptimize.size
         var callersDeoptimized = 0
         for (caller in plan.callersToDeoptimize) {
+            val sig = caller.toGenericString()
             try {
                 if (deoptimize(caller)) {
                     callersDeoptimized++
-                    safeLog(log, "deoptimized caller ${caller.declaringClass.name}#${caller.name}")
+                    safeLog(log, "deoptimized caller [$hookId] $sig")
                 } else {
                     safeLog(
                         log,
-                        "deoptimize caller returned false ${caller.declaringClass.name}#${caller.name} " +
+                        "deoptimize caller [$hookId] returned false $sig " +
                             "(hook proceeds, effect unverified)",
                     )
                 }
             } catch (t: Throwable) {
                 safeLog(
                     log,
-                    "deoptimize caller failed ${caller.declaringClass.name}#${caller.name}: " +
-                        "${t.message}; hook proceeds, effect unverified",
+                    "deoptimize caller [$hookId] failed $sig: " +
+                        "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                        "hook proceeds, effect unverified",
                 )
             }
         }

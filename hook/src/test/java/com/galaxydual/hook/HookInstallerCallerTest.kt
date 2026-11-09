@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -8,21 +9,23 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// Locks caller->callee orchestration (issue #10 Stage1): known callers are
-// deoptimized before the callee hook, each with preserved failure
-// diagnostics (false/exception logged, never "not needed", hook proceeds).
-// Framework ops stay injected fakes; ART effect remains DEVICE-UNVERIFIED.
+// Locks caller->callee orchestration (issue #10 Stage1): known callers
+// (methods or constructors, as Executables) are deoptimized before the callee
+// hook, each with preserved failure diagnostics (hookId + full signature;
+// false/exception logged with throwable class, never "not needed", hook
+// proceeds). Framework ops stay injected fakes; ART effect remains
+// DEVICE-UNVERIFIED.
 class HookInstallerCallerTest {
     private class Host(
-        val deopt: (Method) -> Boolean = { true },
+        val deopt: (Executable) -> Boolean = { true },
         val hookResult: () -> Unit = {},
         val logResult: (String) -> Unit = {},
     ) {
-        val events = mutableListOf<Pair<String, Method>>()
+        val events = mutableListOf<Pair<String, Executable>>()
         val ids = mutableListOf<String>()
         val logs = mutableListOf<String>()
 
-        fun installWithCallers(callee: Method, callers: List<Method>, id: String) =
+        fun installWithCallers(callee: Method, callers: List<Executable?>, id: String) =
             HookInstaller.installWithCallers(
                 callee, id, callers,
                 { target -> events.add("deoptimize" to target); deopt(target) },
@@ -52,7 +55,8 @@ class HookInstallerCallerTest {
         val callee = method("length")
         val callerA = method("isEmpty")
         val callerB = method("hashCode")
-        assertTrue(host.installWithCallers(callee, listOf(callerA, callerB), "id"))
+        val id = "id"
+        assertTrue(host.installWithCallers(callee, listOf(callerA, callerB), id))
         assertEquals(listOf("deoptimize", "deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(callerA, host.events[0].second)
         assertSame(callerB, host.events[1].second)
@@ -60,8 +64,8 @@ class HookInstallerCallerTest {
         assertSame(callee, host.events[3].second)
         assertEquals(
             listOf(
-                "deoptimized caller java.lang.String#isEmpty",
-                "deoptimized caller java.lang.String#hashCode",
+                "deoptimized caller [$id] ${callerA.toGenericString()}",
+                "deoptimized caller [$id] ${callerB.toGenericString()}",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
             ),
@@ -74,10 +78,11 @@ class HookInstallerCallerTest {
         val host = Host(deopt = { false })
         val callee = method("length")
         val caller = method("isEmpty")
-        assertTrue(host.installWithCallers(callee, listOf(caller), "id"))
+        val id = "id"
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(
             listOf(
-                "deoptimize caller returned false java.lang.String#isEmpty (hook proceeds, effect unverified)",
+                "deoptimize caller [$id] returned false ${caller.toGenericString()} (hook proceeds, effect unverified)",
                 "deoptimize returned false java.lang.String#length (hook proceeds, effect unverified)",
                 "hooked java.lang.String#length",
                 "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
@@ -92,10 +97,12 @@ class HookInstallerCallerTest {
             if (target.name == "isEmpty") throw AssertionError("art unavailable") else true
         })
         val callee = method("length")
-        assertTrue(host.installWithCallers(callee, listOf(method("isEmpty")), "id"))
+        val caller = method("isEmpty")
+        val id = "id"
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(
             listOf(
-                "deoptimize caller failed java.lang.String#isEmpty: art unavailable; hook proceeds, effect unverified",
+                "deoptimize caller [$id] failed ${caller.toGenericString()}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
                 "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
@@ -111,7 +118,7 @@ class HookInstallerCallerTest {
         // A caller deopt incomplete summary (added for diagnostics) may follow
         // the hooked entry when callers did not all deoptimize; it must also
         // never claim not-needed/no-op/不需要.
-        val outcomes: List<Pair<String, (Method) -> Boolean>> = listOf(
+        val outcomes: List<Pair<String, (Executable) -> Boolean>> = listOf(
             "true" to { true },
             "false" to { false },
             "throw" to { throw Error("x") },
@@ -143,13 +150,14 @@ class HookInstallerCallerTest {
     fun hookFailureStillReturnsFalse() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(hookResult = { throw Error("install error") })
-        assertFalse(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertFalse(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(caller, host.events[0].second)
         assertSame(callee, host.events[1].second)
         assertSame(callee, host.events[2].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(3, host.logs.size)
         assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
     }
@@ -160,16 +168,17 @@ class HookInstallerCallerTest {
         // fails, so no "caller deopt incomplete ... hook proceeds" summary.
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(
             deopt = { false },
             hookResult = { throw Error("install error") },
         )
-        assertFalse(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertFalse(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(caller, host.events[0].second)
         assertSame(callee, host.events[1].second)
         assertSame(callee, host.events[2].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         // Caller + callee deopt attempts logged (each "returned false"),
         // then hook-failure diagnostic from install(); no incomplete summary.
         assertTrue(host.logs.any { it == "hook failed java.lang.String#length: install error" })
@@ -186,16 +195,17 @@ class HookInstallerCallerTest {
     fun loggerFailureOnDeoptimizedCallerDoesNotChangeResult() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(logResult = { if (it.startsWith("deoptimized caller ")) throw Error("logger") })
-        assertTrue(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(caller, host.events[0].second)
         assertSame(callee, host.events[1].second)
         assertSame(callee, host.events[2].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimized caller java.lang.String#isEmpty",
+                "deoptimized caller [$id] ${caller.toGenericString()}",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
             ),
@@ -207,19 +217,20 @@ class HookInstallerCallerTest {
     fun loggerFailureOnCallerReturnedFalseDoesNotChangeResult() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(
             deopt = { target -> target != caller },
-            logResult = { if (it.startsWith("deoptimize caller returned false ")) throw Error("logger") },
+            logResult = { if (it.startsWith("deoptimize caller [") && it.contains("] returned false ")) throw Error("logger") },
         )
-        assertTrue(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(caller, host.events[0].second)
         assertSame(callee, host.events[1].second)
         assertSame(callee, host.events[2].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimize caller returned false java.lang.String#isEmpty (hook proceeds, effect unverified)",
+                "deoptimize caller [$id] returned false ${caller.toGenericString()} (hook proceeds, effect unverified)",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
                 "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
@@ -232,19 +243,20 @@ class HookInstallerCallerTest {
     fun loggerFailureOnCallerFailedDoesNotChangeResult() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(
             deopt = { target -> if (target == caller) throw AssertionError("art unavailable") else true },
-            logResult = { if (it.startsWith("deoptimize caller failed ")) throw Error("logger") },
+            logResult = { if (it.startsWith("deoptimize caller [") && it.contains("] failed ")) throw Error("logger") },
         )
-        assertTrue(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
         assertSame(caller, host.events[0].second)
         assertSame(callee, host.events[1].second)
         assertSame(callee, host.events[2].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimize caller failed java.lang.String#isEmpty: art unavailable; hook proceeds, effect unverified",
+                "deoptimize caller [$id] failed ${caller.toGenericString()}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
                 "caller deopt incomplete: 0/1 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
@@ -256,8 +268,10 @@ class HookInstallerCallerTest {
     @Test
     fun forwardsNonTrivialHookIdToHook() {
         val host = Host()
-        assertTrue(host.installWithCallers(method("length"), listOf(method("isEmpty")), "galaxydual:custom"))
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        val caller = method("isEmpty")
+        val id = "galaxydual:custom"
+        assertTrue(host.installWithCallers(method("length"), listOf(caller), id))
+        assertEquals(listOf(id), host.ids)
     }
 
     @Test
@@ -276,6 +290,7 @@ class HookInstallerCallerTest {
         val first = method("isEmpty")
         val second = method("hashCode")
         val third = method("toString")
+        val id = "galaxydual:custom"
         val host = Host(deopt = { target ->
             when (target) {
                 first -> false
@@ -283,7 +298,7 @@ class HookInstallerCallerTest {
                 else -> true
             }
         })
-        assertTrue(host.installWithCallers(callee, listOf(first, second, third), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(first, second, third), id))
         assertEquals(
             listOf("deoptimize", "deoptimize", "deoptimize", "deoptimize", "hook"),
             host.events.map { it.first },
@@ -293,12 +308,12 @@ class HookInstallerCallerTest {
         assertSame(third, host.events[2].second)
         assertSame(callee, host.events[3].second)
         assertSame(callee, host.events[4].second)
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimize caller returned false java.lang.String#isEmpty (hook proceeds, effect unverified)",
-                "deoptimize caller failed java.lang.String#hashCode: art unavailable; hook proceeds, effect unverified",
-                "deoptimized caller java.lang.String#toString",
+                "deoptimize caller [$id] returned false ${first.toGenericString()} (hook proceeds, effect unverified)",
+                "deoptimize caller [$id] failed ${second.toGenericString()}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
+                "deoptimized caller [$id] ${third.toGenericString()}",
                 "deoptimized java.lang.String#length",
                 "hooked java.lang.String#length",
                 "caller deopt incomplete: 1/3 deoptimized; hook proceeds, inline bypass may remain (effect unverified)",
@@ -311,13 +326,14 @@ class HookInstallerCallerTest {
     fun callerSucceedsButCalleeDeoptReturnsFalse() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(deopt = { target -> target != callee })
-        assertTrue(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimized caller java.lang.String#isEmpty",
+                "deoptimized caller [$id] ${caller.toGenericString()}",
                 "deoptimize returned false java.lang.String#length (hook proceeds, effect unverified)",
                 "hooked java.lang.String#length",
             ),
@@ -329,13 +345,14 @@ class HookInstallerCallerTest {
     fun callerSucceedsButCalleeDeoptThrows() {
         val callee = method("length")
         val caller = method("isEmpty")
+        val id = "galaxydual:custom"
         val host = Host(deopt = { target -> if (target == callee) throw AssertionError("art unavailable") else true })
-        assertTrue(host.installWithCallers(callee, listOf(caller), "galaxydual:custom"))
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
-        assertEquals(listOf("galaxydual:custom"), host.ids)
+        assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimized caller java.lang.String#isEmpty",
+                "deoptimized caller [$id] ${caller.toGenericString()}",
                 "deoptimize failed java.lang.String#length: art unavailable; hook proceeds, effect unverified",
                 "hooked java.lang.String#length",
             ),
@@ -372,5 +389,64 @@ class HookInstallerCallerTest {
         assertTrue(empty.installWithCallers(callee, emptyList(), "id"))
         assertFalse(empty.logs.any { it.startsWith("caller deopt incomplete:") })
         assertTrue(empty.logs.last().startsWith("hooked "))
+    }
+
+    // Review #1 (P2): same-name overloads must be distinguishable in caller diagnostics.
+    @Test
+    fun overloadCallersProduceDistinguishableSignatures() {
+        val callee = method("length")
+        val intOverload = String::class.java.getMethod("valueOf", Int::class.javaPrimitiveType)
+        val boolOverload = String::class.java.getMethod("valueOf", Boolean::class.javaPrimitiveType)
+        val id = "galaxydual:custom"
+        val host = Host(deopt = { target -> target == intOverload })
+        assertTrue(host.installWithCallers(callee, listOf(intOverload, boolOverload), id))
+        assertEquals(
+            listOf("deoptimize", "deoptimize", "deoptimize", "hook"),
+            host.events.map { it.first },
+        )
+        val intSig = intOverload.toGenericString()
+        val boolSig = boolOverload.toGenericString()
+        assertFalse("overload signatures must differ", intSig == boolSig)
+        assertTrue(host.logs.any { it == "deoptimized caller [$id] $intSig" })
+        assertTrue(host.logs.any {
+            it == "deoptimize caller [$id] returned false $boolSig (hook proceeds, effect unverified)"
+        })
+        assertTrue(host.logs.all { "[id]".let { _ -> "[$id]" in it || !it.startsWith("deoptimize") || !it.contains("caller [") || "[$id]" in it } })
+        assertTrue(host.logs.filter { it.contains("caller [") }.all { "[$id]" in it })
+    }
+
+    @Test
+    fun throwableWithNullMessageOmitsNullText() {
+        val callee = method("length")
+        val caller = method("isEmpty")
+        val id = "id"
+        val host = Host(deopt = { target -> if (target == caller) throw RuntimeException() else true })
+        assertTrue(host.installWithCallers(callee, listOf(caller), id))
+        assertTrue(host.logs.any {
+            it == "deoptimize caller [$id] failed ${caller.toGenericString()}: java.lang.RuntimeException; hook proceeds, effect unverified"
+        })
+        assertFalse(host.logs.any { it.contains("null") && it.contains("failed") })
+    }
+
+    @Test
+    fun constructorCallerDeoptimizedBeforeCalleeHookWithFullSignature() {
+        val host = Host()
+        val callee = method("length")
+        val ctor = String::class.java.getConstructor(ByteArray::class.java)
+        val id = "galaxydual:ctor"
+        assertTrue(host.installWithCallers(callee, listOf(ctor), id))
+        assertEquals(listOf("deoptimize", "deoptimize", "hook"), host.events.map { it.first })
+        assertSame(ctor, host.events[0].second)
+        assertSame(callee, host.events[1].second)
+        assertSame(callee, host.events[2].second)
+        assertEquals(listOf(id), host.ids)
+        assertEquals(
+            listOf(
+                "deoptimized caller [$id] ${ctor.toGenericString()}",
+                "deoptimized java.lang.String#length",
+                "hooked java.lang.String#length",
+            ),
+            host.logs,
+        )
     }
 }

@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotSame
@@ -9,8 +10,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // Locks the pure caller->callee decision (issue #10 Stage1): known caller
-// list -> deoptimize callers + hook callee. Framework-free; ART effect stays
-// DEVICE-UNVERIFIED.
+// list (methods or constructors, as Executables) -> deoptimize callers + hook
+// callee. Framework-free; ART effect stays DEVICE-UNVERIFIED.
 class CallerDeoptPlanTest {
     private fun method(name: String): Method = String::class.java.getMethod(name)
 
@@ -103,5 +104,42 @@ class CallerDeoptPlanTest {
         val caller = method("isEmpty")
         val plan = CallerDeoptPlan.plan(callee, listOf<Method?>(null, caller, null))
         assertEquals(listOf(caller), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun constructorCallerIsSupported() {
+        val callee = method("length")
+        val ctor = String::class.java.getConstructor(ByteArray::class.java)
+        val plan = CallerDeoptPlan.plan(callee, listOf<Executable?>(ctor))
+        assertEquals(listOf<Executable>(ctor), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun constructorCallerDedupedAndOrdered() {
+        val callee = method("length")
+        val ctorA = String::class.java.getConstructor(ByteArray::class.java)
+        val ctorB = String::class.java.getConstructor(CharArray::class.java)
+        val plan = CallerDeoptPlan.plan(callee, listOf<Executable?>(ctorA, ctorB, ctorA, ctorB))
+        assertEquals(listOf<Executable>(ctorA, ctorB), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun constructorNotExcludedByMethodCallee() {
+        val callee = method("length")
+        val ctor = String::class.java.getConstructor()
+        val caller = method("isEmpty")
+        val plan = CallerDeoptPlan.plan(callee, listOf<Executable?>(callee, ctor, caller))
+        assertEquals(listOf<Executable>(ctor, caller), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun mixedMethodAndConstructorPreserveOrderAndDedupe() {
+        val callee = method("length")
+        val m = method("isEmpty")
+        val ctor = String::class.java.getConstructor(ByteArray::class.java)
+        val plan = CallerDeoptPlan.plan(callee, listOf<Executable?>(m, ctor, m, null, ctor))
+        assertEquals(listOf<Executable>(m, ctor), plan.callersToDeoptimize)
+        assertSame(m, plan.callersToDeoptimize[0])
+        assertSame(ctor, plan.callersToDeoptimize[1])
     }
 }

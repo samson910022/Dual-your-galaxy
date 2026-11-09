@@ -1,13 +1,15 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 
 // Caller-side deoptimize plan (issue #10, Stage1 JVM-testable part).
 //
 // Pure framework-free decision: given the hooked callee plus a list of known
-// callers (callers observed or proven to have inlined the callee on a specific
-// ROM/version), decide which callers to deoptimize before hooking the callee.
+// callers (methods or constructors, as Executables, observed or proven to have
+// inlined the callee on a specific ROM/version), decide which callers to
+// deoptimize before hooking the callee.
 //
 // Research note: deoptimizing the callee alone does not remove copies already
 // inlined into callers, so the effective fix is either to deoptimize each
@@ -22,14 +24,14 @@ import java.lang.reflect.Method
 object CallerDeoptPlan {
     data class Plan(
         val callee: Method,
-        val callersToDeoptimize: List<Method>,
+        val callersToDeoptimize: List<Executable>,
     )
 
     // Dedupe (first-seen order kept), drop nulls and any entry equal to the
     // callee itself (the callee is deoptimized by HookInstaller.install, not as
-    // a caller), never mutate the input list. Accepts nullable elements for
-    // defensive Java interop; normal Stage1 behavior is unchanged.
-    fun plan(callee: Method, knownCallers: List<Method?>): Plan {
+    // a caller), never mutate the input list. Accepts nullable Executable
+    // elements (Method or Constructor) for defensive Java interop.
+    fun plan(callee: Method, knownCallers: List<Executable?>): Plan {
         val callers = knownCallers.filterNotNull().filter { it != callee }.distinct()
         return Plan(callee, callers)
     }
