@@ -125,4 +125,29 @@ class WhitelistHookEligibilityTest {
         val byParts = WhitelistHookEligibility.evaluate(method.name, method.parameterTypes, method.returnType)
         assertEquals(WhitelistHookEligibility.evaluate(method), byParts)
     }
+
+
+    @Test
+    fun voidReturn_isSkipped() {
+        val decision = WhitelistHookEligibility.evaluate(
+            "getWhitelistedPackages",
+            emptyArray(),
+            Void.TYPE,
+        )
+        assertTrue(decision is WhitelistHookEligibility.Skip)
+        assertTrue((decision as WhitelistHookEligibility.Skip).reason.contains("void", ignoreCase = true))
+    }
+
+    @Test
+    fun booleanWrapperReturn_isEligibleForRewrite() {
+        val decision = WhitelistHookEligibility.evaluate(
+            "isWhitelistedPackage",
+            arrayOf(String::class.java),
+            java.lang.Boolean::class.java,
+        )
+        assertTrue(decision is WhitelistHookEligibility.Eligible)
+        val eligible = decision as WhitelistHookEligibility.Eligible
+        assertTrue(eligible.booleanRewrite)
+        assertEquals(0, eligible.packageArgIndex)
+    }
 }

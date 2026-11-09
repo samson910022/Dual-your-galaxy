@@ -262,4 +262,45 @@ class WhitelistPolicyTest {
         assertEquals(1, logs.size)
         assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
     }
+
+
+    @Test
+    fun setWithNonStringElementsIsObserveOnly() {
+        val original = setOf(1, 2)
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("x"), "m", log)
+
+        assertSame(original, out)
+        assertEquals(setOf(1, 2), out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun mutableSetWithMixedElementsIsObserveOnly() {
+        val original = mutableSetOf<Any>("a", 1)
+        val out = WhitelistPolicy.apply(original, emptyList(), setOf("b"), "m", log)
+
+        assertSame(original, out)
+        assertEquals(setOf<Any>("a", 1), out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
+
+    @Test
+    fun setMergeDeclaredReturnTypeIncompatibleIsObserveOnly() {
+        val original = setOf("a")
+        val out = WhitelistPolicy.apply(
+            result = original,
+            args = emptyList(),
+            extra = setOf("b"),
+            methodDesc = "m",
+            onLog = log,
+            declaredReturnType = java.util.List::class.java,
+        )
+
+        assertSame(original, out)
+        assertEquals(setOf("a"), out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
+    }
 }
