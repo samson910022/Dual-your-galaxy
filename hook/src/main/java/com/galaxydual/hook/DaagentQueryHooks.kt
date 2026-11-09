@@ -26,14 +26,19 @@ object DaagentQueryHooks {
     )
 
     // Read-query method names only (extend-only WhitelistPolicy.apply).
+    //
+    // Stage 1 (safest): installed-and-whitelist composite queries
+    // (getAllInstalledWhitelistedPackages, isInstalledWhitelistedPackage) are
+    // intentionally EXCLUDED from rewrite/hook eligibility due to install-state
+    // and userId ambiguity; fail-closed until device-verified. See
+    // WhitelistSignatureGuard.isInstalledWhitelistCompositeQuery and
+    // WhitelistHookEligibility.
     internal val DAAGENT_QUERY_METHOD_NAMES = listOf(
-        "getAllInstalledWhitelistedPackages",
         "getWhitelistedPackages",
         "getWhitelistPackages",
         "getWhiteListPkgs",
         "getWhiteListPkgsInSystemServer",
         "isWhitelistedPackage",
         "isWhiteListedPackage",
-        "isInstalledWhitelistedPackage",
     )
 }
