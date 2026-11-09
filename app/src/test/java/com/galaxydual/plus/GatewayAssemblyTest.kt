@@ -95,6 +95,46 @@ class GatewayAssemblyTest {
         assertFalse(failureCli.err.startsWith("service exec failed: "))
     }
 
+    // v6 P1: post-spawn catch marker crosses the wire honestly (round-trip).
+    // GalaxyExecService.onTransact generic catch builds
+    // CmdResult(1, "", "service exec failed: boom\n[truncated]",
+    // truncated=true, transportUnknown=true) local-only; encode drops the
+    // flags, so the marker text is the only truncated signal on the wire.
+    // decode must re-derive truncated=true, the anchored post-spawn prefix
+    // must still hold (isPostSpawnTransportText in core/CmdGateway.kt is
+    // internal to :core, not visible from :app tests -- pinned here by the
+    // exact startsWith it matches, same reason as the timeout-prefix pin in
+    // captureProcess_timeoutCarriesTimedOutFlag), and parse must be Unknown.
+    @Test fun execReply_postSpawnGenericCatchMarkerRoundTrip() {
+        val svc = CmdResult(exit = 1, out = "", err = "service exec failed: boom\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(1, cli.exit)
+        assertEquals("", cli.out)
+        assertEquals(svc.err, cli.err)
+        assertTrue("marker must re-derive truncated over the wire, got: $cli", cli.truncated)
+        assertTrue("anchored prefix must still hit isPostSpawnTransportText, got: \"${cli.err}\"", cli.err.startsWith("service exec failed: "))
+        val parsed = PmOutputParser.parsePackagesTrusted(cli)
+        assertTrue("post-spawn catch reply must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
+    }
+
+    // v6 P1: Interrupted-branch variant (same honesty, interrupted text).
+    // onTransact Interrupted catch builds "service exec failed: interrupted:
+    // ..." plus the marker; asserted identically (exit/out/err verbatim,
+    // truncated re-derived, Unknown parse).
+    @Test fun execReply_postSpawnInterruptedCatchMarkerRoundTrip() {
+        val svc = CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: boom\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+        val (exit, out, err) = encodeExecReply(svc)
+        val cli = decodeExecReply(exit, out, err)
+        assertEquals(1, cli.exit)
+        assertEquals("", cli.out)
+        assertEquals(svc.err, cli.err)
+        assertTrue("marker must re-derive truncated over the wire, got: $cli", cli.truncated)
+        assertTrue("anchored prefix must still hit isPostSpawnTransportText, got: \"${cli.err}\"", cli.err.startsWith("service exec failed: "))
+        val parsed = PmOutputParser.parsePackagesTrusted(cli)
+        assertTrue("interrupted catch reply must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
+    }
+
     // Every Shizuku error mapping must be non-zero with a greppable message.
     @Test fun shizukuErrors_areExplicitNonZero() {
         val cases = listOf(
@@ -657,20 +697,23 @@ class GatewayAssemblyTest {
     // service semantics), v2 = whenever-truncated marker (prior contract,
     // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate, v4 = v3
     // marker+gate with appId normalization, v5 = v4 marker+gate with appId
-    // upper bound (current contract).
+    // upper bound, v6 = v5 marker+gate with parcel-null guards + post-spawn
+    // catch marker (current contract).
     // bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
-    // rebuilds the resident UserService on upgrade (v5 invalidates v4
-    // resident services, as v4 invalidated v3 resident services and v3
-    // invalidated ungated v2 resident services);
+    // rebuilds the resident UserService on upgrade (v6 invalidates v5
+    // resident services, as v5 invalidated v4 resident services, v4
+    // invalidated v3 resident services and v3 invalidated ungated v2
+    // resident services);
     // the bind tag is per-UID derived
     // ("GalaxyDualExec-v1-u<callerUid>", see galaxyExecServiceTag) and the
     // legacy fixed tag "GalaxyDualExec-v1" record is removed by the D1
     // migration on the first run (retryable); if cleanup never succeeds
     // until restart, the orphan sits inert (daemon restart reaps).
-    // SERVICE_VERSION is 5 (D2 bumped it
-    // for the appId upper bound; auth code changed so the daemon must rebuild).
-    @Test fun serviceVersion_isV5() {
-        assertEquals(5, ShizukuExecProtocol.SERVICE_VERSION)
+    // SERVICE_VERSION is 6 (v6 bumped it
+    // for parcel-null guards + the post-spawn catch marker; service-side
+    // capture/encode code changed so the daemon must rebuild).
+    @Test fun serviceVersion_isV6() {
+        assertEquals(6, ShizukuExecProtocol.SERVICE_VERSION)
     }
 
     // P1 UserService version gap -- read-only reproducible verification, OLD
