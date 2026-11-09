@@ -73,11 +73,15 @@
     <color name="oneui_text_primary">#0F172A</color>
     <color name="oneui_text_secondary">#475569</color>
     <!-- Phase UI P1: disabled pill-button tokens. Light #475569 on #D2DEEB =
-         5.55 (AA). Night #C1C6D7 on #242C3D = 8.20 (AA). Applied via
-         state_enabled=false in bg_pill_button(-secondary) + the pill text color
-         state lists; non-text 3:1 also passes. -->
+         5.55 (AA text). Night #C1C6D7 on #242C3D = 8.20 (AA text). Applied via
+         state_enabled=false in bg_pill_button(-secondary) + pill text color state
+         lists. Disabled control boundaries are inactive UI (WCAG 1.4.11 inactive
+         component exemption) and use oneui_disabled_stroke for a recognizable
+         shape on actual surfaces; the "non-text 3:1 passes" claim does not apply
+         to inactive controls or to fill-vs-surface blending on every background. -->
     <color name="oneui_disabled_bg">#D2DEEB</color>
     <color name="oneui_disabled_text">#475569</color>
+    <color name="oneui_disabled_stroke">#94A3B8</color>
     <!-- Phase G (contrast): tertiary darkened #64748B -> #52647A. Measured
          light-theme ratios: on surface_container_high #DFE7F0 4.86 (was
          3.81), on surface_container #E8EEF5 5.19 (was 4.07), on canvas
