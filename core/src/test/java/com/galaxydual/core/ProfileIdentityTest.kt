@@ -2600,4 +2600,114 @@ class ProfileIdentityTest {
         }
     }
 
+
+
+    // ---- P1 (#59 re-review): Unicode whitespace in bare Type KEY/surface ----
+    // BARE_TYPE_LINE uses ASCII \s; Unicode whitespace (NBSP/U+00A0, U+2000, U+3000)
+    // before `Type` or between `Type` and `:` must not make the line miss the bare
+    // branch and fall through to TYPE_LINE.find() (which could trust an embedded
+    // `userType=`). A tolerant bare-Type-like detector fails closed to UNKNOWN
+    // on malformed key surface; exact valid ASCII Type: keeps the strict path.
+
+    @Test
+    fun s24BareType_p1UnicodeWhitespaceInKey_neverFallsThroughToTypeLine() {
+        val cases = listOf(
+            // comment table: both directions, key Unicode before colon / leading
+            "Type\u00A0: profile.PRIVATE userType=profile.CLONE",
+            "Type\u2000: profile.PRIVATE userType=profile.CLONE",
+            "\u00A0Type: profile.PRIVATE userType=profile.CLONE",
+            "Type\u00A0: profile.CLONE userType=profile.PRIVATE",
+            "\u3000Type: profile.CLONE userType=profile.PRIVATE",
+            // variants
+            "Type\u3000: profile.PRIVATE userType=profile.CLONE",
+            "  \u00A0Type: profile.PRIVATE userType=profile.CLONE",
+            "\u00A0\u00A0Type: profile.CLONE userType=profile.PRIVATE",
+            "Type\u2000: userType=profile.CLONE",
+            "Type\u00A0: android.os.usertype.profile.PRIVATE userType=android.os.usertype.profile.CLONE",
+            "Type\u202F: profile.PRIVATE userType=profile.CLONE",
+            // '=' separator with Unicode key surface (detector allows [:=])
+            "Type\u00A0= profile.PRIVATE userType=profile.CLONE",
+            // Cf/Cc in key/indent/separator (not \p{Z}): ZWSP, BOM, control
+            "\u200BType: profile.PRIVATE userType=profile.CLONE",
+            "Type\u200B: profile.PRIVATE userType=profile.CLONE",
+            "Type\uFEFF: profile.CLONE userType=profile.PRIVATE",
+            "\u0001Type: profile.PRIVATE userType=profile.CLONE",
+            "Type\u0001: profile.CLONE userType=profile.PRIVATE",
+        )
+        for (line in cases) {
+            val t = parseSingleBareTypeLine(line).userType
+            assertEquals("Unicode whitespace in bare Type key must be UNKNOWN (never CLONE/OTHER): [$line]", ProfileUserType.UNKNOWN, t)
+            assertTrue("must never classify as CLONE: [$line]", t != ProfileUserType.CLONE)
+            assertTrue("must never classify as OTHER: [$line]", t != ProfileUserType.OTHER)
+        }
+        // Preservation: canonical S24 bare Type and legacy User type / verbose.
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE"))
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE (default)"))
+        assertEquals(ProfileUserType.OTHER, parseSingleBareType("android.os.usertype.profile.PRIVATE (default)"))
+        assertEquals(ProfileUserType.CLONE, parseSingleVerboseType("android.os.usertype.profile.CLONE"))
+    }
+
+    @Test
+    fun s24BareType_p1UnicodeWhitespaceInKey_contradictoryDumpsys_neverConfirmsOrVerifies() {
+        val verbose = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val dumpsys = "Users:\n" +
+            "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+            "    parentId=0\n" +
+            "    Type\u00A0: profile.PRIVATE userType=profile.CLONE\n"
+        val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+        val candidates = SamsungProfileAdapter.parseUserListVerbose(verbose) + dumpsysParsed
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("Unicode-key contradictory dumpsys must not Confirm, got: $res", res !is DualResolution.Confirmed)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+        assertTrue(PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95) != 95)
+    }
+
+    @Test
+    fun s24BareType_p1UnicodeWhitespaceInKey_propertyNoClaim_typedUnknownNotAbsent_bothApis() {
+        val embeddedCases = listOf(
+            "Type\u00A0: profile.PRIVATE userType=profile.CLONE",
+            "Type\u00A0: profile.CLONE userType=profile.PRIVATE",
+            "Type\u2000: profile.PRIVATE userType=profile.CLONE",
+            "\u00A0Type: profile.PRIVATE userType=profile.CLONE",
+            "\u3000Type: profile.CLONE userType=profile.PRIVATE",
+            "Type\u200B: profile.PRIVATE userType=profile.CLONE",
+            "\u200BType: profile.CLONE userType=profile.PRIVATE",
+        )
+        for (embedded in embeddedCases) {
+            val verbose = """
+                Users:
+                  UserInfo{0:Owner:13} running:
+                    Serial number: 0
+                    User type: android.os.usertype.full.SYSTEM
+                  UserInfo{95:Work:400} running:
+                    Serial: 15
+                    parentId=0
+                    User type: android.os.usertype.profile.PRIVATE
+            """.trimIndent()
+            val dumpsys = "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    Type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:Work:400} serialNo=15:\n" +
+                "    parentId=0\n" +
+                "    $embedded\n"
+            val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+            assertEquals("Unicode-key embedded [$embedded] => dumpsys parsed UNKNOWN", ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+            val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+            val repo = DualRepository(gateway)
+            val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+            assertTrue("Unicode-key [$embedded] => typed id Unknown (never Absent/Confirmed), got: $idRes", idRes is DualIdResolution.Unknown)
+            assertTrue("Unicode-key [$embedded] must not be Absent", idRes !is DualIdResolution.Absent)
+            val targetRes = runSuspend { repo.resolveDualTargetTyped() }
+            assertTrue("Unicode-key [$embedded] => typed target Unknown (never Absent/Confirmed), got: $targetRes", targetRes is DualTargetResolution.Unknown)
+            assertTrue("Unicode-key [$embedded] must not be Absent", targetRes !is DualTargetResolution.Absent)
+        }
+    }
+
 }
