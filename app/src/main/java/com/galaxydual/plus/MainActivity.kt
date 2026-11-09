@@ -520,7 +520,8 @@ class MainActivity : ComponentActivity() {
     // WHY 四捨五入：非標準 density（如 2.625）下直接 toInt() 截斷系統性偏小約 1px；
     // v 均為正數，+0.5f 等價 roundToInt，阈值僅 ±1px。已 grep 全檔 dp() 約 160 處
     // （最小 dp(1) 分隔線除外皆 >=2dp），無 Math 依賴需同步，無行為陷阱。
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+    // Phase 4：換算委派 IconSizingPolicy.dpPx（公式一字不差，見該檔，JVM 可測）。
+    private fun dp(v: Int): Int = dpPx(v, resources.displayMetrics.density)
 
     // Phase D: 內聯 divider 共用建構（hook 卡片 12dp／診斷清單預設 4dp 上下邊距）。
     private fun makeDivider(topDp: Int = 4, bottomDp: Int = 4): View = View(this).apply {
@@ -3996,7 +3997,7 @@ class MainActivity : ComponentActivity() {
     // p26-2 Phase 1（4106 修補）：透明占位，永不回傳快取實例本身；新 ColorDrawable
     // 本身即獨立實例（每次新建 ColorDrawable 即獨立實例，無需 mutate），sizePx 經 maxOf 1 保證可見（非 0 尺寸）。
     private fun transparentPlaceholder(sizePx: Int): Drawable {
-        val safePx = maxOf(1, sizePx)
+        val safePx = safeIconPx(sizePx)
         val ph = ColorDrawable(0) // 0 = 完全透明。
         try {
             ph.setBounds(0, 0, safePx, safePx)
@@ -4023,26 +4024,28 @@ class MainActivity : ComponentActivity() {
             Log.w(TAG, "freshIconDrawable failed", e)
             null
         }
-        if (fresh != null) return fresh
-        // 最後防線：方形 max(w,h) 透明占位（intrinsic 尺寸，maxOf 1；讀取異常以 1 補齊；
-        // 每次新建 ColorDrawable 即獨立實例，無需 mutate）。
+        if (!shouldUsePlaceholder(fresh != null)) return fresh!!
+        // 最後防線：方形 max(w,h) 透明占位（intrinsic 尺寸，maxOf 1；讀取異常以 -1
+        // 補齊（舊以 1 補齊，經 placeholderDim 的 maxOf(1,…) 後等價）；
+        // 每次新建 ColorDrawable 即獨立實例，無需 mutate）。尺寸委派
+        // IconSizingPolicy.placeholderDim（方形 max 保底，JVM 可測）。
         val w = try {
-            maxOf(1, cached.intrinsicWidth)
+            cached.intrinsicWidth
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "freshIconDrawable intrinsicWidth failed", e)
-            1
+            -1
         }
         val h = try {
-            maxOf(1, cached.intrinsicHeight)
+            cached.intrinsicHeight
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "freshIconDrawable intrinsicHeight failed", e)
-            1
+            -1
         }
-        return transparentPlaceholder(maxOf(w, h)) // 方形 max(w,h) 占位。
+        return transparentPlaceholder(placeholderDim(w, h)) // 方形 max(w,h) 占位。
     }
 
     // p26-2 Phase 1：供 CheckBox 左圖用的統一尺寸 helper。取 fresh copy
@@ -4068,7 +4071,8 @@ class MainActivity : ComponentActivity() {
             Log.w(TAG, "sizedIcon copy failed", e)
             null
         }
-        val fresh: Drawable = copied ?: return transparentPlaceholder(sizePx)
+        if (shouldUsePlaceholder(copied != null)) return transparentPlaceholder(sizePx)
+        val fresh: Drawable = copied!!
         return try {
             fresh.setBounds(0, 0, sizePx, sizePx)
             fresh
