@@ -64,6 +64,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -72,6 +73,12 @@ import org.junit.runner.RunWith
 // companion private const SOURCE_ICON_DP／CLONED_ICON_DP／ICON_CONTAINER_DP）。
 private const val EXPECTED_SOURCE_ICON_DP = 24
 private const val EXPECTED_CLONED_ICON_DP = 36
+
+// 快照 OOM cap 複本：對應 MainActivity companion
+// private const ICON_SNAPSHOT_CAP_PX=192（MainActivity.kt:4568，Phase A
+// bitmapSnapshotDrawable dst=clampSnapshotPx(dp(36), CAP)）。private 無法
+// 直引，故複本＋下方註明；常量改動時須人工同步兩處，否則高密度斷言才會紅。
+private const val SNAPSHOT_CAP_PX_FOR_TEST = 192
 
 // 精確 finder 鍵：來源 sourceSerial=0 對應 "0:android"（sourceAppKey），
 // 分身由 vm.state.inventory.targetSerial 衍生（null 用 "na"，見 capture）。
@@ -236,13 +243,15 @@ class IconSizingInstrumentationTest {
     }
 
     // Layer2 snapshot-aware：48x24 紅底藍圓 fixture（FILL）經反射
-    // bitmapSnapshotDrawable 等比快照（dst 固定 dp(36) 方形，實作忽略
-    // 傳入 dstPx 以 dp(36) 規範化，故此處傳 dp(36)，文案畫 24x24 已改）。
+    // bitmapSnapshotDrawable 等比快照（dst 以 clampSnapshotPx(dp(36), CAP)
+    // 規範化，實作忽略傳入 dstPx，故此處傳 dp(36)；文案畫 24x24 已改）。
     // 判別：fitCenterRect 留邊使 top 25% 透明（FILL 拉伸則紅色不透明），
-    // 斷 snapshot 非空／BitmapDrawable／bounds 為 dp(36) 方形、中心藍
-    // dominant、中心 x 且 y<h*0.25 處 alpha==0（letterbox），再經
-    // sizedIcon(snapshot, dp24)／freshIconDrawable(snapshot) 仍可見且
-    // 頂部透明、四方互異。勿只打 direct sizedIcon（仍是拉伸，必然紅）。
+    // 斷 snapshot 非空／BitmapDrawable／bounds 與 bitmap 為
+    // expectedSnapPx=clampSnapshotPx(dp(36),192) 方形（高密度下小於
+    // dp(36)；ImageView layout 的 36dp 仍以 dpPx 斷言，見 assertSnapshot，
+    // 兩者不可混用）、中心藍 dominant、中心 x 且 y<h*0.25 處 alpha==0
+    // （letterbox），再經 sizedIcon(snapshot, dp24)／freshIconDrawable(snapshot)
+    // 仍可見且頂部透明、四方互異。勿只打 direct sizedIcon（仍是拉伸，必然紅）。
     @Test
     fun snapshotAware_redBlue48x24_fitCenterLetterboxAndCopiesVisible() {
         val gw = FakeHarnessGateway(dualId = 95)
@@ -258,6 +267,7 @@ class IconSizingInstrumentationTest {
                 var freshBitmap: Bitmap? = null
                 var expected36Px = 0
                 var expected24Px = 0
+                var expectedSnapPx = 0
                 var snapshotBoundsCopy: Rect? = null
                 var snapshotRef: Drawable? = null
                 var sizedRef: Drawable? = null
@@ -267,6 +277,7 @@ class IconSizingInstrumentationTest {
                     val density = activity.resources.displayMetrics.density
                     expected36Px = dpPx(EXPECTED_CLONED_ICON_DP, density)
                     expected24Px = dpPx(EXPECTED_SOURCE_ICON_DP, density)
+                    expectedSnapPx = clampSnapshotPx(expected36Px, SNAPSHOT_CAP_PX_FOR_TEST)
                     val srcBmp = createRedBlueBitmap48x24()
                     val fixture = BitmapDrawable(activity.resources, srcBmp).apply {
                         setGravity(Gravity.FILL)
@@ -295,11 +306,11 @@ class IconSizingInstrumentationTest {
                 val snapshotDraw = snapshotRef!!
                 val snapshotBmp = snapshotBitmap!!
                 val snapshotBounds = snapshotBoundsCopy!!
-                assertEquals(Rect(0, 0, expected36Px, expected36Px), snapshotBounds)
-                assertEquals(expected36Px, snapshotBounds.width())
-                assertEquals(expected36Px, snapshotBounds.height())
-                assertEquals(expected36Px, snapshotBmp.width)
-                assertEquals(expected36Px, snapshotBmp.height)
+                assertEquals(Rect(0, 0, expectedSnapPx, expectedSnapPx), snapshotBounds)
+                assertEquals(expectedSnapPx, snapshotBounds.width())
+                assertEquals(expectedSnapPx, snapshotBounds.height())
+                assertEquals(expectedSnapPx, snapshotBmp.width)
+                assertEquals(expectedSnapPx, snapshotBmp.height)
                 assertTrue("snapshot must have visible opaque pixels, got ${countOpaquePixels(snapshotBmp)}", countOpaquePixels(snapshotBmp) > 0)
                 assertBitmapCenterBlueDominant(snapshotBmp, "snapshot")
                 assertBitmapTopLetterboxTransparent(snapshotBmp, "snapshot")
@@ -337,6 +348,32 @@ class IconSizingInstrumentationTest {
         override fun getIntrinsicWidth(): Int = 48
         override fun getIntrinsicHeight(): Int = 24
         // 刻意不覆寫 getConstantState，constantState 保持 null（見下方 Layer3）。
+    }
+
+    private class BoundsPatternDrawable : Drawable() {
+        private val paint = Paint().apply { color = Color.MAGENTA }
+        override fun draw(canvas: Canvas) {
+            canvas.drawColor(Color.MAGENTA)
+            canvas.drawCircle(bounds.centerX().toFloat(), bounds.centerY().toFloat(), bounds.width() / 6f, paint)
+        }
+
+        override fun setAlpha(alpha: Int) {}
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
+        // 刻意不覆寫 getIntrinsicWidth／Height／getConstantState（保持 -1/-1/null），
+        // 只憑 bounds 畫圖，模擬 unknown intrinsic 框架圖示（見下方未知尺寸 test）。
+    }
+
+    private class ThrowingDrawable : Drawable() {
+        override fun draw(canvas: Canvas) {
+            throw RuntimeException("intentional draw failure for bounds restore test")
+        }
+
+        override fun setAlpha(alpha: Int) {}
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
+        override fun getIntrinsicWidth(): Int = 48
+        override fun getIntrinsicHeight(): Int = 24
     }
 
     // Layer3 snapshot-aware：PatternDrawable 不覆寫 getConstantState
@@ -398,6 +435,205 @@ class IconSizingInstrumentationTest {
                 assertNotSame("sized and fresh of snapshot must be distinct", sizedRef, freshRef)
                 assertNotSame("sized(snapshot) must be new instance, never raw pattern", patternRef, sizedRef)
                 assertNotSame("fresh(snapshot) must be new instance, never raw pattern", patternRef, freshRef)
+            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
+        }
+    }
+
+    // CENTER 方形 48x48：白底四角 12x12 紅／綠／藍／黃＋中心黑圓 r4，
+    // fixture gravity=CENTER（非 FILL），經 snapshot 等比保留四角。
+    // 負對照：direct sizedIcon(fixture,24) 以 CENTER 置中裁切，中央
+    // crop 丟四角，故四角 dominant 必不全成立（若負對照亦全成立則判別無效）。
+    // snapshot bounds／bitmap 用 expectedSnapPx（cap 後），sized／fresh(snapshot)
+    // 可見、四方（fixture／snapshot／sized／fresh）互異。
+    @Test
+    fun snapshotAware_center48CenterGravity_cornersPreservedAndDirectCrops() {
+        val gw = FakeHarnessGateway(dualId = 95)
+        gw.installedPkgs.clear()
+        gw.installedPkgs.add("android")
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                var snapshotBitmap: Bitmap? = null
+                var sizedBitmap: Bitmap? = null
+                var freshBitmap: Bitmap? = null
+                var directBitmap: Bitmap? = null
+                var expected36Px = 0
+                var expected24Px = 0
+                var expectedSnapPx = 0
+                var snapshotBoundsCopy: Rect? = null
+                var snapshotRef: Drawable? = null
+                var sizedRef: Drawable? = null
+                var freshRef: Drawable? = null
+                var fixtureRef: Drawable? = null
+                var directRef: Drawable? = null
+                var fixtureHasConstantState = false
+                var fixtureGravity = Gravity.FILL
+                scenario.onActivity { activity ->
+                    val density = activity.resources.displayMetrics.density
+                    expected36Px = dpPx(EXPECTED_CLONED_ICON_DP, density)
+                    expected24Px = dpPx(EXPECTED_SOURCE_ICON_DP, density)
+                    expectedSnapPx = clampSnapshotPx(expected36Px, SNAPSHOT_CAP_PX_FOR_TEST)
+                    val srcBmp = createCornerBitmap48x48()
+                    val fixture = BitmapDrawable(activity.resources, srcBmp).apply {
+                        setGravity(Gravity.CENTER)
+                        setBounds(0, 0, 48, 48)
+                    }
+                    fixtureRef = fixture
+                    fixtureHasConstantState = fixture.constantState != null
+                    fixtureGravity = fixture.gravity
+                    val snapshot = invokeBitmapSnapshot(activity, fixture, expected36Px)
+                    snapshotRef = snapshot
+                    snapshotBoundsCopy = snapshot?.bounds?.let { Rect(it) }
+                    snapshotBitmap = snapshot?.let { drawableToBitmapCopy(it) }
+                    if (snapshot != null) {
+                        val sized = invokeSizedIcon(activity, snapshot, expected24Px)
+                        sizedRef = sized
+                        sizedBitmap = drawableToBitmapCopy(sized)
+                        val fresh = invokeFreshIconDrawable(activity, snapshot)
+                        freshRef = fresh
+                        freshBitmap = drawableToBitmapCopy(fresh)
+                    }
+                    val direct = invokeSizedIcon(activity, fixture, expected24Px)
+                    directRef = direct
+                    directBitmap = drawableToBitmapCopy(direct)
+                }
+                assertTrue("fixture premise: constantState must not be null", fixtureHasConstantState)
+                assertTrue("fixture premise: gravity must not be FILL, got $fixtureGravity", fixtureGravity != Gravity.FILL)
+                assertEquals(Gravity.CENTER, fixtureGravity)
+                assertNotNull("snapshot must exist", snapshotRef)
+                assertNotNull("snapshot bitmap must exist", snapshotBitmap)
+                assertNotNull("snapshot bounds copy must exist", snapshotBoundsCopy)
+                assertNotNull("sized bitmap must exist", sizedBitmap)
+                assertNotNull("fresh bitmap must exist", freshBitmap)
+                assertNotNull("direct bitmap must exist", directBitmap)
+                assertTrue("snapshot must be BitmapDrawable", snapshotRef is BitmapDrawable)
+                val snapshotBmp = snapshotBitmap!!
+                val snapshotBounds = snapshotBoundsCopy!!
+                assertEquals(Rect(0, 0, expectedSnapPx, expectedSnapPx), snapshotBounds)
+                assertEquals(expectedSnapPx, snapshotBounds.width())
+                assertEquals(expectedSnapPx, snapshotBounds.height())
+                assertEquals(expectedSnapPx, snapshotBmp.width)
+                assertEquals(expectedSnapPx, snapshotBmp.height)
+                assertTrue("snapshot must have visible opaque pixels, got ${countOpaquePixels(snapshotBmp)}", countOpaquePixels(snapshotBmp) > 0)
+                assertBitmapCenterBlackDominant(snapshotBmp, "snapshot")
+                assertBitmapCornersDominant(snapshotBmp, "snapshot")
+                assertBitmapTopCenterWhiteOpaque(snapshotBmp, "snapshot")
+                assertTrue("sized(snapshot) must be visible, got ${countOpaquePixels(sizedBitmap)}", countOpaquePixels(sizedBitmap) > 0)
+                assertTrue("fresh(snapshot) must be visible, got ${countOpaquePixels(freshBitmap)}", countOpaquePixels(freshBitmap) > 0)
+                assertFalse("direct sizedIcon (CENTER crop) must lose corners as negative control, allFourDominant=${hasAllCornersDominant(directBitmap!!)}", hasAllCornersDominant(directBitmap!!))
+                assertBitmapCenterBlackDominant(directBitmap!!, "direct(negative)")
+                assertNotSame("snapshot must be new instance, never cached fixture", fixtureRef, snapshotRef)
+                assertNotSame("sized(snapshot) must be distinct from snapshot", snapshotRef, sizedRef)
+                assertNotSame("fresh(snapshot) must be distinct from snapshot", snapshotRef, freshRef)
+                assertNotSame("sized and fresh of snapshot must be distinct", sizedRef, freshRef)
+                assertNotSame("sized(snapshot) must be new instance, never cached fixture", fixtureRef, sizedRef)
+                assertNotSame("fresh(snapshot) must be new instance, never cached fixture", fixtureRef, freshRef)
+                assertNotSame("direct must be new instance, never cached fixture", fixtureRef, directRef)
+            }
+        } finally {
+            MainActivity.testViewModel = null
+            vm.dispose()
+        }
+    }
+
+    // 未知 intrinsic：BoundsPatternDrawable 不覆寫 intrinsic／constantState，
+    // 只憑 bounds 畫品紅＋圓；前提 intrinsic==-1／-1、constantState==null，
+    // 快照以 dst 兜底仍非空／可見／互異，且 bounds 還原保留（成功＋draw 拋出
+    // 異常兩路均還原 setBounds(7,7,55,31)）。
+    @Test
+    fun snapshotAware_unknownIntrinsic_boundsOnly_visibleAndRestored() {
+        val gw = FakeHarnessGateway(dualId = 95)
+        gw.installedPkgs.clear()
+        gw.installedPkgs.add("android")
+        val vm = newHarnessViewModel(gw)
+        try {
+            awaitHarnessReady(vm)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                var snapshotBitmap: Bitmap? = null
+                var sizedBitmap: Bitmap? = null
+                var freshBitmap: Bitmap? = null
+                var expected36Px = 0
+                var expected24Px = 0
+                var expectedSnapPx = 0
+                var snapshotBoundsCopy: Rect? = null
+                var patternIntrinsicW = 0
+                var patternIntrinsicH = 0
+                var patternConstantStateNull = false
+                var boundsBefore: Rect? = null
+                var boundsAfter: Rect? = null
+                var snapshotRef: Drawable? = null
+                var sizedRef: Drawable? = null
+                var freshRef: Drawable? = null
+                var patternRef: Drawable? = null
+                var throwingSnapshot: Drawable? = null
+                var throwingBoundsBefore: Rect? = null
+                var throwingBoundsAfter: Rect? = null
+                scenario.onActivity { activity ->
+                    val density = activity.resources.displayMetrics.density
+                    expected36Px = dpPx(EXPECTED_CLONED_ICON_DP, density)
+                    expected24Px = dpPx(EXPECTED_SOURCE_ICON_DP, density)
+                    expectedSnapPx = clampSnapshotPx(expected36Px, SNAPSHOT_CAP_PX_FOR_TEST)
+                    val pattern = BoundsPatternDrawable().apply { setBounds(7, 7, 55, 31) }
+                    patternRef = pattern
+                    patternIntrinsicW = pattern.intrinsicWidth
+                    patternIntrinsicH = pattern.intrinsicHeight
+                    patternConstantStateNull = pattern.constantState == null
+                    boundsBefore = Rect(pattern.bounds)
+                    val snapshot = invokeBitmapSnapshot(activity, pattern, expected36Px)
+                    snapshotRef = snapshot
+                    snapshotBoundsCopy = snapshot?.bounds?.let { Rect(it) }
+                    snapshotBitmap = snapshot?.let { drawableToBitmapCopy(it) }
+                    if (snapshot != null) {
+                        val sized = invokeSizedIcon(activity, snapshot, expected24Px)
+                        sizedRef = sized
+                        sizedBitmap = drawableToBitmapCopy(sized)
+                        val fresh = invokeFreshIconDrawable(activity, snapshot)
+                        freshRef = fresh
+                        freshBitmap = drawableToBitmapCopy(fresh)
+                    }
+                    boundsAfter = Rect(pattern.bounds)
+                    val throwing = ThrowingDrawable().apply { setBounds(7, 7, 55, 31) }
+                    throwingBoundsBefore = Rect(throwing.bounds)
+                    val throwingSnap = invokeBitmapSnapshot(activity, throwing, expected36Px)
+                    throwingSnapshot = throwingSnap
+                    throwingBoundsAfter = Rect(throwing.bounds)
+                }
+                assertEquals(-1, patternIntrinsicW)
+                assertEquals(-1, patternIntrinsicH)
+                assertTrue("BoundsPatternDrawable premise: constantState must be null", patternConstantStateNull)
+                assertNotNull("snapshot of unknown intrinsic must exist", snapshotRef)
+                assertNotNull("snapshot bitmap must exist", snapshotBitmap)
+                assertNotNull("snapshot bounds copy must exist", snapshotBoundsCopy)
+                assertNotNull("sized bitmap must exist", sizedBitmap)
+                assertNotNull("fresh bitmap must exist", freshBitmap)
+                assertTrue("snapshot must be BitmapDrawable", snapshotRef is BitmapDrawable)
+                val snapshotBmp = snapshotBitmap!!
+                val snapshotBounds = snapshotBoundsCopy!!
+                assertEquals(Rect(0, 0, expectedSnapPx, expectedSnapPx), snapshotBounds)
+                assertEquals(expectedSnapPx, snapshotBmp.width)
+                assertEquals(expectedSnapPx, snapshotBmp.height)
+                assertTrue("snapshot opaque pixels must be >0, got ${countOpaquePixels(snapshotBmp)}", countOpaquePixels(snapshotBmp) > 0)
+                assertTrue("sized(snapshot) must be visible, got ${countOpaquePixels(sizedBitmap)}", countOpaquePixels(sizedBitmap) > 0)
+                assertTrue("fresh(snapshot) must be visible, got ${countOpaquePixels(freshBitmap)}", countOpaquePixels(freshBitmap) > 0)
+                assertNotSame("snapshot must be new instance, never raw pattern", patternRef, snapshotRef)
+                assertNotSame("sized(snapshot) must be distinct from snapshot", snapshotRef, sizedRef)
+                assertNotSame("fresh(snapshot) must be distinct from snapshot", snapshotRef, freshRef)
+                assertNotSame("sized and fresh of snapshot must be distinct", sizedRef, freshRef)
+                assertNotSame("sized(snapshot) must be new instance, never raw pattern", patternRef, sizedRef)
+                assertNotSame("fresh(snapshot) must be new instance, never raw pattern", patternRef, freshRef)
+                assertEquals(Rect(7, 7, 55, 31), boundsBefore)
+                assertEquals(Rect(7, 7, 55, 31), boundsAfter)
+                assertEquals("bounds must be restored after successful snapshot", boundsBefore, boundsAfter)
+                assertNull("throwing draw snapshot must be null", throwingSnapshot)
+                assertEquals(Rect(7, 7, 55, 31), throwingBoundsBefore)
+                assertEquals(Rect(7, 7, 55, 31), throwingBoundsAfter)
+                assertEquals("bounds must be restored after draw exception", throwingBoundsBefore, throwingBoundsAfter)
             }
         } finally {
             MainActivity.testViewModel = null
@@ -609,6 +845,26 @@ class IconSizingInstrumentationTest {
         return bmp
     }
 
+    private fun createCornerBitmap48x48(): Bitmap {
+        val bmp = Bitmap.createBitmap(48, 48, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.WHITE)
+        val redPaint = Paint().apply { color = Color.RED }
+        val greenPaint = Paint().apply { color = Color.GREEN }
+        val bluePaint = Paint().apply { color = Color.BLUE }
+        val yellowPaint = Paint().apply { color = Color.YELLOW }
+        canvas.drawRect(0f, 0f, 12f, 12f, redPaint)
+        canvas.drawRect(36f, 0f, 48f, 12f, greenPaint)
+        canvas.drawRect(0f, 36f, 12f, 48f, bluePaint)
+        canvas.drawRect(36f, 36f, 48f, 48f, yellowPaint)
+        val blackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(24f, 24f, 4f, blackPaint)
+        return bmp
+    }
+
     private fun assertBitmapCenterBlueEdgeRed(bmp: Bitmap, label: String) {
         val w = bmp.width
         val h = bmp.height
@@ -639,6 +895,49 @@ class IconSizingInstrumentationTest {
         assertTrue("sampleY must be < h*0.25 (letterbox band), sampleY=$sampleY h=$h", sampleY < h * 0.25f)
         val topPixel = bmp.getPixel(w / 2, sampleY)
         assertEquals("$label top center (y=$sampleY < h*0.25) must be transparent (letterbox)", 0, Color.alpha(topPixel))
+    }
+
+    private fun cornerPixel(bmp: Bitmap, left: Boolean, top: Boolean): Int {
+        val x = (if (left) bmp.width / 8 else bmp.width * 7 / 8).coerceIn(0, bmp.width - 1)
+        val y = (if (top) bmp.height / 8 else bmp.height * 7 / 8).coerceIn(0, bmp.height - 1)
+        return bmp.getPixel(x, y)
+    }
+
+    private fun isRedDominant(p: Int): Boolean = Color.red(p) > 150 && Color.red(p) > Color.green(p) + 30 && Color.red(p) > Color.blue(p) + 30
+    private fun isGreenDominant(p: Int): Boolean = Color.green(p) > 150 && Color.green(p) > Color.red(p) + 30 && Color.green(p) > Color.blue(p) + 30
+    private fun isBlueDominant(p: Int): Boolean = Color.blue(p) > 150 && Color.blue(p) > Color.red(p) + 30 && Color.blue(p) > Color.green(p) + 30
+    private fun isYellowDominant(p: Int): Boolean = Color.red(p) > 150 && Color.green(p) > 150 && Color.blue(p) < 120 && (Color.red(p) - Color.blue(p)) > 80 && (Color.green(p) - Color.blue(p)) > 80
+    private fun isBlackDominant(p: Int): Boolean = Color.alpha(p) > 0 && Color.red(p) < 80 && Color.green(p) < 80 && Color.blue(p) < 80
+    private fun isWhiteDominant(p: Int): Boolean = Color.alpha(p) > 0 && Color.red(p) > 200 && Color.green(p) > 200 && Color.blue(p) > 200
+
+    private fun hasAllCornersDominant(bmp: Bitmap): Boolean {
+        return isRedDominant(cornerPixel(bmp, left = true, top = true)) &&
+            isGreenDominant(cornerPixel(bmp, left = false, top = true)) &&
+            isBlueDominant(cornerPixel(bmp, left = true, top = false)) &&
+            isYellowDominant(cornerPixel(bmp, left = false, top = false))
+    }
+
+    private fun assertBitmapCenterBlackDominant(bmp: Bitmap, label: String) {
+        val center = bmp.getPixel(bmp.width / 2, bmp.height / 2)
+        assertTrue("$label center must be non-transparent", Color.alpha(center) > 0)
+        assertTrue("$label center must be black-dominant (r=${Color.red(center)} g=${Color.green(center)} b=${Color.blue(center)})", isBlackDominant(center))
+    }
+
+    private fun assertBitmapCornersDominant(bmp: Bitmap, label: String) {
+        val tl = cornerPixel(bmp, left = true, top = true)
+        val tr = cornerPixel(bmp, left = false, top = true)
+        val bl = cornerPixel(bmp, left = true, top = false)
+        val br = cornerPixel(bmp, left = false, top = false)
+        assertTrue("$label TL must be red-dominant (r=${Color.red(tl)} g=${Color.green(tl)} b=${Color.blue(tl)})", isRedDominant(tl))
+        assertTrue("$label TR must be green-dominant (r=${Color.red(tr)} g=${Color.green(tr)} b=${Color.blue(tr)})", isGreenDominant(tr))
+        assertTrue("$label BL must be blue-dominant (r=${Color.red(bl)} g=${Color.green(bl)} b=${Color.blue(bl)})", isBlueDominant(bl))
+        assertTrue("$label BR must be yellow-dominant (r=${Color.red(br)} g=${Color.green(br)} b=${Color.blue(br)})", isYellowDominant(br))
+    }
+
+    private fun assertBitmapTopCenterWhiteOpaque(bmp: Bitmap, label: String) {
+        val sampleY = (bmp.height / 8).coerceIn(0, bmp.height - 1)
+        val p = bmp.getPixel(bmp.width / 2, sampleY)
+        assertTrue("$label top center (y=$sampleY) must be white opaque (no letterbox, r=${Color.red(p)} g=${Color.green(p)} b=${Color.blue(p)} a=${Color.alpha(p)})", isWhiteDominant(p))
     }
 
     // 反射讀快取 drawable 表（by appKey；失敗回空表，呼叫端 null-tolerant）。
@@ -682,9 +981,12 @@ class IconSizingInstrumentationTest {
         return method.invoke(activity, drawable) as Drawable
     }
 
-    // 私有 bitmapSnapshotDrawable 反射呼叫（MainActivity:4104）。實作忽略
-    // 傳入 dstPx，以 clampSnapshotPx(dp(36), CAP) 規範化，故呼叫端一律傳
-    // dp(36)（即 dpPx(36, density)）；簽名漂移即紅。回值可空（失敗回 null）。
+    // 私有 bitmapSnapshotDrawable 反射呼叫（MainActivity:4108）。實作忽略
+    // 傳入 dstPx，以 clampSnapshotPx(dp(36), ICON_SNAPSHOT_CAP_PX=192，
+    // MainActivity.kt:4568) 規範化，故呼叫端一律傳 dp(36)（即
+    // dpPx(36, density)）；簽名漂移即紅。回值可空（失敗回 null）。期望尺寸
+    // 以 clampSnapshotPx(expected36Px, SNAPSHOT_CAP_PX_FOR_TEST) 計算，
+    // layout 的 36dp 仍以 dpPx 斷言（面板區分）。
     private fun invokeBitmapSnapshot(activity: MainActivity, drawable: Drawable, dstPx: Int): Drawable? {
         val method = MainActivity::class.java.getDeclaredMethod(
             "bitmapSnapshotDrawable",
