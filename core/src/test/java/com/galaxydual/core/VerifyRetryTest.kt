@@ -1168,8 +1168,10 @@ class VerifyRetryTest {
         assertTrue(isPostSpawnTransportText("interrupted: drain join interrupted: sleep"))
         assertTrue(isPostSpawnTransportText("service exec failed: boom"))
         assertTrue(isPostSpawnTransportText("service exec failed: interrupted: boom"))
+        assertTrue(isPostSpawnTransportText("su failed post-spawn: boom"))
         assertTrue(!isPostSpawnTransportText("spawn failed: No such file or directory"))
         assertTrue(!isPostSpawnTransportText("su failed: boom"))
+        assertTrue(!isPostSpawnTransportText("su failed post-spawn boom"))
         assertTrue(!isPostSpawnTransportText("shizuku: bind failed: bind timed out after 10000ms"))
         assertTrue(!isPostSpawnTransportText("Failure [INSTALL_FAILED_INVALID_APK: bad]"))
         assertTrue(!isPostSpawnTransportText("Failure [DELETE_FAILED_INTERNAL_ERROR]"))
@@ -1399,6 +1401,76 @@ class VerifyRetryTest {
         assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
         val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
         assertTrue("detail must name the transport loss, got: \"$detail\"", detail.contains("transport unknown"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    // Phase A2 (re-review #4 P1): Shizuku-wire-shaped post-spawn result --
+    // the service-side capture returned "su failed post-spawn: ..." with
+    // transportUnknown=true, but the frozen (exit,out,err) wire dropped the
+    // flag, so the client only sees truncated=true + the anchored text (out
+    // carries the truncation marker). Must reconcile as VerifyUnknown (after-
+    // pin + single read-only probe), never definite failure.
+    @Test
+    fun cloneVerified_suFailedPostSpawnWire_flagsLost_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "\n[truncated]", err = "su failed post-spawn: boom", truncated = true, transportUnknown = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerified_suFailedPostSpawnWire_flagsLost_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "\n[truncated]", err = "su failed post-spawn: boom", truncated = true, transportUnknown = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun removeVerifiedExpected_suFailedPostSpawnWire_flagsLost_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "package:com.example.chat", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "\n[truncated]", err = "su failed post-spawn: boom", truncated = true, transportUnknown = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).removeVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
+        assertEquals(1, gateway.writeCalls)
+        assertEquals(1, gateway.listCalls)
+        assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
+    }
+
+    @Test
+    fun cloneVerifiedExpected_suFailedPostSpawnWire_flagsLost_isVerifyUnknown() {
+        val gateway = SeqGateway(
+            listFallback = CmdResult(exit = 0, out = "", err = ""),
+        )
+        gateway.writeResult = CmdResult(exit = 1, out = "\n[truncated]", err = "su failed post-spawn: boom", truncated = true, transportUnknown = false)
+        val delays = mutableListOf<Long>()
+        val outcome = runSuspend { virtualRepo(gateway, delays).cloneVerifiedExpected("com.example.chat", 95, 15) }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn unknown, got: \"$detail\"", detail.contains("post-spawn"))
         assertEquals(1, gateway.writeCalls)
         assertEquals(1, gateway.listCalls)
         assertTrue("clean reverse probe must not wait, got: $delays", delays.isEmpty())
