@@ -1164,7 +1164,7 @@ class ShizukuCmdGateway(
     // the deadline, owns its Parcel pair (recycled in finally below); its
     // late reply is discarded, never applied to state -- the await future's
     // late value is dropped and touches no shared holder.
-    // dropBindingLocked() on the timeout path additionally guarantees the
+    // dropBindingIfSameLocked() on the timeout path additionally guarantees the
     // next run() rebinds fresh instead of reusing the timed-out handle.
     // A delivered write is never blindly resent by this gateway.
     //

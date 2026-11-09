@@ -316,7 +316,7 @@ class GatewayAssemblyTest {
     // feeds reply.readString() into; folding null to "" would forge a
     // TrustedFull empty. Must be transportUnknown (timedOut=false).
     // DEVICE-UNVERIFIED: onTransact no-spawn guard, drop-rebind, and service-catch truncated paths.
-    // These need a real-device matrix; no fake instrumentation test is written here.
+    // These need a real-device matrix; ShizukuBinderParcelTest skeleton exists (compiled-not-run).
     @Test fun execReply_nullOutIsTransportUnknown() {
         val res = decodeExecReplyNullable(0, null, "")
         assertEquals(1, res.exit)
