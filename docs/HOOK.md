@@ -157,11 +157,18 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   installed；`<clinit>` hook 行為與計數不變。明確命名的讀查詢 hook 走 `hookDaagentQueryMethods`
   的顯式 allowlist（`DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES`）＋
   `WhitelistHookEligibility`／`WhitelistSignatureGuard`，不依賴 fuzzy sweep。
+- **Stage 1 Boolean 改寫（fail-closed）**：僅允許宣告 `boolean`/`Boolean` 且 **shape-allowlisted
+  單一 `(String)`** 套件參數簽名（index 0，語義仍 [待實機驗證]）；`(String,idSlot)`／`(idSlot,String)`
+  等多參數／userId 形狀、未知／歧義簽名、`*Installed*Whitelist*` 複合查詢一律不改寫
+  （不安裝 rewrite eligibility／攔截器 strict 失敗即回傳原值），不宣稱 userId/profile 隔離。
+  攔截器使用 strict `packageArgIndex`，不以「參數中恰有一個 String」作為未知 overload 的安全依據。
 - Collection／array 合併由 `WhitelistPolicy.apply` 做型別守衛：僅合併 String 元素的 `List`／
   `String[]` 與**非 `SortedSet`／`NavigableSet` 的** `Set`（保留 Set 語意，不降級為 `List`；
   合併結果不保證原排序／具體實作）；`SortedSet`／`NavigableSet`、
   含非 String 元素的容器、其他 `Collection`、未知回傳一律 observe-only 並回傳原值。若提供
-  `declaredReturnType`，合併結果與宣告回傳型別不相容時回傳原值。
+  `declaredReturnType`／`genericReturnType`，合併結果與宣告回傳型別不相容、或空/不可驗證的
+  容器泛型在合併會新增元素時，皆 fail-closed 回傳原值。宣告非 Boolean 的回傳若執行期出現
+  Boolean 值亦不進行 Boolean 改寫。
 - Stage1 額外掛 `DualAppDBHelper`／`DAUtility`／`DualAppManager` 讀查詢方法級候選
   （`DualHook.hookDaagentQueryMethods`，[待實機驗證]）：每個載入成功的候選類上，僅嘗試
   `DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES` 內的 **6 個**讀查詢方法名
