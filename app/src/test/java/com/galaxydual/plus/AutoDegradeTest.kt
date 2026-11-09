@@ -2120,10 +2120,11 @@ class AutoDegradeTest {
         assertEquals("已就緒", vm.state.value.readyMark())
     }
 
-    // Phase 4 C3: refresh runs the single-snapshot path
-    // (DualViewModel.refreshLocked -> repo.refreshVerified() 5):
-    // snapshot(1) + typed-target(3) + list(1). Assert exact per-command
-    // deltas on the SHIZUKU fake (repo lives there after degrade).
+    // Phase 4 C3: refresh runs the single-snapshot path with a post-list
+    // fence (DualViewModel.refreshLocked -> repo.refreshVerified() 8):
+    // snapshot(1) + typed-target(3) + list(1) + post-list re-verify(3).
+    // Assert exact per-command deltas on the SHIZUKU fake (repo lives
+    // there after degrade).
     @Test
     fun phase4_refresh_commandCounts() {
         val suFake = FakeSu(rootOk = false)
@@ -2157,9 +2158,9 @@ class AutoDegradeTest {
         await { !vm.state.value.loading }
 
         assertEquals("refresh snapshot listUsers x1", 1, shizukuFake.listUsersCalls.get())
-        assertEquals("refresh target fetches verbose x1", 1, shizukuFake.verboseCalls.get())
-        assertEquals("refresh target fetches dumpsys x1", 1, shizukuFake.dumpsysCalls.get())
-        assertEquals("refresh target fetches getprop x1", 1, shizukuFake.getpropCalls.get())
+        assertEquals("refresh target fetches verbose x2 (first + post-list re-verify)", 2, shizukuFake.verboseCalls.get())
+        assertEquals("refresh target fetches dumpsys x2 (first + post-list re-verify)", 2, shizukuFake.dumpsysCalls.get())
+        assertEquals("refresh target fetches getprop x2 (first + post-list re-verify)", 2, shizukuFake.getpropCalls.get())
         assertEquals("refresh list probe x1", 1, shizukuFake.listPackagesCalls.get())
         assertEquals("pure refresh must never probe su", suIdUBefore, suFake.idUCalls.get())
     }

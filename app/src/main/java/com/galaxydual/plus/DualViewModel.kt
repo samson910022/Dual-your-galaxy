@@ -827,7 +827,7 @@ class DualViewModel(
     // Reloads profiles AND rebuilds `cloned` from the dual user's actual
     // packages via the single-target refresh (Phase D P2-D): one
     // profilesSnapshot (1 cmd) + one verified-target fetch (3 cmds) + one
-    // list probe on that same id (1 cmd) = 5 commands. Four states are told
+    // list probe on that same id (1 cmd) + post-list re-verify triple (3 cmds) = 8 commands (second triple is the strict-equality fence). Four states are told
     // apart explicitly (issue #9):
     // - ChannelError: `pm list users` itself failed -> "channel error: ...".
     // - NoDual: channel ok but no single DUAL profile -> "no dual profile".
@@ -968,9 +968,9 @@ class DualViewModel(
     // Reload body shared by refresh() and selectChannel(). Must run under
     // opMutex: callers hold it, so this never launches or locks itself.
     // Single-snapshot refresh (#53): refreshLocked runs ONLY
-    // repo.refreshVerified() (snapshot 1 + target 3 cmds + list 1 = 5) and
-    // maps its RefreshOutcome to UiState -- no second snapshot/triple is
-    // ever taken for re-verification, so no cross-window (id, serial) pair
+    // repo.refreshVerified() (snapshot 1 + target 3 cmds + list 1 + re-verify triple 3 = 8) and
+    // maps its RefreshOutcome to UiState -- the second triple inside
+    // refreshVerified is the strict-equality fence, so no cross-window (id, serial) pair
     // can be spliced into a FRESH listing.
     // Repository calls run via onIo (PR-3 stage 1, issue #24) so the retry
     // settle wait never blocks Main; StateFlow updates stay thread-safe from
@@ -1018,9 +1018,10 @@ class DualViewModel(
             // Single snapshot (#53): one repo.refreshVerified() pins the
             // `pm list users` snapshot, the verified target, and the cloned
             // listing to one triple of evidence. The VM only maps the
-            // RefreshOutcome to UiState below -- it never snapshots,
-            // re-resolves, or re-verifies a second time, so a 95->96
-            // rebuild (or a same-id new serial) can never be spliced into
+            // RefreshOutcome to UiState below -- the VM never snapshots,
+            // re-resolves, or re-verifies a second time of its own (the
+            // second triple inside refreshVerified is the strict-equality
+            // fence), so a 95->96 rebuild (or a same-id new serial) can never be spliced into
             // a fictional FRESH pair: whatever is published came from the
             // single pinned target, carried with its true (id, serial,
             // parentId). Drift between two refreshes is real change (the
