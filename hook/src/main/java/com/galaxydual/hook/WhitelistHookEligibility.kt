@@ -9,8 +9,10 @@ import java.lang.reflect.Method
 // Stage 1 (safest) install-state exclusion and Boolean arg-index allowlisting;
 // collection/array/type safety is enforced at runtime by WhitelistPolicy.
 //
-// Fail-closed: unknown/ambiguous Boolean signatures and installed-composite
-// queries are skipped.
+// Fail-closed: unknown/ambiguous Boolean signatures, multi-param/userId/ambiguous
+// Boolean shapes, and installed-composite queries are skipped. Rewrite eligibility
+// for Boolean queries is restricted to Stage 1 shape-allowlisted single (String)
+// package-arg signatures (device-unverified semantics).
 object WhitelistHookEligibility {
 
     sealed interface Decision {
@@ -66,14 +68,21 @@ object WhitelistHookEligibility {
 
         if (isBooleanLike(returnType)) {
             val packageArgIndex = WhitelistSignatureGuard.resolveBooleanPackageArgIndex(parameterTypes)
-                ?: return Skip(
+            if (packageArgIndex == null ||
+                parameterTypes.size != 1 ||
+                packageArgIndex != 0
+            ) {
+                return Skip(
                     methodName,
-                    "Boolean rewrite requires allowlisted package-arg signature; unknown/ambiguous (fail-closed)",
+                    "Boolean rewrite requires Stage 1 device-verified single (String) package signature; " +
+                        "multi-param/userId/ambiguous shapes fail-closed",
                 )
+            }
             return Eligible(
                 methodName = methodName,
-                reason = "Boolean rewrite eligible with verified packageArgIndex=$packageArgIndex",
-                packageArgIndex = packageArgIndex,
+                reason = "Boolean rewrite eligible with Stage 1 shape-allowlisted packageArgIndex=0 " +
+                    "(device-unverified semantics; single String only)",
+                packageArgIndex = 0,
                 booleanRewrite = true,
             )
         }

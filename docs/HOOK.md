@@ -311,12 +311,17 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   plus a `*hitelist*` sweep on `WhiteListApps` that is **Stage 1 diagnose-only (no hook installs)**
   due to mutation/read-only ambiguity on ROM variants (mutation classification +
   eligibility logged, fail-closed).
-- Hook install paths use `WhitelistHookEligibility`/`WhitelistSignatureGuard`;
-  Boolean rewrites use strict allowlisted package-arg indices only (unknown/ambiguous
-  signatures stay observe-only/fail-closed). Interceptors use a lazy/empty-policy fast path
-  and keep composite runtime fail-closed backstops. Collection/array merges are type-guarded
-  (String elements, non-`SortedSet`/`NavigableSet` sets, declared return compatibility) and return original on
-  incompatibility.
+- Hook install paths use `WhitelistHookEligibility`/`WhitelistSignatureGuard`.
+  Stage 1 Boolean rewrites require a strict **shape-allowlisted single `(String)`**
+  package-arg signature only (index 0, device-unverified semantics); multi-param/
+  userId shapes (e.g. `(String,idSlot)`, `(idSlot,String)`), unknown/ambiguous
+  signatures, and composite queries are fail-closed/not rewrite-eligible until a
+  device-verified descriptor allowlist and user/profile contract exist.
+  `WhitelistSignatureGuard` resolves shape indices for diagnostics/future use but
+  does not imply semantic/userId verification. Interceptors use a lazy/empty-policy
+  fast path and keep composite runtime fail-closed backstops. Collection/array merges
+  are type-guarded (String elements, non-`SortedSet`/`NavigableSet` sets, declared
+  return compatibility) and return original on incompatibility.
 - Agent side also patches both `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` and
   `#..._FOR_CHINA` after `<clinit>` (static-final fields stay observe-only, never force-written);
   non-scope processes get `detach()`.
