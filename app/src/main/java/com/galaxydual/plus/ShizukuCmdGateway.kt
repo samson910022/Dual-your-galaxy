@@ -43,6 +43,7 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -433,13 +434,36 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
 // pin tryAcquire/release/peak-cap behavior without Binder/Parcel.
 internal const val SERVICE_EXEC_MAX_CONCURRENT = 4
 
+/**
+ * Over-release guard: [release] must be called exactly once per successful
+ * [tryAcquire]; extra releases are no-ops (never inflate cap). [held]
+ * tracks successful acquires clamped at zero (mirror releaseDrainSlot
+ * style), so an unmatched release never returns a permit to the semaphore.
+ * The production onTransact path releases exactly once in a single finally
+ * per acquire, so the guard never triggers there. held vs availablePermits
+ * are consistent at quiescence only (not under concurrent acquire/release).
+ */
 internal class ServiceExecGate(
-    permits: Int = SERVICE_EXEC_MAX_CONCURRENT,
+    val permits: Int = SERVICE_EXEC_MAX_CONCURRENT,
 ) {
     private val semaphore = Semaphore(permits, true)
-    fun tryAcquire(): Boolean = semaphore.tryAcquire()
+    private val held = AtomicInteger(0)
+    fun tryAcquire(): Boolean =
+        if (semaphore.tryAcquire()) {
+            held.incrementAndGet()
+            true
+        } else {
+            false
+        }
+
     fun release() {
-        semaphore.release()
+        // getAndUpdate returns the previous value; only a positive previous
+        // value means a real held permit was returned (CAS-correct clamp at
+        // 0, mirror releaseDrainSlot style). A zero previous value is an
+        // extra release: no-op, never inflate the cap.
+        if (held.getAndUpdate { cur -> if (cur > 0) cur - 1 else 0 } > 0) {
+            semaphore.release()
+        }
     }
 
     fun availablePermits(): Int = semaphore.availablePermits()
