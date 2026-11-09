@@ -41,6 +41,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.app.AlertDialog
@@ -87,6 +88,7 @@ import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -3983,31 +3985,82 @@ class MainActivity : ComponentActivity() {
     //（memo/inflight/淘汰/回填），完成經 onLoaded 回主執行緒綁定。
     // LRU：命中移尾（LinkedHashMap 插入序，首項＝最久未用，
     // pickIconEvictionKey 照舊淘汰首項）。
-    private fun freshIconDrawable(cached: Drawable): Drawable = try {
-        cached.constantState?.newDrawable()?.mutate() ?: cached.mutate()
-    } catch (_: Exception) {
-        cached
+    // p26-2 Phase 1（4106 修補）：透明占位，永不回傳快取實例本身；新 ColorDrawable
+    // 本身即獨立實例（每次新建 ColorDrawable 即獨立實例，無需 mutate），sizePx 經 maxOf 1 保證可見（非 0 尺寸）。
+    private fun transparentPlaceholder(sizePx: Int): Drawable {
+        val safePx = maxOf(1, sizePx)
+        val ph = ColorDrawable(0) // 0 = 完全透明。
+        try {
+            ph.setBounds(0, 0, safePx, safePx)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "transparentPlaceholder bounds failed", e)
+        }
+        return ph
+    }
+
+    // p26-2 Phase 1（4106 修補）：取 fresh copy（constantState.newDrawable().mutate()，
+    // mutate 僅在 newDrawable 新實例上做狀態解離；newDrawable 失敗直接佔位，
+    // 不經 mutate 共用實例）。永不回傳快取實例本身，失敗直接以透明占位兜底；
+    // ImageView 呼叫端由固定 layout 尺寸縮放，不經 sizedIcon setBounds。
+    private fun freshIconDrawable(cached: Drawable): Drawable {
+        val fresh: Drawable? = try {
+            cached.constantState?.newDrawable()?.mutate()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable failed", e)
+            null
+        }
+        if (fresh != null) return fresh
+        // 最後防線：方形 max(w,h) 透明占位（intrinsic 尺寸，maxOf 1；讀取異常以 1 補齊；
+        // 每次新建 ColorDrawable 即獨立實例，無需 mutate）。
+        val w = try {
+            maxOf(1, cached.intrinsicWidth)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable intrinsic failed", e)
+            1
+        }
+        val h = try {
+            maxOf(1, cached.intrinsicHeight)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "freshIconDrawable intrinsic failed", e)
+            1
+        }
+        return transparentPlaceholder(maxOf(w, h)) // 方形 max(w,h) 占位。
     }
 
     // p26-2 Phase 1：供 CheckBox 左圖用的統一尺寸 helper。取 fresh copy
-    // （constantState.newDrawable().mutate()，不共用快取實例），再 setBounds 強制
+    // （constantState.newDrawable().mutate()，mutate 僅在 newDrawable 新實例上做狀態解離；
+    // newDrawable 失敗直接佔位，不經 mutate 共用實例），再 setBounds 強制
     // 為 sizePx x sizePx；呼叫端用 setCompoundDrawables（非 IntrinsicBounds 版），
     // 避免直接吃各 App getApplicationIcon() 的原生 intrinsic 尺寸。
+    // fallback 語義：永不回傳快取實例本身——copy 失敗回 sizePx x sizePx 透明占位；
+    // setBounds 拋出時直接回 sizePx 透明占位（保持統一尺寸），絕不回傳 0 尺寸不可見圖。
     private fun sizedIcon(drawable: Drawable, sizePx: Int): Drawable {
-        val fresh = try {
+        if (sizePx <= 0) return freshIconDrawable(drawable)
+        val copied: Drawable? = try {
             drawable.constantState?.newDrawable()?.mutate()
-        } catch (_: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "sizedIcon copy failed", e)
             null
         }
-        if (fresh == null) {
-            // fallback：回傳原始 drawable 且不 setBounds，避免污染快取共用實例（尺寸雖不統一但不影響其他列）
-            return drawable
-        }
+        val fresh: Drawable = copied ?: return transparentPlaceholder(sizePx)
         return try {
             fresh.setBounds(0, 0, sizePx, sizePx)
             fresh
-        } catch (_: Exception) {
-            fresh
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "sizedIcon setBounds failed", e)
+            transparentPlaceholder(sizePx)
         }
     }
 
@@ -4020,11 +4073,23 @@ class MainActivity : ComponentActivity() {
             // 即清 inflight 返回，允許下次列表重建時重試。
             try {
                 iconLoadSemaphore.acquire()
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
                 try {
                     iconInflight.remove(appKey)
-                } catch (_: Exception) {
-                    // Best effort.
+                } catch (e2: CancellationException) {
+                    throw e2
+                } catch (e2: Exception) {
+                    Log.w(TAG, "loadIcon inflight remove failed", e2)
+                }
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "loadIcon acquire failed", e)
+                try {
+                    iconInflight.remove(appKey)
+                } catch (e2: CancellationException) {
+                    throw e2
+                } catch (e2: Exception) {
+                    Log.w(TAG, "loadIcon inflight remove failed", e2)
                 }
                 return@launch
             }
@@ -4032,7 +4097,10 @@ class MainActivity : ComponentActivity() {
                 val drawable = withContext(Dispatchers.IO) {
                     try {
                         packageManager.getApplicationIcon(pkg)
-                    } catch (_: Exception) {
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "loadIcon getApplicationIcon failed", e)
                         null
                     }
                 }
@@ -4045,8 +4113,10 @@ class MainActivity : ComponentActivity() {
             } finally {
                 try {
                     iconLoadSemaphore.release()
-                } catch (_: Exception) {
-                    // Best effort.
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "loadIcon release failed", e)
                 }
                 iconInflight.remove(appKey)
             }
@@ -4058,44 +4128,62 @@ class MainActivity : ComponentActivity() {
         if (cached != null) {
             iconDrawables.remove(appKey)
             iconDrawables[appKey] = cached
-            box.setCompoundDrawables(sizedIcon(cached, dp(ICON_DP)), null, null, null)
+            try {
+                box.setCompoundDrawables(sizedIcon(cached, dp(ICON_DP)), null, null, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon checkbox paste failed", e)
+            }
             return
         }
         loadIcon(pkg, appKey) { drawable ->
-            val fresh = sizedIcon(drawable, dp(ICON_DP))
-            // 首選仍掛在容器下且綁定同一 appKey 的發起列；若該列已被重建取代
-            // （parent 已非容器），則在當前容器內按 tag 找同一 key 的可見列重繪
-            //（找不到＝已過濾掉／換 catalog，不貼）。
+            // 先定位目標列，再產生 sizedIcon（sizedIcon 內部保證永不回傳快取實例／非空）；
+            // 發起列仍掛載（tag＋parent 雙符合）則直貼；直貼拋出或該列已重建時，
+            // 都在當前容器內按 tag 找同一 key 的可見列重繪（找不到＝已過濾掉／換 catalog，不貼）。
+            var attached = false
             try {
                 if (box.tag == appKey && box.parent === sourceContainer) {
                     try {
-                        box.setCompoundDrawables(fresh, null, null, null)
-                    } catch (_: Exception) {
-                        // Best effort: 舊列 detach 後貼圖失敗則走容器查找。
+                        box.setCompoundDrawables(sizedIcon(drawable, dp(ICON_DP)), null, null, null)
+                        attached = true
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "requestIcon direct paste failed", e)
+                        // 直貼失敗繼續走容器掃描找新行補圖，不吞掉。
                     }
-                } else {
+                }
+                if (!attached) {
                     for (i in 0 until sourceContainer.childCount) {
                         val child = sourceContainer.getChildAt(i)
                         if (child is CheckBox && child.tag == appKey) {
-                            val perView = try {
-                                sizedIcon(drawable, dp(ICON_DP))
-                            } catch (_: Exception) {
-                                fresh
+                            // sizedIcon 自帶 fallback，無需呼叫端再包 dead try/catch。
+                            try {
+                                child.setCompoundDrawables(sizedIcon(drawable, dp(ICON_DP)), null, null, null)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.w(TAG, "requestIcon container paste failed", e)
                             }
-                            child.setCompoundDrawables(perView, null, null, null)
                             break
                         }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon refill failed", e)
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
             // Phase B B2 跨列表共享 iconInflight：來源完成時分身容器也嘗試重綁，
             // 避免另一列表（同 appKey 先因 inflight 合併而未發起）永久無圖。
             try {
                 rebindClonedIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindCloned failed", e)
             }
         }
     }
@@ -4111,8 +4199,10 @@ class MainActivity : ComponentActivity() {
     private fun requestIcon(pkg: String, appKey: String, imageView: ImageView, gen: Int) {
         try {
             imageView.tag = appKey
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "requestIcon tag failed", e)
         }
         val cached = iconDrawables[appKey]
         if (cached != null) {
@@ -4120,8 +4210,10 @@ class MainActivity : ComponentActivity() {
             iconDrawables[appKey] = cached
             try {
                 imageView.setImageDrawable(freshIconDrawable(cached))
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon image paste failed", e)
             }
             return
         }
@@ -4130,27 +4222,38 @@ class MainActivity : ComponentActivity() {
             // Phase I I3：先跨容器/同容器重綁（tag 精確，找不到丟棄），再做 gen 門。
             try {
                 rebindClonedIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindCloned failed", e)
             }
             // Phase B B2 跨列表共享 iconInflight：分身完成時來源容器也嘗試重綁。
             try {
                 rebindSourceIcon(appKey, drawable)
-            } catch (_: Exception) {
-                // Best effort.
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon rebindSource failed", e)
             }
             if (capturedGen != clonedGen) return@loadIcon
-            val fresh = freshIconDrawable(drawable)
             try {
                 if (isUnderClonedContainer(imageView) && imageView.tag == appKey) {
+                    // 僅在 attach 時複製，避免 detach 時浪費一次複製。
+                    val fresh = freshIconDrawable(drawable)
                     try {
                         imageView.setImageDrawable(fresh)
-                    } catch (_: Exception) {
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "requestIcon image paste failed", e)
                         // Best effort: 舊行 detach 後已由上重綁覆蓋。
                     }
                 }
                 // else 分支已由上重綁覆蓋（容器內按 tag 找同 key 行），此處不再重複。
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "requestIcon refill failed", e)
                 // Best effort: 容器未就緒（測試路徑）時不阻塞圖示快取。
             }
         }
@@ -4163,7 +4266,7 @@ class MainActivity : ComponentActivity() {
         if (!::clonedAppsContainer.isInitialized) return
         val target = findImageViewWithTag(clonedAppsContainer, appKey) ?: return
         // p26-2 Phase 1：ImageView 由固定 36dp layout 統一尺寸，此處保持
-        // freshIconDrawable（不經 sizedIcon）；execute 僅取 fresh 實例避免共用。
+        // freshIconDrawable（不經 sizedIcon）；rebind/呼叫端僅取 fresh 實例避免共用。
         target.setImageDrawable(freshIconDrawable(drawable))
     }
 
@@ -4189,8 +4292,10 @@ class MainActivity : ComponentActivity() {
                     if (found != null) return found
                 }
             }
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "findImageViewWithTag failed", e)
         }
         return null
     }
@@ -4203,8 +4308,10 @@ class MainActivity : ComponentActivity() {
                 if (p === clonedAppsContainer) return true
                 p = (p as? View)?.parent
             }
-        } catch (_: Exception) {
-            // Best effort.
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "isUnderClonedContainer failed", e)
         }
         return false
     }
