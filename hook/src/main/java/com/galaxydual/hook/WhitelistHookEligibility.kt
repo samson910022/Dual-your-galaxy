@@ -74,7 +74,8 @@ object WhitelistHookEligibility {
             ) {
                 return Skip(
                     methodName,
-                    "Boolean rewrite requires Stage 1 device-verified single (String) package signature; " +
+                    "Boolean rewrite requires Stage 1 single (String) package signature " +
+                        "(shape-allowlisted only, semantics device-unverified); " +
                         "multi-param/userId/ambiguous shapes fail-closed",
                 )
             }
