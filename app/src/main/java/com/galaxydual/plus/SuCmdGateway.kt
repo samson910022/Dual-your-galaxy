@@ -196,7 +196,17 @@ fun suArgv(cmd: String): Array<String> = arrayOf("su", "-c", cmd)
 // blocking form -- the binder thread has no coroutine scope, so it cannot
 // run the cancellable suspend variant. The SuCmdGateway client path uses
 // captureProcessCancellable below (same contract, cancellable waits).
-internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEOUT_MS): CmdResult {
+// execFn seam (mirrors captureProcessCancellable): production default is
+// Runtime.exec; JVM tests inject a fake Process to model an Android
+// child-held pipe (wrapper destroyed, child keeps the FDs, drain stays
+// blocked) -- a real JVM process cannot model that because OpenJDK
+// destroyForcibly closes the streams and wakes the drains at once, so the
+// join-expiry path is otherwise unreachable on the JVM.
+internal fun captureProcess(
+    argv: Array<String>,
+    timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
+    execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
+): CmdResult {
     // I1 reserve→spawn→drain: atomically hold both drain slots BEFORE spawn so
     // a spawned child can never wait for a drain that will never start (large
     // output would otherwise block in pipe write() to the 60 s timeout). FD
@@ -206,7 +216,7 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         return CmdResult(exit = 1, out = "", err = "resource exhausted: no drain slots (active=${activeDrainCount.get()}/$MAX_ACTIVE_DRAINS)", truncated = true)
     }
     val proc = try {
-        Runtime.getRuntime().exec(argv)
+        execFn(argv)
     } catch (e: Exception) {
         // Covers missing su ("No such file or directory"), SecurityException,
         // and any other spawn failure: explicit error, exit != 0, no throw.
