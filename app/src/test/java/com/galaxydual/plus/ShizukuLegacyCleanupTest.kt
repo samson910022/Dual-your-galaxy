@@ -2,7 +2,7 @@
 //
 // Phase D1 (P1 legacy fixed-tag migration cleanup): JVM unit tests for the
 // one-time legacy record removal. The run() call site (after ping/permission,
-// before the v13 gate, before the first per-UID v5 bind) is
+// before the v13 gate, before the first per-UID v6 bind) is
 // device-only: Shizuku statics and Parcels throw "Stub!" on the JVM, so
 // these tests drive ensureLegacyCleanupDone() directly through a fake
 // ShizukuLegacyCleaner. The production RealShizukuLegacyCleaner is never
@@ -321,6 +321,57 @@ class ShizukuLegacyCleanupTest {
         assertEquals(0, fake.calls.get())
         assertFalse(gw.isLegacyCleanupCompleteForTest())
         assertEquals(0, driver.sendCount)
+    }
+
+    // Phase C1 (client early bad request): blank / oversize cmds are
+    // rejected before ping, so no preflight, no legacy cleanup, no bind.
+    // The legacy cleanup flag stays incomplete (next legitimate run()
+    // performs it). A 4096-char cmd is NOT early-rejected: it proceeds
+    // past ping to bind (the transact below hits the JVM Parcel Stub!
+    // artifact, asserted only as "proceeded past the early gate", never
+    // as exit==0).
+    @Test fun run_blankOrTooLongCmd_earlyBadRequest_noPingNoBindNoCleanup() = runBlocking {
+        val fake = FakeLegacyCleaner()
+        val driver = FakeBindDriver()
+        var pingCalls = 0
+        var permCalls = 0
+        var versionCalls = 0
+        val gw = ShizukuCmdGateway(
+            "com.example.test",
+            bindDriver = driver,
+            legacyCleaner = fake,
+            preflightPing = { pingCalls++; true },
+            preflightPermission = { permCalls++; true },
+            preflightVersion = { versionCalls++; 13 },
+        )
+        for (cmd in listOf("", "   ", "\n\t", "x".repeat(ShizukuExecProtocol.MAX_CMD_CHARS + 1))) {
+            val res = gw.run(cmd)
+            assertNotEquals(0, res.exit)
+            assertEquals("", res.out)
+            assertTrue("early bad request must contain 'bad request', got: ${res.err}", res.err.contains("bad request"))
+            assertFalse("early bad request must not be timedOut, got: $res", res.timedOut)
+            assertFalse("early bad request must not be transportUnknown, got: $res", res.transportUnknown)
+            assertFalse("early bad request must not be truncated, got: $res", res.truncated)
+        }
+        assertEquals("early bad request must precede ping", 0, pingCalls)
+        assertEquals(0, permCalls)
+        assertEquals(0, versionCalls)
+        assertEquals(0, fake.calls.get())
+        assertFalse(gw.isLegacyCleanupCompleteForTest())
+        assertEquals(0, driver.sendCount)
+        // Exactly-at-bound proceeds past the early gate to ping + cleanup.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val deferred = scope.async { gw.run("x".repeat(ShizukuExecProtocol.MAX_CMD_CHARS)) }
+            await { driver.sendCount == 1 }
+            driver.completeLatestWith(fakeBinder())
+            deferred.await()
+        } finally {
+            scope.cancel()
+        }
+        assertTrue("4096-char cmd must pass the early gate (ping ran)", pingCalls >= 1)
+        assertEquals(1, fake.calls.get())
+        assertTrue(gw.isLegacyCleanupCompleteForTest())
     }
 
     @Test fun run_cleanupCancellation_propagates_noBind() = runBlocking {
