@@ -243,7 +243,9 @@ object SamsungProfileAdapter {
     private val NON_ALNUM = Regex("[^a-z0-9]+")
 
     private fun isKnownOtherBareValue(value: String): Boolean {
-        val low = value.lowercase(java.util.Locale.ROOT)
+        // Strip the sole tolerated `(default)` note (same note classifyMention
+        // allows) so `profile.PRIVATE (default)` resolves by its real tail.
+        val low = DEFAULT_NOTE.replace(value, "").trim().lowercase(java.util.Locale.ROOT)
         // `full.*`/`system.*` are known non-clone usertype categories
         // (bare or `android.os.usertype.` FQ): direct OTHER. Prefix/boundary
         // anchored (never substring) so embedded garbage like `subfull.X`

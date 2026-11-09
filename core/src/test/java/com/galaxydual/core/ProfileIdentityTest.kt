@@ -1962,6 +1962,7 @@ class ProfileIdentityTest {
         val otherValues = listOf(
             "GUEST", "demo", "restricted", "HEADLESS", "car",
             "profile.PRIVATE", "profile.private", "profile.MANAGED",
+            "profile.PRIVATE (default)",
             "android.os.usertype.profile.PRIVATE (default)",
         )
         for (value in otherValues) {
