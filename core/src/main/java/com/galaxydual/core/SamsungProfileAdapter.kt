@@ -226,50 +226,81 @@ object SamsungProfileAdapter {
     private val BARE_TYPE_LINE =
         Regex("^\\s*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
 
-    // Known non-clone tails for bare `Type:` values (fail-closed gate):
-    // FQ `full.`/`system.` prefixes are known categories (direct OTHER);
-    // `profile.` MUST still validate the tail (a non-clone unknown profile
-    // tail -> UNKNOWN, never OTHER). Bare tails below are known Android
-    // user-type tails. Anything else with no recognized token is unknown ->
-    // block UNKNOWN (never OTHER, so typed Absent can never converge on it;
-    // resolveDual stays Unknown/Refused).
-    // BARE example: `  superuser type: profile.CLONE` (leading spaces, but
-    // `type` not at line start) never matches BARE_TYPE_LINE -> UNKNOWN via
-    // the existing left-boundary guard, same as mid-line `note=Type: ...`.
-    private val KNOWN_OTHER_TAILS = setOf(
+    // Known complete non-clone Android user type names (fail-closed allowlist)
+    // for bare S24 `Type:` values (P1 #59 review). Only an exact, complete,
+    // recognized type name (+ optional single valid `(default)` suffix) may
+    // classify as OTHER. Unknown type/tail, unknown category, residual chars,
+    // multiple/contradictory tokens, or any malformed structure -> UNKNOWN
+    // (never OTHER/Absent). `profile.CLONE` is intentionally absent: CLONE is
+    // authorized only via the strict classifyMention token+taint/residual path.
+    // Includes AOSP non-clone profiles COMMUNAL/TEST (UserManager constants);
+    // other official non-clone constants (full/system categories, managed/
+    // private profiles) and legacy simple bare names seen on devices.
+    private val KNOWN_OTHER_BARE_TYPES = setOf(
+        "android.os.usertype.profile.managed", "profile.managed",
+        "android.os.usertype.profile.private", "profile.private",
+        "android.os.usertype.profile.communal", "profile.communal",
+        "android.os.usertype.profile.test", "profile.test",
+        "android.os.usertype.full.system", "full.system",
+        "android.os.usertype.full.secondary", "full.secondary",
+        "android.os.usertype.full.guest", "full.guest",
+        "android.os.usertype.full.demo", "full.demo",
+        "android.os.usertype.full.restricted", "full.restricted",
+        "android.os.usertype.system.headless", "system.headless",
         "other", "private", "managed", "secondary", "system",
         "guest", "demo", "restricted", "headless", "car",
     )
-    private val NON_ALNUM = Regex("[^a-z0-9]+")
 
+    // Strict complete-value validator for bare `Type:` non-CLONE values (P1).
+    // Strips at most one valid `(default)` suffix (must be the sole, well-
+    // formed note with only whitespace around it) and requires the remainder
+    // to be an exact allowlisted non-clone type name. Anything else (unknown
+    // tail/token, unknown category, residual chars, multiple tokens, multiple
+    // notes, or malformed structure) -> false (caller fails closed to UNKNOWN).
     private fun isKnownOtherBareValue(value: String): Boolean {
-        // Strip the sole tolerated `(default)` note (same note classifyMention
-        // allows) so `profile.PRIVATE (default)` resolves by its real tail.
-        val low = DEFAULT_NOTE.replace(value, "").trim().lowercase(java.util.Locale.ROOT)
-        // `full.*`/`system.*` are known non-clone usertype categories
-        // (bare or `android.os.usertype.` FQ): direct OTHER. Prefix/boundary
-        // anchored (never substring) so embedded garbage like `subfull.X`
-        // cannot match. This is authorization-safe (categories can only
-        // ever be OTHER, never CLONE); unknown tails under these categories
-        // still resolve to OTHER by category. `profile.*` must NOT
-        // short-circuit: an unknown profile tail
-        // (e.g. `android.os.usertype.profile.FOO_BAR`) is UNKNOWN, never
-        // OTHER. Fall through to the tail allowlist check below.
-        val isFullCat = low.startsWith("full.") || low.startsWith("android.os.usertype.full.")
-        val isSystemCat = low.startsWith("system.") || low.startsWith("android.os.usertype.system.")
-        if (isFullCat || isSystemCat) return true
-        // Tail allowlist: accept only for recognized forms (plain bare tail
-        // with no dotted FQ structure, or a known-anchored prefix such as
-        // `android.os.usertype.`/`profile.`). Garbage-prefixed dotted values
-        // (e.g. `xandroid.os.usertype.full.SECONDARY`) must not be rescued
-        // by a known tail token - they stay UNKNOWN (fail-closed).
-        val recognizedForm = !low.contains('.') ||
-            low.startsWith("android.os.usertype.") ||
-            low.startsWith("profile.")
-        if (!recognizedForm) return false
-        val tail = low.substringAfterLast('.').trim()
-            .split(NON_ALNUM).lastOrNull { it.isNotEmpty() } ?: ""
-        return tail in KNOWN_OTHER_TAILS
+        val notes = DEFAULT_NOTE.findAll(value).toList()
+        if (notes.size > 1) return false
+        var core = value
+        if (notes.size == 1) {
+            val n = notes[0]
+            val before = value.substring(0, n.range.first)
+            val after = value.substring(n.range.last + 1)
+            if (before.any { !it.isWhitespace() } && after.any { !it.isWhitespace() }) return false
+            if (after.any { !it.isWhitespace() }) return false
+            core = before
+        }
+        core = core.trim()
+        if (core.isEmpty()) return false
+        return core.lowercase(java.util.Locale.ROOT) in KNOWN_OTHER_BARE_TYPES
+    }
+
+    // Strict complete-value CLONE recognizer for bare `Type:` values (P2).
+    // Accepts only the exact CLONE type name (FQ or short `profile.CLONE`)
+    // with at most one valid trailing `(default)` suffix. Rejects doubled/
+    // misplaced `android.os.usertype.` prefixes and any extra residual text,
+    // while preserving the legacy `classifyMention` residual rules on other
+    // (non-bare) paths for compat (e.g. separator-less `usertype profile.CLONE
+    // parentId=0`).
+    private val KNOWN_CLONE_BARE_TYPES = setOf(
+        "android.os.usertype.profile.clone",
+        "profile.clone",
+    )
+
+    private fun isKnownCloneBareValue(value: String): Boolean {
+        val notes = DEFAULT_NOTE.findAll(value).toList()
+        if (notes.size > 1) return false
+        var core = value
+        if (notes.size == 1) {
+            val n = notes[0]
+            val before = value.substring(0, n.range.first)
+            val after = value.substring(n.range.last + 1)
+            if (before.any { !it.isWhitespace() } && after.any { !it.isWhitespace() }) return false
+            if (after.any { !it.isWhitespace() }) return false
+            core = before
+        }
+        core = core.trim()
+        if (core.isEmpty()) return false
+        return core.lowercase(java.util.Locale.ROOT) in KNOWN_CLONE_BARE_TYPES
     }
 
     // Fallback keyword for separator-less ROM forms such as
@@ -569,20 +600,35 @@ object SamsungProfileAdapter {
             val b = BARE_TYPE_LINE.find(line) ?: continue
             val value = b.groupValues[1].trim()
             if (value.isEmpty()) continue
-            val (segClone, segOther) = classifyMention(value)
-            if (segClone && segOther) return ProfileUserType.UNKNOWN
-            if (segClone && !segOther) {
+            // Bare S24 `Type:` is a single complete type declaration (P1/P2,
+            // #59 review): validate the whole value as an exact recognized
+            // CLONE or known non-clone type (optional single valid `(default)`
+            // suffix). This rejects malformed FQ prefixes, residual chars,
+            // unknown tails/categories, and multi-token/contradictory values
+            // that must fail closed to UNKNOWN (never OTHER/Absent). Demoted
+            // CLONE-shaped values (tainted/residual) are treated as OTHER,
+            // consistent with TYPE_LINE (never CLONE-authorizing). Legacy
+            // separator-less compat (`usertype profile.CLONE parentId=0`)
+            // stays on step 2 / TYPE_LINE paths.
+            if (isKnownCloneBareValue(value)) {
                 hasCloneSeg = true
                 continue
             }
+            val (segClone, segOther) = classifyMention(value)
+            if (segClone && segOther) return ProfileUserType.UNKNOWN
+            if (segClone && !segOther) {
+                // Clean CLONE by token/residual rules but not an exact bare
+                // CLONE form (e.g. doubled/misplaced FQ prefix, extra text
+                // tolerated as residual by the generic path) -> fail closed.
+                return ProfileUserType.UNKNOWN
+            }
             if (!segClone && segOther) {
-                // A tainted/residual-demoted CLONE token (has a supported clone
-                // token but classifyMention failed it closed) is "known-shape,
-                // not a valid clone" -> OTHER, consistent with the TYPE_LINE
-                // path (never CLONE-authorizing). Only truly unrecognized
-                // categories / unknown tails (no supported clone token) go
-                // through the known-non-clone gate; unknown profile tails like
-                // `profile.FOO_BAR` remain UNKNOWN (fail-closed).
+                // A tainted/residual-demoted CLONE token is "known-shape, not
+                // a valid clone" -> OTHER (consistent with TYPE_LINE, never
+                // CLONE-authorizing). Only exact allowlisted non-clone type
+                // names classify as OTHER; anything else (unknown tail/token,
+                // unknown category, residual chars, mixed/contradictory
+                // tokens) -> UNKNOWN (fail-closed, never Absent).
                 val hasCloneToken = profileTokenMatches(value).any { isSupportedCloneToken(it.value) }
                 if (hasCloneToken || isKnownOtherBareValue(value)) {
                     hasOtherSeg = true
@@ -591,10 +637,8 @@ object SamsungProfileAdapter {
                 }
                 continue
             }
-            // Unreachable: classifyMention never returns (false, false) --
-            // empty token list yields (false, true), and a non-empty token
-            // list yields at least one of (clone, other) true (taint only
-            // forces segOther true). Kept as fail-closed UNKNOWN.
+            // Unreachable: classifyMention never returns (false, false).
+            // Kept as fail-closed UNKNOWN.
             return ProfileUserType.UNKNOWN
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).

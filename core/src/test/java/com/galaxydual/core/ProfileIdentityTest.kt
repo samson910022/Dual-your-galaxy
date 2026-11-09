@@ -1934,12 +1934,12 @@ class ProfileIdentityTest {
     }
 
     @Test
-    fun s24BareType_fullAndSystemUnknownTailsAreOtherByCategory() {
-        // `full.*`/`system.*` are known non-clone usertype categories: any
-        // tail under these categories is OTHER (never CLONE). Pins the
-        // intentional category short-circuit (authorization-safe); absence
-        // certainty for an unknown tail in these categories is traded for
-        // availability, as documented in isKnownOtherBareValue.
+    fun s24BareType_fullAndSystemUnknownTailsAreUnknown() {
+        // P1 (#59 review): bare `Type:` non-CLONE values require an exact,
+        // complete allowlisted type name. Known `full.*`/`system.*` category
+        // names are OTHER only when the full type is recognized; unknown
+        // tails under these categories are UNKNOWN (fail-closed, never
+        // OTHER/Absent), not "category = safe non-clone".
         val cases = listOf(
             "android.os.usertype.full.FOO_UNKNOWN",
             "full.WHATEVER",
@@ -1948,8 +1948,8 @@ class ProfileIdentityTest {
         )
         for (value in cases) {
             assertEquals(
-                "full/system category tail must be OTHER (never CLONE): $value",
-                ProfileUserType.OTHER,
+                "unknown full/system tail must be UNKNOWN (fail-closed): $value",
+                ProfileUserType.UNKNOWN,
                 parseSingleBareType(value),
             )
         }
@@ -2072,5 +2072,193 @@ class ProfileIdentityTest {
             ProfileUserType.OTHER,
             SamsungProfileAdapter.parseUserListVerbose(managed).single().userType,
         )
+    }
+
+    // ---- P1 (#59 review): bare Type full-value validation (fail-closed) ----
+
+    @Test
+    fun s24BareType_p1MalformedValuesAreUnknownNotOther() {
+        // Must NOT be accepted as OTHER via "last known token" / loose
+        // structure. Each is a single bare `Type:` value -> UNKNOWN (never
+        // OTHER/Absent), per the "unknown type/tail -> UNKNOWN" contract.
+        val cases = listOf(
+            "android.os.usertype.profile.FOO_BAR_PRIVATE", // unknown profile tail, ends w/ PRIVATE
+            "profile.UNKNOWN, profile.MANAGED",            // unknown + known token, order-dependent trap
+            "profile.MANAGED, profile.UNKNOWN",            // reverse order must also be UNKNOWN
+            "android.os.usertype.foo.PRIVATE",             // unknown category `foo`
+            "garbage-PRIVATE",                             // no structure, ends w/ known word
+            "profile.PRIVATE\u200B",                       // trailing zero-width space (residual)
+        )
+        for (value in cases) {
+            assertEquals(
+                "malformed/unknown bare Type must be UNKNOWN (never OTHER): [$value]",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+    }
+
+    @Test
+    fun s24BareType_p1UnknownOnBothSources_typedUnknownNeverAbsent() {
+        // Integration (P1 impact): both sources report the same user with an
+        // unknown bare `Type:` tail, IDs consistent, property is a clean
+        // no-claim (absent). The all-OTHER gate must NOT fire -> typed result
+        // is Unknown, never Absent (must not clear cloned list / select
+        // NoDual).
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.FOO_BAR_PRIVATE
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:DualApp:400} serialNo=15:
+                parentId=0
+                Type: android.os.usertype.profile.FOO_BAR_PRIVATE
+        """.trimIndent()
+        val parsedV = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        val parsedD = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertEquals(ProfileUserType.UNKNOWN, parsedV.single { it.userId == 95 }.userType)
+        assertEquals(ProfileUserType.UNKNOWN, parsedD.single { it.userId == 95 }.userType)
+        val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+        val repo = DualRepository(gateway)
+        val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+        assertTrue("unknown bare Type on both sources must be Unknown, got: $idRes", idRes is DualIdResolution.Unknown)
+        val targetRes = runSuspend { repo.resolveDualTargetTyped() }
+        assertTrue("unknown bare Type target must be Unknown, got: $targetRes", targetRes is DualTargetResolution.Unknown)
+    }
+
+    // ---- P2 (#59 review): bare Type CLONE strict full-value form ----
+
+    @Test
+    fun s24BareType_p2MalformedClonePrefixFailsClosed() {
+        // Doubled/misplaced FQ prefix or trailing FQ residue is not a
+        // complete valid CLONE type name. Bare Type must not accept it as
+        // CLONE (P2); it must fail closed (UNKNOWN) and never Confirm.
+        val bad = listOf(
+            "android.os.usertype.android.os.usertype.profile.CLONE",
+            "profile.CLONE android.os.usertype.",
+        )
+        for (value in bad) {
+            assertEquals(
+                "malformed CLONE prefix/residue must be UNKNOWN: $value",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+        // Even if verbose/dumpsys/prop agreed on such malformed claims, the
+        // id is never Confirmed (no valid CLONE evidence survives).
+        for (value in bad) {
+            val verbose = """
+                Users:
+                  UserInfo{95:DualApp:400} running:
+                    Serial: 15
+                    parentId=0
+                    Type: $value
+            """.trimIndent()
+            val dumpsys = """
+                Users:
+                  UserInfo{95:DualApp:400} serialNo=15:
+                    parentId=0
+                    Type: $value
+            """.trimIndent()
+            val candidates = SamsungProfileAdapter.parseUserListVerbose(verbose) +
+                SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+            assertTrue(
+                "malformed CLONE must not Confirm: $value",
+                SamsungProfileAdapter.resolveDual(candidates, propertyId = 95) !is DualResolution.Confirmed,
+            )
+            assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+        }
+    }
+
+    // ---- P3 (#59 review): known AOSP non-clone profile types ----
+
+    @Test
+    fun s24BareType_p3KnownAospNonCloneProfilesAreOther() {
+        // Official AOSP non-clone profile user types (UserManager constants)
+        // must be recognized as OTHER, never CLONE and never UNKNOWN.
+        val cases = listOf(
+            "android.os.usertype.profile.COMMUNAL",
+            "profile.COMMUNAL",
+            "android.os.usertype.profile.TEST",
+            "profile.TEST",
+            "android.os.usertype.system.headless",
+            "system.headless",
+            "Type: android.os.usertype.profile.COMMUNAL",
+            "Type: profile.test",
+            "Type: android.os.usertype.system.headless",
+        )
+        for (value in cases) {
+            val t = if (value.startsWith("Type:", ignoreCase = true)) {
+                parseSingleBareTypeLine(value).userType
+            } else {
+                parseSingleBareType(value)
+            }
+            assertEquals("known AOSP non-clone profile must be OTHER: $value", ProfileUserType.OTHER, t)
+        }
+    }
+
+    @Test
+    fun s24BareType_p1MalformedDefaultNoteIsUnknown() {
+        // `(default)` suffix is allowed only when single, well-formed, and
+        // trailing with no extra non-whitespace. Malformed variants fail
+        // closed to UNKNOWN (complete-value validation, never OTHER).
+        val cases = listOf(
+            "profile.PRIVATE (defaults)",                  // misspelled/plural
+            "profile.PRIVATE (default) (default)",         // multiple notes
+            "profile (default) PRIVATE",                   // note in middle
+            "android.os.usertype.profile (default) PRIVATE",
+            "profile.PRIVATE (default) trailing",
+            "profile.PRIVATE\u200C",                       // ZWNJ residual
+            "profile.PRIVATE\u200D",                       // ZWJ residual
+            "profile.PRIVATE\uFEFF",                       // BOM/ZWNBSP residual
+        )
+        for (value in cases) {
+            assertEquals(
+                "malformed (default)/residual must be UNKNOWN: [$value]",
+                ProfileUserType.UNKNOWN,
+                parseSingleBareType(value),
+            )
+        }
+    }
+
+    @Test
+    fun s24BareType_p3CommunalOnBothSources_typedAbsentNotUnknown() {
+        // A device with only a COMMUNAL profile (no clone), reported
+        // consistently on both channels with clean no-claim property, yields
+        // typed Absent (confirmed no dual) - never Unknown, never CLONE.
+        val verbose = """
+            Users:
+              UserInfo{0:Owner:13} running:
+                Serial number: 0
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Communal:400} running:
+                Serial: 15
+                parentId=0
+                Type: android.os.usertype.profile.COMMUNAL
+        """.trimIndent()
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                Type: android.os.usertype.full.SYSTEM
+              UserInfo{95:Communal:400} serialNo=15:
+                parentId=0
+                Type: android.os.usertype.profile.COMMUNAL
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose) +
+            SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        assertTrue(parsed.none { it.userType == ProfileUserType.CLONE })
+        assertEquals(ProfileUserType.OTHER, parsed.single { it.userId == 95 }.userType)
+        val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+        val repo = DualRepository(gateway)
+        assertEquals(DualIdResolution.Absent, runSuspend { repo.resolveDualUserIdTyped() })
     }
 }
