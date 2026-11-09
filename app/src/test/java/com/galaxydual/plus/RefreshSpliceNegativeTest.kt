@@ -435,8 +435,9 @@ class RefreshSpliceNegativeTest {
     }
 
     // Intra-refresh serial flip (95,15 -> 95,41 between the first triple and
-    // the post-list re-verify): the post-list fence must fail closed with
-    // CHANNEL_ERROR/CHANNEL, old cloned kept, never FRESH, zero writes.
+    // the post-list re-verify): the post-list fence proves the new target
+    // and reports TargetMoved -- VERIFY_MISMATCH/INVALID, STALE live target
+    // (95,41), old cloned kept, pmReadable true, never FRESH, zero writes.
     // SpliceGateway flip hook: first 3 ident calls see the old incarnation,
     // the re-verify triple sees the new one.
     @Test
@@ -459,22 +460,37 @@ class RefreshSpliceNegativeTest {
         val identsBefore = gw.identCalls
         val listBefore = gw.listPackagesCalls
         vm.refresh()
-        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_MISMATCH }
 
         val s = vm.state.value
         assertFalse("mid-refresh serial flip must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
-        assertEquals(MsgKind.CHANNEL, s.msgKind)
-        assertEquals(DiagnoseCode.CHANNEL_ERROR, s.diagnose?.code)
+        assertEquals(MsgKind.INVALID, s.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, s.diagnose?.code)
+        assertTrue(
+            "detail must name post-list target moved, got: ${s.diagnose?.techDetail}",
+            (s.diagnose?.techDetail ?: "").contains("post-list target moved"),
+        )
         assertTrue(
             "detail must name post-list drift, got: ${s.diagnose?.techDetail}",
             (s.diagnose?.techDetail ?: "").contains("post-list"),
         )
         assertTrue(
+            "msg must ask for reconfirmation, got: ${s.msg}",
+            s.msg.contains("dual target changed") && s.msg.contains("reconfirm"),
+        )
+        assertTrue(
             "VM must not clear the old cloned list on fence fail, got: ${s.cloned}",
             s.cloned.contains("com.example.chat"),
         )
+        assertEquals(true, s.pmReadable)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
         assertEquals(95, s.inventory.targetId)
-        assertEquals(15, s.inventory.targetSerial)
+        assertEquals(41, s.inventory.targetSerial)
+        assertTrue(
+            "empty-selection flip must stay a no-op for selection, got: ${s.selectedKeys}",
+            s.selectedKeys.isEmpty(),
+        )
+        assertEquals("batchReport must stay null, got: ${s.batchReport}", null, s.batchReport)
         assertEquals("zero installs on fence fail, got: ${gw.installCalls}", 0, gw.installCalls)
         assertEquals("zero uninstalls on fence fail, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
         assertEquals("flip must run both triples", 6, gw.identCalls - identsBefore)
@@ -482,7 +498,9 @@ class RefreshSpliceNegativeTest {
     }
 
     // Intra-refresh id flip (95 -> 96 between the first triple and the
-    // post-list re-verify): same fail-closed shape, never FRESH(95,15).
+    // post-list re-verify): the fence proves (96,41) -- VERIFY_MISMATCH/
+    // INVALID, STALE live target (96,41), never FRESH(95,15), old cloned
+    // kept and pmReadable true.
     @Test
     fun splice_midRefreshIdFlip_failClosed() {
         val gw = SpliceGateway(
@@ -504,19 +522,97 @@ class RefreshSpliceNegativeTest {
         val identsBefore = gw.identCalls
         val listBefore = gw.listPackagesCalls
         vm.refresh()
-        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_MISMATCH }
 
         val s = vm.state.value
         assertFalse("mid-refresh id flip must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
-        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(MsgKind.INVALID, s.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, s.diagnose?.code)
+        assertTrue(
+            "detail must name post-list target moved, got: ${s.diagnose?.techDetail}",
+            (s.diagnose?.techDetail ?: "").contains("post-list target moved"),
+        )
+        assertTrue(
+            "msg must ask for reconfirmation, got: ${s.msg}",
+            s.msg.contains("dual target changed") && s.msg.contains("reconfirm"),
+        )
         assertTrue(
             "VM must keep the old cloned list, got: ${s.cloned}",
             s.cloned.contains("com.example.chat"),
         )
-        assertEquals(95, s.inventory.targetId)
-        assertEquals(15, s.inventory.targetSerial)
+        assertEquals(true, s.pmReadable)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals(96, s.inventory.targetId)
+        assertEquals(41, s.inventory.targetSerial)
+        assertTrue(
+            "empty-selection flip must stay a no-op for selection, got: ${s.selectedKeys}",
+            s.selectedKeys.isEmpty(),
+        )
+        assertEquals("batchReport must stay null, got: ${s.batchReport}", null, s.batchReport)
         assertEquals(0, gw.installCalls)
         assertEquals(0, gw.uninstallCalls)
+        assertEquals("flip must run both triples", 6, gw.identCalls - identsBefore)
+        assertEquals("exactly one list probe", 1, gw.listPackagesCalls - listBefore)
+    }
+
+    // Bound selection + mid-refresh flip (95,15)->(96,41): the fence
+    // proves the new target, so the VM must clear the bound selection
+    // (live != bound) and never restore it for the moved target. Mirror
+    // the selection binding of worldSwitch/unknown_keepsSelection.
+    @Test
+    fun splice_midRefreshFlip_clearsBoundSelection() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(
+                95 to mutableSetOf("com.example.chat"),
+                96 to mutableSetOf("com.example.chat"),
+            ),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        vm.setSourceCatalog(
+            listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+        )
+        vm.toggleSelection("0:com.example.chat")
+        assertTrue(vm.state.value.selectedKeys.contains("0:com.example.chat"))
+
+        // Single refresh where identity flips mid-refresh (triple->list):
+        // first triple (95,15), list on 95, re-verify (96,41).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(3) { IdentSpec(95, 15) } + List(30) { IdentSpec(96, 41) }))
+        val identsBefore = gw.identCalls
+        val listBefore = gw.listPackagesCalls
+        vm.refresh()
+        awaitVm(vm) {
+            !vm.state.value.loading &&
+                vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_MISMATCH &&
+                vm.state.value.selectedKeys.isEmpty()
+        }
+
+        val s = vm.state.value
+        assertFalse("mid-refresh flip must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, s.diagnose?.code)
+        assertEquals(MsgKind.INVALID, s.msgKind)
+        assertEquals(InventoryFreshness.STALE, s.inventory.freshness)
+        assertEquals(96, s.inventory.targetId)
+        assertEquals(41, s.inventory.targetSerial)
+        assertTrue(
+            "bound selection must be cleared on proven target move, got: ${s.selectedKeys}",
+            s.selectedKeys.isEmpty(),
+        )
+        assertEquals("batchReport must stay null, got: ${s.batchReport}", null, s.batchReport)
+        assertTrue(
+            "VM must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(true, s.pmReadable)
+        assertEquals("zero installs on fence fail, got: ${gw.installCalls}", 0, gw.installCalls)
+        assertEquals("zero uninstalls on fence fail, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
         assertEquals("flip must run both triples", 6, gw.identCalls - identsBefore)
         assertEquals("exactly one list probe", 1, gw.listPackagesCalls - listBefore)
     }
