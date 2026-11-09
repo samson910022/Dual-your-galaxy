@@ -58,7 +58,11 @@ class Pr63ReviewRegressionUiTest {
 
     @Test
     fun clonedRow_removeButton_contractAndTwoPhaseClick() {
-        val gw = FakeHarnessGateway(dualId = 95)
+        val gw = FakeHarnessGateway(dualId = 95).apply {
+            // requestRemove verifies installed state via the harness gateway;
+            // without this, pm list returns NotInstalled and pendingRemove is never set.
+            installedPkgs.addAll(listOf("com.example.a", "com.example.b"))
+        }
         val vm = newHarnessViewModel(gw)
         try {
             awaitHarnessReady(vm)
