@@ -1517,6 +1517,7 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
                 val icon = ImageView(context).apply {
                     setImageDrawable(getDrawable(iconRes))
+                    tag = iconRes
                     setColorFilter(getColor(R.color.oneui_text_tertiary))
                     importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
