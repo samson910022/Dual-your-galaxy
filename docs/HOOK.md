@@ -107,11 +107,11 @@ Hook Builder 統一使用
 實機證據（S24，DAAgent v3.7.00.0，dexdump 反編譯確認，五層之第 1 層類別選取）：
 該類為 `PUBLIC ABSTRACT` 純常量持有者（3 個 `static final String[]`：
 `DUAL_APP_WHITELIST_PACKAGES`、`..._FOR_CHINA`、`CHINA_SALES_CODES`，
-僅 `<clinit>`＋Base64 helper，**零查詢方法**）——故 `<clinit>` patch 是
-有效的 daagent hook，模糊 `*hitelist*` 掃描在此類正確掛上零方法；
-讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
+僅 `<clinit>`＋Base64 helper，**零查詢方法**）——故 `<clinit>` patch 僅為
+安裝證據（`static final` ⇒ `ObserveOnly`，不寫入），模糊 `*hitelist*`
+掃描在此類正確掛上零方法；讀查詢實際位於 `DualAppDBHelper.getAllInstalledWhitelistedPackages`、
 `DAUtility.getWhiteListPkgs`／`*InSystemServer`、`DualAppManager.*WhitelistPackage*`
-（未來非空政策接上時的方法級 hook 目標）。lspd 日誌已確認 daagent 行程載入
+（Stage1 方法級 hook 候選，見 `DualHook.hookDaagentQueryMethods`，[待實機驗證]）。lspd 日誌已確認 daagent 行程載入
 含該欄位的類（`found ... static=true` 跨多代行程）；
 `using com.samsung.android.da.daagent.provider.WhiteListApps for daagent hooks`
 [S24 已驗證]（新路徑連續命中 7 次、零退回，方法零掛載符合抽象類預期）。
@@ -133,13 +133,13 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     見 `WhitelistPatchReflectTest` 行為鎖定測試）；不做 `setAccessible` 強寫，
     ART 行為未驗證、不宣稱可覆寫。結果以 `Outcome.ObserveOnly` 明確記錄，
     絕不靜默當成功。
-    daagent marker（`scope=daagent`）僅證明至少一個 `WhiteListApps` hook 已安裝
-    （此 ROM 實為 `<clinit>` interceptor），不證明政策已生效
-    （預設空政策下直接返回（語義等同 `Skipped`，未觸及反射）；
+    daagent marker（`scope=daagent`）僅證明至少一個 daagent hook 已安裝
+   （此 ROM 實為 `<clinit>` interceptor 加 Stage1 查詢方法候選 [待實機驗證]），不證明政策已生效
+   （預設空政策下直接返回（語義等同 `Skipped`，未觸及反射）；
     即使將來政策非空，可讀的 `static-final` 欄位回 `ObserveOnly`，
     反射失敗（欄位缺失／讀取失敗）則回 `Skipped`，兩者都不寫入，
     見 `DualHook.patchWhitelistField` 與 `WhitelistPatch.patchFields`／`apply`，
-    故僅觀察）。
+    故僅觀察；政策生效需命中方法級查詢 hook（`WhitelistPolicy.apply`），否則仍 observe-only）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
 - 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
   system_server 側相同的 extend-only 策略。模糊匹配是故意的：
@@ -149,6 +149,13 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   非 Boolean 結果在政策為空時提前返回，不記未知回傳的 log；政策非空時才嘗試
   記錄不支援的集合或未知回傳。Boolean 為 `true` 時直接返回；為 `false` 且參數
   不符合預期時，無論政策是否為空都嘗試記 log，並保持原結果。
+- Stage1 新增 `DualAppDBHelper`／`DAUtility`／`DualAppManager` 讀查詢方法級候選
+  （`DualHook.hookDaagentQueryMethods`，[待實機驗證]）：每個載入成功的候選類上，
+  僅掛讀查詢方法名（`getAllInstalledWhitelistedPackages`、`getWhitelistedPackages`、
+  `getWhiteListPkgs`／`*InSystemServer`、`isWhitelistedPackage` 等；安裝／移除路徑永不掛），
+  攔截器與 system_server 側相同（`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，
+  空政策原樣返回 observe-only）。JVM 單測僅鎖定 `WhitelistPolicy.apply` 決策
+  （見 `DaagentQueryPolicyTest`），安裝與回調需 LSPosed daagent 實機驗證。
 
 ### 1.4 非目標進程：`detach()`（H4：自報 scope 已退場，見下）
 
