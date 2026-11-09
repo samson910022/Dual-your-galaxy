@@ -377,7 +377,11 @@ jobs:
       - name: Unit tests (app, core, hook debug)
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "unit test attempt $attempt failed (max 3)"; exit 1; fi; echo "unit test attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
+          # Two-phase: Phase 1 warms unit-test dependencies with retry (5x/30s) so
+          # transient 504s during download do not fail the run; Phase 2 runs the
+          # actual JVM tests exactly once. 下載可 retry，測試/lint 只跑一次.
+          attempt=1; until ./gradlew :app:compileDebugUnitTestKotlin :core:compileDebugUnitTestKotlin :hook:compileDebugUnitTestKotlin --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 warm unit-test deps attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 warm unit-test deps attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
         if: always()
@@ -414,7 +418,11 @@ jobs:
       - name: Android Lint (AGP built-in)
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew lint --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "lint attempt $attempt failed (max 3)"; exit 1; fi; echo "lint attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
+          # Two-phase: Phase 1 warms lint dependencies (lintChecksClasspath) with
+          # retry (5x/30s) so transient 504s during download do not fail the run;
+          # Phase 2 runs lint exactly once. 下載可 retry，測試/lint 只跑一次.
+          attempt=1; until ./gradlew :app:generateDebugLintModel :app:generateReleaseLintModel :core:generateDebugLintModel :core:generateReleaseLintModel :hook:generateDebugLintModel :hook:generateReleaseLintModel --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 warm lintChecksClasspath deps attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 warm lintChecksClasspath deps attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          ./gradlew lint --no-daemon
       # Always keep lint reports, even when the lint step fails.
       - name: Upload lint reports
         if: always()
