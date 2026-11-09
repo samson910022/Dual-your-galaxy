@@ -151,8 +151,9 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   不符合預期時，無論政策是否為空都嘗試記 log，並保持原結果。
 - Stage1 新增 `DualAppDBHelper`／`DAUtility`／`DualAppManager` 讀查詢方法級候選
   （`DualHook.hookDaagentQueryMethods`，[待實機驗證]）：每個載入成功的候選類上，
-  僅掛讀查詢方法名（`getAllInstalledWhitelistedPackages`、`getWhitelistedPackages`、
-  `getWhiteListPkgs`／`*InSystemServer`、`isWhitelistedPackage` 等；安裝／移除路徑永不掛），
+  僅掛讀查詢方法名（`getAllInstalledWhitelistedPackages`、`getWhitelistedPackages`/`getWhitelistPackages`、
+  `getWhiteListPkgs`/`getWhiteListPkgsInSystemServer`、`isWhitelistedPackage`/`isWhiteListedPackage`/`isInstalledWhitelistedPackage`；
+  read-query only，安裝／移除路徑永不掛），
   攔截器與 system_server 側相同（`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，
   空政策原樣返回 observe-only）。JVM 單測僅鎖定 `WhitelistPolicy.apply` 決策
   （見 `DaagentQueryPolicyTest`），安裝與回調需 LSPosed daagent 實機驗證。
