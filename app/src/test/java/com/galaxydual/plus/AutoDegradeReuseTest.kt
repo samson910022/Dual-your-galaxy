@@ -312,8 +312,8 @@ class AutoDegradeReuseTest {
         val first = scope.async { gw.boundBinder() }
         while (driver.sendCount < 1) delay(10)
         driver.completeLatestWith(fakeBinder())
-        val binder = first.await()
-        assertTrue(binder!!.isBinderAlive)
+        val bound = first.await()
+        assertTrue(bound!!.binder.isBinderAlive)
         assertTrue(gw.hasCachedBindingForTest())
         assertFalse(gw.isClosedForTest())
         assertEquals(0, driver.totalReleases)
@@ -328,7 +328,7 @@ class AutoDegradeReuseTest {
         val second = scope.async { gw.boundBinder() }
         while (driver.sendCount < 2) delay(10)
         driver.completeLatestWith(fakeBinder())
-        assertTrue(second.await()!!.isBinderAlive)
+        assertTrue(second.await()!!.binder.isBinderAlive)
         assertTrue(gw.hasCachedBindingForTest())
         assertEquals("rebind must not touch the released request", 1, driver.totalReleases)
 

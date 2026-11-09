@@ -763,6 +763,16 @@ interface ShizukuBindDriver {
     fun send(onResult: (Result<IBinder>) -> Unit): Request
 }
 
+// P2 generation token (Phase A third round): the Request handle is the
+// per-bind generation. The daemon may hand back the same IBinder instance
+// for a fresh bind (e.g. ShizukuBinderParcelTest.FakeBindDriver reuses one
+// binder across sends), so binder identity alone cannot tell a stale
+// transact failure from a fresh binding -- the Request must match too.
+internal data class BoundBinder(
+    val binder: IBinder,
+    val request: ShizukuBindDriver.Request,
+)
+
 // Legacy fixed-tag migration seam (Phase D1, P1 legacy fixed-tag cleanup):
 // removes the pre-Phase-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG).
 // Contract: normal return = removed-or-already-gone idempotent (the gateway
@@ -1002,14 +1012,14 @@ class ShizukuCmdGateway(
 
             if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
             // No dropBindingLocked here (nothing bound by this call; must not cache)
-            val binder = try {
+            val bound = try {
                 boundBinder()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 return@withContext ShizukuExecErrors.bindFailed(e.message ?: e.javaClass.simpleName)
             } ?: return@withContext ShizukuExecErrors.bindFailed("null binder")
 
-            transactExec(binder, cmd)
+            transactExec(bound.binder, bound.request, cmd)
         }
 
     // Returns the live service binder, binding on first use (mutex-guarded
@@ -1029,13 +1039,13 @@ class ShizukuCmdGateway(
     // latch and never triggers a second unbind. A promoted (cached) request
     // is released exactly once by the later close()/abandon()/drop path, so
     // success and failure releases never overlap (no double-unbind).
-    internal suspend fun boundBinder(): IBinder? =
+    internal suspend fun boundBinder(): BoundBinder? =
         bindMutex.withLock {
             if (closed.get()) {
                 dropBindingLocked()
                 throw IllegalStateException("shizuku gateway closed")
             }
-            cachedBinder?.let { if (it.isBinderAlive) return@withLock it else dropBindingLocked() }
+            cachedBinder?.let { if (it.isBinderAlive) return@withLock BoundBinder(cachedBinder!!, cachedRequest!!) else dropBindingLocked() }
             val latch = CompletableDeferred<IBinder>()
             val request: ShizukuBindDriver.Request = try {
                 resolvedDriver.send { result ->
@@ -1058,7 +1068,7 @@ class ShizukuCmdGateway(
                 cachedRequest = request
                 cachedBinder = binder
                 promoted = true
-                binder
+                BoundBinder(binder, request)
             } finally {
                 if (!promoted) {
                     try {
@@ -1176,9 +1186,9 @@ class ShizukuCmdGateway(
     // transportUnknown=true) for read-only reconciliation, NEVER a definite
     // failure. Only the pre-transact liveness refusal above (command never
     // sent) stays binderDead() -> definite failure.
-    private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
+    private suspend fun transactExec(binder: IBinder, request: ShizukuBindDriver.Request, cmd: String): CmdResult {
         if (!binder.isBinderAlive) {
-            bindMutex.withLock { dropBindingIfSameLocked(binder) }
+            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
             return ShizukuExecErrors.binderDead()
         }
         return try {
@@ -1215,7 +1225,7 @@ class ShizukuCmdGateway(
                 }
             }
             val result = out ?: run {
-                bindMutex.withLock { dropBindingIfSameLocked(binder) }
+                bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
                 ShizukuExecErrors.timedOut()
             }
             // Null-reply transportUnknown (decodeExecReplyNullable above) is
@@ -1230,7 +1240,7 @@ class ShizukuCmdGateway(
             // wire-neutral, no bump); the drop side effect stays here under
             // bindMutex.
             if (shouldDropCachedBinding(result)) {
-                bindMutex.withLock { dropBindingIfSameLocked(binder) }
+                bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
             }
             result
         } catch (e: CancellationException) {
@@ -1248,7 +1258,7 @@ class ShizukuCmdGateway(
             // service may have executed, so transportUnknown via the pure
             // mapPostDispatchError() (JVM-pinned), never a definite failure.
             Thread.interrupted()
-            bindMutex.withLock { dropBindingIfSameLocked(binder) }
+            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
             mapPostDispatchError(e)
         } catch (e: Exception) {
             // Post-dispatch by construction (transact RemoteException, binder
@@ -1256,7 +1266,7 @@ class ShizukuCmdGateway(
             // the service may have executed pm with no reply to judge, so
             // reconcile read-only via the pure mapPostDispatchError()
             // (JVM-pinned) instead of claiming definite failure.
-            bindMutex.withLock { dropBindingIfSameLocked(binder) }
+            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
             mapPostDispatchError(e)
         }
     }
@@ -1276,21 +1286,24 @@ class ShizukuCmdGateway(
         }
     }
 
-    // Identity-checked stale-cache drop (Phase C1 hardening, wire-neutral,
-    // no SERVICE_VERSION bump -- still 6): only clears the cache when the
-    // cached binder is still the exact instance the failing transactExec
-    // call used (=== identity), never a newer binder bound by a concurrent
-    // call that raced in while this transact was in flight. An unconditional
-    // drop here could clear a fresh binding (and release its request) that
-    // this stale call never owned, forcing a needless rebind / churn.
+    // Identity-checked stale-cache drop (Phase C1 hardening, P2 generation
+    // token: the Request is the per-bind generation, wire-neutral, no
+    // SERVICE_VERSION bump -- still 6): only clears the cache when the
+    // cached binder AND request are still the exact instances the failing
+    // transactExec call used (=== identity), never a newer binding bound
+    // by a concurrent call that raced in while this transact was in
+    // flight -- even when the newer binding reuses the same binder
+    // instance with a fresh Request (ABA). An unconditional drop here
+    // could clear a fresh binding (and release its request) that this
+    // stale call never owned, forcing a needless rebind / churn.
     // Caller must hold bindMutex (same contract as dropBindingLocked);
     // internal so JVM tests can pin the identity decision (via boundBinder
     // + a fake driver, quiescent) without a real binder. Only the five
     // transactExec failure paths use this; close()/releaseBinding()/
     // abandon()/boundBinder() keep the unconditional dropBindingLocked()
     // (terminal/soft release and the bind path are not stale-race drops).
-    internal fun dropBindingIfSameLocked(binder: IBinder?) {
-        if (cachedBinder !== binder) return
+    internal fun dropBindingIfSameLocked(binder: IBinder?, request: ShizukuBindDriver.Request? = null) {
+        if (cachedBinder !== binder || cachedRequest !== request) return
         dropBindingLocked()
     }
 
