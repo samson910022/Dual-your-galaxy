@@ -14,7 +14,7 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.channelReadyFor
-import com.galaxydual.core.routePrivilege
+import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -282,16 +282,19 @@ class HookDiagnosisTest {
     }
 
     // (d) Hook-neutral lock: for every probe combination and every hook
-    // status, routing still runs with hasLsposed = false, readiness ignores
+    // status, routing still runs with hook signal excluded, readiness ignores
     // the diagnosis, and the UiState mapping preserves channel/privilege/
     // channelReady while carrying the hook display fields.
     @Test fun hookNeutral_diagnosisNeverGrantsReadinessOrRouting() {
         for (hasRoot in listOf(false, true)) {
             for (hasShizuku in listOf(false, true)) {
-                assertEquals(
-                    routePrivilege(hasLsposed = false, hasShizuku = hasShizuku, hasRoot = hasRoot),
-                    hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku),
-                )
+                // Expected privilege is a pure function of the two probes only
+                // (su ROOT -> Shizuku -> NONE); hook status must not change it.
+                val expectedPrivilege = if (hasRoot) Privilege.ROOT
+                    else if (hasShizuku) Privilege.SHELL
+                    else Privilege.NONE
+                assertEquals(expectedPrivilege, routePrivilegeFromProbes(hasShizuku = hasShizuku, hasRoot = hasRoot))
+                assertEquals(expectedPrivilege, hookNeutralRoute(hasRoot = hasRoot, hasShizuku = hasShizuku))
                 for (status in HookStatus.values()) {
                     val diagnosis = HookDiagnosis(
                         status = status,

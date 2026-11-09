@@ -45,7 +45,7 @@
 // so an LSPosed/NoOp SELECTION never blocks diagnosis) and returns a
 // four-state HookDiagnosis -- ACTIVE / INACTIVE / UNKNOWN_UNREADABLE /
 // UNKNOWN_NO_DIAGNOSTIC. Unknown is never displayed as "not detected".
-// Diagnosis never feeds routing (hasLsposed stays false) or channelReady.
+// Diagnosis never feeds routing (hook signal excluded) or channelReady.
 //
 // Honesty (DEVICE-UNVERIFIED, pending real-device validation):
 // - staleness: the marker survives reboots, so a stale file can read active

@@ -4802,7 +4802,7 @@ internal fun buildRemoveConfirmMessage(
 // fail-closed); explicit Root/Shizuku win regardless of probes (probes fail
 // closed later); explicit LSPosed is still the NoOp placeholder.
 // The hook channel is never auto-selected: there is no app-side evidence
-// signal for LSPosed activation yet (DualViewModel keeps hasLsposed=false).
+// signal for LSPosed activation yet (DualViewModel keeps hook signal out of routing).
 // The su check is a file-presence heuristic, NOT proof su works: the real
 // SuElevator/ShizukuElevator probes (wired below with the same instances)
 // verify each channel, and DualViewModel flips channelReady only when the

@@ -15,7 +15,7 @@
     <!--   通道 `pm install-existing` (su/Shizuku)，不走安裝器會話，不諮詢此權限。 -->
     <!-- - MANAGE_EXTERNAL_STORAGE:已移除。無共享儲存暫存：APK 不落地、無 -->
     <!--   getExternalStorage/MediaStore/DownloadManager 呼叫；寫入通道僅經 shell 命令。 -->
-    <!-- Shizuku shell fallback channel (downgrade path when LSPosed is absent). -->
+    <!-- Shizuku shell channel (independent of LSPosed marker; hook signal never enters routing). -->
     <uses-permission android:name="moe.shizuku.manager.permission.APIV2" />
 
     <!-- allowBackup=false：無備份需求，排除 dual_selection (SharedPreferences) 上雲；
