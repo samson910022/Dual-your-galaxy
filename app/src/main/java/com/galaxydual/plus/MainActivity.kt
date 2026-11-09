@@ -315,7 +315,7 @@ class MainActivity : ComponentActivity() {
     // IO 回主線後比對，過期丟棄；cancel 保留（快速釋放）＋gen 比對（正確性），雙保險。
     private var shizukuGen = 0
     // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
-    // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
+    // 未變只同步移除鈕 enabled（比照 renderSourceList 差量）。
     private var lastClonedListKey: String? = null
     // Phase B B2：分身列表世代 token。renderClonedApps 進入 ++，coroutine
     // capture gen，完成時比對過期丟棄（避免重建後舊圖貼到新行）。
@@ -2276,13 +2276,14 @@ class MainActivity : ComponentActivity() {
             row.addView(textContainer)
 
             // 明確「移除」文字鈕（48dp）：點按仍走 requestRemove 二階段確認
-            // （對話框），行為與原 Switch 相同；不再以 Switch 偽裝成「開關」
+            // （對話框），行為與改版前相同；不再以開關偽裝成移除操作
             // （取消勾選 ≠ 移除）。disabled while busy or channel unwritable.
             val removeRowBtn = Button(this).apply {
                 text = getString(R.string.action_remove)
                 background = getDrawable(R.drawable.bg_pill_button_secondary)
                 setTextColor(getColorStateList(R.color.pill_button_secondary_text))
                 textSize = 12f
+                maxLines = 1
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
@@ -2348,7 +2349,7 @@ class MainActivity : ComponentActivity() {
     // Phase L L1：追加 catalogKey（labelCacheKey／catalog.hashCode 同源，呼叫端
     // 單次計算傳入，sync＋key 共用一次 hash）。catalog label 變化即重建，
     // 舊快取不再經 !isLabelCached 命中殘留；同內容同 hash，不致過度重建。
-    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步 Switch enabled；
+    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步移除鈕 enabled；
     // 納入指紋會致每次 op 全量 removeAllViews＋重建＋圖示/label 重發兩次，並推進
     // clonedGen 使在途回調失效。
     private fun buildClonedListKey(s: UiState, catalogKey: Int): String =
@@ -2661,7 +2662,7 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
-        // renderClonedApps 的 Switch 與稍後按鈕/dialog 共用此 blockKey，不重算。
+        // renderClonedApps 的移除鈕與稍後按鈕/dialog 共用此 blockKey，不重算。
         val busy = s.loading
         // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
         // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
@@ -2992,7 +2993,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "render OneUI badges failed", e)
         }
-        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋Switch 寫入門控 blockKey）。
+        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋移除鈕寫入門控 blockKey）。
         // 移出上段 try：列表失敗不吞徽章更新，徽章失敗不吞列表。
         try {
             renderClonedApps(s, blockKey, catalogKey)
@@ -3148,7 +3149,7 @@ class MainActivity : ComponentActivity() {
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
-        // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
+        // Phase B B1：confirm 門控同移除鈕（loading＋ack＋可寫 blockKey==null）。
         // try 包裝比照 renderClonedApps：未來契約 misfire 時降級，不殺 StateFlow collector。
         try {
             syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
@@ -3260,7 +3261,7 @@ class MainActivity : ComponentActivity() {
     // 在途 loading 時對話框保留但按鈕禁用，靠 VM dedup + 按鈕禁用雙保險：
     // 同一 pending 只更新按鈕 enabled（不重建）；confirm 點下後下一幀
     // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
-    // Phase B B1：confirm 另須通道可寫（blockKey == null，與 Switch/按鈕同源；
+    // Phase B B1：confirm 另須通道可寫（blockKey == null，與移除鈕/其他寫入按鈕同源；
     // busy 時 blockKey 為 null 但 loading 仍禁用，不可繞過）。
     private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?, catalogKey: Int) {
         if (isFinishing || isDestroyed) return
@@ -4587,7 +4588,7 @@ class MainActivity : ComponentActivity() {
 // 副作用留 Activity；呼叫端 when 窮舉無 else，新臂加入即編譯失敗）。
 // 行覆寫引理：B-epoch waiter 的行 rowGen／tag／dialog 守衛對當代 waiter 合法
 // 通過——若 stale 成功仍把舊 pm label 派發給當代 waiter，會以舊資料覆寫
-// title／badge CD／Switch CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
+// title／badge CD／移除鈕 CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
 // 成功）可派發本次 pm label，stale 完成只允許 DROP（丟棄）、SERVE_FROM_CACHE
 //（派發 B-render 已預填的當代快取，永非舊 label）、RELAUNCH_FRESH（重掛 fresh
 // waiter＋重發一次 IO）。same-epoch 失敗語義不變（DROP 全丟，下次 render 重註冊）。
@@ -4621,7 +4622,7 @@ internal fun arbitrateLabelCompletion(
 }
 
 // Phase 1a 分身列表指紋鍵（純函數，JVM 可測；buildClonedListKey 委派，
-// 刻意不含 loading——busy 邊沿只走 early-return 同步 Switch enabled，納入
+// 刻意不含 loading——busy 邊沿只走 early-return 同步移除鈕 enabled，納入
 // 指紋會致每次 op 全量重建＋圖示／label 重發兩次並推進 clonedGen 使在途回調失效）。
 internal fun clonedListKeyFor(
     cloned: List<String>,
@@ -5067,7 +5068,7 @@ internal fun formatBatchReportText(report: BatchReport?): String {
 // Trusted isolates keep normal RTL text from reordering the surrounding identity.
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean = !loading && acknowledged
 
-// Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫）。二參版保留供既有
+// Phase B B1：confirm 門控同移除鈕（loading＋ack＋可寫）。二參版保留供既有
 // JVM 測試；生產呼叫端一律用三參版（writable 即 blockKey == null）。
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable: Boolean): Boolean =
     !loading && acknowledged && writable
