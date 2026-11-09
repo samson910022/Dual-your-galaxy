@@ -20,14 +20,24 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
       # Check out the tagged commit.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Provision JDK 17 to match the build matrix.
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -38,6 +48,160 @@ jobs:
       # Provision Gradle for tag builds.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+      # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
+      - name: YAML syntax check (python)
+        run: |
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+              has_yaml = True
+          except ImportError:
+              has_yaml = False
+              print("PyYAML not available, falling back to basic parse check")
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          if not files:
+              print("no workflow yaml files found")
+              sys.exit(0)
+          ok = True
+          for f in files:
+              try:
+                  with open(f, encoding="utf-8") as fh:
+                      text = fh.read()
+                  if has_yaml:
+                      yaml.safe_load(text)
+                  else:
+                      assert text.strip(), f"empty file: {f}"
+                  print(f"OK: {f}")
+              except Exception as e:
+                  print(f"FAIL: {f}: {e}")
+                  ok = False
+          sys.exit(0 if ok else 1)
+          PY
+      # H1 scope parity: scope.list <-> HookScopes/DualHook <-> manifest.
+      - name: Scope parity (hook scopes)
+        run: |
+          set -e
+          echo "== scope.list =="
+          cat hook/src/main/resources/META-INF/xposed/scope.list
+          echo "== HookScopes (single source of truth) =="
+          grep -F "SYSTEM_SCOPE = " hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          grep -F "DA_AGENT_PACKAGE = " hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          grep -F "SUPPORTED_SCOPES" -A 5 hook/src/main/java/com/galaxydual/hook/HookScopes.kt
+          echo "== DualHook delegation =="
+          grep -F "SYSTEM_SCOPE = HookScopes.SYSTEM_SCOPE" hook/src/main/java/com/galaxydual/hook/DualHook.kt
+          grep -F "DA_AGENT_PACKAGE = HookScopes.DA_AGENT_PACKAGE" hook/src/main/java/com/galaxydual/hook/DualHook.kt
+          grep -F "SUPPORTED_SCOPES" hook/src/main/java/com/galaxydual/hook/DualHook.kt | grep -F "= HookScopes.SUPPORTED_SCOPES"
+          echo "== manifest xposedscope =="
+          grep -F "xposedscope" hook/src/main/AndroidManifest.xml
+          printf 'system\ncom.samsung.android.da.daagent\n' > /tmp/expected_scope.list
+          diff -u /tmp/expected_scope.list hook/src/main/resources/META-INF/xposed/scope.list
+          grep -F 'android:value="system;com.samsung.android.da.daagent"' hook/src/main/AndroidManifest.xml
+          grep -F 'exceptionMode=protective' hook/src/main/resources/META-INF/xposed/module.prop
+          APP_VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n 1 | tr -d ' \r')
+          MOD_VER=$(grep -oP '^version=\K.*' hook/src/main/resources/META-INF/xposed/module.prop | head -n 1 | tr -d ' \r')
+          echo "app versionName=$APP_VER module.prop version=$MOD_VER"
+          test "$APP_VER" = "$MOD_VER"
+          echo "PASS: scope parity + module fail-safe + version sync"
+      # H1 honesty gate: unverified features must never be claimed as working.
+      - name: Honesty gate (no unverified claims)
+        run: |
+          set -e
+          echo "== forbid claiming unverified dual support as done =="
+          if grep -rn --exclude-dir=.git --exclude-dir=build --exclude-dir=.gradle --include='*.kt' --include='*.md' --include='*.xml' --include='*.kts' -E '已支援雙開|已驗證可用|穩定支援 One ?UI|實機驗證通過' . ; then
+            echo "FAIL: unverified success claim found (use [待實機驗證]/DEVICE-UNVERIFIED instead)"
+            exit 1
+          fi
+          echo "== live-claim phrases stay in sanctioned gated keys =="
+          if grep -rn --include='*.xml' -E '已注入|攔截中|運作中|常駐中' app/src/main/res \
+            | grep -v -E 'name="(hook_badge_sec_hook|hook_badge_sec_pm|status_hook_daemon_running|status_hook_daemon_desc|engine_status_active|telemetry_status_active|status_hook_injected_active|engine_diag_all_normal)"'; then
+            echo "FAIL: live-claim phrase outside sanctioned hookLive-gated keys"
+            exit 1
+          fi
+          echo "== live-claim R.string refs keep exact gated counts =="
+          FAIL=0
+          check_count() {
+            N=$(grep -r -E -o "R\\.string\\.$1" app/src/main hook/src/main core/src/main 2>/dev/null | wc -l)
+            if [ "$N" != "$2" ]; then echo "FAIL: R.string.$1 occurs $N times, expected $2 (new/removed render?)"; FAIL=1; fi
+          }
+          check_count hook_badge_sec_hook 1
+          check_count hook_badge_sec_pm 1
+          check_count status_hook_daemon_running 2
+          check_count status_hook_daemon_desc 1
+          check_count engine_status_active 1
+          check_count telemetry_status_active 1
+          check_count status_hook_injected_active 1
+          check_count engine_diag_all_normal 1
+          if [ "$FAIL" != "0" ]; then exit 1; fi
+          echo "== live-claim views keep their hookLive guards =="
+          MA=app/src/main/java/com/galaxydual/plus/MainActivity.kt
+          grep -F 'hookBadgeChip.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'hookSecPmTag.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'injectedActiveLabel.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'daemonFooter.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'residentBadge.visibility = if (hookLiveProven)' "$MA"
+          grep -F 'val hookDisplay = hookLiveDisplay(s)' "$MA"
+          [ "$(grep -c -F 'when (hookDisplay)' "$MA")" = "2" ] || exit 1
+          grep -F 'checklistSummaryView.text = if (hookLiveProven)' "$MA"
+          echo "PASS: honesty gate"
+      # H1 no-touch gates: Knox/Secure Folder + GPL code containment.
+      - name: Knox no-touch gate
+        run: |
+          set -e
+          echo "== Knox/Secure Folder must only appear in policy docs =="
+          if grep -rni --include='*.kt' -E 'knox|secure_?folder|timakeystore|dualspa|enterprise_container|sec_container|container_?agent|knox_container|\bedm\b|\bmdm\b|\bpersona\b|warranty.*void.*0x1|defex|/data/knox|/mnt/knox|/data/media/0/../knox' hook/src/main app/src/main core/src/main ; then
+            echo "FAIL: Knox-related reference in executable sources"
+            exit 1
+          fi
+          echo "== Knox/Secure Folder in XML must be sanctioned non-use only =="
+          if grep -rni --include='*.xml' -E 'knox|secure_?folder|timakeystore|dualspa|enterprise_container|sec_container|container_?agent|knox_container|\bedm\b|\bmdm\b|\bpersona\b|warranty.*void.*0x1|defex|/data/knox|/mnt/knox|/data/media/0/../knox' hook/src/main app/src/main core/src/main \
+            | grep -v -E 'name="hook_mode_subtitle"|no Knox access'; then
+            echo "FAIL: unsanctioned Knox-related reference in executable XML sources"
+            exit 1
+          fi
+          echo "PASS: Knox no-touch"
+      - name: GPL containment gate
+        run: |
+          set -e
+          echo "== GPL project code must not leak into sources =="
+          if grep -rn --include='*.kt' -E 'DualClone|CloneCat|AppDualZuku|JingMatrix|KnoxPatch|edtweak|dual-manager|dual-apps' hook/src app/src core/src ; then
+            echo "FAIL: third-party project reference in executable sources (docs only)"
+            exit 1
+          fi
+          echo "PASS: GPL containment"
+      # Run :app + :core + :hook unit tests before building release bytes.
+      # Fail fast so a broken commit never produces/publishes a release APK.
+      - name: Unit tests (app, core, hook debug)
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-release
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: warn
+          retention-days: 30
+      # NOTE: no ktlint plugin is applied in this repo; use AGP built-in lint.
+      - name: Android Lint (AGP built-in)
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew lint --no-daemon
+      - name: Upload lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports-release
+          path: |
+            **/build/reports/lint-results*.html
+            **/build/reports/lint-results*.xml
+          if-no-files-found: warn
+          retention-days: 30
       # Restore the release keystore from secrets; fail fast when any secret
       # is missing instead of producing an unsigned build.
       - name: Restore release keystore
@@ -58,7 +222,15 @@ jobs:
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/signing"
-          echo "$SIGN_STORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
+          umask 077
+          chmod 700 "$RUNNER_TEMP/signing"
+          tmp="$RUNNER_TEMP/signing/release.jks.tmp"
+          trap 'rm -f "$tmp"' EXIT
+          printf '%s' "$SIGN_STORE_BASE64" | base64 -d > "$tmp"
+          test -s "$tmp"
+          keytool -list -keystore "$tmp" -storepass:env SIGN_STORE_PASSWORD >/dev/null
+          mv "$tmp" "$RUNNER_TEMP/signing/release.jks"
+          trap - EXIT
           chmod 600 "$RUNNER_TEMP/signing/release.jks"
           echo "SIGN_STORE_FILE=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
       # Build release APKs with the committed wrapper (pinned Gradle 8.7); fail fast on errors.
@@ -68,11 +240,35 @@ jobs:
           SIGN_KEY_ALIAS: ${{ secrets.SIGN_KEY_ALIAS }}
           SIGN_KEY_PASSWORD: ${{ secrets.SIGN_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
+      # Remove signing material as soon as the build no longer needs it.
+      - name: Clean up signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP:?}/signing"
+          test ! -e "${RUNNER_TEMP}/signing/release.jks"
+      # Verify release APK artifacts (ShizukuProvider + hook entry + scopes + version).
+      # Shared with PR CI via scripts/verify-release-artifacts.sh to avoid drift.
+      - name: Verify release APK artifacts
+        run: |
+          set -euo pipefail
+          chmod +x scripts/verify-release-artifacts.sh
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No release APKs built; refusing to run artifact checks."
+            exit 1
+          fi
+          ./scripts/verify-release-artifacts.sh "${apks[@]}"
+
       # Gate: every release APK must carry a valid signature; unsigned or
       # unverifiable output stops the job before any checksum or publish step.
       - name: Verify release signatures
+        env:
+          EXPECTED_CERT_SHA256: "608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3"
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -81,50 +277,50 @@ jobs:
             echo "::error::No release APKs built; refusing to publish an empty release."
             exit 1
           fi
+          if [ -z "${ANDROID_HOME:-}" ] || [ ! -d "$ANDROID_HOME/build-tools" ]; then
+            echo "::error::ANDROID_HOME build-tools missing; cannot verify signatures."
+            exit 1
+          fi
           apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/apksigner"
           if [ ! -x "$apksigner" ]; then
             echo "::error::apksigner not found under \$ANDROID_HOME/build-tools; cannot verify signatures."
             exit 1
           fi
-          : > "$RUNNER_TEMP/verified_apks.txt"
+          rm -rf release-publish
+          mkdir -p release-publish
+          chmod +x scripts/parse-apksigner-output.sh
           for apk in "${apks[@]}"; do
             echo "--- verifying $apk ---"
-            if "$apksigner" verify --verbose --print-certs "$apk"; then
-              echo "$apk" >> "$RUNNER_TEMP/verified_apks.txt"
-            else
+            verify_output="$("$apksigner" verify --verbose --print-certs "$apk" 2>&1)" || {
+              echo "$verify_output"
               echo "::error::Signature verification FAILED for $apk; refusing to publish."
               exit 1
-            fi
+            }
+            echo "$verify_output"
+            EXPECTED_CERT_SHA256="$EXPECTED_CERT_SHA256" ./scripts/parse-apksigner-output.sh <<< "$verify_output" || {
+              echo "::error::Signer/certificate check FAILED for $apk; refusing to publish."
+              exit 1
+            }
+            cp "$apk" release-publish/
           done
-          echo "--- verified APKs ---"
-          cat "$RUNNER_TEMP/verified_apks.txt"
-      # Generate a single SHA256SUMS.txt (issue #5: only one) in the release dir
-      # with bare file names so `sha256sum -c` verifies directly. Zero verified
-      # APKs is a failure: never write or publish an empty SHA256SUMS.
-      - name: Generate SHA256 checksums
-        run: |
-          set -euo pipefail
-          mapfile -t apks < "$RUNNER_TEMP/verified_apks.txt"
-          if [ "${#apks[@]}" -eq 0 ]; then
-            echo "::error::No verified APKs; refusing to write an empty SHA256SUMS."
-            exit 1
-          fi
-          rm -f SHA256SUMS.txt app/build/outputs/apk/release/SHA256SUMS.txt
+          # Generate SHA256SUMS.txt next to the verified bytes (same step = no TOCTOU).
           (
-            cd app/build/outputs/apk/release
+            cd release-publish
             names=()
-            for a in "${apks[@]}"; do names+=("$(basename "$a")"); done
-            sha256sum "${names[@]}" > SHA256SUMS.txt
+            for a in *.apk; do [ -f "$a" ] && names+=("$a"); done
+            if [ "${#names[@]}" -eq 0 ]; then
+              echo "::error::No verified APKs staged; refusing to write an empty SHA256SUMS."
+              exit 1
+            fi
+            sha256sum -- "${names[@]}" > SHA256SUMS.txt
             sha256sum -c SHA256SUMS.txt
-            echo "--- SHA256SUMS.txt (release dir, bare names) ---"
+            echo "--- SHA256SUMS.txt ---"
             cat SHA256SUMS.txt
           )
       # Publish a GitHub Release with verified APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/SHA256SUMS.txt
+          files: release-publish/*
           generate_release_notes: true
           fail_on_unmatched_files: true

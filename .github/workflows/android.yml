@@ -112,32 +112,12 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :hook:assembleDebug :core:assembleDebug --no-daemon
-      # B2: verify ShizukuProvider survives into the built DEX (guards provider dep regressions).
-      # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
-      - name: APK ShizukuProvider DEX check
+      # Release-gate parity: run the shared artifact verifier on the debug APK in PR CI.
+      - name: Verify debug APK artifacts (shared release gate)
         run: |
           set -e
-          echo "== (a) manifest declares rikka.shizuku.ShizukuProvider =="
-          grep -F "rikka.shizuku.ShizukuProvider" app/src/main/AndroidManifest.xml
-          echo "== (b) DEX contains ShizukuProvider =="
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK" ]; then
-            echo "FAIL: $APK not found; run :app:assembleDebug first"
-            exit 1
-          fi
-          FOUND=0
-          for dex in $(unzip -l "$APK" | grep -o 'classes[0-9]*\.dex'); do
-            echo "--- scanning $dex ---"
-            if unzip -p "$APK" "$dex" | grep -q "ShizukuProvider"; then
-              echo "FOUND ShizukuProvider in $dex"
-              FOUND=1
-            fi
-          done
-          if [ "$FOUND" -eq 0 ]; then
-            echo "FAIL: ShizukuProvider class string not found in $APK"
-            exit 1
-          fi
-          echo "PASS: ShizukuProvider present in manifest and DEX"
+          chmod +x scripts/verify-release-artifacts.sh
+          ./scripts/verify-release-artifacts.sh app/build/outputs/apk/debug/app-debug.apk
       # C4: forbid android:sharedUserId (uid-equality gate would admit siblings sharing the UID).
       # Matches attribute assignment (with =) only, so the warning comment (without =) does NOT false-positive.
       - name: Exec service sharedUserId invariant
@@ -188,46 +168,58 @@ jobs:
           print("OK: no sharedUserId in APK binary AndroidManifest.xml")
           '
           echo "PASS: no sharedUserId in merged manifest or APK binary manifest"
-      # D1: verify the hook entry survives into the single APK (guards packaging regressions).
-      # Uses only shell/unzip/grep (runner built-ins); no apkanalyzer to avoid missing SDK components.
-      - name: APK hook entry check
+      # Release-gate parity: exercise the apksigner-output parser on both known
+      # output forms (Signer #1 / V2 Signer) without needing the release key.
+      - name: Test apksigner-output parser (fixture)
         run: |
-          set -e
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK" ]; then
-            echo "FAIL: $APK not found; run :app:assembleDebug first"
-            exit 1
+          set -euo pipefail
+          chmod +x scripts/parse-apksigner-output.sh
+          cat > /tmp/signer-v2.txt <<'EOF'
+          Verifies
+          Verified using v2 scheme (APK Signature Scheme v2): true
+          Number of signers: 1
+          V2 Signer: certificate DN: CN=GalaxyDual
+          V2 Signer: certificate SHA-256 digest: 608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3
+          V2 Signer: certificate SHA-1 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          V2 Signer: certificate MD5 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          EOF
+          cat > /tmp/signer-1.txt <<'EOF'
+          Verifies
+          Number of signers: 1
+          Signer #1 certificate DN: CN=GalaxyDual
+          Signer #1 certificate SHA-256 digest: 608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3
+          Signer #1 certificate SHA-1 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          Signer #1 public key SHA-256 digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          EOF
+          EXPECTED_CERT_SHA256=608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3 ./scripts/parse-apksigner-output.sh < /tmp/signer-v2.txt
+          EXPECTED_CERT_SHA256=608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3 ./scripts/parse-apksigner-output.sh < /tmp/signer-1.txt
+          if EXPECTED_CERT_SHA256=0000000000000000000000000000000000000000000000000000000000000000 ./scripts/parse-apksigner-output.sh < /tmp/signer-v2.txt; then
+            echo "FAIL: wrong-cert fixture should have been rejected"; exit 1
           fi
-          echo "== (a) META-INF/xposed resources present in APK =="
-          for entry in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
-            if unzip -l "$APK" | grep -Fq "$entry"; then
-              echo "FOUND $entry"
-            else
-              echo "FAIL: $entry missing in $APK"
-              exit 1
-            fi
-          done
-          echo "== (b) java_init.list points at DualHook =="
-          if unzip -p "$APK" META-INF/xposed/java_init.list | grep -Fq "com.galaxydual.hook.DualHook"; then
-            echo "FOUND DualHook entry in java_init.list"
-          else
-            echo "FAIL: DualHook entry missing in META-INF/xposed/java_init.list"
-            exit 1
+          cat > /tmp/signer-evil.txt <<'EOF'
+          Number of signers: 1
+          Signer #1 certificate DN: CN=evil SHA-256 digest: 608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3
+          Signer #1 certificate SHA-256 digest: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+          EOF
+          if EXPECTED_CERT_SHA256=608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3 ./scripts/parse-apksigner-output.sh < /tmp/signer-evil.txt; then
+            echo "FAIL: DN-injection fixture should have been rejected"; exit 1
           fi
-          echo "== (c) DEX contains DualHook =="
-          FOUND=0
-          for dex in $(unzip -l "$APK" | grep -o 'classes[0-9]*\.dex'); do
-            echo "--- scanning $dex ---"
-            if unzip -p "$APK" "$dex" | grep -q "DualHook"; then
-              echo "FOUND DualHook in $dex"
-              FOUND=1
-            fi
-          done
-          if [ "$FOUND" -eq 0 ]; then
-            echo "FAIL: DualHook class string not found in $APK"
-            exit 1
+          cat > /tmp/signer-pubonly.txt <<'EOF'
+          Number of signers: 1
+          Signer #1 public key SHA-256 digest: 608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3
+          EOF
+          if EXPECTED_CERT_SHA256=608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3 ./scripts/parse-apksigner-output.sh < /tmp/signer-pubonly.txt; then
+            echo "FAIL: pubkey-only fixture should have been rejected"; exit 1
           fi
-          echo "PASS: hook entry (DualHook + xposed resources) present in APK"
+          cat > /tmp/signer-two.txt <<'EOF'
+          Number of signers: 2
+          Signer #1 certificate SHA-256 digest: 608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3
+          EOF
+          if EXPECTED_CERT_SHA256=608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3 ./scripts/parse-apksigner-output.sh < /tmp/signer-two.txt; then
+            echo "FAIL: two-signer fixture should have been rejected"; exit 1
+          fi
+          echo "PASS: apksigner-output parser fixtures"
+
       # H1 scope parity: scope.list <-> HookScopes/DualHook <-> manifest.
       # Single source of truth is HookScopes.kt; DualHook companions delegate.
       - name: Scope parity (hook scopes)
