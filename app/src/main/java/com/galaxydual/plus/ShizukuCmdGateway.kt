@@ -41,6 +41,8 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
+import java.io.Closeable
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -80,12 +82,15 @@ import rikka.shizuku.Shizuku
 // the gate now caps appId at 19999 (AID_APP_LAST), so SDK sandbox
 // (20000-29999) and isolated (99000-99999) appIds stay denied regardless
 // of user; v5 invalidates v4 resident services.
-// v6 = v5 marker+gate with parcel-null guards + post-spawn catch marker
-// (service code changed): the service rejects null/blank wire cmds without
-// spawning, the client maps null reply strings to transportUnknown (never
-// clean-empty), and both post-spawn catch branches append "\n$TRUNCATION_MARKER"
-// so the local truncated=true flag crosses the frozen (int, String, String)
-// wire honestly as marker text; v6 invalidates v5 resident services.
+// v6 = v5 marker+gate + EXEC concurrency semaphore gate
+// (SERVICE_EXEC_MAX_CONCURRENT=4, fair semaphore, non-blocking tryAcquire
+// fail-fast via serviceBusy pre-dispatch definite) + synchronized drain
+// (snapshot/drainCapped under synchronized(sink)) + parcel-null guards +
+// post-spawn catch marker (service code changed): rejects null/blank wire
+// cmds without spawning, maps null reply strings to transportUnknown, and
+// both post-spawn catch branches append "\n$TRUNCATION_MARKER" so
+// truncated=true crosses the frozen (int, String, String) wire honestly;
+// v6 invalidates v5 resident services.
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
@@ -100,10 +105,10 @@ import rikka.shizuku.Shizuku
 // restart, the orphan sits inert (daemon restart reaps). A normal cleanup
 // return means Shizuku accepted the removal and attempted the ONEWAY
 // DESTROY, NOT a synchronous PID-death proof (void unbind, no wait).
-// SERVICE_VERSION is
-// 6 (v6 bumped it for parcel-null guards + the post-spawn catch marker;
-// service-side capture/encode/auth code changed so the daemon must rebuild);
-// the version bump remains the invalidation signal.
+// SERVICE_VERSION is 6 (#54/#55: bumped for concurrency gate + drain sync +
+// parcel-null guards + post-spawn catch marker; service-side
+// capture/encode/auth code changed so daemon must rebuild); the version
+// bump remains the invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
 //   1. install the old APK and start the resident UserService (v1);
@@ -126,6 +131,7 @@ import rikka.shizuku.Shizuku
 //      binder is actually dead (not only that unbind returned) before
 //      claiming the ungated daemon is revoked; include v12 (cleanup-then-
 //      unsupported) and v13+ (cleanup-then-owner-EXEC/foreign-deny) runs.
+//   8. (v5 -> v6) confirm EXEC concurrency gate: with 4 concurrent EXECs holding the gate a 5th EXEC returns pre-dispatch "resource exhausted: service exec concurrency limit" definite failure (exit=1, timedOut=false, transportUnknown=false, no truncation marker, pm never spawned); confirm owner-uid EXEC succeeds under cap, foreign uid denied without consuming permit, DESTROY rebinds when gate full (ungated reap, no orphan); include legacy v2->v6 PID/binder death check as in step 7 (no Shizuku restart).
 // Caller-identity gate (P0 security): the service runs under the shell/root
 // uid, so it must never proxy an arbitrary foreign app's `sh -c` command.
 // Shizuku per-app bind isolation is DEVICE-UNVERIFIED (never confirmed on a
@@ -176,23 +182,23 @@ object ShizukuExecProtocol {
     // semantics); v2 = whenever-truncated marker (prior capture contract,
     // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
     // marker+gate with appId normalization; v5 = v4 marker+gate with appId
-    // upper bound; v6 = v5 marker+gate with parcel-null guards + post-spawn
-    // catch marker (current contract). Bump whenever
-    // the service-side capture/encode/auth code changes: Shizuku requires a
-    // different version code on service-code updates so the daemon (default
-    // true) rebuilds the UserService instead of reusing the resident old
-    // one -- v6 therefore invalidates v5 resident services (parcel-null
-    // guards + post-spawn catch marker), as v5 invalidated v4 resident
-    // services (appId upper bound), v4 invalidated v3 resident services
-    // (full-UID gate) and v3 invalidated ungated v2 resident services. The bind tag is
+    // upper bound; v6 = v5 + concurrency gate + synchronized drain +
+    // parcel-null guards + post-spawn catch marker (current contract). Bump
+    // whenever the service-side capture/encode/auth code changes: Shizuku
+    // requires a different version code on service-code updates so the daemon
+    // (default true) rebuilds the UserService instead of reusing the resident
+    // old one -- v6 therefore invalidates v5 resident services, as v5
+    // invalidated v4 resident services (appId upper bound), v4 invalidated v3
+    // resident services (full-UID gate) and v3 invalidated ungated v2
+    // resident services. The bind tag is
     // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
     // galaxyExecServiceTag); the legacy fixed tag "GalaxyDualExec-v1" is
     // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
     // is NOT bound. Its old service record is removed by the D1 migration
     // on the first successful run() (retryable); if cleanup never succeeds
-    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 6 (v6 bumped it for
-    // parcel-null guards + the post-spawn catch marker; service-side
-    // capture/encode code changed so the daemon must rebuild).
+    // until restart, the orphan sits inert (daemon restart reaps).
+    // SERVICE_VERSION is 6 (#54/#55: concurrency gate + drain sync +
+    // parcel-null guards + post-spawn catch marker; service code changed).
     const val SERVICE_VERSION = 6
 }
 
@@ -361,6 +367,18 @@ object ShizukuExecErrors {
 
     fun timedOut(): CmdResult =
         CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after ${ShizukuExecProtocol.EXEC_TIMEOUT_MS}ms", timedOut = true)
+
+    // Service-side concurrency refusal (#54 Phase1): the exec gate in
+    // GalaxyExecService was full, so pm was never dispatched / never spawned.
+    // Pre-dispatch definite (no flags): must not start with any backstop
+    // prefix ("service exec failed: ", "interrupted: ", "timeout after ",
+    // "shizuku: exec timed out after ", "may have executed"). Same bucket as
+    // the drain-exhaustion "resource exhausted: ..." reply. Shares the
+    // 'resource exhausted:' prefix with pre-spawn drain exhaustion but
+    // truncated=false (no capture, no truncation; drain path uses
+    // truncated=true only for the drain path).
+    fun serviceBusy(): CmdResult =
+        CmdResult(exit = 1, out = "", err = "resource exhausted: service exec concurrency limit (max=$SERVICE_EXEC_MAX_CONCURRENT)")
 }
 
 // Pure wire mapping for the exec reply (JVM-testable): the Binder Parcel
@@ -599,6 +617,55 @@ internal fun mapPostDispatchError(e: Exception): CmdResult {
     return ShizukuExecErrors.transportUnknown(e.message ?: e.javaClass.simpleName)
 }
 
+// Service-side exec concurrency gate (#54 Phase1, binder-pool protection):
+// GalaxyExecService.onTransact runs the BLOCKING captureProcess
+// (EXEC_TIMEOUT_MS 60s + up to ~12s of drain joins) on a Binder-pool thread.
+// Without a cap, concurrent transacts each pin a Binder thread for that whole
+// window and can exhaust the Binder pool, starving even DESTROY / fresh binds.
+// The gate caps at 4 (= TRANSACT_MAX_THREADS); binder pool default 16 leaves
+// headroom for DESTROY/callbacks even at full gate (4 long EXECs = 60s
+// EXEC_TIMEOUT + ~12s joins pin 4/16 threads), DEVICE-UNVERIFIED on device;
+// 4×2=8 drains fits MAX_ACTIVE_DRAINS=16. Excess calls fail fast pre-dispatch
+// via serviceBusy() -- never queued, since queueing would still hold a Binder
+// thread. java.util.concurrent.Semaphore is used (blocking binder thread,
+// non-suspend; tryAcquire is non-blocking so the wait never holds the pool)
+// (fair flag only affects blocking waiters; tryAcquire-only usage never queues
+// so admission order is a scheduler race to tryAcquire, not transact arrival -
+// harmless because excess callers get definite serviceBusy and can retry;
+// production traffic is serialized by opMutex).
+// The client side is unchanged: EXEC_TIMEOUT_MS + awaitBounded + stale-cache
+// dropBindingLocked on timeout stay as they are; this gate only sheds excess
+// server-side concurrency.
+// Pure JVM-testable seam: tests instantiate an isolated ServiceExecGate and
+// pin tryAcquireLease/Lease-close/peak-cap behavior without Binder/Parcel.
+internal const val SERVICE_EXEC_MAX_CONCURRENT = 4
+
+/**
+ * Lease gate: each successful [tryAcquireLease] returns an independent
+ * [Lease] owning exactly one permit. [Lease.close] is idempotent via
+ * AtomicBoolean CAS: only the first close returns the permit; every
+ * subsequent close (including concurrent closes of the same lease with 2+
+ * holders live) is a no-op, so the cap can never be inflated even under
+ * misuse. A null return means the cap is full and no permit was consumed.
+ * Permit restoration is guaranteed for try/finally/use including Error
+ * escapes. Callers must not retain the lease beyond dispatch scope.
+ */
+internal class ServiceExecGate(
+    val permits: Int = SERVICE_EXEC_MAX_CONCURRENT,
+) {
+    private val semaphore = Semaphore(permits, true)
+    fun tryAcquireLease(): Lease? = if (semaphore.tryAcquire()) Lease(semaphore) else null
+    fun availablePermits(): Int = semaphore.availablePermits()
+    internal class Lease(private val semaphore: Semaphore) : Closeable {
+        private val closed = AtomicBoolean(false)
+        override fun close() {
+            if (closed.compareAndSet(false, true)) semaphore.release()
+        }
+    }
+}
+
+internal val serviceExecGate = ServiceExecGate()
+
 // Privileged execution service, instantiated by the Shizuku server process
 // (shell/root uid), NOT by this app's process. Must stay a public top-level
 // class with both constructors: Shizuku v13+ tries the Context constructor
@@ -678,7 +745,9 @@ class GalaxyExecService : Binder {
                 // actual sender uid is DEVICE-UNVERIFIED (could be system 1000 / shell 2000 / root 0);
                 // gating risks orphaned resident services defeating SERVICE_VERSION;
                 // foreign DESTROY impact is negligible availability-only DoS (Shizuku rebinds, no command execution),
-                // so leave ungated deliberately. EXEC remains the P0-gated vector.
+                // so leave ungated deliberately. EXEC remains the P0-gated vector. v6 DESTROY stays ungated so stale v5/v6 records can be reaped when gate is full.
+                // DESTROY dispatch promptness during 4× hung EXECs is
+                // DEVICE-UNVERIFIED, bounded delay ≤ ~72s worst case.
                 System.exit(0)
                 return true
             }
@@ -733,15 +802,29 @@ class GalaxyExecService : Binder {
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
                 // (binder thread), so call it directly via the pure seam.
+                // Concurrency gate (#54 Phase1): gate admission is non-blocking
+                // BEFORE dispatch; excess calls get fast pre-dispatch definite
+                // refusal (serviceBusy, never sent, never spawned). Gate after
+                // auth and after readString so foreign callers/malformed parcels
+                // cannot consume permits. DESTROY (ungated) is not a gate bypass.
+                val lease = serviceExecGate.tryAcquireLease() ?: run {
+                    val (busyExit, busyOut, busyErr) = encodeExecReply(ShizukuExecErrors.serviceBusy())
+                    reply?.writeInt(busyExit)
+                    reply?.writeString(busyOut)
+                    reply?.writeString(busyErr)
+                    return true
+                }
                 // Pre-spawn vs post-spawn (Phase A1, preserved in
                 // handleExecRequest/servicePostSpawnFailure/
-                // serviceInterruptedFailure): spawn failures are already
-                // returned INSIDE captureProcess as definite failures and
-                // never throw here; any exception escaping exec is post-spawn
-                // unknown-after-send by construction ("service exec failed: "
-                // backstop + trailing marker, truncated/transportUnknown).
-                val res = handleExecRequest(callingUid, expectedAppUid, rawCmd) { cmd ->
-                    captureProcessFn(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
+                // serviceInterruptedFailure): spawn failures are returned
+                // INSIDE captureProcess as definite failures; exceptions
+                // escaping exec are post-spawn unknown-after-send by construction.
+                val res = try {
+                    handleExecRequest(callingUid, expectedAppUid, rawCmd) { cmd ->
+                        captureProcessFn(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
+                    }
+                } finally {
+                    lease.close()
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)

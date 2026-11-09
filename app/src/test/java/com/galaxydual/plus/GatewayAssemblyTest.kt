@@ -735,8 +735,8 @@ class GatewayAssemblyTest {
     // service semantics), v2 = whenever-truncated marker (prior contract,
     // EXEC ungated), v3 = v2 marker plus owner-uid EXEC gate, v4 = v3
     // marker+gate with appId normalization, v5 = v4 marker+gate with appId
-    // upper bound, v6 = v5 marker+gate with parcel-null guards + post-spawn
-    // catch marker (current contract).
+    // upper bound; v6 = v5 + concurrency gate + synchronized drain +
+    // parcel-null guards + post-spawn catch marker (current contract).
     // bindUserService uses .version(SERVICE_VERSION) so Shizuku/Sui
     // rebuilds the resident UserService on upgrade (v6 invalidates v5
     // resident services, as v5 invalidated v4 resident services, v4
@@ -747,9 +747,8 @@ class GatewayAssemblyTest {
     // legacy fixed tag "GalaxyDualExec-v1" record is removed by the D1
     // migration on the first run (retryable); if cleanup never succeeds
     // until restart, the orphan sits inert (daemon restart reaps).
-    // SERVICE_VERSION is 6 (v6 bumped it
-    // for parcel-null guards + the post-spawn catch marker; service-side
-    // capture/encode code changed so the daemon must rebuild).
+    // SERVICE_VERSION is 6 (#54/#55: concurrency gate + drain sync +
+    // parcel-null guards + post-spawn catch marker; service code changed).
     @Test fun serviceVersion_isV6() {
         assertEquals(6, ShizukuExecProtocol.SERVICE_VERSION)
     }
@@ -783,7 +782,7 @@ class GatewayAssemblyTest {
     // Shizuku, then confirm the bound service runs the new capture/marker
     // contract (this path arrives WITH marker -> Unknown). v2 -> v3 note:
     // ungated v2 resident services are invalidated by the v3 bump; confirm
-    // owner EXEC succeeds and a foreign uid is denied.
+    // owner EXEC succeeds and a foreign uid is denied. v5 -> v6 note: v5 resident services are invalidated by the v6 bump; confirm EXEC concurrency gate (4 concurrent EXECs hold gate, 5th returns serviceBusy definite failure, foreign uid denied without consuming permit, DESTROY rebinds when gate full).
     @Test fun execReply_newServicePartialWithMarkerParsesUnknown() {
         val svc = buildResult(
             0, StringBuilder("package:com.example.app\n"), StringBuilder(""),

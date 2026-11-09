@@ -196,7 +196,17 @@ fun suArgv(cmd: String): Array<String> = arrayOf("su", "-c", cmd)
 // blocking form -- the binder thread has no coroutine scope, so it cannot
 // run the cancellable suspend variant. The SuCmdGateway client path uses
 // captureProcessCancellable below (same contract, cancellable waits).
-internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEOUT_MS): CmdResult {
+// execFn seam (mirrors captureProcessCancellable): production default is
+// Runtime.exec; JVM tests inject a fake Process to model an Android
+// child-held pipe (wrapper destroyed, child keeps the FDs, drain stays
+// blocked) -- a real JVM process cannot model that because OpenJDK
+// destroyForcibly closes the streams and wakes the drains at once, so the
+// join-expiry path is otherwise unreachable on the JVM.
+internal fun captureProcess(
+    argv: Array<String>,
+    timeoutMs: Long = SU_EXEC_TIMEOUT_MS,
+    execFn: (Array<String>) -> Process = { a -> Runtime.getRuntime().exec(a) },
+): CmdResult {
     // I1 reserve→spawn→drain: atomically hold both drain slots BEFORE spawn so
     // a spawned child can never wait for a drain that will never start (large
     // output would otherwise block in pipe write() to the 60 s timeout). FD
@@ -206,7 +216,7 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         return CmdResult(exit = 1, out = "", err = "resource exhausted: no drain slots (active=${activeDrainCount.get()}/$MAX_ACTIVE_DRAINS)", truncated = true)
     }
     val proc = try {
-        Runtime.getRuntime().exec(argv)
+        execFn(argv)
     } catch (e: Exception) {
         // Covers missing su ("No such file or directory"), SecurityException,
         // and any other spawn failure: explicit error, exit != 0, no throw.
@@ -219,13 +229,12 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
     }
     // Drain both pipes on daemon threads: reading stdout to EOF while stderr
     // sits unfilled can deadlock once the stderr pipe buffer fills.
-    // Known limitation (PR-2 Phase 3, R8): each StringBuilder has exactly one
-    // writer thread and the steady path joins both drains before reading, but
-    // StringBuilder itself is unsynchronized, and on the timeout path
-    // join(2_000) can expire while a drain thread is still appending, racing
-    // with the buildResult read below. Accepted as extremely low risk (2 s
-    // grace on kilobyte-scale pm output; worst case is a torn tail that the
-    // trusted parse already treats as untrusted), never silently trusted.
+    // Concurrency (#54 Phase1): out/err are StringBuilder guarded by
+    // synchronized(sink) -- drainCapped appends under the same lock and
+    // capped()/snapshot copy under it too, so the timeout path's
+    // join(2_000) expiry read is an atomic snapshot, never a torn
+    // StringBuilder (writer append vs reader toString race). The blocking
+    // read() itself stays outside the lock, so a snapshot never waits on I/O.
     val out = StringBuilder()
     val err = StringBuilder()
     // Per-stream drain outcomes (Phase B, issue #22 P1-#2): AtomicReferences
@@ -276,66 +285,91 @@ internal fun captureProcess(argv: Array<String>, timeoutMs: Long = SU_EXEC_TIMEO
         }
         throw t
     }
-    val exited = try {
-        proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-    } catch (e: InterruptedException) {
-        Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        // Post-spawn unknown (Phase A1): the process was spawned, so the
-        // remote pm may have executed before the kill -- unknown-after-send
-        // by construction. transportUnknown=true forces the repository onto
-        // the read-only verify probe instead of claiming definite failure
-        // (exit/out untrusted either way). Pre-spawn spawn failures
-        // ("spawn failed: ...", exec threw, process never started) stay
-        // definite -- only this post-spawn interrupt carries the flag.
-        // The "interrupted: " text prefix is the wire-frozen backstop: the
-        // service-side capture shares this helper and its flag is lost on
-        // the (exit, out, err) parcel, so DualRepository also matches the
-        // anchored text via isPostSpawnTransportText.
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
-    }
-    if (!exited) {
-        proc.destroyForcibly()
-        try {
-            drainOut.join(2_000)
-            drainErr.join(2_000)
-        } catch (e: InterruptedException) {
-            // Post-spawn unknown (Phase A1): the timeout already abandoned
-            // the wait (timedOut=true below covers it), but the drain-join
-            // interrupt itself proves the capture is incomplete after spawn.
-            // Restore the flag and stay unknown-after-send either way.
-            Thread.currentThread().interrupt()
-            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
-        }
-        // Same honest-flag reasoning as the interrupt path above: killed
-        // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
-        // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
-        // remote pm may still have executed, so timedOut=true forces the
-        // repository onto the read-only verify probe instead of claiming
-        // definite failure (exit/out untrusted either way).
-        return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
-    }
+    // Phase 3 post-spawn Error-escape guard: an Error from waitFor/join/exitValue
+    // must not escape without destroyForcibly/pipe-close. The catches below map
+    // only CE/IE paths to CmdResult; this outer catch rethrows after best-effort
+    // cleanup (mirrors the spawn-setup inner path) and never converts to a result.
+    // Behavior for CE/IE/Exception + timeout/interrupt returns stays byte-identical.
     try {
-        drainOut.join(5_000)
-        drainErr.join(5_000)
-    } catch (e: InterruptedException) {
-        // Post-spawn unknown (Phase A1): spawn succeeded and the steady
-        // drain was interrupted -- the remote pm may have executed while
-        // this client holds only a partial capture. Destroy, restore the
-        // flag, and force read-only reconciliation via transportUnknown
-        // (same rule as the wait-interrupt above). The "interrupted: "
-        // prefix is the wire-frozen backstop for the service side.
-        Thread.currentThread().interrupt()
-        proc.destroyForcibly()
-        return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        val exited = try {
+            proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            proc.destroyForcibly()
+            // Post-spawn unknown (Phase A1): the process was spawned, so the
+            // remote pm may have executed before the kill -- unknown-after-send
+            // by construction. transportUnknown=true forces the repository onto
+            // the read-only verify probe instead of claiming definite failure
+            // (exit/out untrusted either way). Pre-spawn spawn failures
+            // ("spawn failed: ...", exec threw, process never started) stay
+            // definite -- only this post-spawn interrupt carries the flag.
+            // The "interrupted: " text prefix is the wire-frozen backstop: the
+            // service-side capture shares this helper and its flag is lost on
+            // the (exit, out, err) parcel, so DualRepository also matches the
+            // anchored text via isPostSpawnTransportText.
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: ${(e.message ?: "wait interrupted")}", truncated = true, transportUnknown = true)
+        }
+        if (!exited) {
+            proc.destroyForcibly()
+            try {
+                drainOut.join(2_000)
+                drainErr.join(2_000)
+            } catch (e: InterruptedException) {
+                // Post-spawn unknown (Phase A1): the timeout already abandoned
+                // the wait (timedOut=true below covers it), but the drain-join
+                // interrupt itself proves the capture is incomplete after spawn.
+                // Restore the flag and stay unknown-after-send either way.
+                Thread.currentThread().interrupt()
+                return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted after timeout: ${(e.message ?: "interrupted")}", truncated = true, timedOut = true, transportUnknown = true)
+            }
+            // Same honest-flag reasoning as the interrupt path above: killed
+            // mid-stream means incomplete output; exit=1 keeps behavior unchanged.
+            // Unknown-after-send (PR-32 P1-1): the client abandoned the wait, the
+            // remote pm may still have executed, so timedOut=true forces the
+            // repository onto the read-only verify probe instead of claiming
+            // definite failure (exit/out untrusted either way).
+            return CmdResult(exit = 1, out = capped(out, true), err = "timeout after ${timeoutMs}ms: ${argv.firstOrNull() ?: "?"}", truncated = true, timedOut = true)
+        }
+        try {
+            drainOut.join(5_000)
+            drainErr.join(5_000)
+        } catch (e: InterruptedException) {
+            // Post-spawn unknown (Phase A1): spawn succeeded and the steady
+            // drain was interrupted -- the remote pm may have executed while
+            // this client holds only a partial capture. Destroy, restore the
+            // flag, and force read-only reconciliation via transportUnknown
+            // (same rule as the wait-interrupt above). The "interrupted: "
+            // prefix is the wire-frozen backstop for the service side.
+            Thread.currentThread().interrupt()
+            proc.destroyForcibly()
+            return CmdResult(exit = 1, out = capped(out, true), err = "interrupted: drain join interrupted: ${(e.message ?: "interrupted")}", truncated = true, transportUnknown = true)
+        }
+        // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
+        // is the expiry signal. A still-alive drain means the capture may be
+        // incomplete even when nothing hit the cap -- fail closed via truncated.
+        // I1: drains always started here (pair reserved pre-spawn), so no null
+        // case remains; READ_ERROR defaults still fail closed via buildResult.
+        val joinExpired = drainOut.isAlive || drainErr.isAlive
+        return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
+    } catch (t: Throwable) {
+        // Error escape (incl. Error + any unhandled Exception): best-effort
+        // cleanup mirroring the spawn-setup inner path, then rethrow. Never
+        // converts to CmdResult: CE propagates, and IE/Exception paths above
+        // already returned (timeout/interrupt values unchanged).
+        try {
+            proc.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Throwable) {
+        }
+        throw t
     }
-    // Join-expiry honesty: join() returns Unit (no timed-out flag), so isAlive
-    // is the expiry signal. A still-alive drain means the capture may be
-    // incomplete even when nothing hit the cap -- fail closed via truncated.
-    // I1: drains always started here (pair reserved pre-spawn), so no null
-    // case remains; READ_ERROR defaults still fail closed via buildResult.
-    val joinExpired = drainOut.isAlive || drainErr.isAlive
-    return buildResult(proc.exitValue(), out, err, outStatus.get(), errStatus.get(), joinExpired)
 }
 
 // Cancellable wait for process exit: polls waitFor(SU_WAIT_POLL_MS) and
@@ -842,6 +876,37 @@ internal suspend fun captureProcessCancellable(
             Thread.currentThread().interrupt()
         }
         return CmdResult(exit = 1, out = capped(out, true), err = "su failed post-spawn: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
+    } catch (t: Throwable) {
+        // Phase 3 Error escape (Error is not an Exception, so the guards above
+        // missed it: waitFor/exitValue Error would otherwise leak proc + pipes
+        // without destroyForcibly/close). Mirror the spawn-setup inner path:
+        // best-effort destroy + stream closes (each try/catch best-effort so a
+        // cleanup throw cannot mask the original), then rethrow. Never
+        // converts to CmdResult, so CE is never swallowed here (CE is an
+        // Exception caught above and rethrown there); this catch only sees
+        // Error + any non-Exception Throwable. Do not add reclaim joins:
+        // close alone lets drains die async without delaying the rethrow.
+        try {
+            proc.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        try {
+            openIn?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            openErr?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.inputStream.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            proc.errorStream.close()
+        } catch (_: Throwable) {
+        }
+        throw t
     }
 }
 
@@ -866,8 +931,9 @@ internal enum class DrainStatus { EOF, CAPPED, READ_ERROR }
 // NEW-client + OLD-service (v1 cap-only marker) gap is closed at the
 // deployment layer by ShizukuExecProtocol.SERVICE_VERSION (v6), which forces
 // the daemon to rebuild the resident UserService on upgrade -- v6 also
-// invalidates v5 resident services (parcel-null guards + post-spawn catch
-// marker); v5 invalidated v4 resident services (appId upper-bound owner-uid EXEC gate).
+// invalidates v5 resident services (concurrency gate + synchronized drain +
+// parcel-null guards + post-spawn catch marker); v5 invalidated v4 resident
+// services (appId upper-bound owner-uid EXEC gate).
 internal fun buildResult(
     exit: Int,
     out: StringBuilder,
@@ -885,37 +951,49 @@ internal fun buildResult(
     return CmdResult(exit = exit, out = capped(out, outTrunc), err = capped(err, errTrunc), truncated = truncated)
 }
 
+// Snapshot copy of a drain sink: the toString() copy runs under the same
+// synchronized(sink) lock drainCapped appends with, so a join-expiry /
+// timeout-path read racing a still-appending drain returns an atomic
+// snapshot, never a torn StringBuilder (count vs backing-array mismatch).
+internal fun snapshot(sink: StringBuilder): String = synchronized(sink) { sink.toString() }
+
 // Reads all of input into sink up to MAX_CAPTURE_CHARS; closes the stream.
 // Returns the drain outcome; already-appended characters are preserved on
 // every path, including READ_ERROR. Internal (not private) so JVM unit tests
 // cover it with an injectable failing-stream fixture (GatewayAssemblyTest).
+// Synchronized writes (#54 Phase1): the length check + room computation +
+// append are one synchronized(sink) critical section, so concurrent drains
+// hammering one sink never overflow the cap and a snapshot racing an append
+// is never torn. The blocking reader.read() stays outside the lock.
 internal fun drainCapped(input: java.io.InputStream, sink: StringBuilder): DrainStatus {
     return try {
         input.bufferedReader().use { reader ->
             val buf = CharArray(8_192)
             var outcome: DrainStatus? = null
             while (outcome == null) {
-                if (sink.length >= MAX_CAPTURE_CHARS) {
+                if (synchronized(sink) { sink.length } >= MAX_CAPTURE_CHARS) {
                     outcome = DrainStatus.CAPPED
                 } else {
                     val n = reader.read(buf, 0, buf.size)
                     if (n < 0) {
                         outcome = DrainStatus.EOF
                     } else {
-                        val room = MAX_CAPTURE_CHARS - sink.length
-                        if (n > room) {
-                            // The cap cuts inside this chunk: bytes were
-                            // dropped, so report CAPPED even if the stream
-                            // ends right after. A stream ending EXACTLY on
-                            // the cap boundary also reports CAPPED (next loop
-                            // pass sees sink.length >= MAX): a conservative
-                            // false-positive, fail-closed and consistent with
-                            // the old isCapped semantics -- never a missed
-                            // truncation.
-                            sink.append(buf, 0, room)
-                            outcome = DrainStatus.CAPPED
-                        } else {
-                            sink.append(buf, 0, n)
+                        synchronized(sink) {
+                            val room = MAX_CAPTURE_CHARS - sink.length
+                            if (n > room) {
+                                // The cap cuts inside this chunk: bytes were
+                                // dropped, so report CAPPED even if the stream
+                                // ends right after. A stream ending EXACTLY on
+                                // the cap boundary also reports CAPPED (next loop
+                                // pass sees sink.length >= MAX): a conservative
+                                // false-positive, fail-closed and consistent with
+                                // the old isCapped semantics -- never a missed
+                                // truncation.
+                                sink.append(buf, 0, room)
+                                outcome = DrainStatus.CAPPED
+                            } else {
+                                sink.append(buf, 0, n)
+                            }
                         }
                     }
                 }
@@ -935,8 +1013,11 @@ internal fun drainCapped(input: java.io.InputStream, sink: StringBuilder): Drain
 // read error, join expiry, or kill path) so text-sniffing consumers (trusted
 // parser fallback, Shizuku client via decodeExecReply) observe the same flag
 // the producer sets. Internal for the same testability reason as above.
-internal fun capped(sink: StringBuilder, truncated: Boolean): String =
-    if (truncated) sink.toString() + "\n$TRUNCATION_MARKER" else sink.toString()
+// Uses snapshot() so the copy is atomic vs a still-appending drain (#54).
+internal fun capped(sink: StringBuilder, truncated: Boolean): String {
+    val snap = snapshot(sink)
+    return if (truncated) snap + "\n$TRUNCATION_MARKER" else snap
+}
 
 // ROOT gateway: executes core-built pm commands via `su -c`.
 // DEVICE-UNVERIFIED: su presence/behavior varies by ROM; verified only by
