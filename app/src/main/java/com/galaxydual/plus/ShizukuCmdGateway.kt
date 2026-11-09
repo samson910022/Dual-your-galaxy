@@ -534,12 +534,16 @@ internal fun handleExecRequest(
     }
     val badRequest = badRequestForCommand(rawCmd)
     if (badRequest != null) return badRequest
-    // Double guard: even though rawCmd is non-null/non-blank and within
+    // Double guard (self-contained, independent of badRequestForCommand,
+    // wire-neutral, no SERVICE_VERSION bump -- still 6, reachable bytes
+    // unchanged): even though rawCmd is non-null/non-blank and within
     // MAX_CMD_CHARS here by the badRequestForCommand check above, never rely
-    // solely on the helper contract -- a direct isNullOrBlank / length check
-    // guarantees no null spawn, no `sh -c ""`, and no oversize spawn if the
-    // helper contract ever changes.
-    if (rawCmd.isNullOrBlank() || rawCmd.length > ShizukuExecProtocol.MAX_CMD_CHARS) return badRequestForCommand(rawCmd)!!
+    // solely on the helper contract -- these direct isNullOrBlank / length
+    // checks with literal replies guarantee no null spawn, no `sh -c ""`,
+    // and no oversize spawn if the helper contract ever changes. Strings
+    // are byte-identical to the helper; no helper call, no `!!` here.
+    if (rawCmd.isNullOrBlank()) return CmdResult(exit = 1, out = "", err = "bad request: blank command")
+    if (rawCmd.length > ShizukuExecProtocol.MAX_CMD_CHARS) return CmdResult(exit = 1, out = "", err = "bad request: command too long (length ${rawCmd.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})")
     val cmd = rawCmd
     return try {
         exec(cmd)
