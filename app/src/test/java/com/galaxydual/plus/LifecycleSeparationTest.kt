@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -49,17 +50,21 @@ class LifecycleSeparationTest {
     }
 
     private class MapBackend {
-        val map = ConcurrentHashMap<String, String?>()
+        val map = ConcurrentHashMap<String, String>()
         val reads = AtomicInteger(0)
         val writes = AtomicInteger(0)
         fun store(): SelectionStore = SelectionStore(
             loadRaw = {
+                // Capture FIRST, signal AFTER: awaiting reads>before guarantees
+                // the snapshot was already taken (no TOCTOU where a later
+                // save() would change the captured value).
+                val raw = map[SELECTION_KEY]
                 reads.incrementAndGet()
-                map[SELECTION_KEY]
+                raw
             },
             saveRaw = { raw ->
-                writes.incrementAndGet()
                 if (raw == null) map.remove(SELECTION_KEY) else map[SELECTION_KEY] = raw
+                writes.incrementAndGet()
                 true
             },
         )
@@ -228,6 +233,24 @@ class LifecycleSeparationTest {
         }
     }
 
+    /**
+     * Deterministic quiescence fence: returns only when every child of
+     * vm.viewModelScope has completed (mutex wait + onIo + state commit).
+     * Preconditions: called after a public API returns under
+     * Dispatchers.Unconfined (setMain in setUp), so the subject job is
+     * already registered; all DualViewModel jobs are finite ops.
+     * Use drain-before + drain-after to prove a negative no-op actually ran.
+     */
+    private fun awaitScopeDrained(vm: DualViewModel, timeoutMs: Long = 5_000L) {
+        val scopeJob = vm.viewModelScope.coroutineContext[Job]
+            ?: throw AssertionError("viewModelScope has no Job")
+        try {
+            await(timeoutMs) { scopeJob.children.none { it.isActive } }
+        } catch (e: AssertionError) {
+            throw AssertionError("timeout draining viewModelScope; state=${vm.state.value}")
+        }
+    }
+
     @Test
     // Config change retains the same ViewModel instance (Android retains VMs
     // across configuration changes), so pendingRemove + selectedKeys survive
@@ -372,6 +395,8 @@ class LifecycleSeparationTest {
         await { vm.state.value.selectedKeys.contains("0:com.example.chat") }
         vm.refresh()
         await { vm.state.value.inventory.targetId > 0 }
+        awaitScopeDrained(vm)
+        val readsBeforeRestore = backend.reads.get()
 
         val selectedBefore = vm.state.value.selectedKeys
         val pendingBefore = vm.state.value.pendingRemove
@@ -379,7 +404,9 @@ class LifecycleSeparationTest {
 
         // Selection is non-empty: restore must NOT overwrite (no auto-resend).
         vm.restoreSelection(95)
-        Thread.sleep(300)
+        awaitScopeDrained(vm)
+        // Guard returns before any store I/O.
+        assertEquals(readsBeforeRestore, backend.reads.get())
         assertEquals(selectedBefore, vm.state.value.selectedKeys)
         assertEquals(pendingBefore, vm.state.value.pendingRemove)
         // Seeded key from store must not have been merged in.
@@ -440,6 +467,7 @@ class LifecycleSeparationTest {
         vm.setSourceCatalog(catalog())
         vm.refresh()
         await { backend.reads.get() > readsBeforeRefresh && vm.state.value.inventory.targetId > 0 }
+        awaitScopeDrained(vm)
         assertEquals(96, vm.state.value.inventory.targetId)
 
         // Seed a 95 snapshot only after refresh's restore/cleanup has run.
@@ -457,7 +485,7 @@ class LifecycleSeparationTest {
         assertNotNull(rawBefore)
 
         vm.restoreSelection(95)
-        Thread.sleep(300)
+        awaitScopeDrained(vm)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
         // Foreign guard returns before any store I/O.
         assertEquals(readsBeforeRestore, backend.reads.get())
@@ -475,10 +503,11 @@ class LifecycleSeparationTest {
         val clock = FakeClock()
         val vm = makeVm(gw, clock, null)
         await { vm.state.value.channelReady }
+        awaitScopeDrained(vm)
 
         vm.setSourceCatalog(catalog())
         vm.restoreSelection(95)
-        Thread.sleep(300)
+        awaitScopeDrained(vm)
         assertNull(vm.state.value.pendingRemove)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
         assertEquals(0, gw.installCalls.size)
@@ -507,10 +536,11 @@ class LifecycleSeparationTest {
         // restore because sourceCatalog is empty, but inventory gets verified).
         vm.refresh()
         await { vm.state.value.inventory.targetId > 0 }
+        awaitScopeDrained(vm)
 
         // Catalog still empty: explicit restore must not burn the marker.
         vm.restoreSelection(95)
-        Thread.sleep(300)
+        awaitScopeDrained(vm)
         assertTrue(vm.state.value.selectedKeys.isEmpty())
 
         // Once catalog is ready, the not-burned marker allows restore.
