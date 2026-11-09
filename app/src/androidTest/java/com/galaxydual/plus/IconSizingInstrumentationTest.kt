@@ -14,17 +14,17 @@
 //   private const SOURCE_ICON_DP=24、CLONED_ICON_DP=36（private 無法直引，
 //   故複本＋下方註明；常量改動時須人工同步兩處，否則裝置斷言才會紅）。
 //   ICON_CONTAINER_DP=44 為外框非圖形，不在本檔斷言（勿混用）。
-// - 設備／density 覆蓋說明（TODO 設備 matrix，commit 前須補實測）：
-//   TODO(matrix)：API 29（mdpi 160，density 1.0，PR CI instrumentation）＋
-//   API 34（xxhdpi 480，density 3.0，manual workflow_dispatch）＋
-//   420dpi（density 2.625，非標準四捨五入對照機）三格；不同 density 下
-//   dp(24)/dp(36) 的 px 不同，故本檔一律以 dpPx(dp, 裝置 density) 對拍，
-//   不寫死 px。截圖 TODO：commit 訊息可用的畫面截圖需在上述三格各補一張
-//   來源列與分身列特寫，否則不得宣稱圖示尺寸視覺驗證通過。
-// - 無測試明示：本環境無 emulator，本檔未實際執行；僅保證
-//   :app:assembleDebugAndroidTest 編譯通過。無測試指「裝置實測未跑」：
-//   未覆蓋 adaptive glyph 等大、深色模式、不同字體縮放下的行高；
-//   未覆蓋真實 PackageManager 未知 intrinsic（-1）以外的損壞 Drawable。
+// - 設備／density 實測記錄（2026-11-09）：
+//   DONE：API 29 emulator-5554（mdpi 160，density 1.0）：connectedDebugAndroidTest
+//   IconSizingInstrumentationTest 2/2 PASS（2 tests，failures 0）；API 34 真機
+//   613f60b7（23013PC75G，density 560／3.5）：單機運行 2/2 PASS。先前三機並行時
+//   真機因屏幕熄滅／process crashed 失敗，單跑＋喚醒後 PASS，屬環境爭用非代碼 bug。
+//   TODO(matrix)：420dpi（density 2.625，非標準四捨五入對照機）未單獨跑：本檔
+//   一律以 dpPx(dp, 裝置 density) 對拍不同 density 下 dp(24)／dp(36) 的 px
+//   （不寫死 px），預期可移植但僅為預期、未實測，仍屬 TODO。截圖 TODO：仍無
+//   畫面截圖，commit／PR 截圖 TODO 仍成立；深色模式與不同字體縮放亦仍 TODO，
+//   不得宣稱圖示尺寸視覺驗證通過。未覆蓋 adaptive glyph 等大、真實
+//   PackageManager 未知 intrinsic（-1）以外的損壞 Drawable。
 // - 寫入安全：全程經 FakeHarnessGateway 注入（零寫入），不點 Clone／移除；
 //   圖示載入打真實 PackageManager 時用真實框架包名 android（虛構包名在
 //   裝置上必然 NameNotFound 而永無 compoundDrawable）。
