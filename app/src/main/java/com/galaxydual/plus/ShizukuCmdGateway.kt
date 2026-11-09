@@ -516,10 +516,11 @@ internal fun shouldDropCachedBinding(result: CmdResult): Boolean = result.transp
 //        - any other Exception (incl. RuntimeException) ->
 //          servicePostSpawnFailure(e).
 // The former onTransact double guard (badRequest helper plus a manual
-// isNullOrBlank Parcel-write fallback) is collapsed to the single helper
-// above plus the pure null fallback below; onTransact keeps only the
-// Parcel read (read-failure -> bad request, which cannot be pure and
-// therefore stays in onTransact) and the encode/write of this result.
+// isNullOrBlank Parcel-write fallback) is now helper + self-contained
+// literal double guard: the single helper above plus the pure null
+// fallback below; onTransact keeps only the Parcel read (read-failure ->
+// bad request, which cannot be pure and therefore stays in onTransact)
+// and the encode/write of this result.
 // JVM tests pin auth/bad-request/verbatim/post-spawn mapping here; the
 // Parcel/Binder round-trip, the actual spawn, and the DEBUG denied log
 // stay device-only and are NOT claimed verified by these JVM tests.
@@ -947,6 +948,9 @@ class ShizukuCmdGateway(
     // Bound lazily on first run(); process-lifetime cache (close() unbinds).
     // Once closed=true the gateway never caches again (fail closed).
     private val bindMutex = Mutex()
+    // Invariant: cachedBinder and cachedRequest are promoted/cleared
+    // together (both set on a successful bind, both nulled by
+    // dropBindingLocked), so they are either both null or both non-null.
     private var cachedBinder: IBinder? = null
     private var cachedRequest: ShizukuBindDriver.Request? = null
     // Phase B P2-2: set by close()/abandon(), read by every lock holder.
@@ -1023,7 +1027,7 @@ class ShizukuCmdGateway(
                 return@withContext ShizukuExecErrors.bindFailed(e.message ?: e.javaClass.simpleName)
             } ?: return@withContext ShizukuExecErrors.bindFailed("null binder")
 
-            transactExec(bound.binder, bound.request, cmd)
+            transactExec(bound, cmd)
         }
 
     // Returns the live service binder, binding on first use (mutex-guarded
@@ -1049,7 +1053,17 @@ class ShizukuCmdGateway(
                 dropBindingLocked()
                 throw IllegalStateException("shizuku gateway closed")
             }
-            cachedBinder?.let { if (it.isBinderAlive) return@withLock BoundBinder(cachedBinder!!, cachedRequest!!) else dropBindingLocked() }
+            // Invariant: cachedBinder and cachedRequest are assigned together
+            // (promotion below) and cleared together (dropBindingLocked), so
+            // they are either both null or both non-null; the null-checks below
+            // avoid `!!` without changing that contract.
+            cachedBinder?.let { b ->
+                if (b.isBinderAlive) {
+                    cachedRequest?.let { r -> return@withLock BoundBinder(b, r) }
+                } else {
+                    dropBindingLocked()
+                }
+            }
             val latch = CompletableDeferred<IBinder>()
             val request: ShizukuBindDriver.Request = try {
                 resolvedDriver.send { result ->
@@ -1190,9 +1204,9 @@ class ShizukuCmdGateway(
     // transportUnknown=true) for read-only reconciliation, NEVER a definite
     // failure. Only the pre-transact liveness refusal above (command never
     // sent) stays binderDead() -> definite failure.
-    private suspend fun transactExec(binder: IBinder, request: ShizukuBindDriver.Request, cmd: String): CmdResult {
-        if (!binder.isBinderAlive) {
-            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
+    private suspend fun transactExec(bound: BoundBinder, cmd: String): CmdResult {
+        if (!bound.binder.isBinderAlive) {
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             return ShizukuExecErrors.binderDead()
         }
         return try {
@@ -1201,7 +1215,7 @@ class ShizukuCmdGateway(
                 val reply = Parcel.obtain()
                 try {
                     data.writeString(cmd)
-                    binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
+                    bound.binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
                     // No readException(): the service writes a raw int exit
                     // first, which readException would misread as an
                     // exception code on any non-zero exit.
@@ -1229,7 +1243,7 @@ class ShizukuCmdGateway(
                 }
             }
             val result = out ?: run {
-                bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
+                bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
                 ShizukuExecErrors.timedOut()
             }
             // Null-reply transportUnknown (decodeExecReplyNullable above) is
@@ -1244,7 +1258,7 @@ class ShizukuCmdGateway(
             // wire-neutral, no bump); the drop side effect stays here under
             // bindMutex.
             if (shouldDropCachedBinding(result)) {
-                bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
+                bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             }
             result
         } catch (e: CancellationException) {
@@ -1262,7 +1276,7 @@ class ShizukuCmdGateway(
             // service may have executed, so transportUnknown via the pure
             // mapPostDispatchError() (JVM-pinned), never a definite failure.
             Thread.interrupted()
-            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             mapPostDispatchError(e)
         } catch (e: Exception) {
             // Post-dispatch by construction (transact RemoteException, binder
@@ -1270,7 +1284,7 @@ class ShizukuCmdGateway(
             // the service may have executed pm with no reply to judge, so
             // reconcile read-only via the pure mapPostDispatchError()
             // (JVM-pinned) instead of claiming definite failure.
-            bindMutex.withLock { dropBindingIfSameLocked(binder, request) }
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             mapPostDispatchError(e)
         }
     }
@@ -1306,7 +1320,7 @@ class ShizukuCmdGateway(
     // transactExec failure paths use this; close()/releaseBinding()/
     // abandon()/boundBinder() keep the unconditional dropBindingLocked()
     // (terminal/soft release and the bind path are not stale-race drops).
-    internal fun dropBindingIfSameLocked(binder: IBinder?, request: ShizukuBindDriver.Request? = null) {
+    internal fun dropBindingIfSameLocked(binder: IBinder?, request: ShizukuBindDriver.Request?) {
         if (cachedBinder !== binder || cachedRequest !== request) return
         dropBindingLocked()
     }
