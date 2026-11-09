@@ -417,9 +417,11 @@ class DualHook : XposedModule() {
 
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown shapes stay
-    // unchanged; non-Boolean results return early without unknown-shape logging
-    // when the policy is empty. Boolean true returns immediately; unexpected
-    // arguments for Boolean false are logged best-effort even with empty policy.
+    // unchanged. Stage 1 (empty effective policy, default): composite queries
+    // still hit the runtime fail-closed backstop, but all other calls return
+    // the original without describe/args/guard/apply overhead (chain.proceed
+    // already ran). Boolean true returns immediately when policy is applied;
+    // unexpected arguments for Boolean false are logged best-effort by apply.
     // For Boolean false rewrites, DualHook resolves the package argument only
     // for allowlisted signatures (WhitelistSignatureGuard) and uses strict
     // signature mode so unverified overloads remain observe-only.
@@ -428,34 +430,30 @@ class DualHook : XposedModule() {
     // (observe-only when empty).
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
-        val executable = try {
-            chain.executable
-        } catch (_: Throwable) {
-            null
-        }
-        val desc = try {
-            executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
-        } catch (_: Throwable) {
-            "unknown-method"
-        }
-        val args: List<Any?> = try {
-            chain.args
-        } catch (_: Throwable) {
-            emptyList()
-        }
         return try {
-            // Defense-in-depth: installed-and-whitelist composite queries are
-            // excluded in Stage 1 (install-state/userId ambiguity). Skip hook
-            // install paths gate these, but keep a runtime fail-closed backstop
-            // regardless of policy.
+            val extra = effectivePolicy()
+            val executable = try {
+                chain.executable
+            } catch (_: Throwable) {
+                null
+            }
             val methodName = try {
                 executable?.name
             } catch (_: Throwable) {
                 null
             }
+            // Defense-in-depth: installed-and-whitelist composite queries are
+            // excluded in Stage 1 (install-state/userId ambiguity). Skip hook
+            // install paths gate these, but keep a runtime fail-closed backstop
+            // regardless of policy.
             if (methodName != null &&
                 WhitelistSignatureGuard.isInstalledWhitelistCompositeQuery(methodName)
             ) {
+                val desc = try {
+                    executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+                } catch (_: Throwable) {
+                    "unknown-method"
+                }
                 try {
                     logi(
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: " +
@@ -467,6 +465,19 @@ class DualHook : XposedModule() {
                 }
                 return@try result
             }
+            if (extra.isEmpty()) {
+                return@try result
+            }
+            val desc = try {
+                executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+            } catch (_: Throwable) {
+                "unknown-method"
+            }
+            val args: List<Any?> = try {
+                chain.args
+            } catch (_: Throwable) {
+                emptyList()
+            }
             val packageArgIndex = executable?.let {
                 WhitelistSignatureGuard.resolveBooleanPackageArgIndex(it)
             }
@@ -474,7 +485,7 @@ class DualHook : XposedModule() {
             WhitelistPolicy.apply(
                 result = result,
                 args = args,
-                extra = effectivePolicy(),
+                extra = extra,
                 methodDesc = desc,
                 onLog = ::logi,
                 packageArgIndex = packageArgIndex,
@@ -482,6 +493,11 @@ class DualHook : XposedModule() {
                 strictSignature = true,
             )
         } catch (t: Throwable) {
+            val desc = try {
+                chain.executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+            } catch (_: Throwable) {
+                "unknown-method"
+            }
             try {
                 logi(
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: policy apply failed " +
