@@ -6,10 +6,12 @@ import java.lang.reflect.Method
 
 // Pure (framework-free) signature guard for whitelist Boolean queries.
 //
-// Resolves the package-argument index only for allowlisted, conservative
-// method shapes. Unknown or ambiguous signatures return null so callers
-// (WhitelistPolicy / DualHook) stay observe-only and never rewrite from an
-// unverified package candidate.
+// Resolves a shape-allowlisted package-argument index for known parameter
+// shapes; NOT semantic verification of packageName/userId. Unknown or
+// ambiguous signatures return null so callers (WhitelistPolicy / DualHook)
+// stay observe-only and never rewrite from an unverified package candidate.
+// Stage 1 rewrite eligibility is restricted separately (see
+// WhitelistHookEligibility).
 object WhitelistSignatureGuard {
 
     private val ID_SLOT_TYPES: Set<Class<*>> = setOf(
@@ -19,11 +21,14 @@ object WhitelistSignatureGuard {
         Long::class.javaObjectType,
     )
 
-    // Allowlisted Stage 1 shapes:
+    // Shape-allowlisted Stage 1 shapes (index resolution only; not semantic
+    // verification of packageName/userId, and not Stage 1 rewrite eligibility):
     // - (String) -> 0
     // - (String, idSlot) -> 0
     // - (idSlot, String) -> 1
-    // where idSlot is int/Integer/long/Long. Anything else is unverified.
+    // where idSlot is a shape slot only: int/Integer/long/Long. Anything else
+    // is unverified. Stage 1 rewrite eligibility is restricted separately to
+    // single (String) only (see WhitelistHookEligibility).
     fun resolveBooleanPackageArgIndex(parameterTypes: Array<out Class<*>>): Int? {
         if (parameterTypes.size == 1 && isStringParam(parameterTypes[0])) return 0
         if (parameterTypes.size == 2) {

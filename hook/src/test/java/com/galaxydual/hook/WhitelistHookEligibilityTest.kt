@@ -43,29 +43,31 @@ class WhitelistHookEligibilityTest {
     }
 
     @Test
-    fun booleanStringThenInt_isEligibleWithIndex0() {
+    fun booleanStringThenInt_isSkipped_stage1FailClosed() {
         val method = BooleanQueries::class.java.getDeclaredMethod(
             "isWhitelistedPackage",
             String::class.java,
             Int::class.javaPrimitiveType,
         )
         val decision = WhitelistHookEligibility.evaluate(method)
-        val eligible = decision as WhitelistHookEligibility.Eligible
-        assertTrue(eligible.booleanRewrite)
-        assertEquals(0, eligible.packageArgIndex)
+        assertTrue(decision is WhitelistHookEligibility.Skip)
+        assertTrue(decision.reason.contains("fail-closed", ignoreCase = true))
+        assertTrue(decision.reason.contains("Stage 1", ignoreCase = true))
+        assertTrue(decision.reason.contains("multi-param", ignoreCase = true))
     }
 
     @Test
-    fun booleanIntThenString_isEligibleWithIndex1() {
+    fun booleanIntThenString_isSkipped_stage1FailClosed() {
         val method = BooleanQueries::class.java.getDeclaredMethod(
             "isWhitelistedPackage",
             Int::class.javaPrimitiveType,
             String::class.java,
         )
         val decision = WhitelistHookEligibility.evaluate(method)
-        val eligible = decision as WhitelistHookEligibility.Eligible
-        assertTrue(eligible.booleanRewrite)
-        assertEquals(1, eligible.packageArgIndex)
+        assertTrue(decision is WhitelistHookEligibility.Skip)
+        assertTrue(decision.reason.contains("fail-closed", ignoreCase = true))
+        assertTrue(decision.reason.contains("Stage 1", ignoreCase = true))
+        assertTrue(decision.reason.contains("multi-param", ignoreCase = true))
     }
 
     @Test

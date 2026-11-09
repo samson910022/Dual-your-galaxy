@@ -23,11 +23,13 @@ object WhitelistPolicy {
     // Shared whitelist policy: extend-only, never shrink.
     //
     // Booleans keep an original "true". A "false" is flipped only when the
-    // package argument is identified safely. Guarded callers (DualHook) resolve
-    // [packageArgIndex] via WhitelistSignatureGuard for allowlisted signatures and
-    // use [strictSignature]=true so unknown/ambiguous overloads remain observe-only
-    // (no rewrite). The presence of a single String argument is NOT used as a
-    // safety basis for unverified/device-unverified overloads.
+    // package argument is identified via a shape-allowlisted/explicit
+    // [packageArgIndex] from a guarded allowlist (WhitelistSignatureGuard shape
+    // resolution; Stage 1 rewrite eligibility may be stricter). Guarded callers
+    // (DualHook) resolve [packageArgIndex] via WhitelistSignatureGuard and use
+    // [strictSignature]=true so unknown/ambiguous/unverified overloads remain
+    // observe-only (no rewrite). The presence of a single String argument is NOT
+    // used as a safety basis for unverified/device-unverified overloads.
     //
     // Backward compatibility: when [packageArgIndex] is null and [strictSignature]
     // is false, a conservative/limited legacy scan returns an index only if args

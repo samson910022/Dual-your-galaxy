@@ -6,6 +6,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+// Tests shape-allowlisted index resolution (not semantic packageName/userId
+// verification, and not Stage 1 rewrite eligibility; see WhitelistHookEligibility).
 class WhitelistSignatureGuardTest {
 
     @Test
