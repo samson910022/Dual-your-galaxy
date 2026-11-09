@@ -210,14 +210,7 @@ class DualHook : XposedModule() {
     // orchestration in HookInstaller.installWithCallers; the device wiring
     // point is knownCallersFor() below (DEVICE-UNVERIFIED, currently empty).
     private fun hookWithDeoptimize(method: Method, hookId: String): Boolean =
-        HookInstaller.install(method, hookId, ::deoptimize, { target, id ->
-            hook(target)
-                // Request framework protection for hook exceptions; this does not
-                // guarantee system_server / daagent cannot crash in every case.
-                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                .setId(id)
-                .intercept { chain -> interceptWhitelistCall(chain) }
-        }, ::logi)
+        HookInstaller.install(method, hookId, ::deoptimize, ::installInterceptHook, ::logi)
 
     // Thin interceptor: runs the original, then applies the shared
     // extend-only policy (WhitelistPolicy, unit-tested). Unknown shapes stay
@@ -266,6 +259,7 @@ class DualHook : XposedModule() {
     // which is exactly the current callee-only best-effort behavior -- no
     // blanket deoptimization of system_server. Not covered by JVM tests
     // beyond the empty default (instantiating DualHook needs the framework).
+    @Suppress("UNUSED_PARAMETER")
     internal fun knownCallersFor(callee: Method): List<Method> = emptyList()
 
     // Caller-aware install seam (issue #10 Stage1, DEVICE-UNVERIFIED).
@@ -275,14 +269,25 @@ class DualHook : XposedModule() {
     // is unchanged today.
     @Suppress("unused")
     private fun hookWithCallerDeoptimize(method: Method, hookId: String): Boolean =
-        HookInstaller.installWithCallers(method, hookId, knownCallersFor(method), ::deoptimize, { target, id ->
-            hook(target)
-                // Request framework protection for hook exceptions; this does not
-                // guarantee system_server / daagent cannot crash in every case.
-                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                .setId(id)
-                .intercept { chain -> interceptWhitelistCall(chain) }
-        }, ::logi)
+        HookInstaller.installWithCallers(
+            method,
+            hookId,
+            knownCallersFor(method),
+            ::deoptimize,
+            ::installInterceptHook,
+            ::logi,
+        )
+
+    // Shared hook builder config (behavior-preserving): used by both callee-only
+    // and caller-aware install paths so the intercept setup stays identical.
+    private fun installInterceptHook(target: Method, id: String) {
+        hook(target)
+            // Request framework protection for hook exceptions; this does not
+            // guarantee system_server / daagent cannot crash in every case.
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId(id)
+            .intercept { chain -> interceptWhitelistCall(chain) }
+    }
 
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
