@@ -3,6 +3,7 @@ package com.galaxydual.hook
 
 import java.lang.reflect.Method
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -45,5 +46,54 @@ class CallerDeoptPlanTest {
         val snapshot = input.toList()
         CallerDeoptPlan.plan(callee, input)
         assertEquals(snapshot, input)
+    }
+
+    @Test
+    fun excludesCalleeWhenEqualButDifferentInstance() {
+        val callee = String::class.java.getMethod("length")
+        val equalToCallee = String::class.java.getMethod("length")
+        assertNotSame("getMethod returned same instance; test precondition not met", callee, equalToCallee)
+        val caller = method("isEmpty")
+        val plan = CallerDeoptPlan.plan(callee, listOf(equalToCallee, caller))
+        assertEquals(listOf(caller), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun dedupesEqualButDifferentInstancesKeepingFirstSeenOrder() {
+        val callee = method("length")
+        val first = String::class.java.getMethod("isEmpty")
+        val equalToFirst = String::class.java.getMethod("isEmpty")
+        assertNotSame("getMethod returned same instance; test precondition not met", first, equalToFirst)
+        val second = String::class.java.getMethod("hashCode")
+        val plan = CallerDeoptPlan.plan(callee, listOf(first, second, equalToFirst))
+        assertEquals(listOf(first, second), plan.callersToDeoptimize)
+        assertSame(first, plan.callersToDeoptimize[0])
+    }
+
+    @Test
+    fun keepsSameNameMethodFromDifferentDeclaringClass() {
+        val callee = String::class.java.getMethod("length")
+        val otherClassSameName = StringBuilder::class.java.getMethod("length")
+        val plan = CallerDeoptPlan.plan(callee, listOf(otherClassSameName))
+        assertEquals(listOf(otherClassSameName), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun keepsDifferentOverloadsWithSameName() {
+        val callee = method("length")
+        val booleanOverload = String::class.java.getMethod("valueOf", java.lang.Boolean.TYPE)
+        val intOverload = String::class.java.getMethod("valueOf", Integer.TYPE)
+        val plan = CallerDeoptPlan.plan(callee, listOf(booleanOverload, intOverload))
+        assertEquals(listOf(booleanOverload, intOverload), plan.callersToDeoptimize)
+    }
+
+    @Test
+    fun allEntriesEqualToCalleeReturnsEmpty() {
+        val callee = method("length")
+        val plan = CallerDeoptPlan.plan(callee, listOf(
+            String::class.java.getMethod("length"),
+            String::class.java.getMethod("length"),
+        ))
+        assertTrue(plan.callersToDeoptimize.isEmpty())
     }
 }
