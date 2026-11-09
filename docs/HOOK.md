@@ -45,7 +45,8 @@ adb shell dumpsys activity services | grep -i -A2 dual
 五層之第 2 層 hook 註冊）：
 `service list` 確認 `dual_app: com.samsung.android.app.ISemDualAppManager`；
 services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
-（含兩方法＋ `isInstalledWhitelistedPackageInternal` 變體）；lspd 模組日誌
+（含 `getAllWhitelistedPackages`、`isInstalledWhitelistedPackage`／
+`isInstalledWhitelistedPackageInternal` 變體）；lspd 模組日誌
 確認候選 1 在三次 system_server 啟動皆 `deoptimized`＋`hooked` 成功、
 無 `method not found`。此為 hook 註冊證據，不等於第 3 層 callback 觸發
 （可驗日誌缺：尚無回調命中／放寬包名 log）與第 4 層政策生效
@@ -55,11 +56,16 @@ services.jar 反編譯確認 `com.android.server.DualAppManagerService` 存在
 模組在 `onSystemServerStarting` 以反射依序嘗試（第一個載入成功者勝出，
 其餘 `try/catch` 略過，非三星 ROM 自動無操作）：
 
-| 候選服務類別 | Hook 的查詢方法 |
-| --- | --- |
-| `com.android.server.DualAppManagerService` | `getAllWhitelistedPackages()` |
-| `com.samsung.android.server.dual.DualAppManagerService` | `isInstalledWhitelistedPackage(String)` |
-| `com.android.server.dual.DualAppManagerService` | （同上，取決於版本存在的方法簽名） |
+| 候選服務類別（第一個載入成功者勝出） | Stage 1 hook 的讀查詢方法 | 明確排除（fail-closed，待裝置驗證） |
+| --- | --- | --- |
+| `com.android.server.DualAppManagerService` | 僅嘗試 `getAllWhitelistedPackages()`（純白名單列表；若存在且通過 eligibility／簽名與回傳守衛） | `isInstalledWhitelistedPackage*`（已安裝且白名單複合查詢，userId／安裝狀態語義未驗證） |
+| `com.samsung.android.server.dual.DualAppManagerService` | （同 Stage 1，僅嘗試 `getAllWhitelistedPackages()`；若存在且通過 eligibility） | （同上） |
+| `com.android.server.dual.DualAppManagerService` | （同 Stage 1，僅嘗試 `getAllWhitelistedPackages()`；取決於版本是否存在該簽名） | （同上） |
+
+安裝／移除路徑永不掛 hook。`*Installed*Whitelist*` 複合查詢在 hook 安裝路徑
+（`WhitelistHookEligibility`）與攔截器（`WhitelistSignatureGuard`／
+`DualHook.interceptWhitelistCall` runtime backstop）雙重 fail-closed，Stage 1
+不改寫其結果，直到裝置驗證其 userId／安裝狀態語義。
 
 每個方法 hook 前先呼叫 **`deoptimize(method)`**（best-effort）：`deoptimize(Executable)`
 機制存在，但缺 caller 身份資訊，因此只明確請求對被 hook 的 callee 本體做 best-effort
@@ -141,24 +147,52 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
     見 `DualHook.patchWhitelistField` 與 `WhitelistPatch.patchFields`／`apply`，
     故僅觀察；政策生效需命中方法級查詢 hook（`WhitelistPolicy.apply`），否則仍 observe-only）。
   - `added=0`（政策已完全包含）：跳過 `set()`，無需寫入，自然 fail-closed。
-- 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者全部掛上與
-  system_server 側相同的 extend-only 策略。模糊匹配是故意的：
-  無實機證據前縮窄正則可能漏掉真正的查詢方法；簽名守衛兜底——
-  Boolean 結果只接受單一 `String` 參數查詢，集合按原類型重建
- （`Set` 不再降級為 `List`，其餘 `Collection`／未知回傳只觀察不改）。
-  非 Boolean 結果在政策為空時提前返回，不記未知回傳的 log；政策非空時才嘗試
-  記錄不支援的集合或未知回傳。Boolean 為 `true` 時直接返回；為 `false` 且參數
-  不符合預期時，無論政策是否為空都嘗試記 log，並保持原結果。
-- Stage1 新增 `DualAppDBHelper`／`DAUtility`／`DualAppManager` 讀查詢方法級候選
-  （`DualHook.hookDaagentQueryMethods`，[待實機驗證]）：每個載入成功的候選類上，
-  僅掛讀查詢方法名（`getAllInstalledWhitelistedPackages`、`getWhitelistedPackages`/`getWhitelistPackages`、
-  `getWhiteListPkgs`/`getWhiteListPkgsInSystemServer`、`isWhitelistedPackage`/`isWhiteListedPackage`/`isInstalledWhitelistedPackage`；
-  read-query only，安裝／移除路徑永不掛），
-  攔截器與 system_server 側相同（`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，
-  空政策原樣返回 observe-only）。JVM 單測僅鎖定 `WhitelistPolicy.apply` 決策
-  （見 `DaagentQueryPolicyTest`），安裝與回調需 LSPosed daagent 實機驗證。
+- 方法名含 `hitelist`（大小寫不敏感，如 `isWhitelisted`）者會掃描，但 hook 安裝路徑採
+  **eligibility gating**（`WhitelistHookEligibility`／`WhitelistSignatureGuard`）為安全兜底：
+  Stage 1 排除 `*Installed*Whitelist*` 複合查詢（install-state／userId 語義未驗證，fail-closed），
+  Boolean 改寫僅限 allowlisted 套件參數索引簽名（例如 `(String)`、`(String,idSlot)`、
+  `(idSlot,String)`，idSlot 為 int/Integer/long/Long），未知／歧義簽名不安裝 hook（fail-closed），
+  void 回傳略過。攔截器（`DualHook.interceptWhitelistCall`）對 Boolean 改寫使用 strict signature
+  與已驗證 `packageArgIndex`；不再以「參數中恰有一個 String」作為未知 overload 的安全依據。
+- Collection／array 合併由 `WhitelistPolicy.apply` 做型別守衛：僅合併 String 元素的 `List`／
+  `String[]` 與**非 `SortedSet`／`NavigableSet` 的** `Set`（保留 Set 語意，不降級為 `List`；
+  合併結果不保證原排序／具體實作）；`SortedSet`／`NavigableSet`、
+  含非 String 元素的容器、其他 `Collection`、未知回傳一律 observe-only 並回傳原值。若提供
+  `declaredReturnType`，合併結果與宣告回傳型別不相容時回傳原值。
+- Stage1 額外掛 `DualAppDBHelper`／`DAUtility`／`DualAppManager` 讀查詢方法級候選
+  （`DualHook.hookDaagentQueryMethods`，[待實機驗證]）：每個載入成功的候選類上，僅嘗試
+  `DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES` 內的 **6 個**讀查詢方法名
+  （`getWhitelistedPackages`／`getWhitelistPackages`、`getWhiteListPkgs`／
+  `getWhiteListPkgsInSystemServer`、`isWhitelistedPackage`／`isWhiteListedPackage`；read-query only，
+  安裝／移除路徑永不掛）。Stage 1 **不**掛 `getAllInstalledWhitelistedPackages`、
+  `isInstalledWhitelistedPackage`（installed+whitelist 複合，fail-closed）。每個 overload 先經
+  `WhitelistHookEligibility.evaluate()`；不合格者跳過並記 log。攔截器與 system_server 側相同
+  （`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，空政策原樣返回 observe-only）。
+  JVM 單測僅鎖定 `WhitelistPolicy.apply`／eligibility／guard 決策，安裝與回調需 LSPosed
+  daagent 實機驗證。
 
-### 1.4 非目標進程：`detach()`（H4：自報 scope 已退場，見下）
+### 1.4 JVM 測試邊界與啟用非空政策前的硬閘門
+
+JVM 測試（`WhitelistPolicy`／`WhitelistSignatureGuard`／`WhitelistHookEligibility`／contract tests）
+**僅證明純決策／選擇邏輯**。它們**不**證明：裝置上目標類別是否存在、方法簽名／宣告回傳型別、
+hook 是否真的安裝、攔截器 callback 是否被命中、符合 eligibility 的 overload 在 Samsung DAAgent／
+LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPosed 執行行為、ART 內聯／
+去最佳化效果亦不在 JVM 測試範圍（見 §1.2 反內聯待辦）。
+
+**啟用任何非空政策前的硬閘門（hard gate，缺一不可）：**
+
+1. 裝置驗證每個欲 hook 查詢的**完整方法簽名＋宣告回傳型別**（dexdump／反編譯／framework 證據）。
+2. 每個方法的 **hook 安裝數**證據（lspd／模組 log：deoptimize＋hooked／installed 計數），且安裝失敗不得當作生效。
+3. **callback 命中**證據（非 marker／clinit-only）；能區分「hook 已裝」與「查詢路徑真的被攔截」。
+4. 正確處理 Android user／profile isolation 與 install-state 語意（尤其 `*Installed*Whitelist*` 複合查詢的 userId／已安裝判斷）；Stage 1 對此類查詢 **fail-closed 排除**，S24／DAAgent 相關 overload 仍標記 **[待實機驗證]**。
+5. 在目標 ROM（例如 S24／DAAgent）做**受控的空政策 vs 非空政策**對照，確認只有預期查詢被擴展、安裝／移除／Knox 路徑不受影響，且無 bootloop／崩潰回歸。
+
+Stage 1 明確保持 `*Installed*Whitelist*` 排除：daagent 不掛
+`getAllInstalledWhitelistedPackages`／`isInstalledWhitelistedPackage`；system_server 不掛
+`isInstalledWhitelistedPackage*`。原因為 install-state／userId 歧義——在語意未經裝置驗證前
+fail-closed，寧可 observe-only 也不錯誤放寬。
+
+### 1.5 非目標進程：`detach()`（H4：自報 scope 已退場，見下）
 
 `onPackageLoaded` 第一件事就是檢查 `SUPPORTED_SCOPES`；不在名單內的進程
 立即呼叫 **`detach()`**，該 entry 在此進程不再收到後續生命週期回調
@@ -227,7 +261,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
    原則不變：兩個用戶都要開、都要含 `system`。
 4. App 內通道選擇（F4b-P1 手動 picker，見 `docs/USAGE.md` §4）：打開 App，
    用四按鈕（自動／ROOT／Shizuku／LSPosed）選擇通道；LSPosed 模式顯示
-   Hook marker 行（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，見 §1.4 與 P1 四態），
+   Hook marker 行（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，見 §1.5 與 P1 四態），
    該行僅顯示、永不授權——LSPosed 通道為 NoOp 佔位，寫入一律拒絕。
 
 ### 2.3 重啟需求
@@ -264,16 +298,30 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 - The hook module extends Samsung Dual whitelist *queries* only (extend-only, never shrink);
   default policy set is empty so hooks are observe-only placeholders.
-- System side: reflectively hooks `DualAppManagerService#getAllWhitelistedPackages` /
-  `#isInstalledWhitelistedPackage` (`dual_app` transactions ~1/2/3/4, verify per One UI),
-  with best-effort `deoptimize()` (callee-only, effect unverified) and `PROTECTIVE` exception mode.
-- Agent side: patches both `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` and
-  `#..._FOR_CHINA` after `<clinit>` (static-final fields stay observe-only, never force-written) and
-  hooks `*hitelist*` query methods (fuzzy match kept for lack of on-device evidence;
-  signature guard keeps unknown shapes observe-only); non-scope processes get `detach()`.
+- **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
+  (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/
+  `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity
+  until device-verified. System_server hooks only the pure list query
+  `getAllWhitelistedPackages()` when eligible. Daagent hooks 6 named read queries
+  (`getWhitelistedPackages`/`getWhitelistPackages`, `getWhiteListPkgs`/
+  `getWhiteListPkgsInSystemServer`, `isWhitelistedPackage`/`isWhiteListedPackage`)
+  plus a fuzzy `*hitelist*` sweep, all eligibility-gated.
+- Hook install paths use `WhitelistHookEligibility`/`WhitelistSignatureGuard`;
+  Boolean rewrites use strict allowlisted package-arg indices only (unknown/ambiguous
+  signatures stay observe-only/fail-closed). Interceptors use a lazy/empty-policy fast path
+  and keep composite runtime fail-closed backstops. Collection/array merges are type-guarded
+  (String elements, non-`SortedSet`/`NavigableSet` sets, declared return compatibility) and return original on
+  incompatibility.
+- Agent side also patches both `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` and
+  `#..._FOR_CHINA` after `<clinit>` (static-final fields stay observe-only, never force-written);
+  non-scope processes get `detach()`.
+- **JVM tests prove pure decision/selection logic only** (not on-device class presence,
+  signatures/return types, hook installation, callback interception, or that eligible overloads
+  are hit on Samsung DAAgent/LSPosed). Before enabling any non-empty policy, meet the hard gate
+  in §1.4 (device-verified signatures/return types, hook-install counts, callback-hit evidence,
+  user/profile/install-state semantics, controlled empty vs non-empty comparison on target ROM).
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
-- The marker proves hook installation only, not policy effect (empty=>no-op,
-  returns early in `DualHook.patchWhitelistField`; readable static-final
-  =>`ObserveOnly`, reflection failure=>`Skipped`, neither writes, see
-  `DualHook.patchWhitelistField` + `WhitelistPatch.patchFields`/`apply`).
+- The marker proves hook installation only, not policy effect (empty=>observe-only;
+  static-final holder fields may remain `ObserveOnly`, reflection failures `Skipped`; see
+  `DualHook`/`WhitelistPatch`).
