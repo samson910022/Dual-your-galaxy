@@ -106,18 +106,26 @@ class IconSizingPolicyTest {
         assertEquals(1.0f, fitScale(0, 24, 24), 0.001f)
     }
 
-    // 快照真值表四行：有 CS＋方形 false、有 CS＋非方形 true、
-    // 有 CS＋<=0 false、無 CS＋任一 true。
+    // 快照真值表：無 CS 任一 true、非 FILL 任一 true、有 CS＋<=0＋FILL false、
+    // 有 CS＋非方形＋FILL true、方形＋FILL false（P2-1 方形 CENTER 須 true）。
     @Test
     fun shouldUseSnapshot_truthTable() {
-        assertFalse(shouldUseSnapshot(true, 24, 24))
-        assertTrue(shouldUseSnapshot(true, 48, 24))
-        assertTrue(shouldUseSnapshot(true, 24, 48))
-        assertFalse(shouldUseSnapshot(true, 0, 24))
-        assertFalse(shouldUseSnapshot(true, -1, -1))
-        assertTrue(shouldUseSnapshot(false, 24, 24))
-        assertTrue(shouldUseSnapshot(false, 48, 24))
-        assertTrue(shouldUseSnapshot(false, 0, 0))
+        assertFalse(shouldUseSnapshot(true, 24, 24, false))
+        assertTrue(shouldUseSnapshot(true, 48, 24, false))
+        assertTrue(shouldUseSnapshot(true, 24, 48, false))
+        assertFalse(shouldUseSnapshot(true, 0, 24, false))
+        assertFalse(shouldUseSnapshot(true, -1, -1, false))
+        assertTrue(shouldUseSnapshot(false, 24, 24, false))
+        assertTrue(shouldUseSnapshot(false, 48, 24, false))
+        assertTrue(shouldUseSnapshot(false, 0, 0, false))
+        // 方形＋非 FILL（CENTER）必須快照，FILL 不需。
+        assertTrue(shouldUseSnapshot(true, 48, 48, true))
+        assertFalse(shouldUseSnapshot(true, 48, 48, false))
+        // 非 FILL 優先於 <=0（尺寸未知仍快照，以 dst 兜底）。
+        assertTrue(shouldUseSnapshot(true, 0, 24, true))
+        assertTrue(shouldUseSnapshot(true, -1, -1, true))
+        // 無 CS 任一皆快照（含非 FILL）。
+        assertTrue(shouldUseSnapshot(false, 48, 48, true))
     }
 
     // 快照 OOM cap：min(safeIconPx(size), max(1, cap))。
