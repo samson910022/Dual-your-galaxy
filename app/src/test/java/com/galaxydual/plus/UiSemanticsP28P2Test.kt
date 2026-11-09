@@ -202,6 +202,50 @@ class UiSemanticsP28P2Test {
         assertFalse(batchEnabled(s))
     }
 
+    // ---- Stage1 批次建立兩步確認（canConfirmBatch / buildBatchConfirmMessage） ----
+
+    @Test
+    fun canConfirmBatch_happy_isTrue() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertTrue(canConfirmBatch(s, acknowledged = true))
+    }
+
+    @Test
+    fun canConfirmBatch_unacknowledged_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertFalse(canConfirmBatch(s, acknowledged = false))
+    }
+
+    @Test
+    fun canConfirmBatch_blockedBusyOrNoTarget_isFalseEvenAcknowledged() {
+        val blocked = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            writeReady = false,
+        )
+        assertTrue(writeBlockReason(blocked) != null)
+        assertFalse(canConfirmBatch(blocked, acknowledged = true))
+        val busy = writableState().copy(loading = true, selectedKeys = setOf("1:com.example.a"))
+        assertFalse(canConfirmBatch(busy, acknowledged = true))
+        val noTarget = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            inventory = InventorySnapshot.unknown(),
+        )
+        assertFalse(canConfirmBatch(noTarget, acknowledged = true))
+    }
+
+    @Test
+    fun buildBatchConfirmMessage_includesCountAndVerifiedTarget() {
+        val text = buildBatchConfirmMessage(
+            template = "將建立：%1\$d 個分身\n已驗證目標：user %2\$d，serial %3\$d\n須勾選下方確認框。",
+            count = 3,
+            targetId = 10,
+            targetSerial = 7,
+        )
+        assertTrue(text.contains("3 個分身"))
+        assertTrue(text.contains("user 10"))
+        assertTrue(text.contains("serial 7"))
+    }
+
     // ---- P2-1 isWriteBlockDuplicate ----
 
     @Test

@@ -50,12 +50,22 @@
         <item quantity="other">建立 %1$d 個分身</item>
     </plurals>
     <plurals name="batch_create_cd">
-        <item quantity="one">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
-        <item quantity="other">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載）</item>
+        <item quantity="one">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載；需二次確認）</item>
+        <item quantity="other">批次建立 %1$d 個分身（對已勾選逐項執行；勾選本身不等於卸載；需二次確認）</item>
     </plurals>
     <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
     <!-- A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時的可見原因（VM 守衛不動，僅 UI 層提示）。 -->
     <string name="batch_target_unavailable">批次目標未確認（user/serial 未知或 serial 缺失），批次按鈕已禁用；請點「重新連線並更新」重查後再試</string>
+    <!-- Stage1：sticky bottom bar 勾選數（永遠可見）。 -->
+    <plurals name="batch_selected_count">
+        <item quantity="one">已選 %1$d 項</item>
+        <item quantity="other">已選 %1$d 項</item>
+    </plurals>
+    <!-- Stage1：批次建立兩步確認（沿用 remove ack 模式：世代＋勾選＋目標摘要＋風險）。 -->
+    <string name="batch_confirm_title">確認建立分身</string>
+    <string name="batch_confirm_message">警告：將為已勾選的應用各建立一個分身；建立後佔用額外儲存空間，並可能影響電池與效能。分身與主 profile 的資料獨立，部分應用可能無法正常使用。\n將建立：%1$d 個分身\n已驗證目標：user %2$d，serial %3$d\n須勾選下方確認框才會啟用「確認建立」。</string>
+    <string name="batch_confirm_positive">確認建立</string>
+    <string name="batch_confirm_acknowledge">我已閱讀警告，並核對上方目標 user、serial 與數量。</string>
     <string name="shizuku_listener_failed">Shizuku 監聽註冊失敗：%1$s</string>
     <string name="copy_failed">複製失敗：%1$s</string>
     <string name="dialog_close">關閉</string>
