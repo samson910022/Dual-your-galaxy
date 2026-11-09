@@ -1217,8 +1217,9 @@ class DualRepository(
         // clean-but-absent -> VerifyUnknown (reverse, write may still land),
         // Unknown -> VerifyUnknown (never InstallFailed/VerifyFailed).
         if (isUnknownAfterSend(res)) {
-            val byText = !res.timedOut && !res.transportUnknown
             val transportLost = res.transportUnknown
+            val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
+            val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val syntheticTimeoutBefore = VerifiedTarget(expectedDualId, expectedSerial, parentId = null)
             val timeoutAfter = fetchVerifiedTarget()
             val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
@@ -1228,9 +1229,9 @@ class DualRepository(
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
                         expectedDualId,
-                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText, transportLost = transportLost),
+                        writeTimeoutReverseDetail(observed = "absent", intended = "clone", byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err),
                     )
-                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost))
+                is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, writeTimeoutDetail(state.detail, byText = byText, transportLost = transportLost, postSpawnByText = postSpawnByText, writeErr = res.err))
             }
         }
         if (!PmOutputParser.isSuccess(res.out + "\n" + res.err, res.exit)) {

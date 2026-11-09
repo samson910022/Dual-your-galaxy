@@ -157,6 +157,21 @@ object ShizukuExecProtocol {
     // Wire-frozen denied reply for foreign callers (exit=1, out="", err=this).
     // The onTransact auth gate writes it without reading/executing the cmd.
     const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
+    // Phase C1 cmd length bound (wire-neutral, no SERVICE_VERSION bump --
+    // still 6): rejects oversize wire cmds pre-spawn (service) and pre-bind
+    // (client) as a definite bad request (exit=1, no flags, never sent).
+    // Headroom check: every legitimate PmOutputParser builder output is a
+    // few hundred chars at most -- package input is capped at 256 chars
+    // (MAX_PACKAGE_INPUT_CHARS) by the VM, so buildInstallExisting /
+    // buildUninstall are <~300 chars even with a 10-digit dual id, the
+    // fixed identity commands (CMD_LIST_USERS etc.) are <30 chars, and the
+    // only direct gateway.run caller outside DualRepository is
+    // HookStateProvider's `cat <fixed marker path>` (<100 chars). The
+    // retained buildGrant/buildAppOpsSet builders have no production
+    // caller. 4096 chars is >10x the legitimate bound, so no legitimate
+    // command is rejected, while a corrupt/malicious Parcel cannot force
+    // an unbounded `sh -c` string.
+    const val MAX_CMD_CHARS = 4096
     // UserService implementation version. v1 = cap-only marker (old service
     // semantics); v2 = whenever-truncated marker (prior capture contract,
     // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
@@ -373,12 +388,41 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
 // bad-request CmdResult (exit=1, no timedOut/transportUnknown: pre-spawn,
 // never sent) for null/blank, null for a usable command. GatewayAssemblyTest
 // pins null/blank -> bad request.
+// Retained blank-only for compatibility: production gates (handleExecRequest
+// and ShizukuCmdGateway.run) use badRequestForCommand below, which adds the
+// Phase C1 length check on top of this blank check. Keeping this helper
+// blank-only preserves its existing pin (incl. the 8000-char pass-through
+// in validEdgeCases) instead of silently redefining it.
 internal fun badRequestForBlankCommand(raw: String?): CmdResult? =
     if (raw == null || raw.isBlank()) {
         CmdResult(exit = 1, out = "", err = "bad request: blank command")
     } else {
         null
     }
+
+// Pure request-side validation with the Phase C1 length bound
+// (JVM-testable, wire-neutral, no SERVICE_VERSION bump -- still 6):
+// null/blank -> "bad request: blank command" (via badRequestForBlankCommand
+// above), length > ShizukuExecProtocol.MAX_CMD_CHARS (4096) ->
+// "bad request: command too long ...", else null. Both bad-request shapes
+// are pre-spawn definite failures (exit=1, out="", no timedOut /
+// transportUnknown / truncated, and no backstop prefix) so the repository
+// never treats them as possibly sent. Length is the raw String length
+// (chars), checked after the blank check so a long whitespace-only cmd
+// still reports as blank. GatewayAssemblyTest / ShizukuExecHandleTest pin
+// the 4096-pass / 4097-reject boundary.
+internal fun badRequestForCommand(raw: String?): CmdResult? {
+    badRequestForBlankCommand(raw)?.let { return it }
+    // raw is non-null/non-blank here by the check above.
+    if (raw!!.length > ShizukuExecProtocol.MAX_CMD_CHARS) {
+        return CmdResult(
+            exit = 1,
+            out = "",
+            err = "bad request: command too long (length ${raw.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})",
+        )
+    }
+    return null
+}
 
 // Pure nullable-reply decode (JVM-testable): Parcel.readString() is nullable;
 // folding null to "" would forge a clean-empty reply (exit 0 + empty streams
@@ -454,9 +498,11 @@ internal fun shouldDropCachedBinding(result: CmdResult): Boolean = result.transp
 //      encodeExecReply, so the frozen (int, String, String) layout stays
 //      single-sourced. The uid is never echoed onto the wire. exec is never
 //      called for a foreign caller.
-//   2. badRequestForBlankCommand(rawCmd) -> definite bad request
+//   2. badRequestForCommand(rawCmd) -> definite bad request
 //      (exit=1, no flags, pre-spawn, never sent). exec is never called
-//      for a null/blank wire cmd, so `sh -c ""` can never spawn.
+//      for a null/blank wire cmd, so `sh -c ""` can never spawn, nor for
+//      an oversize cmd (Phase C1: length > MAX_CMD_CHARS), so an unbounded
+//      `sh -c` string can never spawn.
 //   3. exec(cmd) with cmd verbatim (no trim/re-quote) -> its CmdResult
 //      returned as-is. Pre-spawn spawn failures are already returned
 //      inside captureProcess as definite failures and never throw here;
@@ -486,13 +532,14 @@ internal fun handleExecRequest(
     if (!isAllowedCaller(callingUid, expectedAppUid)) {
         return CmdResult(exit = 1, out = "", err = ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
     }
-    val badRequest = badRequestForBlankCommand(rawCmd)
+    val badRequest = badRequestForCommand(rawCmd)
     if (badRequest != null) return badRequest
-    // Double guard: even though rawCmd is non-null/non-blank here by the
-    // badRequestForBlankCommand check above, never rely solely on the helper
-    // contract -- a direct isNullOrBlank check guarantees no null spawn and
-    // no `sh -c ""` if the helper contract ever changes.
-    if (rawCmd.isNullOrBlank()) return badRequestForBlankCommand(rawCmd)!!
+    // Double guard: even though rawCmd is non-null/non-blank and within
+    // MAX_CMD_CHARS here by the badRequestForCommand check above, never rely
+    // solely on the helper contract -- a direct isNullOrBlank / length check
+    // guarantees no null spawn, no `sh -c ""`, and no oversize spawn if the
+    // helper contract ever changes.
+    if (rawCmd.isNullOrBlank() || rawCmd.length > ShizukuExecProtocol.MAX_CMD_CHARS) return badRequestForCommand(rawCmd)!!
     val cmd = rawCmd
     return try {
         exec(cmd)
@@ -883,6 +930,15 @@ class ShizukuCmdGateway(
 
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
+            // Phase C1 client early bad-request (wire-neutral, no bump):
+            // blank / oversize cmds are rejected before ping/bind with the
+            // same definite bad-request shape the service returns
+            // (exit=1, out="", no flags, never sent). This intentionally
+            // skips the legacy fixed-tag cleanup below -- the cleanup flag
+            // stays incomplete, so the next legitimate run() performs it
+            // (retryable by design, Phase E1/F1); a blank/oversize cmd must
+            // never trigger bind/transact nor be needed to complete cleanup.
+            badRequestForCommand(cmd)?.let { return@withContext it }
             // Order (Phase F1): ping -> permission -> version read ->
             // cleanup (fail-closed, only if the server has the UserService
             // API) -> version reject (if <13) -> bind. Pre-flight: no
@@ -1110,7 +1166,7 @@ class ShizukuCmdGateway(
     // sent) stays binderDead() -> definite failure.
     private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
         if (!binder.isBinderAlive) {
-            bindMutex.withLock { dropBindingLocked() }
+            bindMutex.withLock { dropBindingIfSameLocked(binder) }
             return ShizukuExecErrors.binderDead()
         }
         return try {
@@ -1147,7 +1203,7 @@ class ShizukuCmdGateway(
                 }
             }
             val result = out ?: run {
-                bindMutex.withLock { dropBindingLocked() }
+                bindMutex.withLock { dropBindingIfSameLocked(binder) }
                 ShizukuExecErrors.timedOut()
             }
             // Null-reply transportUnknown (decodeExecReplyNullable above) is
@@ -1162,7 +1218,7 @@ class ShizukuCmdGateway(
             // wire-neutral, no bump); the drop side effect stays here under
             // bindMutex.
             if (shouldDropCachedBinding(result)) {
-                bindMutex.withLock { dropBindingLocked() }
+                bindMutex.withLock { dropBindingIfSameLocked(binder) }
             }
             result
         } catch (e: CancellationException) {
@@ -1180,7 +1236,7 @@ class ShizukuCmdGateway(
             // service may have executed, so transportUnknown via the pure
             // mapPostDispatchError() (JVM-pinned), never a definite failure.
             Thread.interrupted()
-            bindMutex.withLock { dropBindingLocked() }
+            bindMutex.withLock { dropBindingIfSameLocked(binder) }
             mapPostDispatchError(e)
         } catch (e: Exception) {
             // Post-dispatch by construction (transact RemoteException, binder
@@ -1188,7 +1244,7 @@ class ShizukuCmdGateway(
             // the service may have executed pm with no reply to judge, so
             // reconcile read-only via the pure mapPostDispatchError()
             // (JVM-pinned) instead of claiming definite failure.
-            bindMutex.withLock { dropBindingLocked() }
+            bindMutex.withLock { dropBindingIfSameLocked(binder) }
             mapPostDispatchError(e)
         }
     }
@@ -1206,6 +1262,24 @@ class ShizukuCmdGateway(
             } catch (_: Exception) {
             }
         }
+    }
+
+    // Identity-checked stale-cache drop (Phase C1 hardening, wire-neutral,
+    // no SERVICE_VERSION bump -- still 6): only clears the cache when the
+    // cached binder is still the exact instance the failing transactExec
+    // call used (=== identity), never a newer binder bound by a concurrent
+    // call that raced in while this transact was in flight. An unconditional
+    // drop here could clear a fresh binding (and release its request) that
+    // this stale call never owned, forcing a needless rebind / churn.
+    // Caller must hold bindMutex (same contract as dropBindingLocked);
+    // internal so JVM tests can pin the identity decision (via boundBinder
+    // + a fake driver, quiescent) without a real binder. Only the five
+    // transactExec failure paths use this; close()/releaseBinding()/
+    // abandon()/boundBinder() keep the unconditional dropBindingLocked()
+    // (terminal/soft release and the bind path are not stale-race drops).
+    internal fun dropBindingIfSameLocked(binder: IBinder?) {
+        if (cachedBinder !== binder) return
+        dropBindingLocked()
     }
 
     // Test seam: reports whether a binding is currently cached (acquires the

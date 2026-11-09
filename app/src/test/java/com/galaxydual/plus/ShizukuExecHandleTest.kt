@@ -244,6 +244,51 @@ class ShizukuExecHandleTest {
         }
     }
 
+    // Phase C1 (4KB bound, service side): an oversize wire cmd
+    // (4097 chars) is a pre-spawn bad request for the owner caller --
+    // exec must never be called, exit=1, no flags, err contains
+    // "bad request" + "too long". Wire-neutral: no SERVICE_VERSION bump.
+    @Test fun handleExecRequest_tooLong_neverCallsExec() {
+        var calls = 0
+        val tooLong = "x".repeat(ShizukuExecProtocol.MAX_CMD_CHARS + 1)
+        val res = handleExecRequest(callingUid = 10234, expectedAppUid = 10234, rawCmd = tooLong) {
+            calls++
+            CmdResult(exit = 0, out = "", err = "")
+        }
+        assertEquals("oversize cmd must never reach exec", 0, calls)
+        assertEquals(1, res.exit)
+        assertEquals("", res.out)
+        assertTrue(
+            "bad request err must contain 'bad request' + 'too long', got: ${res.err}",
+            res.err.contains("bad request") && res.err.contains("too long"),
+        )
+        assertFalse("bad request must not carry truncated, got: $res", res.truncated)
+        assertFalse("bad request must not carry timedOut, got: $res", res.timedOut)
+        assertFalse("bad request must not carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse(
+            "bad request err must not start with a backstop prefix, got: ${res.err}",
+            res.err.startsWith("service exec failed: ") || res.err.startsWith("interrupted: ") ||
+                res.err.startsWith("timeout after ") || res.err.startsWith("shizuku: exec timed out after "),
+        )
+    }
+
+    // Phase C1 (4KB boundary): exactly MAX_CMD_CHARS (4096) chars passes
+    // the service-side gate and reaches exec exactly once, verbatim.
+    @Test fun handleExecRequest_exactlyMaxChars_callsExecOnceVerbatim() {
+        var calls = 0
+        var seen: String? = null
+        val raw = "x".repeat(ShizukuExecProtocol.MAX_CMD_CHARS)
+        val res = handleExecRequest(callingUid = 10234, expectedAppUid = 10234, rawCmd = raw) { cmd ->
+            calls++
+            seen = cmd
+            CmdResult(exit = 0, out = "ok", err = "")
+        }
+        assertEquals(1, calls)
+        assertEquals("cmd at the bound must reach exec verbatim", raw, seen)
+        assertEquals(0, res.exit)
+        assertEquals("ok", res.out)
+    }
+
     // The decision is exactly transportUnknown: a timedOut result (client
     // wait expiry, dropped on its own timeout path in transactExec) is
     // not a shouldDropCachedBinding drop -- pinning the equality so a
