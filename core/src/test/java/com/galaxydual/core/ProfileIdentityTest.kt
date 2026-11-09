@@ -753,7 +753,7 @@ class ProfileIdentityTest {
         // propertyId=95 alongside dual-CLONE + parentId=0 on both channels.
         assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 15),
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
             SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
         )
     }
@@ -1032,7 +1032,7 @@ class ProfileIdentityTest {
         // (S24 verbose carries no serial; dumpsys serialNo=95 alone binds).
         assertEquals(DualResolution.Confirmed(95, 95, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 95),
+            VerifiedDualTarget(userId = 95, serial = 95, parentId = 0),
             SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
         )
         assertEquals(
@@ -1040,7 +1040,7 @@ class ProfileIdentityTest {
             PmOutputParser.resolveDualUserIdVerified(S24_VERBOSE, S24_DUMPSYS, 95),
         )
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 95),
+            VerifiedDualTarget(userId = 95, serial = 95, parentId = 0),
             PmOutputParser.resolveDualTargetVerified(S24_VERBOSE, S24_DUMPSYS, 95),
         )
     }
@@ -1090,7 +1090,7 @@ class ProfileIdentityTest {
             PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95),
         )
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 15),
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
             PmOutputParser.resolveDualTargetVerified(verbose, dumpsys, 95),
         )
     }
@@ -1124,7 +1124,7 @@ class ProfileIdentityTest {
     fun singleSourceSerial_confirmsButMismatchOrBothMissingRefuse() {
         // Verbose missing, dumpsys carrying: single source binds.
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 95),
+            VerifiedDualTarget(userId = 95, serial = 95, parentId = 0),
             SamsungProfileAdapter.resolveDualTarget(
                 listOf(
                     claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V),
@@ -1135,7 +1135,7 @@ class ProfileIdentityTest {
         )
         // Dumpsys missing, verbose carrying: symmetric single source binds.
         assertEquals(
-            VerifiedDualTarget(userId = 95, serial = 15),
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
             SamsungProfileAdapter.resolveDualTarget(
                 listOf(
                     claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),

@@ -122,7 +122,7 @@ val privilege: Privilege = when {
    Write replies `timedOut ‖ transportUnknown ‖ isPostSpawnTransportText ‖ isServiceTimeoutText` go verify-first (single bounded read-only `verifyListProbe`, never resend the write).
    Reverse observations are always Unknown (present-after-remove / absent-after-clone never claim StillInstalled/VerifyFailed); before/after pin drift → `VerifyUnknown` (identity-changed).
    `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
-   註：`DualViewModel.refreshLocked()` 目前仍走 9 命令 resolve-then-reverify 舊路徑（`DualViewModel.kt:399-490`），遷移到 `refreshVerified()` 5 命令為 follow-up；兩者同為 fail-closed，僅命令數差異。
+   註（#53）：`DualViewModel.refreshLocked()` 已遷移到 `refreshVerified()` 5 命令單一快照（snapshot 1 ＋ typed target 3 ＋ list 1），VM 只做 `RefreshOutcome→UiState` 映射，不再二次 snapshot＋triple；pinned target 攜帶真 parentId，parent/serial 漂移 fail-closed。
 
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
