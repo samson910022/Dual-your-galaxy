@@ -1786,7 +1786,8 @@ class DualRepository(
     // transport text is recognized (isPostSpawnTransportText backstop:
     // "interrupted: ..." from a su/service wait/drain interrupt after spawn,
     // "service exec failed: ..." from the GalaxyExecService catch after
-    // spawn). Pre-spawn definite signals -- "spawn failed: ..." (exec threw,
+    // spawn, and "su failed post-spawn: ..." from the captureProcess
+    // post-spawn catch). Pre-spawn definite signals -- "spawn failed: ..." (exec threw,
     // process never started), pre-dispatch refusals (no binder, not
     // authorized, bind failure), and explicit pm failures (Failure[...]) --
     // carry none of these and stay on the isSuccess judgement -> definite

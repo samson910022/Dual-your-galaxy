@@ -1,7 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
 // DEVICE-UNVERIFIED：S24 未跑（[待實機驗證]）。本檔為 CI-run API29
-// in-process fake suite（run 42582946410，locale green；不 spawn、零 pm
+// in-process fake suite（PR run 42602714676，locale-instrumentation green；不 spawn、零 pm
 // 寫入），僅覆蓋行程內 Parcel/Binder wiring；真 service spawn、Shizuku
 // daemon 重建與 S24 實機行為仍未驗，勿視為可用。
 // 不測 DESTROY：TRANSACTION_DESTROY 會 System.exit(0)，永不呼叫。
@@ -10,7 +10,7 @@
 // FakeExecBinder 是行程內假 binder（不經 Shizuku/真 service），
 // 故全程不產生任何 pm 寫入。
 //
-// Phase B §2（Phase 4 instrumentation，API29 in-process fake，CI run 42582946410 green）：真
+// Phase B §2（Phase 4 instrumentation，API29 in-process fake，CI PR run 42602714676 green）：真
 // android.os.Parcel 的 Binder 層測試，補 JVM 純函數測試（ShizukuExecHandleTest /
 // GatewayAssemblyTest）覆蓋不到的 Parcel 讀/寫 wiring。
 // - Service 側（5 測）：對 GalaxyExecService 經 binder.transact（分派到

@@ -317,7 +317,7 @@ class GatewayAssemblyTest {
     // TrustedFull empty. Must be transportUnknown (timedOut=false).
     // Parcel/Binder wiring (onTransact no-spawn guard, drop-rebind, and
     // service-catch truncated paths) is covered in-process by
-    // ShizukuBinderParcelTest on API29 fake (CI run 42582946410 green,
+    // ShizukuBinderParcelTest on API29 fake (CI PR run 42602714676 green,
     // no spawn, zero pm writes); S24 real-device matrix stays
     // [待實機驗證] DEVICE-UNVERIFIED.
     @Test fun execReply_nullOutIsTransportUnknown() {
