@@ -22,7 +22,7 @@ import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.PmOutputParser
-import com.galaxydual.core.routePrivilege
+import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -414,7 +414,7 @@ data class UiState(
 // in LSPosed mode. The LSPosed gateway stays the NoOp placeholder (whitelist
 // policy branch pending): writes under it are refused with an explicit
 // reason, never executed. The marker never feeds privilege routing
-// (hook signal never enters routing; `routePrivilege` has no `hasLsposed`
+// (hook signal never enters routing; `routePrivilegeFromProbes` has no `hasLsposed`
 // parameter): a present marker is not proof of a live, effective hook, so it
 // must not grant privilege.
 //
@@ -5797,12 +5797,12 @@ class DualViewModel(
 }
 
 // P1 hook-neutral routing (issue #6, 沿襲 #19, 配合 #27): privilege routing
-// has no hook input (`routePrivilege` signature has no `hasLsposed` parameter).
+// has no hook input (`routePrivilegeFromProbes` signature has no `hasLsposed` parameter).
 // A present marker is existence+scope evidence, not proof of a live, effective
 // hook, so it must never grant privilege. probeChannels routes through this
 // function; HookDiagnosisTest locks the contract.
 fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
-    routePrivilege(hasShizuku = hasShizuku, hasRoot = hasRoot)
+    routePrivilegeFromProbes(hasShizuku = hasShizuku, hasRoot = hasRoot)
 
 // PR-7 P2 (issue #26):選取自動恢復 marker 初值 (從未恢復)。
 // 合法 dualId 恆 >= -1 (-1 = 無目標),故 -2 = 「從未恢復」哨兵。

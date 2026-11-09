@@ -47,7 +47,7 @@ hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、�
 // file marker 是存在性證據，不是 live hook 證明，不得作為授權輸入）；
 // hasRoot/hasShizuku 由 Su/ShizukuElevator 真通道探測填入。Hook 狀態走
 // UiState.hookActive／hookScopes（display-only）供 LSPosed picker 行顯示。
-val privilege = routePrivilege(hasShizuku = shizukuAlive, hasRoot = hasRoot)
+val privilege = routePrivilegeFromProbes(hasShizuku = shizukuAlive, hasRoot = hasRoot)
 val ready = channelReadyFor(gatewayPrivilege, hasRoot, shizukuAlive)
 ```
 
