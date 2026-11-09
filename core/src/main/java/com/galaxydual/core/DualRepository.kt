@@ -1831,6 +1831,12 @@ class DualRepository(
     // resolver's true parentId (== 0 by policy, never a hardcoded null),
     // so a disagreeing parent can only surface as Unknown here -- never
     // as a FRESH listing on a drifted identity.
+    // serial==null caveat: when both triples are SerialUnavailable, the strict
+    // triple is (id,null,parent). Agreement proves same id/parent confirmed
+    // twice around successful listing in this snapshot; it does NOT prove same
+    // incarnation -- same-id rebuild with no serial on either channel is
+    // unobservable and its new list may still publish as GroundTruth(id,null).
+    // Such FRESH(id,null) authorizes no writes (pinned paths re-check before/after).
     suspend fun refreshVerified(): RefreshOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RefreshOutcome.ChannelError(snap.detail)
@@ -1879,6 +1885,9 @@ class DualRepository(
     // fails closed to Unknown (profiles carried, detail names post-list
     // drift / identity changed before/after list) -- never NoDual/FRESH
     // on re-verify; the listed payload never becomes GroundTruth here.
+    // serial==null: both triples (id,null,parent) match a rebuilt same-id
+    // incarnation with no serial evidence -- GroundTruth(id,null) pins no
+    // incarnation guarantee.
     private suspend fun listFenceResult(
         profiles: List<DualProfile>,
         pinned: VerifiedTarget,

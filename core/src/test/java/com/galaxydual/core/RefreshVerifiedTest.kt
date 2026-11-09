@@ -758,6 +758,38 @@ class RefreshVerifiedTest {
         assertEquals(8, gateway.commands.size)
     }
 
+    // KNOWN LIMIT / contract: serial==null both triples + same-id rebuild
+    // between first triple and the list (old list -> new list, identity still (95,null,0) on
+    // both sides because neither channel carries a serial) publishes the
+    // new incarnation's list as GroundTruth(95,null,0). Pins the current
+    // contracted behavior; a future FRESH-suppression implementer must flip
+    // this test to expect Unknown.
+    @Test
+    fun serialUnavailableBothTriples_rebuildDuringList_returnsGroundTruthWithNewList_pinsNoIncarnationGuarantee() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.VERBOSE_NO_SERIAL_95,
+            dumpsysOutput = FakeGateway.DUMPSYS_NO_SERIAL_95,
+            propOutput = "95\n",
+            listPackagesOutput = "package:com.example.old\n",
+            secondListPackagesOutput = "package:com.example.new\n",
+            listPackagesFlipAfter = 0,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial-null rebuild must be GroundTruth (known limit), got: $outcome", outcome is RefreshOutcome.GroundTruth)
+        val ground = outcome as RefreshOutcome.GroundTruth
+        assertEquals(95, ground.target.userId)
+        assertNull("serial must stay null, got: ${ground.target}", ground.target.serial)
+        assertEquals(0, ground.target.parentId)
+        assertEquals(listOf("com.example.new"), ground.cloned)
+        assertTrue("profiles must contain the target for display", ground.profiles.any { it.userId == 95 })
+        assertEquals(1, gateway.listUsersCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(8, gateway.commands.size)
+    }
+
     // S3(a): Truncated identity evidence refuses the first triple. A
     // truncated `cmd user list -v` capture is untrusted, never
     // absence/presence evidence: RefreshOutcome.Unknown with the pm

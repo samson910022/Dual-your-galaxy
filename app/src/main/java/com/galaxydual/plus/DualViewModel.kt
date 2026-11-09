@@ -837,8 +837,10 @@ class DualViewModel(
     // - Empty: dual exists but owns no clones -> "no clones installed".
     // A failed clone-listing (GroundTruth cloned == null) keeps the previous
     // `cloned` and reports "result unknown" rather than claiming the list is
-    // empty. Drift is eliminated inside this API (single target throughout);
-    // the explicit-id residual remains only in the old entries.
+    // empty. Observable-serial drift is eliminated inside this API (single
+    // target throughout); serial==null proves only same (id,parent) twice
+    // + listing, not incarnation (known limit, see repo KDoc). The
+    // explicit-id residual remains only in the old entries.
     fun refresh() {
         // Coalesce rapid taps (PR-3 stage 1, issue #24; P25 Item 2 shares the
         // gate with reconnect): while an op is in flight (including waiting on
@@ -969,8 +971,10 @@ class DualViewModel(
     // Single-snapshot refresh (#53): refreshLocked runs ONLY
     // repo.refreshVerified() (snapshot 1 + target 3 cmds + list 1 + re-verify triple 3 = 8) and
     // maps its RefreshOutcome to UiState -- the second triple inside
-    // refreshVerified is the strict-equality fence, so no cross-window (id, serial) pair
-    // can be spliced into a FRESH listing.
+    // refreshVerified is the strict-equality fence, so with observable serial
+    // no cross-window (id, serial) pair can be spliced into a FRESH listing;
+    // serial==null proves only same (id,parent) twice + listing, not
+    // incarnation (known limit, see repo KDoc).
     // Repository calls run via onIo (PR-3 stage 1, issue #24) so the retry
     // settle wait never blocks Main; StateFlow updates stay thread-safe from
     // any dispatcher.
@@ -1027,12 +1031,14 @@ class DualViewModel(
             // RefreshOutcome to UiState below -- the VM never snapshots,
             // re-resolves, or re-verifies a second time of its own (the
             // second triple inside refreshVerified is the strict-equality
-            // fence), so a 95->96 rebuild (or a same-id new serial) can never be spliced into
-            // a fictional FRESH pair: whatever is published came from the
-            // single pinned target, carried with its true (id, serial,
-            // parentId). Drift between two refreshes is real change (the
+            // fence), so with observable serial a 95->96 rebuild (or a same-id
+            // new serial) can never be spliced into a fictional FRESH pair:
+            // whatever is published came from the single pinned target,
+            // carried with its true (id, serial, parentId); serial==null proves
+            // only same (id,parent) twice + listing, not incarnation (known limit,
+            // see repo KDoc). Drift between two refreshes is real change (the
             // new world publishes as a whole on the next refresh, never
-            // mixed with the old world's id/serial).
+            // mixed with the old world's id/serial when serial is observable).
             when (val outcome = onIo { repo.refreshVerified() }) {
                 is RefreshOutcome.ChannelError -> {
                     val now = nowWallMs()
