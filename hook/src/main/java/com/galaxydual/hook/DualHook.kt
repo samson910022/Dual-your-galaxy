@@ -198,6 +198,17 @@ class DualHook : XposedModule() {
     // inlined before this runs may still bypass the hook. The anti-inline
     // effect is unverified on-device; the return value is logged best-effort without
     // inferring why the framework returned it.
+    //
+    // Caller-side research note (issue #10 Stage1): the effective fix needs
+    // either (a) identifying callers that already inlined the callee on the
+    // supported ROM/version and deoptimizing THOSE callers, or (b) choosing a
+    // hook point the inline copies cannot bypass. Caller identities require
+    // on-device ART evidence and are unknown today, so this path stays
+    // callee-only. Do NOT blanket-deoptimize the whole system_server to
+    // compensate; keep the proven-minimal scope (known callers + hooked
+    // callee). JVM-testable decision lives in CallerDeoptPlan with
+    // orchestration in HookInstaller.installWithCallers; the device wiring
+    // point is knownCallersFor() below (DEVICE-UNVERIFIED, currently empty).
     private fun hookWithDeoptimize(method: Method, hookId: String): Boolean =
         HookInstaller.install(method, hookId, ::deoptimize, { target, id ->
             hook(target)
@@ -245,6 +256,33 @@ class DualHook : XposedModule() {
     // change listener into a volatile cache).
     // Kept as a separate function so that future work touches exactly one seam.
     internal fun remotePolicySnapshot(): Set<String> = emptySet()
+
+    // Caller-side wiring point (issue #10 Stage1, DEVICE-UNVERIFIED).
+    //
+    // Future device work resolves the inlined callers of [callee] for the
+    // running ROM/version (ART evidence required) and returns them here so
+    // hookWithCallerDeoptimize() can deoptimize callers + hook callee via
+    // CallerDeoptPlan/HookInstaller.installWithCallers. Returns empty today,
+    // which is exactly the current callee-only best-effort behavior -- no
+    // blanket deoptimization of system_server. Not covered by JVM tests
+    // beyond the empty default (instantiating DualHook needs the framework).
+    internal fun knownCallersFor(callee: Method): List<Method> = emptyList()
+
+    // Caller-aware install seam (issue #10 Stage1, DEVICE-UNVERIFIED).
+    // Wired to knownCallersFor(); with the current empty list it behaves
+    // identically to hookWithDeoptimize(). Call sites stay on
+    // hookWithDeoptimize() until per-ROM caller evidence exists, so behavior
+    // is unchanged today.
+    @Suppress("unused")
+    private fun hookWithCallerDeoptimize(method: Method, hookId: String): Boolean =
+        HookInstaller.installWithCallers(method, hookId, knownCallersFor(method), ::deoptimize, { target, id ->
+            hook(target)
+                // Request framework protection for hook exceptions; this does not
+                // guarantee system_server / daagent cannot crash in every case.
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId(id)
+                .intercept { chain -> interceptWhitelistCall(chain) }
+        }, ::logi)
 
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
