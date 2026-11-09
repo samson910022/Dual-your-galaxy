@@ -1005,8 +1005,9 @@ class DualViewModel(
         // intentionally duplicated per RefreshOutcome branch (no helper
         // extracted). Only the GroundTruth listed branch can actually
         // trigger it (msgKind NONE/INFO); the ChannelError/NoDual/Unknown/
-        // GroundTruth-null/catch branches set CHANNEL/NO_DUAL/FAILED, so
-        // their guards are dead but kept for symmetry.
+        // TargetMoved/GroundTruth-null/catch branches set
+        // CHANNEL/NO_DUAL/INVALID/FAILED, so their guards are dead but
+        // kept for symmetry.
         // Mark busy first so the UI can render a spinner. Dialog 開著時狀態列
         // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
         // loading=true（refresh 不應驅散確認對話框的提示）。
@@ -1171,6 +1172,50 @@ class DualViewModel(
                     }
                     // Phase B #1：未知時亦跑綁定檢查：保留舊 targetId，
                     // 故 bound 一致即 no-op（不清勾選）。
+                    handleSelectionTargetChangeLocked()
+                }
+                is RefreshOutcome.TargetMoved -> {
+                    // Confirmed post-list drift: the re-verify proved a
+                    // new target. Keep the old cloned list, publish the
+                    // live target as STALE (never FRESH, never the
+                    // discarded list), report VERIFY_MISMATCH + INVALID
+                    // requiring reconfirmation. Selection: the live
+                    // target differs from any bound selection, so
+                    // handleSelectionTargetChangeLocked clears it (do NOT
+                    // restoreSelectionLocked for the moved target).
+                    val live = outcome.liveTarget
+                    val now = nowWallMs()
+                    _state.update { cur ->
+                        val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            "dual target changed: please reconfirm",
+                            MsgKind.INVALID,
+                            cur.degrade,
+                        )
+                        val next = cur.copy(
+                            loading = false,
+                            profiles = outcome.profiles,
+                            pmReadable = true,
+                            inventory = cur.inventory.toStaleOrUnknown(
+                                now = now,
+                                source = DualRepository.CMD_LIST_USERS,
+                                targetId = live.userId,
+                                targetSerial = live.serial,
+                            ),
+                            diagnose = diagnoseEvent(
+                                DiagnoseCode.VERIFY_MISMATCH,
+                                techDetail = "post-list target moved: " + sanitizeForDisplay(outcome.detail).take(200),
+                            ),
+                            msg = combinedMsg,
+                            msgKind = combinedKind,
+                        )
+                        if (cur.pendingRemove != null &&
+                            (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                        ) {
+                            next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                        } else {
+                            next
+                        }
+                    }
                     handleSelectionTargetChangeLocked()
                 }
                 is RefreshOutcome.GroundTruth -> {

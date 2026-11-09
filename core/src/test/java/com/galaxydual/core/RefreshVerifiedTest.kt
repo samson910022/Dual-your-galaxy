@@ -379,10 +379,11 @@ class RefreshVerifiedTest {
 
     // Post-list serial switch (95,15 -> 95,41 between the first triple and
     // the post-list re-verify; the list itself already serves the new
-    // incarnation's packages): the fence must fail closed to Unknown, never
-    // publish the fictional FRESH(95,15,newList).
+    // incarnation's packages): the fence proves the new target, so it
+    // returns TargetMoved with the live (95,41,0) -- never publish the
+    // fictional FRESH(95,15,newList); the listed payload is discarded.
     @Test
-    fun postListSwitchToNewSerial_returnsUnknownAndNeverFresh() {
+    fun postListSwitchToNewSerial_returnsTargetMoved() {
         val gateway = FakeGateway(
             userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
             dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
@@ -398,11 +399,14 @@ class RefreshVerifiedTest {
             listPackagesFlipAfter = 0,
         )
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
-        assertTrue("post-list serial switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
-        val unknown = outcome as RefreshOutcome.Unknown
-        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
-        assertTrue("detail must be non-blank, got: '${unknown.detail}'", unknown.detail.isNotBlank())
-        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertTrue("post-list serial switch must be TargetMoved, got: $outcome", outcome is RefreshOutcome.TargetMoved)
+        val moved = outcome as RefreshOutcome.TargetMoved
+        assertEquals(95, moved.liveTarget.userId)
+        assertEquals(41, moved.liveTarget.serial)
+        assertEquals(0, moved.liveTarget.parentId)
+        assertTrue("profiles must still be carried, got: ${moved.profiles}", moved.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${moved.detail}'", moved.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${moved.detail}", moved.detail.contains("post-list"))
         assertEquals(1, gateway.listPackagesCount)
         assertEquals(2, gateway.verboseCount)
         assertEquals(2, gateway.dumpsysCount)
@@ -411,10 +415,11 @@ class RefreshVerifiedTest {
     }
 
     // Switch between list and re-verify: first triple AND list see
-    // (95,15)+oldList, the post-list re-verify sees (95,41). Same fail-closed
-    // Unknown; the list payload (old) proves the flip landed after the list.
+    // (95,15)+oldList, the post-list re-verify sees (95,41). The distinct
+    // Confirmed triple proves the move -> TargetMoved (95,41,0); the list
+    // payload is discarded and never becomes GroundTruth.
     @Test
-    fun switchBetweenListAndReverify_returnsUnknown() {
+    fun postListSwitchBetweenListAndReverify_returnsTargetMoved() {
         val gateway = FakeGateway(
             userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
             dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
@@ -428,21 +433,26 @@ class RefreshVerifiedTest {
             propFlipAfter = 1,
         )
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
-        assertTrue("list->reverify switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
-        val unknown = outcome as RefreshOutcome.Unknown
-        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
-        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertTrue("list->reverify switch must be TargetMoved, got: $outcome", outcome is RefreshOutcome.TargetMoved)
+        val moved = outcome as RefreshOutcome.TargetMoved
+        assertEquals(95, moved.liveTarget.userId)
+        assertEquals(41, moved.liveTarget.serial)
+        assertEquals(0, moved.liveTarget.parentId)
+        assertTrue("profiles must still be carried, got: ${moved.profiles}", moved.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${moved.detail}'", moved.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${moved.detail}", moved.detail.contains("post-list"))
         assertEquals(1, gateway.listPackagesCount)
         assertEquals(2, gateway.verboseCount)
         assertEquals(2, gateway.dumpsysCount)
         assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
     }
 
     // Post-list id switch (95 -> 96 between first triple and re-verify):
-    // re-verify Confirmed(96,41) differs from pinned (95,15) -> Unknown,
-    // never FRESH/NoDual on the stale snapshot.
+    // re-verify Confirmed(96,41) differs from pinned (95,15) -> TargetMoved
+    // with the live (96,41,0), never FRESH/NoDual on the stale snapshot.
     @Test
-    fun postListSwitchToDifferentId_returnsUnknown() {
+    fun postListSwitchToDifferentId_returnsTargetMoved() {
         val verbose96_41 =
             "Users:\n" +
                 "  UserInfo{0:Owner:13} running:\n" +
@@ -474,14 +484,19 @@ class RefreshVerifiedTest {
             listPackagesFlipAfter = 0,
         )
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
-        assertTrue("post-list id switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
-        val unknown = outcome as RefreshOutcome.Unknown
-        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
-        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertTrue("post-list id switch must be TargetMoved, got: $outcome", outcome is RefreshOutcome.TargetMoved)
+        val moved = outcome as RefreshOutcome.TargetMoved
+        assertEquals(96, moved.liveTarget.userId)
+        assertEquals(41, moved.liveTarget.serial)
+        assertEquals(0, moved.liveTarget.parentId)
+        assertTrue("profiles must still be carried, got: ${moved.profiles}", moved.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${moved.detail}'", moved.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${moved.detail}", moved.detail.contains("post-list"))
         assertEquals(1, gateway.listPackagesCount)
         assertEquals(2, gateway.verboseCount)
         assertEquals(2, gateway.dumpsysCount)
         assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
     }
 
     // Post-list parent drift: first triple agrees on parent 0, the re-verify
@@ -585,10 +600,10 @@ class RefreshVerifiedTest {
     }
 
     // Null-list fence-fail: list channel fails (null) but the re-verify shows
-    // drift. The fence must win over the null-list GroundTruth: Unknown, not
-    // GroundTruth with a new targetId on the old list.
+    // drift. The fence must win over the null-list GroundTruth: TargetMoved
+    // with the live (95,41,0), not GroundTruth with a new targetId.
     @Test
-    fun postListDriftWithNullList_returnsUnknown() {
+    fun postListDriftWithNullList_returnsTargetMoved() {
         val gateway = FakeGateway(
             userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
             dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
@@ -604,10 +619,65 @@ class RefreshVerifiedTest {
             propFlipAfter = 1,
         )
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
-        assertTrue("null-list drift must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
-        val unknown = outcome as RefreshOutcome.Unknown
-        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
-        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertTrue("null-list drift must be TargetMoved, got: $outcome", outcome is RefreshOutcome.TargetMoved)
+        val moved = outcome as RefreshOutcome.TargetMoved
+        assertEquals(95, moved.liveTarget.userId)
+        assertEquals(41, moved.liveTarget.serial)
+        assertEquals(0, moved.liveTarget.parentId)
+        assertTrue("profiles must still be carried, got: ${moved.profiles}", moved.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${moved.detail}'", moved.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${moved.detail}", moved.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // Post-list SerialUnavailable with a different id: pinned Confirmed
+    // (95,15), the re-verify sees SerialUnavailable(96,null,0). A different
+    // proven id is a move -> TargetMoved with the live (96,null,0), while
+    // the same-id serial loss (postListSerialBecomesUnavailable) stays
+    // Unknown. The pm snapshot still lists {0,95}; the re-verify runs with
+    // the reused pmIds, and the typed 96/null world still resolves as
+    // SerialUnavailable without tripping the pm veto check for this shape.
+    @Test
+    fun postListSerialUnavailableDifferentId_returnsTargetMoved() {
+        val verbose96NoSerial =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{96:DualApp:400} running:\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.CLONE\n"
+        val dumpsys96NoSerial =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{96:DualApp:400}:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            secondUserListVerboseOutput = verbose96NoSerial,
+            secondDumpsysOutput = dumpsys96NoSerial,
+            secondPropOutput = "96\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial-unavailable different-id must be TargetMoved, got: $outcome", outcome is RefreshOutcome.TargetMoved)
+        val moved = outcome as RefreshOutcome.TargetMoved
+        assertEquals(96, moved.liveTarget.userId)
+        assertNull("live serial must stay null for a serial-unavailable target, got: ${moved.liveTarget}", moved.liveTarget.serial)
+        assertEquals(0, moved.liveTarget.parentId)
+        assertTrue("profiles must still be carried, got: ${moved.profiles}", moved.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${moved.detail}'", moved.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${moved.detail}", moved.detail.contains("post-list"))
         assertEquals(1, gateway.listPackagesCount)
         assertEquals(2, gateway.verboseCount)
         assertEquals(2, gateway.dumpsysCount)
