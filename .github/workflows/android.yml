@@ -43,7 +43,7 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -56,8 +56,11 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: |
-            # Retry on 504: gradle-8.7-bin.zip download may transiently 504
-            for i in 1 2 3; do ./gradlew :app:connectedDebugAndroidTest --no-daemon && break; echo "attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+            # Two-phase: Phase 1 builds/deps with retry (5x/30s) so transient 504s during
+            # dependency download don't fail the run; Phase 2 runs the real tests once
+            # (never re-run the tests themselves on retry).
+            attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Upload instrumentation reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -94,7 +97,7 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
       # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
       - name: YAML syntax check (python)
         run: |
@@ -131,7 +134,7 @@ jobs:
       - name: Assemble app, hook, core (debug)
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :hook:assembleDebug :core:assembleDebug --no-daemon
+          attempt=1; until ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :hook:assembleDebug :core:assembleDebug --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
       # Release-gate parity: run the shared artifact verifier on the debug APK in PR CI.
       - name: Verify debug APK artifacts (shared release gate)
         run: |
@@ -374,7 +377,7 @@ jobs:
       - name: Unit tests (app, core, hook debug)
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
+          attempt=1; until ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "unit test attempt $attempt failed (max 3)"; exit 1; fi; echo "unit test attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
         if: always()
@@ -393,7 +396,7 @@ jobs:
       - name: Compile androidTest (no device needed)
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebugAndroidTest --no-daemon
+          attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "compile androidTest attempt $attempt failed (max 3)"; exit 1; fi; echo "compile androidTest attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
       - name: Upload APK artifacts (debug + androidTest)
         if: success()
         uses: actions/upload-artifact@v4
@@ -411,7 +414,7 @@ jobs:
       - name: Android Lint (AGP built-in)
         run: |
           chmod +x ./gradlew
-          ./gradlew lint --no-daemon
+          attempt=1; until ./gradlew lint --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "lint attempt $attempt failed (max 3)"; exit 1; fi; echo "lint attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
       # Always keep lint reports, even when the lint step fails.
       - name: Upload lint reports
         if: always()
@@ -454,7 +457,7 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -470,13 +473,16 @@ jobs:
           script: |
             chmod +x ./gradlew
             # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip
-            for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+            attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
             adb shell input keyevent 82 || true
             adb shell input keyevent 224 || true
             adb shell wm dismiss-keyguard || true
             sleep 2
-            # Retry on 504: gradle-8.7-bin.zip download may transiently 504
-            for i in 1 2 3; do ./gradlew :app:connectedDebugAndroidTest --no-daemon && break; echo "attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
+            # Two-phase: Phase 1 builds/deps with retry (5x/30s) so transient 504s during
+            # dependency download don't fail the run; Phase 2 runs the real tests once
+            # (never re-run the tests themselves on retry).
+            attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Record tested APK provenance
         if: always()
         run: |
