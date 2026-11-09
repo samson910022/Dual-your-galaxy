@@ -37,17 +37,20 @@ object WhitelistPolicy {
     ): Any? {
         if (result is Boolean) {
             if (result) return true
-            // Extend-only re-decision is only meaningful for a query shaped
-            // like isXxx(String pkg): anything else stays observe-only.
-            if (args.size != 1 || args[0] !is String) {
+            // Extend-only re-decision: if exactly 1 String arg exists anywhere in
+            // args, treat it as the package candidate (supports (String),
+            // (String, int), (int, String), etc.). 0 or >1 String args is
+            // ambiguous — stay observe-only and never guess.
+            val stringArgs = args.filterIsInstance<String>()
+            if (stringArgs.size != 1) {
                 onLog(
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
-                        "result with unexpected args (size=${args.size}); " +
-                        "returning original",
+                        "result with ambiguous args (size=${args.size}, " +
+                        "stringCount=${stringArgs.size}); returning original",
                 )
                 return result
             }
-            return extra.contains(args[0] as String)
+            return extra.contains(stringArgs[0])
         }
         if (extra.isEmpty()) return result
         if (result is List<*>) {

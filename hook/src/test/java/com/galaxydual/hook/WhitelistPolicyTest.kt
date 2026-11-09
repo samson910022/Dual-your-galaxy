@@ -51,12 +51,48 @@ class WhitelistPolicyTest {
 
     @Test
     fun booleanFalseWithTwoArgsIsObserveOnly() {
+        // Two String args are ambiguous even if one is in extra; never guess.
         assertEquals(false, WhitelistPolicy.apply(false, listOf("a", "b"), setOf("a"), "m", log))
         assertEquals(1, logs.size)
         assertTrue(
             "log should carry observe-only marker, was: ${logs.single()}",
             logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER),
         )
+    }
+
+    @Test
+    fun booleanFalseSingleStringPlusIntInExtraFlipsTrue() {
+        val out = WhitelistPolicy.apply(
+            false, listOf("com.listed.app", 0), setOf("com.listed.app"), "m", log,
+        )
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanFalseIntPlusSingleStringInExtraFlipsTrue() {
+        val out = WhitelistPolicy.apply(
+            false, listOf(0, "com.listed.app"), setOf("com.listed.app"), "m", log,
+        )
+        assertEquals(true, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanFalseMultiArgUnlistedPackageStaysFalse() {
+        val out = WhitelistPolicy.apply(
+            false, listOf("com.other.app", 0), setOf("com.listed.app"), "m", log,
+        )
+        assertEquals(false, out)
+        assertTrue(logs.isEmpty())
+    }
+
+    @Test
+    fun booleanFalseMultiArgNoStringArgsIsObserveOnly() {
+        val out = WhitelistPolicy.apply(false, listOf(0, 1), setOf("a"), "m", log)
+        assertEquals(false, out)
+        assertEquals(1, logs.size)
+        assertTrue(logs.single().contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
     }
 
     @Test
