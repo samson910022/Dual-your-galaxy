@@ -123,7 +123,7 @@ TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）
 （continuity lost，與實作一致）。
 pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＝12 命令（probe 最多 2 次 retry 另計）；寫前 fresh-vs-before 重核僅縮小 before-to-write 重用窗口，仍殘餘 fresh-to-write 微窗口（fail closed，與 DualRepository KDoc 一致）。
 列表刷新（`refreshVerified()`，Phase D P2-D）為單一 target：一次 `pm list users`（1）
-＋一次 verified-target fetch（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
+＋一次 typed target（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
 ＋一次 `pm list packages --user <dualId>`（1）＋post-list re-verify triple（3）＝8 命令（舊 resolve-then-reverify
 列表路徑為 9）；同一 target 全程，第二次 triple 即 strict-equality fence，resolve→list 漂移在本 API 內消除；fetch→probe 殘唯讀窗口（只誤報 presence/absence，不重定向寫入）（explicit
 舊入口殘餘除外）。Auto 降級與單一恢復入口仍由 #25 擁有，本 API 只保證列表
