@@ -494,6 +494,7 @@ class DualHook : XposedModule() {
                 WhitelistSignatureGuard.resolveBooleanPackageArgIndex(it)
             }
             val declaredReturnType = (executable as? Method)?.returnType
+            val genericReturnType = (executable as? Method)?.genericReturnType
             WhitelistPolicy.apply(
                 result = result,
                 args = args,
@@ -503,6 +504,7 @@ class DualHook : XposedModule() {
                 packageArgIndex = packageArgIndex,
                 declaredReturnType = declaredReturnType,
                 strictSignature = true,
+                genericReturnType = genericReturnType,
             )
         } catch (t: Throwable) {
             val desc = try {
