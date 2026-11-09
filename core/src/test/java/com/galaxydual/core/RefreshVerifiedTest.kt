@@ -10,12 +10,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // Phase D P2-D regression tests (issue #21): single-target refresh.
-// refreshVerified() pins snapshot + target + listing to one id
-// (snapshot 1 + target 3 cmds + list 1 = 5), so resolve-to-list drift is
-// inexpressible. Uses a FakeGateway (no device).
+// refreshVerified() pins snapshot + target + listing to one id with a
+// post-list fence (snapshot 1 + target 3 + list 1 + re-verify 3 = 8), so
+// resolve-to-list drift fails closed to Unknown. Uses a FakeGateway (no device).
 class RefreshVerifiedTest {
-    // In-memory gateway with per-channel counters so the 9->5 convergence
-    // (old resolve-then-reverify listing needed 9 commands) is locked.
+    // In-memory gateway with per-channel counters so the command budget
+    // is locked. Optional second-incarnation outputs + per-channel flip
+    // thresholds model an intra-refresh world switch: after N calls on a
+    // channel the gateway serves the second incarnation's output (list
+    // output likewise keyed to the incarnation so old vs new packages
+    // are distinguishable).
     private class FakeGateway(
         var listUsersOutput: String = DEFAULT_USERS_95,
         var listUsersExit: Int = 0,
@@ -29,6 +33,14 @@ class RefreshVerifiedTest {
         var listPackagesOutput: String = "package:com.example.chat\npackage:com.example.mail\n",
         var listPackagesExit: Int = 0,
         var listPackagesErr: String = "",
+        var secondUserListVerboseOutput: String? = null,
+        var secondDumpsysOutput: String? = null,
+        var secondPropOutput: String? = null,
+        var secondListPackagesOutput: String? = null,
+        var verboseFlipAfter: Int = Int.MAX_VALUE,
+        var dumpsysFlipAfter: Int = Int.MAX_VALUE,
+        var propFlipAfter: Int = Int.MAX_VALUE,
+        var listPackagesFlipAfter: Int = Int.MAX_VALUE,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -47,19 +59,43 @@ class RefreshVerifiedTest {
                 }
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
                     verboseCount++
-                    CmdResult(exit = userListVerboseExit, out = userListVerboseOutput, err = "")
+                    val second = secondUserListVerboseOutput
+                    val out = if (verboseCount > verboseFlipAfter && second != null) {
+                        second
+                    } else {
+                        userListVerboseOutput
+                    }
+                    CmdResult(exit = userListVerboseExit, out = out, err = "")
                 }
                 cmd == DualRepository.CMD_DUMPSYS_USER -> {
                     dumpsysCount++
-                    CmdResult(exit = dumpsysExit, out = dumpsysOutput, err = "")
+                    val second = secondDumpsysOutput
+                    val out = if (dumpsysCount > dumpsysFlipAfter && second != null) {
+                        second
+                    } else {
+                        dumpsysOutput
+                    }
+                    CmdResult(exit = dumpsysExit, out = out, err = "")
                 }
                 cmd == DualRepository.CMD_GETPROP_DUAL -> {
                     propCount++
-                    CmdResult(exit = propExit, out = propOutput, err = "")
+                    val second = secondPropOutput
+                    val out = if (propCount > propFlipAfter && second != null) {
+                        second
+                    } else {
+                        propOutput
+                    }
+                    CmdResult(exit = propExit, out = out, err = "")
                 }
                 cmd.startsWith("pm list packages") -> {
                     listPackagesCount++
-                    CmdResult(exit = listPackagesExit, out = listPackagesOutput, err = listPackagesErr)
+                    val second = secondListPackagesOutput
+                    val out = if (listPackagesCount > listPackagesFlipAfter && second != null) {
+                        second
+                    } else {
+                        listPackagesOutput
+                    }
+                    CmdResult(exit = listPackagesExit, out = out, err = listPackagesErr)
                 }
                 else -> CmdResult(exit = 0, out = "ok", err = "")
             }
@@ -87,6 +123,37 @@ class RefreshVerifiedTest {
                     "    parentId=0\n" +
                     "    userType=android.os.usertype.profile.CLONE\n"
             const val DEFAULT_PROP_95 = "95\n"
+            const val VERBOSE_95_41 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    Serial: 41\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            const val DUMPSYS_95_41 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} serialNo=41:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
+            const val VERBOSE_NO_SERIAL_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} running:\n" +
+                    "    Serial number: 0\n" +
+                    "    User type: android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400} running:\n" +
+                    "    parentId=0\n" +
+                    "    User type: android.os.usertype.profile.CLONE\n"
+            const val DUMPSYS_NO_SERIAL_95 =
+                "Users:\n" +
+                    "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                    "    userType=android.os.usertype.full.SYSTEM\n" +
+                    "  UserInfo{95:DualApp:400}:\n" +
+                    "    parentId=0\n" +
+                    "    userType=android.os.usertype.profile.CLONE\n"
         }
     }
 
@@ -253,25 +320,10 @@ class RefreshVerifiedTest {
     // Unknown 且零 list 探測。Same snapshot gate shape as Confirmed above.
     @Test
     fun serialUnavailableNotInSnapshot_mapsUnknown() {
-        val verboseNoSerial95 =
-            "Users:\n" +
-                "  UserInfo{0:Owner:13} running:\n" +
-                "    Serial number: 0\n" +
-                "    User type: android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{95:DualApp:400} running:\n" +
-                "    parentId=0\n" +
-                "    User type: android.os.usertype.profile.CLONE\n"
-        val dumpsysNoSerial95 =
-            "Users:\n" +
-                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
-                "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{95:DualApp:400}:\n" +
-                "    parentId=0\n" +
-                "    userType=android.os.usertype.profile.CLONE\n"
         val gateway = FakeGateway(
             listUsersOutput = "Users:\n\tUserInfo{0:Owner:13} running\n",
-            userListVerboseOutput = verboseNoSerial95,
-            dumpsysOutput = dumpsysNoSerial95,
+            userListVerboseOutput = FakeGateway.VERBOSE_NO_SERIAL_95,
+            dumpsysOutput = FakeGateway.DUMPSYS_NO_SERIAL_95,
             propOutput = "95\n",
         )
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
@@ -283,21 +335,20 @@ class RefreshVerifiedTest {
         )
     }
 
-    // One refreshVerified is exactly 5 commands: pm-list-users 1 + verbose 1
-    // + dumpsys 1 + prop 1 + pm-list-packages 1 (old resolve-then-reverify
-    // listing path needed 9: snapshot 1 + target 3 + snapshot 1 + target 3 +
-    // list 1). Locks the 9->5 convergence.
+    // One refreshVerified is exactly 8 commands: pm-list-users 1 + verbose 2
+    // + dumpsys 2 + prop 2 + pm-list-packages 1 (snapshot 1 + first triple 3
+    // + list 1 + post-list re-verify triple 3).
     @Test
-    fun commandCount_isExactlyFive() {
+    fun commandCount_isExactlyEight() {
         val gateway = FakeGateway()
         val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
         assertTrue("expected GroundTruth, got: $outcome", outcome is RefreshOutcome.GroundTruth)
         assertEquals(1, gateway.listUsersCount)
-        assertEquals(1, gateway.verboseCount)
-        assertEquals(1, gateway.dumpsysCount)
-        assertEquals(1, gateway.propCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
         assertEquals(1, gateway.listPackagesCount)
-        assertEquals(5, gateway.commands.size)
+        assertEquals(8, gateway.commands.size)
     }
 
     // List channel failure maps to GroundTruth with cloned == null (unknown,
@@ -305,6 +356,8 @@ class RefreshVerifiedTest {
     // no-retry listProbe (single gateway.run, no sleep), so this test is fast
     // by construction; the retry+sleep path belongs to verifyListProbe
     // (covered by VerifyRetryTest) and is intentionally not exercised here.
+    // A null list with a passing post-list fence still publishes GroundTruth
+    // with cloned == null.
     @Test
     fun listChannelFailure_returnsGroundTruthWithNullCloned() {
         val gateway = FakeGateway(
@@ -318,5 +371,287 @@ class RefreshVerifiedTest {
         assertEquals(95, ground.target.userId)
         assertNull(ground.cloned)
         assertTrue(ground.profiles.any { it.userId == 95 })
+    }
+
+    // Post-list serial switch (95,15 -> 95,41 between the first triple and
+    // the post-list re-verify; the list itself already serves the new
+    // incarnation's packages): the fence must fail closed to Unknown, never
+    // publish the fictional FRESH(95,15,newList).
+    @Test
+    fun postListSwitchToNewSerial_returnsUnknownAndNeverFresh() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            listPackagesOutput = "package:com.example.old\n",
+            secondUserListVerboseOutput = FakeGateway.VERBOSE_95_41,
+            secondDumpsysOutput = FakeGateway.DUMPSYS_95_41,
+            secondPropOutput = "95\n",
+            secondListPackagesOutput = "package:com.example.new\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+            listPackagesFlipAfter = 0,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("post-list serial switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${unknown.detail}'", unknown.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // Switch between list and re-verify: first triple AND list see
+    // (95,15)+oldList, the post-list re-verify sees (95,41). Same fail-closed
+    // Unknown; the list payload (old) proves the flip landed after the list.
+    @Test
+    fun switchBetweenListAndReverify_returnsUnknown() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            listPackagesOutput = "package:com.example.old\n",
+            secondUserListVerboseOutput = FakeGateway.VERBOSE_95_41,
+            secondDumpsysOutput = FakeGateway.DUMPSYS_95_41,
+            secondPropOutput = "95\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("list->reverify switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+    }
+
+    // Post-list id switch (95 -> 96 between first triple and re-verify):
+    // re-verify Confirmed(96,41) differs from pinned (95,15) -> Unknown,
+    // never FRESH/NoDual on the stale snapshot.
+    @Test
+    fun postListSwitchToDifferentId_returnsUnknown() {
+        val verbose96_41 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{96:DualApp:400} running:\n" +
+                "    Serial: 41\n" +
+                "    parentId=0\n" +
+                "    User type: android.os.usertype.profile.CLONE\n"
+        val dumpsys96_41 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{96:DualApp:400} serialNo=41:\n" +
+                "    parentId=0\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            listPackagesOutput = "package:com.example.old\n",
+            secondUserListVerboseOutput = verbose96_41,
+            secondDumpsysOutput = dumpsys96_41,
+            secondPropOutput = "96\n",
+            secondListPackagesOutput = "package:com.example.new96\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+            listPackagesFlipAfter = 0,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("post-list id switch must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+    }
+
+    // Post-list parent drift: first triple agrees on parent 0, the re-verify
+    // triple sees verbose 0 vs dumpsys 1 and refuses -> Unknown.
+    @Test
+    fun postListParentDrift_returnsUnknown() {
+        val dumpsysParent1 =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                "    parentId=1\n" +
+                "    userType=android.os.usertype.profile.CLONE\n"
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            secondDumpsysOutput = dumpsysParent1,
+            verboseFlipAfter = Int.MAX_VALUE,
+            dumpsysFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("post-list parent drift must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertTrue("detail must name the parent conflict, got: ${unknown.detail}", unknown.detail.contains("parent"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+    }
+
+    // Post-list vanish: first triple confirms (95,15), the re-verify sees an
+    // owner-only world (dual gone). This is Unknown, not Absent: the reused
+    // pmIds {0,95} hit the pm-veto (DualRepository resolveDualTargetTyped:
+    // pm snapshot contains ids missing from typed channels) because the
+    // typed channels now claim only {0}. The fence maps any re-verify
+    // Absent/Unknown to Unknown -- never NoDual, never FRESH; the Absent ->
+    // false fence arm is defensive/unreachable with reused pmIds.
+    @Test
+    fun postListVanish_returnsUnknownNeverNoDual() {
+        val ownerVerbose =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} running:\n" +
+                "    Serial number: 0\n" +
+                "    User type: android.os.usertype.full.SYSTEM\n"
+        val ownerDumpsys =
+            "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    userType=android.os.usertype.full.SYSTEM\n"
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            secondUserListVerboseOutput = ownerVerbose,
+            secondDumpsysOutput = ownerDumpsys,
+            secondPropOutput = "",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("post-list vanish must be Unknown (never NoDual), got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must be non-blank, got: '${unknown.detail}'", unknown.detail.isNotBlank())
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+    }
+
+    // Confirmed -> SerialUnavailable flip across the list: first triple pins
+    // (95,15), the re-verify sees the same id with no serial. Strict
+    // null-sensitive equality rejects the flip -> Unknown.
+    @Test
+    fun postListSerialBecomesUnavailable_returnsUnknown() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            secondUserListVerboseOutput = FakeGateway.VERBOSE_NO_SERIAL_95,
+            secondDumpsysOutput = FakeGateway.DUMPSYS_NO_SERIAL_95,
+            secondPropOutput = "95\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial flip must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // Null-list fence-fail: list channel fails (null) but the re-verify shows
+    // drift. The fence must win over the null-list GroundTruth: Unknown, not
+    // GroundTruth with a new targetId on the old list.
+    @Test
+    fun postListDriftWithNullList_returnsUnknown() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            dumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            propOutput = "95\n",
+            listPackagesOutput = "",
+            listPackagesErr = "error: closed",
+            listPackagesExit = 1,
+            secondUserListVerboseOutput = FakeGateway.VERBOSE_95_41,
+            secondDumpsysOutput = FakeGateway.DUMPSYS_95_41,
+            secondPropOutput = "95\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("null-list drift must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // Reverse flip: SerialUnavailable -> Confirmed across the list. First
+    // triple pins (95, null, 0) (no agreed serial), the re-verify sees
+    // Confirmed(95,15). Strict null-sensitive equality rejects the flip
+    // (15 != null) -> Unknown.
+    @Test
+    fun postListSerialBecomesConfirmed_returnsUnknown() {
+        val gateway = FakeGateway(
+            userListVerboseOutput = FakeGateway.VERBOSE_NO_SERIAL_95,
+            dumpsysOutput = FakeGateway.DUMPSYS_NO_SERIAL_95,
+            propOutput = "95\n",
+            secondUserListVerboseOutput = FakeGateway.DEFAULT_VERBOSE_95,
+            secondDumpsysOutput = FakeGateway.DEFAULT_DUMPSYS_95,
+            secondPropOutput = "95\n",
+            verboseFlipAfter = 1,
+            dumpsysFlipAfter = 1,
+            propFlipAfter = 1,
+        )
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("serial-unavailable -> confirmed flip must be Unknown, got: $outcome", outcome is RefreshOutcome.Unknown)
+        val unknown = outcome as RefreshOutcome.Unknown
+        assertTrue("profiles must still be carried, got: ${unknown.profiles}", unknown.profiles.any { it.userId == 95 })
+        assertTrue("detail must name post-list drift, got: ${unknown.detail}", unknown.detail.contains("post-list"))
+        assertEquals(1, gateway.listPackagesCount)
+        assertEquals(2, gateway.verboseCount)
+        assertEquals(2, gateway.dumpsysCount)
+        assertEquals(2, gateway.propCount)
+        assertEquals(1, gateway.listUsersCount)
+    }
+
+    // ChannelError 0-ident lock: `pm list users` itself fails (exit 1) ->
+    // RefreshOutcome.ChannelError, and no identity/list channel is probed.
+    @Test
+    fun listUsersFailure_returnsChannelErrorWithZeroIdentityProbes() {
+        val gateway = FakeGateway(listUsersExit = 1)
+        val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+        assertTrue("list-users failure must be ChannelError, got: $outcome", outcome is RefreshOutcome.ChannelError)
+        assertTrue("detail must be non-blank, got: '${(outcome as RefreshOutcome.ChannelError).detail}'", outcome.detail.isNotBlank())
+        assertEquals(1, gateway.listUsersCount)
+        assertEquals(0, gateway.verboseCount)
+        assertEquals(0, gateway.dumpsysCount)
+        assertEquals(0, gateway.propCount)
+        assertEquals(0, gateway.listPackagesCount)
     }
 }

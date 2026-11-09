@@ -1,19 +1,19 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
 // #53 splice-negative tests: refreshLocked runs ONE repo.refreshVerified()
-// (snapshot 1 + typed target 3 + list 1 = 5 commands) and only maps the
-// RefreshOutcome to UiState. There is no second snapshot/triple to splice
-// with, so a mid-refresh 95->96 rebuild or a same-id new serial can never
-// surface as a fictional FRESH pair such as (95, 41): each refresh
-// publishes the single pinned world as a whole, and a parent-drifted
-// identity fails closed (CHANNEL, old list kept, zero list probes).
+// (snapshot 1 + typed target 3 + list 1 + post-list re-verify 3 = 8 commands)
+// and only maps the RefreshOutcome to UiState. FRESH is published only when
+// both triples agree on the strict (id, serial, parentId); an intra-refresh
+// 95->96 rebuild or same-id new serial fails closed (CHANNEL, old list kept,
+// never a fictional (95, 41) FRESH pair), and a parent-drifted identity
+// fails closed with zero list probes.
 //
 // Harness mirrors RemoveConfirmStageCTest (Unconfined Main + IO poll).
 // Fixture is call-order scripted (ScriptedGateway pattern: every listUsers
 // call consumes one snap entry, every identity call consumes one ident
 // entry; exhausted scripts repeat the last value fail-safe) -- never a
 // global R+N threshold. Scripts are refilled AFTER init settles, so each
-// refresh phase consumes exactly: 1 snap + 3 idents + 1 packages.
+// refresh phase consumes exactly: 1 snap + 6 idents + 1 packages.
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope
@@ -199,8 +199,8 @@ class RefreshSpliceNegativeTest {
     }
 
     // Happy path guard: a stable (95, 15) world still publishes
-    // FRESH(95, 15), consuming exactly one snapshot + one triple + one
-    // list probe (5 commands) -- never a second snapshot for re-verify.
+    // FRESH(95, 15), consuming exactly one snapshot + two triples + one
+    // list probe (8 commands) -- never a second snapshot for re-verify.
     @Test
     fun splice_singleSnapshot_stillFresh() {
         val gw = SpliceGateway(
@@ -215,7 +215,7 @@ class RefreshSpliceNegativeTest {
         val listBefore = gw.listPackagesCalls
         reachFresh95(gw, vm, serial = 15)
         assertEquals("refresh must take exactly one snapshot", 1, gw.listUsersCalls - listUsersBefore)
-        assertEquals("refresh must take exactly one identity triple", 3, gw.identCalls - identsBefore)
+        assertEquals("refresh must take two identity triples (first + post-list re-verify)", 6, gw.identCalls - identsBefore)
         assertEquals("refresh must list exactly once", 1, gw.listPackagesCalls - listBefore)
     }
 
@@ -398,6 +398,93 @@ class RefreshSpliceNegativeTest {
         )
         assertEquals("zero installs on rebuild, got: ${gw.installCalls}", 0, gw.installCalls)
         assertEquals("zero uninstalls on rebuild, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
+    }
+
+    // Intra-refresh serial flip (95,15 -> 95,41 between the first triple and
+    // the post-list re-verify): the post-list fence must fail closed with
+    // CHANNEL_ERROR/CHANNEL, old cloned kept, never FRESH, zero writes.
+    // SpliceGateway flip hook: first 3 ident calls see the old incarnation,
+    // the re-verify triple sees the new one.
+    @Test
+    fun splice_midRefreshSerialFlip_failClosed() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(95 to mutableSetOf("com.example.chat")),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        // Single refresh where identity flips mid-refresh (triple->list):
+        // first triple (95,15), list on 95, re-verify (95,41).
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(3) { IdentSpec(95, 15) } + List(30) { IdentSpec(95, 41) }))
+        val identsBefore = gw.identCalls
+        val listBefore = gw.listPackagesCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertFalse("mid-refresh serial flip must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertEquals(DiagnoseCode.CHANNEL_ERROR, s.diagnose?.code)
+        assertTrue(
+            "detail must name post-list drift, got: ${s.diagnose?.techDetail}",
+            (s.diagnose?.techDetail ?: "").contains("post-list"),
+        )
+        assertTrue(
+            "VM must not clear the old cloned list on fence fail, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertEquals("zero installs on fence fail, got: ${gw.installCalls}", 0, gw.installCalls)
+        assertEquals("zero uninstalls on fence fail, got: ${gw.uninstallCalls}", 0, gw.uninstallCalls)
+        assertEquals("flip must run both triples", 6, gw.identCalls - identsBefore)
+        assertEquals("exactly one list probe", 1, gw.listPackagesCalls - listBefore)
+    }
+
+    // Intra-refresh id flip (95 -> 96 between the first triple and the
+    // post-list re-verify): same fail-closed shape, never FRESH(95,15).
+    @Test
+    fun splice_midRefreshIdFlip_failClosed() {
+        val gw = SpliceGateway(
+            snaps = snapsOf(95),
+            idents = stable95(),
+            pkgsByUser = mutableMapOf(
+                95 to mutableSetOf("com.example.chat"),
+                96 to mutableSetOf("com.example.chat"),
+            ),
+        )
+        val vm = makeVm(gw)
+        awaitVm(vm) { vm.state.value.channelReady }
+        reachFresh95(gw, vm, serial = 15)
+
+        gw.snaps.clear()
+        gw.snaps.addAll(snapsOf(95))
+        gw.idents.clear()
+        gw.idents.addAll(ArrayDeque(List(3) { IdentSpec(95, 15) } + List(30) { IdentSpec(96, 41) }))
+        val identsBefore = gw.identCalls
+        val listBefore = gw.listPackagesCalls
+        vm.refresh()
+        awaitVm(vm) { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
+
+        val s = vm.state.value
+        assertFalse("mid-refresh id flip must never be FRESH, got: $s", s.inventory.freshness == InventoryFreshness.FRESH)
+        assertEquals(MsgKind.CHANNEL, s.msgKind)
+        assertTrue(
+            "VM must keep the old cloned list, got: ${s.cloned}",
+            s.cloned.contains("com.example.chat"),
+        )
+        assertEquals(95, s.inventory.targetId)
+        assertEquals(15, s.inventory.targetSerial)
+        assertEquals(0, gw.installCalls)
+        assertEquals(0, gw.uninstallCalls)
+        assertEquals("flip must run both triples", 6, gw.identCalls - identsBefore)
+        assertEquals("exactly one list probe", 1, gw.listPackagesCalls - listBefore)
     }
 
     // Resolution without a serial (SerialUnavailable shape: id confirmed,

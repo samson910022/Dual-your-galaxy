@@ -1776,15 +1776,20 @@ class DualRepository(
     }
 
     // Single-target refresh (Phase D P2-D, issue #21; single-snapshot
-    // rule #53): exactly one profilesSnapshot() (1 cmd) then one
-    // resolveDualTargetTyped() (3 cmds: verbose + dumpsys + property) then
-    // one listProbe(target.userId) (1 cmd, no re-resolution) = 5 commands
-    // total (was 9 via the old resolve-then-reverify listing path). Single
-    // snapshot + single triple + single listing throughout, so the VM sees
-    // one consistent (id, serial, parentId) pin: a 95->96 rebuild or a
-    // same-id new-serial splice can never be published as a fictional
-    // FRESH pair, because there is no second snapshot/triple to splice
-    // with. ChannelError early-returns; a typed Absent maps to NoDual
+    // rule #53) with a post-list continuity fence: exactly one
+    // profilesSnapshot() (1 cmd) then one resolveDualTargetTyped()
+    // (3 cmds: verbose + dumpsys + property), snapshot containment check,
+    // one listProbe(target.userId) (1 cmd), then a second
+    // resolveDualTargetTyped() with the same pmIds (3 cmds) re-verifying
+    // identity after the list = 8 commands total. GroundTruth (FRESH) is
+    // published only when both triples agree on the strict triple
+    // (userId, serial, parentId) null-sensitively; any post-list drift
+    // (id/serial/parent change, Confirmed<->SerialUnavailable flip,
+    // Absent/Unknown on re-verify) fails closed to Unknown (keep the old
+    // list, never NoDual/FRESH), never a fictional (oldSerial, newList)
+    // FRESH pair. The remaining window is re-verify->publish (VM hop, no
+    // I/O): display converges on the next refresh, writes still
+    // re-verify. ChannelError early-returns; a typed Absent maps to NoDual
     // (profiles still carried for display), except an empty snapshot
     // (Absent + empty -> Unknown: a bare absence is never NoDual from an
     // untrustworthy empty snapshot). A typed Unknown (refused /
@@ -1792,23 +1797,24 @@ class DualRepository(
     // veto) maps to Unknown (fail closed, keep the old list); likewise a
     // Confirmed or SerialUnavailable id missing from the pm snapshot
     // (not-in-snapshot -> Unknown, never NoDual) keeps the old list.
-    // Otherwise GroundTruth with cloned null when the list channel fails. The
-    // GroundTruth target always carries the resolver's true parentId
-    // (== 0 by policy, never a hardcoded null), so a disagreeing parent
-    // can only surface as Unknown here -- never as a FRESH listing on a
-    // drifted identity.
+    // Otherwise GroundTruth with cloned null when the list channel fails
+    // and the fence passes. The GroundTruth target always carries the
+    // resolver's true parentId (== 0 by policy, never a hardcoded null),
+    // so a disagreeing parent can only surface as Unknown here -- never
+    // as a FRESH listing on a drifted identity.
     suspend fun refreshVerified(): RefreshOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RefreshOutcome.ChannelError(snap.detail)
         val profiles = (snap as ProfilesSnapshot.Loaded).profiles
-        return when (val resolution = resolveDualTargetTyped(pmIds = profiles.map { it.userId }.toSet())) {
+        val pmIds = profiles.map { it.userId }.toSet()
+        return when (val resolution = resolveDualTargetTyped(pmIds = pmIds)) {
             is DualTargetResolution.Confirmed -> {
                 val typed = resolution.target
                 if (profiles.none { it.userId == typed.userId }) {
                     RefreshOutcome.Unknown(profiles, "confirmed id missing from pm snapshot")
                 } else {
                     val target = VerifiedTarget(typed.userId, typed.serial, typed.parentId)
-                    RefreshOutcome.GroundTruth(profiles, target, listProbe(typed.userId))
+                    listFenceResult(profiles, target, pmIds)
                 }
             }
             is DualTargetResolution.SerialUnavailable -> {
@@ -1818,7 +1824,7 @@ class DualRepository(
                     // Serial not pinnable: pin (id, null, true parentId);
                     // the listing still runs on this single id only.
                     val target = VerifiedTarget(resolution.userId, null, resolution.parentId)
-                    RefreshOutcome.GroundTruth(profiles, target, listProbe(resolution.userId))
+                    listFenceResult(profiles, target, pmIds)
                 }
             }
             is DualTargetResolution.Absent -> {
@@ -1830,6 +1836,50 @@ class DualRepository(
             }
             is DualTargetResolution.Unknown -> RefreshOutcome.Unknown(profiles, resolution.detail)
         }
+    }
+
+    // Post-list continuity fence (shared by Confirmed/SerialUnavailable):
+    // listProbe then a strict null-sensitive triple re-verify with the
+    // same pmIds. Pinned (id, serial?, parentId) must equal the re-verify
+    // triple exactly: Confirmed == Confirmed with equal (id, serial,
+    // parent), or SerialUnavailable == SerialUnavailable with equal
+    // (id, null, parent). Any mismatch, Absent/Unknown, id/serial/parent
+    // change, or Confirmed<->SerialUnavailable flip fails closed to
+    // Unknown (profiles carried, detail names post-list drift / identity
+    // changed before/after list) -- never NoDual/FRESH on re-verify.
+    private suspend fun listFenceResult(
+        profiles: List<DualProfile>,
+        pinned: VerifiedTarget,
+        pmIds: Set<Int>,
+    ): RefreshOutcome {
+        val listed = listProbe(pinned.userId)
+        val reverify = resolveDualTargetTyped(pmIds = pmIds)
+        val matched = when (reverify) {
+            is DualTargetResolution.Confirmed ->
+                reverify.target.userId == pinned.userId &&
+                    reverify.target.serial == pinned.serial &&
+                    reverify.target.parentId == pinned.parentId
+            is DualTargetResolution.SerialUnavailable ->
+                reverify.userId == pinned.userId &&
+                    pinned.serial == null &&
+                    reverify.parentId == pinned.parentId
+            is DualTargetResolution.Absent -> false
+            is DualTargetResolution.Unknown -> false
+        }
+        if (matched) return RefreshOutcome.GroundTruth(profiles, pinned, listed)
+        val reDetail = when (reverify) {
+            is DualTargetResolution.Confirmed ->
+                "confirmed(id=${reverify.target.userId},serial=${reverify.target.serial},parent=${reverify.target.parentId})"
+            is DualTargetResolution.SerialUnavailable ->
+                "serial-unavailable(id=${reverify.userId},parent=${reverify.parentId})"
+            is DualTargetResolution.Absent -> "absent"
+            is DualTargetResolution.Unknown -> "unknown(${reverify.detail})"
+        }
+        return RefreshOutcome.Unknown(
+            profiles,
+            "post-list identity drift: identity changed before/after list " +
+                "(pinned=(id=${pinned.userId},serial=${pinned.serial},parent=${pinned.parentId}), reverify=$reDetail)",
+        )
     }
 
     // Unknown-after-send discriminator (PR-32 P1-1 timeout, extended by P1-2
