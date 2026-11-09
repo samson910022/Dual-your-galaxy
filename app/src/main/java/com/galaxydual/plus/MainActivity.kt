@@ -102,9 +102,10 @@ import rikka.shizuku.Shizuku
 
 // Stage1 批次建立兩步確認請求快照（Activity 本地狀態，不經 VmState）。
 // 沿用 remove ack 的世代契約：每次點擊 batchBtn 產生新世代，ack 綁世代保留
-// （同世代旋轉保留、跨世代重置）；confirm 才呼叫 vm.cloneSelected()，
-// VM 的 isWritable/起始 pin 守衛完全不變（此處只做 UI 門控與訊息呈現）。
+// （同世代旋轉保留、跨世代重置）；confirm 才呼叫 vm.cloneSelected(approved)，
+// VM 在鎖內驗證「核准快照(keys+target) == live/pin」後才寫入（PR64 P1）。
 private data class BatchConfirmRequest(
+    val selectedKeys: Set<String>,
     val count: Int,
     val targetId: Int,
     val targetSerial: Int,
@@ -163,6 +164,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var batchBtn: Button
     // Stage1：sticky bottom bar 的勾選數文字（「已選 N 項」），與主 CTA 永遠可見。
     private lateinit var batchSelCountView: TextView
+    // P2：sticky bar 內簡短狀態/原因（捲動時仍可見），點擊可捲至詳細結果。
+    private lateinit var batchBarStatusView: TextView
     // Stage1：sticky bottom bar 容器（只在雙開應用頁顯示；Engine 頁隱藏，見 switchTab）。
     private lateinit var batchBar: LinearLayout
     private lateinit var batchResultView: TextView
@@ -405,22 +408,28 @@ class MainActivity : ComponentActivity() {
                 null
             }
         // Stage1 批次建立確認：請求快照隨 Activity 存活保留（同世代旋轉重現對話框）。
+        // PR64 P1：keys 缺失（舊狀態）fail-closed，不恢復可授權的快照。
         if (savedInstanceState != null && savedInstanceState.containsKey(KEY_BATCH_REQ_GEN)) {
             val generation = savedInstanceState.getLong(KEY_BATCH_REQ_GEN)
-            pendingBatchRequest = BatchConfirmRequest(
-                count = savedInstanceState.getInt(KEY_BATCH_REQ_COUNT),
-                targetId = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_ID),
-                targetSerial = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_SERIAL),
-                generation = generation,
-            )
-            batchGeneration = generation
-            batchAcknowledged = savedInstanceState.getBoolean(KEY_BATCH_ACK)
-            batchAcknowledgedGeneration =
-                if (savedInstanceState.containsKey(KEY_BATCH_ACK_GEN)) {
-                    savedInstanceState.getLong(KEY_BATCH_ACK_GEN)
-                } else {
-                    null
-                }
+            val restoredKeys = savedInstanceState.getStringArrayList(KEY_BATCH_REQ_KEYS)?.toSet()
+            val restoredCount = savedInstanceState.getInt(KEY_BATCH_REQ_COUNT)
+            if (restoredKeys != null && restoredKeys.isNotEmpty() && restoredKeys.size == restoredCount) {
+                pendingBatchRequest = BatchConfirmRequest(
+                    selectedKeys = restoredKeys,
+                    count = restoredCount,
+                    targetId = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_ID),
+                    targetSerial = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_SERIAL),
+                    generation = generation,
+                )
+                batchGeneration = generation
+                batchAcknowledged = savedInstanceState.getBoolean(KEY_BATCH_ACK)
+                batchAcknowledgedGeneration =
+                    if (savedInstanceState.containsKey(KEY_BATCH_ACK_GEN)) {
+                        savedInstanceState.getLong(KEY_BATCH_ACK_GEN)
+                    } else {
+                        null
+                    }
+            }
         }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
@@ -496,6 +505,7 @@ class MainActivity : ComponentActivity() {
         if (acknowledgedGeneration != null) outState.putLong(KEY_REMOVE_ACK_GEN, acknowledgedGeneration!!)
         // Stage1 批次建立確認：請求快照隨旋轉保留（同世代重現對話框，跨世代重置）。
         pendingBatchRequest?.let { req ->
+            outState.putStringArrayList(KEY_BATCH_REQ_KEYS, ArrayList(req.selectedKeys))
             outState.putInt(KEY_BATCH_REQ_COUNT, req.count)
             outState.putInt(KEY_BATCH_REQ_TARGET_ID, req.targetId)
             outState.putInt(KEY_BATCH_REQ_TARGET_SERIAL, req.targetSerial)
@@ -1560,13 +1570,20 @@ class MainActivity : ComponentActivity() {
         // 捲動。門控沿用 batchEnabled(s)，禁用原因仍由 batchResultView/writeBlockView
         // 顯示（見 renderSourceList/render）。
         batchBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(getColor(R.color.oneui_surface))
             minimumHeight = dp(56)
             val pad = dp(12)
             setPadding(pad, dp(6), pad, dp(6))
             elevation = dp(4).toFloat()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+        }
+        val batchBarRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1581,8 +1598,29 @@ class MainActivity : ComponentActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         )
-        batchBar.addView(batchSelCountView)
-        batchBar.addView(batchBtn)
+        batchBarRow.addView(batchSelCountView)
+        batchBarRow.addView(batchBtn)
+        batchBarStatusView = TextView(this).apply {
+            visibility = View.GONE
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            // 不設 POLITE：避免與 batchResultView 雙重播報；仍可聚焦/點擊前往詳情。
+            isClickable = true
+            isFocusable = true
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(2) }
+            setOnClickListener {
+                if (::tabAppsScroll.isInitialized && ::batchResultView.isInitialized) {
+                    tabAppsScroll.post { tabAppsScroll.smoothScrollTo(0, batchResultView.top) }
+                }
+            }
+        }
+        batchBar.addView(batchBarRow)
+        batchBar.addView(batchBarStatusView)
         root.addView(batchBar)
 
         // ================= Bottom Navigation Bar =================
@@ -3579,9 +3617,12 @@ class MainActivity : ComponentActivity() {
         // 與 batchEnabled 同一 UI 門控（fail-closed）；按鈕本身已禁用，此為縱深。
         if (!batchEnabled(s)) return
         val serial = s.inventory.targetSerial ?: return
+        val approvedKeys = s.selectedKeys.toSet()
+        if (approvedKeys.isEmpty()) return
         batchGeneration += 1
         val request = BatchConfirmRequest(
-            count = s.selectedKeys.size,
+            selectedKeys = approvedKeys,
+            count = approvedKeys.size,
             targetId = s.inventory.targetId,
             targetSerial = serial,
             generation = batchGeneration,
@@ -3607,9 +3648,15 @@ class MainActivity : ComponentActivity() {
             batchAcknowledged = false
             batchAcknowledgedGeneration = null
         }
+        // P2：STALE/非即時驗證時不得宣稱「已驗證目標」；VM 執行前仍會再次 pin。
+        val messageTemplate = if (s.inventory.freshness == InventoryFreshness.FRESH) {
+            R.string.batch_confirm_message
+        } else {
+            R.string.batch_confirm_message_stale
+        }
         val message = buildBatchConfirmMessage(
-            template = getString(R.string.batch_confirm_message),
-            count = request.count,
+            template = getString(messageTemplate),
+            count = request.selectedKeys.size,
             targetId = request.targetId,
             targetSerial = request.targetSerial,
         )
@@ -3646,19 +3693,36 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             batchAcknowledged = checked
             batchAcknowledgedGeneration = if (checked) request.generation else null
-            updateBatchConfirmEnabled(s)
+            // P2：勿用建構當下的 stale UiState；以 live 狀態重算 enablement。
+            val live = try { vm.state.value } catch (_: Exception) { s }
+            updateBatchConfirmEnabled(live)
         }
         batchConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 確定性路徑：重讀 live 狀態（busy/可寫/目標），不賴 stale 參數。
+            // 確定性路徑：重讀 live 狀態並核對「已確認快照」(keys+target+世代)，再交由 VM 鎖內二次驗證。
             val cur = try {
                 vm.state.value
             } catch (_: Exception) {
                 null
             }
-            if (cur != null && canConfirmBatch(cur, batchAcknowledged)) {
+            val pending = pendingBatchRequest
+            val snapshotMatches = cur != null && pending != null &&
+                pending.generation == request.generation &&
+                cur.inventory.targetId == request.targetId &&
+                cur.inventory.targetSerial == request.targetSerial &&
+                cur.selectedKeys == request.selectedKeys
+            if (cur != null && snapshotMatches && canConfirmBatch(cur, batchAcknowledged)) {
+                val approved = ApprovedBatchCloneRequest(
+                    targetId = request.targetId,
+                    targetSerial = request.targetSerial,
+                    selectedKeys = request.selectedKeys,
+                )
                 // 確認後立即關閉，由狀態列/清單呈現執行進度；VM 結果不復委對話框。
                 cancelBatchConfirm()
-                vm.cloneSelected()
+                vm.cloneSelected(approved)
+            } else if (cur != null) {
+                // 快照/狀態不符：fail-closed，同步對話框（重建或取消），不執行。
+                syncBatchDialog(pendingBatchRequest, cur)
+                updateBatchConfirmEnabled(cur)
             }
         }
         batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
@@ -3693,14 +3757,17 @@ class MainActivity : ComponentActivity() {
             return
         }
         val liveSerial = s.inventory.targetSerial
+        val liveKeys = s.selectedKeys.toSet()
+        // PR64 P1：任一 key/目標變動（含同數量換選取）即重建並清 ack，不得沿用舊核准。
         if (s.inventory.targetId != request.targetId ||
             liveSerial != request.targetSerial ||
-            s.selectedKeys.size != request.count
+            liveKeys != request.selectedKeys
         ) {
             // verifiedTargetAvailable 已保證 serial 非 null 且勾選非空；此處顯式不變式。
             val verifiedSerial = checkNotNull(liveSerial) { "verified target missing serial" }
             val regenerated = request.copy(
-                count = s.selectedKeys.size,
+                selectedKeys = liveKeys,
+                count = liveKeys.size,
                 targetId = s.inventory.targetId,
                 targetSerial = verifiedSerial,
                 generation = request.generation + 1,
@@ -4215,6 +4282,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
             lastBatchResultText = newBatchText
+        }
+        // P2：sticky bar 鏡像簡短原因/結果，捲動時仍可見（無額外播報，避免雙重 POLITE）。
+        if (::batchBarStatusView.isInitialized) {
+            try {
+                if (newBatchText.isBlank()) {
+                    batchBarStatusView.visibility = View.GONE
+                    batchBarStatusView.text = ""
+                    batchBarStatusView.contentDescription = null
+                } else {
+                    batchBarStatusView.text = newBatchText
+                    batchBarStatusView.contentDescription = newBatchText
+                    batchBarStatusView.visibility = View.VISIBLE
+                }
+            } catch (_: Exception) {
+                // Best effort.
+            }
         }
         val key = buildSourceListKey(s)
         if (key == lastSourceListKey) {
@@ -4840,7 +4923,8 @@ class MainActivity : ComponentActivity() {
         // 移除確認勾選綁定世代保留鍵：同世代旋轉保留，跨世代重置；Neutral 不重置。
         private const val KEY_REMOVE_ACK = "removeAck"
         private const val KEY_REMOVE_ACK_GEN = "removeAckGen"
-        // Stage1 批次建立兩步確認旋轉保留鍵：請求快照（數量/目標/世代）＋勾選世代。
+        // Stage1 批次建立兩步確認旋轉保留鍵：請求快照（keys/數量/目標/世代）＋勾選世代。
+        private const val KEY_BATCH_REQ_KEYS = "batchReqKeys"
         private const val KEY_BATCH_REQ_COUNT = "batchReqCount"
         private const val KEY_BATCH_REQ_TARGET_ID = "batchReqTargetId"
         private const val KEY_BATCH_REQ_TARGET_SERIAL = "batchReqTargetSerial"
@@ -5380,6 +5464,18 @@ internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable:
 // 起始 pin 守衛保留為縱深。
 internal fun canConfirmBatch(s: UiState, acknowledged: Boolean): Boolean =
     batchEnabled(s) && acknowledged
+
+// PR64 P1：已確認快照與 live 狀態不一致（同數量換選取亦算）即視為失效，須重建/清 ack。
+internal fun batchRequestMatchesLive(
+    requestKeys: Set<String>,
+    requestTargetId: Int,
+    requestTargetSerial: Int,
+    live: UiState,
+): Boolean =
+    requestKeys.isNotEmpty() &&
+        requestKeys == live.selectedKeys &&
+        requestTargetId == live.inventory.targetId &&
+        requestTargetSerial == live.inventory.targetSerial
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
