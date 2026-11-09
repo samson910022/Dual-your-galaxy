@@ -3524,7 +3524,12 @@ class DualViewModel(
     //   (opId=batch:clone);取消 (CancellationException) 直接重拋,不寫
     //   partial,僅靠 finally 釋放 inFlight key (B3)。
     // - cloned 只加入 Success 確認的包 (與單筆 clone 一致的 fail-closed)。
-    fun cloneSelected() {
+    // PR64 P1：approved 為使用者確認快照（keys＋targetId＋targetSerial）。
+    // 非 null 時 VM 在 opMutex 內驗證「核准快照 == live 勾選/目標」且
+    // 起始 pin 目標一致後才寫入，任一不符即拒絕（零裝置寫入），關閉
+    // confirm→mutex 競態與同數量換選取誤執行。UI 確認路徑必傳 approved；
+    // null 僅保留給既有測試/非確認呼叫（以呼叫當下 live 快照執行）。
+    internal fun cloneSelected(approved: ApprovedBatchCloneRequest? = null) {
         viewModelScope.launch {
             // B1 鎖外快照:僅做早拒 (空選取) 用,不作為執行依據。
             val outerKeys = _state.value.selectedKeys.toList()
@@ -3547,7 +3552,30 @@ class DualViewModel(
                 opMutex.withLock {
                     if (!isWritable()) return@withLock
                     // B1 鎖內重讀:以此快照為執行唯一依據 (鎖外僅早拒)。
-                    val lockedKeys = _state.value.selectedKeys.toList()
+                    val liveState = _state.value
+                    val lockedKeys = liveState.selectedKeys.toList()
+                    // PR64 P1：確認路徑必驗證「核准快照 == live 勾選/目標」；不符即拒絕（零寫入）。
+                    if (approved != null) {
+                        val liveTargetOk =
+                            liveState.inventory.targetId == approved.targetId &&
+                                liveState.inventory.targetSerial == approved.targetSerial
+                        val liveKeysOk = liveState.selectedKeys == approved.selectedKeys
+                        if (!liveTargetOk || !liveKeysOk || approved.selectedKeys.isEmpty()) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    batchReport = null,
+                                    diagnose = diagnoseEvent(
+                                        DiagnoseCode.VERIFY_MISMATCH,
+                                        techDetail = "batch approval mismatch: selection/target changed",
+                                    ),
+                                    msg = "批次請求已過期：勾選或目標已變更，請重新確認",
+                                    msgKind = MsgKind.INVALID,
+                                )
+                            }
+                            return@withLock
+                        }
+                    }
                     if (lockedKeys.isEmpty()) {
                         _state.update {
                             it.copy(
@@ -3558,9 +3586,11 @@ class DualViewModel(
                         }
                         return@withLock
                     }
-                    val catalogByKey = _state.value.sourceCatalog.associateBy { it.appKey }
+                    val catalogByKey = liveState.sourceCatalog.associateBy { it.appKey }
                     // 確定順序:包名升冪 (catalog 缺失的 key 排最後,按 key 比)。
-                    val ordered = lockedKeys.sortedWith(
+                    // approved 非 null 時僅執行核准集合（已驗證與 live 相符）。
+                    val executionKeys = if (approved != null) approved.selectedKeys.toList() else lockedKeys
+                    val ordered = executionKeys.sortedWith(
                         compareBy(
                             { catalogByKey[it]?.packageName ?: it },
                             { it },
@@ -3674,6 +3704,29 @@ class DualViewModel(
                         (pinned as? DualTargetResult.Confirmed)?.let {
                             SelectionTarget(it.target.userId, it.target.serial)
                         }
+                    // PR64 P1：pin 結果必須與核准目標一致（防執行期目標漂移）。
+                    if (approved != null && expectedTarget != null &&
+                        (expectedTarget.id != approved.targetId || expectedTarget.serial != approved.targetSerial)
+                    ) {
+                        _state.update { cur ->
+                            cur.copy(
+                                loading = false,
+                                batchReport = null,
+                                inventory = cur.inventory.copy(
+                                    freshness = InventoryFreshness.STALE,
+                                    targetId = expectedTarget.id,
+                                    targetSerial = expectedTarget.serial,
+                                ),
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.VERIFY_MISMATCH,
+                                    techDetail = "batch approval target mismatch vs pin",
+                                ),
+                                msg = "批次請求已過期：目標已變更，請重新確認",
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
                     if (expectedTarget == null) {
                         // 起始即無 verified target（NoDual）：整批拒絕，不碰裝置
                         //（除上行 pin＋此處鑑別用 snapshot，無 install）。
@@ -5666,6 +5719,14 @@ fun hookNeutralRoute(hasRoot: Boolean, hasShizuku: Boolean): Privilege =
 // PR-37 Phase B #2：marker 與綁定皆為 (id, serial) 配對（見 SelectionTarget），
 // 哨兵 id 取 -2、serial 取 null。
 private const val SELECTION_RESTORE_ID_NONE = -2
+
+// PR64 P1：UI 已確認的批次快照（VM 在 opMutex 內驗證相符後才寫入）。
+// selectedKeys 為不可變集合快照；target 為確認當下已驗證目標 (id, serial)。
+internal data class ApprovedBatchCloneRequest(
+    val targetId: Int,
+    val targetSerial: Int,
+    val selectedKeys: Set<String>,
+)
 
 // 選取目標身份：verified dualId＋平台 serial 配對（PR-37 Phase B #2 serial 綁定）。
 // serial null＝id-only（legacy 快照恢復或 serial 不可用時的殘留）；與完全體

@@ -60,6 +60,7 @@
     <!-- Stage1: two-step batch confirmation (mirrors remove ack pattern: generation + checkbox + target summary + risk). -->
     <string name="batch_confirm_title">Confirm clone creation</string>
     <string name="batch_confirm_message">Warning: this creates one clone for each checked app; clones use extra storage and may affect battery and performance. Clone data is separate from the main profile, and some apps may not work correctly.\nTo create: %1$d clones\nVerified target: user %2$d, serial %3$d\nYou must check the confirmation box below to enable Create.</string>
+    <string name="batch_confirm_message_stale">Warning: this creates one clone for each checked app; clones use extra storage and may affect battery and performance. Clone data is separate from the main profile, and some apps may not work correctly.\nTo create: %1$d clones\nLast identified target (will be re-verified before execution): user %2$d, serial %3$d\nYou must check the confirmation box below to enable Create.</string>
     <string name="batch_confirm_positive">Create</string>
     <string name="batch_confirm_acknowledge">I have read the warning and verified the target user, serial and count above.</string>
     <string name="shizuku_listener_failed">Shizuku listener registration failed: %1$s</string>

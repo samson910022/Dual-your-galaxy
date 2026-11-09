@@ -253,6 +253,29 @@ class UiSemanticsP28P2Test {
         assertTrue(text.contains("serial 7"))
     }
 
+    // PR64 P1：同數量換選取 (A→B) 必須視為快照失效；目標變更亦然。
+    @Test
+    fun batchRequestMatchesLive_sameCountDifferentKeys_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.b"))
+        assertFalse(
+            batchRequestMatchesLive(
+                requestKeys = setOf("1:com.example.a"),
+                requestTargetId = 10,
+                requestTargetSerial = 1,
+                live = s,
+            ),
+        )
+    }
+
+    @Test
+    fun batchRequestMatchesLive_targetOrExactKeysChange_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 11, 1, s))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 2, s))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a", "1:com.example.b"), 10, 1, s))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, s))
+    }
+
     // ---- P2-1 isWriteBlockDuplicate ----
 
     @Test

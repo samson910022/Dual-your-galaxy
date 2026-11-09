@@ -314,6 +314,7 @@ class UiSemanticsP28Test {
             "batch_target_unavailable",
             "batch_confirm_title",
             "batch_confirm_message",
+            "batch_confirm_message_stale",
             "batch_confirm_positive",
             "batch_confirm_acknowledge",
         )
@@ -425,12 +426,19 @@ class UiSemanticsP28Test {
                 en.getValue("batch_confirm_message").contains("Verified target") &&
                 en.getValue("batch_confirm_message").contains("check the confirmation box below"),
         )
-        // 格式佔位：batch_confirm_message 依序帶入 count/userId/serial（Locale.ROOT）。
+        // 格式佔位：batch_confirm_message(_stale) 依序帶入 count/userId/serial（Locale.ROOT）。
         for ((locale, map) in listOf("zh" to zh, "en" to en, "hant" to hant)) {
-            val msg = map.getValue("batch_confirm_message")
-            assertTrue("$locale batch_confirm_message needs %1\$d", msg.contains("%1\$d"))
-            assertTrue("$locale batch_confirm_message needs %2\$d", msg.contains("%2\$d"))
-            assertTrue("$locale batch_confirm_message needs %3\$d", msg.contains("%3\$d"))
+            for (key in listOf("batch_confirm_message", "batch_confirm_message_stale")) {
+                val msg = map.getValue(key)
+                assertTrue("$locale $key needs %1\$d", msg.contains("%1\$d"))
+                assertTrue("$locale $key needs %2\$d", msg.contains("%2\$d"))
+                assertTrue("$locale $key needs %3\$d", msg.contains("%3\$d"))
+            }
+            assertTrue(
+                "$locale stale batch confirm must not claim 已驗證目標/Verified target",
+                !map.getValue("batch_confirm_message_stale").contains("已驗證目標") &&
+                    !map.getValue("batch_confirm_message_stale").contains("Verified target"),
+            )
         }
         assertTrue(
             "batch_selected_count plural must exist in zh/en",
