@@ -138,4 +138,20 @@ class IconSizingPolicyTest {
         assertEquals(1, clampSnapshotPx(100, 0))
         assertEquals(1, clampSnapshotPx(100, -5))
     }
+
+    // 高 DPI：36dp 在 6.0 density 下 dpPx=216，需 cap 至 192；同密度下
+    // ImageView layout 的 36dp 仍為 216（JVM 不對 layout 限位，僅快照限位，
+    // 區分 snapshot bounds 與 layout 尺寸）。
+    @Test
+    fun clampSnapshotPx_highDensityCapsSnapshotButNotLayout() {
+        assertEquals(216, dpPx(36, 6.0f))
+        assertEquals(192, clampSnapshotPx(dpPx(36, 6.0f), 192))
+        assertEquals(192, clampSnapshotPx(216, 192))
+        assertEquals(144, dpPx(24, 6.0f))
+        assertEquals(144, clampSnapshotPx(dpPx(24, 6.0f), 192))
+        assertEquals(126, dpPx(36, 3.5f))
+        assertEquals(126, clampSnapshotPx(dpPx(36, 3.5f), 192))
+        assertEquals(95, dpPx(36, 2.625f))
+        assertEquals(95, clampSnapshotPx(dpPx(36, 2.625f), 192))
+    }
 }
