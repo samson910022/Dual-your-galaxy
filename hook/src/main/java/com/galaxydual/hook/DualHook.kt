@@ -104,12 +104,16 @@ class DualHook : XposedModule() {
         // Hook whitelist query methods only; install/remove paths are never hooked.
         var installed = 0
         for (methodName in SERVICE_WHITELIST_METHODS) {
-            val overloads = target.declaredMethods.filter { it.name == methodName }
-            if (overloads.isEmpty()) {
-                logi("method not found: ${target.name}#$methodName")
-                continue
+            try {
+                val overloads = target.declaredMethods.filter { it.name == methodName }
+                if (overloads.isEmpty()) {
+                    logi("method not found: ${target.name}#$methodName")
+                    continue
+                }
+                overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) installed++ }
+            } catch (t: Throwable) {
+                logi("hook lookup failed: ${target.name}#$methodName: ${t.message}")
             }
-            overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) installed++ }
         }
         return installed
     }
@@ -190,9 +194,13 @@ class DualHook : XposedModule() {
         // method names are unknown, so narrowing the match could miss the real
         // query. Install logging is best-effort, and signatures the shared policy
         // does not understand stay observe-only (see WhitelistPolicy.apply).
-        target.declaredMethods
-            .filter { it.name.contains("hitelist", ignoreCase = true) }
-            .forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + it.name)) installed++ }
+        try {
+            target.declaredMethods
+                .filter { it.name.contains("hitelist", ignoreCase = true) }
+                .forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + it.name)) installed++ }
+        } catch (t: Throwable) {
+            logi("hook *hitelist* sweep failed on ${target.name}: ${t.message}")
+        }
         return installed
     }
 
@@ -222,7 +230,7 @@ class DualHook : XposedModule() {
             } catch (_: Throwable) {
                 continue
             }
-            logi("using ${target.name} for daagent query hooks")
+            var classInstalled = 0
             for (methodName in DAAGENT_QUERY_METHOD_NAMES) {
                 val overloads = try {
                     target.declaredMethods.filter { it.name == methodName }
@@ -232,7 +240,11 @@ class DualHook : XposedModule() {
                 if (overloads.isEmpty()) {
                     continue
                 }
-                overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) installed++ }
+                overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) classInstalled++ }
+            }
+            if (classInstalled > 0) {
+                logi("using ${target.name} for daagent query hooks (+$classInstalled)")
+                installed += classInstalled
             }
         }
         if (installed == 0) {
