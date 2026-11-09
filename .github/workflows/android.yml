@@ -35,6 +35,10 @@ jobs:
           cache: gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-includes: |
+            caches
+            wrapper/dists
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -75,6 +79,10 @@ jobs:
       # fixes the version, so runner preinstalled updates cannot change it.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-includes: |
+            caches
+            wrapper/dists
       # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
       - name: YAML syntax check (python)
         run: |
