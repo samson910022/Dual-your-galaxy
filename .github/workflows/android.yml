@@ -35,6 +35,15 @@ jobs:
           cache: gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-includes: |
+            caches
+            wrapper/dists
+      # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip so transient 504s don't fail the job.
+      - name: Warm Gradle wrapper
+        run: |
+          chmod +x ./gradlew
+          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -46,7 +55,9 @@ jobs:
           api-level: 29
           arch: x86_64
           disable-animations: true
-          script: ./gradlew :app:connectedDebugAndroidTest --no-daemon
+          script: |
+            # Retry on 504: gradle-8.7-bin.zip download may transiently 504
+            for i in 1 2 3; do ./gradlew :app:connectedDebugAndroidTest --no-daemon && break; echo "attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
       - name: Upload instrumentation reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -75,6 +86,15 @@ jobs:
       # fixes the version, so runner preinstalled updates cannot change it.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-includes: |
+            caches
+            wrapper/dists
+      # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip so transient 504s don't fail the job.
+      - name: Warm Gradle wrapper
+        run: |
+          chmod +x ./gradlew
+          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
       # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
       - name: YAML syntax check (python)
         run: |
@@ -426,6 +446,15 @@ jobs:
           cache: gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-home-cache-includes: |
+            caches
+            wrapper/dists
+      # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip so transient 504s don't fail the job.
+      - name: Warm Gradle wrapper
+        run: |
+          chmod +x ./gradlew
+          for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -440,11 +469,14 @@ jobs:
           disable-animations: true
           script: |
             chmod +x ./gradlew
+            # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip
+            for i in 1 2 3; do ./gradlew --version && break; echo "wrapper warmup attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
             adb shell input keyevent 82 || true
             adb shell input keyevent 224 || true
             adb shell wm dismiss-keyguard || true
             sleep 2
-            ./gradlew :app:connectedDebugAndroidTest --no-daemon
+            # Retry on 504: gradle-8.7-bin.zip download may transiently 504
+            for i in 1 2 3; do ./gradlew :app:connectedDebugAndroidTest --no-daemon && break; echo "attempt $i failed, sleep 15"; sleep 15; [ $i -eq 3 ] && exit 1; done
       - name: Record tested APK provenance
         if: always()
         run: |
