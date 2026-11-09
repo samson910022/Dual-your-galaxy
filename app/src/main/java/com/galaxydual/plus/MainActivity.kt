@@ -2152,10 +2152,10 @@ class MainActivity : ComponentActivity() {
                 layoutParams = FrameLayout.LayoutParams(dp(CLONED_ICON_DP), dp(CLONED_ICON_DP)).apply {
                     gravity = Gravity.CENTER
                 }
-                // p26-2 Phase 1：與來源列行為一致，尺寸由 layout 固定為 36dp。
-                // 選 FIT_CENTER：不中心裁切，避免 adaptive icon 安全區／圓角邊緣被
-                // CENTER_CROP 吃掉；36dp 方形框均勻容納完整圖形。禁止 view 自行繞
-                // wrap 尺寸，確保不同 intrinsic 尺寸貼進去同樣大。
+                // p26-2 Phase 1 / Phase 3 註解修正：ImageView 預設即 FIT_CENTER /
+                // adjustViewBounds=false / cropToPadding=false，三行顯式聲明防未來誤改 wrap；
+                // layout 固定 36dp 方形框。方形 view + 方形 intrinsic 時 FIT==CROP，本處無裁切；
+                // mask／圓角不自動套用；adaptive safe zone 由 bounds 內等比縮放保證。
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 adjustViewBounds = false
                 cropToPadding = false
@@ -3938,6 +3938,11 @@ class MainActivity : ComponentActivity() {
                     // Phase 3 P2 a11y: 48dp touch target via minimumHeight
                     // (height stays WRAP_CONTENT so large fonts grow).
                     minimumHeight = dp(48)
+                    // p26-2 Phase 3：顯式 8dp compound padding，固定 24dp 圖示與文字／勾選框間距，
+                    // 避免 OEM 預設漂移；只改 compound padding，不動行高／基線。
+                    setCompoundDrawablePadding(dp(8))
+                    // TODO(RTL, pre-existing)：現用絕對 setCompoundDrawables（左圖），未來如需鏡像可改
+                    // setCompoundDrawablesRelative；本 PR 不改。
                 }
                 requestIcon(entry.packageName, entry.appKey, box)
                 box.setOnCheckedChangeListener { _, checked ->
@@ -4049,6 +4054,10 @@ class MainActivity : ComponentActivity() {
     // setBounds 拋出時直接回 sizePx 透明占位（保持統一尺寸），絕不回傳 0 尺寸不可見圖。
     // 為何不快取 sized 版：需 appKey+sizePx 聯合鍵，避免雙尺寸共用實例覆蓋 bounds；
     // 目前每次 newDrawable 共享 Bitmap 不翻倍，故不快取。
+    // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 108dp 安全區 66%，
+    // 24dp bounds 實際 glyph 約 16dp，與 legacy 仍差約 33%；若需 glyph 等大需對 adaptive 特殊放大。
+    // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
+    // 行高 48dp／44dp 容器兜底。
     private fun sizedIcon(drawable: Drawable, sizePx: Int): Drawable {
         if (sizePx <= 0) return freshIconDrawable(drawable)
         val copied: Drawable? = try {
@@ -4372,12 +4381,16 @@ class MainActivity : ComponentActivity() {
         // PR-7 P2 (#26):圖示 Drawable 有界快取上限 (顯示用,不參與身分鍵)。
         private const val MAX_ICON_CACHE = 200
 
-        // p26-2 統一圖標尺寸（圖形尺寸與容器尺寸分開定義，勿混用）：
+        // p26-2 統一圖示尺寸（圖形尺寸與容器尺寸分開定義，勿混用）：
         // SOURCE_ICON_DP = 來源 CheckBox 左圖圖形 24dp（setBounds 強制）、
         // CLONED_ICON_DP = 分身 ImageView 圖形 36dp（layout 固定）、
         // ICON_CONTAINER_DP = 2144 行分身列左圖外框 FrameLayout 44dp（容器，非圖形）。
         // 圖形尺寸都經 dp() 轉 px；CheckBox 另以 setBounds 強制，避免各 App 原生
         // intrinsic 尺寸（density/adaptive icon）不一導致忽大忽小。
+        // adaptive 局限：bounds 統一（24/36）≠ 可見 glyph 統一；AdaptiveIconDrawable 108dp 安全區 66%，
+        // 24dp bounds 實際 glyph 約 16dp，與 legacy 仍差約 33%；若需 glyph 等大需對 adaptive 特殊放大。
+        // 目前按 bounds 統一收斂，視覺走查確認。24 vs 36 取捨：來源 24dp 密度高、分身 36dp 獨立位圖、
+        // 行高 48dp／44dp 容器兜底。
         private const val SOURCE_ICON_DP = 24
         private const val CLONED_ICON_DP = 36
         private const val ICON_CONTAINER_DP = 44
