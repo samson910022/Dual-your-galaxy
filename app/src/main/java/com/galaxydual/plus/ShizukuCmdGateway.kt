@@ -62,7 +62,7 @@ import rikka.shizuku.Shizuku
 // only, no independent completeness bit; adding one is a wire break, so the
 // truncated flag travels as marker text inside the streams).
 // The client re-derives truncated from the core TRUNCATION_MARKER via
-// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 (SERVICE_VERSION = 5): the
+// decodeExecReply() below. Marker semantics v2 + v3 + v4 + v5 + v6 (SERVICE_VERSION = 6): the
 // service appends the marker whenever the capture is truncated (cap, read
 // error, or join expiry -- see capped() / buildResult() in SuCmdGateway.kt),
 // so every truncated=true result carries detectable text (review Phase B,
@@ -70,7 +70,7 @@ import rikka.shizuku.Shizuku
 // a read-error / join-expiry path returned exit=0 partial package lines (or
 // clean empty) with NO marker, which a new client decodes as truncated=false.
 // v2 = whenever-truncated marker with ungated EXEC (prior contract, kept
-// accurate here -- marker behavior unchanged in v3/v4/v5). v3 = v2 marker plus
+// accurate here -- marker behavior unchanged in v3/v4/v5/v6). v3 = v2 marker plus
 // owner-uid EXEC gate (below); v3 invalidates ungated v2 resident services.
 // v4 = v3 marker+gate with appId normalization (auth code changed; C2):
 // the gate now strips the user offset before the AID_APP_START comparison,
@@ -80,6 +80,12 @@ import rikka.shizuku.Shizuku
 // the gate now caps appId at 19999 (AID_APP_LAST), so SDK sandbox
 // (20000-29999) and isolated (99000-99999) appIds stay denied regardless
 // of user; v5 invalidates v4 resident services.
+// v6 = v5 marker+gate with parcel-null guards + post-spawn catch marker
+// (service code changed): the service rejects null/blank wire cmds without
+// spawning, the client maps null reply strings to transportUnknown (never
+// clean-empty), and both post-spawn catch branches append "\n$TRUNCATION_MARKER"
+// so the local truncated=true flag crosses the frozen (int, String, String)
+// wire honestly as marker text; v6 invalidates v5 resident services.
 // Upgrade gap closed at the deployment layer: UserServiceArgs
 // .version(SERVICE_VERSION) forces Shizuku/Sui to rebuild the resident
 // UserService on upgrade (official UserServiceArgs.version(int) contract:
@@ -95,8 +101,9 @@ import rikka.shizuku.Shizuku
 // return means Shizuku accepted the removal and attempted the ONEWAY
 // DESTROY, NOT a synchronous PID-death proof (void unbind, no wait).
 // SERVICE_VERSION is
-// 5 (D2 bumped it for the appId upper bound); the version bump remains the
-// invalidation signal.
+// 6 (v6 bumped it for parcel-null guards + the post-spawn catch marker;
+// service-side capture/encode/auth code changed so the daemon must rebuild);
+// the version bump remains the invalidation signal.
 // Device upgrade verification (S24 real-device item, NOT JVM-testable: the
 // android.os.Parcel / Binder round-trip is a framework stub on the JVM):
 //   1. install the old APK and start the resident UserService (v1);
@@ -111,7 +118,10 @@ import rikka.shizuku.Shizuku
 //      (e.g. user 10 app 1010234).
 //   6. (v4 -> v5) confirm appIds > 19999 are denied (e.g. 20000 SDK sandbox,
 //      99000 isolated) and appId 19999 succeeds.
-//   7. (legacy v2 -> v5, no Shizuku restart) record the old fixed-tag v2
+//   7. (v5 -> v6) confirm a null/blank wire cmd is rejected as bad request
+//      without spawning, and a post-spawn exception arrives WITH the
+//      truncation marker (truncated=true -> Unknown, never TrustedFull).
+//   8. (legacy v2 -> v6, no Shizuku restart) record the old fixed-tag v2
 //      PID/binder, upgrade, trigger one run(), then verify that old PID /
 //      binder is actually dead (not only that unbind returned) before
 //      claiming the ungated daemon is revoked; include v12 (cleanup-then-
@@ -147,25 +157,43 @@ object ShizukuExecProtocol {
     // Wire-frozen denied reply for foreign callers (exit=1, out="", err=this).
     // The onTransact auth gate writes it without reading/executing the cmd.
     const val DENIED_FOREIGN_CALLER = "denied: foreign caller"
+    // Phase C1 cmd length bound (wire-neutral, no SERVICE_VERSION bump --
+    // still 6): rejects oversize wire cmds pre-spawn (service) and pre-bind
+    // (client) as a definite bad request (exit=1, no flags, never sent).
+    // Headroom check: every legitimate PmOutputParser builder output is a
+    // few hundred chars at most -- package input is capped at 256 chars
+    // (MAX_PACKAGE_INPUT_CHARS) by the VM, so buildInstallExisting /
+    // buildUninstall are <~300 chars even with a 10-digit dual id, the
+    // fixed identity commands (CMD_LIST_USERS etc.) are <30 chars, and the
+    // only direct gateway.run caller outside DualRepository is
+    // HookStateProvider's `cat <fixed marker path>` (<100 chars). The
+    // retained buildGrant/buildAppOpsSet builders have no production
+    // caller. 4096 chars is >10x the legitimate bound, so no legitimate
+    // command is rejected, while a corrupt/malicious Parcel cannot force
+    // an unbounded `sh -c` string.
+    const val MAX_CMD_CHARS = 4096
     // UserService implementation version. v1 = cap-only marker (old service
     // semantics); v2 = whenever-truncated marker (prior capture contract,
     // EXEC ungated); v3 = v2 marker plus owner-uid EXEC gate; v4 = v3
     // marker+gate with appId normalization; v5 = v4 marker+gate with appId
-    // upper bound (current contract). Bump whenever
+    // upper bound; v6 = v5 marker+gate with parcel-null guards + post-spawn
+    // catch marker (current contract). Bump whenever
     // the service-side capture/encode/auth code changes: Shizuku requires a
     // different version code on service-code updates so the daemon (default
     // true) rebuilds the UserService instead of reusing the resident old
-    // one -- v5 therefore invalidates v4 resident services (appId upper
-    // bound), as v4 invalidated v3 resident services (full-UID gate) and
-    // v3 invalidated ungated v2 resident services. The bind tag is
+    // one -- v6 therefore invalidates v5 resident services (parcel-null
+    // guards + post-spawn catch marker), as v5 invalidated v4 resident
+    // services (appId upper bound), v4 invalidated v3 resident services
+    // (full-UID gate) and v3 invalidated ungated v2 resident services. The bind tag is
     // per-UID derived ("GalaxyDualExec-v1-u<callerUid>", see
     // galaxyExecServiceTag); the legacy fixed tag "GalaxyDualExec-v1" is
     // retained only as LEGACY_GALAXY_EXEC_TAG for cleanup/documentation and
     // is NOT bound. Its old service record is removed by the D1 migration
     // on the first successful run() (retryable); if cleanup never succeeds
-    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 5 (D2 bumped it for the
-    // appId upper bound; auth code changed so the daemon must rebuild).
-    const val SERVICE_VERSION = 5
+    // until restart, the orphan sits inert (daemon restart reaps). SERVICE_VERSION is 6 (v6 bumped it for
+    // parcel-null guards + the post-spawn catch marker; service-side
+    // capture/encode code changed so the daemon must rebuild).
+    const val SERVICE_VERSION = 6
 }
 
 // UID decomposition consts (Phase C2). Literals, not android.os imports,
@@ -354,18 +382,184 @@ internal fun decodeExecReply(exit: Int, out: String, err: String): CmdResult =
         truncated = out.contains(TRUNCATION_MARKER) || err.contains(TRUNCATION_MARKER),
     )
 
-// Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
-// err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
-// paths log it locally in DEBUG builds only). Delegates to
-// encodeExecReply() so the frozen (int, String, String) layout stays
-// single-sourced with the service reply path.
-private fun writeDenied(reply: Parcel?) {
-    val (exit, out, err) = encodeExecReply(
-        CmdResult(1, "", ShizukuExecProtocol.DENIED_FOREIGN_CALLER),
-    )
-    reply?.writeInt(exit)
-    reply?.writeString(out)
-    reply?.writeString(err)
+// Pure request-side validation (JVM-testable): Parcel.readString() is nullable
+// and a null/blank wire cmd must never spawn `sh -c ""` (empty shell would
+// exit 0 and be misjudged as a successful empty command). Returns a definite
+// bad-request CmdResult (exit=1, no timedOut/transportUnknown: pre-spawn,
+// never sent) for null/blank, null for a usable command. GatewayAssemblyTest
+// pins null/blank -> bad request.
+// Retained blank-only for compatibility: production gates (handleExecRequest
+// and ShizukuCmdGateway.run) use badRequestForCommand below, which adds the
+// Phase C1 length check on top of this blank check. Keeping this helper
+// blank-only preserves its existing pin (incl. the 8000-char pass-through
+// in validEdgeCases) instead of silently redefining it.
+internal fun badRequestForBlankCommand(raw: String?): CmdResult? =
+    if (raw == null || raw.isBlank()) {
+        CmdResult(exit = 1, out = "", err = "bad request: blank command")
+    } else {
+        null
+    }
+
+// Pure request-side validation with the Phase C1 length bound
+// (JVM-testable, wire-neutral, no SERVICE_VERSION bump -- still 6):
+// null/blank -> "bad request: blank command" (via badRequestForBlankCommand
+// above), length > ShizukuExecProtocol.MAX_CMD_CHARS (4096) ->
+// "bad request: command too long ...", else null. Both bad-request shapes
+// are pre-spawn definite failures (exit=1, out="", no timedOut /
+// transportUnknown / truncated, and no backstop prefix) so the repository
+// never treats them as possibly sent. Length is the raw String length
+// (chars), checked after the blank check so a long whitespace-only cmd
+// still reports as blank. GatewayAssemblyTest / ShizukuExecHandleTest pin
+// the 4096-pass / 4097-reject boundary.
+internal fun badRequestForCommand(raw: String?): CmdResult? {
+    badRequestForBlankCommand(raw)?.let { return it }
+    // raw is non-null/non-blank here by the check above; use a smart-cast
+    // local instead of `!!` so a helper-contract regression cannot NPE.
+    // Fail-closed on a helper-contract regression: never return null (which
+    // would let a null/blank/oversize command pass as "no bad request") --
+    // mirror the blank bad-request shape with a self-contained CmdResult so
+    // the guard does not depend on badRequestForBlankCommand's contract.
+    val nonBlank = raw ?: return CmdResult(exit = 1, out = "", err = "bad request: blank command")
+    if (nonBlank.length > ShizukuExecProtocol.MAX_CMD_CHARS) {
+        return CmdResult(
+            exit = 1,
+            out = "",
+            err = "bad request: command too long (length ${nonBlank.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})",
+        )
+    }
+    return null
+}
+
+// Pure nullable-reply decode (JVM-testable): Parcel.readString() is nullable;
+// folding null to "" would forge a clean-empty reply (exit 0 + empty streams
+// parses as TrustedFull) for a post-dispatch reply loss, so null is
+// transportUnknown (timedOut=false, transportUnknown=true -> repository
+// reconciles read-only via verifyListProbe, never a definite failure or
+// auto resend). Non-null delegates verbatim to decodeExecReply(), so the
+// marker -> truncated logic above is unaffected. GatewayAssemblyTest pins
+// null out/err -> transportUnknown and non-null marker round-trip.
+internal fun decodeExecReplyNullable(exit: Int, out: String?, err: String?): CmdResult =
+    if (out == null || err == null) {
+        ShizukuExecErrors.transportUnknown("null reply string (exit=$exit, outNull=${out == null}, errNull=${err == null})")
+    } else {
+        decodeExecReply(exit, out, err)
+    }
+
+// Pure post-spawn failure mapping (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump, side effects still pending instrumentation): the
+// service-side catch around captureProcess after spawn started. Extracted 1:1
+// from GalaxyExecService.onTransact's Phase 1 generic catch direct
+// CmdResult construction -- exit=1, out="", err="service exec failed: ..."
+// plus "\n$TRUNCATION_MARKER" tail marker, truncated=true,
+// transportUnknown=true. The marker is what crosses the frozen
+// (int, String, String) wire honestly (encode drops the local flags, the
+// client re-derives truncated via decodeExecReply); the anchored
+// "service exec failed: " prefix is the wire-frozen backstop the repository
+// matches via isPostSpawnTransportText (fail closed: read-only verify, no
+// resend). Pure: no Parcel/Binder touch, no Thread flag touch -- the
+// interrupt-flag restoration for the Interrupted variant stays on the
+// onTransact call path (see handleExecRequest below), mirroring
+// mapPostDispatchError's purity split. JVM-testable via
+// ShizukuExecHandleTest; the Parcel/Binder round-trip itself stays
+// device-only and is NOT claimed verified by these JVM tests.
+internal fun servicePostSpawnFailure(e: Exception): CmdResult =
+    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+
+// Pure post-spawn Interrupted mapping (Phase B JVM extraction, wire-neutral,
+// no SERVICE_VERSION bump, side effects still pending instrumentation):
+// extracted 1:1 from onTransact's Phase 1 Interrupted catch direct
+// CmdResult construction -- same shape as servicePostSpawnFailure above
+// with the "interrupted: " infix ("service exec failed: interrupted: ...").
+// truncated=true + transportUnknown=true + trailing marker, identical
+// rationale: unified post-spawn unknown capture, never TrustedFull.
+// Pure (see servicePostSpawnFailure): the Thread.currentThread().interrupt()
+// restoration that the original catch performed is NOT in here -- it stays
+// on the binder-thread call path in handleExecRequest (invoked from
+// onTransact) so unit tests calling this mapper on arbitrary threads stay
+// side-effect free.
+internal fun serviceInterruptedFailure(e: InterruptedException): CmdResult =
+    CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+
+// Pure stale-cache drop decision (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump): true iff the transactExec result is a post-dispatch
+// transportUnknown (null-reply decode, transact throw, binder death
+// mid-call). The side effect itself -- dropBindingLocked() under bindMutex
+// so the next run() rebinds fresh -- stays in transactExec; this only
+// decides, so JVM tests pin it without a real binder. Invariant: normal
+// decodeExecReply() never sets transportUnknown, so this fires only for a
+// null-reply transportUnknown; a post-spawn service reply arriving over the
+// wire (binder already alive) never drops here. A null reply string
+// (decodeExecReplyNullable) therefore drops, a normal reply does not.
+// JVM-testable only; the actual rebind stays device-only.
+internal fun shouldDropCachedBinding(result: CmdResult): Boolean = result.transportUnknown
+
+// Pure EXEC request decision (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump, side effects still pending instrumentation): bundles
+// GalaxyExecService.onTransact's EXEC decisions into one JVM-testable seam
+// so onTransact is left with only Parcel read/write wiring. Internal order
+// is the original onTransact order, preserved 1:1:
+//   1. isAllowedCaller(callingUid, expectedAppUid) -> frozen denied reply
+//      (exit=1, out="", err=DENIED_FOREIGN_CALLER) -- the writeDenied
+//      equivalent as a CmdResult; onTransact encodes/writes it via
+//      encodeExecReply, so the frozen (int, String, String) layout stays
+//      single-sourced. The uid is never echoed onto the wire. exec is never
+//      called for a foreign caller.
+//   2. badRequestForCommand(rawCmd) -> definite bad request
+//      (exit=1, no flags, pre-spawn, never sent). exec is never called
+//      for a null/blank wire cmd, so `sh -c ""` can never spawn, nor for
+//      an oversize cmd (Phase C1: length > MAX_CMD_CHARS), so an unbounded
+//      `sh -c` string can never spawn.
+//   3. exec(cmd) with cmd verbatim (no trim/re-quote) -> its CmdResult
+//      returned as-is. Pre-spawn spawn failures are already returned
+//      inside captureProcess as definite failures and never throw here;
+//      any exception ESCAPING exec therefore happened AFTER spawn started
+//      (post-spawn unknown by construction):
+//        - InterruptedException -> Thread.currentThread().interrupt()
+//          restores the flag on the binder thread (the onTransact call
+//          path -- handleExecRequest is invoked from onTransact on that
+//          same thread, so the original catch's flag restoration is
+//          preserved), then serviceInterruptedFailure(e).
+//        - any other Exception (incl. RuntimeException) ->
+//          servicePostSpawnFailure(e).
+// The former onTransact double guard (badRequest helper plus a manual
+// isNullOrBlank Parcel-write fallback) is now helper + self-contained
+// literal double guard: the single helper above plus the pure null
+// fallback below; onTransact keeps only the Parcel read (read-failure ->
+// bad request, which cannot be pure and therefore stays in onTransact)
+// and the encode/write of this result.
+// JVM tests pin auth/bad-request/verbatim/post-spawn mapping here; the
+// Parcel/Binder round-trip, the actual spawn, and the DEBUG denied log
+// stay device-only and are NOT claimed verified by these JVM tests.
+internal fun handleExecRequest(
+    callingUid: Int,
+    expectedAppUid: Int,
+    rawCmd: String?,
+    exec: (String) -> CmdResult,
+): CmdResult {
+    if (!isAllowedCaller(callingUid, expectedAppUid)) {
+        return CmdResult(exit = 1, out = "", err = ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+    }
+    val badRequest = badRequestForCommand(rawCmd)
+    if (badRequest != null) return badRequest
+    // Double guard (self-contained, independent of badRequestForCommand,
+    // wire-neutral, no SERVICE_VERSION bump -- still 6, reachable bytes
+    // unchanged): even though rawCmd is non-null/non-blank and within
+    // MAX_CMD_CHARS here by the badRequestForCommand check above, never rely
+    // solely on the helper contract -- these direct isNullOrBlank / length
+    // checks with literal replies guarantee no null spawn, no `sh -c ""`,
+    // and no oversize spawn if the helper contract ever changes. Strings
+    // are byte-identical to the helper; no helper call, no `!!` here.
+    if (rawCmd.isNullOrBlank()) return CmdResult(exit = 1, out = "", err = "bad request: blank command")
+    if (rawCmd.length > ShizukuExecProtocol.MAX_CMD_CHARS) return CmdResult(exit = 1, out = "", err = "bad request: command too long (length ${rawCmd.length} > ${ShizukuExecProtocol.MAX_CMD_CHARS})")
+    val cmd = rawCmd
+    return try {
+        exec(cmd)
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        serviceInterruptedFailure(e)
+    } catch (e: Exception) {
+        servicePostSpawnFailure(e)
+    }
 }
 
 // Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
@@ -424,6 +618,18 @@ class GalaxyExecService : Binder {
     // denied); pre-v13 servers never reach here (gateway rejects pre-bind).
     private val expectedAppUid: Int
 
+    // Phase B §2 instrumentation injection point (wire-neutral, no
+    // SERVICE_VERSION bump -- still 6): the sole spawn call in onTransact
+    // goes through this fn (the exec lambda passed to handleExecRequest
+    // below wraps it as `sh -c <cmd>`). Production default is the real
+    // blocking captureProcess; androidTest replaces it with a counting
+    // fake so Parcel-level tests can prove spawn==0/1 without ever
+    // spawning a process. Internal: same-module androidTest can see it.
+    // Constructors are unchanged (both must stay public for Shizuku
+    // reflection: Context ctor tried first v13+, default ctor is the
+    // fail-closed sink) -- this var adds no constructor.
+    @Volatile internal var captureProcessFn: (Array<String>, Long) -> CmdResult = ::captureProcess
+
     constructor() : super() {
         expectedAppUid = -1
     }
@@ -477,47 +683,65 @@ class GalaxyExecService : Binder {
                 return true
             }
             ShizukuExecProtocol.TRANSACTION_EXEC -> {
-                // P0 gate: auth runs BEFORE reading the cmd (fail closed, do
-                // no work for a foreign caller; Parcel position is left
-                // unread on deny -- the reply is terminal either way).
+                // Phase B JVM pure extraction (wire-neutral, no SERVICE_VERSION
+                // bump -- still 6, side effects still pending instrumentation):
+                // onTransact is now only Parcel read/write wiring. The EXEC
+                // decision (owner-uid auth gate, null/blank bad request,
+                // verbatim exec, post-spawn backstop) lives in the pure
+                // handleExecRequest() seam above (JVM-tested via
+                // ShizukuExecHandleTest); this branch only reads the raw cmd
+                // and encodes/writes the returned CmdResult. The Parcel/
+                // Binder round-trip itself stays DEVICE-UNVERIFIED and is
+                // NOT claimed verified by the JVM tests.
+                // SERVICE_VERSION history (unchanged): v6 was bumped for the
+                // parcel-null guards plus the post-spawn catch marker -- the
+                // wire layout stays int+String+String and the client never
+                // sends blank, but the daemon must rebuild the resident
+                // UserService so the old service cannot be reused for a
+                // corrupt/malicious Parcel. This extraction changes no
+                // service-side capture/encode/auth behavior, hence no bump.
                 val callingUid = Binder.getCallingUid()
+                // Defense-in-depth early gate (auth-before-read, P0): foreign
+                // callers are denied BEFORE any Parcel read, so a foreign +
+                // corrupt Parcel returns DENIED rather than a bad-request read
+                // exception. Coexists with the isAllowedCaller check inside
+                // handleExecRequest() above (both must pass).
                 if (!isAllowedCaller(callingUid, expectedAppUid)) {
                     if (BuildConfig.DEBUG) Log.w("GalaxyExec", "denied code=$code callingUid=$callingUid")
-                    writeDenied(reply)
+                    val (deniedExit, deniedOut, deniedErr) = encodeExecReply(
+                        CmdResult(exit = 1, out = "", err = ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+                    )
+                    reply?.writeInt(deniedExit)
+                    reply?.writeString(deniedOut)
+                    reply?.writeString(deniedErr)
                     return true
                 }
-                val cmd = try {
-                    data.readString() ?: ""
+                val rawCmd = try {
+                    data.readString()
                 } catch (e: Exception) {
-                    reply?.writeInt(1)
-                    reply?.writeString("")
-                    reply?.writeString("bad request: ${(e.message ?: e.javaClass.simpleName)}")
+                    // Parcel read failure cannot be pure, so it stays here:
+                    // same frozen bad-request shape (exit=1, no flags,
+                    // pre-spawn definite failure), never spawns.
+                    val (readExit, readOut, readErr) = encodeExecReply(
+                        CmdResult(exit = 1, out = "", err = "bad request: ${(e.message ?: e.javaClass.simpleName)}")
+                    )
+                    reply?.writeInt(readExit)
+                    reply?.writeString(readOut)
+                    reply?.writeString(readErr)
                     return true
                 }
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
-                // (binder thread), so call it directly.
-                // Pre-spawn vs post-spawn (Phase A1): spawn failures
-                // ("spawn failed: ...", exec threw, process never started)
-                // are already returned INSIDE captureProcess as definite
-                // failures and never throw here. Any exception ESCAPING
-                // captureProcess therefore happened AFTER spawn started --
-                // the remote pm may have executed -- so this catch is
-                // post-spawn unknown-after-send by construction. The
-                // "service exec failed: " prefix is the wire-frozen backstop:
-                // the (exit, out, err) parcel drops the transportUnknown
-                // flag, so DualRepository.isUnknownAfterSend matches this
-                // anchored text via isPostSpawnTransportText (fail closed:
-                // read-only verify, no resend). Anchoring is exact
-                // (startsWith "service exec failed: ") so normal pm
-                // "Failure [...]" lines (capital F) can never hit.
-                val res = try {
-                    captureProcess(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}", truncated = true, transportUnknown = true)
-                } catch (e: Exception) {
-                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}", transportUnknown = true)
+                // (binder thread), so call it directly via the pure seam.
+                // Pre-spawn vs post-spawn (Phase A1, preserved in
+                // handleExecRequest/servicePostSpawnFailure/
+                // serviceInterruptedFailure): spawn failures are already
+                // returned INSIDE captureProcess as definite failures and
+                // never throw here; any exception escaping exec is post-spawn
+                // unknown-after-send by construction ("service exec failed: "
+                // backstop + trailing marker, truncated/transportUnknown).
+                val res = handleExecRequest(callingUid, expectedAppUid, rawCmd) { cmd ->
+                    captureProcessFn(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
@@ -549,6 +773,16 @@ interface ShizukuBindDriver {
 
     fun send(onResult: (Result<IBinder>) -> Unit): Request
 }
+
+// P2 generation token (Phase A third round): the Request handle is the
+// per-bind generation. The daemon may hand back the same IBinder instance
+// for a fresh bind (e.g. ShizukuBinderParcelTest.FakeBindDriver reuses one
+// binder across sends), so binder identity alone cannot tell a stale
+// transact failure from a fresh binding -- the Request must match too.
+internal data class BoundBinder(
+    val binder: IBinder,
+    val request: ShizukuBindDriver.Request,
+)
 
 // Legacy fixed-tag migration seam (Phase D1, P1 legacy fixed-tag cleanup):
 // removes the pre-Phase-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG).
@@ -589,7 +823,7 @@ private val legacyCleanupNoOpConnection = object : ServiceConnection {
 // ONLY the legacy fixed tag (NO processNameSuffix/version -- a minimal args
 // pair that addresses the old record; suffix/version would scope it to a
 // different identity and miss). remove=true drops the resident record so the
-// first per-UID v5 bind starts clean; unbinding an already-gone record is a
+// first per-UID v6 bind starts clean; unbinding an already-gone record is a
 // normal idempotent return. Throws propagate to the gateway's retry wrapper.
 private class RealShizukuLegacyCleaner(
     private val packageName: String,
@@ -613,7 +847,7 @@ private class RealShizukuBindDriver(
         val args = Shizuku.UserServiceArgs(
             ComponentName(packageName, serviceClassName),
             // Tag is per-UID derived via galaxyExecServiceTag(callerUid)
-            // (full caller uid, stable); SERVICE_VERSION (5) remains the
+            // (full caller uid, stable); SERVICE_VERSION (6) remains the
             // invalidation signal that forces Shizuku/Sui to rebuild the
             // resident UserService on upgrade (see ShizukuExecProtocol).
         ).processNameSuffix("dualexec").version(ShizukuExecProtocol.SERVICE_VERSION).tag(galaxyExecServiceTag(callerUid))
@@ -720,6 +954,9 @@ class ShizukuCmdGateway(
     // Bound lazily on first run(); process-lifetime cache (close() unbinds).
     // Once closed=true the gateway never caches again (fail closed).
     private val bindMutex = Mutex()
+    // Invariant: cachedBinder and cachedRequest are promoted/cleared
+    // together (both set on a successful bind, both nulled by
+    // dropBindingLocked), so they are either both null or both non-null.
     private var cachedBinder: IBinder? = null
     private var cachedRequest: ShizukuBindDriver.Request? = null
     // Phase B P2-2: set by close()/abandon(), read by every lock holder.
@@ -729,6 +966,15 @@ class ShizukuCmdGateway(
 
     override suspend fun run(cmd: String): CmdResult =
         withContext(Dispatchers.IO) {
+            // Phase C1 client early bad-request (wire-neutral, no bump):
+            // blank / oversize cmds are rejected before ping/bind with the
+            // same definite bad-request shape the service returns
+            // (exit=1, out="", no flags, never sent). This intentionally
+            // skips the legacy fixed-tag cleanup below -- the cleanup flag
+            // stays incomplete, so the next legitimate run() performs it
+            // (retryable by design, Phase E1/F1); a blank/oversize cmd must
+            // never trigger bind/transact nor be needed to complete cleanup.
+            badRequestForCommand(cmd)?.let { return@withContext it }
             // Order (Phase F1): ping -> permission -> version read ->
             // cleanup (fail-closed, only if the server has the UserService
             // API) -> version reject (if <13) -> bind. Pre-flight: no
@@ -752,7 +998,7 @@ class ShizukuCmdGateway(
 
             // Legacy fixed-tag cleanup, BLOCKING fail-closed (Phase E1/F1):
             // the one-time removal runs BEFORE the v13 reject and before the
-            // first per-UID v5 bind, but ONLY when the server actually has
+            // first per-UID v6 bind, but ONLY when the server actually has
             // the UserService API (version >= MIN_USERSERVICE_VERSION=10).
             // A non-cancellation failure returns a definite
             // legacyCleanupFailed refusal here (no bind/cache/transact, cache
@@ -780,14 +1026,14 @@ class ShizukuCmdGateway(
 
             if (!isSupportedShizukuVersion(version)) return@withContext ShizukuExecErrors.unsupportedVersion(version)
             // No dropBindingLocked here (nothing bound by this call; must not cache)
-            val binder = try {
+            val bound = try {
                 boundBinder()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 return@withContext ShizukuExecErrors.bindFailed(e.message ?: e.javaClass.simpleName)
             } ?: return@withContext ShizukuExecErrors.bindFailed("null binder")
 
-            transactExec(binder, cmd)
+            transactExec(bound, cmd)
         }
 
     // Returns the live service binder, binding on first use (mutex-guarded
@@ -807,13 +1053,23 @@ class ShizukuCmdGateway(
     // latch and never triggers a second unbind. A promoted (cached) request
     // is released exactly once by the later close()/abandon()/drop path, so
     // success and failure releases never overlap (no double-unbind).
-    internal suspend fun boundBinder(): IBinder? =
+    internal suspend fun boundBinder(): BoundBinder? =
         bindMutex.withLock {
             if (closed.get()) {
                 dropBindingLocked()
                 throw IllegalStateException("shizuku gateway closed")
             }
-            cachedBinder?.let { if (it.isBinderAlive) return@withLock it else dropBindingLocked() }
+            // Invariant: cachedBinder and cachedRequest are assigned together
+            // (promotion below) and cleared together (dropBindingLocked), so
+            // they are either both null or both non-null; the null-checks below
+            // avoid `!!` without changing that contract.
+            cachedBinder?.let { b ->
+                if (b.isBinderAlive) {
+                    cachedRequest?.let { r -> return@withLock BoundBinder(b, r) }
+                } else {
+                    dropBindingLocked()
+                }
+            }
             val latch = CompletableDeferred<IBinder>()
             val request: ShizukuBindDriver.Request = try {
                 resolvedDriver.send { result ->
@@ -836,7 +1092,7 @@ class ShizukuCmdGateway(
                 cachedRequest = request
                 cachedBinder = binder
                 promoted = true
-                binder
+                BoundBinder(binder, request)
             } finally {
                 if (!promoted) {
                     try {
@@ -851,7 +1107,7 @@ class ShizukuCmdGateway(
     // One-time legacy fixed-tag cleanup (Phase D1, P1 legacy fixed-tag
     // migration; Phase E1 fail-closed/F2 per-call outcome): removes the
     // pre-C1 ungated v2 resident record (LEGACY_GALAXY_EXEC_TAG) before the
-    // first per-UID v5 bind. The run() call site sits after ping/permission/
+    // first per-UID v6 bind. The run() call site sits after ping/permission/
     // version-read and before the <13 reject (see run() for the conditional
     // cleanup-before-reject rationale), so this assumes the caller already
     // passed ping/permission; it runs on Dispatchers.IO (inside run()'s
@@ -942,7 +1198,7 @@ class ShizukuCmdGateway(
     // the deadline, owns its Parcel pair (recycled in finally below); its
     // late reply is discarded, never applied to state -- the await future's
     // late value is dropped and touches no shared holder.
-    // dropBindingLocked() on the timeout path additionally guarantees the
+    // dropBindingIfSameLocked() on the timeout path additionally guarantees the
     // next run() rebinds fresh instead of reusing the timed-out handle.
     // A delivered write is never blindly resent by this gateway.
     //
@@ -954,9 +1210,9 @@ class ShizukuCmdGateway(
     // transportUnknown=true) for read-only reconciliation, NEVER a definite
     // failure. Only the pre-transact liveness refusal above (command never
     // sent) stays binderDead() -> definite failure.
-    private suspend fun transactExec(binder: IBinder, cmd: String): CmdResult {
-        if (!binder.isBinderAlive) {
-            bindMutex.withLock { dropBindingLocked() }
+    private suspend fun transactExec(bound: BoundBinder, cmd: String): CmdResult {
+        if (!bound.binder.isBinderAlive) {
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             return ShizukuExecErrors.binderDead()
         }
         return try {
@@ -965,7 +1221,7 @@ class ShizukuCmdGateway(
                 val reply = Parcel.obtain()
                 try {
                     data.writeString(cmd)
-                    binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
+                    bound.binder.transact(ShizukuExecProtocol.TRANSACTION_EXEC, data, reply, 0)
                     // No readException(): the service writes a raw int exit
                     // first, which readException would misread as an
                     // exception code on any non-zero exit.
@@ -977,18 +1233,40 @@ class ShizukuCmdGateway(
                     // so parsers can tell "clean empty" from "cut off"
                     // without changing any caller.
                     val execExit = reply.readInt()
-                    val execOut = reply.readString() ?: ""
-                    val execErr = reply.readString() ?: ""
-                    decodeExecReply(execExit, execOut, execErr)
+                    // Null reply strings are post-dispatch reply loss, NOT
+                    // clean-empty: decodeExecReplyNullable maps them to
+                    // transportUnknown (timedOut=false, transportUnknown=true
+                    // -> read-only verifyListProbe). Never fold to "" here,
+                    // which would forge exit=0 + empty as TrustedFull.
+                    // Non-null still delegates to decodeExecReply(), so the
+                    // marker -> truncated logic is unaffected.
+                    val execOut = reply.readString()
+                    val execErr = reply.readString()
+                    decodeExecReplyNullable(execExit, execOut, execErr)
                 } finally {
                     reply.recycle()
                     data.recycle()
                 }
             }
-            out ?: run {
-                bindMutex.withLock { dropBindingLocked() }
+            val result = out ?: run {
+                bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
                 ShizukuExecErrors.timedOut()
             }
+            // Null-reply transportUnknown (decodeExecReplyNullable above) is
+            // a transport-loss failure path like the catch branches below:
+            // drop the stale cache so the next run() rebinds fresh. Only
+            // this path returns transportUnknown from inside the block, so
+            // this check never drops on a normal reply. Invariant: decodeExecReply
+            // never sets transportUnknown, so this drop fires only for a null
+            // reply; a post-spawn service reply arriving over the wire means the
+            // binder is already alive and never drops here. The decision is
+            // the pure shouldDropCachedBinding() seam (Phase B JVM extraction,
+            // wire-neutral, no bump); the drop side effect stays here under
+            // bindMutex.
+            if (shouldDropCachedBinding(result)) {
+                bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
+            }
+            result
         } catch (e: CancellationException) {
             // Intentionally no dropBindingLocked() on the cancel path: the
             // orphan transact still owns the old handle but the driver serves
@@ -1004,7 +1282,7 @@ class ShizukuCmdGateway(
             // service may have executed, so transportUnknown via the pure
             // mapPostDispatchError() (JVM-pinned), never a definite failure.
             Thread.interrupted()
-            bindMutex.withLock { dropBindingLocked() }
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             mapPostDispatchError(e)
         } catch (e: Exception) {
             // Post-dispatch by construction (transact RemoteException, binder
@@ -1012,7 +1290,7 @@ class ShizukuCmdGateway(
             // the service may have executed pm with no reply to judge, so
             // reconcile read-only via the pure mapPostDispatchError()
             // (JVM-pinned) instead of claiming definite failure.
-            bindMutex.withLock { dropBindingLocked() }
+            bindMutex.withLock { dropBindingIfSameLocked(bound.binder, bound.request) }
             mapPostDispatchError(e)
         }
     }
@@ -1030,6 +1308,27 @@ class ShizukuCmdGateway(
             } catch (_: Exception) {
             }
         }
+    }
+
+    // Identity-checked stale-cache drop (Phase C1 hardening, P2 generation
+    // token: the Request is the per-bind generation, wire-neutral, no
+    // SERVICE_VERSION bump -- still 6): only clears the cache when the
+    // cached binder AND request are still the exact instances the failing
+    // transactExec call used (=== identity), never a newer binding bound
+    // by a concurrent call that raced in while this transact was in
+    // flight -- even when the newer binding reuses the same binder
+    // instance with a fresh Request (ABA). An unconditional drop here
+    // could clear a fresh binding (and release its request) that this
+    // stale call never owned, forcing a needless rebind / churn.
+    // Caller must hold bindMutex (same contract as dropBindingLocked);
+    // internal so JVM tests can pin the identity decision (via boundBinder
+    // + a fake driver, quiescent) without a real binder. Only the five
+    // transactExec failure paths use this; close()/releaseBinding()/
+    // abandon()/boundBinder() keep the unconditional dropBindingLocked()
+    // (terminal/soft release and the bind path are not stale-race drops).
+    internal fun dropBindingIfSameLocked(binder: IBinder?, request: ShizukuBindDriver.Request?) {
+        if (cachedBinder !== binder || cachedRequest !== request) return
+        dropBindingLocked()
     }
 
     // Test seam: reports whether a binding is currently cached (acquires the
