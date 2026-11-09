@@ -122,7 +122,7 @@ val privilege: Privilege = when {
    Write replies `timedOut ‖ transportUnknown ‖ isPostSpawnTransportText ‖ isServiceTimeoutText` go verify-first (single bounded read-only `verifyListProbe`, never resend the write).
    Reverse observations are always Unknown (present-after-remove / absent-after-clone never claim StillInstalled/VerifyFailed); before/after pin drift → `VerifyUnknown` (identity-changed).
    `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
-   註（#53）：`DualViewModel.refreshLocked()` 已遷移到 `refreshVerified()` 8 命令單一快照（snapshot 1 ＋ typed target 3 ＋ list 1 ＋ re-verify triple 3），VM 只做 `RefreshOutcome→UiState` 映射，第二次 triple 即 strict-equality fence；pinned target 攜帶真 parentId，parent/serial 漂移 fail-closed。
+   註（#53）：`DualViewModel.refreshLocked()` 已遷移到 `refreshVerified()` 8 命令單一快照（snapshot 1 ＋ typed target 3 ＋ list 1 ＋ re-verify triple 3），VM 只做 `RefreshOutcome→UiState` 映射，第二次 triple 即 strict-equality fence；pinned target 攜帶真 parentId，parent drift fail-closed；serial intra-triple conflict fail-closed, inter-refresh rebuild = whole-world FRESH。 Refresh `Unknown` keeps the old `cloned` list, marks the inventory STALE, and reports `pmReadable=true` (vs `NoDual` which clears `cloned`), refresh no longer emits `VERIFY_MISMATCH` (a rebuild between refreshes publishes the whole new world as FRESH on the next refresh), and `Unknown` has four shapes (typed refusal, confirmed id missing from the pm snapshot, Absent with an empty snapshot, and post-list identity drift).
 
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。

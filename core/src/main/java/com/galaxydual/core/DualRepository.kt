@@ -26,8 +26,9 @@ sealed interface DualTargetResult {
 // triple (verbose/dumpsys/getprop) maps to exactly one of:
 // - Confirmed(target): dual-CLONE consensus on one id (same gates as the
 //   typed id entry) PLUS property corroboration PLUS one agreed serial.
-// - SerialUnavailable(userId): the id is confirmed but no single agreed
-//   serial exists for it (both sides missing, or disagreeing).
+// - SerialUnavailable(userId, parentId): the id is confirmed but no single
+//   agreed serial exists for it (both sides missing, or disagreeing); the
+//   agreed parentId travels with the id so the pinned triple stays true.
 // - Absent: clean channels agree no dual exists (same Absent convergence as
 //   the typed id entry: all-OTHER claims on both sources, identical user
 //   sets, clean no-claim property, pmIds veto passed).
@@ -503,7 +504,8 @@ class DualRepository(
     // candidates so the id and the serial come from one evidence set and can
     // never splice two independent triples into a fictional pair):
     // - Confirmed(target): id confirmed AND one agreed serial.
-    // - SerialUnavailable(id): id confirmed but no agreed serial.
+    // - SerialUnavailable(id, parentId): id confirmed but no agreed serial;
+    //   parentId is the resolver's agreed parent, carried into the pinned triple.
     // - Absent: same convergence as the typed id entry (clean all-OTHER on
     //   both sources, identical user sets, clean no-claim property, pm veto
     //   passed).
@@ -511,8 +513,8 @@ class DualRepository(
     // Never throws except on coroutine cancellation (CancellationException
     // rethrown; InterruptedException restores the flag and maps to Unknown).
     // The legacy resolveDualUserIdTyped / fetchDualTarget entries are
-    // untouched; refreshLocked is the first caller (batch/requestRemove/
-    // confirmRemove fallback triples stay as-is this round).
+    // untouched; called by refreshVerified() (the refreshLocked path);
+    // batch/requestRemove/confirmRemove fallback triples stay as-is.
     // @param pmIds pm 快照戶集合（VM 傳 profiles id 集合；null 表無快照不否決）：
     //   Absent 須另滿足 pmIds==null 或 pmIds 為 verboseIds 子集。
     suspend fun resolveDualTargetTyped(pmIds: Set<Int>? = null): DualTargetResolution {
@@ -925,7 +927,9 @@ class DualRepository(
     }
 
     // Lists the dual profile's actual packages (ground truth for refresh).
-    // Null means unknown: no verified dual profile, channel failure, guard
+    // Retained for tests / explicit-id listing; refresh no longer calls
+    // this (refreshVerified uses listProbe directly). Null means unknown:
+    // no verified dual profile, channel failure, guard
     // refusal, or an untrusted listing (truncated / non-zero /
     // error-semantic / unexpected-format stdout / unexplained stderr:
     // never an authoritative empty). Non-null (possibly empty) is
@@ -957,7 +961,8 @@ class DualRepository(
     // - Unknown: channel failure, guard refusal, id drift/vanish, or untrusted
     //   listing. Callers keep the old display list (fail closed).
     // Reuses the listing-internal fetchVerifiedTarget only; no new gateway
-    // triple is introduced by this type.
+    // triple is introduced by this type. Retained for tests / explicit-id
+    // listing (SerialBreach included); refresh no longer calls it.
     sealed interface ListClonedResult {
         data class Ok(val packages: List<String>) : ListClonedResult
         data class SerialBreach(val fresh: VerifiedTarget?, val reason: String = "") : ListClonedResult
@@ -1775,6 +1780,11 @@ class DualRepository(
         is TrustedList.Unknown -> null
     }
 
+    // Not-in-snapshot gate shared by Confirmed/SerialUnavailable in
+    // refreshVerified below.
+    private fun missingFromSnapshot(profiles: List<DualProfile>, id: Int): Boolean =
+        profiles.none { it.userId == id }
+
     // Single-target refresh (Phase D P2-D, issue #21; single-snapshot
     // rule #53) with a post-list continuity fence: exactly one
     // profilesSnapshot() (1 cmd) then one resolveDualTargetTyped()
@@ -1810,7 +1820,7 @@ class DualRepository(
         return when (val resolution = resolveDualTargetTyped(pmIds = pmIds)) {
             is DualTargetResolution.Confirmed -> {
                 val typed = resolution.target
-                if (profiles.none { it.userId == typed.userId }) {
+                if (missingFromSnapshot(profiles, typed.userId)) {
                     RefreshOutcome.Unknown(profiles, "confirmed id missing from pm snapshot")
                 } else {
                     val target = VerifiedTarget(typed.userId, typed.serial, typed.parentId)
@@ -1818,7 +1828,7 @@ class DualRepository(
                 }
             }
             is DualTargetResolution.SerialUnavailable -> {
-                if (profiles.none { it.userId == resolution.userId }) {
+                if (missingFromSnapshot(profiles, resolution.userId)) {
                     RefreshOutcome.Unknown(profiles, "confirmed id missing from pm snapshot")
                 } else {
                     // Serial not pinnable: pin (id, null, true parentId);
