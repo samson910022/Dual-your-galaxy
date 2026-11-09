@@ -240,18 +240,33 @@ object SamsungProfileAdapter {
         "other", "private", "managed", "secondary", "system",
         "guest", "demo", "restricted", "headless", "car",
     )
+    private val NON_ALNUM = Regex("[^a-z0-9]+")
 
     private fun isKnownOtherBareValue(value: String): Boolean {
         val low = value.lowercase(java.util.Locale.ROOT)
-        // `full.`/`system.` are known categories: direct OTHER (fail-closed
-        // short-circuit is safe here because no unknown `full.`/`system.`
-        // tail may authorize a write; they can only ever be OTHER).
-        if (low.contains("full.") || low.contains("system.")) return true
-        // `profile.` must NOT short-circuit: an unknown profile tail
+        // `full.*`/`system.*` are known non-clone usertype categories
+        // (bare or `android.os.usertype.` FQ): direct OTHER. Prefix/boundary
+        // anchored (never substring) so embedded garbage like `subfull.X`
+        // cannot match. This is authorization-safe (categories can only
+        // ever be OTHER, never CLONE); unknown tails under these categories
+        // still resolve to OTHER by category. `profile.*` must NOT
+        // short-circuit: an unknown profile tail
         // (e.g. `android.os.usertype.profile.FOO_BAR`) is UNKNOWN, never
         // OTHER. Fall through to the tail allowlist check below.
+        val isFullCat = low.startsWith("full.") || low.startsWith("android.os.usertype.full.")
+        val isSystemCat = low.startsWith("system.") || low.startsWith("android.os.usertype.system.")
+        if (isFullCat || isSystemCat) return true
+        // Tail allowlist: accept only for recognized forms (plain bare tail
+        // with no dotted FQ structure, or a known-anchored prefix such as
+        // `android.os.usertype.`/`profile.`). Garbage-prefixed dotted values
+        // (e.g. `xandroid.os.usertype.full.SECONDARY`) must not be rescued
+        // by a known tail token - they stay UNKNOWN (fail-closed).
+        val recognizedForm = !low.contains('.') ||
+            low.startsWith("android.os.usertype.") ||
+            low.startsWith("profile.")
+        if (!recognizedForm) return false
         val tail = low.substringAfterLast('.').trim()
-            .split(Regex("[^a-z0-9]+")).lastOrNull { it.isNotEmpty() } ?: ""
+            .split(NON_ALNUM).lastOrNull { it.isNotEmpty() } ?: ""
         return tail in KNOWN_OTHER_TAILS
     }
 
@@ -559,7 +574,15 @@ object SamsungProfileAdapter {
                 continue
             }
             if (!segClone && segOther) {
-                if (isKnownOtherBareValue(value)) {
+                // A tainted/residual-demoted CLONE token (has a supported clone
+                // token but classifyMention failed it closed) is "known-shape,
+                // not a valid clone" -> OTHER, consistent with the TYPE_LINE
+                // path (never CLONE-authorizing). Only truly unrecognized
+                // categories / unknown tails (no supported clone token) go
+                // through the known-non-clone gate; unknown profile tails like
+                // `profile.FOO_BAR` remain UNKNOWN (fail-closed).
+                val hasCloneToken = profileTokenMatches(value).any { isSupportedCloneToken(it.value) }
+                if (hasCloneToken || isKnownOtherBareValue(value)) {
                     hasOtherSeg = true
                 } else {
                     return ProfileUserType.UNKNOWN
