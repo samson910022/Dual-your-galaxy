@@ -14,6 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -30,32 +32,37 @@ class GalaxyExecConcurrencyTest {
         )
     }
 
-    // tryAcquire caps at the permit count: every permit can be held at once
-    // and the next acquire fails fast (never blocks a Binder thread), then a
-    // single release admits exactly one more.
-    @Test fun serviceGate_tryAcquireCapsAtMaxAndRecovers() {
+    // tryAcquireLease caps at the permit count: every permit can be held at
+    // once and the next acquire fails fast (null, never blocks a Binder
+    // thread), then a single close admits exactly one more.
+    @Test fun serviceGate_tryAcquireLeaseCapsAtMaxAndRecovers() {
         val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
         assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
-        val acquired = mutableListOf<Boolean>()
-        repeat(SERVICE_EXEC_MAX_CONCURRENT) { acquired += gate.tryAcquire() }
-        assertTrue("every permit must acquire, got $acquired", acquired.all { it })
+        val leases = mutableListOf<ServiceExecGate.Lease>()
+        repeat(SERVICE_EXEC_MAX_CONCURRENT) {
+            val lease = gate.tryAcquireLease()
+            assertNotNull("every permit must acquire", lease)
+            leases += lease!!
+        }
         assertEquals(0, gate.availablePermits())
-        assertFalse("acquire past the cap must fail fast", gate.tryAcquire())
-        gate.release()
+        assertNull("acquire past the cap must fail fast", gate.tryAcquireLease())
+        leases.removeAt(0).close()
         assertEquals(1, gate.availablePermits())
-        assertTrue("a single release must admit one more", gate.tryAcquire())
-        repeat(SERVICE_EXEC_MAX_CONCURRENT) { gate.release() }
+        val admitted = gate.tryAcquireLease()
+        assertNotNull("a single close must admit one more", admitted)
+        leases += admitted!!
+        leases.forEach { it.close() }
         assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
     }
 
     // Concurrent hammer on an isolated gate: 20 threads x 20 rounds of
-    // acquire-hold-release must never exceed the cap at once, and every
-    // permit must be back afterwards (no leak, no over-release past the cap).
+    // lease acquire-hold-close must never exceed the cap at once, and every
+    // permit must be back afterwards (no leak, no double-close past the cap).
     // A CyclicBarrier(21) start gate (20 workers + main) releases all
     // workers together. First-wave holders block on the releaseHold latch
-    // until every worker has made its first tryAcquire attempt, so the
+    // until every worker has made its first tryAcquireLease attempt, so the
     // first wave deterministically fills the cap and the rest are rejected
-    // while the permits are held; later rounds hold for 10ms inside.
+    // (null lease) while the permits are held; later rounds hold for 10ms inside.
     @Test fun serviceGate_concurrentHammer_peakNeverExceedsCap() {
         val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
         val active = AtomicInteger(0)
@@ -70,7 +77,8 @@ class GalaxyExecConcurrencyTest {
                 try {
                     startBarrier.await()
                     repeat(20) { round ->
-                        if (gate.tryAcquire()) {
+                        val lease = gate.tryAcquireLease()
+                        if (lease != null) {
                             try {
                                 val now = active.incrementAndGet()
                                 peak.updateAndGet { p -> maxOf(p, now) }
@@ -85,7 +93,7 @@ class GalaxyExecConcurrencyTest {
                                 }
                             } finally {
                                 active.decrementAndGet()
-                                gate.release()
+                                lease.close()
                             }
                         } else {
                             rejections.incrementAndGet()
@@ -118,46 +126,111 @@ class GalaxyExecConcurrencyTest {
         assertEquals("no holder may remain", 0, active.get())
     }
 
-    // Over-release guard: releasing without a matching acquire is a no-op
-    // and must never inflate the permit count past the cap, and the gate
-    // stays fully usable afterwards (the held counter clamps at zero).
-    @Test fun serviceGate_overReleaseNeverInflatesCap() {
+    // Double-close idempotency: closing the same lease twice (or N times)
+    // is a no-op after the first close and must never inflate the permit
+    // count past the cap, and the gate stays fully usable afterwards.
+    @Test fun serviceGate_doubleCloseNeverInflatesCap() {
         val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
-        gate.release()
-        gate.release()
+        val lease = gate.tryAcquireLease()
+        assertNotNull(lease)
+        assertEquals(SERVICE_EXEC_MAX_CONCURRENT - 1, gate.availablePermits())
+        lease!!.close()
         assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
-        assertTrue(gate.tryAcquire())
-        gate.release()
-        gate.release()
-        gate.release()
+        lease.close()
+        lease.close()
         assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
-        // Still functional after over-release: the full cap can be held again.
+        // Still functional after double-close: the full cap can be held again.
+        val leases = mutableListOf<ServiceExecGate.Lease>()
         repeat(SERVICE_EXEC_MAX_CONCURRENT) {
-            assertTrue("gate must still admit the full cap after over-release", gate.tryAcquire())
+            val next = gate.tryAcquireLease()
+            assertNotNull("gate must still admit the full cap after double-close", next)
+            leases += next!!
         }
         assertEquals(0, gate.availablePermits())
-        repeat(SERVICE_EXEC_MAX_CONCURRENT) { gate.release() }
+        leases.forEach { it.close() }
         assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
     }
 
-    // Permit restoration: a holder that throws still returns its permit via
-    // try/finally-release. This pins the gate-level contract behind the
-    // onTransact single finally release (release count == acquire count).
+    // Permit restoration: a holder that throws (including Error) still
+    // returns its permit via lease.use close. This pins the gate-level
+    // contract behind the onTransact single finally lease.close().
     @Test fun serviceGate_permitRestoredWhenHolderThrows() {
         val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
         var caught: Throwable? = null
         try {
-            assertTrue(gate.tryAcquire())
+            val lease = gate.tryAcquireLease()
+            assertNotNull(lease)
             assertEquals(SERVICE_EXEC_MAX_CONCURRENT - 1, gate.availablePermits())
-            throw RuntimeException("boom")
+            lease!!.use { throw Error("boom") }
         } catch (t: Throwable) {
             caught = t
-        } finally {
-            gate.release()
         }
+        assertTrue("use must propagate the Error, caught=$caught", caught is Error)
         assertEquals("boom", caught?.message)
         assertEquals(
             "permit must be restored after a throwing holder",
+            SERVICE_EXEC_MAX_CONCURRENT,
+            gate.availablePermits(),
+        )
+    }
+
+    // Two-holder double-close regression: closing one holder's lease twice
+    // must return only its own permit (availablePermits == cap-1 while the
+    // other holder is still live, never cap). With B still live, C/D/E fill
+    // to exactly cap (peak 4, never 5) and F is rejected.
+    @Test fun serviceGate_twoHoldersDoubleCloseNeverExceedsCap() {
+        val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
+        val a = gate.tryAcquireLease()
+        assertNotNull(a)
+        val b = gate.tryAcquireLease()
+        assertNotNull(b)
+        assertEquals(SERVICE_EXEC_MAX_CONCURRENT - 2, gate.availablePermits())
+        a!!.close()
+        a.close()
+        assertEquals(
+            "double-close of A must return only A's permit while B is still live",
+            SERVICE_EXEC_MAX_CONCURRENT - 1,
+            gate.availablePermits(),
+        )
+        val c = gate.tryAcquireLease()
+        assertNotNull(c)
+        val d = gate.tryAcquireLease()
+        assertNotNull(d)
+        val e = gate.tryAcquireLease()
+        assertNotNull(e)
+        assertEquals("B+C+D+E must fill the cap exactly (peak 4, never 5)", 0, gate.availablePermits())
+        assertNull("a fifth live lease must be rejected (peak never 5)", gate.tryAcquireLease())
+        b!!.close()
+        c!!.close()
+        d!!.close()
+        e!!.close()
+        assertEquals(SERVICE_EXEC_MAX_CONCURRENT, gate.availablePermits())
+    }
+
+    // Same-lease concurrent closes: 2 threads x 10 closes of one lease must
+    // return only one permit (AtomicBoolean CAS on Lease.close).
+    @Test fun serviceGate_sameLeaseConcurrentClosesOnlyReturnsOnePermit() {
+        val gate = ServiceExecGate(SERVICE_EXEC_MAX_CONCURRENT)
+        val lease = gate.tryAcquireLease()
+        assertNotNull(lease)
+        assertEquals(SERVICE_EXEC_MAX_CONCURRENT - 1, gate.availablePermits())
+        val errors = CopyOnWriteArrayList<Throwable>()
+        val startBarrier = CyclicBarrier(2)
+        val threads = (0 until 2).map { idx ->
+            thread(isDaemon = true, name = "service-gate-close-$idx") {
+                try {
+                    startBarrier.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                    repeat(10) { lease!!.close() }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                }
+            }
+        }
+        threads.forEach { it.join(10_000L) }
+        assertTrue(threads.none { it.isAlive })
+        assertTrue("close threads must not throw, got: ${errors.firstOrNull()}", errors.isEmpty())
+        assertEquals(
+            "2x10 concurrent closes of one lease must return only one permit",
             SERVICE_EXEC_MAX_CONCURRENT,
             gate.availablePermits(),
         )
