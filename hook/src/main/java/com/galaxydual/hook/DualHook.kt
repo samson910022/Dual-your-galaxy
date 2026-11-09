@@ -85,16 +85,20 @@ class DualHook : XposedModule() {
         }
     }
 
-    // Hooks DualAppManagerService#getAllWhitelistedPackages and
-    // #isInstalledWhitelistedPackage when present on this Samsung ROM.
-    // Returns the number of installed hooks (0 = nothing hooked, so the
-    // caller skips the active-marker write and stays honestly undetected).
+    // Hooks DualAppManagerService whitelist read-query methods when present on
+    // this Samsung ROM (Stage 1 safest set; install-state composite queries are
+    // excluded until device-verified). Returns the number of installed hooks
+    // (0 = nothing hooked, so the caller skips the active-marker write and
+    // stays honestly undetected).
     //
     // Device evidence (S24 OneUI 9, services.jar dexdump-verified):
-    // com.android.server.DualAppManagerService exists with both methods
-    // (getAllWhitelistedPackages x2 refs, isInstalledWhitelistedPackage x4
-    // + Internal variant); lspd logs confirm candidate 1 wins with
-    // deoptimize+hook success on all boots. Candidates 2-3 stay as fallback.
+    // com.android.server.DualAppManagerService exists with whitelist methods
+    // (e.g. getAllWhitelistedPackages, isInstalledWhitelistedPackage/Internal
+    // variants). Stage 1 hooks only the pure whitelist-list query from
+    // SERVICE_WHITELIST_METHODS (install-state-sensitive methods excluded,
+    // fail-closed); lspd logs on devices that match candidate 1 should still
+    // show deoptimize+hook success for the hooked method(s). Candidates 2-3
+    // stay as fallback.
     private fun hookDualAppManagerService(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, SERVICE_CLASS_CANDIDATES)
         if (target == null) {
@@ -440,9 +444,14 @@ class DualHook : XposedModule() {
         )
 
         // Whitelist query methods only; install/remove paths are never hooked.
+        //
+        // Stage 1 (safest): isInstalledWhitelistedPackage is install-state-
+        // sensitive (installed AND whitelisted composite, userId ambiguity) and
+        // is EXCLUDED from rewrite hooks until device-verified (fail-closed).
+        // getAllWhitelistedPackages remains (pure whitelist list) and is guarded
+        // by signature/return guards at runtime (Phase 3 wiring).
         private val SERVICE_WHITELIST_METHODS = listOf(
             "getAllWhitelistedPackages",
-            "isInstalledWhitelistedPackage",
         )
 
         private val WHITE_LIST_APPS_CLASS_CANDIDATES = listOf(

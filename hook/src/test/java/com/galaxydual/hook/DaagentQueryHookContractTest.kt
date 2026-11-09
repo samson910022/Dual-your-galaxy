@@ -8,8 +8,10 @@ import org.junit.Test
 
 // Hook contract test (JVM, framework-free constants in DaagentQueryHooks).
 //
-// Locks the Stage1 daagent read-query hook candidates to the docs/S24 contract:
-// read-query names only, and every candidate class in the daagent package family.
+// Locks the Stage 1 (safest) daagent read-query hook candidates: read-query
+// names only, and every candidate class in the daagent package family.
+// Installed-and-whitelist composite queries are excluded (fail-closed) until
+// device-verified due to install-state/userId ambiguity.
 // Constants live in DaagentQueryHooks (pure object) so tests run without loading
 // DualHook/Xposed (compileOnly at unit test runtime). DualHook install/callback
 // remains DEVICE-UNVERIFIED (not covered here).
@@ -19,19 +21,37 @@ class DaagentQueryHookContractTest {
     fun queryMethodNames_areNonEmptyAndContainKeyS24ReadQueries() {
         val names = DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES
         assertTrue("DAAGENT_QUERY_METHOD_NAMES must not be empty", names.isNotEmpty())
-        // Lock the full doc-aligned candidate set (Stage 1). Update intentionally
+        // Lock the Stage 1 (safest) candidate set. Installed-composite queries
+        // are excluded until device-verified (fail-closed). Update intentionally
         // when candidates change with device evidence.
         val expected = setOf(
-            "getAllInstalledWhitelistedPackages",
             "getWhitelistedPackages",
             "getWhitelistPackages",
             "getWhiteListPkgs",
             "getWhiteListPkgsInSystemServer",
             "isWhitelistedPackage",
             "isWhiteListedPackage",
-            "isInstalledWhitelistedPackage",
         )
         assertEquals(expected, names.toSet())
+    }
+
+    @Test
+    fun installedCompositeQueries_areExcludedFromStage1Candidates() {
+        val names = DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES.toSet()
+        val excluded = listOf(
+            "getAllInstalledWhitelistedPackages",
+            "isInstalledWhitelistedPackage",
+        )
+        for (name in excluded) {
+            assertFalse(
+                "installed-composite query must be excluded from Stage 1 candidates: $name",
+                names.contains(name),
+            )
+            assertTrue(
+                "WhitelistSignatureGuard must identify excluded composite query: $name",
+                WhitelistSignatureGuard.isInstalledWhitelistCompositeQuery(name),
+            )
+        }
     }
 
     @Test
