@@ -98,4 +98,14 @@ data class VerifiedDualTarget(
     // Agreed platform serial for that id (exactly one distinct non-null
     // serial across the verbose channels; see KDoc above).
     val serial: Int,
+    // Parent user id pinned beside (id, serial): the agreed parentId from
+    // resolveDual's Confirmed (Phase B policy requires both verbose channels
+    // to carry it, equal, and == 0, so every constructed target carries 0).
+    // Pinned as a triple in refreshVerified's strict-equality fence
+    // (#53): a disagreeing parent can only surface as Refused -> Unknown
+    // at resolution (never a FRESH listing on a drifted identity); writes
+    // re-verify via continuityBreach on their own before/after pin.
+    // The ViewModel's InventorySnapshot persists (id, serial) only and
+    // drops this field (it is not re-checked at listing time).
+    val parentId: Int,
 )

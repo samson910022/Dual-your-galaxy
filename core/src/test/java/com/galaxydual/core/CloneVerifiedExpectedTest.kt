@@ -560,6 +560,118 @@ class CloneVerifiedExpectedTest {
         assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
     }
 
+    // Phase C1 (cloneVerifiedExpected detail parity with cloneVerified):
+    // post-spawn "service exec failed: ..." text (flags lost on the frozen
+    // wire, timedOut=false/transportUnknown=false) + clean reverse probe
+    // (absent) -> VerifyUnknown via writeTimeoutReverseDetail whose detail
+    // names post-spawn + the write err (never InstallFailed/VerifyFailed).
+    // Single write, single probe.
+    @Test
+    fun installPostSpawnServiceExecFailed_probeAbsent_isVerifyUnknownWithPostSpawnDetail() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "service exec failed: boom",
+            installTimedOut = false,
+            installTransportUnknown = false,
+            listPackagesOut = "",
+            listPackagesExit = 0,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must carry the write err, got: \"$detail\"", detail.contains("service exec failed"))
+        assertTrue("detail must explain reverse is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.installRuns())
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // Phase C1 (cloneVerifiedExpected detail parity): post-spawn
+    // "interrupted: ..." text + clean reverse probe -> same post-spawn
+    // reverse detail (write err carried verbatim).
+    @Test
+    fun installPostSpawnInterrupted_probeAbsent_isVerifyUnknownWithPostSpawnDetail() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "interrupted: wait interrupted",
+            installTimedOut = false,
+            installTransportUnknown = false,
+            listPackagesOut = "",
+            listPackagesExit = 0,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must carry the write err, got: \"$detail\"", detail.contains("interrupted:"))
+        assertTrue("detail must explain reverse is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.installRuns())
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // Phase C1 (cloneVerifiedExpected detail parity): service-side timeout
+    // text ("timeout after ...", flags lost) + clean reverse probe ->
+    // VerifyUnknown via the byText reverse detail (recognized by text,
+    // never plain "write reply timed out" alone).
+    @Test
+    fun installServiceTimeoutText_probeAbsent_isVerifyUnknownWithByTextDetail() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "timeout after 60000ms: sh",
+            installTimedOut = false,
+            installTransportUnknown = false,
+            listPackagesOut = "",
+            listPackagesExit = 0,
+        )
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name the write timeout, got: \"$detail\"", detail.contains("write reply timed out"))
+        assertTrue("detail must name the text recognition, got: \"$detail\"", detail.contains("recognized by text"))
+        assertTrue("detail must explain reverse is unknown, got: \"$detail\"", detail.contains("treated as unknown"))
+        assertEquals(1, gateway.installRuns())
+        assertEquals(1, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
+    // Phase C1 (cloneVerifiedExpected detail parity, Unknown-probe arm):
+    // post-spawn text + probe itself Unknown (persistent non-zero) ->
+    // VerifyUnknown via writeTimeoutDetail (not the reverse detail):
+    // detail names post-spawn + the write err and keeps the probe cause.
+    // Single write, bounded probe retries (virtual delay, no real sleep).
+    @Test
+    fun installPostSpawn_probeUnknown_isVerifyUnknownWithPostSpawnDetail() {
+        val gateway = FakeGateway(
+            installExit = 1,
+            installOut = "",
+            installErr = "service exec failed: boom",
+            installTimedOut = false,
+            installTransportUnknown = false,
+            listPackagesOut = "",
+            listPackagesExit = 1,
+        )
+        val repo = DualRepository(gateway)
+        repo.delayFn = { }
+        val outcome = runSuspend {
+            repo.cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("detail must name post-spawn, got: \"$detail\"", detail.contains("post-spawn"))
+        assertTrue("detail must carry the write err, got: \"$detail\"", detail.contains("service exec failed"))
+        assertTrue("detail must keep the probe cause, got: \"$detail\"", detail.contains("exit=1"))
+        assertEquals(1, gateway.installRuns())
+        assertEquals(DualRepository.VERIFY_MAX_ATTEMPTS, gateway.commands.count { it.startsWith("pm list packages") })
+    }
+
     // Stage3-3 (write 後 after-pin drift):install 與 list-packages 之間翻
     // serial (15 -> 41，重建同 id 新 incarnation) -> VerifyUnknown
     // (identity-changed，永不 Success/VerifyFailed），零額外 install。

@@ -931,7 +931,9 @@ internal enum class DrainStatus { EOF, CAPPED, READ_ERROR }
 // NEW-client + OLD-service (v1 cap-only marker) gap is closed at the
 // deployment layer by ShizukuExecProtocol.SERVICE_VERSION (v6), which forces
 // the daemon to rebuild the resident UserService on upgrade -- v6 also
-// invalidates v5 resident services (concurrency gate + drain sync).
+// invalidates v5 resident services (concurrency gate + synchronized drain +
+// parcel-null guards + post-spawn catch marker); v5 invalidated v4 resident
+// services (appId upper-bound owner-uid EXEC gate).
 internal fun buildResult(
     exit: Int,
     out: StringBuilder,

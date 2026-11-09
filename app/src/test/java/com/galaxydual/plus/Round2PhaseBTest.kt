@@ -38,9 +38,10 @@ class Round2PhaseBTest {
     // 雙 fake：suGw 跑 repo + SuElevator；shGw 只跑 ShizukuElevator
     // (`pm list users` exit 0 即 hasShizuku，見 ShizukuElevator.probe)。
     // typed 失敗開關走 listUsersCalls 分代（沿用 Phase5 drift 機制）：
-    // refresh 內 #1 snap/#2 listCloned snap/#3 nullSnap 計數，typed  runs
-    // 穿插其間，故 typedFailFromListUsers=3 即「前兩次 typed 成功、
-    // listing-null 後複查失敗」。
+    // 舊多快照 refresh 內 #1 snap/#2 listCloned snap/#3 nullSnap 計數，
+    // 使 typedFailFromListUsers=3 為「前兩次 typed 成功、listing-null 後
+    // 複查失敗」；single-snapshot refreshVerified 每輪僅一快照，故 3 在
+    // refresh 路徑永遠到不了（見 p25_listingNullAndReresolveUnknown）。
     private class FakeRepo(
         var dualId: Int = 95,
         var failListPackages: Boolean = false,
@@ -300,9 +301,13 @@ class Round2PhaseBTest {
         vm.refresh()
         await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
 
-        // 清單失敗 + 第三次 listUsers 起 typed 失敗：初查 Confirmed(95)，
-        // 複查 Unknown（舊 Int -1）→ 必須走 UNKNOWN，不報 drift。
-        // 計數在 seed 後歸零（init probe 與 seed refresh 的 listUsers 不計入）。
+        // 清單失敗 → GroundTruth(cloned=null) → VERIFY_UNKNOWN（不報 drift）。
+        // typedFailFromListUsers=3 under single-snapshot refreshVerified
+        // never fires (only one pm list users snapshot per refresh, so
+        // listUsersCalls never reaches 3); it is kept as a dead fixture
+        // and the test passes via the new null-list path, not via a
+        // second typed re-resolution. 計數在 seed 後歸零（init probe 與
+        // seed refresh 的 listUsers 不計入）。
         suGw.failListPackages = true
         suGw.listUsersCalls = 0
         suGw.typedFailFromListUsers = 3

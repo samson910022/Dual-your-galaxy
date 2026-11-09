@@ -8,7 +8,6 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.DualProfile
 import com.galaxydual.core.DualIdResolution
 import com.galaxydual.core.DualRepository
-import com.galaxydual.core.DualTargetResolution
 import com.galaxydual.core.DualTargetResult
 import com.galaxydual.core.Elevator
 import com.galaxydual.core.NoOpGateway
@@ -16,7 +15,6 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
-import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.VerifyState
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
@@ -266,8 +264,8 @@ data class UiState(
     // returns hasRoot=true on `id -u == 0` even when its `pm list users`
     // fails (dualUserId=-1), so anyProbePassed is true while refresh reports
     // ChannelError. True PM readability is decided by refresh
-    // (profilesSnapshot Loaded vs ChannelError, listClonedPackages null vs
-    // list), not by this flag.
+    // (RefreshOutcome ChannelError vs Loaded variants NoDual/Unknown/
+    // GroundTruth), not by this flag.
     // AUTO probes all, so this is device-wide; explicit probes only its own
     // channel (P25 Item 3), so for explicit anyProbePassed == writeReady by
     // construction (unrelated channels intentionally unprobed, never reported).
@@ -687,7 +685,7 @@ class DualViewModel(
     // - refreshLocked 偵測到 verified target 變動（bound 舊≠新）時清空
     //   selectedKeys＋batchReport、重置恢復 marker，msg 明示目標變更。
     // - Serial 綁定（PR-37 Phase B #2）：綁定為 (id, serial) 配對，由當下
-    //   已驗證 inventory 取得（refresh 以 resolveDualTargetTyped 一次取回 id＋serial，
+    //   已驗證 inventory 取得（refresh 以 repo.refreshVerified 一次取回 id＋serial，
     //   與舊 resolveDualUserId 同為三通道、同等裝置呼叫，零額外開銷）。
     //   殘留風險如實揭露：inventory serial 未知（SerialUnavailable 罕見路徑）
     //   或 legacy 快照恢復時綁定為 id-only (serial null)；id-only 綁定永不
@@ -826,16 +824,23 @@ class DualViewModel(
 
     // Reloads profiles AND rebuilds `cloned` from the dual user's actual
     // packages via the single-target refresh (Phase D P2-D): one
-    // profilesSnapshot (1 cmd) + one verified-target fetch (3 cmds) + one
-    // list probe on that same id (1 cmd) = 5 commands. Three states are told
+    // profilesSnapshot (1 cmd) + one typed triple via resolveDualTargetTyped
+    // (3 cmds) + one list probe on that same id (1 cmd) + post-list re-verify
+    // triple (3 cmds) = 8 commands (second triple is the strict-equality fence). Four states are told
     // apart explicitly (issue #9):
     // - ChannelError: `pm list users` itself failed -> "channel error: ...".
     // - NoDual: channel ok but no single DUAL profile -> "no dual profile".
+    // - Unknown: identity unconfirmable (serial/parent conflict, refused,
+    //   confirmed id missing from the snapshot, Absent with an empty
+    //   snapshot, ...) -> "refresh result unknown: cannot confirm dual
+    //   profile", keep the old cloned.
     // - Empty: dual exists but owns no clones -> "no clones installed".
     // A failed clone-listing (GroundTruth cloned == null) keeps the previous
     // `cloned` and reports "result unknown" rather than claiming the list is
-    // empty. Drift is eliminated inside this API (single target throughout);
-    // the explicit-id residual remains only in the old entries.
+    // empty. Observable-serial drift is eliminated inside this API (single
+    // target throughout); serial==null proves only same (id,parent) twice
+    // + listing, not incarnation (known limit, see repo KDoc). The
+    // explicit-id residual remains only in the old entries.
     fun refresh() {
         // Coalesce rapid taps (PR-3 stage 1, issue #24; P25 Item 2 shares the
         // gate with reconnect): while an op is in flight (including waiting on
@@ -963,12 +968,13 @@ class DualViewModel(
 
     // Reload body shared by refresh() and selectChannel(). Must run under
     // opMutex: callers hold it, so this never launches or locks itself.
-    // Phase D P2-D (single target fetch: snapshot 1 + target 3 cmds + list 1
-    // = 5): repo.refreshVerified() pins snapshot, target, and listing to the
-    // same id so resolve-to-list drift is inexpressible (preferred for new
-    // code). This VM still uses the resolve-then-reverify path below;
-    // migrating refreshLocked() to refreshVerified() is follow-up (same
-    // fail-closed mapping, fewer commands).
+    // Single-snapshot refresh (#53): refreshLocked runs ONLY
+    // repo.refreshVerified() (snapshot 1 + target 3 cmds + list 1 + re-verify triple 3 = 8) and
+    // maps its RefreshOutcome to UiState -- the second triple inside
+    // refreshVerified is the strict-equality fence, so with observable serial
+    // no cross-window (id, serial) pair can be spliced into a FRESH listing;
+    // serial==null proves only same (id,parent) twice + listing, not
+    // incarnation (known limit, see repo KDoc).
     // Repository calls run via onIo (PR-3 stage 1, issue #24) so the retry
     // settle wait never blocks Main; StateFlow updates stay thread-safe from
     // any dispatcher.
@@ -999,6 +1005,13 @@ class DualViewModel(
     }
 
     private suspend fun refreshLocked() {
+        // NOTE (Phase 3): the pendingRemove-preserve guard below is
+        // intentionally duplicated per RefreshOutcome branch (no helper
+        // extracted). Only the GroundTruth listed branch can actually
+        // trigger it (msgKind NONE/INFO); the ChannelError/NoDual/Unknown/
+        // TargetMoved/GroundTruth-null/catch branches set
+        // CHANNEL/NO_DUAL/INVALID/FAILED, so their guards are dead but
+        // kept for symmetry.
         // Mark busy first so the UI can render a spinner. Dialog 開著時狀態列
         // 不洗掉確認提示：pendingRemove != null 時保留原 msg/msgKind，只設
         // loading=true（refresh 不應驅散確認對話框的提示）。
@@ -1012,12 +1025,26 @@ class DualViewModel(
             else it.copy(loading = true, msg = "", msgKind = MsgKind.NONE)
         }
         try {
-            when (val snap = onIo { repo.profilesSnapshot() }) {
-                is ProfilesSnapshot.ChannelError -> {
+            // Single snapshot (#53): one repo.refreshVerified() pins the
+            // `pm list users` snapshot, the verified target, and the cloned
+            // listing to one triple of evidence. The VM only maps the
+            // RefreshOutcome to UiState below -- the VM never snapshots,
+            // re-resolves, or re-verifies a second time of its own (the
+            // second triple inside refreshVerified is the strict-equality
+            // fence), so with observable serial a 95->96 rebuild (or a same-id
+            // new serial) can never be spliced into a fictional FRESH pair:
+            // whatever is published came from the single pinned target,
+            // carried with its true (id, serial, parentId); serial==null proves
+            // only same (id,parent) twice + listing, not incarnation (known limit,
+            // see repo KDoc). Drift between two refreshes is real change (the
+            // new world publishes as a whole on the next refresh, never
+            // mixed with the old world's id/serial when serial is observable).
+            when (val outcome = onIo { repo.refreshVerified() }) {
+                is RefreshOutcome.ChannelError -> {
                     val now = nowWallMs()
                     _state.update { cur ->
                         val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                            "channel error: ${sanitizeForDisplay(snap.detail)}",
+                            "channel error: ${sanitizeForDisplay(outcome.detail)}",
                             MsgKind.CHANNEL,
                             cur.degrade,
                         )
@@ -1035,7 +1062,10 @@ class DualViewModel(
                                 // UI 在未知中仍可見上次目標。
                                 targetId = cur.inventory.targetId,
                             ),
-                            diagnose = snap.toDiagnoseEvent(),
+                            diagnose = diagnoseEvent(
+                                DiagnoseCode.CHANNEL_ERROR,
+                                techDetail = "profiles snapshot channel failed: ${sanitizeForDisplay(outcome.detail).take(200)}",
+                            ),
                             msg = combinedMsg,
                             msgKind = combinedKind,
                         )
@@ -1051,114 +1081,183 @@ class DualViewModel(
                     // 綁定檢查（FRESH→STALE 不清勾選；bound 一致即 no-op）。
                     handleSelectionTargetChangeLocked()
                 }
-                is ProfilesSnapshot.Loaded -> {
-                    val profiles = snap.profiles
-                    // Verified identity only: the id comes from the repo's
-                    // cross-source resolver, never from the pm-list label
-                    // (display-only by contract), so the display layer makes
-                    // no label judgment and shares one verified target with
-                    // the listing below.
-                    // P2-5 (verified -1 誤判修正)：-1 一律視為「無法確認」。
-                    // 舊碼用 Int 哨兵 (resolveDualUserId 回 -1) 再以快照有無
-                    // 猜 NO_DUAL/CHANNEL_ERROR：typed 通道單獨失敗時也會回 -1，
-                    // 快照正常有戶就被誤判為「確認無 dual」並清空 cloned。
-                    // 現改走 typed 入口 resolveDualUserIdTyped()：Confirmed
-                    // (正值) 才取 id 查核；Absent（通道乾淨且確認無 dual）且
-                    // 快照可用才報 NO_DUAL 並清空；其餘（Unknown 全域，含舊
-                    // -1；或 Absent 但快照為空不可信）一律保留舊 cloned、報
-                    // CHANNEL_ERROR，不謊稱無 dual。
-                    // M2 pm 否決：Absent 前 repo 另收 pm 戶集合否決 typed 漏戶
-                    //（null 表無快照不否決；此處快照可用故傳 profiles id 集合）。
-                    // PR-37 P26 Stage 1 (GH #1 + #2)：單次 triple 取 (id,serial)
-                    // 配對——resolveDualTargetTyped 一次 gateway triple 同時確認
-                    // id 與 serial，FRESH/STALE 寫入的 (targetId,targetSerial)
-                    // 即來自同一次證據，不可能再出現 FRESH(95,41) 虛構配對
-                    //（舊雙呼叫：typed 取 id + fetchDualTarget 另取 serial，
-                    // 兩次 triple 間重建即拼接）。SerialUnavailable 保留
-                    // id-only（serial null，id 路徑不受影響）。
-                    val targetRes =
-                        onIo { repo.resolveDualTargetTyped(pmIds = profiles.map { it.userId }.toSet()) }
-                    val dualId = when (targetRes) {
-                        is DualTargetResolution.Confirmed -> targetRes.target.userId
-                        is DualTargetResolution.SerialUnavailable -> targetRes.userId
-                        is DualTargetResolution.Absent,
-                        is DualTargetResolution.Unknown -> NO_TARGET_ID
+                is RefreshOutcome.NoDual -> {
+                    val now = nowWallMs()
+                    _state.update { cur ->
+                        val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            "no dual profile",
+                            MsgKind.NO_DUAL,
+                            cur.degrade,
+                        )
+                        val next = cur.copy(
+                            loading = false,
+                            profiles = outcome.profiles,
+                            cloned = emptyList(),
+                            // Phase C P2: profiles parsed (readable) but no
+                            // dual target -- still true (`pm list users`
+                            // succeeded).
+                            pmReadable = true,
+                            inventory = InventorySnapshot(
+                                source = DualRepository.CMD_LIST_USERS,
+                                targetId = NO_TARGET_ID,
+                                targetSerial = null,
+                                queryTimeMs = now,
+                                freshness = InventoryFreshness.UNKNOWN,
+                                count = 0,
+                            ),
+                            diagnose = diagnoseEvent(
+                                DiagnoseCode.NO_DUAL,
+                                techDetail = "no verified dual target",
+                            ),
+                            msg = combinedMsg,
+                            msgKind = combinedKind,
+                        )
+                        if (cur.pendingRemove != null &&
+                            (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                        ) {
+                            next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                        } else {
+                            next
+                        }
                     }
-                    val dualSerial =
-                        (targetRes as? DualTargetResolution.Confirmed)?.target?.serial
-                    if (dualId <= NO_TARGET_ID) {
+                    // Phase B #1：無目標/未知時亦跑綁定檢查：bound 舊≠新（-1）
+                    // 即清空舊勾選（防 95 勾選殘留到舊目標外的空窗）。
+                    handleSelectionTargetChangeLocked()
+                }
+                is RefreshOutcome.Unknown -> {
+                    // Fail closed: the single triple could not confirm the
+                    // dual identity (conflicting serial/parent, refused
+                    // typed channels, pm veto, parent drift, ...). Keep the
+                    // old cloned list and the old inventory target (STALE /
+                    // UNKNOWN), report CHANNEL + CHANNEL_ERROR, and surface
+                    // the typed detail. The write gate is untouched: only a
+                    // proven-false pmReadable blocks writes; this branch
+                    // neither proves unreadability nor clears the way for
+                    // writes on the old list's authority -- writes still
+                    // re-verify in the repo.
+                    val now = nowWallMs()
+                    _state.update { cur ->
+                        val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            "refresh result unknown: " +
+                                "cannot confirm dual profile",
+                            MsgKind.CHANNEL,
+                            cur.degrade,
+                        )
+                        val next = cur.copy(
+                            loading = false,
+                            profiles = outcome.profiles,
+                            // Phase C P2: `pm list users` returned (Loaded)
+                            // so readable; only the dual identity is
+                            // unverifiable here. Same rule as before: the
+                            // UNKNOWN branch never claims pm unreadability
+                            // (false) from identity refusal alone.
+                            pmReadable = true,
+                            inventory = cur.inventory.toStaleOrUnknown(
+                                now = now,
+                                source = DualRepository.CMD_LIST_USERS,
+                                targetId = cur.inventory.targetId,
+                            ),
+                            diagnose = diagnoseEvent(
+                                DiagnoseCode.CHANNEL_ERROR,
+                                techDetail = if (outcome.detail.isNotBlank()) {
+                                    "verified dual id unknown: " + sanitizeForDisplay(outcome.detail).take(200)
+                                } else {
+                                    "verified dual id unknown"
+                                },
+                            ),
+                            msg = combinedMsg,
+                            msgKind = combinedKind,
+                        )
+                        if (cur.pendingRemove != null &&
+                            (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                        ) {
+                            next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                        } else {
+                            next
+                        }
+                    }
+                    // Phase B #1：未知時亦跑綁定檢查：保留舊 targetId，
+                    // 故 bound 一致即 no-op（不清勾選）。
+                    handleSelectionTargetChangeLocked()
+                }
+                is RefreshOutcome.TargetMoved -> {
+                    // Confirmed post-list drift: the re-verify proved a
+                    // new target. Keep the old cloned list, publish the
+                    // live target as STALE (never FRESH, never the
+                    // discarded list), report VERIFY_MISMATCH + INVALID
+                    // requiring reconfirmation. Selection: the live
+                    // target differs from any bound selection, so
+                    // handleSelectionTargetChangeLocked clears it (do NOT
+                    // restoreSelectionLocked for the moved target).
+                    val live = outcome.liveTarget
+                    val now = nowWallMs()
+                    _state.update { cur ->
+                        val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            "dual target changed: please reconfirm",
+                            MsgKind.INVALID,
+                            cur.degrade,
+                        )
+                        val next = cur.copy(
+                            loading = false,
+                            profiles = outcome.profiles,
+                            pmReadable = true,
+                            inventory = cur.inventory.toStaleOrUnknown(
+                                now = now,
+                                source = DualRepository.CMD_LIST_USERS,
+                                targetId = live.userId,
+                                targetSerial = live.serial,
+                            ),
+                            diagnose = diagnoseEvent(
+                                DiagnoseCode.VERIFY_MISMATCH,
+                                techDetail = "post-list target moved: " + sanitizeForDisplay(outcome.detail).take(200),
+                            ),
+                            msg = combinedMsg,
+                            msgKind = combinedKind,
+                        )
+                        if (cur.pendingRemove != null &&
+                            (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
+                        ) {
+                            next.copy(msg = cur.msg, msgKind = cur.msgKind)
+                        } else {
+                            next
+                        }
+                    }
+                    handleSelectionTargetChangeLocked()
+                }
+                is RefreshOutcome.GroundTruth -> {
+                    val target = outcome.target
+                    val listed = outcome.cloned
+                    if (listed == null) {
+                        // The list channel failed on the pinned target.
+                        // Unknown listing: keep the old cloned list, mark
+                        // the pinned target STALE, VERIFY_UNKNOWN.
                         val now = nowWallMs()
-                        // 真正確認無 dual 的唯一條件：typed 稱 Absent 且快照
-                        // 可用（列得出戶）。Unknown 全域走 CHANNEL_ERROR；
-                        // 空快照（連 owner 都列不出，快照不可信）時即使 typed
-                        // 稱 Absent 也不得報 NO_DUAL（快照本身已證通道有問題）。
-                        val confirmedAbsent =
-                            targetRes is DualTargetResolution.Absent && profiles.isNotEmpty()
                         _state.update { cur ->
-                            val next = if (confirmedAbsent) {
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                    "no dual profile",
-                                    MsgKind.NO_DUAL,
-                                    cur.degrade,
-                                )
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    cloned = emptyList(),
-                                    // Phase C P2: profiles parsed (readable)
-                                    // but no dual target -- still true
-                                    // (`pm list users` succeeded).
-                                    pmReadable = true,
-                                    inventory = InventorySnapshot(
-                                        source = DualRepository.CMD_LIST_USERS,
-                                        targetId = NO_TARGET_ID,
-                                        queryTimeMs = now,
-                                        freshness = InventoryFreshness.UNKNOWN,
-                                        count = 0,
-                                    ),
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.NO_DUAL,
-                                        techDetail = "typed resolution absent",
-                                    ),
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
-                            } else {
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                    "refresh result unknown: " +
-                                        "cannot confirm dual profile",
-                                    MsgKind.CHANNEL,
-                                    cur.degrade,
-                                )
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    // Phase C P2: `pm list users` returned
-                                    // (Loaded) so readable; only the dual
-                                    // identity is unverifiable here.
-                                    pmReadable = true,
-                                    inventory = cur.inventory.toStaleOrUnknown(
-                                        now = now,
-                                        source = DualRepository.CMD_LIST_USERS,
-                                        targetId = cur.inventory.targetId,
-                                    ),
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.CHANNEL_ERROR,
-                                        techDetail = when {
-                                            targetRes is DualTargetResolution.Unknown &&
-                                                targetRes.detail.isNotBlank() ->
-                                                "verified dual id unknown: " +
-                                                    targetRes.detail
-                                            targetRes is DualTargetResolution.Absent ->
-                                                "profiles snapshot empty " +
-                                                    "despite typed absent"
-                                            else -> "verified dual id unknown"
-                                        },
-                                    ),
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
-                            }
+                            val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                "refresh result unknown: " +
+                                    "cannot list clones for user ${target.userId}",
+                                MsgKind.CHANNEL,
+                                cur.degrade,
+                            )
+                            val next = cur.copy(
+                                loading = false,
+                                profiles = outcome.profiles,
+                                // `pm list users` was readable (the snapshot
+                                // parsed); only the clone listing is unknown.
+                                pmReadable = true,
+                                inventory = cur.inventory.toStaleOrUnknown(
+                                    now = now,
+                                    source = PmOutputParser.buildListPackages(target.userId),
+                                    targetId = target.userId,
+                                    targetSerial = target.serial,
+                                ),
+                                diagnose = diagnoseEvent(
+                                    DiagnoseCode.VERIFY_UNKNOWN,
+                                    techDetail = "cannot list clones for user ${target.userId}",
+                                ),
+                                msg = combinedMsg,
+                                msgKind = combinedKind,
+                            )
                             if (cur.pendingRemove != null &&
                                 (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
                             ) {
@@ -1167,297 +1266,61 @@ class DualViewModel(
                                 next
                             }
                         }
-                        // Phase B #1：無目標/未知時亦跑綁定檢查：bound 舊≠新（-1）
-                        // 即清空舊勾選（防 95 勾選殘留到 96 前的空窗）。
                         handleSelectionTargetChangeLocked()
+                        val invNow = _state.value.inventory
+                        restoreSelectionLocked(invNow.targetId, invNow.targetSerial)
                     } else {
-                        // PR-37 P26 Stage 1 (GH #1): explicit listing carries the
-                        // resolve-time pair so a same-id rebuild (fresh serial
-                        // missing/unequal) surfaces as SerialBreach BEFORE any
-                        // `pm list packages` probe. SerialBreach maps to
-                        // VERIFY_MISMATCH + STALE with the live fresh target
-                        // (never FRESH, old cloned kept, zero writes); Unknown
-                        // keeps the existing null-path discrimination below.
-                        // Reuses the listing-internal fetchVerifiedTarget only;
-                        // no new gateway triple is added here.
-                        val listing = onIo {
-                            repo.listClonedPackages(
-                                dualId,
-                                VerifiedTarget(dualId, dualSerial, parentId = null),
-                            )
-                        }
-                        val serialBreach = listing as? DualRepository.ListClonedResult.SerialBreach
-                        val groundTruth = (listing as? DualRepository.ListClonedResult.Ok)?.packages
-                        val isUnknown = listing is DualRepository.ListClonedResult.Unknown
-                        // listClonedPackages==Unknown 原因鑑別：只在 Unknown 路徑加跑
-                        // 唯讀的 profilesSnapshot + resolveDualTargetTyped
-                        // (成功路徑零額外開銷)。通道失敗->CHANNEL_ERROR
-                        // (techDetail 寫明)；只有正值且不同的新 verified ID
-                        // (Confirmed/SerialUnavailable 且 != dualId) 才報 drift
-                        // (VERIFY_MISMATCH，detail 攜新舊 targetId，inventory
-                        // 帶新目標，UI 可見新目標)；複查 Unknown/Absent
-                        // (P2-5：舊 Int -1 走此路) 與 id 一致者一律維持
-                        // VERIFY_UNKNOWN，不誤報 MISMATCH。單次 triple 取 id，
-                        // 與首跳同一 API，不拼接。
-                        // Stage C C6：此處複查刻意傳 pmIds=null——本路徑 Unknown/Absent
-                        // 一律 VERIFY_UNKNOWN，不授權 Absent 清單 (Absent 需快照可用
-                        // + typed 乾淨，見 refresh 首跳)；null 僅省一次快照傳參，
-                        // 語意仍為未知，不清空。
-                        val nullSnap: ProfilesSnapshot? =
-                            if (isUnknown) onIo { repo.profilesSnapshot() } else null
-                        // Stage C C6：同上，刻意 null——Absent 在此亦只報 UNKNOWN。
-                        // 本路徑 Unknown/Absent 一律收斂 VERIFY_UNKNOWN（僅
-                        // 已確認-不同-id 觸發 drift；snapshot 通道失敗另走
-                        // CHANNEL_ERROR，不屬本收斂），故不傳 pm 快照作 pmIds
-                        // 否決；以重查快照（Loaded）為準、回退原快照。
-                        val nullVerified: DualTargetResolution? =
-                            if (isUnknown) {
-                                onIo { repo.resolveDualTargetTyped(pmIds = null) }
-                            } else {
-                                null
-                            }
-                        // 單次證據 id：Confirmed 取 target.userId，
-                        // SerialUnavailable 取 userId（id-only 仍可判漂移），
-                        // 其餘 null（未知，不報 drift）。
-                        val nullVerifiedId: Int? = when (nullVerified) {
-                            is DualTargetResolution.Confirmed -> nullVerified.target.userId
-                            is DualTargetResolution.SerialUnavailable -> nullVerified.userId
-                            is DualTargetResolution.Absent,
-                            is DualTargetResolution.Unknown,
-                            null -> null
-                        }
+                        val now = nowWallMs()
+                        val isEmpty = listed.isEmpty()
                         _state.update { cur ->
-                            val now = nowWallMs()
-                            val next = if (serialBreach != null) {
-                                // Same-id rebuild: the listing-time fresh target
-                                // names the same id with a missing/unequal serial
-                                // (or parent mismatch). Fail closed: VERIFY_MISMATCH
-                                // + STALE with the live fresh target, old cloned
-                                // kept, zero writes. Mirrors the id-drift branch
-                                // below (STALE + live target + selection clearing
-                                // via handleSelectionTargetChangeLocked).
-                                val fresh = serialBreach.fresh
-                                val liveId = fresh?.userId ?: dualId
-                                val liveSerial = fresh?.serial
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                    "refresh verification mismatch: " +
-                                        "target $dualId#${dualSerial ?: "?"} -> " +
-                                        "$liveId#${liveSerial ?: "?"}",
-                                    MsgKind.VERIFY,
-                                    cur.degrade,
-                                )
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    // Listing snapshot was Loaded (otherwise
-                                    // Unknown, not breach), so `pm list users`
-                                    // stays readable.
-                                    pmReadable = true,
-                                    inventory = cur.inventory.toStaleOrUnknown(
-                                        now = now,
-                                        source = PmOutputParser.buildListPackages(dualId),
-                                        targetId = liveId,
-                                        // Live incarnation: new serial (or null
-                                        // on continuity-lost), never the stale
-                                        // resolve-time serial.
-                                        targetSerial = liveSerial,
-                                    ),
-                                    diagnose = diagnoseEvent(
-                                        DiagnoseCode.VERIFY_MISMATCH,
-                                        techDetail = "verified serial drifted: " +
-                                            "listed $dualId#${dualSerial ?: "?"} but now " +
-                                            "$liveId#${liveSerial ?: "?"} " +
-                                            "(${serialBreach.reason.ifEmpty { "reuse suspected" }})",
-                                    ),
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
-                            } else if (isUnknown) {
-                                // 未知：保留舊 cloned，inventory 舊資料標 STALE
-                                // (FRESH->STALE；否則 UNKNOWN，傳入的 targetId
-                                // 不再丟棄)，供上層重查。
-                                // Phase C P2: pmReadable 由本次 null 鑑別重查決定
-                                // (ChannelError->false，未漂移 Loaded->true)，
-                                // 非一律 true。
-                                val snapErr = (nullSnap as? ProfilesSnapshot.ChannelError)?.detail
-                                val freshProfiles =
-                                    (nullSnap as? ProfilesSnapshot.Loaded)?.profiles ?: profiles
-                                if (snapErr != null) {
-                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                        "refresh result unknown: " +
-                                            "channel error: ${sanitizeForDisplay(snapErr)}",
-                                        MsgKind.CHANNEL,
-                                        cur.degrade,
-                                    )
-                                    cur.copy(
-                                        loading = false,
-                                        profiles = freshProfiles,
-                                        // Phase C P2: 重查連 `pm list users`
-                                        // 都失敗 -> 不可讀。
-                                        pmReadable = false,
-                                        inventory = cur.inventory.toStaleOrUnknown(
-                                            now = now,
-                                            source = PmOutputParser.buildListPackages(dualId),
-                                            targetId = dualId,
-                                            // Listing-time 已驗證對偶已知：
-                                            // 通道失敗的是清單列舉，不是身份本身，
-                                            // 故身份配對沿用本次 listing-time 值
-                                            // (Stage5 原子配對，免兩步 copy)。
-                                            targetSerial = dualSerial,
-                                        ),
-                                        diagnose = diagnoseEvent(
-                                            DiagnoseCode.CHANNEL_ERROR,
-                                            techDetail = "profiles snapshot " +
-                                                "channel failed: $snapErr",
-                                        ),
-                                        msg = combinedMsg,
-                                        msgKind = combinedKind,
-                                    )
-                                } else if (nullVerifiedId != null &&
-                                    nullVerifiedId != dualId
-                                ) {
-                                    // Confirmed/SerialUnavailable 皆保證正值
-                                    //（repo 拒收 0/負值），故此分支即「正值且
-                                    // 不同」的新身份。
-                                    val newTarget = nullVerifiedId
-                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                        "refresh verification mismatch: " +
-                                            "target $dualId -> $newTarget",
-                                        MsgKind.VERIFY,
-                                        cur.degrade,
-                                    )
-                                    cur.copy(
-                                        loading = false,
-                                        profiles = freshProfiles,
-                                        // Phase C P2: 重查 Loaded 證明 `pm list
-                                        // users` 可讀 (僅 clone 清單未知)。
-                                        pmReadable = true,
-                                        inventory = cur.inventory.toStaleOrUnknown(
-                                            now = now,
-                                            source = PmOutputParser.buildListPackages(dualId),
-                                            targetId = newTarget,
-                                            // 真漂移 (newTarget != dualId 恆成立)：
-                                            // 舊 serial 永不殘留到新 id
-                                            // (Stage5 原子配對，免兩步 copy)。
-                                            targetSerial = null,
-                                        ),
-                                        diagnose = diagnoseEvent(
-                                            DiagnoseCode.VERIFY_MISMATCH,
-                                            techDetail = "verified id drifted: " +
-                                                "listed $dualId but now $newTarget",
-                                        ),
-                                        msg = combinedMsg,
-                                        msgKind = combinedKind,
-                                    )
-                                } else {
-                                    val (combinedMsg, combinedKind) = combineWithDegradeNote(
-                                        "refresh result unknown: " +
-                                            "cannot list clones for user $dualId",
-                                        MsgKind.CHANNEL,
-                                        cur.degrade,
-                                    )
-                                    cur.copy(
-                                        loading = false,
-                                        profiles = freshProfiles,
-                                        // Phase C P2: 同上，重查 Loaded -> 可讀。
-                                        pmReadable = true,
-                                        inventory = cur.inventory.toStaleOrUnknown(
-                                            now = now,
-                                            source = PmOutputParser.buildListPackages(dualId),
-                                            targetId = dualId,
-                                            // 同上：列舉不可查，身份仍為本次
-                                            // listing-time 已驗證配對
-                                            // (Stage5 原子配對，免兩步 copy)。
-                                            targetSerial = dualSerial,
-                                        ),
-                                        diagnose = diagnoseEvent(
-                                            DiagnoseCode.VERIFY_UNKNOWN,
-                                            techDetail = "cannot list clones for user $dualId",
-                                        ),
-                                        msg = combinedMsg,
-                                        msgKind = combinedKind,
-                                    )
-                                }
-                            } else if (groundTruth.orEmpty().isEmpty()) {
-                                // 契約 (Stage C C4，選 (c))：FRESH 成功清碼時同步
-                                // 歸檔 FAILED 歷史——diagnose 將清 null (phase !=
-                                // UNKNOWN) 且 phase==FAILED 時 lastOperation 同步
-                                // 清為 null，三者一致 (diagnose null + 無 FAILED
-                                // 歷史 + 就緒 msg)；OK 判據為 diagnose==null &&
-                                // lastOperation==null 或 phase != FAILED。
-                                // UNKNOWN 仍保留 (需下一次 pinned verify 才覆寫)；
-                                // SUCCESS 保留 (成功歷史非錯誤，與 OK 共存)。
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                            // 契約 (Stage C C4，選 (c))：FRESH 成功清碼時同步
+                            // 歸檔 FAILED 歷史——diagnose 將清 null (phase !=
+                            // UNKNOWN) 且 phase==FAILED 時 lastOperation 同步
+                            // 清為 null，三者一致 (diagnose null + 無 FAILED
+                            // 歷史 + 就緒 msg)；OK 判據為 diagnose==null &&
+                            // lastOperation==null 或 phase != FAILED。
+                            // UNKNOWN 仍保留 (需下一次 pinned verify 才覆寫)；
+                            // SUCCESS 保留 (成功歷史非錯誤，與 OK 共存)。
+                            val (combinedMsg, combinedKind) = if (isEmpty) {
+                                combineWithDegradeNote(
                                     "no clones installed",
                                     MsgKind.INFO,
                                     cur.degrade,
                                 )
-                                // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
-                                val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    cloned = emptyList(),
-                                    pmReadable = true,
-                                    inventory = InventorySnapshot(
-                                        source = PmOutputParser.buildListPackages(dualId),
-                                        targetId = dualId,
-                                        targetSerial = dualSerial,
-                                        queryTimeMs = now,
-                                        freshness = InventoryFreshness.FRESH,
-                                        count = 0,
-                                    ),
-                                    lastOperation = if (clearFailed) {
-                                        null
-                                    } else {
-                                        cur.lastOperation
-                                    },
-                                    diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
-                                        cur.diagnose
-                                    } else {
-                                        null
-                                    },
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
                             } else {
-                                // 契約同上 (Stage C C4)：UNKNOWN 保留原 diagnose；
-                                // FAILED 隨 FRESH 成功清碼同步清除 (見空分支註解)；
-                                // SUCCESS 保留。
-                                val (combinedMsg, combinedKind) = combineWithDegradeNote(
+                                combineWithDegradeNote(
                                     "",
                                     MsgKind.NONE,
                                     cur.degrade,
                                 )
-                                // Stage C C4：diagnose 清 null 且 FAILED 時同步清歷史。
-                                val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
-                                cur.copy(
-                                    loading = false,
-                                    profiles = profiles,
-                                    cloned = groundTruth.orEmpty(),
-                                    pmReadable = true,
-                                    inventory = InventorySnapshot(
-                                        source = PmOutputParser.buildListPackages(dualId),
-                                        targetId = dualId,
-                                        targetSerial = dualSerial,
-                                        queryTimeMs = now,
-                                        freshness = InventoryFreshness.FRESH,
-                                        count = groundTruth.orEmpty().size,
-                                    ),
-                                    lastOperation = if (clearFailed) {
-                                        null
-                                    } else {
-                                        cur.lastOperation
-                                    },
-                                    diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
-                                        cur.diagnose
-                                    } else {
-                                        null
-                                    },
-                                    msg = combinedMsg,
-                                    msgKind = combinedKind,
-                                )
                             }
+                            val clearFailed = cur.lastOperation?.phase == OpPhase.FAILED
+                            val next = cur.copy(
+                                loading = false,
+                                profiles = outcome.profiles,
+                                cloned = listed,
+                                pmReadable = true,
+                                inventory = InventorySnapshot(
+                                    source = PmOutputParser.buildListPackages(target.userId),
+                                    targetId = target.userId,
+                                    targetSerial = target.serial,
+                                    queryTimeMs = now,
+                                    freshness = InventoryFreshness.FRESH,
+                                    count = listed.size,
+                                ),
+                                lastOperation = if (clearFailed) {
+                                    null
+                                } else {
+                                    cur.lastOperation
+                                },
+                                diagnose = if (cur.lastOperation?.phase == OpPhase.UNKNOWN) {
+                                    cur.diagnose
+                                } else {
+                                    null
+                                },
+                                msg = combinedMsg,
+                                msgKind = combinedKind,
+                            )
                             if (cur.pendingRemove != null &&
                                 (next.msgKind == MsgKind.NONE || next.msgKind == MsgKind.INFO)
                             ) {
@@ -1468,16 +1331,10 @@ class DualViewModel(
                         }
                         // Phase B #1：目標變動先清舊勾選（bound 舊≠新即清空＋重置
                         // marker＋INVALID 明示），再由下行對新目標補觸恢復。
-                        // 未驗證分支（groundTruth==null）的 drift 新目標亦在此
-                        // 清（inventory 已帶新目標）；FRESH 分支清完後 restore
-                        // 新目標存檔（或舊勾選不殘留）。
                         handleSelectionTargetChangeLocked()
                         // PR-7 P2 (#26):清單 FRESH 且目標已知時,對該目標自動
                         // 恢復一次持久選取 (僅打勾,不重送寫入;已有勾選則跳過)。
                         // 必須在 opMutex 下呼叫 (refreshLocked 已持有)。
-                        // VERIFY_MISMATCH/drift 分支 inventory 已帶新目標：
-                        // 必須以 inventory 新目標恢復，listing-time 舊 id 已過期。
-                        // PR-37 Phase B #2：攜帶當下 verified serial 配對驗證。
                         val invNow = _state.value.inventory
                         restoreSelectionLocked(invNow.targetId, invNow.targetSerial)
                     }

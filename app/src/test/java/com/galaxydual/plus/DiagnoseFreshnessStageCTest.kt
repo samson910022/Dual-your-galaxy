@@ -265,9 +265,11 @@ class DiagnoseFreshnessStageCTest {
         await { vm.state.value.channelReady }
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.diagnose?.code == DiagnoseCode.CHANNEL_ERROR }
-        assertEquals(
-            "profiles snapshot empty despite typed absent",
-            vm.state.value.diagnose?.techDetail,
+        assertTrue(
+            "techDetail must name empty snapshot despite absent, got: ${vm.state.value.diagnose?.techDetail}",
+            (vm.state.value.diagnose?.techDetail ?: "").startsWith(
+                "verified dual id unknown: profiles snapshot empty despite typed absent",
+            ),
         )
     }
 
