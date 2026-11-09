@@ -18,10 +18,11 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.galaxydual.core.Privilege
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -56,6 +57,46 @@ class Pr63ReviewRegressionUiTest {
         return out
     }
 
+    private fun assertWritableState(vm: DualViewModel) {
+        val s = vm.state.value
+        assertTrue("explicit writable precondition: not loading", !s.loading)
+        assertTrue("explicit writable precondition: writeReady", s.writeReady)
+        assertTrue("explicit writable precondition: pmReadable != false", s.pmReadable != false)
+        assertTrue(
+            "explicit writable precondition: not LSPosed placeholder",
+            s.resolvedGateway != ResolvedChannel.LSPOSED_PLACEHOLDER,
+        )
+        assertTrue("explicit writable precondition: execIdentity", s.execIdentity != Privilege.NONE)
+        assertTrue("explicit writable precondition: privilege", s.privilege != Privilege.NONE)
+    }
+
+    private fun awaitRowButtons(
+        scenario: ActivityScenario<MainActivity>,
+        keyCount: Int,
+        genBefore: Int,
+        btnA0: Button,
+        btnB0: Button,
+        expectEnabled: Boolean,
+    ) {
+        HarnessPoll.await(30_000L) {
+            var ok = false
+            scenario.onActivity { activity ->
+                val bs = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
+                val container = field(activity, "clonedAppsContainer") as LinearLayout
+                val genNow = field(activity, "clonedGen") as Int
+                val nowA = bs.firstOrNull { it.tag == "remove:com.example.a" }
+                val nowB = bs.firstOrNull { it.tag == "remove:com.example.b" }
+                ok = bs.size == 2 &&
+                    bs.all { it.isEnabled == expectEnabled } &&
+                    container.childCount == keyCount &&
+                    genNow == genBefore &&
+                    nowA === btnA0 &&
+                    nowB === btnB0
+            }
+            ok
+        }
+    }
+
     @Test
     fun clonedRow_removeButton_contractAndTwoPhaseClick() {
         val gw = FakeHarnessGateway(dualId = 95).apply {
@@ -72,67 +113,84 @@ class Pr63ReviewRegressionUiTest {
                 scenario.onActivity { activity ->
                     activity.switchTab(MainActivity.TAB_DUAL_APPS, announce = false)
                 }
-                setVmState(vm) { it.copy(loading = false, cloned = listOf("com.example.a", "com.example.b")) }
+                // Render cloned rows with an explicit writable precondition. Fields
+                // affecting writeBlockReason/blockKey but NOT clonedListKeyFor
+                // (cloned, targetSerial, targetId, hookLiveProven, catalogKey) are
+                // set so early-return sync transitions can be asserted naturally.
+                setVmState(vm) {
+                    it.copy(
+                        loading = false,
+                        cloned = listOf("com.example.a", "com.example.b"),
+                        pmReadable = true,
+                        writeReady = true,
+                        resolvedGateway = ResolvedChannel.ROOT,
+                        privilege = Privilege.ROOT,
+                        execIdentity = Privilege.ROOT,
+                    )
+                }
                 HarnessPoll.await(30_000L) {
                     var count = 0
                     scenario.onActivity { activity -> count = findRowRemoveButtons(activity).size }
                     count >= 2
                 }
+
+                var keyCount = 0
+                var genBefore = 0
+                lateinit var btnA0: Button
+                lateinit var btnB0: Button
                 scenario.onActivity { activity ->
                     val buttons = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
                     assertEquals(2, buttons.size)
                     val expectedText = activity.getString(R.string.action_remove)
-                    buttons.forEachIndexed { idx, b ->
-                        val pkg = if (idx == 0) "com.example.a" else "com.example.b"
+                    buttons.forEach { b ->
+                        val pkg = b.tag.toString().removePrefix("remove:")
                         assertEquals("remove:$pkg", b.tag)
                         assertEquals(expectedText, b.text.toString())
                         assertNotNull(b.contentDescription)
                         val cd = b.contentDescription.toString()
-                        assertTrue("CD should contain action", cd.contains(expectedText))
-                        assertTrue("CD should contain pkg context", cd.contains("com.example.a") || cd.contains("com.example.b"))
+                        assertTrue("CD should contain action for $pkg", cd.contains(expectedText))
+                        assertTrue("CD should contain pkg $pkg", cd.contains(pkg))
                         assertTrue("touch target >= 48dp", b.minimumHeight >= (48 * activity.resources.displayMetrics.density).toInt())
                         assertTrue("touch target >= 48dp", b.minimumWidth >= (48 * activity.resources.displayMetrics.density).toInt())
                         assertEquals(1, b.maxLines)
                     }
-                }
-                // Same-key early return: busy toggle must sync row remove enabled
-                // without rebuilding rows (buildClonedListKey excludes loading).
-                var keyCount = 0
-                scenario.onActivity { activity ->
                     keyCount = (field(activity, "clonedAppsContainer") as LinearLayout).childCount
+                    genBefore = field(activity, "clonedGen") as Int
+                    btnA0 = buttons.first { it.tag == "remove:com.example.a" }
+                    btnB0 = buttons.first { it.tag == "remove:com.example.b" }
+                    assertTrue("initial row buttons must be enabled", btnA0.isEnabled && btnB0.isEnabled)
                 }
-                setVmState(vm) { it.copy(loading = true) }
-                HarnessPoll.await(30_000L) {
-                    var disabled = false
-                    scenario.onActivity { activity ->
-                        val bs = findRowRemoveButtons(activity)
-                        disabled = bs.size == 2 && bs.all { !it.isEnabled } &&
-                            (field(activity, "clonedAppsContainer") as LinearLayout).childCount == keyCount
-                    }
-                    disabled
-                }
-                setVmState(vm) { it.copy(loading = false) }
-                HarnessPoll.await(30_000L) {
-                    var ok = false
-                    scenario.onActivity { activity ->
-                        val bs = findRowRemoveButtons(activity)
-                        ok = bs.size == 2 && (field(activity, "clonedAppsContainer") as LinearLayout).childCount == keyCount
-                    }
-                    ok
-                }
+                assertWritableState(vm)
 
-                // Async label rebind regression (remove button tag/type path) +
-                // wiring: click requests removal (two-phase) with no immediate write.
+                // Same-key early return: busy and writable/blockKey transitions must
+                // sync row remove enabled without rebuilding rows. buildClonedListKey
+                // excludes loading; pmReadable is not in the fingerprint but affects
+                // writeBlockReason/blockKey, so it exercises the writable gate via the
+                // same early-return sync (state seam, no View.isEnabled forcing).
+                setVmState(vm) { it.copy(loading = true) }
+                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = false)
+                setVmState(vm) { it.copy(loading = false) }
+                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = true)
+                assertWritableState(vm)
+
+                setVmState(vm) { it.copy(loading = false, pmReadable = false) }
+                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = false)
+                setVmState(vm) { it.copy(loading = false, pmReadable = true) }
+                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = true)
+                assertWritableState(vm)
+
+                // Async label rebind updates CD in place (same Button instances) and
+                // a naturally enabled click requests removal (two-phase) with no
+                // immediate uninstall/write.
                 scenario.onActivity { activity ->
                     method(activity, "cacheLabel", String::class.java, String::class.java)
                         .invoke(activity, "com.example.a", "Example A")
                     method(activity, "rebindClonedLabel", String::class.java, String::class.java)
                         .invoke(activity, "com.example.a", "Example A")
                     val rebound = findRowRemoveButtons(activity).first { it.tag == "remove:com.example.a" }
+                    assertSame("rebind must not rebuild row/button", btnA0, rebound)
                     assertTrue(rebound.contentDescription.toString().contains("Example A"))
-                    // Enable for deterministic handler wiring; writability gating is
-                    // separately enforced by VM/other tests.
-                    rebound.isEnabled = true
+                    assertTrue("naturally enabled after transitions", rebound.isEnabled)
                     val before = gw.uninstallCalls
                     rebound.performClick()
                     assertEquals("click must not uninstall immediately", before, gw.uninstallCalls)

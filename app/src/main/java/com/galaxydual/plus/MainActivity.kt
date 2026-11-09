@@ -2287,9 +2287,11 @@ class MainActivity : ComponentActivity() {
                 textSize = 12f
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
-                // PR #63 review: cap growth on small width/large font so the app-name
-                // column (weight=1 + minWidth) keeps readable space.
-                maxWidth = dp(132)
+                // PR #63 re-review #1: 320dp worst case leaves ~186dp for
+                // text+button (tab 32 + card 24 + row 16 + icon 44 + margins 18 =
+                // 134 fixed). 186 - 96(text minWidth) = 90dp max for the button,
+                // preserving 48dp touch target while protecting the app-name column.
+                maxWidth = dp(90)
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
