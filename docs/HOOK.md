@@ -88,8 +88,9 @@ caller-inline fixture 尚未建立，相關裝置驗證尚未完成；驗收待�
   `HookInstallerCallerTest` 鎖定（含 false 不得寫成「不需要」／no-op）。
 - `DualHook.knownCallersFor()` 為 DEVICE-UNVERIFIED 接線點，目前回空
   （＝今日 callee-only 行為，呼叫點仍走 `hookWithDeoptimize()`，行為不變）；
-  待按 ROM 取到 caller ART 證據後才接上。ART 實效與非空政策實路徑驗證
-  仍待裝置，驗收待辦維持不變。
+  待按 ROM 取到 caller ART 證據後才接上。ART 實效仍待裝置驗證；未來若接上
+  非空 caller 名單，其實路徑驗證亦屬 #10 caller/反內聯範圍（非非空政策
+  concern）待裝置，驗收待辦維持不變。
 Hook Builder 統一使用
 **`ExceptionMode.PROTECTIVE`**（佔位保護）：請求 framework 保護 hook 例外處理，
 不保證所有情況下 `system_server` 或 daagent 都不會崩潰。

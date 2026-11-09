@@ -5,6 +5,14 @@ import java.lang.reflect.Method
 
 // Framework-free orchestration; the caller supplies the actual framework operations.
 internal object HookInstaller {
+    private inline fun safeLog(log: (String) -> Unit, message: String) {
+        try {
+            log(message)
+        } catch (_: Throwable) {
+            // Diagnostics must not affect installation or its result.
+        }
+    }
+
     fun install(
         method: Method,
         hookId: String,
@@ -12,35 +20,29 @@ internal object HookInstaller {
         hook: (Method, String) -> Unit,
         log: (String) -> Unit,
     ): Boolean {
-        fun safeLog(message: String) {
-            try {
-                log(message)
-            } catch (_: Throwable) {
-                // Diagnostics must not affect installation or its result.
-            }
-        }
-
         try {
             try {
                 if (deoptimize(method)) {
-                    safeLog("deoptimized ${method.declaringClass.name}#${method.name}")
+                    safeLog(log, "deoptimized ${method.declaringClass.name}#${method.name}")
                 } else {
                     safeLog(
+                        log,
                         "deoptimize returned false ${method.declaringClass.name}#${method.name} " +
                             "(hook proceeds, effect unverified)",
                     )
                 }
             } catch (t: Throwable) {
                 safeLog(
+                    log,
                     "deoptimize failed ${method.declaringClass.name}#${method.name}: " +
                         "${t.message}; hook proceeds, effect unverified",
                 )
             }
             hook(method, hookId)
-            safeLog("hooked ${method.declaringClass.name}#${method.name}")
+            safeLog(log, "hooked ${method.declaringClass.name}#${method.name}")
             return true
         } catch (t: Throwable) {
-            safeLog("hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
+            safeLog(log, "hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
             return false
         }
     }
@@ -60,27 +62,21 @@ internal object HookInstaller {
         hook: (Method, String) -> Unit,
         log: (String) -> Unit,
     ): Boolean {
-        fun safeLog(message: String) {
-            try {
-                log(message)
-            } catch (_: Throwable) {
-                // Diagnostics must not affect installation or its result.
-            }
-        }
-
         val plan = CallerDeoptPlan.plan(callee, knownCallers)
         for (caller in plan.callersToDeoptimize) {
             try {
                 if (deoptimize(caller)) {
-                    safeLog("deoptimized caller ${caller.declaringClass.name}#${caller.name}")
+                    safeLog(log, "deoptimized caller ${caller.declaringClass.name}#${caller.name}")
                 } else {
                     safeLog(
+                        log,
                         "deoptimize caller returned false ${caller.declaringClass.name}#${caller.name} " +
                             "(hook proceeds, effect unverified)",
                     )
                 }
             } catch (t: Throwable) {
                 safeLog(
+                    log,
                     "deoptimize caller failed ${caller.declaringClass.name}#${caller.name}: " +
                         "${t.message}; hook proceeds, effect unverified",
                 )
