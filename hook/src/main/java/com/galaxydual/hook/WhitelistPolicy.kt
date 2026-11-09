@@ -3,6 +3,9 @@ package com.galaxydual.hook
 
 import java.lang.reflect.Executable
 
+import java.util.NavigableSet
+import java.util.SortedSet
+
 // Pure (framework-free) whitelist-extension policy shared by all hooks.
 //
 // Kept free of android.* / LibXposed types so it runs as a plain JVM unit
@@ -19,49 +22,88 @@ object WhitelistPolicy {
 
     // Shared whitelist policy: extend-only, never shrink.
     //
-    // Booleans keep an original "true"; a "false" is flipped only for a
-    // single-String-arg query whose package is in [extra]. Collections get
-    // EXTRA entries appended with the ORIGINAL container type preserved
-    // (a Set stays a Set -- callers may cast). Anything unrecognized is
-    // observe-only: returned unchanged plus one diagnosable log line.
+    // Booleans keep an original "true". A "false" is flipped only when the
+    // package argument is identified safely: callers should pass a verified
+    // [packageArgIndex] (resolved via WhitelistSignatureGuard). For backward
+    // compatibility, when [packageArgIndex] is null and [strictSignature] is
+    // false, a conservative legacy scan accepts only args containing exactly
+    // one String. When [strictSignature] is true, an unverified index is
+    // observe-only (no rewrite). Empty [extra] never rewrites.
     //
-    // EXTRA_WHITELIST_PACKAGES is empty by default, so hooks are observe-only
-    // placeholders until a real policy source (e.g. RemotePreferences) is
-    // wired in.
+    // Collections/arrays are extended only when element types are safe and the
+    // merged value is compatible with [declaredReturnType] (when provided).
+    // Sorted/Navigable sets and non-String containers stay observe-only.
+    // Anything unrecognized is observe-only: returned unchanged plus one
+    // diagnosable log line.
     fun apply(
         result: Any?,
         args: List<Any?>,
         extra: Set<String>,
         methodDesc: String,
         onLog: (String) -> Unit,
+        packageArgIndex: Int? = null,
+        declaredReturnType: Class<*>? = null,
+        strictSignature: Boolean = false,
     ): Any? {
         if (result is Boolean) {
             if (result) return true
-            // Extend-only re-decision: if exactly 1 String arg exists anywhere in
-            // args, treat it as the package candidate (supports (String),
-            // (String, int), (int, String), etc.). 0 or >1 String args is
-            // ambiguous — stay observe-only and never guess.
-            val stringArgs = args.filterIsInstance<String>()
-            if (stringArgs.size != 1) {
+            if (extra.isEmpty()) return false
+            val effectiveIndex = packageArgIndex ?: if (strictSignature) {
+                null
+            } else {
+                legacyBooleanPackageArgIndex(args)
+            }
+            if (effectiveIndex == null) {
                 onLog(
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
-                        "result with ambiguous args (size=${args.size}, " +
-                        "stringCount=${stringArgs.size}); returning original",
+                        "result with unverified package arg (size=${args.size}); " +
+                        "returning original",
                 )
                 return result
             }
-            return extra.contains(stringArgs[0])
+            val pkg = args.getOrNull(effectiveIndex)
+            if (pkg !is String) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
+                        "result with non-String package arg at index $effectiveIndex; " +
+                        "returning original",
+                )
+                return result
+            }
+            return extra.contains(pkg)
         }
         if (extra.isEmpty()) return result
         if (result is List<*>) {
-            return result + extra.filter { !result.contains(it) }
+            if (result.any { it !is String }) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "list with non-String elements; returning original",
+                )
+                return result
+            }
+            val merged = result + extra.filter { !result.contains(it) }
+            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         if (result is Set<*>) {
-            // Preserve the Set type: rebuilding as a List would break callers
+            if (result is SortedSet<*> || result is NavigableSet<*>) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "sorted/navigable set ${result.javaClass.name}; returning original",
+                )
+                return result
+            }
+            if (result.any { it !is String }) {
+                onLog(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "set with non-String elements; returning original",
+                )
+                return result
+            }
+            // Preserve Set semantics; rebuilding as a List would break callers
             // that cast the result back to Set.
             val merged = result.toMutableSet()
             merged.addAll(extra.filter { !merged.contains(it) })
-            return merged
+            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         if (result is Collection<*>) {
             // Other Collection kinds (Queue, etc.) have unknown contracts;
@@ -78,8 +120,9 @@ object WhitelistPolicy {
         ) {
             @Suppress("UNCHECKED_CAST")
             val current = result as Array<String>
-            return (current.toList() + extra.filter { !current.contains(it) })
+            val merged = (current.toList() + extra.filter { !current.contains(it) })
                 .toTypedArray()
+            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         onLog(
             "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
@@ -87,5 +130,34 @@ object WhitelistPolicy {
                 "returning original",
         )
         return result
+    }
+
+    private fun legacyBooleanPackageArgIndex(args: List<Any?>): Int? {
+        var found: Int? = null
+        for ((i, arg) in args.withIndex()) {
+            if (arg is String) {
+                if (found != null) return null
+                found = i
+            }
+        }
+        return found
+    }
+
+    private fun compatibleOrOriginal(
+        merged: Any,
+        declaredReturnType: Class<*>?,
+        original: Any,
+        methodDesc: String,
+        onLog: (String) -> Unit,
+    ): Any {
+        if (declaredReturnType != null && !declaredReturnType.isInstance(merged)) {
+            onLog(
+                "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                    "merged type ${merged.javaClass.name} incompatible with " +
+                    "declared ${declaredReturnType.name}; returning original",
+            )
+            return original
+        }
+        return merged
     }
 }
