@@ -100,6 +100,17 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
+// Stage1 批次建立兩步確認請求快照（Activity 本地狀態，不經 VmState）。
+// 沿用 remove ack 的世代契約：每次點擊 batchBtn 產生新世代，ack 綁世代保留
+// （同世代旋轉保留、跨世代重置）；confirm 才呼叫 vm.cloneSelected()，
+// VM 的 isWritable/起始 pin 守衛完全不變（此處只做 UI 門控與訊息呈現）。
+private data class BatchConfirmRequest(
+    val count: Int,
+    val targetId: Int,
+    val targetSerial: Int,
+    val generation: Long,
+)
+
 // Observes DualViewModel.state, drives Shizuku binder/permission lifecycle,
 // and renders the dual-app screen. All shell work stays in the ViewModel.
 class MainActivity : ComponentActivity() {
@@ -137,9 +148,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var refreshBtn: Button
     // PR-7 P2 (#26, 階段 1):個人來源唯讀 catalog + 勾選。
     // searchInput/系統開關只改 UiState 搜尋狀態；清單列為 CheckBox (唯讀展示
-    // + 勾選,取消勾選 ≠ 卸載)；batchBtn 顯示「建立 N 個分身」,走
-    // vm.cloneSelected (cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證，
-    // 見 DualViewModel)。
+    // + 勾選,取消勾選 ≠ 卸載)；batchBtn 顯示「建立 N 個分身」。
+    // Stage1：batchBtn 移到 sticky bottom bar（貼 bottomBar 上方），點擊先開
+    // 「確認建立」對話框（世代＋ack＋目標摘要＋風險），確認後才 vm.cloneSelected()
+    // (cloneVerifiedExpected 逐項 pin：非原子交易、逐包驗證，見 DualViewModel)。
     private lateinit var searchInput: EditText
     private lateinit var systemToggleBtn: Button
     private lateinit var selectAllBtn: Button
@@ -149,6 +161,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
+    // Stage1：sticky bottom bar 的勾選數文字（「已選 N 項」），與主 CTA 永遠可見。
+    private lateinit var batchSelCountView: TextView
+    // Stage1：sticky bottom bar 容器（只在雙開應用頁顯示；Engine 頁隱藏，見 switchTab）。
+    private lateinit var batchBar: LinearLayout
     private lateinit var batchResultView: TextView
     private lateinit var permBtn: Button
     // p28-1：通道四按鈕改為互斥單選語意（RadioGroup/RadioButton），checked 狀態
@@ -211,6 +227,18 @@ class MainActivity : ComponentActivity() {
     // Neutral（標籤詳情）不解散父對話框、不重置此狀態；旋轉經 Bundle 保留。
     private var acknowledgedGeneration: Long? = null
     private var shownPending: PendingRemove? = null
+
+    // Stage1 批次建立兩步確認（Activity 本地，沿用 remove ack 模式）：
+    // 點擊 batchBtn 只建立請求快照（世代 + 目標摘要 + 數量）並開對話框，
+    // 勾選_ack 且非 busy/可寫才啟用「確認建立」；confirm 才 cloneSelected()。
+    // pendingBatchRequest 為當前待確認快照（旋轉經 Bundle 保留，render 重新顯示）；
+    // shownBatchRequest 追蹤已在屏的實例，避免每輪 render 重建對話框。
+    private var batchConfirmDialog: AlertDialog? = null
+    private var pendingBatchRequest: BatchConfirmRequest? = null
+    private var shownBatchRequest: BatchConfirmRequest? = null
+    private var batchAcknowledged = false
+    private var batchAcknowledgedGeneration: Long? = null
+    private var batchGeneration = 0L
 
     // 診斷匯出預覽對話框 (比照 removeConfirmDialog)：旋轉/銷毀時需主動
     // dismiss，否則舊 Activity 的 window 洩漏。
@@ -376,6 +404,24 @@ class MainActivity : ComponentActivity() {
             } else {
                 null
             }
+        // Stage1 批次建立確認：請求快照隨 Activity 存活保留（同世代旋轉重現對話框）。
+        if (savedInstanceState != null && savedInstanceState.containsKey(KEY_BATCH_REQ_GEN)) {
+            val generation = savedInstanceState.getLong(KEY_BATCH_REQ_GEN)
+            pendingBatchRequest = BatchConfirmRequest(
+                count = savedInstanceState.getInt(KEY_BATCH_REQ_COUNT),
+                targetId = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_ID),
+                targetSerial = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_SERIAL),
+                generation = generation,
+            )
+            batchGeneration = generation
+            batchAcknowledged = savedInstanceState.getBoolean(KEY_BATCH_ACK)
+            batchAcknowledgedGeneration =
+                if (savedInstanceState.containsKey(KEY_BATCH_ACK_GEN)) {
+                    savedInstanceState.getLong(KEY_BATCH_ACK_GEN)
+                } else {
+                    null
+                }
+        }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -448,6 +494,15 @@ class MainActivity : ComponentActivity() {
         // 移除確認勾選綁定世代保留（Neutral 不重置，同世代旋轉保留）。
         outState.putBoolean(KEY_REMOVE_ACK, removeAcknowledged)
         if (acknowledgedGeneration != null) outState.putLong(KEY_REMOVE_ACK_GEN, acknowledgedGeneration!!)
+        // Stage1 批次建立確認：請求快照隨旋轉保留（同世代重現對話框，跨世代重置）。
+        pendingBatchRequest?.let { req ->
+            outState.putInt(KEY_BATCH_REQ_COUNT, req.count)
+            outState.putInt(KEY_BATCH_REQ_TARGET_ID, req.targetId)
+            outState.putInt(KEY_BATCH_REQ_TARGET_SERIAL, req.targetSerial)
+            outState.putLong(KEY_BATCH_REQ_GEN, req.generation)
+        }
+        outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
+        if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
     }
 
     override fun onDestroy() {
@@ -460,6 +515,14 @@ class MainActivity : ComponentActivity() {
         removeLabelsDialog = null
         removeConfirmDialog = null
         shownPending = null
+        try {
+            batchConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        batchConfirmDialog = null
+        pendingBatchRequest = null
+        shownBatchRequest = null
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -857,7 +920,8 @@ class MainActivity : ComponentActivity() {
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
-            setOnClickListener { vm.cloneSelected() }
+            // Stage1：點擊不直接 clone，先開「確認建立」對話框（見 requestBatchConfirm）。
+            setOnClickListener { requestBatchConfirm() }
         }
         batchResultView = TextView(this).apply {
             textSize = 12f
@@ -1015,8 +1079,8 @@ class MainActivity : ComponentActivity() {
 
         tabAppsLayout.addView(buildHookModeCard())
 
-        // Batch Action Button
-        tabAppsLayout.addView(batchBtn)
+        // Batch Action Button：Stage1 已移至底部 sticky bar（見下方），
+        // 此處只保留批次結果/原因文字區（batchResultView）。
         tabAppsLayout.addView(batchResultView)
 
         // Search Bar with Clear Button (Phase C: WRAP_CONTENT + minimumHeight so
@@ -1491,6 +1555,36 @@ class MainActivity : ComponentActivity() {
         contentFrame.addView(tabEngineScroll)
         root.addView(contentFrame)
 
+        // ================= Sticky Batch Bar (Stage1) =================
+        // 貼 bottomBar 上方：勾選數（「已選 N 項」）＋主 CTA 永遠可見，不隨清單
+        // 捲動。門控沿用 batchEnabled(s)，禁用原因仍由 batchResultView/writeBlockView
+        // 顯示（見 renderSourceList/render）。
+        batchBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(getColor(R.color.oneui_surface))
+            minimumHeight = dp(56)
+            val pad = dp(12)
+            setPadding(pad, dp(6), pad, dp(6))
+            elevation = dp(4).toFloat()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+        }
+        batchSelCountView = TextView(this).apply {
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        batchBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        batchBar.addView(batchSelCountView)
+        batchBar.addView(batchBtn)
+        root.addView(batchBar)
+
         // ================= Bottom Navigation Bar =================
         // Phase C: WRAP_CONTENT + minimumHeight (was fixed dp60, clips large
         // fonts). Touch target stays >= 60dp.
@@ -1944,6 +2038,11 @@ class MainActivity : ComponentActivity() {
     internal fun switchTab(tab: Int, announce: Boolean = true) {
         currentTab = tab
         if (!::tabAppsScroll.isInitialized || !::tabEngineScroll.isInitialized) return
+        // Stage1：sticky batch bar 只屬雙開應用頁；切到 Engine 頁隱藏，避免命令列
+        // 引擎頁出現不相干的批次 CTA（batchBtn 禁用原因仍在各頁主區顯示）。
+        if (::batchBar.isInitialized) {
+            batchBar.visibility = if (tab == TAB_DUAL_APPS) View.VISIBLE else View.GONE
+        }
         if (tab == TAB_DUAL_APPS) {
             tabAppsScroll.visibility = View.VISIBLE
             tabEngineScroll.visibility = View.GONE
@@ -3152,6 +3251,12 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "syncRemoveDialog failed", e)
         }
+        // Stage1 批次建立兩步確認：請求存在即顯示/同步對話框（旋轉同世代保留 ack）。
+        try {
+            syncBatchDialog(pendingBatchRequest, s)
+        } catch (e: Exception) {
+            Log.w(TAG, "syncBatchDialog failed", e)
+        }
     }
 
     // P2-2 手動輸入即時門控（TextWatcher 輕量路徑）：只更新 clone/remove/
@@ -3457,6 +3562,190 @@ class MainActivity : ComponentActivity() {
                     // Best effort.
                 }
             }
+        }
+    }
+
+    // Stage1 批次建立兩步確認（Activity 本地，沿用 remove ack 世代契約）：
+    // batchBtn 點擊只建立請求快照（世代/數量/目標）並顯示對話框，確認後才
+    // vm.cloneSelected()。VM 守衛（isWritable、起始 pin）完全不經手，此處只做
+    // UI 門控（canConfirmBatch）與文案呈現（buildBatchConfirmMessage）。
+    private fun requestBatchConfirm() {
+        if (isFinishing || isDestroyed) return
+        val s = try {
+            vm.state.value
+        } catch (_: Exception) {
+            return
+        }
+        // 與 batchEnabled 同一 UI 門控（fail-closed）；按鈕本身已禁用，此為縱深。
+        if (!batchEnabled(s)) return
+        val serial = s.inventory.targetSerial ?: return
+        batchGeneration += 1
+        val request = BatchConfirmRequest(
+            count = s.selectedKeys.size,
+            targetId = s.inventory.targetId,
+            targetSerial = serial,
+            generation = batchGeneration,
+        )
+        // 跨世代一律重置勾選（同 remove：新請求不得沿用舊世代的 ack）。
+        batchAcknowledged = false
+        batchAcknowledgedGeneration = null
+        pendingBatchRequest = request
+        showBatchConfirmDialog(request, s)
+    }
+
+    // 顯示/重建對話框。呼叫端需先建立 request（點擊或旋轉恢復）。
+    private fun showBatchConfirmDialog(request: BatchConfirmRequest, s: UiState) {
+        if (isFinishing || isDestroyed) return
+        try {
+            batchConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window may already be gone.
+        }
+        shownBatchRequest = request
+        // 同世代重建（旋轉）保留勾選；跨世代已先在請求端重置。
+        if (batchAcknowledgedGeneration != request.generation) {
+            batchAcknowledged = false
+            batchAcknowledgedGeneration = null
+        }
+        val message = buildBatchConfirmMessage(
+            template = getString(R.string.batch_confirm_message),
+            count = request.count,
+            targetId = request.targetId,
+            targetSerial = request.targetSerial,
+        )
+        val acknowledgement = CheckBox(this).apply {
+            setText(R.string.batch_confirm_acknowledge)
+            // 窄螢幕可見可操作：24px 改 dp 換算＋WRAP_CONTENT＋最小觸控高 48dp。
+            val d = resources.displayMetrics.density
+            val hPad = (24 * d).toInt()
+            setPadding(hPad, 0, hPad, 0)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            minimumHeight = (48 * d).toInt()
+            isChecked = batchAcknowledged
+        }
+        try {
+            batchConfirmDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.batch_confirm_title))
+                .setMessage(message)
+                .setView(acknowledgement)
+                .setCancelable(!s.loading)
+                .setPositiveButton(getString(R.string.batch_confirm_positive), null)
+                .setNegativeButton(getString(R.string.dialog_cancel), null)
+                .setOnCancelListener { cancelBatchConfirm() }
+                .show()
+        } catch (_: Exception) {
+            batchConfirmDialog = null
+            shownBatchRequest = null
+            pendingBatchRequest = null
+            return
+        }
+        acknowledgement.setOnCheckedChangeListener { _, checked ->
+            batchAcknowledged = checked
+            batchAcknowledgedGeneration = if (checked) request.generation else null
+            updateBatchConfirmEnabled(s)
+        }
+        batchConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            // 確定性路徑：重讀 live 狀態（busy/可寫/目標），不賴 stale 參數。
+            val cur = try {
+                vm.state.value
+            } catch (_: Exception) {
+                null
+            }
+            if (cur != null && canConfirmBatch(cur, batchAcknowledged)) {
+                // 確認後立即關閉，由狀態列/清單呈現執行進度；VM 結果不復委對話框。
+                cancelBatchConfirm()
+                vm.cloneSelected()
+            }
+        }
+        batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+            cancelBatchConfirm()
+        }
+        updateBatchConfirmEnabled(s)
+    }
+
+    // render 每輪同步：request 為空即關閉；已顯示且同一實例只更新按鈕 enablement
+    // （比照 syncRemoveDialog 的 early-return，不重建對話框）。目標或數量變化時
+    // 建立新世代（ack 重置）並重建，避免摘要與實際執行目標漂移。
+    private fun syncBatchDialog(request: BatchConfirmRequest?, s: UiState) {
+        if (isFinishing || isDestroyed) return
+        if (request == null) {
+            if (batchConfirmDialog != null) {
+                try {
+                    batchConfirmDialog?.dismiss()
+                } catch (_: Exception) {
+                    // Best effort: the window may already be gone.
+                }
+            }
+            batchConfirmDialog = null
+            shownBatchRequest = null
+            batchAcknowledged = false
+            batchAcknowledgedGeneration = null
+            return
+        }
+        // 目標不再可確認（refresh 降級/漂移）：請求失效，關閉對話框；
+        // 禁用原因由 batchResultView 顯示（不可靜默）。
+        if (!verifiedTargetAvailable(s)) {
+            cancelBatchConfirm()
+            return
+        }
+        val liveSerial = s.inventory.targetSerial
+        if (s.inventory.targetId != request.targetId ||
+            liveSerial != request.targetSerial ||
+            s.selectedKeys.size != request.count
+        ) {
+            val regenerated = request.copy(
+                count = s.selectedKeys.size,
+                targetId = s.inventory.targetId,
+                targetSerial = liveSerial ?: request.targetSerial,
+                generation = request.generation + 1,
+            )
+            batchGeneration = regenerated.generation
+            batchAcknowledged = false
+            batchAcknowledgedGeneration = null
+            pendingBatchRequest = regenerated
+            try {
+                batchConfirmDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            batchConfirmDialog = null
+            shownBatchRequest = null
+            showBatchConfirmDialog(regenerated, s)
+            return
+        }
+        if (batchConfirmDialog?.isShowing == true && shownBatchRequest == request) {
+            updateBatchConfirmEnabled(s)
+            return
+        }
+        showBatchConfirmDialog(request, s)
+    }
+
+    private fun cancelBatchConfirm() {
+        try {
+            batchConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window may already be gone.
+        }
+        batchConfirmDialog = null
+        pendingBatchRequest = null
+        shownBatchRequest = null
+        batchAcknowledged = false
+        batchAcknowledgedGeneration = null
+    }
+
+    // 按鈕 enablement 以傳入的 live 快照為準（batchEnabled 門控＋ack）。
+    private fun updateBatchConfirmEnabled(s: UiState) {
+        try {
+            batchConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                canConfirmBatch(s, batchAcknowledged)
+            batchConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !s.loading
+            batchConfirmDialog?.setCancelable(!s.loading)
+            batchConfirmDialog?.setCanceledOnTouchOutside(!s.loading)
+        } catch (_: Exception) {
+            // Best effort: 無障礙屬性失敗不影響顯示。
         }
     }
 
@@ -3883,6 +4172,12 @@ class MainActivity : ComponentActivity() {
         batchBtn.text = resources.getQuantityString(R.plurals.batch_create, s.selectedKeys.size, s.selectedKeys.size)
         batchBtn.contentDescription = resources.getQuantityString(
             R.plurals.batch_create_cd,
+            s.selectedKeys.size,
+            s.selectedKeys.size,
+        )
+        // Stage1 sticky bar：勾選數永遠可見（含 0 項）。
+        batchSelCountView.text = resources.getQuantityString(
+            R.plurals.batch_selected_count,
             s.selectedKeys.size,
             s.selectedKeys.size,
         )
@@ -4541,6 +4836,13 @@ class MainActivity : ComponentActivity() {
         // 移除確認勾選綁定世代保留鍵：同世代旋轉保留，跨世代重置；Neutral 不重置。
         private const val KEY_REMOVE_ACK = "removeAck"
         private const val KEY_REMOVE_ACK_GEN = "removeAckGen"
+        // Stage1 批次建立兩步確認旋轉保留鍵：請求快照（數量/目標/世代）＋勾選世代。
+        private const val KEY_BATCH_REQ_COUNT = "batchReqCount"
+        private const val KEY_BATCH_REQ_TARGET_ID = "batchReqTargetId"
+        private const val KEY_BATCH_REQ_TARGET_SERIAL = "batchReqTargetSerial"
+        private const val KEY_BATCH_REQ_GEN = "batchReqGen"
+        private const val KEY_BATCH_ACK = "batchAck"
+        private const val KEY_BATCH_ACK_GEN = "batchAckGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -5069,6 +5371,12 @@ internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean 
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable: Boolean): Boolean =
     !loading && acknowledged && writable
 
+// Stage1 批次建立 confirm 門控（純函數，JVM 可測）：沿用 batchEnabled 門控
+// （非 busy、有勾選、可寫、verified target 可用）再叠加 ack 勾選。VM isWritable/
+// 起始 pin 守衛保留為縱深。
+internal fun canConfirmBatch(s: UiState, acknowledged: Boolean): Boolean =
+    batchEnabled(s) && acknowledged
+
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
     val out = StringBuilder("\u2068")
@@ -5119,6 +5427,15 @@ internal fun buildRemoveConfirmMessage(
     sanitizeRemoveConfirmField(appLabel, 32, 96), sanitizeRemoveConfirmField(pkg), dualId.toString(),
     sanitizeRemoveConfirmField(profileLabel, 32, 96), serial.toString(),
 )
+
+// Stage1 批次建立確認文案（純函數，JVM 可測）：數字欄位（數量/user/serial）
+// 不含使用者可控字串，無需控制字元跳脫；模板經資源雙語對齊（見 UiSemantics）。
+internal fun buildBatchConfirmMessage(
+    template: String,
+    count: Int,
+    targetId: Int,
+    targetSerial: Int,
+): String = String.format(java.util.Locale.ROOT, template, count, targetId, targetSerial)
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
 // DEVICE-UNVERIFIED: selection/exec never ran on a device.

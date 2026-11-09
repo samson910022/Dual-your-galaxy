@@ -312,6 +312,10 @@ class UiSemanticsP28Test {
             "diagnostic_copy_button",
             "diagnostic_copy_success",
             "batch_target_unavailable",
+            "batch_confirm_title",
+            "batch_confirm_message",
+            "batch_confirm_positive",
+            "batch_confirm_acknowledge",
         )
         for (k in keys) {
             assertTrue("zh missing/empty $k", !zh[k].isNullOrEmpty())
@@ -406,6 +410,38 @@ class UiSemanticsP28Test {
         assertTrue(
             "en batch target must name Reconnect and refresh",
             en.getValue("batch_target_unavailable").contains("Reconnect and refresh"),
+        )
+        // Stage1 批次建立兩步確認：sticky 勾選數（plural）＋確認對話框字串雙語齊備。
+        assertTrue(
+            "zh batch confirm message must name 警告/已驗證目標/勾選下方確認框",
+            zh.getValue("batch_confirm_message").contains("警告") &&
+                zh.getValue("batch_confirm_message").contains("已驗證目標") &&
+                zh.getValue("batch_confirm_message").contains("勾選下方確認框"),
+        )
+        assertTrue(
+            "en batch confirm message must name Warning/Verified target/check the confirmation box below",
+            en.getValue("batch_confirm_message").contains("Warning") &&
+                en.getValue("batch_confirm_message").contains("Verified target") &&
+                en.getValue("batch_confirm_message").contains("check the confirmation box below"),
+        )
+        assertTrue(
+            "batch_selected_count plural must exist in zh/en",
+            pluralNames(resFile("values/strings.xml")).contains("batch_selected_count") &&
+                pluralNames(resFile("values-en/strings.xml")).contains("batch_selected_count"),
+        )
+        // Stage1 批次 CTA 無障礙描述三語皆標註需二次確認（zh/hant 需二次確認；
+        // en requires two-step confirmation）。
+        assertTrue(
+            "zh batch_create_cd must name 需二次確認",
+            pluralText(resFile("values/strings.xml"), "batch_create_cd").contains("需二次確認"),
+        )
+        assertTrue(
+            "hant batch_create_cd must name 需二次確認",
+            pluralText(resFile("values-b+zh+Hant/strings.xml"), "batch_create_cd").contains("需二次確認"),
+        )
+        assertTrue(
+            "en batch_create_cd must name requires two-step confirmation",
+            pluralText(resFile("values-en/strings.xml"), "batch_create_cd").contains("requires two-step confirmation"),
         )
         // 空白禁用可感知理由：zh 須命名已禁用＋輸入包名，en 須命名 disabled＋Enter a package name。
         assertTrue(
@@ -524,6 +560,25 @@ class UiSemanticsP28Test {
             out.add(nodes.item(i).attributes.getNamedItem("name").nodeValue)
         }
         return out
+    }
+
+    // 取指定 plural 所有 item 文字（串接），供批次文案斷言鎖定。
+    private fun pluralText(f: File, name: String): String {
+        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(f)
+        val nodes = doc.getElementsByTagName("plurals")
+        for (i in 0 until nodes.length) {
+            val n = nodes.item(i)
+            if (n.attributes.getNamedItem("name").nodeValue == name) {
+                val items = n.childNodes
+                val sb = StringBuilder()
+                for (j in 0 until items.length) {
+                    val item = items.item(j)
+                    if (item.nodeName == "item") sb.append(item.textContent.trim())
+                }
+                return sb.toString()
+            }
+        }
+        throw AssertionError("missing plural: $name")
     }
 
     private fun colorMap(f: File): Map<String, String> {

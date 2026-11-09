@@ -221,6 +221,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
   部分成功如實呈現（例「成功 1 / 失敗 1 / 未知 0」）；全成功清診斷事件，否則留彙總診斷；
   成功或未知（可能已寫入未驗證）即把清單標 STALE；目標漂移時無條件 STALE 並更新為 live target、清空選取（同目標變更處理）。
   唯讀／佔位通道整批拒絕（不產生報告）；勾選變更後舊報告即清（stale 報告不保留）。
+- 兩步確認與 sticky bar：批次 CTA 與勾選數固定於底部 sticky bar（貼 bottom navigation 上方，不隨清單捲動；只在雙開應用頁顯示，切到 Engine 頁自動隱藏）；點「建立 N 個分身」不直接執行，先開「確認建立分身」對話框（警告、將建立數量、已驗證目標 user/serial），須勾選「我已閱讀警告…」確認框才啟用「確認建立」，按後才逐項執行（batch_create_cd 已標註需二次確認）。
 - 重啟恢復行為：重啟後新 ViewModel＋同一持久化，恢復只打勾（永不自動執行 clone），
   只恢復仍在目前 catalog 的 key（已卸載的包自動捨去），且同一目標只恢復一次；
   空 catalog 上不置恢復標記（待 catalog 就緒後仍可重試）；目標變更（profile 變動）時舊選取失效清除。
