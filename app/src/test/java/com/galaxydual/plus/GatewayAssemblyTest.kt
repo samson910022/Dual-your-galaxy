@@ -200,6 +200,91 @@ class GatewayAssemblyTest {
         assertTrue(res.err.contains("reply decode failed"))
     }
 
+    // Parcel-null P0 (availability): a null wire cmd must never spawn
+    // `sh -c ""` (empty shell exit=0 misjudged as success). Pure helper
+    // badRequestForBlankCommand is what GalaxyExecService.onTransact checks
+    // after data.readString(); Parcel itself is a JVM stub and not covered.
+    @Test fun execRequest_nullCmdIsBadRequest() {
+        val res = badRequestForBlankCommand(null)
+        assertTrue("null cmd must be bad request, got: $res", res != null)
+        assertEquals(1, res!!.exit)
+        assertEquals("", res.out)
+        assertTrue("bad request err must contain 'bad request', got: \"${res.err}\"", res.err.contains("bad request"))
+        // Pre-spawn definite failure: never sent, so neither unknown flag.
+        assertFalse("bad request must not carry timedOut, got: $res", res.timedOut)
+        assertFalse("bad request must not carry transportUnknown, got: $res", res.transportUnknown)
+    }
+
+    // Blank (empty / whitespace-only) wire cmd is the same bad request:
+    // onTransact must reply exit=1 without calling captureProcess.
+    @Test fun execRequest_blankCmdIsBadRequest() {
+        for (blank in listOf("", "   ", "\n\t")) {
+            val res = badRequestForBlankCommand(blank)
+            assertTrue("blank cmd '$blank' must be bad request, got: $res", res != null)
+            assertEquals(1, res!!.exit)
+            assertTrue(res.err.contains("bad request"))
+            assertFalse(res.timedOut)
+            assertFalse(res.transportUnknown)
+        }
+    }
+
+    // A usable command passes through verbatim (no bad request).
+    @Test fun execRequest_validCmdIsNotBadRequest() {
+        assertEquals(null, badRequestForBlankCommand("pm list packages"))
+        assertEquals(null, badRequestForBlankCommand("  pm list packages  "))
+    }
+
+    // Parcel-null P0: a null reply string is post-dispatch reply loss, NOT
+    // clean-empty. Pure helper decodeExecReplyNullable is what transactExec
+    // feeds reply.readString() into; folding null to "" would forge a
+    // TrustedFull empty. Must be transportUnknown (timedOut=false).
+    @Test fun execReply_nullOutIsTransportUnknown() {
+        val res = decodeExecReplyNullable(0, null, "")
+        assertNotEquals(0, res.exit)
+        assertTrue("null reply out must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("null reply must not carry timedOut, got: $res", res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("may have executed"))
+        assertTrue(res.err.contains("null reply string"))
+        // Must not be forgeable as clean-empty TrustedFull.
+        assertFalse(res.truncated == false && res.exit == 0)
+    }
+
+    @Test fun execReply_nullErrIsTransportUnknown() {
+        val res = decodeExecReplyNullable(0, "package:com.example.app\n", null)
+        assertNotEquals(0, res.exit)
+        assertTrue("null reply err must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse(res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("null reply string"))
+    }
+
+    @Test fun execReply_nullBothIsTransportUnknown() {
+        val res = decodeExecReplyNullable(0, null, null)
+        assertNotEquals(0, res.exit)
+        assertTrue(res.transportUnknown)
+        assertFalse(res.timedOut)
+        assertTrue(res.err.contains("null reply string"))
+    }
+
+    // Marker logic unaffected: non-null replies still delegate to
+    // decodeExecReply, so clean-empty stays truncated=false and a marker
+    // still yields truncated=true (never transportUnknown).
+    @Test fun execReply_nonNullStillUsesMarkerTruncated() {
+        val clean = decodeExecReplyNullable(0, "", "")
+        assertEquals(0, clean.exit)
+        assertFalse(clean.truncated)
+        assertFalse(clean.transportUnknown)
+        assertFalse(clean.timedOut)
+        val marked = decodeExecReplyNullable(0, "partial\n$TRUNCATION_MARKER", "")
+        assertEquals(0, marked.exit)
+        assertTrue(marked.truncated)
+        assertFalse(marked.transportUnknown)
+        val markedErr = decodeExecReplyNullable(0, "", "partial\n$TRUNCATION_MARKER")
+        assertTrue(markedErr.truncated)
+        assertFalse(markedErr.transportUnknown)
+    }
+
     // PR-32 P1-1: Su client-side wait timeout (SU_EXEC_TIMEOUT path) carries
     // timedOut=true so the repository verifies read-only instead of claiming
     // definite failure. Short budget keeps the JVM test fast.
