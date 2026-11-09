@@ -70,30 +70,95 @@ class Pr63ReviewRegressionUiTest {
         assertTrue("explicit writable precondition: privilege", s.privilege != Privilege.NONE)
     }
 
+    private data class RowDiag(
+        val ok: Boolean,
+        val detail: String,
+    )
+
     private fun awaitRowButtons(
         scenario: ActivityScenario<MainActivity>,
+        vm: DualViewModel,
         keyCount: Int,
         genBefore: Int,
         btnA0: Button,
         btnB0: Button,
         expectEnabled: Boolean,
+        phase: String,
     ) {
-        HarnessPoll.await(30_000L) {
-            var ok = false
+        val deadline = System.nanoTime() + 30_000L * 1_000_000L
+        var last = RowDiag(false, "no sample")
+        while (System.nanoTime() <= deadline) {
             scenario.onActivity { activity ->
                 val bs = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
                 val container = field(activity, "clonedAppsContainer") as LinearLayout
                 val genNow = field(activity, "clonedGen") as Int
+                val lastKey = field(activity, "lastClonedListKey") as? String
                 val nowA = bs.firstOrNull { it.tag == "remove:com.example.a" }
                 val nowB = bs.firstOrNull { it.tag == "remove:com.example.b" }
-                ok = bs.size == 2 &&
+                val ok = bs.size == 2 &&
                     bs.all { it.isEnabled == expectEnabled } &&
                     container.childCount == keyCount &&
                     genNow == genBefore &&
                     nowA === btnA0 &&
                     nowB === btnB0
+                val s = vm.state.value
+                last = RowDiag(
+                    ok,
+                    "phase=$phase expectEnabled=$expectEnabled " +
+                        "ok=$ok bs.size=${bs.size} enabled=${bs.map { it.isEnabled }} " +
+                        "childCount=${container.childCount}/$keyCount clonedGen=$genNow/$genBefore " +
+                        "idA=${nowA === btnA0} idB=${nowB === btnB0} " +
+                        "tags=${bs.map { it.tag }} " +
+                        "vm[loading=${s.loading} writeReady=${s.writeReady} pmReadable=${s.pmReadable} " +
+                        "resolved=${s.resolvedGateway} privilege=${s.privilege} exec=${s.execIdentity} " +
+                        "cloned=${s.cloned} inv.targetId=${s.inventory.targetId} inv.serial=${s.inventory.targetSerial} " +
+                        "sourceCatalog.size=${s.sourceCatalog.size} sourceCatalog.hash=${s.sourceCatalog.hashCode()} " +
+                        "hookStatus=${s.hookStatus} hookBootFresh=${s.hookBootFresh}] " +
+                        "lastClonedListKey=$lastKey",
+                )
             }
-            ok
+            if (last.ok) return
+            Thread.sleep(50)
+        }
+        throw AssertionError("awaitRowButtons timeout: ${last.detail}")
+    }
+
+    private fun awaitCatalogSettled(scenario: ActivityScenario<MainActivity>, timeoutMs: Long = 30_000L) {
+        HarnessPoll.await(timeoutMs) {
+            var settled = false
+            scenario.onActivity { activity ->
+                val job = try { field(activity, "catalogJob") } catch (_: Exception) { null }
+                val active = try {
+                    (job as? kotlinx.coroutines.Job)?.isActive == true
+                } catch (_: Exception) {
+                    false
+                }
+                settled = !active
+            }
+            settled
+        }
+    }
+
+    private fun applyStableWritableState(vm: DualViewModel) {
+        // Pin fingerprint inputs used by renderClonedApps/buildClonedListKey so
+        // Activity init/foreground/catalog async work cannot change the list key
+        // between baseline capture and early-return sync assertions. catalogKey is
+        // derived from sourceCatalog (stable empty list here); inventory/hook
+        // evidence stay at defaults. loading/pmReadable transitions under test do
+        // NOT affect clonedListKeyFor.
+        vm.setSourceCatalog(emptyList())
+        setVmState(vm) {
+            it.copy(
+                loading = false,
+                cloned = listOf("com.example.a", "com.example.b"),
+                pmReadable = true,
+                writeReady = true,
+                resolvedGateway = ResolvedChannel.ROOT,
+                privilege = Privilege.ROOT,
+                execIdentity = Privilege.ROOT,
+                inventory = InventorySnapshot.unknown(),
+                hookBootFresh = false,
+            )
         }
     }
 
@@ -107,31 +172,27 @@ class Pr63ReviewRegressionUiTest {
         val vm = newHarnessViewModel(gw)
         try {
             awaitHarnessReady(vm)
+            awaitHarnessDrained(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                // Ensure Dual Apps tab and inject two cloned rows via VM state.
                 scenario.onActivity { activity ->
                     activity.switchTab(MainActivity.TAB_DUAL_APPS, announce = false)
                 }
-                // Render cloned rows with an explicit writable precondition. Fields
-                // affecting writeBlockReason/blockKey but NOT clonedListKeyFor
-                // (cloned, targetSerial, targetId, hookLiveProven, catalogKey) are
-                // set so early-return sync transitions can be asserted naturally.
-                setVmState(vm) {
-                    it.copy(
-                        loading = false,
-                        cloned = listOf("com.example.a", "com.example.b"),
-                        pmReadable = true,
-                        writeReady = true,
-                        resolvedGateway = ResolvedChannel.ROOT,
-                        privilege = Privilege.ROOT,
-                        execIdentity = Privilege.ROOT,
-                    )
-                }
+                // Wait for Activity startup catalog load to settle, pin a stable
+                // sourceCatalog/inventory, then re-check: closes the small window
+                // where a reload could start between settle and pinning. This prevents
+                // catalogHash/fingerprint changes from rebuilding rows (clonedGen/
+                // Button identity) during early-return sync checks.
+                awaitCatalogSettled(scenario)
+                applyStableWritableState(vm)
+                awaitCatalogSettled(scenario)
                 HarnessPoll.await(30_000L) {
-                    var count = 0
-                    scenario.onActivity { activity -> count = findRowRemoveButtons(activity).size }
-                    count >= 2
+                    var ok = false
+                    scenario.onActivity { activity ->
+                        val bs = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
+                        ok = bs.size == 2 && bs.all { it.isEnabled }
+                    }
+                    ok
                 }
 
                 var keyCount = 0
@@ -168,15 +229,15 @@ class Pr63ReviewRegressionUiTest {
                 // writeBlockReason/blockKey, so it exercises the writable gate via the
                 // same early-return sync (state seam, no View.isEnabled forcing).
                 setVmState(vm) { it.copy(loading = true) }
-                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = false)
+                awaitRowButtons(scenario, vm, keyCount, genBefore, btnA0, btnB0, expectEnabled = false, phase = "loading=true")
                 setVmState(vm) { it.copy(loading = false) }
-                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = true)
+                awaitRowButtons(scenario, vm, keyCount, genBefore, btnA0, btnB0, expectEnabled = true, phase = "loading=false")
                 assertWritableState(vm)
 
                 setVmState(vm) { it.copy(loading = false, pmReadable = false) }
-                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = false)
+                awaitRowButtons(scenario, vm, keyCount, genBefore, btnA0, btnB0, expectEnabled = false, phase = "pmReadable=false")
                 setVmState(vm) { it.copy(loading = false, pmReadable = true) }
-                awaitRowButtons(scenario, keyCount, genBefore, btnA0, btnB0, expectEnabled = true)
+                awaitRowButtons(scenario, vm, keyCount, genBefore, btnA0, btnB0, expectEnabled = true, phase = "pmReadable=true")
                 assertWritableState(vm)
 
                 // Async label rebind updates CD in place (same Button instances) and
