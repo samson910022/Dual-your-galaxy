@@ -77,4 +77,57 @@ class IconSizingPolicyTest {
         assertFalse(shouldUsePlaceholder(true))
         assertTrue(shouldUsePlaceholder(false))
     }
+
+    // 等比置中：48x24 在 24 方框內為置中 24x12（P2-2 拉伸回歸）。
+    @Test
+    fun fitCenterRect_nonSquareCentered() {
+        assertEquals(FitRect(0, 6, 24, 18), fitCenterRect(48, 24, 24))
+        assertEquals(FitRect(6, 0, 18, 24), fitCenterRect(24, 48, 24))
+        assertEquals(FitRect(0, 0, 24, 24), fitCenterRect(24, 24, 24))
+    }
+
+    // 負數／非正方形填滿：dst<=0 先 safeIconPx，src<=0 方形填滿。
+    @Test
+    fun fitCenterRect_nonPositiveSquareFill() {
+        assertEquals(FitRect(0, 0, 1, 1), fitCenterRect(48, 24, 0))
+        assertEquals(FitRect(0, 0, 1, 1), fitCenterRect(48, 24, -10))
+        assertEquals(FitRect(0, 0, 24, 24), fitCenterRect(0, 24, 24))
+        assertEquals(FitRect(0, 0, 24, 24), fitCenterRect(24, 0, 24))
+        assertEquals(FitRect(0, 0, 24, 24), fitCenterRect(-5, -5, 24))
+    }
+
+    // 等比縮放：48x24 在 24 方框內 scale 0.5，正方形 scale 1.0。
+    @Test
+    fun fitScale_equalRatio() {
+        assertEquals(0.5f, fitScale(48, 24, 24), 0.001f)
+        assertEquals(0.5f, fitScale(24, 48, 24), 0.001f)
+        assertEquals(1.0f, fitScale(24, 24, 24), 0.001f)
+        assertEquals(0.5f, fitScale(96, 96, 48), 0.001f)
+        assertEquals(1.0f, fitScale(0, 24, 24), 0.001f)
+    }
+
+    // 快照真值表四行：有 CS＋方形 false、有 CS＋非方形 true、
+    // 有 CS＋<=0 false、無 CS＋任一 true。
+    @Test
+    fun shouldUseSnapshot_truthTable() {
+        assertFalse(shouldUseSnapshot(true, 24, 24))
+        assertTrue(shouldUseSnapshot(true, 48, 24))
+        assertTrue(shouldUseSnapshot(true, 24, 48))
+        assertFalse(shouldUseSnapshot(true, 0, 24))
+        assertFalse(shouldUseSnapshot(true, -1, -1))
+        assertTrue(shouldUseSnapshot(false, 24, 24))
+        assertTrue(shouldUseSnapshot(false, 48, 24))
+        assertTrue(shouldUseSnapshot(false, 0, 0))
+    }
+
+    // 快照 OOM cap：min(safeIconPx(size), max(1, cap))。
+    @Test
+    fun clampSnapshotPx_capsOOM() {
+        assertEquals(36, clampSnapshotPx(36, 192))
+        assertEquals(192, clampSnapshotPx(500, 192))
+        assertEquals(1, clampSnapshotPx(0, 192))
+        assertEquals(1, clampSnapshotPx(-10, 192))
+        assertEquals(1, clampSnapshotPx(100, 0))
+        assertEquals(1, clampSnapshotPx(100, -5))
+    }
 }
