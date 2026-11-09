@@ -222,7 +222,9 @@ class GatewayAssemblyTest {
             val res = badRequestForBlankCommand(blank)
             assertTrue("blank cmd '$blank' must be bad request, got: $res", res != null)
             assertEquals(1, res!!.exit)
+            assertEquals("", res.out)
             assertTrue(res.err.contains("bad request"))
+            assertFalse(res.truncated)
             assertFalse(res.timedOut)
             assertFalse(res.transportUnknown)
         }
@@ -238,33 +240,194 @@ class GatewayAssemblyTest {
     // clean-empty. Pure helper decodeExecReplyNullable is what transactExec
     // feeds reply.readString() into; folding null to "" would forge a
     // TrustedFull empty. Must be transportUnknown (timedOut=false).
+    // DEVICE-UNVERIFIED: onTransact no-spawn guard, drop-rebind, and service-catch truncated paths.
+    // These need a real-device matrix; no fake instrumentation test is written here.
     @Test fun execReply_nullOutIsTransportUnknown() {
         val res = decodeExecReplyNullable(0, null, "")
-        assertNotEquals(0, res.exit)
+        assertEquals(1, res.exit)
+        assertEquals("", res.out)
+        assertFalse("null reply must not carry truncated, got: $res", res.truncated)
         assertTrue("null reply out must carry transportUnknown, got: $res", res.transportUnknown)
         assertFalse("null reply must not carry timedOut, got: $res", res.timedOut)
         assertTrue(res.err.contains("transport unknown"))
         assertTrue(res.err.contains("may have executed"))
         assertTrue(res.err.contains("null reply string"))
-        // Must not be forgeable as clean-empty TrustedFull.
-        assertFalse(res.truncated == false && res.exit == 0)
+        // Must not be forgeable as clean-empty TrustedFull: parser must see Unknown.
+        val parsed = PmOutputParser.parsePackagesTrusted(res)
+        assertTrue("null reply must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
     }
 
     @Test fun execReply_nullErrIsTransportUnknown() {
         val res = decodeExecReplyNullable(0, "package:com.example.app\n", null)
-        assertNotEquals(0, res.exit)
+        assertEquals(1, res.exit)
+        assertEquals("", res.out)
+        assertFalse("null reply must not carry truncated, got: $res", res.truncated)
         assertTrue("null reply err must carry transportUnknown, got: $res", res.transportUnknown)
-        assertFalse(res.timedOut)
+        assertFalse("null reply must not carry timedOut, got: $res", res.timedOut)
         assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("may have executed"))
         assertTrue(res.err.contains("null reply string"))
     }
 
     @Test fun execReply_nullBothIsTransportUnknown() {
         val res = decodeExecReplyNullable(0, null, null)
-        assertNotEquals(0, res.exit)
-        assertTrue(res.transportUnknown)
-        assertFalse(res.timedOut)
+        assertEquals(1, res.exit)
+        assertEquals("", res.out)
+        assertFalse("null reply must not carry truncated, got: $res", res.truncated)
+        assertTrue("null reply both must carry transportUnknown, got: $res", res.transportUnknown)
+        assertFalse("null reply must not carry timedOut, got: $res", res.timedOut)
+        assertTrue(res.err.contains("transport unknown"))
+        assertTrue(res.err.contains("may have executed"))
         assertTrue(res.err.contains("null reply string"))
+    }
+
+    // #1: bad request survives the frozen (exit, out, err) encode/decode as a
+    // pre-spawn definite failure (all three flags false, never a backstop text).
+    @Test fun execRequest_badRequestSurvivesEncodeRoundTrip() {
+        val bad = badRequestForBlankCommand(null)
+        assertTrue("null cmd must be bad request, got: $bad", bad != null)
+        val encoded = encodeExecReply(bad!!)
+        assertEquals(Triple(1, "", "bad request: blank command"), encoded)
+        val cli = decodeExecReply(encoded.first, encoded.second, encoded.third)
+        assertEquals(1, cli.exit)
+        assertEquals("", cli.out)
+        assertEquals("bad request: blank command", cli.err)
+        assertFalse("bad request round-trip must not carry truncated, got: $cli", cli.truncated)
+        assertFalse("bad request round-trip must not carry timedOut, got: $cli", cli.timedOut)
+        assertFalse("bad request round-trip must not carry transportUnknown, got: $cli", cli.transportUnknown)
+        for (prefix in listOf("interrupted: ", "service exec failed: ", "timeout after ", "shizuku: exec timed out after ")) {
+            assertFalse("bad request err must not start with backstop prefix '$prefix', got: \"${cli.err}\"", cli.err.startsWith(prefix))
+        }
+    }
+
+    // #2: null reply strings parse as Unknown, never as TrustedEmpty/TrustedFull.
+    @Test fun execReply_nullStringsParseAsUnknownNotTrustedEmpty() {
+        val cases = listOf(
+            "outNull" to decodeExecReplyNullable(0, null, ""),
+            "errNull" to decodeExecReplyNullable(0, "package:com.example.app\n", null),
+            "bothNull" to decodeExecReplyNullable(0, null, null),
+        )
+        for ((label, res) in cases) {
+            val parsed = PmOutputParser.parsePackagesTrusted(res)
+            assertTrue("null reply ($label) must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
+        }
+    }
+
+    // #3: non-null normal listing stays TrustedFull (no marker, no null).
+    @Test fun nonNullNormalListingStaysTrustedFull() {
+        val cli = decodeExecReplyNullable(0, "package:com.example.app\n", "")
+        assertEquals(0, cli.exit)
+        assertFalse(cli.truncated)
+        val parsed = PmOutputParser.parsePackagesTrusted(cli)
+        assertTrue("normal listing must parse TrustedFull, got $parsed", parsed is TrustedList.TrustedFull)
+        assertEquals(
+            listOf("com.example.app"),
+            (parsed as TrustedList.TrustedFull).packages,
+        )
+    }
+
+    // #4: non-null clean empty stays TrustedEmpty (confirmed empty, not Unknown).
+    @Test fun nonNullCleanEmptyStaysTrustedEmpty() {
+        val cli = decodeExecReplyNullable(0, "", "")
+        assertEquals(0, cli.exit)
+        assertFalse(cli.truncated)
+        val parsed = PmOutputParser.parsePackagesTrusted(cli)
+        assertTrue("clean empty must parse TrustedEmpty, got $parsed", parsed is TrustedList.TrustedEmpty)
+    }
+
+    // #5: marker on both streams yields truncated=true (never transportUnknown).
+    @Test fun markerBothStreams() {
+        val cli = decodeExecReplyNullable(0, "partial\n$TRUNCATION_MARKER", "warn\n$TRUNCATION_MARKER")
+        assertEquals(0, cli.exit)
+        assertEquals("partial\n$TRUNCATION_MARKER", cli.out)
+        assertEquals("warn\n$TRUNCATION_MARKER", cli.err)
+        assertTrue(cli.truncated)
+        assertFalse(cli.timedOut)
+        assertFalse(cli.transportUnknown)
+        val parsed = PmOutputParser.parsePackagesTrusted(cli)
+        assertTrue("truncated reply must parse Unknown, got $parsed", parsed is TrustedList.Unknown)
+    }
+
+    // #6: non-zero exit without marker stays untruncated (explicit pm failure).
+    @Test fun nonZeroExitUntruncated() {
+        val cli = decodeExecReplyNullable(1, "", "oops")
+        assertEquals(1, cli.exit)
+        assertEquals("", cli.out)
+        assertEquals("oops", cli.err)
+        assertFalse(cli.truncated)
+        assertFalse(cli.timedOut)
+        assertFalse(cli.transportUnknown)
+    }
+
+    // #7: the detail identifies which side was null (with the wire exit).
+    @Test fun detailIdentifiesNullSide() {
+        val outNull = decodeExecReplyNullable(0, null, "")
+        assertTrue(outNull.err.contains("null reply string"))
+        assertTrue(outNull.err.contains("exit=0"))
+        assertTrue(outNull.err.contains("outNull=true"))
+        assertTrue(outNull.err.contains("errNull=false"))
+        val errNull = decodeExecReplyNullable(0, "package:com.example.app\n", null)
+        assertTrue(errNull.err.contains("null reply string"))
+        assertTrue(errNull.err.contains("exit=0"))
+        assertTrue(errNull.err.contains("outNull=false"))
+        assertTrue(errNull.err.contains("errNull=true"))
+        val bothNull = decodeExecReplyNullable(0, null, null)
+        assertTrue(bothNull.err.contains("null reply string"))
+        assertTrue(bothNull.err.contains("exit=0"))
+        assertTrue(bothNull.err.contains("outNull=true"))
+        assertTrue(bothNull.err.contains("errNull=true"))
+    }
+
+    // #8: any wire exit with a null string is discarded to exit=1 + transportUnknown.
+    @Test fun discardsWireExit() {
+        val cases = listOf(
+            decodeExecReplyNullable(3, null, ""),
+            decodeExecReplyNullable(-1, "", null),
+            decodeExecReplyNullable(Int.MAX_VALUE, null, null),
+        )
+        for (res in cases) {
+            assertEquals("wire exit must be discarded to 1, got: $res", 1, res.exit)
+            assertEquals("", res.out)
+            assertFalse(res.truncated)
+            assertTrue(res.transportUnknown)
+            assertFalse(res.timedOut)
+        }
+    }
+
+    // #9: plausible commands (even marker-like or exotic whitespace) pass through.
+    @Test fun validEdgeCases() {
+        val valids = listOf(
+            "a",
+            "0",
+            "echo [truncated]",
+            "pm list packages\npm list users",
+            "x".repeat(8000),
+            "\u200B",
+        )
+        for (cmd in valids) {
+            assertEquals("valid cmd must pass through, got: $cmd", null, badRequestForBlankCommand(cmd))
+        }
+        // Sole NBSP pin (deviation from report's Java-isBlank assumption, verified
+        // on Kotlin/JVM): NBSP isSpaceChar=true so isBlank=true -> bad request,
+        // not a pass-through. Pinned here so the real behavior never regresses.
+        val nbsp = badRequestForBlankCommand("\u00A0")
+        assertTrue("sole NBSP must be blank (Kotlin isSpaceChar), got: $nbsp", nbsp != null)
+        assertEquals(1, nbsp!!.exit)
+        assertEquals("", nbsp.out)
+        assertTrue(nbsp.err.contains("bad request"))
+        assertFalse(nbsp.timedOut)
+        assertFalse(nbsp.transportUnknown)
+    }
+
+    // #10: mixed whitespace is still blank (bad request, pre-spawn definite).
+    @Test fun mixedWhitespace() {
+        val res = badRequestForBlankCommand(" \t\n\r ")
+        assertTrue("mixed whitespace must be bad request, got: $res", res != null)
+        assertEquals(1, res!!.exit)
+        assertEquals("", res.out)
+        assertTrue(res.err.contains("bad request"))
+        assertFalse(res.timedOut)
+        assertFalse(res.transportUnknown)
     }
 
     // Marker logic unaffected: non-null replies still delegate to
