@@ -395,18 +395,113 @@ internal fun decodeExecReplyNullable(exit: Int, out: String?, err: String?): Cmd
         decodeExecReply(exit, out, err)
     }
 
-// Frozen denied-reply writer for the onTransact auth gate: exit=1, out="",
-// err=DENIED_FOREIGN_CALLER. The uid is never echoed onto the wire (deny
-// paths log it locally in DEBUG builds only). Delegates to
-// encodeExecReply() so the frozen (int, String, String) layout stays
-// single-sourced with the service reply path.
-private fun writeDenied(reply: Parcel?) {
-    val (exit, out, err) = encodeExecReply(
-        CmdResult(1, "", ShizukuExecProtocol.DENIED_FOREIGN_CALLER),
-    )
-    reply?.writeInt(exit)
-    reply?.writeString(out)
-    reply?.writeString(err)
+// Pure post-spawn failure mapping (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump, side effects still pending instrumentation): the
+// service-side catch around captureProcess after spawn started. Extracted 1:1
+// from GalaxyExecService.onTransact's Phase 1 generic catch direct
+// CmdResult construction -- exit=1, out="", err="service exec failed: ..."
+// plus "\n$TRUNCATION_MARKER" tail marker, truncated=true,
+// transportUnknown=true. The marker is what crosses the frozen
+// (int, String, String) wire honestly (encode drops the local flags, the
+// client re-derives truncated via decodeExecReply); the anchored
+// "service exec failed: " prefix is the wire-frozen backstop the repository
+// matches via isPostSpawnTransportText (fail closed: read-only verify, no
+// resend). Pure: no Parcel/Binder touch, no Thread flag touch -- the
+// interrupt-flag restoration for the Interrupted variant stays on the
+// onTransact call path (see handleExecRequest below), mirroring
+// mapPostDispatchError's purity split. JVM-testable via
+// ShizukuExecHandleTest; the Parcel/Binder round-trip itself stays
+// device-only and is NOT claimed verified by these JVM tests.
+internal fun servicePostSpawnFailure(e: Exception): CmdResult =
+    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+
+// Pure post-spawn Interrupted mapping (Phase B JVM extraction, wire-neutral,
+// no SERVICE_VERSION bump, side effects still pending instrumentation):
+// extracted 1:1 from onTransact's Phase 1 Interrupted catch direct
+// CmdResult construction -- same shape as servicePostSpawnFailure above
+// with the "interrupted: " infix ("service exec failed: interrupted: ...").
+// truncated=true + transportUnknown=true + trailing marker, identical
+// rationale: unified post-spawn unknown capture, never TrustedFull.
+// Pure (see servicePostSpawnFailure): the Thread.currentThread().interrupt()
+// restoration that the original catch performed is NOT in here -- it stays
+// on the binder-thread call path in handleExecRequest (invoked from
+// onTransact) so unit tests calling this mapper on arbitrary threads stay
+// side-effect free.
+internal fun serviceInterruptedFailure(e: InterruptedException): CmdResult =
+    CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
+
+// Pure stale-cache drop decision (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump): true iff the transactExec result is a post-dispatch
+// transportUnknown (null-reply decode, transact throw, binder death
+// mid-call). The side effect itself -- dropBindingLocked() under bindMutex
+// so the next run() rebinds fresh -- stays in transactExec; this only
+// decides, so JVM tests pin it without a real binder. Invariant: normal
+// decodeExecReply() never sets transportUnknown, so this fires only for a
+// null-reply transportUnknown; a post-spawn service reply arriving over the
+// wire (binder already alive) never drops here. A null reply string
+// (decodeExecReplyNullable) therefore drops, a normal reply does not.
+// JVM-testable only; the actual rebind stays device-only.
+internal fun shouldDropCachedBinding(result: CmdResult): Boolean = result.transportUnknown
+
+// Pure EXEC request decision (Phase B JVM extraction, wire-neutral, no
+// SERVICE_VERSION bump, side effects still pending instrumentation): bundles
+// GalaxyExecService.onTransact's EXEC decisions into one JVM-testable seam
+// so onTransact is left with only Parcel read/write wiring. Internal order
+// is the original onTransact order, preserved 1:1:
+//   1. isAllowedCaller(callingUid, expectedAppUid) -> frozen denied reply
+//      (exit=1, out="", err=DENIED_FOREIGN_CALLER) -- the writeDenied
+//      equivalent as a CmdResult; onTransact encodes/writes it via
+//      encodeExecReply, so the frozen (int, String, String) layout stays
+//      single-sourced. The uid is never echoed onto the wire. exec is never
+//      called for a foreign caller.
+//   2. badRequestForBlankCommand(rawCmd) -> definite bad request
+//      (exit=1, no flags, pre-spawn, never sent). exec is never called
+//      for a null/blank wire cmd, so `sh -c ""` can never spawn.
+//   3. exec(cmd) with cmd verbatim (no trim/re-quote) -> its CmdResult
+//      returned as-is. Pre-spawn spawn failures are already returned
+//      inside captureProcess as definite failures and never throw here;
+//      any exception ESCAPING exec therefore happened AFTER spawn started
+//      (post-spawn unknown by construction):
+//        - InterruptedException -> Thread.currentThread().interrupt()
+//          restores the flag on the binder thread (the onTransact call
+//          path -- handleExecRequest is invoked from onTransact on that
+//          same thread, so the original catch's flag restoration is
+//          preserved), then serviceInterruptedFailure(e).
+//        - any other Exception (incl. RuntimeException) ->
+//          servicePostSpawnFailure(e).
+// The former onTransact double guard (badRequest helper plus a manual
+// isNullOrBlank Parcel-write fallback) is collapsed to the single helper
+// above plus the pure null fallback below; onTransact keeps only the
+// Parcel read (read-failure -> bad request, which cannot be pure and
+// therefore stays in onTransact) and the encode/write of this result.
+// JVM tests pin auth/bad-request/verbatim/post-spawn mapping here; the
+// Parcel/Binder round-trip, the actual spawn, and the DEBUG denied log
+// stay device-only and are NOT claimed verified by these JVM tests.
+internal fun handleExecRequest(
+    callingUid: Int,
+    expectedAppUid: Int,
+    rawCmd: String?,
+    exec: (String) -> CmdResult,
+): CmdResult {
+    if (!isAllowedCaller(callingUid, expectedAppUid)) {
+        return CmdResult(exit = 1, out = "", err = ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+    }
+    val badRequest = badRequestForBlankCommand(rawCmd)
+    if (badRequest != null) return badRequest
+    // Double guard: even though rawCmd is non-null/non-blank here by the
+    // badRequestForBlankCommand check above, never rely solely on the helper
+    // contract -- a direct isNullOrBlank check guarantees no null spawn and
+    // no `sh -c ""` if the helper contract ever changes.
+    if (rawCmd.isNullOrBlank()) return badRequestForBlankCommand(rawCmd)!!
+    val cmd = rawCmd
+    return try {
+        exec(cmd)
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        serviceInterruptedFailure(e)
+    } catch (e: Exception) {
+        servicePostSpawnFailure(e)
+    }
 }
 
 // Pure post-dispatch error mapping (E2 review P1-2 follow-up): transactExec
@@ -518,18 +613,45 @@ class GalaxyExecService : Binder {
                 return true
             }
             ShizukuExecProtocol.TRANSACTION_EXEC -> {
-                // P0 gate: auth runs BEFORE reading the cmd (fail closed, do
-                // no work for a foreign caller; Parcel position is left
-                // unread on deny -- the reply is terminal either way).
+                // Phase B JVM pure extraction (wire-neutral, no SERVICE_VERSION
+                // bump -- still 6, side effects still pending instrumentation):
+                // onTransact is now only Parcel read/write wiring. The EXEC
+                // decision (owner-uid auth gate, null/blank bad request,
+                // verbatim exec, post-spawn backstop) lives in the pure
+                // handleExecRequest() seam above (JVM-tested via
+                // ShizukuExecHandleTest); this branch only reads the raw cmd
+                // and encodes/writes the returned CmdResult. The Parcel/
+                // Binder round-trip itself stays DEVICE-UNVERIFIED and is
+                // NOT claimed verified by the JVM tests.
+                // SERVICE_VERSION history (unchanged): v6 was bumped for the
+                // parcel-null guards plus the post-spawn catch marker -- the
+                // wire layout stays int+String+String and the client never
+                // sends blank, but the daemon must rebuild the resident
+                // UserService so the old service cannot be reused for a
+                // corrupt/malicious Parcel. This extraction changes no
+                // service-side capture/encode/auth behavior, hence no bump.
                 val callingUid = Binder.getCallingUid()
+                // Defense-in-depth early gate (auth-before-read, P0): foreign
+                // callers are denied BEFORE any Parcel read, so a foreign +
+                // corrupt Parcel returns DENIED rather than a bad-request read
+                // exception. Coexists with the isAllowedCaller check inside
+                // handleExecRequest() above (both must pass).
                 if (!isAllowedCaller(callingUid, expectedAppUid)) {
                     if (BuildConfig.DEBUG) Log.w("GalaxyExec", "denied code=$code callingUid=$callingUid")
-                    writeDenied(reply)
+                    val (deniedExit, deniedOut, deniedErr) = encodeExecReply(
+                        CmdResult(exit = 1, out = "", err = ShizukuExecProtocol.DENIED_FOREIGN_CALLER)
+                    )
+                    reply?.writeInt(deniedExit)
+                    reply?.writeString(deniedOut)
+                    reply?.writeString(deniedErr)
                     return true
                 }
                 val rawCmd = try {
                     data.readString()
                 } catch (e: Exception) {
+                    // Parcel read failure cannot be pure, so it stays here:
+                    // same frozen bad-request shape (exit=1, no flags,
+                    // pre-spawn definite failure), never spawns.
                     val (readExit, readOut, readErr) = encodeExecReply(
                         CmdResult(exit = 1, out = "", err = "bad request: ${(e.message ?: e.javaClass.simpleName)}")
                     )
@@ -538,80 +660,18 @@ class GalaxyExecService : Binder {
                     reply?.writeString(readErr)
                     return true
                 }
-                // Null/blank wire cmd must never spawn `sh -c ""`: reply the
-                // same frozen bad-request shape as the read-failure path
-                // above (exit=1, no flags, pre-spawn definite failure).
-                // SERVICE_VERSION bumped to v6 for these parcel-null guards
-                // (plus the post-spawn catch marker below): the wire layout
-                // stays int+String+String and the client never sends blank,
-                // but the daemon must rebuild the resident UserService so the
-                // old service cannot be reused for a corrupt/malicious Parcel.
-                // Like the truncated unification below (encode discards the
-                // local truncated dead-flag; the client re-derives truncated
-                // from marker text), this is wire-neutral on the wire but
-                // service-side behavior changed, hence the bump.
-                val badRequest = badRequestForBlankCommand(rawCmd)
-                if (badRequest != null) {
-                    val (badExit, badOut, badErr) = encodeExecReply(badRequest)
-                    reply?.writeInt(badExit)
-                    reply?.writeString(badOut)
-                    reply?.writeString(badErr)
-                    return true
-                }
-                // Double guard: if the helper contract ever changes, never NPE the
-                // binder thread via rawCmd!! -- fall back to the same bad-request
-                // shape instead (pre-spawn definite failure).
-                val cmd = if (rawCmd.isNullOrBlank()) {
-                    val (guardExit, guardOut, guardErr) = encodeExecReply(
-                        CmdResult(exit = 1, out = "", err = "bad request: blank command")
-                    )
-                    reply?.writeInt(guardExit)
-                    reply?.writeString(guardOut)
-                    reply?.writeString(guardErr)
-                    return true
-                } else {
-                    rawCmd
-                }
                 // Runs under the service uid (shell/root): captureProcess is
                 // the same helper the su gateway uses; already off-main here
-                // (binder thread), so call it directly.
-                // Pre-spawn vs post-spawn (Phase A1): spawn failures
-                // ("spawn failed: ...", exec threw, process never started)
-                // are already returned INSIDE captureProcess as definite
-                // failures and never throw here. Any exception ESCAPING
-                // captureProcess therefore happened AFTER spawn started --
-                // the remote pm may have executed -- so this catch is
-                // post-spawn unknown-after-send by construction. The
-                // "service exec failed: " prefix is the wire-frozen backstop:
-                // the (exit, out, err) parcel drops the transportUnknown
-                // flag, so DualRepository.isUnknownAfterSend matches this
-                // anchored text via isPostSpawnTransportText (fail closed:
-                // read-only verify, no resend). Anchoring is exact
-                // (startsWith "service exec failed: ") so normal pm
-                // "Failure [...]" lines (capital F) can never hit.
-                val res = try {
+                // (binder thread), so call it directly via the pure seam.
+                // Pre-spawn vs post-spawn (Phase A1, preserved in
+                // handleExecRequest/servicePostSpawnFailure/
+                // serviceInterruptedFailure): spawn failures are already
+                // returned INSIDE captureProcess as definite failures and
+                // never throw here; any exception escaping exec is post-spawn
+                // unknown-after-send by construction ("service exec failed: "
+                // backstop + trailing marker, truncated/transportUnknown).
+                val res = handleExecRequest(callingUid, expectedAppUid, rawCmd) { cmd ->
                     captureProcess(arrayOf("sh", "-c", cmd), ShizukuExecProtocol.EXEC_TIMEOUT_MS)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    // v6: append the truncation marker so the local
-                    // truncated=true flag crosses the frozen wire honestly as
-                    // marker text (the client re-derives it via
-                    // decodeExecReply); exit/flags/out unchanged.
-                    CmdResult(exit = 1, out = "", err = "service exec failed: interrupted: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
-                } catch (e: Exception) {
-                    // Unified truncated=true with the Interrupted branch above:
-                    // both are post-spawn unknown captures (partial output
-                    // possible), so fail closed to Unknown, never TrustedFull.
-                    // v6: the truncated local flag now crosses the wire
-                    // honestly -- the marker text appended here is re-derived
-                    // as truncated=true by the client (decodeExecReply), so
-                    // an old service that dropped this flag cannot forge a
-                    // TrustedFull. True fail-closed also rests on exit!=0
-                    // plus the "service exec failed: " backstop, which the
-                    // repository anchors to via isPostSpawnTransportText.
-                    // The anchored prefix is a strict prefix: the appended
-                    // marker (newline + marker) never breaks startsWith.
-                    CmdResult(exit = 1, out = "", err = "service exec failed: ${(e.message ?: e.javaClass.simpleName)}\n$TRUNCATION_MARKER", truncated = true, transportUnknown = true)
                 }
                 val (replyExit, replyOut, replyErr) = encodeExecReply(res)
                 reply?.writeInt(replyExit)
@@ -1097,8 +1157,11 @@ class ShizukuCmdGateway(
             // this check never drops on a normal reply. Invariant: decodeExecReply
             // never sets transportUnknown, so this drop fires only for a null
             // reply; a post-spawn service reply arriving over the wire means the
-            // binder is already alive and never drops here.
-            if (result.transportUnknown) {
+            // binder is already alive and never drops here. The decision is
+            // the pure shouldDropCachedBinding() seam (Phase B JVM extraction,
+            // wire-neutral, no bump); the drop side effect stays here under
+            // bindMutex.
+            if (shouldDropCachedBinding(result)) {
                 bindMutex.withLock { dropBindingLocked() }
             }
             result
