@@ -54,6 +54,16 @@
     <string name="batch_target_unavailable">Batch target unverified (user/serial unknown or serial missing); batch is disabled. Tap Reconnect and refresh to re-query, then retry.</string>
     <!-- Stage1: sticky bottom bar selection/status (always visible). -->
     <string name="batch_bar_go_to_detail">Tap to go to details above</string>
+    <!-- Batch result summary/details (sticky bar + detail; %1$d=%2$d=%3$d=%4$d = success/failed/unknown/total). -->
+    <string name="batch_report_summary">Batch result: %1$d succeeded / %2$d failed / %3$d unknown (%4$d total)</string>
+    <string name="batch_report_item_success">Success</string>
+    <string name="batch_report_item_failed">Failed</string>
+    <string name="batch_report_item_unknown_recheck">Unknown (recheck needed)</string>
+    <string name="batch_report_item_unknown_channel">Unknown (channel could not verify, please retry)</string>
+    <string name="batch_report_truncated">  … %1$d more (%2$d total, showing first %3$d)</string>
+    <!-- PR64: approved snapshot invalidated (VM refusal, zero writes). -->
+    <string name="batch_approval_mismatch_selection">Batch request expired: selection or target changed. Please review and confirm again.</string>
+    <string name="batch_approval_mismatch_pin">Batch request expired: target changed and previous selection was cleared. Please review and confirm again (user %1$s → %2$s).</string>
     <plurals name="batch_selected_count">
         <item quantity="one">%1$d selected</item>
         <item quantity="other">%1$d selected</item>
