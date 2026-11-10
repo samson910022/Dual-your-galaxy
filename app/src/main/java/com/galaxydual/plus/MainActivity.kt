@@ -104,12 +104,14 @@ import rikka.shizuku.Shizuku
 // 沿用 remove ack 的世代契約：每次點擊 batchBtn 產生新世代，ack 綁世代保留
 // （同世代旋轉保留、跨世代重置）；confirm 才呼叫 vm.cloneSelected(approved)，
 // VM 在鎖內驗證「核准快照(keys+target) == live/pin」後才寫入（PR64 P1）。
-private data class BatchConfirmRequest(
+// P2（review #4）：ack/請求亦綁定 FRESH vs 非-FRESH 警告語境，避免跨 recreate/click 沿用舊 ack。
+internal data class BatchConfirmRequest(
     val selectedKeys: Set<String>,
     val count: Int,
     val targetId: Int,
     val targetSerial: Int,
     val generation: Long,
+    val wasFresh: Boolean,
 )
 
 // Observes DualViewModel.state, drives Shizuku binder/permission lifecycle,
@@ -410,10 +412,15 @@ class MainActivity : ComponentActivity() {
             }
         // Stage1 批次建立確認：請求快照隨 Activity 存活保留（同世代旋轉重現對話框）。
         // PR64 P1：keys 缺失（舊狀態）fail-closed，不恢復可授權的快照。
-        if (savedInstanceState != null && savedInstanceState.containsKey(KEY_BATCH_REQ_GEN)) {
+        // Review #4：freshness 語境亦必須保存，否則跨 recreate 可能沿用舊 ack。
+        if (savedInstanceState != null &&
+            savedInstanceState.containsKey(KEY_BATCH_REQ_GEN) &&
+            savedInstanceState.containsKey(KEY_BATCH_REQ_WAS_FRESH)
+        ) {
             val generation = savedInstanceState.getLong(KEY_BATCH_REQ_GEN)
             val restoredKeys = savedInstanceState.getStringArrayList(KEY_BATCH_REQ_KEYS)?.toSet()
             val restoredCount = savedInstanceState.getInt(KEY_BATCH_REQ_COUNT)
+            val restoredWasFresh = savedInstanceState.getBoolean(KEY_BATCH_REQ_WAS_FRESH)
             if (restoredKeys != null && restoredKeys.isNotEmpty() && restoredKeys.size == restoredCount) {
                 pendingBatchRequest = BatchConfirmRequest(
                     selectedKeys = restoredKeys,
@@ -421,6 +428,7 @@ class MainActivity : ComponentActivity() {
                     targetId = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_ID),
                     targetSerial = savedInstanceState.getInt(KEY_BATCH_REQ_TARGET_SERIAL),
                     generation = generation,
+                    wasFresh = restoredWasFresh,
                 )
                 batchGeneration = generation
                 batchAcknowledged = savedInstanceState.getBoolean(KEY_BATCH_ACK)
@@ -511,6 +519,7 @@ class MainActivity : ComponentActivity() {
             outState.putInt(KEY_BATCH_REQ_TARGET_ID, req.targetId)
             outState.putInt(KEY_BATCH_REQ_TARGET_SERIAL, req.targetSerial)
             outState.putLong(KEY_BATCH_REQ_GEN, req.generation)
+            outState.putBoolean(KEY_BATCH_REQ_WAS_FRESH, req.wasFresh)
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
@@ -3630,6 +3639,7 @@ class MainActivity : ComponentActivity() {
             targetId = s.inventory.targetId,
             targetSerial = serial,
             generation = batchGeneration,
+            wasFresh = (s.inventory.freshness == InventoryFreshness.FRESH),
         )
         // 跨世代一律重置勾選（同 remove：新請求不得沿用舊世代的 ack）。
         batchAcknowledged = false
@@ -3647,14 +3657,15 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window may already be gone.
         }
         shownBatchRequest = request
-        shownBatchWasFresh = (s.inventory.freshness == InventoryFreshness.FRESH)
+        // Review #4：ack/文案語境綁定請求快照（非 live），避免跨 recreate 沿用舊 ack。
+        shownBatchWasFresh = request.wasFresh
         // 同世代重建（旋轉）保留勾選；跨世代已先在請求端重置。
         if (batchAcknowledgedGeneration != request.generation) {
             batchAcknowledged = false
             batchAcknowledgedGeneration = null
         }
         // P2：STALE/非即時驗證時不得宣稱「已驗證目標」；VM 執行前仍會再次 pin。
-        val messageTemplate = if (s.inventory.freshness == InventoryFreshness.FRESH) {
+        val messageTemplate = if (request.wasFresh) {
             R.string.batch_confirm_message
         } else {
             R.string.batch_confirm_message_stale
@@ -3704,7 +3715,7 @@ class MainActivity : ComponentActivity() {
             updateBatchConfirmEnabled(live)
         }
         batchConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 確定性路徑：重讀 live 狀態並核對「已確認快照」(keys+target+世代)，再交由 VM 鎖內二次驗證。
+            // 確定性路徑：重讀 live 狀態並核對「已確認快照」(keys+target+世代+語境)，再交由 VM 鎖內二次驗證。
             val cur = try {
                 vm.state.value
             } catch (_: Exception) {
@@ -3713,7 +3724,7 @@ class MainActivity : ComponentActivity() {
             val pending = pendingBatchRequest
             val snapshotMatches = cur != null && pending != null &&
                 pending.generation == request.generation &&
-                batchRequestMatchesLive(request.selectedKeys, request.targetId, request.targetSerial, cur)
+                batchRequestMatchesLive(request, cur)
             if (cur != null && snapshotMatches && canConfirmBatch(cur, batchAcknowledged)) {
                 val approved = ApprovedBatchCloneRequest(
                     targetId = request.targetId,
@@ -3763,6 +3774,7 @@ class MainActivity : ComponentActivity() {
         }
         val liveSerial = s.inventory.targetSerial
         val liveKeys = s.selectedKeys.toSet()
+        val liveFresh = s.inventory.freshness == InventoryFreshness.FRESH
         // PR64 P1：任一 key/目標變動（含同數量換選取）即重建並清 ack，不得沿用舊核准。
         if (s.inventory.targetId != request.targetId ||
             liveSerial != request.targetSerial ||
@@ -3776,6 +3788,7 @@ class MainActivity : ComponentActivity() {
                 targetId = s.inventory.targetId,
                 targetSerial = verifiedSerial,
                 generation = request.generation + 1,
+                wasFresh = liveFresh,
             )
             batchGeneration = regenerated.generation
             batchAcknowledged = false
@@ -3788,30 +3801,29 @@ class MainActivity : ComponentActivity() {
             }
             batchConfirmDialog = null
             shownBatchRequest = null
+            shownBatchWasFresh = null
+            showBatchConfirmDialog(regenerated, s)
+            return
+        }
+        // Review #4：freshness 語境跨越 FRESH/非FRESH（含跨 recreate/尚未同步顯示）即失效，清 ack 並重建。
+        if (request.wasFresh != liveFresh) {
+            val regenerated = request.copy(generation = request.generation + 1, wasFresh = liveFresh)
+            batchGeneration = regenerated.generation
+            batchAcknowledged = false
+            batchAcknowledgedGeneration = null
+            pendingBatchRequest = regenerated
+            try {
+                batchConfirmDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            batchConfirmDialog = null
+            shownBatchRequest = null
+            shownBatchWasFresh = null
             showBatchConfirmDialog(regenerated, s)
             return
         }
         if (batchConfirmDialog?.isShowing == true && shownBatchRequest == request) {
-            // P2：freshness 跨越 FRESH/非FRESH 會改變風險文案（不得持續宣稱已驗證）；
-            // 視為新確認語境：重建並清 ack。
-            val isFresh = s.inventory.freshness == InventoryFreshness.FRESH
-            if (shownBatchWasFresh != null && shownBatchWasFresh != isFresh) {
-                val regenerated = request.copy(generation = request.generation + 1)
-                batchGeneration = regenerated.generation
-                batchAcknowledged = false
-                batchAcknowledgedGeneration = null
-                pendingBatchRequest = regenerated
-                try {
-                    batchConfirmDialog?.dismiss()
-                } catch (_: Exception) {
-                    // Best effort.
-                }
-                batchConfirmDialog = null
-                shownBatchRequest = null
-                shownBatchWasFresh = null
-                showBatchConfirmDialog(regenerated, s)
-                return
-            }
             updateBatchConfirmEnabled(s)
             return
         }
@@ -5003,6 +5015,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_TARGET_ID = "batchReqTargetId"
         private const val KEY_BATCH_REQ_TARGET_SERIAL = "batchReqTargetSerial"
         private const val KEY_BATCH_REQ_GEN = "batchReqGen"
+        private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
@@ -5579,16 +5592,29 @@ internal fun canConfirmBatch(s: UiState, acknowledged: Boolean): Boolean =
     batchEnabled(s) && acknowledged
 
 // PR64 P1：已確認快照與 live 狀態不一致（同數量換選取亦算）即視為失效，須重建/清 ack。
+// Review #4：ack 同時綁定 FRESH vs 非-FRESH 警告語境（requestWasFresh 預設 FRESH 以相容既有 4 參呼叫）。
 internal fun batchRequestMatchesLive(
     requestKeys: Set<String>,
     requestTargetId: Int,
     requestTargetSerial: Int,
     live: UiState,
+    requestWasFresh: Boolean = (live.inventory.freshness == InventoryFreshness.FRESH),
 ): Boolean =
     requestKeys.isNotEmpty() &&
         requestKeys == live.selectedKeys &&
         requestTargetId == live.inventory.targetId &&
-        requestTargetSerial == live.inventory.targetSerial
+        requestTargetSerial == live.inventory.targetSerial &&
+        requestWasFresh == (live.inventory.freshness == InventoryFreshness.FRESH)
+
+// 以請求快照驗證（含 freshness 語境）。
+internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState): Boolean =
+    batchRequestMatchesLive(
+        request.selectedKeys,
+        request.targetId,
+        request.targetSerial,
+        live,
+        request.wasFresh,
+    )
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
