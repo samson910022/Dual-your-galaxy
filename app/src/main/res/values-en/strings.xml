@@ -11,6 +11,10 @@
     <string name="pkg_input_required">Enter a package name (clone/remove is disabled while empty)</string>
     <string name="action_clone">Clone</string>
     <string name="action_remove">Remove</string>
+    <!-- PR #63 re-review #3 P2: short visual label for cloned-row remove button
+         (avoids truncation at narrow width / large font scale). Full action
+         semantics stay in remove_row_cd contentDescription. -->
+    <string name="action_remove_row">Remove</string>
     <string name="remove_cd">Remove clone (requires confirmation; the first tap only opens the dialog)</string>
     <string name="action_reconnect">Reconnect and refresh</string>
     <string name="action_request_shizuku">Request Shizuku permission</string>

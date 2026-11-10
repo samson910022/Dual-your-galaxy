@@ -14,6 +14,9 @@
     <!-- 主要動作：#28 統一繁中「建立分身／移除分身」。 -->
     <string name="action_clone">建立分身</string>
     <string name="action_remove">移除分身</string>
+    <!-- PR #63 re-review #3 P2：分身列移除鈕視覺短標籤（窄寬/大字體不截斷）；
+         完整動作語意保留於 remove_row_cd 的 action 參數（contentDescription）。 -->
+    <string name="action_remove_row">移除</string>
     <string name="remove_cd">移除分身（需二次確認，第一步僅開啟確認對話框）</string>
     <string name="action_reconnect">重新連線並更新</string>
     <string name="action_request_shizuku">請求 Shizuku 授權</string>
