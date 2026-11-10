@@ -223,12 +223,13 @@ class Pr63ReviewRegressionUiTest {
                         assertEquals(1, b.maxLines)
                         assertTrue("width should be positive for $pkg", b.width > 0)
                         assertTrue("height should be positive for $pkg", b.height > 0)
-                        b.layout?.let { layout ->
-                            assertTrue(
-                                "row remove label must not ellipsize for $pkg (line0 ellipsis=${layout.getEllipsisCount(0)})",
-                                layout.lineCount <= 0 || layout.getEllipsisCount(0) == 0,
-                            )
-                        }
+                        val layout = requireNotNull(b.layout) { "layout must be measured for $pkg" }
+                        assertTrue("layout should have at least one line for $pkg", layout.lineCount > 0)
+                        assertEquals(
+                            "row remove label must not ellipsize for $pkg (line0 ellipsis=${layout.getEllipsisCount(0)})",
+                            0,
+                            layout.getEllipsisCount(0),
+                        )
                     }
                     keyCount = (field(activity, "clonedAppsContainer") as LinearLayout).childCount
                     genBefore = field(activity, "clonedGen") as Int

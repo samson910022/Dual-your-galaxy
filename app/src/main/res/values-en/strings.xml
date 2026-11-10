@@ -202,8 +202,9 @@
     <string name="badge_dot_format">● %1$s</string>
     <string name="badge_dual_tag_format">#%1$d %2$s</string>
     <!-- Phase G (i18n): remove-row content description (was hardcoded
-         half-width ":" concatenation in code; full-width colon, zh/en sync). -->
-    <string name="remove_row_cd">%1$s: %2$s</string>
+         half-width ":" concatenation in code; full-width colon, zh/en sync).
+         PR #63 re-review #4 P3: make clone-removal semantics explicit in en. -->
+    <string name="remove_row_cd">%1$s clone: %2$s</string>
     <string name="dual_badge_cd">Clone badge (second copy): %1$s</string>
     <string name="engine_uid_unknown">UID: —</string>
     <string name="nav_tab_state_selected">selected</string>
