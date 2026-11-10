@@ -58,6 +58,16 @@
     <string name="batch_target_unavailable">批次目標未確認（user/serial 未知或 serial 缺失），批次按鈕已禁用；請點「重新連線並更新」重查後再試</string>
     <!-- Stage1：sticky bottom bar 勾選數/狀態（永遠可見）。 -->
     <string name="batch_bar_go_to_detail">點按前往上方詳情</string>
+    <!-- 批次結果摘要/明細（sticky bar + 詳情；%1$d=%2$d=%3$d=%4$d = success/failed/unknown/total）。 -->
+    <string name="batch_report_summary">批次結果：成功 %1$d / 失敗 %2$d / 未知 %3$d（共 %4$d 項）</string>
+    <string name="batch_report_item_success">成功</string>
+    <string name="batch_report_item_failed">失敗</string>
+    <string name="batch_report_item_unknown_recheck">未知（需重查）</string>
+    <string name="batch_report_item_unknown_channel">未知（通道無法查證，請重試）</string>
+    <string name="batch_report_truncated">  …等 %1$d 項（共 %2$d 項，僅顯示前 %3$d 項）</string>
+    <!-- PR64：核准快照失效（VM 拒絕，零寫入）。 -->
+    <string name="batch_approval_mismatch_selection">批次請求已過期：勾選或目標已變更，請重新確認</string>
+    <string name="batch_approval_mismatch_pin">批次請求已過期：目標已變更，已清空舊勾選，請重新確認（user %1$s → %2$s）</string>
     <plurals name="batch_selected_count">
         <item quantity="one">已選 %1$d 項</item>
         <item quantity="other">已選 %1$d 項</item>

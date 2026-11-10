@@ -3253,7 +3253,7 @@ class MainActivity : ComponentActivity() {
         val newMsgText = if (busy) {
             getString(R.string.status_loading)
         } else {
-            s.msg.ifEmpty { getString(R.string.status_ready) }
+            localizeVmMessage(s.msg).ifEmpty { getString(R.string.status_ready) }
         }
         val msgViewCurrent = try {
             msgView.text.toString()
@@ -4292,7 +4292,8 @@ class MainActivity : ComponentActivity() {
         } else {
             null
         }
-        val reportText = batchReportText(s.batchReport)
+        val hasReport = s.batchReport?.items?.isNotEmpty() == true
+        val reportText = if (hasReport) batchReportTextLocalized(s.batchReport) else ""
         val newBatchText = if (reportText.isNotEmpty()) reportText else (batchTargetReason ?: "")
         val batchViewCurrent = try {
             batchResultView.text.toString()
@@ -4318,8 +4319,8 @@ class MainActivity : ComponentActivity() {
                     batchBarStatusView.text = ""
                     batchBarStatusView.contentDescription = null
                 } else {
-                    val stickyText = if (reportText.isNotEmpty()) {
-                        formatBatchReportSummary(s.batchReport)
+                    val stickyText = if (hasReport) {
+                        batchReportSummaryLocalized(s.batchReport)
                     } else {
                         newBatchText
                     }
@@ -4930,6 +4931,45 @@ class MainActivity : ComponentActivity() {
     // Stage4：純渲染走頂層 formatBatchReportText（JVM 可測），此處僅委派。
     private fun batchReportText(report: BatchReport?): String = formatBatchReportText(report)
 
+    // UI 用：依目前 locale 解析批次結果字串（P3 三語）。
+    private fun batchReportStrings(): BatchReportStrings = BatchReportStrings(
+        summary = { s, f, u, t -> getString(R.string.batch_report_summary, s, f, u, t) },
+        itemSuccess = getString(R.string.batch_report_item_success),
+        itemFailed = getString(R.string.batch_report_item_failed),
+        itemUnknownRecheck = getString(R.string.batch_report_item_unknown_recheck),
+        itemUnknownChannel = getString(R.string.batch_report_item_unknown_channel),
+        truncated = { rest, total, max -> getString(R.string.batch_report_truncated, rest, total, max) },
+    )
+
+    private fun batchReportTextLocalized(report: BatchReport?): String =
+        formatBatchReportText(report, batchReportStrings())
+
+    private fun batchReportSummaryLocalized(report: BatchReport?): String =
+        formatBatchReportSummary(report, batchReportStrings())
+
+    // PR64 P3：VM 無 Context，核准失效訊息以常數/前綴標記，UI 依 locale 本地化顯示。
+    private fun localizeVmMessage(msg: String): String {
+        if (msg.isEmpty()) return msg
+        return try {
+            when {
+                msg == BATCH_APPROVAL_MISMATCH_SELECTION_MSG ->
+                    getString(R.string.batch_approval_mismatch_selection)
+                msg.startsWith(BATCH_APPROVAL_MISMATCH_PIN_PREFIX) -> {
+                    val suffix = msg.removePrefix(BATCH_APPROVAL_MISMATCH_PIN_PREFIX)
+                    val parts = suffix.removeSuffix("）").split(" → ", limit = 2)
+                    if (parts.size == 2) {
+                        getString(R.string.batch_approval_mismatch_pin, parts[0], parts[1])
+                    } else {
+                        msg
+                    }
+                }
+                else -> msg
+            }
+        } catch (_: Exception) {
+            msg
+        }
+    }
+
     companion object {
         // Test seam: allow instrumentation to inject a fake-backed ViewModel
         // (zero device writes) without changing production defaults. Null in
@@ -5440,7 +5480,7 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 // 「…等 M 項」收尾（與來源清單 MAX_SOURCE_ROWS 同式截斷提示）。
 const val BATCH_REPORT_MAX_ROWS = 50
 
-// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派；保留繁中 scope-limited，非雙語)。
+// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派)。
 // - 未知口徑與 DualViewModel.isBatchUnknownOutcome 一致：VerifyUnknown 與
 //   ChannelError（身份暫時無法判定、零寫入，需重查）皆計未知；NoDual 計失敗
 //   （真 Absent＋M13 短路語意），其餘非 Success 皆計失敗。彙總計數由呼叫端
@@ -5448,33 +5488,68 @@ const val BATCH_REPORT_MAX_ROWS = 50
 // - 明細包名顯示 raw pkg 是 by-design（與 renderLastOpText 的 redactPackage
 //   差異是故意的）：此處列的是使用者剛勾選、即將/已經逐項執行的包名，需可核對；
 //   診斷匯出/日誌仍經兩道遮蔽（見 buildDiagnosticExport）。
-internal fun formatBatchReportText(report: BatchReport?): String {
+
+data class BatchReportStrings(
+    val summary: (success: Int, failed: Int, unknown: Int, total: Int) -> String,
+    val itemSuccess: String,
+    val itemFailed: String,
+    val itemUnknownRecheck: String,
+    val itemUnknownChannel: String,
+    val truncated: (rest: Int, total: Int, max: Int) -> String,
+)
+
+private val DEFAULT_BATCH_REPORT_STRINGS = BatchReportStrings(
+    summary = { s, f, u, t -> "批次結果：成功 $s / 失敗 $f / 未知 $u（共 $t 項）" },
+    itemSuccess = "成功",
+    itemFailed = "失敗",
+    itemUnknownRecheck = "未知（需重查）",
+    itemUnknownChannel = "未知（通道無法查證，請重試）",
+    truncated = { rest, total, max -> "  …等 $rest 項（共 $total 項，僅顯示前 $max 項）" },
+)
+
+internal fun formatBatchReportText(
+    report: BatchReport?,
+    strings: BatchReportStrings,
+): String {
     if (report == null || report.items.isEmpty()) return ""
     return buildString {
-        appendLine(formatBatchReportSummary(report))
+        appendLine(formatBatchReportSummary(report, strings))
         val shown = report.items.take(BATCH_REPORT_MAX_ROWS)
         for (item in shown) {
             val mark = when (item.outcome) {
-                is CloneOutcome.Success -> "成功"
-                is CloneOutcome.VerifyUnknown -> "未知（需重查）"
-                is CloneOutcome.ChannelError -> "未知（通道無法查證，請重試）"
-                else -> "失敗"
+                is CloneOutcome.Success -> strings.itemSuccess
+                is CloneOutcome.VerifyUnknown -> strings.itemUnknownRecheck
+                is CloneOutcome.ChannelError -> strings.itemUnknownChannel
+                else -> strings.itemFailed
             }
             appendLine("  ${item.pkg}：$mark")
         }
         val rest = report.items.size - shown.size
         if (rest > 0) {
-            appendLine("  …等 $rest 項（共 ${report.items.size} 項，僅顯示前 $BATCH_REPORT_MAX_ROWS 項）")
+            appendLine(strings.truncated(rest, report.items.size, BATCH_REPORT_MAX_ROWS))
         }
     }.trimEnd()
 }
 
 // Sticky bar 用單句摘要（避免 TalkBack 朗讀逐項明細）；完整明細保留於 batchResultView。
-internal fun formatBatchReportSummary(report: BatchReport?): String {
+internal fun formatBatchReportSummary(
+    report: BatchReport?,
+    strings: BatchReportStrings,
+): String {
     if (report == null || report.items.isEmpty()) return ""
-    return "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
-        "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）"
+    return strings.summary(report.successCount, report.failedCount, report.unknownCount, report.items.size)
 }
+
+// 向後相容：既有 JVM 測試/呼叫點沿用預設（繁中）字串。
+internal fun formatBatchReportText(report: BatchReport?): String =
+    formatBatchReportText(report, DEFAULT_BATCH_REPORT_STRINGS)
+
+internal fun formatBatchReportSummary(report: BatchReport?): String =
+    formatBatchReportSummary(report, DEFAULT_BATCH_REPORT_STRINGS)
+
+// PR64：VM 核准失效訊息（VM 無 Context；UI 依此常數映射本地化字串）。
+const val BATCH_APPROVAL_MISMATCH_SELECTION_MSG = "批次請求已過期：勾選或目標已變更，請重新確認"
+const val BATCH_APPROVAL_MISMATCH_PIN_PREFIX = "批次請求已過期：目標已變更，已清空舊勾選，請重新確認（user "
 
 // 移除確認文案純函數（MainActivity 頂層 internal，JVM 可測）。
 // 破壞性確認顯示原文以供核對，匯出才遮蔽（by-design 例外）：

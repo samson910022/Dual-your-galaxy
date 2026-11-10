@@ -3569,7 +3569,7 @@ class DualViewModel(
                                         DiagnoseCode.VERIFY_MISMATCH,
                                         techDetail = "batch approval mismatch: selection/target changed",
                                     ),
-                                    msg = "批次請求已過期：勾選或目標已變更，請重新確認",
+                                    msg = BATCH_APPROVAL_MISMATCH_SELECTION_MSG,
                                     msgKind = MsgKind.INVALID,
                                 )
                             }
@@ -3727,8 +3727,8 @@ class DualViewModel(
                                     DiagnoseCode.VERIFY_MISMATCH,
                                     techDetail = "batch approval target mismatch vs pin",
                                 ),
-                                msg = "批次請求已過期：目標已變更，已清空舊勾選，請重新確認" +
-                                    "（user ${oldBound.display()} → ${expectedTarget.display()}）",
+                                msg = BATCH_APPROVAL_MISMATCH_PIN_PREFIX +
+                                    "${oldBound.display()} → ${expectedTarget.display()}）",
                                 msgKind = MsgKind.INVALID,
                             )
                         }
