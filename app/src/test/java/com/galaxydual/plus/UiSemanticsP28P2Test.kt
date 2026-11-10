@@ -276,6 +276,22 @@ class UiSemanticsP28P2Test {
         assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, s))
     }
 
+    // Review #4：同 key/target 但 freshness 語境跨 FRESH↔非-FRESH 時快照失效。
+    @Test
+    fun batchRequestMatchesLive_freshnessContextMismatch_isFalse() {
+        val fresh = writableState().copy(
+            inventory = writableState().inventory.copy(freshness = InventoryFreshness.FRESH),
+            selectedKeys = setOf("1:com.example.a"),
+        )
+        val stale = fresh.copy(
+            inventory = fresh.inventory.copy(freshness = InventoryFreshness.STALE),
+        )
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, stale, requestWasFresh = true))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, fresh, requestWasFresh = false))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, fresh, requestWasFresh = true))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, stale, requestWasFresh = false))
+    }
+
     // ---- P2-1 isWriteBlockDuplicate ----
 
     @Test
