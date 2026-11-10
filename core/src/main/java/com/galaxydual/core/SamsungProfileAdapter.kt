@@ -215,38 +215,28 @@ object SamsungProfileAdapter {
     private val TYPE_LINE =
         Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
 
-    // Bare S24 `Type:` lines (issue #58, Android 17 dumpsys user): e.g.
-    // `Type: android.os.usertype.profile.CLONE`. Anchored to line start
-    // (after whitespace) so mid-line `superuser type:` never matches --
-    // that shape must stay UNKNOWN via the existing left-boundary guard.
-    // Case-insensitive, `:`/`=` with surrounding spaces tolerated.
-    // Value is group 1; classification reuses classifyMention plus the
-    // fail-closed known-OTHER gate below (unknown tail -> block UNKNOWN,
-    // never OTHER/Absent). Strict ASCII whitespace only (P1 #59): a Unicode
-    // whitespace char in the key/indent/separator position (NBSP, U+2000,
-    // U+3000, etc.) must NOT be normalized into a valid bare declaration --
-    // see BARE_TYPE_LIKE_KEY.
+    // Raw bare `Type:` declaration (issue #58, S24 dumpsys user). Strict
+    // ASCII key surface (P1 #59): indent/around `type`/around separator may
+    // contain ONLY space and tab [ \t] (Java `\s` is NOT used: it would accept
+    // VT/FF and eat them before validation). Group 4 is the raw value tail
+    // after the separator (untrimmed, never `\s`-consumed) so disallowed chars
+    // (e.g. VT before value) remain visible to validation. Classification
+    // reuses complete-value allowlists (fail closed: malformed/non-exact/
+    // unknown -> UNKNOWN, never CLONE-authorizing, never OTHER/Absent).
     private val BARE_TYPE_LINE =
-        Regex("^\\s*type\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+        Regex("^([ \\t]*)type([ \\t]*)([:=])(.*)$", RegexOption.IGNORE_CASE)
 
-    // Tolerant detector for a line-start bare `Type`-like declaration where
-    // Unicode whitespace/separator/format/control chars (\p{Z}, whitespace,
-    // \p{Cf} e.g. ZWSP/BOM, \p{Cc} controls) may appear in indentation or
-    // around the `type` keyword/separator (P1 #59). If this matches but
-    // strict BARE_TYPE_LINE does not, the key surface is malformed and must
-    // fail closed to UNKNOWN -- never fall through to TYPE_LINE.find(), which
-    // could trust an embedded `userType=`. Does NOT match `User type:` /
-    // `userType=` / `usertype` legacy forms (they do not start with the bare
-    // `type` token).
-    private val BARE_TYPE_LIKE_KEY =
-        Regex("^[\\p{Z}\\s\\p{Cf}\\p{Cc}]*type[\\p{Z}\\s\\p{Cf}\\p{Cc}]*[:=]", RegexOption.IGNORE_CASE)
-
-    // ASCII-only bare `type` key+separator (no Unicode in indent/keyword/
-    // separator position). Used to distinguish "Unicode key surface" (fail
-    // closed UNKNOWN) from "ASCII bare-Type key but strict BARE_TYPE_LINE
-    // did not fully match, e.g. empty value" (ignore, never fall through).
-    private val ASCII_BARE_TYPE_KEY =
-        Regex("^\\s*type\\s*[:=]", RegexOption.IGNORE_CASE)
+    // Tolerant, raw detector for a line-start bare `Type` declaration ATTEMPT
+    // (P1 #59): anchored to a bare `type` token as the first token on the line
+    // (not `User type`/`userType`/`usertype`) followed by any key chars up to a
+    // `:`/`=` separator. Matches even when the key surface is malformed (VT/FF
+    // or other Cc, Cf/Z Unicode whitespace, Unicode line-end chars in key,
+    // punctuation like `!`, etc.) so the line is OWNED by bare handling and
+    // can be failed closed to UNKNOWN -- never falling through to TYPE_LINE.find()
+    // (which could trust an embedded `userType=`). Non-bare legacy forms do not
+    // start with the bare `type` token and are not matched.
+    private val BARE_TYPE_ATTEMPT =
+        Regex("^[\\p{Z}\\s\\p{Cf}\\p{Cc}]*type(?![A-Za-z0-9_])[^\\r\\n]*?[:=]", RegexOption.IGNORE_CASE)
 
     // Known complete non-clone Android user type names (fail-closed allowlist)
     // for bare S24 `Type:` values (P1 #59 review). Only an exact, complete,
@@ -568,11 +558,15 @@ object SamsungProfileAdapter {
         return Pair(anyClone && !failClosed, anyOtherToken || failClosed)
     }
 
-    // Unicode line terminators that Kotlin lines() does NOT split on but
-    // Java regex `.` treats as line ends (truncating the TYPE_LINE value
-    // capture). Without normalization a `profile.CLONE<U+2028>evil` mention
-    // would have its tail silently cut and misclassify as CLONE.
+    // Unicode line terminators (NEL, LS, PS). Not used as record separators
+    // (we split on standard CR/LF only so raw bare-Type key chars remain
+    // visible for ownership validation); normalized to `?` in values/legacy
+    // lines for fail-closed residual safety (P1 #59).
     private val UNICODE_LINE_END = Regex("[\\u0085\\u2028\\u2029]")
+
+    // Standard record line breaks only. Keeps NEL/LS/PS/VT/FF inside the raw
+    // line so bare-Type key/value boundary checks see the original chars.
+    private val STD_LINE_BREAK = Regex("\\r\\n|\\r|\\n")
 
     // Classifies a block body with token-level type uniqueness (P1-1,
     // issue #21 owner re-review R3): a block is UNKNOWN whenever its
@@ -626,32 +620,48 @@ object SamsungProfileAdapter {
     private fun classifyType(body: String): ProfileUserType {
         var hasCloneSeg = false
         var hasOtherSeg = false
-        // Normalize Unicode line ends first (see UNICODE_LINE_END): map them
-        // to `?` (never allowlisted, never a separator) so a smuggled tail
-        // fails closed to OTHER via the residual check instead of being cut.
-        val text = UNICODE_LINE_END.replace(body, "?")
-        // Step 1: explicit `user type :/= value` lines, token-level, plus
-        // bare S24 `Type:` lines (issue #58). A line-start bare `Type:`
-        // (BARE_TYPE_LINE) is handled FIRST and parsed ONLY with the strict
-        // bare complete-value validator (P1 #59 re-review): an embedded
-        // `userType=` / `User type:` / `user_type=` inside its value must
-        // never be matched by TYPE_LINE.find() and override the bare
-        // declaration. The FULL bare-captured value (including embedded
-        // keyword text) is validated; disallowed chars / non-exact/unknown
-        // tails fail closed to UNKNOWN (never CLONE, never OTHER/Absent).
-        // `User type:` lines do not start with bare `Type:` so BARE_TYPE_LINE
-        // does not match them; they keep the TYPE_LINE path below.
-        for (line in text.lines()) {
-            val b = BARE_TYPE_LINE.find(line)
-            if (b != null) {
-                val rawValue = b.groupValues[1]
-                // Reject any bare `Type:` value whose raw form contains disallowed
-                // Unicode whitespace/control/format chars (NBSP, U+2000/U+3000/
-                // U+202F, ZWSP, controls). Kotlin/Unicode trim must never launder
-                // these into an allowlisted CLONE/OTHER (P1 #59). ASCII space/tab
-                // only; the outer capture is not Unicode-trimmed.
-                if (hasDisallowedBareChars(rawValue)) return ProfileUserType.UNKNOWN
-                val value = asciiTrim(rawValue)
+        // Split on standard line breaks only (CRLF/CR/LF), NOT on Unicode line
+        // terminators NEL/LS/PS or VT/FF: String.lines() would split on them,
+        // breaking raw bare-Type key detection (P1 #59). Keeping NEL/LS/PS/VT/FF
+        // inside the raw line lets us detect them as malformed key/value chars.
+        val rawLines = body.split(STD_LINE_BREAK)
+        // Step 1: process per raw line (P1 #59). Do NOT pre-replace
+        // UNICODE_LINE_END across the whole body before detection: that can
+        // corrupt a bare `Type` key (e.g. NEL/LS/PS inside the key becomes `?`,
+        // hiding a malformed bare-Type attempt from ownership and letting
+        // TYPE_LINE.find() trust an embedded `userType=`). A line that is a
+        // bare `Type` declaration ATTEMPT (anchored, line-start bare `type`
+        // token) is OWNED here and never evaluated by TYPE_LINE/step-2:
+        // - valid strict ASCII key surface ([ \t] only in indent/around type/
+        //   around separator) -> parse value fail-closed on the bare path;
+        // - malformed key surface (any Cc/Cf/Z/Unicode line-end/control/
+        //   punctuation or other non-[ \t] char in key positions) -> UNKNOWN.
+        // Non-bare lines keep legacy TYPE_LINE/step-2 compat, evaluated on a
+        // safety-normalized view (UNICODE_LINE_END -> `?`) to preserve existing
+        // value/tail residual behavior.
+        for (rawLine in rawLines) {
+            if (BARE_TYPE_ATTEMPT.containsMatchIn(rawLine)) {
+                val strict = BARE_TYPE_LINE.find(rawLine)
+                if (strict == null) {
+                    // Bare `Type` declaration attempt with a malformed key
+                    // surface (VT/FF/other Cc, Cf/Z/Unicode line-end chars,
+                    // punctuation like `!`, or any non-[ \t] in key/indent/
+                    // separator positions). Fail closed to UNKNOWN and never
+                    // fall through to TYPE_LINE.find().
+                    return ProfileUserType.UNKNOWN
+                }
+                val rawValue = strict.groupValues[4]
+                // Safety-normalize Unicode line-end chars in the value tail so
+                // a smuggled terminator cannot be cut/hidden; normalized to `?`
+                // (disallowed by hasDisallowedBareChars) => fail closed.
+                val safeValue = UNICODE_LINE_END.replace(rawValue, "?")
+                // Reject any bare `Type:` value whose raw/safe form contains
+                // disallowed chars (Unicode whitespace/control/format, VT/FF,
+                // or anything outside the strict ASCII allowlist). Kotlin/
+                // Unicode trim must never launder these into an allowlisted
+                // CLONE/OTHER (P1 #59). ASCII space/tab only.
+                if (hasDisallowedBareChars(safeValue)) return ProfileUserType.UNKNOWN
+                val value = asciiTrim(safeValue)
                 if (value.isEmpty()) continue
                 // Bare S24 `Type:` accepts CLONE only as an exact complete
                 // allowlisted value (optional single valid `(default)`). Demoted/
@@ -659,8 +669,8 @@ object SamsungProfileAdapter {
                 // (never CLONE); unlike TYPE_LINE/step-2 compat (which may map
                 // tainted mentions to OTHER via classifyMention), the bare
                 // complete-value path fails closed below (UNKNOWN) unless the
-                // value is an exact allowlisted OTHER form. Legacy separator-less
-                // compat stays on step 2 / TYPE_LINE paths.
+                // value is an exact allowlisted OTHER form. Legacy compat stays
+                // on TYPE_LINE / step-2 paths for non-bare lines.
                 if (isKnownCloneBareValue(value)) {
                     hasCloneSeg = true
                     continue
@@ -690,20 +700,11 @@ object SamsungProfileAdapter {
                 // Kept as fail-closed UNKNOWN.
                 return ProfileUserType.UNKNOWN
             }
-            // Line-start bare `Type`-like declaration (P1 #59): tolerant
-            // detector matches but strict BARE_TYPE_LINE did not. If the key/
-            // indent/separator surface has disallowed Unicode whitespace, fail
-            // closed to UNKNOWN (never fall through to TYPE_LINE.find(), which
-            // could trust an embedded `userType=`). If the key surface is
-            // ASCII-valid but strict BARE did not fully match (e.g. empty
-            // value), ignore the declaration without falling through.
-            if (BARE_TYPE_LIKE_KEY.containsMatchIn(line)) {
-                if (!ASCII_BARE_TYPE_KEY.containsMatchIn(line)) {
-                    return ProfileUserType.UNKNOWN
-                }
-                continue
-            }
-            val m = TYPE_LINE.find(line)
+            // Non-bare line: legacy explicit `user type :/= value` path on a
+            // safety-normalized view (preserves existing UNICODE_LINE_END tail
+            // fail-closed behavior for legacy values).
+            val legacyLine = UNICODE_LINE_END.replace(rawLine, "?")
+            val m = TYPE_LINE.find(legacyLine)
             if (m != null) {
                 val value = m.groupValues[1].trim()
                 if (value.isEmpty()) continue
@@ -715,12 +716,16 @@ object SamsungProfileAdapter {
             }
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
-        // Same token rule applied to the remainder after the keyword.
-        for (line in text.lines()) {
-            if (TYPE_LINE.find(line) != null || BARE_TYPE_LINE.find(line) != null) continue
-            if (!TYPE_KEYWORD.containsMatchIn(line)) continue
-            if (EXPLICIT_SEP.containsMatchIn(line)) continue
-            val remainder = TYPE_KEYWORD.replaceFirst(line, "").trim()
+        // Same token rule applied to the remainder after the keyword. Bare
+        // `Type` declaration attempts are owned by step 1 and must never be
+        // reprocessed here.
+        for (rawLine in rawLines) {
+            if (BARE_TYPE_ATTEMPT.containsMatchIn(rawLine)) continue
+            val legacyLine = UNICODE_LINE_END.replace(rawLine, "?")
+            if (TYPE_LINE.find(legacyLine) != null) continue
+            if (!TYPE_KEYWORD.containsMatchIn(legacyLine)) continue
+            if (EXPLICIT_SEP.containsMatchIn(legacyLine)) continue
+            val remainder = TYPE_KEYWORD.replaceFirst(legacyLine, "").trim()
             if (remainder.isEmpty()) {
                 hasOtherSeg = true
                 continue
