@@ -3705,12 +3705,18 @@ class DualViewModel(
                             SelectionTarget(it.target.userId, it.target.serial)
                         }
                     // PR64 P1：pin 結果必須與核准目標一致（防執行期目標漂移）。
+                    // 與 bound-mismatch/handleSelectionTargetChangeLocked 同收斂：
+                    // 清選取＋重置 bound/restore marker＋遞增 gen，避免舊目標勾選殘留。
                     if (approved != null && expectedTarget != null &&
                         (expectedTarget.id != approved.targetId || expectedTarget.serial != approved.targetSerial)
                     ) {
+                        val oldBound = selectionBoundTarget
+                        selectionBoundTarget = SELECTION_BOUND_NONE
+                        selectionRestoredForTarget = SELECTION_RESTORE_NONE
                         _state.update { cur ->
                             cur.copy(
                                 loading = false,
+                                selectedKeys = emptySet(),
                                 batchReport = null,
                                 inventory = cur.inventory.copy(
                                     freshness = InventoryFreshness.STALE,
@@ -3721,10 +3727,12 @@ class DualViewModel(
                                     DiagnoseCode.VERIFY_MISMATCH,
                                     techDetail = "batch approval target mismatch vs pin",
                                 ),
-                                msg = "批次請求已過期：目標已變更，請重新確認",
+                                msg = "批次請求已過期：目標已變更，已清空舊勾選，請重新確認" +
+                                    "（user ${oldBound.display()} → ${expectedTarget.display()}）",
                                 msgKind = MsgKind.INVALID,
                             )
                         }
+                        selectionGen.incrementAndGet()
                         return@withLock
                     }
                     if (expectedTarget == null) {

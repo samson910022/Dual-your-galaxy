@@ -1572,6 +1572,7 @@ class MainActivity : ComponentActivity() {
         // 捲動。門控沿用 batchEnabled(s)，禁用原因仍由 batchResultView/writeBlockView
         // 顯示（見 renderSourceList/render）。
         batchBar = LinearLayout(this).apply {
+            id = R.id.batch_bar
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(getColor(R.color.oneui_surface))
             minimumHeight = dp(56)
@@ -1611,6 +1612,7 @@ class MainActivity : ComponentActivity() {
             // 不設 POLITE：避免與 batchResultView 雙重播報；仍可聚焦/點擊前往詳情。
             isClickable = true
             isFocusable = true
+            minimumHeight = dp(48)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -4307,7 +4309,8 @@ class MainActivity : ComponentActivity() {
             }
             lastBatchResultText = newBatchText
         }
-        // P2：sticky bar 鏡像簡短原因/結果，捲動時仍可見（無額外播報，避免雙重 POLITE）。
+        // P2/P3：sticky bar 顯示簡短原因/摘要（捲動時仍可見）；完整明細僅在 batchResultView。
+        // a11y：避免朗讀 50 筆逐項明細，改為單句摘要/原因 + 前往詳情提示。
         if (::batchBarStatusView.isInitialized) {
             try {
                 if (newBatchText.isBlank()) {
@@ -4315,8 +4318,15 @@ class MainActivity : ComponentActivity() {
                     batchBarStatusView.text = ""
                     batchBarStatusView.contentDescription = null
                 } else {
-                    batchBarStatusView.text = newBatchText
-                    batchBarStatusView.contentDescription = newBatchText
+                    val stickyText = if (reportText.isNotEmpty()) {
+                        formatBatchReportSummary(s.batchReport)
+                    } else {
+                        newBatchText
+                    }
+                    val detailHint = try { getString(R.string.batch_bar_go_to_detail) } catch (_: Exception) { "" }
+                    batchBarStatusView.text = stickyText
+                    batchBarStatusView.contentDescription =
+                        if (detailHint.isNotEmpty()) "$stickyText。$detailHint" else stickyText
                     batchBarStatusView.visibility = View.VISIBLE
                 }
             } catch (_: Exception) {
@@ -5441,10 +5451,7 @@ const val BATCH_REPORT_MAX_ROWS = 50
 internal fun formatBatchReportText(report: BatchReport?): String {
     if (report == null || report.items.isEmpty()) return ""
     return buildString {
-        appendLine(
-            "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
-                "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）",
-        )
+        appendLine(formatBatchReportSummary(report))
         val shown = report.items.take(BATCH_REPORT_MAX_ROWS)
         for (item in shown) {
             val mark = when (item.outcome) {
@@ -5460,6 +5467,13 @@ internal fun formatBatchReportText(report: BatchReport?): String {
             appendLine("  …等 $rest 項（共 ${report.items.size} 項，僅顯示前 $BATCH_REPORT_MAX_ROWS 項）")
         }
     }.trimEnd()
+}
+
+// Sticky bar 用單句摘要（避免 TalkBack 朗讀逐項明細）；完整明細保留於 batchResultView。
+internal fun formatBatchReportSummary(report: BatchReport?): String {
+    if (report == null || report.items.isEmpty()) return ""
+    return "批次結果：成功 ${report.successCount} / 失敗 ${report.failedCount} " +
+        "/ 未知 ${report.unknownCount}（共 ${report.items.size} 項）"
 }
 
 // 移除確認文案純函數（MainActivity 頂層 internal，JVM 可測）。

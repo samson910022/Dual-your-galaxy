@@ -2291,6 +2291,35 @@ class InventorySelectionTest {
         assertNull(st.batchReport)
     }
 
+    // PR64：合法核准快照（keys+target）→ 依快照執行，單筆成功寫入。
+    @Test
+    fun cloneSelected_approvedSnapshot_executesSuccessfully() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.good")
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 95,
+            targetSerial = 15,
+            selectedKeys = setOf("0:com.example.good"),
+        )
+        vm.cloneSelected(approved)
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val st = vm.state.value
+        val report = st.batchReport!!
+        assertEquals(1, report.items.size)
+        assertTrue(report.items.single().outcome is CloneOutcome.Success)
+        assertEquals(1, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertEquals(listOf("com.example.good"), gw.installCalls)
+    }
+
     // PR64 P1：核准與 live 相符，但 pin 時 fetchDualTarget 漂移到不同目標→拒絕，零寫入。
     @Test
     fun cloneSelected_approvedMatchesLive_butPinResolvesDifferentTarget_refusesZeroWrites() {
@@ -2320,7 +2349,10 @@ class InventorySelectionTest {
         assertNull(st.batchReport)
         assertEquals(MsgKind.INVALID, st.msgKind)
         assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
-        assertTrue(st.msg.contains("目標已變更，請重新確認"))
+        assertTrue(st.msg.contains("目標已變更"))
+        assertTrue(st.msg.contains("已清空舊勾選"))
+        assertTrue(st.msg.contains("請重新確認"))
+        assertEquals("pin mismatch must clear stale selection", emptySet<String>(), st.selectedKeys)
         assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
         assertEquals(96, st.inventory.targetId)
         assertEquals(16, st.inventory.targetSerial)
