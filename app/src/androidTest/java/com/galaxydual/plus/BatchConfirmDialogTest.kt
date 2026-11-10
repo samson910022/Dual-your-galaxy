@@ -10,6 +10,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.galaxydual.plus.R
@@ -87,6 +88,46 @@ class BatchConfirmDialogTest {
             val dialog = field(activity, "batchConfirmDialog") as AlertDialog
             val check = checkbox(dialog.window!!.decorView)!!
             check.isChecked = true
+            assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
+        }
+    }
+
+    private fun awaitStableForeground(scenario: androidx.test.core.app.ActivityScenario<MainActivity>, vm: DualViewModel) {
+        HarnessPoll.await(15_000) {
+            var btnEnabled = false
+            scenario.onActivity { activity ->
+                val btn = activity.findViewById<Button?>(R.id.batch_btn)
+                btnEnabled = btn != null && btn.isEnabled
+            }
+            val s = vm.state.value
+            !s.loading && btnEnabled && s.inventory.targetId == 95 && s.inventory.targetSerial == 15
+        }
+    }
+
+    private fun openDialogInCurrentContext(
+        scenario: androidx.test.core.app.ActivityScenario<MainActivity>,
+        vm: DualViewModel,
+        expectWasFresh: Boolean,
+    ) {
+        scenario.onActivity { activity ->
+            // 在同一主執行緒事件中開 Dialog，避免中途 refresh/render 改變語境。
+            activity.findViewById<Button>(R.id.batch_btn).performClick()
+        }
+        HarnessPoll.await(10_000) {
+            var ok = false
+            scenario.onActivity { activity ->
+                val dialog = field(activity, "batchConfirmDialog") as? AlertDialog
+                val pending = field(activity, "pendingBatchRequest")
+                val wasFresh = pending?.let { field(it, "wasFresh") as? Boolean }
+                ok = dialog?.isShowing == true && wasFresh == expectWasFresh
+            }
+            ok
+        }
+        scenario.onActivity { activity ->
+            val pending = field(activity, "pendingBatchRequest")!!
+            assertEquals(expectWasFresh, field(pending, "wasFresh"))
+            val dialog = field(activity, "batchConfirmDialog") as AlertDialog
+            checkbox(dialog.window!!.decorView)!!.isChecked = true
             assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
         }
     }
@@ -195,7 +236,8 @@ class BatchConfirmDialogTest {
         }
     }
 
-    // Review #4：同 key/target 下 FRESH→STALE 跨 recreate，舊 ack 必須失效。
+    // Review #4/#5：同 key/target 下 FRESH→STALE 跨 recreate，舊 ack 必須失效。
+    // 先停至 CREATED 再改 live freshness，確保 crossing 發生於儲存/還原之間（非舊 Activity 同畫面 sync 消費）。
     @Test
     fun freshnessFreshToStale_recreate_clearsAck_andDisablesPositive() {
         val gw = FakeHarnessGateway(dualId = 95)
@@ -206,11 +248,20 @@ class BatchConfirmDialogTest {
             assertEquals(InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                openDialogAndAck(scenario)
-                scenario.onActivity { setInventoryFreshness(vm, InventoryFreshness.STALE) }
-                HarnessPoll.await(10_000) { vm.state.value.inventory.freshness == InventoryFreshness.STALE }
+                awaitStableForeground(scenario, vm)
+                openDialogInCurrentContext(scenario, vm, expectWasFresh = true)
+                var reqGen = 0L
+                scenario.onActivity { activity ->
+                    val pending = field(activity, "pendingBatchRequest")!!
+                    reqGen = field(pending, "generation") as Long
+                    assertEquals(true, field(pending, "wasFresh"))
+                    assertEquals(true, field(activity, "batchAcknowledged"))
+                }
+                scenario.moveToState(Lifecycle.State.CREATED)
+                setInventoryFreshness(vm, InventoryFreshness.STALE)
                 scenario.recreate()
-                HarnessPoll.await(10_000) {
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                HarnessPoll.await(15_000) {
                     var ok = false
                     scenario.onActivity { activity ->
                         val dialog = field(activity, "batchConfirmDialog") as? AlertDialog
@@ -223,6 +274,16 @@ class BatchConfirmDialogTest {
                     }
                     ok
                 }
+                scenario.onActivity { activity ->
+                    val pending = field(activity, "pendingBatchRequest")
+                    // 語境跨越後請求應已失效/重建（不得沿用舊 ack）；若仍同請求則必須不可確認。
+                    if (pending != null) {
+                        val gen = field(pending, "generation") as Long
+                        val wasFresh = field(pending, "wasFresh") as? Boolean
+                        assertTrue("cross-recreate context must not preserve acked old request",
+                            gen != reqGen || wasFresh != true || !(field(activity, "batchAcknowledged") as Boolean))
+                    }
+                }
                 assertEquals(0, gw.installCalls)
                 assertEquals(0, gw.writeCalls)
             }
@@ -232,7 +293,9 @@ class BatchConfirmDialogTest {
         }
     }
 
-    // Review #4：同 key/target 下 STALE→FRESH 跨 recreate，舊 ack 必須失效。
+    // Review #4/#5：同 key/target 下 STALE→FRESH 跨 recreate，舊 ack 必須失效。
+    // 先等 onForeground 穩定（FRESH），再於已啟動 Activity 後設為 STALE 並同事件開 Dialog（assert wasFresh=false），
+    // 停至 CREATED 後改回 FRESH 再 recreate，證明 crossing 發生於儲存/還原之間。
     @Test
     fun freshnessStaleToFresh_recreate_clearsAck_andDisablesPositive() {
         val gw = FakeHarnessGateway(dualId = 95)
@@ -240,39 +303,55 @@ class BatchConfirmDialogTest {
         try {
             awaitHarnessReady(vm)
             prepareWritableSelection(vm)
-            scenarioSetStaleThenTest(vm, gw, toFresh = true)
+            assertEquals(InventoryFreshness.FRESH, vm.state.value.inventory.freshness)
+            MainActivity.testViewModel = vm
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                awaitStableForeground(scenario, vm)
+                // onForeground 已穩定；在 Activity 啟動後強制 STALE 並立即開啟 STALE 語境 Dialog。
+                scenario.onActivity { setInventoryFreshness(vm, InventoryFreshness.STALE) }
+                HarnessPoll.await(10_000) {
+                    vm.state.value.inventory.freshness == InventoryFreshness.STALE
+                }
+                openDialogInCurrentContext(scenario, vm, expectWasFresh = false)
+                var reqGen = 0L
+                scenario.onActivity { activity ->
+                    val pending = field(activity, "pendingBatchRequest")!!
+                    reqGen = field(pending, "generation") as Long
+                    assertEquals(false, field(pending, "wasFresh"))
+                    assertEquals(true, field(activity, "batchAcknowledged"))
+                }
+                scenario.moveToState(Lifecycle.State.CREATED)
+                setInventoryFreshness(vm, InventoryFreshness.FRESH)
+                scenario.recreate()
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                HarnessPoll.await(15_000) {
+                    var ok = false
+                    scenario.onActivity { activity ->
+                        val dialog = field(activity, "batchConfirmDialog") as? AlertDialog
+                        val check = dialog?.window?.decorView?.let { checkbox(it) }
+                        val acked = (field(activity, "batchAcknowledged") as? Boolean) == true
+                        ok = dialog?.isShowing == true &&
+                            check?.isChecked == false &&
+                            !acked &&
+                            !dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled
+                    }
+                    ok
+                }
+                scenario.onActivity { activity ->
+                    val pending = field(activity, "pendingBatchRequest")
+                    if (pending != null) {
+                        val gen = field(pending, "generation") as Long
+                        val wasFresh = field(pending, "wasFresh") as? Boolean
+                        assertTrue("cross-recreate context must not preserve acked old request",
+                            gen != reqGen || wasFresh != false || !(field(activity, "batchAcknowledged") as Boolean))
+                    }
+                }
+                assertEquals(0, gw.installCalls)
+                assertEquals(0, gw.writeCalls)
+            }
         } finally {
             MainActivity.testViewModel = null
             vm.dispose()
-        }
-    }
-
-    private fun scenarioSetStaleThenTest(vm: DualViewModel, gw: FakeHarnessGateway, toFresh: Boolean) {
-        if (!toFresh) return
-        // 先降為 STALE 再開啟並勾選，然後升回 FRESH 驗證反向失效。
-        setInventoryFreshness(vm, InventoryFreshness.STALE)
-        HarnessPoll.await(10_000) { vm.state.value.inventory.freshness == InventoryFreshness.STALE }
-        MainActivity.testViewModel = vm
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            openDialogAndAck(scenario)
-            scenario.onActivity { setInventoryFreshness(vm, InventoryFreshness.FRESH) }
-            HarnessPoll.await(10_000) { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
-            scenario.recreate()
-            HarnessPoll.await(10_000) {
-                var ok = false
-                scenario.onActivity { activity ->
-                    val dialog = field(activity, "batchConfirmDialog") as? AlertDialog
-                    val check = dialog?.window?.decorView?.let { checkbox(it) }
-                    val acked = (field(activity, "batchAcknowledged") as? Boolean) == true
-                    ok = dialog?.isShowing == true &&
-                        check?.isChecked == false &&
-                        !acked &&
-                        !dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled
-                }
-                ok
-            }
-            assertEquals(0, gw.installCalls)
-            assertEquals(0, gw.writeCalls)
         }
     }
 
