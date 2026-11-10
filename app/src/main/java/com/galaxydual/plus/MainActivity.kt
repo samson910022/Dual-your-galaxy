@@ -2106,13 +2106,17 @@ class MainActivity : ComponentActivity() {
         val key = buildClonedListKey(s, catalogKey)
         if (key == lastClonedListKey) {
             val writable = blockKey == null
-            for (i in 0 until clonedAppsContainer.childCount) {
-                val row = clonedAppsContainer.getChildAt(i) as? LinearLayout ?: continue
-                for (j in 0 until row.childCount) {
-                    val child = row.getChildAt(j)
-                    // Phase UI P1：分身列移除鈕（明確文字鈕，tag=remove:pkg）同步門控。
-                    if (child is Button) child.isEnabled = !s.loading && writable
+            fun syncRemoveButtons(root: android.view.View) {
+                if (root is Button && (root.tag as? String)?.startsWith("remove:") == true) {
+                    root.isEnabled = !s.loading && writable
+                    return
                 }
+                if (root is ViewGroup) {
+                    for (j in 0 until root.childCount) syncRemoveButtons(root.getChildAt(j))
+                }
+            }
+            for (i in 0 until clonedAppsContainer.childCount) {
+                syncRemoveButtons(clonedAppsContainer.getChildAt(i))
             }
             return
         }
@@ -2136,9 +2140,10 @@ class MainActivity : ComponentActivity() {
         // Phase L L1：sync 已在指紋比對前完成，此處不再重算 hash／重 sync。
         val catalogLabels = catalogLabelsFor(s.sourceCatalog)
         for (pkg in s.cloned) {
+            // PR #63 re-review #4 P2：外層改垂直堆疊（每 app 一個 row，childCount/key 語意不變）；
+            // 上方 icon+文字佔滿寬度，下方移除鈕獨立一行可自然伸展，避免 320dp/大字體英文截斷。
             val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.VERTICAL
                 val p = dp(8)
                 setPadding(p, p, p, p)
                 layoutParams = LinearLayout.LayoutParams(
@@ -2148,6 +2153,14 @@ class MainActivity : ComponentActivity() {
                     bottomMargin = dp(6)
                 }
                 background = getDrawable(R.drawable.bg_island_card_high)
+            }
+            val topContent = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
             }
 
             // Left icon container with #2 badge overlay
@@ -2208,7 +2221,6 @@ class MainActivity : ComponentActivity() {
                 minimumWidth = dp(96)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     marginStart = dp(10)
-                    marginEnd = dp(8)
                 }
             }
             val titleRow = LinearLayout(this).apply {
@@ -2275,25 +2287,22 @@ class MainActivity : ComponentActivity() {
             }
             textContainer.addView(titleRow)
             textContainer.addView(subtitleView)
-            row.addView(textContainer)
+            topContent.addView(iconContainer)
+            topContent.addView(textContainer)
+            row.addView(topContent)
 
             // 明確「移除」文字鈕（48dp）：點按仍走 requestRemove 二階段確認
             // （對話框），行為與改版前相同；不再以開關偽裝成移除操作
             // （取消勾選 ≠ 移除）。disabled while busy or channel unwritable.
             val removeRowBtn = Button(this).apply {
-                // PR #63 re-review #3 P2：視覺用短標籤避免窄寬/大字體截斷；
-                // 完整動作語意（「移除分身」等）保留於 contentDescription。
+                // PR #63 re-review #3/#4：視覺用短標籤；完整動作語意保留於 contentDescription。
+                // 按鈕置於獨立底列（全寬）可避免 320dp/大字體截斷，不再以 90dp 硬上限擠壓。
                 text = getString(R.string.action_remove_row)
                 background = getDrawable(R.drawable.bg_pill_button_secondary)
                 setTextColor(getColorStateList(R.color.pill_button_secondary_text))
                 textSize = 12f
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
-                // PR #63 re-review #1: 320dp worst case leaves ~186dp for
-                // text+button (tab 32 + card 24 + row 16 + icon 44 + margins 18 =
-                // 134 fixed). 186 - 96(text minWidth) = 90dp max for the button,
-                // preserving 48dp touch target while protecting the app-name column.
-                maxWidth = dp(90)
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
@@ -2312,10 +2321,21 @@ class MainActivity : ComponentActivity() {
                     vm.requestRemove(pkg)
                 }
             }
-            row.addView(
+            val actionRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    topMargin = dp(4)
+                }
+            }
+            actionRow.addView(
                 removeRowBtn,
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
             )
+            row.addView(actionRow)
             clonedAppsContainer.addView(row)
             // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
             // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。

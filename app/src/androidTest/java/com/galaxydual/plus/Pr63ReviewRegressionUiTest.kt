@@ -45,14 +45,17 @@ class Pr63ReviewRegressionUiTest {
     private fun findRowRemoveButtons(activity: MainActivity): List<Button> {
         val container = field(activity, "clonedAppsContainer") as? LinearLayout ?: return emptyList()
         val out = mutableListOf<Button>()
-        for (i in 0 until container.childCount) {
-            val row = container.getChildAt(i) as? ViewGroup ?: continue
-            for (j in 0 until row.childCount) {
-                val child = row.getChildAt(j)
-                if (child is Button && (child.tag as? String)?.startsWith("remove:") == true) {
-                    out += child
-                }
+        fun collect(root: android.view.View) {
+            if (root is Button && (root.tag as? String)?.startsWith("remove:") == true) {
+                out += root
+                return
             }
+            if (root is ViewGroup) {
+                for (j in 0 until root.childCount) collect(root.getChildAt(j))
+            }
+        }
+        for (i in 0 until container.childCount) {
+            collect(container.getChildAt(i))
         }
         return out
     }
