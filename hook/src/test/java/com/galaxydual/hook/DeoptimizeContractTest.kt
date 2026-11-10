@@ -44,8 +44,8 @@ class DeoptimizeContractTest {
         }
         assertEquals(listOf("first", "second"), host.ids)
         assertEquals(
-            listOf("deoptimized java.lang.String#length", "hooked java.lang.String#length",
-                "deoptimized java.lang.String#isEmpty", "hooked java.lang.String#isEmpty"),
+            listOf("deoptimized java.lang.String#length()->int", "hooked java.lang.String#length()->int",
+                "deoptimized java.lang.String#isEmpty()->boolean", "hooked java.lang.String#isEmpty()->boolean"),
             host.logs,
         )
     }
@@ -59,8 +59,8 @@ class DeoptimizeContractTest {
         host.events.forEach { assertSame(target, it.second) }
         assertEquals(listOf("id"), host.ids)
         assertEquals(
-            listOf("deoptimize returned false java.lang.String#length (hook proceeds, effect unverified)",
-                "hooked java.lang.String#length"), host.logs,
+            listOf("deoptimize returned false java.lang.String#length()->int (hook proceeds, effect unverified)",
+                "hooked java.lang.String#length()->int"), host.logs,
         )
     }
 
@@ -72,8 +72,8 @@ class DeoptimizeContractTest {
         assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
         host.events.forEach { assertSame(target, it.second) }
         assertEquals(
-            listOf("deoptimize failed java.lang.String#length: art unavailable; hook proceeds, effect unverified",
-                "hooked java.lang.String#length"), host.logs,
+            listOf("deoptimize failed java.lang.String#length()->int: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
+                "hooked java.lang.String#length()->int"), host.logs,
         )
     }
 
@@ -88,7 +88,7 @@ class DeoptimizeContractTest {
             host.events.forEach { assertSame(target, it.second) }
             assertEquals(listOf("id"), host.ids)
             assertEquals(2, host.logs.size)
-            assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
+            assertEquals("hook failed java.lang.String#length()->int: java.lang.Error: install error", host.logs.last())
         }
     }
 
@@ -105,7 +105,7 @@ class DeoptimizeContractTest {
             assertEquals(listOf("id"), host.ids)
             assertEquals(2, host.logs.size)
             assertTrue(host.logs.first().startsWith(prefix))
-            assertEquals("hooked java.lang.String#length", host.logs.last())
+            assertEquals("hooked java.lang.String#length()->int", host.logs.last())
         }
     }
 
@@ -114,7 +114,7 @@ class DeoptimizeContractTest {
         val host = Host(logResult = { if (it.startsWith("hooked ")) throw Error("logger") })
         assertTrue(host.install(method("length"), "id"))
         assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
-        assertEquals(listOf("deoptimized java.lang.String#length", "hooked java.lang.String#length"), host.logs)
+        assertEquals(listOf("deoptimized java.lang.String#length()->int", "hooked java.lang.String#length()->int"), host.logs)
     }
 
     @Test
@@ -125,6 +125,6 @@ class DeoptimizeContractTest {
         )
         assertFalse(host.install(method("length"), "id"))
         assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
-        assertEquals("hook failed java.lang.String#length: install error", host.logs.last())
+        assertEquals("hook failed java.lang.String#length()->int: java.lang.Error: install error", host.logs.last())
     }
 }
