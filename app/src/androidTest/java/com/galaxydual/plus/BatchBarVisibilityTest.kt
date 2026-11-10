@@ -1,7 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// Stage1：sticky batch bar 只屬雙開應用頁。切到 Engine tab 時其容器（batchBtn
-// 的 parent）必須 GONE，切回雙開應用頁恢復 VISIBLE；全程不點任何寫入按鈕。
+// Stage1：sticky batch bar 只屬雙開應用頁。切到 Engine tab 時外層 batch_bar
+// 容器必須 GONE，切回雙開應用頁恢復 VISIBLE；全程不點任何寫入按鈕。
 package com.galaxydual.plus
 
 import android.view.View
@@ -18,10 +18,8 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class BatchBarVisibilityTest {
 
-    private fun batchBar(activity: MainActivity): View {
-        val batchBtn = activity.findViewById<Button>(R.id.batch_btn)
-        return batchBtn.parent as View
-    }
+    private fun batchBar(activity: MainActivity): View =
+        activity.findViewById(R.id.batch_bar)
 
     @Test
     fun batchBar_onlyVisibleOnDualAppsTab() {

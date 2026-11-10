@@ -56,7 +56,8 @@
     <string name="catalog_load_failed">來源清單載入失敗，已保留舊列表（請點「重新連線並更新」重試）</string>
     <!-- A：可寫但批次目標未確認（targetSerial null/UNKNOWN）時的可見原因（VM 守衛不動，僅 UI 層提示）。 -->
     <string name="batch_target_unavailable">批次目標未確認（user/serial 未知或 serial 缺失），批次按鈕已禁用；請點「重新連線並更新」重查後再試</string>
-    <!-- Stage1：sticky bottom bar 勾選數（永遠可見）。 -->
+    <!-- Stage1：sticky bottom bar 勾選數/狀態（永遠可見）。 -->
+    <string name="batch_bar_go_to_detail">點按前往上方詳情</string>
     <plurals name="batch_selected_count">
         <item quantity="one">已選 %1$d 項</item>
         <item quantity="other">已選 %1$d 項</item>

@@ -14,6 +14,7 @@
     <item name="refresh_btn" type="id" />
     <item name="perm_btn" type="id" />
     <item name="batch_btn" type="id" />
+    <item name="batch_bar" type="id" />
     <item name="msg_view" type="id" />
     <item name="write_block_reason" type="id" />
     <item name="channel_scroll" type="id" />
