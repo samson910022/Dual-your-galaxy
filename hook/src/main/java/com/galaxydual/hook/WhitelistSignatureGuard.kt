@@ -67,9 +67,11 @@ object WhitelistSignatureGuard {
     fun isPotentialMutationMethod(methodName: String): Boolean {
         if (methodName.isEmpty()) return false
         for (token in MUTATION_TOKENS) {
+            // Token matching is case-insensitive, but camelCase/underscore
+            // boundaries stay case-sensitive so names like getSettings/
+            // hasDataset/getWhitelistDataset are not misclassified (C1).
             val pattern = Regex(
-                "(^|(?<=[a-z])(?=[A-Z])|_)${Regex.escape(token)}($|(?=[A-Z_0-9]))",
-                RegexOption.IGNORE_CASE,
+                "(^|(?<=[a-z])(?=[A-Z])|_)(?i:${Regex.escape(token)})($|(?=[A-Z_0-9]))",
             )
             if (pattern.containsMatchIn(methodName)) return true
         }

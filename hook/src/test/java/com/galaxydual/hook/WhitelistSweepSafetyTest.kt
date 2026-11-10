@@ -88,5 +88,7 @@ class WhitelistSweepSafetyTest {
         // "set" inside "Settings" is not a mutation verb segment; must not flag.
         assertFalse(WhitelistSignatureGuard.isPotentialMutationMethod("getSettings"))
         assertFalse(WhitelistSignatureGuard.isPotentialMutationMethod("hasDataset"))
+        // "set" inside "Dataset" after a whitelist token is still not a mutation segment.
+        assertFalse(WhitelistSignatureGuard.isPotentialMutationMethod("getWhitelistDataset"))
     }
 }
