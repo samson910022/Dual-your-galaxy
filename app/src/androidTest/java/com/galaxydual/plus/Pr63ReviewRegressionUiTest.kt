@@ -127,13 +127,18 @@ class Pr63ReviewRegressionUiTest {
         HarnessPoll.await(timeoutMs) {
             var settled = false
             scenario.onActivity { activity ->
-                val job = try { field(activity, "catalogJob") } catch (_: Exception) { null }
-                val active = try {
-                    (job as? kotlinx.coroutines.Job)?.isActive == true
-                } catch (_: Exception) {
-                    false
+                val job = try {
+                    field(activity, "catalogJob")
+                } catch (e: Exception) {
+                    throw AssertionError("awaitCatalogSettled: failed to read catalogJob field", e)
                 }
-                settled = !active
+                settled = when (job) {
+                    null -> false
+                    is kotlinx.coroutines.Job -> job.isCompleted
+                    else -> throw AssertionError(
+                        "awaitCatalogSettled: catalogJob has unexpected type ${job.javaClass.name}",
+                    )
+                }
             }
             settled
         }
