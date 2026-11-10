@@ -285,7 +285,7 @@ class DualHook : XposedModule() {
             )
         } catch (t: Throwable) {
             logi(
-                "caller plan failed [$hookId] ${method.toGenericString()}: " +
+                "caller plan failed [$hookId] ${HookInstaller.executableSignature(method)}: " +
                     "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
                     "falling back to callee-only hook, effect unverified",
             )

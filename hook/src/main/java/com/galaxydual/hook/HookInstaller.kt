@@ -1,11 +1,18 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.lang.reflect.Constructor
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
 
 // Framework-free orchestration; the caller supplies the actual framework operations.
 internal object HookInstaller {
+    internal fun executableSignature(e: Executable): String {
+        val name = if (e is Constructor<*>) "<init>" else e.name
+        val params = e.parameterTypes.joinToString(",") { it.typeName }
+        return "${e.declaringClass.name}#$name($params)"
+    }
+
     private inline fun safeLog(log: (String) -> Unit, message: String) {
         try {
             log(message)
@@ -72,7 +79,7 @@ internal object HookInstaller {
         } catch (t: Throwable) {
             safeLog(
                 log,
-                "caller plan failed [$hookId] ${callee.toGenericString()}: " +
+                "caller plan failed [$hookId] ${executableSignature(callee)}: " +
                     "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
                     "falling back to callee-only hook, effect unverified",
             )
@@ -81,7 +88,7 @@ internal object HookInstaller {
         val callersAttempted = plan.callersToDeoptimize.size
         var callersDeoptimized = 0
         for (caller in plan.callersToDeoptimize) {
-            val sig = caller.toGenericString()
+            val sig = executableSignature(caller)
             try {
                 if (deoptimize(caller)) {
                     callersDeoptimized++
@@ -106,7 +113,8 @@ internal object HookInstaller {
         if (result && callersAttempted > 0 && callersDeoptimized < callersAttempted) {
             safeLog(
                 log,
-                "caller deopt incomplete: $callersDeoptimized/$callersAttempted deoptimized; " +
+                "caller deopt incomplete [$hookId] ${executableSignature(callee)}: " +
+                    "$callersDeoptimized/$callersAttempted deoptimized; " +
                     "hook proceeds, inline bypass may remain (effect unverified)",
             )
         }
