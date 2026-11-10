@@ -10,7 +10,8 @@ internal object HookInstaller {
     internal fun executableSignature(e: Executable): String {
         val name = if (e is Constructor<*>) "<init>" else e.name
         val params = e.parameterTypes.joinToString(",") { it.typeName }
-        return "${e.declaringClass.name}#$name($params)"
+        val base = "${e.declaringClass.name}#$name($params)"
+        return if (e is Method) "$base->${e.returnType.typeName}" else base
     }
 
     private inline fun safeLog(log: (String) -> Unit, message: String) {

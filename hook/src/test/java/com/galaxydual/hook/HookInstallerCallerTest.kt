@@ -521,4 +521,57 @@ class HookInstallerCallerTest {
                 it.contains("不需要")
         })
     }
+
+    open class BridgeParent {
+        open fun value(): Any? = null
+    }
+
+    class BridgeChild : BridgeParent() {
+        override fun value(): String = "ok"
+    }
+
+    private fun bridgeValueMethods(): Pair<Method, Method> {
+        val methods = BridgeChild::class.java.declaredMethods.filter { it.name == "value" && it.parameterCount == 0 }
+        assertEquals("expected bridge and implementation methods", 2, methods.size)
+        val impl = methods.first { !it.isBridge }
+        val bridge = methods.first { it.isBridge }
+        return impl to bridge
+    }
+
+    @Test
+    fun covariantBridgeAndImplementationHaveDifferentSignatures() {
+        val (impl, bridge) = bridgeValueMethods()
+        val implSig = sig(impl)
+        val bridgeSig = sig(bridge)
+        assertFalse("bridge and impl signatures must differ", implSig == bridgeSig)
+        assertTrue("impl should include String return type: $implSig", implSig.endsWith("->java.lang.String"))
+        assertTrue("bridge should include Object return type: $bridgeSig", bridgeSig.endsWith("->java.lang.Object"))
+    }
+
+    @Test
+    fun installWithCallersDistinguishesCovariantBridgeAndImplementation() {
+        val callee = method("length")
+        val (impl, bridge) = bridgeValueMethods()
+        val id = "galaxydual:bridge"
+        val host = Host(deopt = { target -> target == impl })
+        assertTrue(host.installWithCallers(callee, listOf(impl, bridge), id))
+
+        assertEquals(listOf("deoptimize", "deoptimize", "deoptimize", "hook"), host.events.map { it.first })
+        assertSame(impl, host.events[0].second)
+        assertSame(bridge, host.events[1].second)
+        assertSame(callee, host.events[2].second)
+        assertSame(callee, host.events[3].second)
+
+        val implSig = sig(impl)
+        val bridgeSig = sig(bridge)
+        assertFalse(implSig == bridgeSig)
+        assertEquals("deoptimized caller [$id] $implSig", host.logs[0])
+        assertEquals(
+            "deoptimize caller [$id] returned false $bridgeSig (hook proceeds, effect unverified)",
+            host.logs[1],
+        )
+        assertEquals(incompleteSummary(id, callee, 1, 2), host.logs.last())
+        assertTrue(host.logs.none { it.contains(implSig) && it.contains("returned false") })
+        assertTrue(host.logs.none { it.contains(bridgeSig) && it.startsWith("deoptimized caller ") })
+    }
 }
