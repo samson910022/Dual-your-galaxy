@@ -208,11 +208,31 @@ class Pr63ReviewRegressionUiTest {
                 lateinit var btnA0: Button
                 lateinit var btnB0: Button
                 scenario.onActivity { activity ->
+                    val container = field(activity, "clonedAppsContainer") as LinearLayout
+                    assertEquals("container should render one row per cloned app", 2, container.childCount)
                     val buttons = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
                     assertEquals(2, buttons.size)
                     val expectedVisualText = activity.getString(R.string.action_remove_row)
                     val expectedActionCd = activity.getString(R.string.action_remove)
                     val min48 = (48 * activity.resources.displayMetrics.density).toInt()
+                    val pkgs = listOf("com.example.a", "com.example.b")
+                    for (i in 0 until container.childCount) {
+                        val row = container.getChildAt(i) as ViewGroup
+                        assertEquals("row should be stacked as [topContent, actionRow]", 2, row.childCount)
+                        val topContent = row.getChildAt(0) as ViewGroup
+                        val actionRow = row.getChildAt(1) as ViewGroup
+                        assertEquals("topContent should contain [iconContainer, textContainer]", 2, topContent.childCount)
+                        val iconContainer = topContent.getChildAt(0) as ViewGroup
+                        val removeBtn = actionRow.getChildAt(0) as Button
+                        assertTrue("remove button must be tagged remove:*", (removeBtn.tag as? String)?.startsWith("remove:") == true)
+                        assertEquals("icon container should belong to topContent", topContent, iconContainer.parent)
+                        assertTrue("icon container should be measured", iconContainer.width > 0 && iconContainer.height > 0)
+                        val pkg = removeBtn.tag.toString().removePrefix("remove:")
+                        assertTrue("row remove button pkg should match expected cloned set", pkg in pkgs)
+                        val title = row.findViewWithTag<TextView>(pkg)
+                        assertNotNull("row title should exist for $pkg", title)
+                        assertTrue("title should be measured for $pkg", title!!.width > 0 && title.height > 0)
+                    }
                     buttons.forEach { b ->
                         val pkg = b.tag.toString().removePrefix("remove:")
                         assertEquals("remove:$pkg", b.tag)
@@ -234,7 +254,7 @@ class Pr63ReviewRegressionUiTest {
                             layout.getEllipsisCount(0),
                         )
                     }
-                    keyCount = (field(activity, "clonedAppsContainer") as LinearLayout).childCount
+                    keyCount = container.childCount
                     genBefore = field(activity, "clonedGen") as Int
                     btnA0 = buttons.first { it.tag == "remove:com.example.a" }
                     btnB0 = buttons.first { it.tag == "remove:com.example.b" }

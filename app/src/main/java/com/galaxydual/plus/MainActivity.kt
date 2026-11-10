@@ -2213,7 +2213,6 @@ class MainActivity : ComponentActivity() {
             }
             iconContainer.addView(appIconView)
             iconContainer.addView(badgeView)
-            row.addView(iconContainer)
 
             // Center details
             val textContainer = LinearLayout(this).apply {
