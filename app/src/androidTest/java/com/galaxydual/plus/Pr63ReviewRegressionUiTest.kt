@@ -195,7 +195,7 @@ class Pr63ReviewRegressionUiTest {
                     var ok = false
                     scenario.onActivity { activity ->
                         val bs = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
-                        ok = bs.size == 2 && bs.all { it.isEnabled }
+                        ok = bs.size == 2 && bs.all { it.isEnabled && it.width > 0 && it.layout != null }
                     }
                     ok
                 }
@@ -207,18 +207,28 @@ class Pr63ReviewRegressionUiTest {
                 scenario.onActivity { activity ->
                     val buttons = findRowRemoveButtons(activity).sortedBy { it.tag?.toString() }
                     assertEquals(2, buttons.size)
-                    val expectedText = activity.getString(R.string.action_remove)
+                    val expectedVisualText = activity.getString(R.string.action_remove_row)
+                    val expectedActionCd = activity.getString(R.string.action_remove)
+                    val min48 = (48 * activity.resources.displayMetrics.density).toInt()
                     buttons.forEach { b ->
                         val pkg = b.tag.toString().removePrefix("remove:")
                         assertEquals("remove:$pkg", b.tag)
-                        assertEquals(expectedText, b.text.toString())
+                        assertEquals("visual short label for $pkg", expectedVisualText, b.text.toString())
                         assertNotNull(b.contentDescription)
                         val cd = b.contentDescription.toString()
-                        assertTrue("CD should contain action for $pkg", cd.contains(expectedText))
+                        assertTrue("CD should contain full action for $pkg", cd.contains(expectedActionCd))
                         assertTrue("CD should contain pkg $pkg", cd.contains(pkg))
-                        assertTrue("touch target >= 48dp", b.minimumHeight >= (48 * activity.resources.displayMetrics.density).toInt())
-                        assertTrue("touch target >= 48dp", b.minimumWidth >= (48 * activity.resources.displayMetrics.density).toInt())
+                        assertTrue("touch target >= 48dp", b.minimumHeight >= min48)
+                        assertTrue("touch target >= 48dp", b.minimumWidth >= min48)
                         assertEquals(1, b.maxLines)
+                        assertTrue("width should be positive for $pkg", b.width > 0)
+                        assertTrue("height should be positive for $pkg", b.height > 0)
+                        b.layout?.let { layout ->
+                            assertTrue(
+                                "row remove label must not ellipsize for $pkg (line0 ellipsis=${layout.getEllipsisCount(0)})",
+                                layout.lineCount <= 0 || layout.getEllipsisCount(0) == 0,
+                            )
+                        }
                     }
                     keyCount = (field(activity, "clonedAppsContainer") as LinearLayout).childCount
                     genBefore = field(activity, "clonedGen") as Int

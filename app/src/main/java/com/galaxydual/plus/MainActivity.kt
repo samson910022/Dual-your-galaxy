@@ -2281,7 +2281,9 @@ class MainActivity : ComponentActivity() {
             // （對話框），行為與改版前相同；不再以開關偽裝成移除操作
             // （取消勾選 ≠ 移除）。disabled while busy or channel unwritable.
             val removeRowBtn = Button(this).apply {
-                text = getString(R.string.action_remove)
+                // PR #63 re-review #3 P2：視覺用短標籤避免窄寬/大字體截斷；
+                // 完整動作語意（「移除分身」等）保留於 contentDescription。
+                text = getString(R.string.action_remove_row)
                 background = getDrawable(R.drawable.bg_pill_button_secondary)
                 setTextColor(getColorStateList(R.color.pill_button_secondary_text))
                 textSize = 12f
@@ -2298,6 +2300,7 @@ class MainActivity : ComponentActivity() {
                 // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
                 tag = "remove:$pkg"
                 // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
+                // CD action 保持完整語意（R.string.action_remove），不隨視覺短標籤縮短。
                 contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
                     // 僅以 live View.isEnabled 門控：early-return 路徑每輪 render 皆同步
@@ -2339,6 +2342,7 @@ class MainActivity : ComponentActivity() {
                         }
                         try {
                             // Phase G: full-width colon via remove_row_cd.
+                            // CD action 保持完整語意（R.string.action_remove）。
                             removeRowBtn.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
                         } catch (_: Exception) {
                             // Best effort.
@@ -3789,6 +3793,7 @@ class MainActivity : ComponentActivity() {
                 }
                 try {
                     // Phase G: full-width colon via remove_row_cd.
+                    // CD action 保持完整語意（R.string.action_remove）。
                     row.findViewWithTag<Button>("remove:$pkg")?.contentDescription =
                         getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 } catch (_: Exception) {
