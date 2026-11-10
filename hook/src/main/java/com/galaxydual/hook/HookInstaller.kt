@@ -32,26 +32,31 @@ internal object HookInstaller {
         try {
             try {
                 if (deoptimize(method)) {
-                    safeLog(log, "deoptimized ${method.declaringClass.name}#${method.name}")
+                    safeLog(log, "deoptimized ${executableSignature(method)}")
                 } else {
                     safeLog(
                         log,
-                        "deoptimize returned false ${method.declaringClass.name}#${method.name} " +
+                        "deoptimize returned false ${executableSignature(method)} " +
                             "(hook proceeds, effect unverified)",
                     )
                 }
             } catch (t: Throwable) {
                 safeLog(
                     log,
-                    "deoptimize failed ${method.declaringClass.name}#${method.name}: " +
-                        "${t.message}; hook proceeds, effect unverified",
+                    "deoptimize failed ${executableSignature(method)}: " +
+                        "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                        "hook proceeds, effect unverified",
                 )
             }
             hook(method, hookId)
-            safeLog(log, "hooked ${method.declaringClass.name}#${method.name}")
+            safeLog(log, "hooked ${executableSignature(method)}")
             return true
         } catch (t: Throwable) {
-            safeLog(log, "hook failed ${method.declaringClass.name}#${method.name}: ${t.message}")
+            safeLog(
+                log,
+                "hook failed ${executableSignature(method)}: " +
+                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}",
+            )
             return false
         }
     }
