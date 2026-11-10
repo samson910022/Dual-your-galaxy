@@ -2710,4 +2710,129 @@ class ProfileIdentityTest {
         }
     }
 
+
+
+    // ---- P1 (#59 re-review): bare Type raw key/value boundary (VT/FF, Unicode line-end in key, malformed key punctuation) ----
+    // (A) Java `\s` includes VT(\u000B)/FF(\f) - must not be treated as [ \t] in
+    // key/indent/separator or eaten before value. (B) Unicode line-end chars in
+    // key (NEL/LS/PS) and malformed key punctuation (!) must be owned by the
+    // bare-Type-attempt path and fail closed to UNKNOWN (never fall through to
+    // TYPE_LINE.find() trusting an embedded userType=). Raw per-line, [ \t]-only
+    // key surface.
+
+    @Test
+    fun s24BareType_p1VtFfInKeyOrValue_neverAcceptedAsClone() {
+        val cases = listOf(
+            "Type\u000B: profile.CLONE",   // VT between Type and :
+            "Type\u000C: profile.CLONE",   // FF between Type and :
+            "Type:\u000Bprofile.CLONE",    // VT before value (must not be eaten)
+            "\u000BType: profile.CLONE",   // VT indent
+            "Type:\u000Cprofile.CLONE",    // FF before value
+            "\u000CType: profile.CLONE",    // FF indent
+            "Type\u000B: android.os.usertype.profile.CLONE",
+        )
+        for (line in cases) {
+            val t = parseSingleBareTypeLine(line).userType
+            assertEquals("VT/FF in bare Type key/value must be UNKNOWN (never CLONE): [$line]", ProfileUserType.UNKNOWN, t)
+            assertTrue("must never classify as CLONE: [$line]", t != ProfileUserType.CLONE)
+            assertTrue("must never classify as OTHER: [$line]", t != ProfileUserType.OTHER)
+        }
+        // Preservation
+        assertEquals(ProfileUserType.CLONE, parseSingleBareType("android.os.usertype.profile.CLONE"))
+        assertEquals(ProfileUserType.CLONE, parseSingleVerboseType("android.os.usertype.profile.CLONE"))
+    }
+
+    @Test
+    fun s24BareType_p1UnicodeLineEndOrPunctInKey_neverFallsThroughToTypeLine() {
+        val cases = listOf(
+            // Unicode line-end chars in key (raw), both directions
+            "Type\u2028: profile.PRIVATE userType=profile.CLONE",
+            "Type\u0085: profile.PRIVATE userType=profile.CLONE",
+            "Type\u2029: profile.PRIVATE userType=profile.CLONE",
+            "Type\u2028: profile.CLONE userType=profile.PRIVATE",
+            "Type\u0085: profile.CLONE userType=profile.PRIVATE",
+            "Type\u2029: profile.CLONE userType=profile.PRIVATE",
+            // malformed key punctuation, both directions
+            "Type!: profile.PRIVATE userType=profile.CLONE",
+            "Type!: profile.CLONE userType=profile.PRIVATE",
+            "Type! : profile.PRIVATE userType=profile.CLONE",
+            "Type?: profile.PRIVATE userType=profile.CLONE",
+            "Type?: profile.CLONE userType=profile.PRIVATE",
+        )
+        for (line in cases) {
+            val t = parseSingleBareTypeLine(line).userType
+            assertEquals("Unicode line-end/punct in bare Type key must be UNKNOWN (never CLONE/OTHER): [$line]", ProfileUserType.UNKNOWN, t)
+            assertTrue("must never classify as CLONE: [$line]", t != ProfileUserType.CLONE)
+            assertTrue("must never classify as OTHER: [$line]", t != ProfileUserType.OTHER)
+        }
+    }
+
+    @Test
+    fun s24BareType_p1MalformedKeyBoundary_contradictoryDumpsys_neverConfirmsOrVerifies() {
+        val verbose = """
+            Users:
+              UserInfo{95:DualApp:400} running:
+                Serial: 15
+                parentId=0
+                User type: android.os.usertype.profile.CLONE
+        """.trimIndent()
+        val malformedLines = listOf(
+            "Type\u000B: profile.CLONE",
+            "Type\u2028: profile.PRIVATE userType=profile.CLONE",
+            "Type!: profile.PRIVATE userType=profile.CLONE",
+            "Type\u0085: profile.PRIVATE userType=profile.CLONE",
+        )
+        for (malformed in malformedLines) {
+            val dumpsys = "Users:\n" +
+                "  UserInfo{95:DualApp:400} serialNo=15:\n" +
+                "    parentId=0\n" +
+                "    $malformed\n"
+            val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+            assertEquals("malformed key [$malformed] => dumpsys parsed UNKNOWN", ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+            val candidates = SamsungProfileAdapter.parseUserListVerbose(verbose) + dumpsysParsed
+            val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+            assertTrue("malformed key [$malformed] must not Confirm, got: $res", res !is DualResolution.Confirmed)
+            assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+            assertTrue(PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, 95) != 95)
+        }
+    }
+
+    @Test
+    fun s24BareType_p1MalformedKeyBoundary_propertyNoClaim_typedUnknownNotAbsent_bothApis() {
+        val malformedLines = listOf(
+            "Type\u000B: profile.CLONE",
+            "Type\u2028: profile.PRIVATE userType=profile.CLONE",
+            "Type!: profile.PRIVATE userType=profile.CLONE",
+            "Type\u000B: profile.PRIVATE userType=profile.CLONE",
+        )
+        for (malformed in malformedLines) {
+            val verbose = """
+                Users:
+                  UserInfo{0:Owner:13} running:
+                    Serial number: 0
+                    User type: android.os.usertype.full.SYSTEM
+                  UserInfo{95:Work:400} running:
+                    Serial: 15
+                    parentId=0
+                    User type: android.os.usertype.profile.PRIVATE
+            """.trimIndent()
+            val dumpsys = "Users:\n" +
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
+                "    Type: android.os.usertype.full.SYSTEM\n" +
+                "  UserInfo{95:Work:400} serialNo=15:\n" +
+                "    parentId=0\n" +
+                "    $malformed\n"
+            val dumpsysParsed = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+            assertEquals("malformed key [$malformed] => dumpsys parsed UNKNOWN", ProfileUserType.UNKNOWN, dumpsysParsed.single { it.userId == 95 }.userType)
+            val gateway = CloneUnknownFakeGateway(verboseOut = verbose, dumpsysOut = dumpsys)
+            val repo = DualRepository(gateway)
+            val idRes = runSuspend { repo.resolveDualUserIdTyped() }
+            assertTrue("malformed key [$malformed] => typed id Unknown (never Absent/Confirmed), got: $idRes", idRes is DualIdResolution.Unknown)
+            assertTrue("malformed key [$malformed] must not be Absent", idRes !is DualIdResolution.Absent)
+            val targetRes = runSuspend { repo.resolveDualTargetTyped() }
+            assertTrue("malformed key [$malformed] => typed target Unknown (never Absent/Confirmed), got: $targetRes", targetRes is DualTargetResolution.Unknown)
+            assertTrue("malformed key [$malformed] must not be Absent", targetRes !is DualTargetResolution.Absent)
+        }
+    }
+
 }
