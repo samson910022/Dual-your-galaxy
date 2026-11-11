@@ -18,6 +18,17 @@ import java.lang.reflect.Modifier
 // wrong element type) returns Skipped and the original whitelist is left
 // untouched -- equivalent to the hook not existing.
 //
+// Static-final bypass evaluation (Stage1, S24 OneUI 9): the ROM holder
+// declares `static final String[]`, so plain Field.set() cannot reassign
+// it (JVM IllegalAccessException, locked in WhitelistPatchReflectTest; ART
+// unverified). No setAccessible force-write is attempted -- final fields
+// stay ObserveOnly by design. The effective policy path is therefore NOT
+// this holder patch but the method-level WhitelistPolicy.apply hooks on
+// the read-query methods (DualAppDBHelper / DAUtility / DualAppManager):
+// when such a hook hits, a non-empty policy flips/adds the listed
+// packages; when no query hook hits (or the policy is empty), behavior
+// stays observe-only even with a non-empty policy seeded.
+//
 // Copy-on-write promise (list case): the union is fully computed on a plain
 // ArrayList copy; the live list sees at most ONE mutating call (addAll). If
 // that call throws after a partial append (hostile AbstractMutableList), we

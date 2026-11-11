@@ -59,15 +59,22 @@ class DualHook : XposedModule() {
             // Phase F4b-P2: same marker contract as system_server above,
             // scope "daagent". Both processes read-merge-write the same file,
             // so each installed scope survives the other's write.
-            // Marker semantics: install evidence only (at least one WhiteListApps
-            // hook installed, currently the <clinit> interceptor on this ROM),
-            // not proof policy took effect. Empty policy => no-op today
-            // (early return, semantically skipped; no Outcome emitted,
-            // returns before reflection); even with non-empty
-            // policy, readable static-final fields => ObserveOnly
+            // Marker semantics: install evidence only (at least one daagent
+            // hook installed: WhiteListApps <clinit> and/or a query-method
+            // hook below), not proof policy took effect. Empty policy =>
+            // no-op today (early return, semantically skipped; no Outcome
+            // emitted, returns before reflection; WhitelistPolicy.apply
+            // returns the original result unchanged); even with non-empty
+            // policy, readable static-final holder fields => ObserveOnly,
+            // only a method-level query hook can carry the policy
             // (see DualHook.patchWhitelistField + WhitelistPatch.patchFields/apply;
             // chain patchWhitelistField->patchFields->apply).
-            val installed = hookWhiteListApps(param.defaultClassLoader)
+            // DEVICE-UNVERIFIED: the daagent query-method hooks below
+            // (hookDaagentQueryMethods) run only inside the LSPosed daagent
+            // process; JVM tests cover the WhitelistPolicy.apply decision
+            // only, never the on-device install/callback.
+            var installed = hookWhiteListApps(param.defaultClassLoader)
+            installed += hookDaagentQueryMethods(param.defaultClassLoader)
             if (installed > 0) {
                 try {
                     HookMarker.markActive(HookMarker.SCOPE_DAAGENT, onLog = ::logi)
@@ -78,16 +85,20 @@ class DualHook : XposedModule() {
         }
     }
 
-    // Hooks DualAppManagerService#getAllWhitelistedPackages and
-    // #isInstalledWhitelistedPackage when present on this Samsung ROM.
-    // Returns the number of installed hooks (0 = nothing hooked, so the
-    // caller skips the active-marker write and stays honestly undetected).
+    // Hooks DualAppManagerService whitelist read-query methods when present on
+    // this Samsung ROM (Stage 1 safest set; install-state composite queries are
+    // excluded until device-verified). Returns the number of installed hooks
+    // (0 = nothing hooked, so the caller skips the active-marker write and
+    // stays honestly undetected).
     //
     // Device evidence (S24 OneUI 9, services.jar dexdump-verified):
-    // com.android.server.DualAppManagerService exists with both methods
-    // (getAllWhitelistedPackages x2 refs, isInstalledWhitelistedPackage x4
-    // + Internal variant); lspd logs confirm candidate 1 wins with
-    // deoptimize+hook success on all boots. Candidates 2-3 stay as fallback.
+    // com.android.server.DualAppManagerService exists with whitelist methods
+    // (e.g. getAllWhitelistedPackages, isInstalledWhitelistedPackage/Internal
+    // variants). Stage 1 hooks only the pure whitelist-list query from
+    // SERVICE_WHITELIST_METHODS (install-state-sensitive methods excluded,
+    // fail-closed); lspd logs on devices that match candidate 1 should still
+    // show deoptimize+hook success for the hooked method(s). Candidates 2-3
+    // stay as fallback.
     private fun hookDualAppManagerService(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, SERVICE_CLASS_CANDIDATES)
         if (target == null) {
@@ -96,31 +107,83 @@ class DualHook : XposedModule() {
         }
         // Hook whitelist query methods only; install/remove paths are never hooked.
         var installed = 0
+        var guardSkipped = 0
+        var installFailures = 0
         for (methodName in SERVICE_WHITELIST_METHODS) {
-            val overloads = target.declaredMethods.filter { it.name == methodName }
-            if (overloads.isEmpty()) {
-                logi("method not found: ${target.name}#$methodName")
-                continue
+            try {
+                val overloads = target.declaredMethods.filter { it.name == methodName }
+                if (overloads.isEmpty()) {
+                    logi("method not found: ${target.name}#$methodName (no overloads)")
+                    continue
+                }
+                overloads.forEach { method ->
+                    val decision = try {
+                        WhitelistHookEligibility.evaluate(method)
+                    } catch (t: Throwable) {
+                        guardSkipped++
+                        try {
+                            logi("skip hook ${target.name}#${method.name}: eligibility evaluation failed (${t.message})")
+                        } catch (_: Throwable) {
+                        }
+                        return@forEach
+                    }
+                    if (decision is WhitelistHookEligibility.Skip) {
+                        guardSkipped++
+                        try {
+                            logi("skip hook ${target.name}#${method.name}: ${decision.reason}")
+                        } catch (_: Throwable) {
+                        }
+                        return@forEach
+                    }
+                    try {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name)) {
+                            installed++
+                        } else {
+                            installFailures++
+                        }
+                    } catch (t: Throwable) {
+                        installFailures++
+                        try {
+                            logi("hook install failed: ${target.name}#${method.name}: ${t.message}")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                try {
+                    logi("hook lookup failed: ${target.name}#$methodName: ${t.message}")
+                } catch (_: Throwable) {
+                }
             }
-            overloads.forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + methodName)) installed++ }
+        }
+        if (installed == 0 && (guardSkipped > 0 || installFailures > 0)) {
+            logi(
+                "system_server whitelist hooks: installed=0, guardSkipped=$guardSkipped, " +
+                    "installFailures=$installFailures on ${target.name} (observe-only)",
+            )
         }
         return installed
     }
 
     // Hooks the daagent-side whitelist holder reflectively. Returns the
-    // number of installed hooks (clinit patch hook + query-method hooks);
+    // number of installed hooks (<clinit> patch hook only from this holder;
+    // query-method hooks are installed by hookDaagentQueryMethods);
     // 0 keeps the caller from writing the active marker.
     //
     // Device evidence (S24 OneUI 9, DAAgent v3.7.00.0, dexdump-verified):
     // provider.WhiteListApps is a PUBLIC ABSTRACT constants-only holder
     // (3 static-final String[] + <clinit> + Base64 helper, zero query
-    // methods), so the <clinit> patch is the effective daagent hook and the
-    // fuzzy *hitelist* sweep correctly installs nothing here. Read queries
-    // live in DualAppDBHelper.getAllInstalledWhitelistedPackages,
-    // DAUtility.getWhiteListPkgs/*
-    // (*InSystemServer), and DualAppManager.*WhitelistPackage* -- future
-    // non-empty-policy work should target those with method-level evidence,
-    // keeping this holder as the patch point.
+    // methods), so the <clinit> patch is install evidence only
+    // (static-final => ObserveOnly, never force-written; see
+    // WhitelistPatch.apply isFinal branch). The fuzzy *hitelist* sweep is
+    // Stage 1 diagnose-only (no hook installs) due to mutation/read-only
+    // ambiguity on ROM variants (S24 has zero query methods; no functional
+    // loss). The effective policy path is the method-level query hooks in
+    // hookDaagentQueryMethods below: when one of those query methods is hit,
+    // WhitelistPolicy.apply carries a non-empty policy (false->true for a
+    // listed package, collection/array union); when none is hit -- or the
+    // policy is empty -- behavior stays observe-only. This holder stays as
+    // the <clinit> patch point only.
     private fun hookWhiteListApps(classLoader: ClassLoader): Int {
         val target = findFirstAvailableClass(classLoader, WHITE_LIST_APPS_CLASS_CANDIDATES)
         if (target == null) {
@@ -176,15 +239,168 @@ class DualHook : XposedModule() {
         } catch (t: Throwable) {
             logi("hook <clinit> failed: ${t.message}")
         }
-        // Hook any *hitelist* query methods (e.g. isWhitelisted) if they exist.
-        // Deliberately fuzzy: without on-device evidence the exact Samsung
-        // method names are unknown, so narrowing the match could miss the real
-        // query. Install logging is best-effort, and signatures the shared policy
-        // does not understand stay observe-only (see WhitelistPolicy.apply).
-        target.declaredMethods
-            .filter { it.name.contains("hitelist", ignoreCase = true) }
-            .forEach { if (hookWithDeoptimize(it, HOOK_ID_PREFIX + it.name)) installed++ }
+        // Stage 1 diagnose-only *hitelist* sweep (no hook installs): mutation/
+        // read-only ambiguity on ROM variants makes fuzzy install unsafe (e.g.
+        // removeWhitelistedPackage/addWhitelist*/setWhitelist*/clearWhitelist).
+        // S24 WhiteListApps has zero query methods, so no functional loss.
+        // Named read-query hooks use explicit allowlists/eligibility elsewhere
+        // (hookDaagentQueryMethods). <clinit> hook/count unchanged. Best-effort.
+        try {
+            target.declaredMethods
+                .filter { it.name.contains("hitelist", ignoreCase = true) }
+                .forEach { method ->
+                    val decision = try {
+                        WhitelistHookEligibility.evaluate(method)
+                    } catch (t: Throwable) {
+                        try {
+                            logi(
+                                "diagnose-only sweep ${target.name}#${method.name}: " +
+                                    "eligibility evaluation failed (${t.message}); " +
+                                    "no hook installed (Stage 1 fail-closed)",
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        return@forEach
+                    }
+                    val mutationShaped = try {
+                        WhitelistSignatureGuard.isPotentialMutationMethod(method.name)
+                    } catch (_: Throwable) {
+                        true // fail-closed classification for diagnosis safety
+                    }
+                    val safety = if (mutationShaped) "mutation-shaped/unsafe-to-hook" else "read-like-name"
+                    try {
+                        val reason = when (decision) {
+                            is WhitelistHookEligibility.Eligible -> decision.reason
+                            is WhitelistHookEligibility.Skip -> decision.reason
+                        }
+                        logi(
+                            "diagnose-only sweep ${target.name}#${method.name}: " +
+                                "safety=$safety, eligibility=${reason}; " +
+                                "no hook installed (Stage 1 fail-closed, diagnose-only)",
+                        )
+                    } catch (_: Throwable) {
+                    }
+                }
+        } catch (t: Throwable) {
+            try {
+                logi("diagnose-only *hitelist* sweep failed on ${target.name}: ${t.message}")
+            } catch (_: Throwable) {
+            }
+        }
         return installed
+    }
+
+    // Hooks the daagent-side read-query methods reflectively. Returns the
+    // number of installed hooks (0 = nothing hooked).
+    //
+    // Stage1 method-level candidates (DEVICE-UNVERIFIED): S24 dexdump names
+    // the holder (WhiteListApps, static-final String[] => ObserveOnly) but
+    // does not pin the query-holder package layout, so every class in
+    // DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES that loads is tried
+    // and every DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES entry present
+    // on it is eligibility-gated (WhitelistHookEligibility) and hooked with
+    // the shared extend-only WhitelistPolicy.apply interceptor
+    // (interceptWhitelistCall). Read queries only -- install/remove paths
+    // are never hooked. Installed-composite queries and unknown/ambiguous
+    // Boolean signatures are skipped (fail-closed). With a non-empty policy
+    // a hit flips/adds the listed packages; with an empty policy (today) the
+    // interceptor returns the original result unchanged (observe-only).
+    // JVM tests cover only the WhitelistPolicy.apply decision; install and
+    // callback behavior require an LSPosed daagent process and are NOT
+    // covered by JVM tests.
+    private fun hookDaagentQueryMethods(classLoader: ClassLoader): Int {
+        var hooksInstalled = 0
+        var classesLoaded = 0
+        var classLookupMisses = 0
+        var methodLookupFailures = 0
+        var overloadsMatched = 0
+        var guardSkipped = 0
+        var installFailures = 0
+        val totalCandidates = DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES.size
+        for (className in DaagentQueryHooks.DAAGENT_QUERY_CLASS_CANDIDATES) {
+            val target = try {
+                classLoader.loadClass(className)
+            } catch (_: Throwable) {
+                classLookupMisses++
+                continue
+            }
+            classesLoaded++
+            var classInstalled = 0
+            for (methodName in DaagentQueryHooks.DAAGENT_QUERY_METHOD_NAMES) {
+                val overloads = try {
+                    target.declaredMethods.filter { it.name == methodName }
+                } catch (_: Throwable) {
+                    methodLookupFailures++
+                    continue
+                }
+                if (overloads.isEmpty()) {
+                    continue
+                }
+                overloadsMatched += overloads.size
+                overloads.forEach { method ->
+                    val decision = try {
+                        WhitelistHookEligibility.evaluate(method)
+                    } catch (t: Throwable) {
+                        // Fail-closed at call site (privileged hook path).
+                        guardSkipped++
+                        try {
+                            logi("skip hook ${target.name}#${method.name}: eligibility evaluation failed (${t.message})")
+                        } catch (_: Throwable) {
+                        }
+                        return@forEach
+                    }
+                    if (decision is WhitelistHookEligibility.Skip) {
+                        guardSkipped++
+                        try {
+                            logi("skip hook ${target.name}#${method.name}: ${decision.reason}")
+                        } catch (_: Throwable) {
+                        }
+                        return@forEach
+                    }
+                    try {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name)) {
+                            classInstalled++
+                        } else {
+                            installFailures++
+                        }
+                    } catch (t: Throwable) {
+                        installFailures++
+                        try {
+                            logi("hook install failed: ${target.name}#${method.name}: ${t.message}")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+            if (classInstalled > 0) {
+                logi("using ${target.name} for daagent query hooks (+$classInstalled)")
+                hooksInstalled += classInstalled
+            }
+        }
+        if (hooksInstalled == 0) {
+            val cause = when {
+                classesLoaded == 0 -> "no candidate class loaded"
+                overloadsMatched == 0 && methodLookupFailures == 0 -> "candidate classes loaded but no queried method present"
+                overloadsMatched == 0 && methodLookupFailures > 0 -> "method lookups failed on loaded classes"
+                guardSkipped > 0 && installFailures == 0 -> "all matched overloads skipped by eligibility guard"
+                installFailures > 0 -> "hook install failed for eligible overloads"
+                else -> "no hooks installed"
+            }
+            logi(
+                "daagent query hooks: installed=0 ($cause, observe-only), " +
+                    "classesLoaded=$classesLoaded/$totalCandidates, classLookupMisses=$classLookupMisses, " +
+                    "overloadsMatched=$overloadsMatched, guardSkipped=$guardSkipped, " +
+                    "methodLookupFailures=$methodLookupFailures, installFailures=$installFailures",
+            )
+        } else {
+            logi(
+                "daagent query hooks: installed=$hooksInstalled, " +
+                    "classesLoaded=$classesLoaded/$totalCandidates, classLookupMisses=$classLookupMisses, " +
+                    "overloadsMatched=$overloadsMatched, guardSkipped=$guardSkipped, " +
+                    "methodLookupFailures=$methodLookupFailures, installFailures=$installFailures",
+            )
+        }
+        return hooksInstalled
     }
 
     // Installs one hook with best-effort inlining protection and a request for
@@ -208,27 +424,104 @@ class DualHook : XposedModule() {
                 .intercept { chain -> interceptWhitelistCall(chain) }
         }, ::logi)
 
-    // Thin interceptor: runs the original, then applies the shared
-    // extend-only policy (WhitelistPolicy, unit-tested). Unknown shapes stay
-    // unchanged; non-Boolean results return early without unknown-shape logging
-    // when the policy is empty. Boolean true returns immediately; unexpected
-    // arguments for Boolean false are logged best-effort even with empty policy.
-    // H2: the effective set is PolicySource.effective(seed + remote). No remote
-    // source is wired, so behavior today is identical to the static seed
-    // (observe-only when empty).
+    // Thin interceptor: runs the original, then applies the shared extend-only
+    // policy (WhitelistPolicy, unit-tested). Unknown shapes stay unchanged.
+    //
+    // Phase 4 fast paths / fail-closed guards:
+    // - Installed-whitelist composite queries (WhitelistSignatureGuard) are
+    //   excluded at runtime regardless of policy (Stage 1 fail-closed backstop;
+    //   install paths also gate these) and return the original.
+    // - Empty effective policy (Stage 1 default): returns original with lazy
+    //   desc/args/guard/apply overhead avoided for non-composite calls
+    //   (chain.proceed already ran).
+    // - Non-empty policy: resolves method desc/args lazily, uses strict
+    //   allowlisted package-arg index (WhitelistSignatureGuard) for Boolean
+    //   rewrites so unverified overloads remain observe-only.
+    //
+    // H2: effective set = PolicySource.effective(seed + remote); no remote
+    // source wired, so behavior today is identical to the static seed.
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
-        val desc = try {
-            WhitelistPolicy.describe(chain.executable)
-        } catch (_: Throwable) {
-            "unknown-method"
+        return try {
+            val extra = effectivePolicy()
+            val executable = try {
+                chain.executable
+            } catch (_: Throwable) {
+                null
+            }
+            val methodName = try {
+                executable?.name
+            } catch (_: Throwable) {
+                null
+            }
+            // Defense-in-depth: installed-and-whitelist composite queries are
+            // excluded in Stage 1 (install-state/userId ambiguity). Skip hook
+            // install paths gate these, but keep a runtime fail-closed backstop
+            // regardless of policy.
+            if (methodName != null &&
+                WhitelistSignatureGuard.isInstalledWhitelistCompositeQuery(methodName)
+            ) {
+                val desc = try {
+                    executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+                } catch (_: Throwable) {
+                    "unknown-method"
+                }
+                try {
+                    logi(
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: " +
+                            "installed-whitelist composite query excluded " +
+                            "(Stage 1 fail-closed); returning original",
+                    )
+                } catch (_: Throwable) {
+                    // Logging must never break the hook path.
+                }
+                return result
+            }
+            if (extra.isEmpty()) {
+                return result
+            }
+            val desc = try {
+                executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+            } catch (_: Throwable) {
+                "unknown-method"
+            }
+            val args: List<Any?> = try {
+                chain.args
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            val packageArgIndex = executable?.let {
+                WhitelistSignatureGuard.resolveBooleanPackageArgIndex(it)
+            }
+            val declaredReturnType = (executable as? Method)?.returnType
+            val genericReturnType = (executable as? Method)?.genericReturnType
+            WhitelistPolicy.apply(
+                result = result,
+                args = args,
+                extra = extra,
+                methodDesc = desc,
+                onLog = ::logi,
+                packageArgIndex = packageArgIndex,
+                declaredReturnType = declaredReturnType,
+                strictSignature = true,
+                genericReturnType = genericReturnType,
+            )
+        } catch (t: Throwable) {
+            val desc = try {
+                chain.executable?.let { WhitelistPolicy.describe(it) } ?: "unknown-method"
+            } catch (_: Throwable) {
+                "unknown-method"
+            }
+            try {
+                logi(
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: policy apply failed " +
+                        "(${t.javaClass.name}); returning original",
+                )
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            result
         }
-        val args: List<Any?> = try {
-            chain.args
-        } catch (_: Throwable) {
-            emptyList()
-        }
-        return WhitelistPolicy.apply(result, args, effectivePolicy(), desc, ::logi)
     }
 
     // Effective policy for this process: static seed (+ a RemotePreferences
@@ -335,9 +628,14 @@ class DualHook : XposedModule() {
         )
 
         // Whitelist query methods only; install/remove paths are never hooked.
+        //
+        // Stage 1 (safest): isInstalledWhitelistedPackage is install-state-
+        // sensitive (installed AND whitelisted composite, userId ambiguity) and
+        // is EXCLUDED from rewrite hooks until device-verified (fail-closed).
+        // getAllWhitelistedPackages remains (pure whitelist list) and is guarded
+        // by signature/return guards at runtime (Phase 3 wiring).
         private val SERVICE_WHITELIST_METHODS = listOf(
             "getAllWhitelistedPackages",
-            "isInstalledWhitelistedPackage",
         )
 
         private val WHITE_LIST_APPS_CLASS_CANDIDATES = listOf(
@@ -349,6 +647,10 @@ class DualHook : XposedModule() {
             "DUAL_APP_WHITELIST_PACKAGES",
             "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA",
         )
+
+        // Stage1 daagent read-query candidates moved to
+        // DaagentQueryHooks (framework-free) so JVM contract tests can lock
+        // them without loading DualHook/Xposed. See DaagentQueryHooks.
 
         private const val HOOK_ID_PREFIX = "galaxydual:"
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"
