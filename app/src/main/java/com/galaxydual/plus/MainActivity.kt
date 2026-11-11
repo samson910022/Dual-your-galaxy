@@ -3484,7 +3484,10 @@ class MainActivity : ComponentActivity() {
                 s.pendingPolicyWrite,
                 s.loading,
                 s.policyWritePhase != PolicyWritePhase.IDLE,
-                s.policyWritePhase == PolicyWritePhase.SAVING,
+                // Stage A：核對中視同寫入中（禁用確認/取消，顯示忙碌；dialog 以
+                // pending==null 關閉，confirm 核對中 pending 保留故 dialog 續留）。
+                s.policyWritePhase == PolicyWritePhase.SAVING ||
+                    s.policyWritePhase == PolicyWritePhase.RECONCILING,
             )
         } catch (e: Exception) {
             Log.w(TAG, "syncPolicyWriteDialog failed", e)
@@ -4214,21 +4217,24 @@ class MainActivity : ComponentActivity() {
                 policyDialogCanConfirm(policySaving, checked)
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING 才禁用
-            //（QUEUED 可確認，避免 request 即 QUEUED 導致恆禁用死鎖）；世代守衛在 VM。
+            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING/
+            // RECONCILING 才禁用（QUEUED 可確認，避免 request 即 QUEUED 導致恆
+            // 禁用死鎖；核對中請勿重試）；世代守衛在 VM。
             val curPolicySaving = try {
-                vm.state.value.policyWritePhase == PolicyWritePhase.SAVING
+                val ph = vm.state.value.policyWritePhase
+                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
             } catch (_: Exception) {
                 policySaving
             }
             if (policyDialogCanConfirm(curPolicySaving, policyAcknowledged)) vm.confirmPolicyWrite(pending)
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
-        // 點按時即時重讀 phase，SAVING 即 toast「寫入中，無法取消」且不調 VM；
-        // queued 才調 vm.cancelPolicyWrite（維持 P1 #1 語義）。
+        // 點按時即時重讀 phase，SAVING/RECONCILING 即 toast「寫入中，無法取消」
+        // 且不調 VM；queued 才調 vm.cancelPolicyWrite（維持 P1 #1 語義）。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
             val savingNow = try {
-                vm.state.value.policyWritePhase == PolicyWritePhase.SAVING
+                val ph = vm.state.value.policyWritePhase
+                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
             } catch (_: Exception) {
                 policySaving
             }
@@ -6318,6 +6324,8 @@ private class DualViewModelFactory(
                         PolicyTextKind.REFRESHED -> res.getString(R.string.policy_refreshed)
                         PolicyTextKind.REFRESH_FAILED -> res.getString(R.string.policy_refresh_failed)
                         PolicyTextKind.BLIND_CLEAR_FIRST -> res.getString(R.string.policy_blind_clear_first)
+                        PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
+                        PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
                     }
                 },
             ) as T
