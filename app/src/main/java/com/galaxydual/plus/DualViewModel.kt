@@ -870,6 +870,15 @@ class DualViewModel(
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
     private val policyTxId = AtomicLong(0L)
     private val activePolicyTx = AtomicReference<PolicyTx?>(null)
+    // Stage I2 (P2#3#4)：跨 VM 陳舊修訂同步。
+    // - lastRevisionSeenTxId/Key：settled 常駐收集的去重水位（全域單調 txId＋key
+    //   雙元，replay=1 晚訂閱仍只應用一次；自發射即記水位，免自回放重 bump）。
+    // - policyRevisionStale：本地有 activeTx 時收到異 Tx 終態即丟棄並記 stale，
+    //   後續 request/confirm 強制重讀（UNKNOWN_REFRESH 拒絕，直至 refresh Known
+    //   或自身 Tx 成功結清洗白）。
+    private val lastRevisionSeenTxId = AtomicLong(-1L)
+    private val lastRevisionSeenKey = AtomicReference<String?>(null)
+    private val policyRevisionStale = AtomicBoolean(false)
     // Stage F2 (P2#4)：reconciler 專用獨立讀池（per-VM 單執行緒，執行緒名
     // policyReconcile）。Binder 不可中斷：逾時讀的執行緒滯留此池（不佔共用 IO
     // 池），呼叫側計預算（withTimeout 照常到期）。per-VM 而非全域：無限阻塞測
@@ -924,6 +933,9 @@ class DualViewModel(
                     policyFreshnessGen.incrementAndGet()
                     policyOwnershipGen.incrementAndGet()
                 }
+                // Stage I2：自發射即記水位，免常駐收集自回放重 bump。
+                lastRevisionSeenTxId.set(tx.txId)
+                lastRevisionSeenKey.set(tx.key)
                 coord.tryEmitSettled(
                     PolicySettled(tx.txId, tx.key, s.policyDraft, s.policyDraftKnown, s.msgKind, s.msg, tx.isClear),
                 )
@@ -966,6 +978,9 @@ class DualViewModel(
         msg: String,
     ) {
         try {
+            // Stage I2：自發射即記水位，免常駐收集自回放重 bump。
+            lastRevisionSeenTxId.set(tx.txId)
+            lastRevisionSeenKey.set(tx.key)
             policyTxCoordinator?.tryEmitSettled(
                 PolicySettled(tx.txId, tx.key, draft, known, msgKind, msg, tx.isClear),
             )
@@ -1012,6 +1027,9 @@ class DualViewModel(
                     policyFreshnessGen.incrementAndGet()
                     policyOwnershipGen.incrementAndGet()
                 }
+                // Stage I2：跟隨即記水位（不洗 stale：異 Tx 陳舊仍須顯式重讀）。
+                lastRevisionSeenTxId.set(settled.txId)
+                lastRevisionSeenKey.set(settled.key)
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                     else {
@@ -1115,6 +1133,9 @@ class DualViewModel(
                 policyFreshnessGen.incrementAndGet()
                 policyOwnershipGen.incrementAndGet()
             }
+            // Stage I2：跟隨即記水位，免常駐收集重入（不洗 stale：仍須顯式重讀）。
+            lastRevisionSeenTxId.set(settled.txId)
+            lastRevisionSeenKey.set(settled.key)
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                 else {
@@ -1139,6 +1160,81 @@ class DualViewModel(
                 policyReconciling.remove(tx.key)
             } catch (_: Exception) {
             }
+        }
+    }
+
+    // Stage I2 (P2#3#4)：coordinator 級陳舊修訂同步——每 VM init 常駐收集 settled，
+    // 不限認領單一 txId（以 lastSeenTxId 去重，replay=1 晚訂閱仍只應用一次）。
+    // - 收到 txId+key != 本地 activeTx 的新終態：
+    //   - 本地無 activeTx → bump 版本三元＋更新 draft/Known/msg（phase 保持 IDLE，
+    //     pending/loading 不動；僅 IDLE/QUEUED 才應用，SAVING/RECONCILING 窗口丟棄）。
+    //     外來 Unknown（他者失敗）無新修訂即忽略（不 bump、不 stale）。
+    //   - 本地有 activeTx（異 Tx）→ 丟棄＋記 stale，後續 request/confirm 強制重讀。
+    // - 自 Tx（同 id+key）即跳過（專屬跟隨路徑處理，此處僅記水位）。
+    private fun observeRevisionUpdates() {
+        val coord = policyTxCoordinator ?: return
+        viewModelScope.launch {
+            try {
+                coord.settled.collect { settled -> handleForeignSettled(settled) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Best effort: 收集失敗不影響本地終態。
+            }
+        }
+    }
+
+    private fun handleForeignSettled(settled: PolicySettled) {
+        try {
+            val lastId = lastRevisionSeenTxId.get()
+            val lastK = lastRevisionSeenKey.get()
+            if (settled.txId == lastId && settled.key == lastK) return
+            // 全域單調：舊修訂（txId 更小）一律丟棄，免 stale 覆寫新事實。
+            if (settled.txId < lastId) return
+            val localTx = try { activePolicyTx.get() } catch (_: Exception) { null }
+            // 自 Tx 終態經專屬跟隨處理，此處僅記水位不應用。
+            if (localTx != null && settled.txId == localTx.txId && settled.key == localTx.key) {
+                lastRevisionSeenTxId.set(settled.txId)
+                lastRevisionSeenKey.set(settled.key)
+                return
+            }
+            // 異 Tx 而本地有 activeTx → 丟棄＋記 stale（後續 request/confirm 強制重讀）。
+            if (localTx != null) {
+                lastRevisionSeenTxId.set(settled.txId)
+                lastRevisionSeenKey.set(settled.key)
+                // 僅 Known 成功修訂才記 stale（他者失敗無新修訂，不污染）。
+                if (settled.known) policyRevisionStale.set(true)
+                return
+            }
+            // 本地無 activeTx：外來 Unknown 無新修訂即忽略。
+            if (!settled.known) {
+                lastRevisionSeenTxId.set(settled.txId)
+                lastRevisionSeenKey.set(settled.key)
+                return
+            }
+            lastRevisionSeenTxId.set(settled.txId)
+            lastRevisionSeenKey.set(settled.key)
+            policyDraftVersion.incrementAndGet()
+            policyFreshnessGen.incrementAndGet()
+            policyOwnershipGen.incrementAndGet()
+            policyRevisionStale.set(false)
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
+                    cur.policyWritePhase != PolicyWritePhase.QUEUED
+                ) {
+                    cur
+                } else {
+                    disarmBlindClear()
+                    cur.copy(
+                        policyDraft = settled.draft,
+                        policyDraftKnown = true,
+                        msg = settled.msg,
+                        msgKind = settled.msgKind,
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
         }
     }
 
@@ -1757,6 +1853,10 @@ class DualViewModel(
                 observeSettledFor(tx)
             }
         }
+        // Stage I2：每 VM init 常駐收集 settled（不限認領單一 txId；replay=1 晚到
+        // 仍可見）。異 Tx 新終態：無 activeTx 即 bump＋更新（phase 保持 IDLE），
+        // 有 activeTx 即丟棄＋記 stale（後續 request/confirm 強制重讀）。
+        observeRevisionUpdates()
         // Probe elevation channels first; later ops queue behind this, so the
         // first refresh always sees the routed privilege, never a default.
         viewModelScope.launch {
@@ -5445,6 +5545,10 @@ class DualViewModel(
                     } else if (result is LoadResult.Known) {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         disarmBlindClear()
+                        // Stage I2：顯式重讀 Known 即洗白陳舊修訂 stale（後續
+                        // request/confirm 恢復；late-join 結清不經此，保留 stale
+                        // 直至顯式重讀）。
+                        policyRevisionStale.set(false)
                         if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                             cur.copy(
                                 policyDraft = result.packages,
@@ -5517,6 +5621,17 @@ class DualViewModel(
             _state.update {
                 it.copy(
                     msg = policyText(PolicyText(PolicyTextKind.OWNER_WRITE)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        // Stage I2：陳舊修訂 stale 即強制重讀（fail closed：異 Tx 終態已丟棄，
+        // 本地 draft 看似 Known 實則落後，不得整包覆寫未見新修訂）。
+        if (policyRevisionStale.get()) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
@@ -5664,6 +5779,23 @@ class DualViewModel(
             }
             return
         }
+        // Stage I2：陳舊修訂 stale 即強制重讀（同 unknown 門控：清 pending、不碰
+        // store、重申 Unknown＋fence，晚到舊 Known 不得蓋回）。
+        if (policyRevisionStale.get()) {
+            markPolicyUnknownLocked()
+            _state.update { cur ->
+                if (cur.pendingPolicyWrite != expected) return@update cur
+                cur.copy(
+                    pendingPolicyWrite = null,
+                    policyWritePhase = PolicyWritePhase.IDLE,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    policyDraftKnown = false,
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
         viewModelScope.launch {
             val pendingAtCall = expected
             if (_state.value.pendingPolicyWrite != pendingAtCall) return@launch
@@ -5768,6 +5900,22 @@ class DualViewModel(
                     // 明確刪除≠覆寫未見內容。
                     // Phase 3：同 TTL，本 op 未持有 loading，不碰 loading。
                     if (!_state.value.policyDraftKnown) {
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return@withLock
+                    }
+                    // Stage I2：排隊期間異 Tx 終態已丟棄並記 stale → 取鎖後強制重讀
+                    // （同 unknown 門控，不啟 IO；stale 旗留至 refresh Known 洗白）。
+                    if (policyRevisionStale.get()) {
                         markPolicyUnknownLocked()
                         _state.update {
                             it.copy(
@@ -6391,18 +6539,22 @@ class DualViewModel(
                     // 保留 RECONCILING（reconciler 擁有終態發布權）：僅確保
                     // loading=false 並提示 BUSY，不得回 IDLE 覆寫 RECONCILING；
                     // 集合先行窗口（phase 尚未翻）才回 IDLE。
+                    // Stage I2 (P2#3#4)：clear pre-IO fail-fast 條件回 IDLE——僅仍
+                    // 擁有 QUEUED（本 clear 排隊態）才回 IDLE＋epoch+1；
+                    // RECONCILING/SAVING 不動（他 op 在途，誤回即丟 fence）。
                     if (isPolicyReconcilingLocked()) {
                         _state.update { cur ->
-                            if (cur.policyWritePhase == PolicyWritePhase.RECONCILING) {
+                            if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                 cur.copy(
                                     loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                     msg = policyText(PolicyText(PolicyTextKind.BUSY)),
                                     msgKind = MsgKind.INFO,
                                 )
                             } else {
                                 cur.copy(
                                     loading = false,
-                                    policyWritePhase = PolicyWritePhase.IDLE,
                                     msg = policyText(PolicyText(PolicyTextKind.BUSY)),
                                     msgKind = MsgKind.INFO,
                                 )
@@ -6441,12 +6593,25 @@ class DualViewModel(
                     val h1ClearCoord = policyTxCoordinator
                     if (h1ClearCoord != null) {
                         if (!h1ClearCoord.writeMutex.tryLock()) {
+                            // Stage I2：tryLock 失敗即條件回 IDLE（仍 QUEUED 才回＋
+                            // epoch；RECONCILING/SAVING 不動；confirm 保持 QUEUED
+                            // 可重試，clear 本無 pending 故回 IDLE）。
                             _state.update { cur ->
-                                cur.copy(
-                                    loading = false,
-                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
-                                    msgKind = MsgKind.INFO,
-                                )
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
                             }
                             return@withLock
                         }
@@ -6473,12 +6638,23 @@ class DualViewModel(
                             } catch (_: Exception) {
                             }
                             writeLocked = false
+                            // Stage I2：CAS 失敗同 tryLock（條件回 IDLE＋epoch）。
                             _state.update { cur ->
-                                cur.copy(
-                                    loading = false,
-                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
-                                    msgKind = MsgKind.INFO,
-                                )
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
                             }
                             return@withLock
                         }
@@ -6493,12 +6669,23 @@ class DualViewModel(
                             } catch (_: Exception) {
                             }
                             writeLocked = false
+                            // Stage I2：本地 CAS 失敗同上（條件回 IDLE＋epoch）。
                             _state.update { cur ->
-                                cur.copy(
-                                    loading = false,
-                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
-                                    msgKind = MsgKind.INFO,
-                                )
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
                             }
                             return@withLock
                         }
