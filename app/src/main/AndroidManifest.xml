@@ -60,8 +60,8 @@
             tools:node="remove" />
 
         <!-- 守衛版 provider:同一 authority,但只信任 LSPosed daemon
-             (uid < FIRST_APPLICATION_UID,含 shell 2000——其 callingUid 由
-              kernel 設定、一般 app 無法偽造)或本 app,見 GuardXposedProvider。 -->
+             (僅 root(0)/system(1000)/self，shell 拒絕——其 callingUid 由
+              kernel 設定、一般 app 無法偽造),見 GuardXposedProvider。 -->
         <provider
             android:name=".GuardXposedProvider"
             android:authorities="${applicationId}.XposedService"
