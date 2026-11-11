@@ -136,7 +136,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
 
     fun invalidate() = synchronized(lock) {
         valid = false
-        // 政策變更為明確訊號，允許立即重試 (重置冷卻)。
+        // Policy change is an explicit signal, allow immediate retry (reset cooldown).
         lastFailureMs = null
         // Mark invalidated so the cooldown path cannot resurrect a stale
         // pre-invalidation cached value (fail-closed to seed).

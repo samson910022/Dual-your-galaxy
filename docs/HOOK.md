@@ -31,7 +31,7 @@
   `IRemotePreferenceCallback`，daemon 在遠端偏好變更時推送 diff 並通知
   hook 行程的 `OnSharedPreferenceChangeListener`，`DualHook` 據此 invalidate
   快取，故 app 寫入後 hook 近乎即時生效。`EffectivePolicyCache` 另有 60 秒
-  TTL 重讀同一 group 的 cached 實例，屬 redundancy（若框架未推送，重讀同一
+  TTL 重讀同一 group 的 cached 實例（此 60 秒為 hook 側快取 TTL，與 App 側寫入確認 dialog 的 5 分鐘 TTL 不同），屬 redundancy（若框架未推送，重讀同一
   實例也不會強制重新抓取），非主要新鮮度機制。端到端仍需 on-device 驗證
   （DEVICE-UNVERIFIED）。
 - 樂觀快取限制：`RemotePreferences.commit()` 先更新行程內快取再走 binder，

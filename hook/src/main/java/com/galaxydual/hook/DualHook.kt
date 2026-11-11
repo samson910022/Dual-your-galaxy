@@ -803,7 +803,7 @@ class DualHook : XposedModule() {
 
         // Recommended LSPosed scopes, mirrored in META-INF/xposed/scope.list.
         // H4: self-scope packages (H3) were evaluated and retired; the F4b-P2
-        // file marker is the single hook-active signal (see HOOK.md §1.4).
+        // file marker is the single hook-active signal (see HOOK.md §1.5).
         // NOTE: com.android.settings stays out (D2): no settings-side hook
         // exists, so scoping it would only widen the injection surface.
         // SYSTEM_SCOPE never matches onPackageLoaded; it is kept here for

@@ -47,7 +47,7 @@ val privilege: Privilege = when {
 > [S24 調查](UX_REVIEW_S24.md) §5)：已觀察 —— (1)類別選取：
 > daagent `using provider.WhiteListApps` 連續命中×7（僅類別選取，
 > 不等於 `<clinit>` 執行／回調／放寬）；(2)hook 註冊：system
-> `DualAppManagerService` 雙方法 deoptimize＋hooked（僅註冊，
+> `DualAppManagerService` 單方法（getAllWhitelistedPackages）deoptimize＋hooked（僅註冊，
 > 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
 >（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
 > 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
@@ -157,6 +157,7 @@ val privilege: Privilege = when {
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉既有 FAILED＋Unknown fence，不新增語義）；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
+- 完整語義（pending 世代、TTL、fence、二步清除）見 `docs/USAGE.md` 政策寫入流程。
 
 ## Non-Goals
 

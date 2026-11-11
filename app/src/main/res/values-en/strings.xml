@@ -174,7 +174,7 @@
     <string name="write_block_explicit">Selected mode %1$s (%2$s channel) failed probing; writes are disabled (an explicit mode never crosses channels). Switch to Auto, or tap Reconnect and refresh to retry.</string>
     <string name="write_block_pm">Probing passed but PM is not readable (pm list users failed); writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
     <string name="write_block_readonly">Read-only: no privileged channel available; writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
-    <!-- P2-3 Auto degrade typed reasons (probe产物, resolved via resources; no Verbatim on the main path). No args. -->
+    <!-- P2-3 Auto degrade typed reasons (probe output, resolved via resources; no Verbatim on the main path). No args. -->
     <string name="auto_degrade_su_to_shizuku">Auto degraded based on probing: su was detected but its probe was denied (id -u failed), switched to Shizuku; to restore ROOT, check su authorization then tap Reconnect and refresh.</string>
     <string name="auto_degrade_both_failed">Auto probing found both channels failed (su present but denied and Shizuku not passed), currently read-only; check authorization then tap Reconnect and refresh.</string>
     <string name="auto_degrade_no_channel">Auto probing found no usable channel (no su and Shizuku not passed), currently read-only; authorize Shizuku or gain ROOT then tap Reconnect and refresh.</string>
@@ -196,12 +196,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">Dual App Whitelist Injector</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku)</string>
+    <string name="hero_subtitle_apps">Requires an active LSPosed Hook (pending device verification) to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku)</string>
     <string name="hero_subtitle_engine">Isolated Environment · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
-    <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
+    <string name="hook_mode_subtitle">Requires an active LSPosed Hook (pending device verification) to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
     <string name="hook_mode_subtitle_ops">Clone and remove work on the verified profile through this privileged channel (Auto/Root/Shizuku) with no Hook required; LSPosed only adds deeper Samsung whitelist and native UI integration.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
@@ -219,7 +219,7 @@
     <string name="section_pending_apps_hint">Check apps to select; Batch create writes the clones (checking alone writes nothing)</string>
     <string name="section_advanced_manual">Advanced Manual Package Entry</string>
     <string name="status_hook_daemon_running">Native Dual Messenger Core Hook Running</string>
-    <string name="status_hook_daemon_desc">Successfully intercepted daagent whitelist verification callbacks</string>
+    <string name="status_hook_daemon_desc">Hook installed (existence evidence only, interception not confirmed)</string>
     <string name="engine_status_title">Low-Level Injection Status</string>
     <string name="engine_status_subtitle">One UI · Android 10+</string>
     <string name="engine_status_active">Resident</string>
