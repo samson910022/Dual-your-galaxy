@@ -208,6 +208,14 @@ data class PendingPolicyWrite(
     val requestedAtMs: Long,
     val droppedCount: Int = 0,
     val generation: Long = policyWriteGeneration.incrementAndGet(),
+    // Stage J3 (P2#3 foreign-vs-pending)：綁定請求當下的修訂版本（顯示 fence）。
+    // request 時快照 policyDraftVersion；confirm 在 opMutex
+    // 內、store IO 前比對失配即 abort（UNKNOWN_REFRESH），防盲覆寫外來修訂。
+    // 僅比 version（freshness-only 推進為重疊 load 顯示守衛，不代表修訂推進，
+    // 不得使 pending 失效，故不快照／不比對，免誤殺）。
+    // -1＝legacy 注入（單測直接 setPending，未經 request），比對時跳過版本檢查
+    // （僅走 stale/unknown 門控，保既有測試綠）。
+    val baseDraftVersion: Long = -1L,
 )
 
 data class PendingRemove(
@@ -1232,6 +1240,38 @@ class DualViewModel(
                 policyRevisionStale.set(true)
                 return
             }
+            // Stage J3 (P2#3 foreign-vs-pending)：無 activeTx 但有 pending（QUEUED
+            // 待確認，對話框基於舊修訂構建）時，外來終態不得覆寫 draft——跳過
+            // draft 更新＋記 stale＋翻 Unknown（保留 pending＋draft 舊快照，後續
+            // confirm 經 stale/unknown 門控拒寫 UNKNOWN_REFRESH，需顯式重讀後
+            // 重建 pending）。無 pending 才走既有 Known 更新／Unknown 作廢。
+            // （bump＝markUnknown fence，作廢在途 stale load；phase 保持，不動
+            // pending，不 disarm，免誤關對話框或洩漏舊 arm。）
+            val hasPendingForForeign = try {
+                _state.value.pendingPolicyWrite != null
+            } catch (_: Exception) {
+                false
+            }
+            if (hasPendingForForeign) {
+                lastRevisionSeenTxId.set(settled.txId)
+                lastRevisionSeenKey.set(settled.key)
+                policyRevisionStale.set(true)
+                markPolicyUnknownLocked()
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
+                        cur.policyWritePhase != PolicyWritePhase.QUEUED
+                    ) {
+                        cur.copy(policyDraftKnown = false)
+                    } else {
+                        cur.copy(
+                            policyDraftKnown = false,
+                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
+                    }
+                }
+                return
+            }
             // Stage J2: 本地無 activeTx 但收到共享終態失敗/未決 (known==false) 不得
             // 忽略——必須作廢本地 Known（樂觀快取跨 VM 污染：他 VM 失敗前本 VM 可能
             // 已讀到其樂觀值 B 並誤存為 Known）。bump 三元作廢在途 load，翻 Unknown
@@ -1595,12 +1635,12 @@ class DualViewModel(
             LoadResult.Unknown to false
         }
     }
-    // F1 快徑 read-after-ack（fresh，有界；失敗即 Unknown，信 ack 保既有語義，
-    // Stage G1 維持：reconciler／late-join 才嚴格（Unknown 不信），快徑不改）。
+    // F1 快徑 read-after-ack（fresh，有界；Stage J3：Unknown 永不信 ack，
+    // 快徑 Unknown 一律 RECONCILING＋handover，不發布 SUCCESS；reconciler／
+    // late-join 嚴格見 decidePolicyTxSettle）。
     // 有界取 min(policyIoTimeoutMs, 1s)：預設 10s 下阻塞式測試 load（latch）會
     // pin opMutex 10s 致既有 5s await 超時；1s 上限保快徑即時性（生產 binder IPC
-    // 皆 ms 級，1s 已充裕；注入短超時 200ms 仍尊重原值）。Unknown 即信 ack
-    // （保既有 stalePending／slowUnknown 綠；G1 嚴格化見 reconciler／late-join）。
+    // 皆 ms 級，1s 已充裕；注入短超時 200ms 仍尊重原值）。
     // detach 式（同 save）：讀跑獨立 async，await 僅等 bound；測試 latch 式
     // loadRaw 以 Thread.sleep 迴圈無視協程取消（catch InterruptedException 續跑），
     // withTimeout 包 onIo 無法搶佔，必須 detach 放棄慢讀（結果不再採納，僅免
@@ -5827,9 +5867,15 @@ class DualViewModel(
         }
         // Phase 3：建 pending 即進 QUEUED（同一 _state.update 翻相位＋epoch+1；
         // dropped 警語在上一次 emission，第二次 copy 保留其 msg 不覆寫）。
+        // Stage J3：綁定當下修訂版本（外來修訂即 stale，confirm 比對失配拒寫）。
         _state.update {
             it.copy(
-                pendingPolicyWrite = PendingPolicyWrite(sanitized, nowMonoMs(), dropped),
+                pendingPolicyWrite = PendingPolicyWrite(
+                    packages = sanitized,
+                    requestedAtMs = nowMonoMs(),
+                    droppedCount = dropped,
+                    baseDraftVersion = policyDraftVersion.get(),
+                ),
                 policyWritePhase = PolicyWritePhase.QUEUED,
                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
             )
@@ -6151,9 +6197,67 @@ class DualViewModel(
                         }
                         h1Deferred = lazy
                         preClaimTx = tx
+                        // Stage J3: IO 前最終修訂檢查（bind pending to revision）。
+                        // H1 claim 後、lazy.start() 前：若請求時的 base 與當下版本
+                        // 失配（期間外來修訂推進），或 stale 旗已立（排隊期間異 Tx
+                        // 終態），即 abort——回滾認領（settle＋解鎖＋cancel lazy，
+                        // 免殘留 fence 卡死後續），mark＋UNKNOWN_REFRESH＋清 pending，
+                        // 不啟 IO（store 零觸碰，防盲覆寫外來修訂）。
+                        val baseMismatchPreIo = pendingAtCall.baseDraftVersion != -1L &&
+                            pendingAtCall.baseDraftVersion != policyDraftVersion.get()
+                        if (baseMismatchPreIo || policyRevisionStale.get()) {
+                            settlePolicyTx(tx)
+                            preClaimTx = null
+                            if (writeLocked) {
+                                try {
+                                    h1Coord.writeMutex.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                            try {
+                                lazy.cancel()
+                            } catch (_: Exception) {
+                            }
+                            markPolicyUnknownLocked()
+                            _state.update { s ->
+                                s.copy(
+                                    loading = false,
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
+                        }
                         try {
                             lazy.start()
                         } catch (_: Exception) {
+                        }
+                    }
+                    // Stage J3 (無 coordinator 舊路徑)：IO 前最終修訂檢查。
+                    // 無 H1 前置時仍須比對 base（legacy -1 跳過）＋stale，失配即
+                    // abort（UNKNOWN_REFRESH＋清 pending，不啟 IO；本 op 未持有
+                    // loading，不碰 loading）。
+                    if (h1Coord == null) {
+                        val baseMismatchNoCoord = pendingAtCall.baseDraftVersion != -1L &&
+                            pendingAtCall.baseDraftVersion != policyDraftVersion.get()
+                        if (baseMismatchNoCoord || policyRevisionStale.get()) {
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
                         }
                     }
                     // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission（消除
@@ -6346,9 +6450,9 @@ class DualViewModel(
                         if (ok) {
                             // Stage F1 快徑收斂（P2#3）：ok==true 先一次 fresh
                             // read-after-ack，==sanitized 才 WRITE_SUCCESS，
-                            // !=sanitized 即 REFRESHED；Unknown 信 ack（保既有
-                            // 版本守衛語義；Stage G1 的 settle 嚴格化僅適用
-                            // reconciler／late-join，見 decidePolicyTxSettle）。
+                            // !=sanitized 即 REFRESHED；Stage J3：Unknown 永不信
+                            // ack（上行已早返 RECONCILING＋handover，此處僅 Known
+                            // 存活；reconciler／late-join 嚴格見 decidePolicyTxSettle）。
                             // 仍在 opMutex 內，讀寫同一 store，無需另取號；
                             // 發布前 bump 照舊（TOCTOU #2）。
                             // Stage I1：讀 job 顯式化（detach＋有界 min(policyIoTimeoutMs,1s)，
@@ -6418,11 +6522,126 @@ class DualViewModel(
                                 }
                                 return@withLock
                             }
+                            // Stage J3 (P1 trusts-ack-on-Unknown＋P2 stale-base)：
+                            // - ackRead Unknown（逾時/例外，無 ground truth）→永不
+                            //   信 ack 發 SUCCESS；mark＋RECONCILING＋handover（同
+                            //   逾時分支），由 reconciler 經 ground-truth 結清。
+                            // - stale（SAVING 期中外來 settled）→永不 SUCCESS；
+                            //   Known 即 REFRESHED（ground truth），Unknown 即
+                            //   RECONCILING handover。stale 旗保留至顯式 refresh
+                            //   Known 洗白（此處不洗）。
+                            if (policyRevisionStale.get()) {
+                                if (ackRead is LoadResult.Known) {
+                                    policyDraftVersion.incrementAndGet()
+                                    policyFreshnessGen.incrementAndGet()
+                                    policyOwnershipGen.incrementAndGet()
+                                    disarmBlindClear()
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraft = ackRead.packages,
+                                            policyDraftKnown = true,
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                    val pc = preClaimTx
+                                    if (pc != null) {
+                                        emitTxSettledSnapshot(pc)
+                                        settlePolicyTx(pc)
+                                        preClaimTx = null
+                                    }
+                                    if (writeLocked) {
+                                        try {
+                                            policyTxCoordinator?.writeMutex?.unlock()
+                                        } catch (_: Exception) {
+                                        }
+                                        writeLocked = false
+                                    }
+                                    return@withLock
+                                } else {
+                                    markPolicyUnknownLocked()
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            policyWritePhase = PolicyWritePhase.RECONCILING,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraftKnown = false,
+                                            msg = policyText(PolicyText(PolicyTextKind.WRITE_TIMEOUT)),
+                                            msgKind = MsgKind.CHANNEL,
+                                        )
+                                    }
+                                    val pc = preClaimTx
+                                    if (pc != null) {
+                                        handoverTx = pc
+                                        preClaimTx = null
+                                        if (writeLocked) {
+                                            try {
+                                                policyTxCoordinator?.writeMutex?.unlock()
+                                            } catch (_: Exception) {
+                                            }
+                                            writeLocked = false
+                                        }
+                                    } else {
+                                        handoverTx = PolicyTx(
+                                            txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                                            key = key,
+                                            deferred = deferred,
+                                            sanitized = sanitized,
+                                            store = store,
+                                            isClear = false,
+                                            pending = pendingAtCall,
+                                        )
+                                    }
+                                    return@withLock
+                                }
+                            }
+                            if (ackRead is LoadResult.Unknown) {
+                                markPolicyUnknownLocked()
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.WRITE_TIMEOUT)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                                val pc = preClaimTx
+                                if (pc != null) {
+                                    handoverTx = pc
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try {
+                                            policyTxCoordinator?.writeMutex?.unlock()
+                                        } catch (_: Exception) {
+                                        }
+                                        writeLocked = false
+                                    }
+                                } else {
+                                    handoverTx = PolicyTx(
+                                        txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                                        key = key,
+                                        deferred = deferred,
+                                        sanitized = sanitized,
+                                        store = store,
+                                        isClear = false,
+                                        pending = pendingAtCall,
+                                    )
+                                }
+                                return@withLock
+                            }
                             // TOCTOU (#2): bump version + freshness + ownership
                             // so any in-flight load started before this save is
                             // discarded instead of overwriting the fresh Known
                             // state. Stage G1：顯示＋所有權同推（無 Tx 在途，
                             // ownership 推進無害；有舊 reconciler 亦應丟棄）。
+                            // Stage J3：至此已排除 stale＋Unknown（上行早返），僅
+                            // Known 存活：mismatch→REFRESHED，match→SUCCESS。
                             policyDraftVersion.incrementAndGet()
                             policyFreshnessGen.incrementAndGet()
                             policyOwnershipGen.incrementAndGet()
@@ -6728,6 +6947,61 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // Stage J3 (P2 blind-clear)：執行前必須 Known。
+                    // 第二 tap（arm 通過、已 disarm 排隊至此）仍須一次有界
+                    // fresh 重讀：Known 才執行（明確刪除已知內容）；Unknown 即
+                    // abort（REFRESH_FAILED＋Unknown＋IDLE，不碰 store、不刪未見
+                    // 內容）。arm 已在外層消費，此處 abort 不重 arm（下次 tap 視
+                    // 為新的第一次，需重走 double-confirm）。
+                    // 有界 min(policyIoTimeoutMs,1s)＋detach（同快徑 ack，不 pin
+                    // opMutex；殘留 job 自收，不發布）。
+                    run {
+                        val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                        val preRead: LoadResult = try {
+                            withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
+                        } catch (te: TimeoutCancellationException) {
+                            try {
+                                preJob.cancel()
+                            } catch (_: Exception) {
+                            }
+                            LoadResult.Unknown
+                        } catch (e: CancellationException) {
+                            try {
+                                preJob.cancel()
+                            } catch (_: Exception) {
+                            }
+                            throw e
+                        } catch (_: Exception) {
+                            try {
+                                preJob.cancel()
+                            } catch (_: Exception) {
+                            }
+                            LoadResult.Unknown
+                        }
+                        if (preRead is LoadResult.Unknown) {
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                            return@withLock
+                        }
+                    }
                     // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission。
                     // Stage H1：clear 前置（opMutex 內、store IO 前同步 CAS claim；
                     // LAZY async，失敗即 BUSY 不啟 IO；沿用 confirm 雙層：先
@@ -6933,7 +7207,8 @@ class DualViewModel(
                     if (ok) {
                         // Stage F1 快徑收斂（clear 對稱）：ok==true 先一次 fresh
                         // read-after-ack，Known-empty 才 CLEAR_SUCCESS，否則
-                        // REFRESHED；Unknown 信 ack（保既有語義）。
+                        // REFRESHED；Stage J3：Unknown 永不信 ack（上行已早返
+                        // RECONCILING＋handover，此處僅 Known 存活）。
                         // Stage I1：讀 job 顯式化（同 confirm 快徑；敗者可 cancel）。
                         val ackJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
                         val ackRead: LoadResult = try {
@@ -6988,6 +7263,131 @@ class DualViewModel(
                                 } catch (_: Exception) {
                                 }
                                 writeLocked = false
+                            }
+                            return@withLock
+                        }
+                        // Stage J3 (P1 trusts-ack-on-Unknown＋P2 stale-base，clear 對稱)：
+                        // - ackRead Unknown→永不信 ack 發 CLEAR_SUCCESS；mark＋
+                        //   RECONCILING＋handover（同逾時分支），由 reconciler 經
+                        //   ground-truth 結清。
+                        // - stale（SAVING 期中外來 settled）→永不 SUCCESS；Known
+                        //   即 REFRESHED（ground truth），Unknown 即 RECONCILING。
+                        //   stale 旗保留至顯式 refresh Known 洗白，此處不洗。
+                        if (policyRevisionStale.get()) {
+                            if (ackRead is LoadResult.Known) {
+                                policyDraftVersion.incrementAndGet()
+                                policyFreshnessGen.incrementAndGet()
+                                policyOwnershipGen.incrementAndGet()
+                                disarmBlindClear()
+                                if (ackRead.packages.isNotEmpty()) {
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            policyDraft = ackRead.packages,
+                                            policyDraftKnown = true,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                } else {
+                                    _state.update {
+                                        it.copy(
+                                            loading = false,
+                                            policyDraft = emptySet(),
+                                            policyDraftKnown = true,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                }
+                                val pc = preClaimTx
+                                if (pc != null) {
+                                    emitTxSettledSnapshot(pc)
+                                    settlePolicyTx(pc)
+                                    preClaimTx = null
+                                }
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                                return@withLock
+                            } else {
+                                markPolicyUnknownLocked()
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_TIMEOUT)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                                val pc = preClaimTx
+                                if (pc != null) {
+                                    handoverTx = pc
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try {
+                                            policyTxCoordinator?.writeMutex?.unlock()
+                                        } catch (_: Exception) {
+                                        }
+                                        writeLocked = false
+                                    }
+                                } else {
+                                    handoverTx = PolicyTx(
+                                        txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                                        key = key,
+                                        deferred = deferred,
+                                        sanitized = emptySet(),
+                                        store = store,
+                                        isClear = true,
+                                        pending = null,
+                                    )
+                                }
+                                return@withLock
+                            }
+                        }
+                        if (ackRead is LoadResult.Unknown) {
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraftKnown = false,
+                                    policyWritePhase = PolicyWritePhase.RECONCILING,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_TIMEOUT)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                handoverTx = pc
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                            } else {
+                                handoverTx = PolicyTx(
+                                    txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                                    key = key,
+                                    deferred = deferred,
+                                    sanitized = emptySet(),
+                                    store = store,
+                                    isClear = true,
+                                    pending = null,
+                                )
                             }
                             return@withLock
                         }

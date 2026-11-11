@@ -12,8 +12,8 @@
 //   皆可讀；集合僅數十包名，VM 側經 onIo 切 IO 線程，見 DualViewModel)。
 // - 取消保存 (clear)/取消確認 (cancel):只刪持久化條目或什麼都不做，永不觸及
 //   裝置寫入路徑 (≠卸載≠安裝)。
-// - 損壞恢復:無法解析 (條目型別錯亂/ClassCastException 等) -> 視為無草稿
-//   (不拋出)；主動清除損壞條目，下一次 save 覆寫即恢復可用。
+// - 損壞恢復:無法解析 (條目型別錯亂/ClassCastException 等) -> 視為 Unknown
+//   (不拋出、不自清；Stage J3：永不 auto-delete，保留舊快照待顯式重讀)。
 //
 // 資料流 (Stage2 接線):
 // - 本 store 由 remoteHookPolicyStore 綁定 LSPosed remote preferences (非
@@ -70,10 +70,12 @@ class HookPolicyStore(
     private val saveRaw: (Set<String>?) -> Boolean,
 ) {
     // 讀草稿結果:損壞 (拋出，如條目型別錯亂的 ClassCastException) -> 視為
-    // Unknown 並主動清除損壞條目 (fail closed；下次 save 覆寫即恢復)。
+    // Unknown，永不 auto-delete（Stage J3 P1：CCE 自清會在 untrusted type
+    // confusion 下刪除有效草稿，fail-closed 要求保留舊快照、僅標 Unknown；
+    // 如需自癒應 quarantine 至備份鍵，絕不直接刪主鍵）。
     // 與 remoteHookPolicyStore.loadRaw 的分工:provider() 解析失敗 (暫時性
     // IPC/service 缺席) 已在綁定層轉為 null (Unknown、不自清,避免刪掉有效
-    // 草稿);會走到 ClassCastException catch 的只剩值/型別損壞,故自清。
+    // 草稿);會走到 ClassCastException catch 的只剩值/型別損壞,亦不自清。
     // 其他例外 (例如 getStringSet 的暫時性 IPC 失敗) 視為 Unknown,不清除
     // 有效草稿 (避免資料遺失)。
     // Phase 4:抓 Throwable (含 Error 如 AssertionError) 轉 Unknown/false,
@@ -82,14 +84,8 @@ class HookPolicyStore(
     fun loadResult(): LoadResult = try {
         val raw = loadRaw()
         if (raw == null) LoadResult.Unknown else LoadResult.Known(sanitizeHookPolicy(raw))
-    } catch (e: ClassCastException) {
-        try {
-            saveRaw(null)
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Throwable) {
-            // Best effort:下次 save 覆寫即恢復。
-        }
+    } catch (_: ClassCastException) {
+        // Stage J3:永不 auto-delete（見上）；保留舊快照，僅回 Unknown。
         LoadResult.Unknown
     } catch (ce: CancellationException) {
         throw ce
