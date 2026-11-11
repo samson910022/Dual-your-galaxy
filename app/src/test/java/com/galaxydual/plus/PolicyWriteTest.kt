@@ -2641,10 +2641,11 @@ class PolicyWriteTest {
     }
 
     // Stage A review (a) TOCTOU 丟棄：RECONCILING 期間 refresh 推進 generation，
-    // reconciler 的晚到發布必須被丟棄（最新者勝，不覆寫新事實）。
+    // reconciler 的晚到發布必須被丟棄（最新者勝，不覆寫新事實），且丟棄分支
+    // 亦回 IDLE（保留 draft＋REFRESHED＋epoch+1），不得永留 RECONCILING。
     // 定序：save 阻塞觸逾時→RECONCILING；reconciler 首延 500ms 空窗內 refresh
     // 先讀到 NEW 並發布；再放行 reconciler 讀到 stale OLD（Known），世代已變即
-    // 丟棄（draft 續為 NEW，穩定窗口斷言）。
+    // 丟棄（draft 續為 NEW，穩定窗口斷言），終態回 IDLE 且可新 request。
     @Test
     fun reconcilerStalePublish_discardedWhenRefreshAdvancesGeneration() {
         val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
@@ -2706,7 +2707,8 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.policyDraftKnown)
         assertTrue(reconcilerStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
 
-        // 放行晚到的 stale 讀；世代已變必須丟棄（穩定窗口斷言續為 NEW）。
+        // 放行晚到的 stale 讀；世代已變即丟棄（draft 續為 NEW），且丟棄分支
+        // 亦回 IDLE（保留 draft＋REFRESHED＋epoch+1），不得永留 RECONCILING。
         reconcilerRelease.set(true)
         assertTrue(reconcilerFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
         val stableUntil = System.currentTimeMillis() + 500
@@ -2715,13 +2717,31 @@ class PolicyWriteTest {
             assertTrue(vm.state.value.policyDraftKnown)
             Thread.sleep(20)
         }
-        // reconciler 終態 finally 已清 key（發布被丟棄，相位保持 RECONCILING 待
-        // 終態——本測試僅鎖定 draft 不被覆寫，不鎖定相位回位）。
+        // 丟棄終態：回 IDLE＋pending 清空＋reconciling/saving/inFlight 清空
+        // （參照 all-unknown 恢復斷言，證明未卡 RECONCILING）。
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertEquals(setOf("com.fresh"), vm.state.value.policyDraft)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.REFRESHED).defaultText(),
+            vm.state.value.msg,
+        )
+        assertNull(vm.state.value.pendingPolicyWrite)
         await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
+        assertTrue(savingKeysOf(vm).isEmpty())
+        assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
 
         // 清理：放行脫鉤慢 save（結果不再採納，僅免執行緒殘留）。
         saveRelease.set(true)
         assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+        // 丟棄後可新 request（draft 已 Known fresh，無需額外 refresh）。
+        seedSelection(vm)
+        vm.requestPolicyWrite()
+        val pending2 = vm.state.value.pendingPolicyWrite
+        assertNotNull(pending2)
+        assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
     }
 
     // Stage A review (b) 全 Unknown 終態：load 恆 null（3 次重試皆 Unknown）→
