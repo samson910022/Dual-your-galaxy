@@ -176,6 +176,10 @@ class MainActivity : ComponentActivity() {
     private var shownPolicyWriteSaving: Boolean = false
     private var policyAcknowledged = false
     private var policyAckGeneration: Long? = null
+    // Stage J4 (dialog trap)：RECONCILING 期使用者 Back/觸外/取消導致的本地 dismiss
+    // 世代（僅 UI 層抑制重建，不調 vm.cancelPolicyWrite、不清 VM fence；pending 仍在，
+    // reconciler／late-join 照常結清；該世代終態 IDLE 或新世代即清除）。
+    private var policyWriteDismissedForReconcilingGen: Long? = null
     // Stage B P2 dialog 完整清單（方案 A Toggle）：展開/收合純 UI 開關。
     // rest>0 才顯示 Toggle；in-place 切換保 ack；世代重置同步重置 expanded；
     // 旋轉經 KEY_POLICY_EXPANDED(/GEN) 保留，同世代保留、跨世代重置。
@@ -476,6 +480,14 @@ class MainActivity : ComponentActivity() {
             } else {
                 null
             }
+        // Stage J4：RECONCILING 期本地抑制世代保留（旋轉重建不丟抑制；跨世代/
+        // 終態清除仍由 syncPolicyWriteDialog 負責，此處僅恢復原始值）。
+        policyWriteDismissedForReconcilingGen =
+            if (savedInstanceState?.containsKey(KEY_POLICY_WRITE_DISMISSED_GEN) == true) {
+                savedInstanceState.getLong(KEY_POLICY_WRITE_DISMISSED_GEN)
+            } else {
+                null
+            }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -572,6 +584,9 @@ class MainActivity : ComponentActivity() {
         // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
         outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
         if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
+        // Stage J4：RECONCILING 期本地抑制世代保留（同世代旋轉保留；跨世代/終態
+        // 清除見 syncPolicyWriteDialog：pending 清除、世代不匹配不抑制、非 RECONCILING 清除）。
+        if (policyWriteDismissedForReconcilingGen != null) outState.putLong(KEY_POLICY_WRITE_DISMISSED_GEN, policyWriteDismissedForReconcilingGen!!)
     }
 
     override fun onDestroy() {
@@ -3493,17 +3508,17 @@ class MainActivity : ComponentActivity() {
         // 旋轉由 retained ViewModel 重播 state，無需重送）。
         // Phase 3：唯一真相為 state（s.policyWritePhase）；不再讀
         // vm.policyOperationInProgress / policyWriteCommitInProgress getter
-        //（相容保留，見 DualViewModel）。四參：pending＋全域 loading（僅顯示用，
-        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/policySaving。
+        //（相容保留，見 DualViewModel）。五參：pending＋全域 loading（僅顯示用，
+        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/saving/reconciling。
         try {
             syncPolicyWriteDialog(
                 s.pendingPolicyWrite,
                 s.loading,
                 s.policyWritePhase != PolicyWritePhase.IDLE,
-                // Stage A：核對中視同寫入中（禁用確認/取消，顯示忙碌；dialog 以
-                // pending==null 關閉，confirm 核對中 pending 保留故 dialog 續留）。
-                s.policyWritePhase == PolicyWritePhase.SAVING ||
-                    s.policyWritePhase == PolicyWritePhase.RECONCILING,
+                // Stage J4：拆分 SAVING（不可取消）vs RECONCILING（可取消僅 dismiss，
+                // 見 sync 內 cancelable＝!saving||reconciling；confirm 仍兩者皆禁）。
+                s.policyWritePhase == PolicyWritePhase.SAVING,
+                s.policyWritePhase == PolicyWritePhase.RECONCILING,
             )
         } catch (e: Exception) {
             Log.w(TAG, "syncPolicyWriteDialog failed", e)
@@ -4059,6 +4074,7 @@ class MainActivity : ComponentActivity() {
         globalLoading: Boolean,
         policyOp: Boolean,
         policySaving: Boolean,
+        policyReconciling: Boolean = false,
     ) {
         if (isFinishing || isDestroyed) return
         if (pending == null) {
@@ -4076,25 +4092,48 @@ class MainActivity : ComponentActivity() {
             // Stage B P2：展開開關同步重置（同 ack，避免殘留污染下一世代）。
             policyWriteExpanded = false
             policyWriteExpandedGeneration = null
+            // Stage J4：pending 清除即清除 RECONCILING 本地抑制（終態已到）。
+            policyWriteDismissedForReconcilingGen = null
             return
         }
+        // Stage J4：RECONCILING 期本地抑制（使用者已 Back/取消/稍后刷新主動關閉）：
+        // 不重建 dialog，VM fence 保留，reconciler／late-join 照常結清；新世代即清除。
+        if (policyReconciling && policyWriteDismissedForReconcilingGen == pending.generation) {
+            try {
+                policyWriteDialog?.dismiss()
+            } catch (_: Exception) {
+            }
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            return
+        }
+        if (!policyReconciling) {
+            policyWriteDismissedForReconcilingGen = null
+        }
+        // Stage J4：confirm 門控沿用舊 policySaving 語義（SAVING||RECONCILING 即禁確認）；
+        // cancelable 拆分（SAVING 不可取消，RECONCILING 可取消僅 dismiss）。
+        val confirmSaving = policySaving || policyReconciling
+        // Nit：直接以 (policySaving, policyReconciling) 調雙參真相
+        // (!saving || reconciling)；舊 savingOnly 中介與此等價（真值表一致），故省去。
+        val cancelable = policyDialogShouldBeCancelable(policySaving, policyReconciling)
         if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(policySaving, policyAcknowledged)
+                policyDialogCanConfirm(confirmSaving, policyAcknowledged)
             // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
-            // Back/觸外仍以 !policySaving 門控。
+            // Stage J4：RECONCILING 點按為本地 dismiss（不清 VM fence）。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-            policyWriteDialog?.setCancelable(policyDialogShouldBeCancelable(policySaving))
-            policyWriteDialog?.setCanceledOnTouchOutside(policyDialogShouldBeCancelable(policySaving))
+            policyWriteDialog?.setCancelable(cancelable)
+            policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
             // queued/saving 忙碌文案：全量重建（冪等），render 每幀同步。
             // Phase 5：SAVING 翻轉播報寫入中（POLITE，不洗掉 dialog 內容）。
             val wasSaving = shownPolicyWriteSaving
             try {
-                policyWriteDialog?.setMessage(policyWriteMessage(pending, policyOp, policySaving))
+                policyWriteDialog?.setMessage(policyWriteMessage(pending, policyOp, confirmSaving))
             } catch (_: Exception) {
                 // Best effort: 文案更新失敗不影響門控。
             }
-            if (policySaving && !wasSaving) {
+            if (confirmSaving && !wasSaving) {
                 shownPolicyWriteSaving = true
                 try {
                     val announce = try {
@@ -4106,7 +4145,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     // Best effort: 播報失敗不影響門控。
                 }
-            } else if (!policySaving) {
+            } else if (!confirmSaving) {
                 shownPolicyWriteSaving = false
             }
             return
@@ -4117,7 +4156,7 @@ class MainActivity : ComponentActivity() {
             // Best effort.
         }
         shownPolicyWrite = pending
-        shownPolicyWriteSaving = policySaving
+        shownPolicyWriteSaving = confirmSaving
         // 同世代（旋轉重建）保留勾選，跨世代重置（見 policyAckShouldReset 純函數；
         // 此處為 Activity 側實現，JVM 以該純函數鎖定語義）。
         if (policyAckShouldReset(policyAckGeneration, pending.generation)) {
@@ -4130,7 +4169,7 @@ class MainActivity : ComponentActivity() {
             policyWriteExpanded = false
             policyWriteExpandedGeneration = null
         }
-        val message = policyWriteMessage(pending, policyOp, policySaving)
+        val message = policyWriteMessage(pending, policyOp, confirmSaving)
         // 破壞性確認顯示完整包名以供核對（政策寫入放寬白名單，需明示對象；
         // 包名來自 catalog/PM，非使用者隱私輸入；匯出/日誌仍經遮蔽）。
         // Stage B P2（方案 A Toggle）：預設收合前 50 項＋溢出行（全量 200 行會擠出
@@ -4239,10 +4278,31 @@ class MainActivity : ComponentActivity() {
                 .setTitle(getString(R.string.policy_write_title))
                 .setMessage(message)
                 .setView(container)
-                .setCancelable(!policySaving)
+                .setCancelable(cancelable)
                 .setPositiveButton(getString(R.string.policy_write_positive), null)
                 .setNegativeButton(getString(R.string.dialog_cancel), null)
-                .setOnCancelListener { vm.cancelPolicyWrite(pending) }
+                .setNeutralButton(try { getString(R.string.policy_write_snooze) } catch (_: Exception) { "稍後刷新" }, null)
+                .setOnCancelListener {
+                    // Stage J4：RECONCILING 期 Back/觸外僅本地 dismiss（不清 VM fence，
+                    // 不調 cancel）；SAVING/QUEUED 沿既有 cancel 語義。
+                    val recNow = try {
+                        vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+                    } catch (_: Exception) {
+                        policyReconciling
+                    }
+                    if (recNow) {
+                        policyWriteDismissedForReconcilingGen = pending.generation
+                        try {
+                            policyWriteDialog?.dismiss()
+                        } catch (_: Exception) {
+                        }
+                        policyWriteDialog = null
+                        shownPolicyWrite = null
+                        shownPolicyWriteSaving = false
+                    } else {
+                        vm.cancelPolicyWrite(pending)
+                    }
+                }
                 .show()
         } catch (_: Exception) {
             policyWriteDialog = null
@@ -4258,7 +4318,7 @@ class MainActivity : ComponentActivity() {
             // 下一次 render 的 early-return 同步，真正寫入門控在 Positive 點擊
             // 即時重讀＋VM confirmPolicyWrite 世代守衛雙層 fail-closed。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(policySaving, checked)
+                policyDialogCanConfirm(confirmSaving, checked)
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING/
@@ -4268,21 +4328,21 @@ class MainActivity : ComponentActivity() {
                 val ph = vm.state.value.policyWritePhase
                 ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
             } catch (_: Exception) {
-                policySaving
+                confirmSaving
             }
             if (policyDialogCanConfirm(curPolicySaving, policyAcknowledged)) vm.confirmPolicyWrite(pending)
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
-        // 點按時即時重讀 phase，SAVING/RECONCILING 即 toast「寫入中，無法取消」
-        // 且不調 VM；queued 才調 vm.cancelPolicyWrite（維持 P1 #1 語義）。
+        // 點按時即時重讀 phase；Stage J4：SAVING 即 toast「寫入中，無法取消」且不調 VM；
+        // RECONCILING 即本地 dismiss（不清 VM fence，不調 cancel）；queued 才調 cancel。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
-            val savingNow = try {
-                val ph = vm.state.value.policyWritePhase
-                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
+            val phNow = try {
+                vm.state.value.policyWritePhase
             } catch (_: Exception) {
-                policySaving
+                if (policyReconciling) PolicyWritePhase.RECONCILING
+                else if (policySaving) PolicyWritePhase.SAVING else PolicyWritePhase.IDLE
             }
-            if (savingNow) {
+            if (phNow == PolicyWritePhase.SAVING) {
                 val denied = try {
                     getString(R.string.policy_write_cancel_denied)
                 } catch (_: Exception) {
@@ -4293,18 +4353,40 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     // Best effort: toast 失敗不影響門控。
                 }
+            } else if (phNow == PolicyWritePhase.RECONCILING) {
+                policyWriteDismissedForReconcilingGen = pending.generation
+                try {
+                    policyWriteDialog?.dismiss()
+                } catch (_: Exception) {
+                }
+                policyWriteDialog = null
+                shownPolicyWrite = null
+                shownPolicyWriteSaving = false
             } else {
                 vm.cancelPolicyWrite(pending)
             }
         }
+        // Stage J4：稍后刷新（RECONCILING 期手動恢復入口）：觸發一次顯式重讀
+        // （reconciler 已退出 unresolved 時經 late-join 結清；否則 yielding），
+        // 並本地 dismiss（不清 fence），待終態重建或保持抑制。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            // Stage J4：僅 RECONCILING 期有效（QUEUED/SAVING 點按 no-op，避免無用
+            // refresh＋SAVING commit 期併發 IO；按鈕常建、early-return 常駐，故門控在前）。
+            val recNow = try { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING } catch (_: Exception) { policyReconciling }
+            if (!recNow) return@setOnClickListener
+            try { vm.refreshPolicyDraft() } catch (_: Exception) { }
+            policyWriteDismissedForReconcilingGen = pending.generation
+            try { policyWriteDialog?.dismiss() } catch (_: Exception) { }
+            policyWriteDialog = null; shownPolicyWrite = null; shownPolicyWriteSaving = false
+        }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-            policyDialogCanConfirm(policySaving, policyAcknowledged)
-        // Phase 5：negative 保持可點（見上 toast），Back/觸外仍以 !saving 門控。
+            policyDialogCanConfirm(confirmSaving, policyAcknowledged)
+        // Phase 5：negative 保持可點（見上 toast/本地 dismiss），Back/觸外以 cancelable 門控。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-        policyWriteDialog?.setCancelable(policyDialogShouldBeCancelable(policySaving))
-        policyWriteDialog?.setCanceledOnTouchOutside(policyDialogShouldBeCancelable(policySaving))
+        policyWriteDialog?.setCancelable(cancelable)
+        policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
         // Phase 5：初建即 SAVING 時播報一次（early-return 分支覆蓋後續翻轉）。
-        if (policySaving) {
+        if (confirmSaving) {
             try {
                 val announce = try {
                     getString(R.string.policy_write_saving_announce)
@@ -5629,6 +5711,8 @@ class MainActivity : ComponentActivity() {
         // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
         private const val KEY_POLICY_EXPANDED = "policyExpanded"
         private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"
+        // Stage J4：RECONCILING 期本地抑制世代（同世代旋轉保留，跨世代/終態清除見 sync）。
+        private const val KEY_POLICY_WRITE_DISMISSED_GEN = "policyWriteDismissedGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -6266,7 +6350,13 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
 internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean): Boolean =
     !policySaving && acknowledged
 
+// Stage J4 (dialog trap)：SAVING 不可取消 vs RECONCILING 可取消（僅 UI 層 dismiss，
+// 不清 VM fence）。雙參為真相；單參相容保留（舊測試／舊調用：reconciling=false）。
+// 語義：(!saving || reconciling)——SAVING 且非 RECONCILING 才不可取消。
 internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !policySaving
+
+internal fun policyDialogShouldBeCancelable(saving: Boolean, reconciling: Boolean): Boolean =
+    !saving || reconciling
 
 internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
     storedGeneration != pendingGeneration

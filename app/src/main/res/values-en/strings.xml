@@ -111,6 +111,7 @@
     <string name="policy_write_busy_queued">"\n(waiting…)"</string>
     <string name="policy_write_cancel_denied">Write in progress, cannot cancel</string>
     <string name="policy_write_saving_announce">Policy write in progress</string>
+    <string name="policy_write_snooze">Refresh later</string>
     <!-- Stage B P2 full-list dialog (option A Toggle): in-place expand/collapse on
          overflow; Toggle only when rest>0, preserves ack, announces; list CD
          distinguishes full vs truncated. -->
