@@ -888,7 +888,29 @@ class DualViewModel(
     // 本 Tx 結清（含首次）；false 表 Tx 已非擁有者（併發已結，不重複移除）。
     // Stage G2：同清 coordinator（CAS，跨 VM 唯一真相；onCleared 刻意不清除，
     // 僅 settle 清）。
+    // Stage H2：勝者在 settle 前 tryEmit 終態（集中式：取當下 _state 已發布的
+    // IDLE 終態快照，replay=1 供敗者跟隨；unresolved 續留不經此處故不發射）。
+    // Known 成功同步 bump 版本三元（同快徑），使晚到 stale 讀丟棄（敗者 refresh
+    // 不覆寫勝者）；Failed/Unknown 經 mark 已 bump，此處不重複。
     private fun settlePolicyTx(tx: PolicyTx): Boolean {
+        val coord = policyTxCoordinator
+        if (coord != null) {
+            try {
+                val s = _state.value
+                if (s.policyWritePhase == PolicyWritePhase.IDLE) {
+                    if (s.policyDraftKnown) {
+                        policyDraftVersion.incrementAndGet()
+                        policyFreshnessGen.incrementAndGet()
+                        policyOwnershipGen.incrementAndGet()
+                    }
+                    coord.tryEmitSettled(
+                        PolicySettled(tx.txId, s.policyDraft, s.policyDraftKnown, s.msgKind, s.msg, tx.isClear),
+                    )
+                }
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
         val owned = activePolicyTx.compareAndSet(tx, null)
         policyTxCoordinator?.activeTx?.compareAndSet(tx, null)
         if (owned) policyReconciling.remove(tx.key)
@@ -910,9 +932,165 @@ class DualViewModel(
         if (!coord.activeTx.compareAndSet(tx, null)) {
             activePolicyTx.compareAndSet(tx, null)
             policyReconciling.remove(tx.key)
+            // Stage H2：敗者啟動跟隨（有界等待勝者 settled，收到即應用本地 IDLE
+            // 終態；逾時走顯式 reconcile 兜底，不永久卡死）。
+            launchLoserSync(tx)
             return false
         }
         return true
+    }
+
+    // Stage H2 (P2#3#4)：勝者終態廣播（settle 前 tryEmit）。
+    // coordinator 非 null 才發射；無 coordinator 本地路徑不需廣播。
+    private fun emitTxSettled(
+        tx: PolicyTx,
+        draft: Set<String>,
+        known: Boolean,
+        msgKind: MsgKind,
+        msg: String,
+    ) {
+        try {
+            policyTxCoordinator?.tryEmitSettled(
+                PolicySettled(tx.txId, draft, known, msgKind, msg, tx.isClear),
+            )
+        } catch (_: Exception) {
+            // Best effort: 廣播失敗不影響本地終態。
+        }
+    }
+
+    // Stage H2：敗者跟隨＋init 認領訂閱共用。
+    // - 有界等待同一 txId 的勝者 settled（withTimeout(policyIoTimeoutMs)，replay=1
+    //   使晚訂閱仍可見）：收到即應用本地 IDLE+draft/Known/msg（僅 phase 仍為
+    //   RECONCILING 才應用，免覆寫已結新事實；Known 成功即 disarm）。
+    // - 逾時兜底：顯式可信重讀一次（boundedReconcileRead），Known 即 IDLE+Known+
+    //   REFRESHED（disarm），Unknown 即 IDLE+Unknown+REFRESH_FAILED（保留舊快照），
+    //   皆清 pending、不永久卡死。
+    // - CE 透傳（scope 取消不吞）。
+    private fun launchLoserSync(tx: PolicyTx) {
+        val coord = policyTxCoordinator ?: return
+        viewModelScope.launch {
+            val settled: PolicySettled? = try {
+                coord.awaitSettled(tx.txId, policyIoTimeoutMs)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            if (settled != null) {
+                // Stage H2：敗者應用勝者終態即 bump（同勝者），使本地晚到 stale
+                // refresh 丟棄（敗者 refresh 不覆寫勝者）。
+                if (settled.known) {
+                    policyDraftVersion.incrementAndGet()
+                    policyFreshnessGen.incrementAndGet()
+                    policyOwnershipGen.incrementAndGet()
+                }
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                    else {
+                        if (settled.known) disarmBlindClear()
+                        cur.copy(
+                            pendingPolicyWrite = null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraft = if (settled.known) settled.draft else cur.policyDraft,
+                            policyDraftKnown = settled.known,
+                            msg = settled.msg,
+                            msgKind = settled.msgKind,
+                        )
+                    }
+                }
+                // 跟隨即清本地 fence（已清則 no-op；不碰 coordinator，免誤清新 Tx）。
+                try {
+                    activePolicyTx.compareAndSet(tx, null)
+                } catch (_: Exception) {
+                }
+                try {
+                    policyReconciling.remove(tx.key)
+                } catch (_: Exception) {
+                }
+                return@launch
+            }
+            // 兜底：可信重讀後顯式 reconcile 本地 phase，不永久卡死。
+            val read: LoadResult = try {
+                val (r, _) = boundedReconcileRead(tx.store)
+                r
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                LoadResult.Unknown
+            }
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                else if (read is LoadResult.Known) {
+                    disarmBlindClear()
+                    cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = read.packages,
+                        policyDraftKnown = true,
+                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                        msgKind = MsgKind.INFO,
+                    )
+                } else {
+                    cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+            }
+        }
+    }
+
+    // Stage H2：init/認領後訂閱（同一 txId 即應用，replay=1 晚到仍可見）。
+    // 認領即啟動，勝者終態一到即收斂本地（與 reconciler 敗者跟隨同 helper，冪等）。
+    // 訂閱僅跟隨（長預算等待，不做顯式 reconcile 兜底，免與進行中 reconciler 競爭
+    // 提前 IDLE 殘留 Tx；reconciler 敗者路徑另經 launchLoserSync 兜底）。
+    private fun observeSettledFor(tx: PolicyTx) {
+        val coord = policyTxCoordinator ?: return
+        viewModelScope.launch {
+            val settled: PolicySettled? = try {
+                coord.awaitSettled(tx.txId, POLICY_RECONCILE_TOTAL_BUDGET_MS)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            if (settled == null) return@launch
+            if (settled.known) {
+                policyDraftVersion.incrementAndGet()
+                policyFreshnessGen.incrementAndGet()
+                policyOwnershipGen.incrementAndGet()
+            }
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                else {
+                    if (settled.known) disarmBlindClear()
+                    cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = if (settled.known) settled.draft else cur.policyDraft,
+                        policyDraftKnown = settled.known,
+                        msg = settled.msg,
+                        msgKind = settled.msgKind,
+                    )
+                }
+            }
+            // 訂閱跟隨即清本地 fence（已清則 no-op；不碰 coordinator）。
+            try {
+                activePolicyTx.compareAndSet(tx, null)
+            } catch (_: Exception) {
+            }
+            try {
+                policyReconciling.remove(tx.key)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     // Stage G2：handoverTx 登記（本地＋coordinator 同組＋reconciling＋
@@ -1023,6 +1201,16 @@ class DualViewModel(
                 if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
                 // P2-1 settle-CAS 先行、勝者才發布（coordinator CAS 成功才發布）。
                 if (!tryClaimCoordinatorPublish(tx)) return
+                // Stage H2：勝者在 settle 前 tryEmit 終態（敗者跟隨用；集中式
+                // settle 發射兜底，此處顯式發射保時序，見 settlePolicyTx）。
+                if (tx.isClear) emitTxSettled(
+                    tx, emptySet(), true, MsgKind.INFO,
+                    policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                )
+                else emitTxSettled(
+                    tx, decision.packages, true, MsgKind.INFO,
+                    policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, decision.packages.size)),
+                )
                 disarmBlindClear()
                 _state.update { cur ->
                     if (activePolicyTx.get() !== tx) cur
@@ -1051,6 +1239,11 @@ class DualViewModel(
                 if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
                 // P2-1 settle-CAS 先行、勝者才發布。
                 if (!tryClaimCoordinatorPublish(tx)) return
+                // Stage H2：勝者在 settle 前 tryEmit 終態。
+                emitTxSettled(
+                    tx, decision.packages, true, MsgKind.INFO,
+                    policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                )
                 disarmBlindClear()
                 _state.update { cur ->
                     if (activePolicyTx.get() !== tx) cur
@@ -1071,6 +1264,16 @@ class DualViewModel(
                 if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
                 // P2-1 settle-CAS 先行、勝者才發布（先搶發布權，再 mark＋發布）。
                 if (!tryClaimCoordinatorPublish(tx)) return
+                // Stage H2：勝者在 settle 前 tryEmit 終態（Failed 保留舊快照，draft
+                // 取當下值供敗者收斂；敗者 Known=false 不覆寫為 Known，見跟隨）。
+                emitTxSettled(
+                    tx, _state.value.policyDraft, false, MsgKind.FAILED,
+                    policyText(
+                        PolicyText(
+                            if (tx.isClear) PolicyTextKind.CLEAR_FAILED else PolicyTextKind.WRITE_FAILED,
+                        ),
+                    ),
+                )
                 markPolicyUnknownLocked()
                 val expV = policyDraftVersion.get()
                 val expO = policyOwnershipGen.get()
@@ -1500,6 +1703,9 @@ class DualViewModel(
                     )
                 }
                 if (tx.isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+                // Stage H2：init/認領後訂閱 settled（同一 txId 即應用本地 IDLE 終態，
+                // replay=1 晚到仍可見；與 reconciler 敗者跟隨同 helper，冪等）。
+                observeSettledFor(tx)
             }
         }
         // Probe elevation channels first; later ops queue behind this, so the
@@ -5151,11 +5357,11 @@ class DualViewModel(
                                 }
                             }
                         } else {
-                            // Stage G1 Tx 期中讓位（yielding）：deferred 未完成或
-                            // 本次 Unknown 時，可更新顯示（draft/msg），但
-                            // Known=false 或維持 Unknown，不碰 phase/pending；
-                            // phase 續留 RECONCILING，pending 保留，不 disarm；
-                            // ownership 未推進，reconciler 續留（不丟棄）。
+                            // Stage H2 refresh yielding 誠實化（P2#3#4）：
+                            // Tx 存活＋deferred 未完成→不更新 policyDraft（保留舊快照），
+                            // 只設 Known=false，不碰 phase/pending，不 disarm，不洗 msg；
+                            // 生產穿透分支（remote 新身份 Known）同視 Unverified（亦不
+                            // 更新 draft、不 disarm、不洗 msg）。
                             // 唯 late-join（Known＋已完成，上行分支）才結清 Tx。
                             // 世代失配（新事實：version 推進，或同顯示新 refresh
                             // 的 freshness 推進）即丟棄，不覆寫。
@@ -5166,34 +5372,9 @@ class DualViewModel(
                                 policyFreshnessGen.get() != freshGen
                             ) {
                                 cur
-                            } else if (result is LoadResult.Known) {
-                                // G1：deferred 未完成＋Known（A 或 B）不 settle；
-                                // 顯示可 yielding 更新（draft＝讀值），但 Known=false，
-                                // 不 disarm，不碰 phase/pending（保留 fence）。
-                                if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
-                                    cur.copy(
-                                        policyDraft = result.packages,
-                                        policyDraftKnown = false,
-                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                        msgKind = MsgKind.INFO,
-                                    )
-                                } else {
-                                    cur.copy(policyDraft = result.packages, policyDraftKnown = false)
-                                }
                             } else {
-                                if (store == null) {
-                                    cur.copy(
-                                        policyDraftKnown = false,
-                                        msg = policyText(PolicyText(PolicyTextKind.NO_STORE_READ)),
-                                        msgKind = MsgKind.CHANNEL,
-                                    )
-                                } else {
-                                    cur.copy(
-                                        policyDraftKnown = false,
-                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
-                                        msgKind = MsgKind.CHANNEL,
-                                    )
-                                }
+                                // Known/Unknown 一律僅 Known=false，保留舊快照＋原 msg。
+                                cur.copy(policyDraftKnown = false)
                             }
                         }
                     } else if (result is LoadResult.Known) {
