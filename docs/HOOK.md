@@ -79,6 +79,24 @@ JVM 的 `DeoptimizeContractTest` 使用 fake 操作，只驗證無框架依賴�
 `HookInstaller` 編排（順序、同一方法、結果及錯誤處理），**不驗證**
 `DualHook` 的 framework adapter、LSPosed 執行行為或 ART 內聯效果。
 caller-inline fixture 尚未建立，相關裝置驗證尚未完成；驗收待辦見下。
+
+#### Caller-side 研究註記（issue #10 Stage1，不改行為）
+- callee-only best-effort 維持現狀：真正的反內聯修正需要 **(a)** 按支援
+  ROM／版本辨識已內聯 callee 的 caller（方法或建構子，`Executable`）並對
+  **那些 caller** 做 deoptimize，或 **(b)** 選擇內聯副本無法繞過的 hook point。
+- **不無差別 deoptimize 整個 system_server**：只維持已證據的最小範圍
+ （已知 callers＋被 hook 的 callee）。
+- JVM 可測部分已落地：`CallerDeoptPlan.plan(callee, knownCallers)`
+  純函數決策（去重、保序、排除 callee 本體、不改輸入）＋
+  `HookInstaller.installWithCallers` 編排（先逐一 best-effort deoptimize
+  callers 並逐條保留 false／例外診斷（含 hookId 與完整簽名），再走既有
+  callee deopt＋hook；caller 失敗不擋 hook），由 `CallerDeoptPlanTest`／
+  `HookInstallerCallerTest` 鎖定（含 false 不得寫成「不需要」／no-op）。
+- `DualHook.knownCallersFor()` 為 DEVICE-UNVERIFIED 接線點，目前回空
+  （＝今日 callee-only 行為，呼叫點仍走 `hookWithDeoptimize()`，行為不變）；
+  待按 ROM 取到 caller ART 證據後才接上。ART 實效仍待裝置驗證；未來若接上
+  非空 caller 名單，其實路徑驗證亦屬 #10 caller/反內聯範圍（非非空政策
+  concern）待裝置，驗收待辦維持不變。
 Hook Builder 統一使用
 **`ExceptionMode.PROTECTIVE`**（佔位保護）：請求 framework 保護 hook 例外處理，
 不保證所有情況下 `system_server` 或 daagent 都不會崩潰。
