@@ -202,6 +202,96 @@ class UiSemanticsP28P2Test {
         assertFalse(batchEnabled(s))
     }
 
+    // ---- Stage1 批次建立兩步確認（canConfirmBatch / buildBatchConfirmMessage） ----
+
+    @Test
+    fun canConfirmBatch_happy_isTrue() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertTrue(canConfirmBatch(s, acknowledged = true))
+    }
+
+    @Test
+    fun canConfirmBatch_unacknowledged_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertFalse(canConfirmBatch(s, acknowledged = false))
+    }
+
+    @Test
+    fun canConfirmBatch_blockedBusyOrNoTarget_isFalseEvenAcknowledged() {
+        val blocked = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            writeReady = false,
+        )
+        assertTrue(writeBlockReason(blocked) != null)
+        assertFalse(canConfirmBatch(blocked, acknowledged = true))
+        val busy = writableState().copy(loading = true, selectedKeys = setOf("1:com.example.a"))
+        assertFalse(canConfirmBatch(busy, acknowledged = true))
+        val noTarget = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            inventory = InventorySnapshot.unknown(),
+        )
+        assertFalse(canConfirmBatch(noTarget, acknowledged = true))
+        val serialMissing = writableState().copy(
+            selectedKeys = setOf("1:com.example.a"),
+            inventory = writableState().inventory.copy(targetSerial = null),
+        )
+        assertFalse(canConfirmBatch(serialMissing, acknowledged = true))
+        val emptySelection = writableState().copy(selectedKeys = emptySet())
+        assertFalse(canConfirmBatch(emptySelection, acknowledged = true))
+    }
+
+    @Test
+    fun buildBatchConfirmMessage_includesCountAndVerifiedTarget() {
+        val text = buildBatchConfirmMessage(
+            template = "將建立：%1\$d 個分身\n已驗證目標：user %2\$d，serial %3\$d\n須勾選下方確認框。",
+            count = 3,
+            targetId = 10,
+            targetSerial = 7,
+        )
+        assertTrue(text.contains("3 個分身"))
+        assertTrue(text.contains("user 10"))
+        assertTrue(text.contains("serial 7"))
+    }
+
+    // PR64 P1：同數量換選取 (A→B) 必須視為快照失效；目標變更亦然。
+    @Test
+    fun batchRequestMatchesLive_sameCountDifferentKeys_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.b"))
+        assertFalse(
+            batchRequestMatchesLive(
+                requestKeys = setOf("1:com.example.a"),
+                requestTargetId = 10,
+                requestTargetSerial = 1,
+                live = s,
+            ),
+        )
+    }
+
+    @Test
+    fun batchRequestMatchesLive_targetOrExactKeysChange_isFalse() {
+        val s = writableState().copy(selectedKeys = setOf("1:com.example.a"))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 11, 1, s))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 2, s))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a", "1:com.example.b"), 10, 1, s))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, s))
+    }
+
+    // Review #4：同 key/target 但 freshness 語境跨 FRESH↔非-FRESH 時快照失效。
+    @Test
+    fun batchRequestMatchesLive_freshnessContextMismatch_isFalse() {
+        val fresh = writableState().copy(
+            inventory = writableState().inventory.copy(freshness = InventoryFreshness.FRESH),
+            selectedKeys = setOf("1:com.example.a"),
+        )
+        val stale = fresh.copy(
+            inventory = fresh.inventory.copy(freshness = InventoryFreshness.STALE),
+        )
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, stale, requestWasFresh = true))
+        assertFalse(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, fresh, requestWasFresh = false))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, fresh, requestWasFresh = true))
+        assertTrue(batchRequestMatchesLive(setOf("1:com.example.a"), 10, 1, stale, requestWasFresh = false))
+    }
+
     // ---- P2-1 isWriteBlockDuplicate ----
 
     @Test
