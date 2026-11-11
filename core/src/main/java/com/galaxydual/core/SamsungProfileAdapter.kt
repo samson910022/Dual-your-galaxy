@@ -201,23 +201,162 @@ object SamsungProfileAdapter {
     private const val FQ_PREFIX_DOT = "android.os.usertype."
 
     // `user type` keyword core shared by TYPE_LINE/TYPE_KEYWORD/EXPLICIT_SEP.
+    // FQ guard (superuser/note FQ fix): the keyword must not sit inside a
+    // dotted path (`android.os.usertype.profile.CLONE`). The lookbehind
+    // blocks both `superuser`-embedded (`...suser type`, alnum) and
+    // FQ-internal (`.usertype`, dot) hits; TYPE_KEYWORD additionally
+    // rejects a trailing `.` so FQ-internal `usertype.` never counts as a
+    // separator-less keyword (otherwise the fallback remainder
+    // `... android.os..profile.CLONE` fails closed to OTHER instead of
+    // staying UNKNOWN).
     private const val USER_TYPE_PREFIX = "user[\\s_\\-]*type"
     // Explicit type lines, e.g. `User type: ...`, `userType=...`.
     // Value is group 1 when `:`/`=` is present.
     private val TYPE_LINE =
-        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]\\s*(.+)", RegexOption.IGNORE_CASE)
+
+    // Raw bare `Type:` declaration (issue #58, S24 dumpsys user). Strict
+    // ASCII key surface (P1 #59): indent/around `type`/around separator may
+    // contain ONLY space and tab [ \t] (Java `\s` is NOT used: it would accept
+    // VT/FF and eat them before validation). Group 4 is the raw value tail
+    // after the separator (untrimmed, never `\s`-consumed) so disallowed chars
+    // (e.g. VT before value) remain visible to validation. Classification
+    // reuses complete-value allowlists (fail closed: malformed/non-exact/
+    // unknown -> UNKNOWN, never CLONE-authorizing, never OTHER/Absent).
+    private val BARE_TYPE_LINE =
+        Regex("^([ \\t]*)type([ \\t]*)([:=])(.*)$", RegexOption.IGNORE_CASE)
+
+    // Tolerant, raw detector for a line-start bare `Type` declaration ATTEMPT
+    // (P1 #59): anchored to a bare `type` token as the first token on the line
+    // (not `User type`/`userType`/`usertype`) followed by any key chars up to a
+    // `:`/`=` separator. Matches even when the key surface is malformed (VT/FF
+    // or other Cc, Cf/Z Unicode whitespace, Unicode line-end chars in key,
+    // punctuation like `!`, etc.) so the line is OWNED by bare handling and
+    // can be failed closed to UNKNOWN -- never falling through to TYPE_LINE.find()
+    // (which could trust an embedded `userType=`). Non-bare legacy forms do not
+    // start with the bare `type` token and are not matched.
+    private val BARE_TYPE_ATTEMPT =
+        Regex("^[\\p{Z}\\s\\p{Cf}\\p{Cc}]*type(?![A-Za-z0-9_])[^\\r\\n]*?[:=]", RegexOption.IGNORE_CASE)
+
+    // Known complete non-clone Android user type names (fail-closed allowlist)
+    // for bare S24 `Type:` values (P1 #59 review). Only an exact, complete,
+    // recognized type name (+ optional single valid `(default)` suffix) may
+    // classify as OTHER. Unknown type/tail, unknown category, residual chars,
+    // multiple/contradictory tokens, or any malformed structure -> UNKNOWN
+    // (never OTHER/Absent). `profile.CLONE` is intentionally absent: CLONE is
+    // authorized only via the strict classifyMention token+taint/residual path.
+    // Includes AOSP non-clone profiles COMMUNAL/TEST (UserManager constants);
+    // other official non-clone constants (full/system categories, managed/
+    // private profiles) and legacy simple bare names seen on devices.
+    private val KNOWN_OTHER_BARE_TYPES = setOf(
+        "android.os.usertype.profile.managed", "profile.managed",
+        "android.os.usertype.profile.private", "profile.private",
+        "android.os.usertype.profile.communal", "profile.communal",
+        "android.os.usertype.profile.test", "profile.test",
+        "android.os.usertype.profile.supervising", "profile.supervising",
+        "android.os.usertype.full.system", "full.system",
+        "android.os.usertype.full.secondary", "full.secondary",
+        "android.os.usertype.full.guest", "full.guest",
+        "android.os.usertype.full.demo", "full.demo",
+        "android.os.usertype.full.restricted", "full.restricted",
+        "android.os.usertype.system.headless", "system.headless",
+        "other", "private", "managed", "secondary", "system",
+        "guest", "demo", "restricted", "headless", "car",
+    )
+
+    // Bare `Type:` values: strict ASCII-only surface (P1 #59). A complete bare
+    // type value may contain only letters, digits, `.`, `_`, `-`, space, tab,
+    // and `(` `)` (for a single trailing `(default)` note). Any Unicode
+    // whitespace/control/format char (NBSP, U+2000/U+3000/U+202F, ZWSP, controls)
+    // is disallowed so Kotlin Unicode trim can never launder a residual into an
+    // allowlisted CLONE/OTHER form. Checked on the raw (pre-trim) value.
+    private fun hasDisallowedBareChars(s: String): Boolean =
+        s.any { c ->
+            !(c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' ||
+                c == '.' || c == '_' || c == '-' || c == ' ' || c == '\t' ||
+                c == '(' || c == ')')
+        }
+
+    private fun asciiTrim(s: String): String = s.trim { it == ' ' || it == '\t' }
+
+    // Strip at most one valid, sole, trailing `(default)` suffix (well-
+    // formed, whitespace-only around it). Returns the ASCII-trimmed core, or
+    // null for disallowed chars, malformed/multiple notes, or empty core
+    // (fail-closed).
+    private fun bareCore(value: String): String? {
+        if (hasDisallowedBareChars(value)) return null
+        val notes = DEFAULT_NOTE.findAll(value).toList()
+        if (notes.size > 1) return null
+        var core = value
+        if (notes.size == 1) {
+            val n = notes[0]
+            val before = value.substring(0, n.range.first)
+            val after = value.substring(n.range.last + 1)
+            // `(default)` must be sole/trailing with only ASCII space/tab around it.
+            if (before.any { it != ' ' && it != '\t' } && after.any { it != ' ' && it != '\t' }) return null
+            if (after.any { it != ' ' && it != '\t' }) return null
+            core = before
+        }
+        core = asciiTrim(core)
+        if (core.isEmpty()) return null
+        return core
+    }
+
+    // Legacy `profile<sep>NAME` short forms (space/_/-/tab, 1-3 chars, single
+    // alnum name segment) that the parser historically accepted as tokens;
+    // normalized to `profile.name` for bare complete-value matching (P2 compat,
+    // no residual). Dot/FQ forms pass through unchanged.
+    private val BARE_PROFILE_SEP = Regex("^profile([ _\\-\\t]{1,3})([A-Za-z0-9]+)$", RegexOption.IGNORE_CASE)
+
+    private fun normalizeBareProfileCore(core: String): String {
+        val m = BARE_PROFILE_SEP.matchEntire(core) ?: return core
+        return "profile.${m.groupValues[2].lowercase(java.util.Locale.ROOT)}"
+    }
+
+    // Strict complete-value validator for bare `Type:` non-CLONE values (P1).
+    // Requires the remainder (after single valid `(default)`) to be an exact
+    // allowlisted non-clone type name or a normalized legacy `profile<sep>NAME`
+    // short form. Anything else (unknown tail/token, unknown category, residual
+    // chars, multiple tokens/notes, malformed structure) -> false (UNKNOWN).
+    private fun isKnownOtherBareValue(value: String): Boolean {
+        val core = bareCore(value) ?: return false
+        val norm = normalizeBareProfileCore(core).lowercase(java.util.Locale.ROOT)
+        return norm in KNOWN_OTHER_BARE_TYPES
+    }
+
+    // Strict complete-value CLONE recognizer for bare `Type:` values (P2).
+    // Accepts only the exact CLONE type name (FQ or short `profile.CLONE`,
+    // canonical dot or normalized legacy separator variants) with at most one
+    // valid trailing `(default)` suffix. Rejects doubled/misplaced FQ prefix
+    // and any extra residual text, preserving legacy `classifyMention` rules
+    // on other (non-bare) paths for compat.
+    private val KNOWN_CLONE_BARE_TYPES = setOf(
+        "android.os.usertype.profile.clone",
+        "profile.clone",
+    )
+
+    private fun isKnownCloneBareValue(value: String): Boolean {
+        val core = bareCore(value) ?: return false
+        val norm = normalizeBareProfileCore(core).lowercase(java.util.Locale.ROOT)
+        return norm in KNOWN_CLONE_BARE_TYPES
+    }
 
     // Fallback keyword for separator-less ROM forms such as
     // `usertype profile.MANAGED` (no `:`/`=`). Any body line carrying the
     // keyword counts as an explicit type statement. Left boundary guards
-    // against mid-token hits (PmOutputParser convention).
+    // against mid-token hits (PmOutputParser convention); the dot guards
+    // additionally exclude FQ-internal `usertype` (see above) so lines like
+    // `superuser type: android.os.usertype.profile.CLONE` or
+    // `note=Type: android.os.usertype.profile.CLONE` carry no keyword and
+    // stay UNKNOWN instead of falling back to OTHER.
     private val TYPE_KEYWORD =
-        Regex("(?<![A-Za-z0-9])$USER_TYPE_PREFIX", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])$USER_TYPE_PREFIX(?!\\.)", RegexOption.IGNORE_CASE)
 
     // Explicit `:`/`=` separator after the keyword: lines matching this take
     // the explicit-value path, never the separator-less fallback path.
+    // Same dotted-path lookbehind as TYPE_LINE (FQ-internal never explicit).
     private val EXPLICIT_SEP =
-        Regex("(?<![A-Za-z0-9])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
+        Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
 
     // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
     // Left boundary so `transparentId`/`grandparentId` never match.
@@ -419,11 +558,15 @@ object SamsungProfileAdapter {
         return Pair(anyClone && !failClosed, anyOtherToken || failClosed)
     }
 
-    // Unicode line terminators that Kotlin lines() does NOT split on but
-    // Java regex `.` treats as line ends (truncating the TYPE_LINE value
-    // capture). Without normalization a `profile.CLONE<U+2028>evil` mention
-    // would have its tail silently cut and misclassify as CLONE.
+    // Unicode line terminators (NEL, LS, PS). Not used as record separators
+    // (we split on standard CR/LF only so raw bare-Type key chars remain
+    // visible for ownership validation); normalized to `?` in values/legacy
+    // lines for fail-closed residual safety (P1 #59).
     private val UNICODE_LINE_END = Regex("[\\u0085\\u2028\\u2029]")
+
+    // Standard record line breaks only. Keeps NEL/LS/PS/VT/FF inside the raw
+    // line so bare-Type key/value boundary checks see the original chars.
+    private val STD_LINE_BREAK = Regex("\\r\\n|\\r|\\n")
 
     // Classifies a block body with token-level type uniqueness (P1-1,
     // issue #21 owner re-review R3): a block is UNKNOWN whenever its
@@ -477,27 +620,112 @@ object SamsungProfileAdapter {
     private fun classifyType(body: String): ProfileUserType {
         var hasCloneSeg = false
         var hasOtherSeg = false
-        // Normalize Unicode line ends first (see UNICODE_LINE_END): map them
-        // to `?` (never allowlisted, never a separator) so a smuggled tail
-        // fails closed to OTHER via the residual check instead of being cut.
-        val text = UNICODE_LINE_END.replace(body, "?")
-        // Step 1: explicit `user type :/= value` lines, token-level.
-        for (line in text.lines()) {
-            val m = TYPE_LINE.find(line) ?: continue
-            val value = m.groupValues[1].trim()
-            if (value.isEmpty()) continue
-            val (segClone, segOther) = classifyMention(value)
-            if (segClone && segOther) return ProfileUserType.UNKNOWN
-            if (segClone) hasCloneSeg = true
-            if (segOther) hasOtherSeg = true
+        // Split on standard line breaks only (CRLF/CR/LF), NOT on Unicode line
+        // terminators NEL/LS/PS or VT/FF: String.lines() would split on them,
+        // breaking raw bare-Type key detection (P1 #59). Keeping NEL/LS/PS/VT/FF
+        // inside the raw line lets us detect them as malformed key/value chars.
+        val rawLines = body.split(STD_LINE_BREAK)
+        // Step 1: process per raw line (P1 #59). Do NOT pre-replace
+        // UNICODE_LINE_END across the whole body before detection: that can
+        // corrupt a bare `Type` key (e.g. NEL/LS/PS inside the key becomes `?`,
+        // hiding a malformed bare-Type attempt from ownership and letting
+        // TYPE_LINE.find() trust an embedded `userType=`). A line that is a
+        // bare `Type` declaration ATTEMPT (anchored, line-start bare `type`
+        // token) is OWNED here and never evaluated by TYPE_LINE/step-2:
+        // - valid strict ASCII key surface ([ \t] only in indent/around type/
+        //   around separator) -> parse value fail-closed on the bare path;
+        // - malformed key surface (any Cc/Cf/Z/Unicode line-end/control/
+        //   punctuation or other non-[ \t] char in key positions) -> UNKNOWN.
+        // Non-bare lines keep legacy TYPE_LINE/step-2 compat, evaluated on a
+        // safety-normalized view (UNICODE_LINE_END -> `?`) to preserve existing
+        // value/tail residual behavior.
+        for (rawLine in rawLines) {
+            if (BARE_TYPE_ATTEMPT.containsMatchIn(rawLine)) {
+                val strict = BARE_TYPE_LINE.find(rawLine)
+                if (strict == null) {
+                    // Bare `Type` declaration attempt with a malformed key
+                    // surface (VT/FF/other Cc, Cf/Z/Unicode line-end chars,
+                    // punctuation like `!`, or any non-[ \t] in key/indent/
+                    // separator positions). Fail closed to UNKNOWN and never
+                    // fall through to TYPE_LINE.find().
+                    return ProfileUserType.UNKNOWN
+                }
+                val rawValue = strict.groupValues[4]
+                // Safety-normalize Unicode line-end chars in the value tail so
+                // a smuggled terminator cannot be cut/hidden; normalized to `?`
+                // (disallowed by hasDisallowedBareChars) => fail closed.
+                val safeValue = UNICODE_LINE_END.replace(rawValue, "?")
+                // Reject any bare `Type:` value whose raw/safe form contains
+                // disallowed chars (Unicode whitespace/control/format, VT/FF,
+                // or anything outside the strict ASCII allowlist). Kotlin/
+                // Unicode trim must never launder these into an allowlisted
+                // CLONE/OTHER (P1 #59). ASCII space/tab only.
+                if (hasDisallowedBareChars(safeValue)) return ProfileUserType.UNKNOWN
+                val value = asciiTrim(safeValue)
+                if (value.isEmpty()) continue
+                // Bare S24 `Type:` accepts CLONE only as an exact complete
+                // allowlisted value (optional single valid `(default)`). Demoted/
+                // tainted or residual CLONE-shaped forms are NOT authorized here
+                // (never CLONE); unlike TYPE_LINE/step-2 compat (which may map
+                // tainted mentions to OTHER via classifyMention), the bare
+                // complete-value path fails closed below (UNKNOWN) unless the
+                // value is an exact allowlisted OTHER form. Legacy compat stays
+                // on TYPE_LINE / step-2 paths for non-bare lines.
+                if (isKnownCloneBareValue(value)) {
+                    hasCloneSeg = true
+                    continue
+                }
+                val (segClone, segOther) = classifyMention(value)
+                if (segClone && segOther) return ProfileUserType.UNKNOWN
+                if (segClone && !segOther) {
+                    // Clean CLONE by token/residual rules but not an exact bare
+                    // CLONE form (e.g. doubled/misplaced FQ prefix, extra text
+                    // tolerated as residual by the generic path) -> fail closed.
+                    return ProfileUserType.UNKNOWN
+                }
+                if (!segClone && segOther) {
+                    // Bare `Type:` uses only the complete-value allowlist (P1 #59
+                    // re-review): exact known non-clone type -> OTHER; everything
+                    // else (malformed/tainted CLONE, residual chars, unknown tails/
+                    // tokens, repeated notes, mixed values) -> UNKNOWN (fail-closed,
+                    // never OTHER/Absent). TYPE_LINE/step-2 retain their own compat.
+                    if (isKnownOtherBareValue(value)) {
+                        hasOtherSeg = true
+                    } else {
+                        return ProfileUserType.UNKNOWN
+                    }
+                    continue
+                }
+                // Unreachable: classifyMention never returns (false, false).
+                // Kept as fail-closed UNKNOWN.
+                return ProfileUserType.UNKNOWN
+            }
+            // Non-bare line: legacy explicit `user type :/= value` path on a
+            // safety-normalized view (preserves existing UNICODE_LINE_END tail
+            // fail-closed behavior for legacy values).
+            val legacyLine = UNICODE_LINE_END.replace(rawLine, "?")
+            val m = TYPE_LINE.find(legacyLine)
+            if (m != null) {
+                val value = m.groupValues[1].trim()
+                if (value.isEmpty()) continue
+                val (segClone, segOther) = classifyMention(value)
+                if (segClone && segOther) return ProfileUserType.UNKNOWN
+                if (segClone) hasCloneSeg = true
+                if (segOther) hasOtherSeg = true
+                continue
+            }
         }
         // Step 2: separator-less fallback (`usertype <token>` with no :/=).
-        // Same token rule applied to the remainder after the keyword.
-        for (line in text.lines()) {
-            if (TYPE_LINE.find(line) != null) continue
-            if (!TYPE_KEYWORD.containsMatchIn(line)) continue
-            if (EXPLICIT_SEP.containsMatchIn(line)) continue
-            val remainder = TYPE_KEYWORD.replaceFirst(line, "").trim()
+        // Same token rule applied to the remainder after the keyword. Bare
+        // `Type` declaration attempts are owned by step 1 and must never be
+        // reprocessed here.
+        for (rawLine in rawLines) {
+            if (BARE_TYPE_ATTEMPT.containsMatchIn(rawLine)) continue
+            val legacyLine = UNICODE_LINE_END.replace(rawLine, "?")
+            if (TYPE_LINE.find(legacyLine) != null) continue
+            if (!TYPE_KEYWORD.containsMatchIn(legacyLine)) continue
+            if (EXPLICIT_SEP.containsMatchIn(legacyLine)) continue
+            val remainder = TYPE_KEYWORD.replaceFirst(legacyLine, "").trim()
             if (remainder.isEmpty()) {
                 hasOtherSeg = true
                 continue
