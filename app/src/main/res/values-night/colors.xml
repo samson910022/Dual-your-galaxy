@@ -64,4 +64,11 @@
     <color name="oneui_text_primary">#E1E2EA</color>
     <color name="oneui_text_secondary">#C1C6D7</color>
     <color name="oneui_text_tertiary">#8B91A0</color>
+    <!-- Phase UI P1: disabled pill-button tokens (night). #C1C6D7 on #242C3D =
+         8.20 (AA text); tertiary #8B91A0 would be 4.43 (below AA). Disabled
+         control boundaries use oneui_disabled_stroke for recognizable shape on
+         actual surfaces (inactive UI; WCAG 1.4.11 exemption). -->
+    <color name="oneui_disabled_bg">#242C3D</color>
+    <color name="oneui_disabled_text">#C1C6D7</color>
+    <color name="oneui_disabled_stroke">#475569</color>
 </resources>

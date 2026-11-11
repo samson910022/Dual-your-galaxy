@@ -1,14 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
-<ripple xmlns:android="http://schemas.android.com/apk/res/android"
-    android:color="@color/oneui_stroke_subtle">
-    <item>
+<!-- Phase UI P1: explicit disabled state (state_enabled=false). Same gray
+     tokens as bg_pill_button so remove/clone rows read consistently. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
         <shape android:shape="rectangle">
-            <solid android:color="@color/oneui_surface_container_high" />
+            <solid android:color="@color/oneui_disabled_bg" />
             <corners android:radius="9999dp" />
             <stroke
                 android:width="1dp"
-                android:color="@color/oneui_stroke_subtle" />
+                android:color="@color/oneui_disabled_stroke" />
         </shape>
     </item>
-</ripple>
+    <item>
+        <ripple
+            android:color="@color/oneui_stroke_subtle">
+            <item android:id="@android:id/mask">
+                <shape android:shape="rectangle">
+                    <solid android:color="@android:color/white" />
+                    <corners android:radius="9999dp" />
+                </shape>
+            </item>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="@color/oneui_surface_container_high" />
+                    <corners android:radius="9999dp" />
+                    <stroke
+                        android:width="1dp"
+                        android:color="@color/oneui_stroke_subtle" />
+                </shape>
+            </item>
+        </ripple>
+    </item>
+</selector>

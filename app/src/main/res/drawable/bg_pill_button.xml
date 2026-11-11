@@ -1,11 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
-<ripple xmlns:android="http://schemas.android.com/apk/res/android"
-    android:color="@color/oneui_primary_tint">
-    <item>
+<!-- Phase UI P1: explicit disabled state (state_enabled=false) so disabled
+     batch/clone/refresh buttons read as unavailable instead of tappable.
+     Light disabled: oneui_disabled_text #475569 on oneui_disabled_bg
+     #D2DEEB = 5.55 (AA); night version swaps tokens (see drawable-night). -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
         <shape android:shape="rectangle">
-            <solid android:color="@color/oneui_primary" />
+            <solid android:color="@color/oneui_disabled_bg" />
             <corners android:radius="9999dp" />
+            <stroke
+                android:width="1dp"
+                android:color="@color/oneui_disabled_stroke" />
         </shape>
     </item>
-</ripple>
+    <item>
+        <ripple
+            android:color="@color/oneui_primary_tint">
+            <item android:id="@android:id/mask">
+                <shape android:shape="rectangle">
+                    <solid android:color="@android:color/white" />
+                    <corners android:radius="9999dp" />
+                </shape>
+            </item>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="@color/oneui_primary" />
+                    <corners android:radius="9999dp" />
+                </shape>
+            </item>
+        </ripple>
+    </item>
+</selector>

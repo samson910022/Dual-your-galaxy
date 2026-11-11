@@ -2,13 +2,34 @@
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
 <!-- Phase C (night contrast): primary buttons use primary_container bg in
      night mode. #002958 (oneui_button_text) on #418FFF = 4.52 (AA); white on
-     night primary #0381FE is only 3.77. Day version keeps oneui_primary bg. -->
-<ripple xmlns:android="http://schemas.android.com/apk/res/android"
-    android:color="@color/oneui_on_primary_container">
-    <item>
+     night primary #0381FE is only 3.77. Day version keeps oneui_primary bg.
+     Phase UI P1: disabled state uses oneui_disabled_bg #242C3D +
+     oneui_disabled_text #C1C6D7 = 8.20 (AA). -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
         <shape android:shape="rectangle">
-            <solid android:color="@color/oneui_primary_container" />
+            <solid android:color="@color/oneui_disabled_bg" />
             <corners android:radius="9999dp" />
+            <stroke
+                android:width="1dp"
+                android:color="@color/oneui_disabled_stroke" />
         </shape>
     </item>
-</ripple>
+    <item>
+        <ripple
+            android:color="@color/oneui_on_primary_container">
+            <item android:id="@android:id/mask">
+                <shape android:shape="rectangle">
+                    <solid android:color="@android:color/white" />
+                    <corners android:radius="9999dp" />
+                </shape>
+            </item>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="@color/oneui_primary_container" />
+                    <corners android:radius="9999dp" />
+                </shape>
+            </item>
+        </ripple>
+    </item>
+</selector>
