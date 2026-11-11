@@ -308,4 +308,52 @@
     <string name="nav_tab_cd_selected">%1$s, %2$s</string>
     <!-- Phase 3 P3 B7: settings nav opens a dialog (not a tab); CD names it. -->
     <string name="settings_tab_cd">About, double-tap opens dialog</string>
+    <!-- P2: VM hardcoded-string localization (was DualViewModel msg="..." mixed literals; the VM
+         has no Context, display resolves via MainActivity.localizeVmMessage/vmMessageRes; JVM pins
+         the mapping via vmMessageRes). %1$s=raw dynamic suffix (package/count/tech detail, untranslated).
+         Known limitation (locale-mixed by design): prefix template is localized, %1$s remainder
+         passes through verbatim; package/tech remainders are locale-neutral, but structured
+         Chinese-message remainders carry Chinese clauses (verified-id/serial/label,
+         select-target, rebound, saved-selection, batch, serial-missing suffix), so EN renders
+         "EN prefix + Chinese remainder" mixed (see MainActivity vmMessageRes KDoc +
+         StageJ5PolishTest mixed assertion); keep pass-through until the VM emits
+         structured params. -->
+    <string name="vm_no_dual_profile">No dual profile</string>
+    <string name="vm_no_pending_remove">No pending removal to confirm</string>
+    <string name="vm_busy_batch_clone">Batch clone already in progress</string>
+    <string name="vm_selection_cleared">Selection cleared (no clones uninstalled)</string>
+    <string name="vm_save_failed">Failed to save selection</string>
+    <string name="vm_unsave_failed">Failed to cancel saved selection</string>
+    <string name="vm_save_cancelled">Saved selection cancelled (installed clones and current selection unaffected)</string>
+    <string name="vm_no_store_save">No selection store; cannot save</string>
+    <string name="vm_no_store_unsave">No selection store; cannot cancel saved selection</string>
+    <string name="vm_remove_ttl_expired">Confirmation expired; please request removal again</string>
+    <string name="vm_target_unverifiable">Removal target unverifiable (serial missing); please confirm again</string>
+    <string name="vm_serial_unknown_retry">Cannot verify clone identity (serial missing); please retry</string>
+    <string name="vm_list_stale_resave">List is stale (STALE); please refresh before saving</string>
+    <string name="vm_in_progress">Already in progress: %1$s</string>
+    <string name="vm_cloned">Cloned: %1$s</string>
+    <string name="vm_removed">Removed: %1$s</string>
+    <string name="vm_clone_failed">Clone failed: %1$s</string>
+    <string name="vm_clone_verify_failed">Clone verification failed: %1$s</string>
+    <string name="vm_clone_mismatch">Clone verification mismatch: %1$s</string>
+    <string name="vm_clone_unknown">Clone result unknown: %1$s</string>
+    <string name="vm_remove_failed">Remove failed: %1$s</string>
+    <string name="vm_remove_unknown">Remove result unknown: %1$s</string>
+    <string name="vm_remove_cancelled">Removal cancelled: %1$s</string>
+    <string name="vm_await_remove">Awaiting removal confirmation: %1$s</string>
+    <string name="vm_not_installed">Not installed, nothing to remove: %1$s</string>
+    <string name="vm_target_changed_verified_id">Removal target changed (verified id %1$s</string>
+    <string name="vm_target_changed_serial">Removal target changed (serial %1$s</string>
+    <string name="vm_target_changed_label">Removal target changed (%1$s</string>
+    <string name="vm_serial_unknown_suffix">Cannot verify clone identity (serial missing), %1$s</string>
+    <string name="vm_select_target_user">Selection target changed (user %1$s</string>
+    <string name="vm_select_target_serial">Selection target changed (serial %1$s</string>
+    <string name="vm_target_rebound">Selection was bound to an old target%1$s</string>
+    <string name="vm_saved_selection">Selection saved: %1$s</string>
+    <string name="vm_batch_no_start">Cannot start batch: channel error: %1$s</string>
+    <string name="vm_batch_target_changed">Batch interrupted: target changed (user %1$s</string>
+    <string name="vm_batch_partial">Batch interrupted: completed %1$s</string>
+    <string name="vm_probe_failed">Probe failed: %1$s</string>
+    <string name="vm_foreground_failed">Foreground refresh failed: %1$s</string>
 </resources>

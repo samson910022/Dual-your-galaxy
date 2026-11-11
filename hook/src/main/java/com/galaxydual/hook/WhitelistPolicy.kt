@@ -28,12 +28,40 @@ object WhitelistPolicy {
     private const val DESCRIBE_CACHE_MAX = 128
     private val describeCache = ConcurrentHashMap<Executable, String>()
 
-    // Caps unexpected-args observe-only spam on the hot path: the Boolean-false
-    // shape log fires only while extra is non-empty, and at most the first N
-    // times per process (a persistently mismatched method would otherwise log
-    // on every query).
+    // Caps unexpected-args observe-only spam on the hot path: mismatch logs
+    // fire only while extra is non-empty, and at most the first N times per
+    // process (a persistently mismatched method would otherwise log on every
+    // query). Wired via logBounded() (no dead fields); see BoundedLogTest.
     private const val MAX_UNEXPECTED_ARGS_LOGS = 8
     private val unexpectedArgsLogs = AtomicInteger(0)
+
+    // Bounded mismatch logger (P2-4): logs the first MAX_UNEXPECTED_ARGS_LOGS
+    // mismatches, then stays silent. Returns true when the message was
+    // logged (false when suppressed). Test seam: remainingBudget() exposes
+    // the budget for JVM tests without touching Android. The Boolean return
+    // is the rate-limit contract (callers must not assume a log fired).
+    internal fun logBounded(onLog: (String) -> Unit, msg: String): Boolean {
+        val n = unexpectedArgsLogs.incrementAndGet()
+        if (n <= MAX_UNEXPECTED_ARGS_LOGS) {
+            try {
+                onLog(msg)
+            } catch (_: Throwable) {
+            }
+            return true
+        }
+        return false
+    }
+
+    internal fun unexpectedArgsLogCount(): Int = unexpectedArgsLogs.get()
+
+    internal fun remainingUnexpectedArgsBudget(): Int =
+        (MAX_UNEXPECTED_ARGS_LOGS - unexpectedArgsLogs.get()).coerceAtLeast(0)
+
+    // Test-only reset (JVM tests run in one process; without reset the 8-log
+    // budget would leak across tests).
+    internal fun resetUnexpectedArgsLogsForTest() {
+        unexpectedArgsLogs.set(0)
+    }
 
     // Human-readable hook target for logs, e.g.
     // "com.foo.Bar#isWhitelisted(java.lang.String)".
@@ -112,7 +140,7 @@ object WhitelistPolicy {
         }
         if (result is Boolean) {
             if (declaredReturnType != null && !isBooleanLikeDeclaredReturn(declaredReturnType)) {
-                onLog(
+                logBounded(onLog, 
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with non-Boolean declared return ${declaredReturnType.name}; " +
                         "returning original",
@@ -127,7 +155,7 @@ object WhitelistPolicy {
                 legacyBooleanPackageArgIndex(args)
             }
             if (effectiveIndex == null) {
-                onLog(
+                logBounded(onLog, 
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with unverified package arg (size=${args.size}); " +
                         "returning original",
@@ -136,7 +164,7 @@ object WhitelistPolicy {
             }
             val pkg = args.getOrNull(effectiveIndex)
             if (pkg !is String) {
-                onLog(
+                logBounded(onLog, 
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with non-String package arg at index $effectiveIndex; " +
                         "returning original",
@@ -155,7 +183,7 @@ object WhitelistPolicy {
         if (result is List<*>) {
             try {
                 if (result.any { it !is String }) {
-                    onLog(
+                    logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "list with non-String elements; returning original",
                     )
@@ -163,7 +191,7 @@ object WhitelistPolicy {
                 }
                 val wouldAddElements = extra.any { !result.contains(it) }
                 if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
-                    onLog(
+                    logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "unverified collection element type/generic for list; returning original",
                     )
@@ -179,7 +207,7 @@ object WhitelistPolicy {
         }
         if (result is Set<*>) {
             if (result is SortedSet<*> || result is NavigableSet<*>) {
-                onLog(
+                logBounded(onLog, 
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                         "sorted/navigable set ${result.javaClass.name}; returning original",
                 )
@@ -187,7 +215,7 @@ object WhitelistPolicy {
             }
             try {
                 if (result.any { it !is String }) {
-                    onLog(
+                    logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "set with non-String elements; returning original",
                     )
@@ -195,7 +223,7 @@ object WhitelistPolicy {
                 }
                 val wouldAddElements = extra.any { !result.contains(it) }
                 if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
-                    onLog(
+                    logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "unverified collection element type/generic for set; returning original",
                     )
@@ -228,7 +256,7 @@ object WhitelistPolicy {
         if (result is Collection<*>) {
             // Other Collection kinds (Queue, etc.) have unknown contracts;
             // observe-only rather than reshaping them into a List.
-            onLog(
+            logBounded(onLog, 
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                     "unsupported collection ${result.javaClass.name}; " +
                     "returning original",
@@ -250,7 +278,7 @@ object WhitelistPolicy {
                 result
             }
         }
-        onLog(
+        logBounded(onLog, 
             "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                 "unrecognized result ${result?.javaClass?.name ?: "null"}; " +
                 "returning original",
@@ -317,7 +345,7 @@ object WhitelistPolicy {
         onLog: (String) -> Unit,
     ): Any {
         if (declaredReturnType != null && !declaredReturnType.isInstance(merged)) {
-            onLog(
+            logBounded(onLog, 
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                     "merged type ${merged.javaClass.name} incompatible with " +
                     "declared ${declaredReturnType.name}; returning original",

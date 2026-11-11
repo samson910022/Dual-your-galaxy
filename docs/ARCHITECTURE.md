@@ -166,6 +166,7 @@ val privilege: Privilege = when {
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
 
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
+- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例，寫入側版本序號＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshBudget` 有界執行器＋50ms stall 預算，超時回 seed／last-known-good（fail-closed）。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活，後續全 `BUSY`，由 `refreshPolicyDraft` late-join 結清回 `IDLE`）；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
 - Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。
