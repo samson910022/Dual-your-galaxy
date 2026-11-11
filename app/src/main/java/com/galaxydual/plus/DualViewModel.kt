@@ -960,6 +960,28 @@ class DualViewModel(
         if (!coord.activeTx.compareAndSet(tx, null)) {
             activePolicyTx.compareAndSet(tx, null)
             policyReconciling.remove(tx.key)
+            // Stage J1：敗者收斂——SAVING 無 fence 不得滯留。CAS 失敗即本 Tx 已失
+            // 發布權（coordinator 已空或被新 Tx 替換），上已清本地；若此時仍為
+            // SAVING＋pending 保留，即無在途工作卻永不收斂（跟隨門僅收
+            // RECONCILING）。此處同步翻 RECONCILING（pending／draft／Known／
+            // msg 原樣保留、loading=false、epoch＋1）再啟動跟隨：同步翻＋先翻
+            // 後啟動保證 launchLoserSync 首檢即見 RECONCILING，勝者終態經跟隨
+            // 應用（已知即 IDLE＋勝者 draft／未知即 IDLE＋Unknown），逾時走顯式
+            // reconcile 兜底。僅雙 fence 皆空（無新 Tx 在途）才翻——新 Tx 在途
+            // 即跟隨必丟棄（見首檢），不碰新 op 的 SAVING（新 op 擁有收斂權，
+            // 其終態無條件覆寫，自愈）。
+            val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
+            val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
+            if (curLocal == null && curCoord == null) {
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
+                    else cur.copy(
+                        loading = false,
+                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    )
+                }
+            }
             // Stage H2：敗者啟動跟隨（有界等待勝者 settled，收到即應用本地 IDLE
             // 終態；逾時走顯式 reconcile 兜底，不永久卡死）。
             launchLoserSync(tx)
@@ -6253,22 +6275,23 @@ class DualViewModel(
                                 }
                                 LoadResult.Unknown
                             }
-                            // Stage I1：快徑 claim 先行（coordinator 路徑）——認領
-                            // 已失（同 Tx 另有勝者已搶發布權）即敗者 early-return：
-                            // 不發布（免覆寫勝者終態，恰一勝者）、不結清（勝者清）、
-                            // cancel 讀 job＋解鎖 writeMutex；_state 不碰（勝者終態
-                            // 保留）。無 coordinator 舊路徑 preClaimTx 為 null，
-                            // 行為不變。
+                            // Stage J1 (P1#1)：快徑 claim 原子化——以 tryClaimCoordinatorPublish
+                            // CAS 仲裁取代先讀後發射。舊 `===` 預檢＋後發射存在讀-發窗口：
+                            // 跨執行緒併發終態可在預檢通過後、發射前搶先 CAS 勝出並
+                            // 發布，敗者隨後仍發射第二終態覆寫勝者 replay。現以 CAS
+                            // 為唯一仲裁：勝者（coordinator tx→null 成功）方可續行
+                            // bump＋_state.update＋emitTxSettledSnapshot＋settle；
+                            // 敗者 early-return（不碰 _state、不發射；tryClaim 內已
+                            // 清本地＋啟動 loser 跟隨）。settlePolicyTx 的協調器 CAS
+                            // 此時為冪等 no-op（claim 已消費），本地 CAS 仍清 fence。
                             val pcFast = preClaimTx
-                            if (pcFast != null &&
-                                (activePolicyTx.get() !== pcFast ||
-                                    policyTxCoordinator?.activeTx?.get() !== pcFast)
-                            ) {
+                            if (pcFast != null && !tryClaimCoordinatorPublish(pcFast)) {
                                 try {
                                     ackJob.cancel()
                                 } catch (_: Exception) {
                                     // Best effort.
                                 }
+                                preClaimTx = null
                                 if (writeLocked) {
                                     try {
                                         policyTxCoordinator?.writeMutex?.unlock()
@@ -6338,13 +6361,16 @@ class DualViewModel(
                                 writeLocked = false
                             }
                         } else {
-                            // Stage I1：快徑 claim 先行（失敗分支同成功：敗者
-                            // early-return＋解鎖，不發布；勝者發布終態）。
+                            // Stage J1 (P1#1)：快徑 claim 原子化（失敗分支：CAS 敗者先
+                            // 本地 mark 再 early-return＋解鎖，不發布；勝者發布終態）。
+                            // 敗者 save 已回 false＝已證失敗：本地亦 mark（與勝者
+                            // FAILED＋Unknown 一致，非發散；僅推世代三元，使在途
+                            // stale Known 讀丟棄），終態經 tryClaim 內已啟動的
+                            // loserSync 跟隨勝者收斂（RECONCILING→IDLE＋Unknown）。
                             val pcFailFast = preClaimTx
-                            if (pcFailFast != null &&
-                                (activePolicyTx.get() !== pcFailFast ||
-                                    policyTxCoordinator?.activeTx?.get() !== pcFailFast)
-                            ) {
+                            if (pcFailFast != null && !tryClaimCoordinatorPublish(pcFailFast)) {
+                                markPolicyUnknownLocked()
+                                preClaimTx = null
                                 if (writeLocked) {
                                     try {
                                         policyTxCoordinator?.writeMutex?.unlock()
@@ -6829,18 +6855,16 @@ class DualViewModel(
                             }
                             LoadResult.Unknown
                         }
-                        // Stage I1：快徑 claim 先行（同 confirm：敗者 early-return＋
-                        // cancel 讀 job＋解鎖，不發布不結清）。
+                        // Stage J1 (P1#1)：快徑 claim 原子化（clear 對稱，同 confirm：
+                        // CAS 敗者 early-return＋cancel 讀 job＋解鎖，不發布不結清）。
                         val pcClearFast = preClaimTx
-                        if (pcClearFast != null &&
-                            (activePolicyTx.get() !== pcClearFast ||
-                                policyTxCoordinator?.activeTx?.get() !== pcClearFast)
-                        ) {
+                        if (pcClearFast != null && !tryClaimCoordinatorPublish(pcClearFast)) {
                             try {
                                 ackJob.cancel()
                             } catch (_: Exception) {
                                 // Best effort.
                             }
+                            preClaimTx = null
                             if (writeLocked) {
                                 try {
                                     policyTxCoordinator?.writeMutex?.unlock()
@@ -6898,13 +6922,13 @@ class DualViewModel(
                             writeLocked = false
                         }
                     } else {
-                        // Stage I1：快徑 claim 先行（clear 失敗分支：敗者
-                        // early-return＋解鎖，不發布）。
+                        // Stage J1 (P1#1)：快徑 claim 原子化（clear 失敗分支：CAS 敗者
+                        // 先本地 mark 再 early-return＋解鎖，不發布；勝者發布終態）。
+                        // （同 confirm 失敗分支：已證失敗即本地 Unknown＋跟隨收斂。）
                         val pcClearFailFast = preClaimTx
-                        if (pcClearFailFast != null &&
-                            (activePolicyTx.get() !== pcClearFailFast ||
-                                policyTxCoordinator?.activeTx?.get() !== pcClearFailFast)
-                        ) {
+                        if (pcClearFailFast != null && !tryClaimCoordinatorPublish(pcClearFailFast)) {
+                            markPolicyUnknownLocked()
+                            preClaimTx = null
                             if (writeLocked) {
                                 try {
                                     policyTxCoordinator?.writeMutex?.unlock()

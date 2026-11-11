@@ -13,8 +13,10 @@ import com.galaxydual.core.Privilege
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -5308,8 +5310,9 @@ class PolicyWriteTest {
     // Stage I1 T2：雙活快徑 vs reconciler 衝突——恰一勝者（舊碼敗新碼過）。
     // VM 慢 save 在途（SAVING＋前置認領＋writeMutex 持有）；併發勝者（模擬雙活
     // 對端 reconciler 先勝，經 settle 結清認領）後放行 save：快徑 ok==true＋
-    // read-after-ack 到達時認領已失→敗者 early-return（不發布：pending 保留、
-    // draft 不動、無終態廣播），cancel 讀 job＋解鎖 writeMutex；舊碼
+    // read-after-ack 到達時認領已失→敗者 early-return＋RECONCILING（不發布：
+    // 無終態廣播），cancel 讀 job＋解鎖 writeMutex，再經 loserSync 兜底收斂為
+    // 落盤真值（IDLE＋Known＋pending 清除）；舊碼
     // publish-then-settle 直接覆寫勝者終態（pending 清空＋draft=B＋廣播，
     // 以下斷言舊碼敗）。
     @Test
@@ -5352,14 +5355,18 @@ class PolicyWriteTest {
             assertNull(coordinatorTxOf(coord))
             assertNull(activeTxOf(vm))
 
-            // 放行 save：快徑 ok==true，但認領已失→敗者 early-return，不發布。
+            // 放行 save：快徑 ok==true，但認領已失→敗者 early-return＋RECONCILING，
+            // 不發布；經 loserSync 兜底（無勝者終態→可信重讀 ground truth）收斂。
             saveRelease.set(true)
             await { backend.get() == setOf("com.B") }
             await { inFlightKeysOf(vm).none { it.startsWith("policy-") } }
 
-            // 恰一勝者：快徑敗者未發布——pending 保留、draft 未動。
-            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
-            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            // 恰一勝者＋敗者收斂：快徑敗者未發布（無第二發射），終態經跟隨兜底
+            // 收斂為落盤真值 B（IDLE＋Known(B)＋pending 清除），writeMutex 解鎖。
+            await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(setOf("com.B"), vm.state.value.policyDraft)
+            assertTrue(vm.state.value.policyDraftKnown)
             assertEquals(1, saveCalls.get())
             // 無終態廣播（勝者之外無第二發射）。
             val noDouble = kotlinx.coroutines.runBlocking { coord.awaitSettled(tx.txId, tx.key, 300) }
@@ -5368,6 +5375,217 @@ class PolicyWriteTest {
             assertFalse(coord.writeMutex.isLocked)
         } finally {
             saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage J1-1：快徑成功分支 guard-then-lose（ack 讀阻塞期間勝者搶 CAS 並發布
+    //  勝者終態 X；放行 ack 後敗者須 CAS 失敗 early-return＋RECONCILING，經
+    // loserSync 跟隨收斂為勝者 X（不被 divergent ack 覆寫）、恰一終態發射、
+    // writeMutex 解鎖）。
+    @Test
+    fun j1_fastPathGuardThenLose_noSecondEmit() {
+        val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.seed"))
+        val divergent = java.util.concurrent.atomic.AtomicReference(setOf("com.DIVERGENT"))
+        val blockAck = java.util.concurrent.atomic.AtomicBoolean(false)
+        val ackStarted = java.util.concurrent.CountDownLatch(1)
+        val ackRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (blockAck.get()) {
+                    ackStarted.countDown()
+                    while (!ackRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    divergent.get()
+                } else {
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        var collectScope: CoroutineScope? = null
+        var collectJob: kotlinx.coroutines.Job? = null
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+
+            // ack 讀即將阻塞：先開旗再 confirm（init 已走完，save 前無讀）。
+            blockAck.set(true)
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(ackStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx = activeTxOf(vm) as DualViewModel.PolicyTx
+            assertTrue(coord.writeMutex.isLocked)
+
+            // 勝者（同 Tx，跨 VM 層面）：CAS 搶發布權＋發布勝者終態 X；刻意不碰
+            // 本 VM _state（還原真實雙活交錯；敗者經 loserSync 跟隨收斂）。
+            assertTrue(callTryClaim(vm, tx))
+            val winnerDraft = setOf("com.WINNER")
+            val winnerMsg = PolicyText(PolicyTextKind.WRITE_SUCCESS, winnerDraft.size).defaultText()
+            val seen = java.util.concurrent.CopyOnWriteArrayList<PolicySettled>()
+            collectScope = CoroutineScope(Dispatchers.Default)
+            collectJob = collectScope.launch {
+                coord.settled.collect { s ->
+                    if (s.txId == tx.txId && s.key == tx.key) seen.add(s)
+                }
+            }
+            assertTrue(coord.tryEmitSettled(PolicySettled(tx.txId, tx.key, winnerDraft, true, MsgKind.INFO, winnerMsg, false)))
+
+            // 放行 ack（讀到 DIVERGENT≠B）：敗者 CAS 失敗即 early-return＋
+            // RECONCILING，經 loserSync 跟隨勝者收斂（不發射第二終態）。
+            ackRelease.set(true)
+            await { saveCalls.get() == 1 && inFlightKeysOf(vm).none { it.startsWith("policy-") } }
+            await(timeoutMs = 5_000L) { !coord.writeMutex.isLocked }
+            // 敗者經跟隨收斂為勝者值：draft/pending/phase/msg 皆為勝者終態，
+            // 未被 DIVERGENT ack 覆寫。
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vm.state.value.pendingPolicyWrite == null &&
+                    vm.state.value.policyDraft == winnerDraft
+            }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(winnerMsg, vm.state.value.msg)
+            assertEquals(1, saveCalls.get())
+            // 恰一終態：靜默窗口內敗者無第二發射（replay 仍為勝者）。
+            Thread.sleep(500)
+            assertEquals(1, seen.size)
+            assertEquals(winnerDraft, seen[0].draft)
+            val replay = kotlinx.coroutines.runBlocking { coord.awaitSettled(tx.txId, tx.key, 300) }
+            assertNotNull(replay)
+            assertEquals(winnerDraft, replay!!.draft)
+            assertFalse(coord.writeMutex.isLocked)
+        } finally {
+            ackRelease.set(true)
+            try {
+                collectJob?.cancel()
+            } catch (_: Exception) {
+            }
+            try {
+                collectScope?.cancel()
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage J1-2：快徑失敗分支 guard-then-lose（save 阻塞期間跨 VM 勝者在協調器
+    // 層面搶 CAS 並發布 FAILED 終態，不碰本 VM _state；放行 save（回 false）後敗者
+    // 須先過 pending 一致性再於 CAS 失敗 early-return：本地 mark（Unknown，與勝者
+    // 一致）＋RECONCILING，經 loserSync 跟隨勝者收斂（不發射，pending 清除、
+    // 恰一發射、writeMutex 解鎖）。
+    // 註：勝者終態必清 pending，若勝者先落本 VM _state，VM1 將提前以
+    // cancel-during-race abort（QUEUED）而到不了失敗守衛；跨 VM 勝者只動協調器，
+    // 故本測試採協調器層面勝出，還原真實雙活交錯。
+    @Test
+    fun j1_fastPathFailGuardThenLose_convergesToWinnerFailed() {
+        val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { _ ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                false
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        var collectScope: CoroutineScope? = null
+        var collectJob: kotlinx.coroutines.Job? = null
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx = activeTxOf(vm) as DualViewModel.PolicyTx
+            assertTrue(coord.writeMutex.isLocked)
+
+            // 勝者（同 Tx，跨 VM 層面）：CAS 搶發布權＋發布 FAILED 終態（保留舊快照
+            // seed＋Unknown）；刻意不碰本 VM _state（pending 續為 pendingB，使 VM1
+            // 能通過 pending 一致性直達失敗守衛，還原真實雙活交錯）。
+            assertTrue(callTryClaim(vm, tx))
+            val failMsg = PolicyText(PolicyTextKind.WRITE_FAILED).defaultText()
+            val seen = java.util.concurrent.CopyOnWriteArrayList<PolicySettled>()
+            collectScope = CoroutineScope(Dispatchers.Default)
+            collectJob = collectScope.launch {
+                coord.settled.collect { s ->
+                    if (s.txId == tx.txId && s.key == tx.key) seen.add(s)
+                }
+            }
+            assertTrue(
+                coord.tryEmitSettled(
+                    PolicySettled(tx.txId, tx.key, setOf("com.seed"), false, MsgKind.FAILED, failMsg, false),
+                ),
+            )
+
+            // 放行 save（已證失敗）：pending 一致性通過，敗者於 CAS 失敗 early-return，
+            // 本地 mark（Unknown，與勝者一致）＋RECONCILING，經 loserSync 跟隨勝者
+            // FAILED 終態收斂（不發射第二終態）。
+            saveRelease.set(true)
+            await { saveCalls.get() == 1 && inFlightKeysOf(vm).none { it.startsWith("policy-") } }
+            await(timeoutMs = 5_000L) { !coord.writeMutex.isLocked }
+
+            // 敗者經跟隨收斂為勝者 FAILED 終態：IDLE＋Unknown（draft 保留舊快照
+            // seed）＋pending 清除＋FAILED 文案。
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vm.state.value.pendingPolicyWrite == null
+            }
+            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(failMsg, vm.state.value.msg)
+            assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+            assertEquals(1, saveCalls.get())
+            Thread.sleep(500)
+            assertEquals(1, seen.size)
+            assertFalse(seen[0].known)
+            val replay = kotlinx.coroutines.runBlocking { coord.awaitSettled(tx.txId, tx.key, 300) }
+            assertNotNull(replay)
+            assertFalse(replay!!.known)
+            assertFalse(coord.writeMutex.isLocked)
+        } finally {
+            saveRelease.set(true)
+            try {
+                collectJob?.cancel()
+            } catch (_: Exception) {
+            }
+            try {
+                collectScope?.cancel()
+            } catch (_: Exception) {
+            }
             try {
                 coord.close()
             } catch (_: Exception) {
