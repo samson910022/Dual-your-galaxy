@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -64,17 +65,38 @@ class PolicyTxCoordinator {
     //   DualViewModel confirm/clear「finally 不碰 coordinator」）。
     val writeMutex = Mutex()
 
-    // Stage H2 settled 廣播：勝者終態（IDLE+draft/Known/msg）replay=1。
+    // Stage H2 settled 廣播：勝者終態（IDLE+draft/Known/msg）replay=8。
     // 勝者在 tryClaim 成功後、settle 前 tryEmit；敗者以有界 withTimeout 訂閱
     // 同一 txId，收到即應用本地 IDLE 終態；逾時則走顯式 reconcile 兜底，不永久卡死。
+    // Stage J4 (P2#5 tryEmit drop)：replay=1＋extra=1 下 tryEmit 失敗即丟棄，
+    // 連發終態覆寫 replay 使跟隨者等滿超時再降級。改 replay=8＋extra=8 並經
+    // emitSettledAsync 兜底（tryEmit 失敗即 coordinator.scope 內 suspending emit，
+    // 有界 2s），免掉終態 strands claimed VM。
     private val _settled =
-        MutableSharedFlow<PolicySettled>(replay = 1, extraBufferCapacity = 1)
+        MutableSharedFlow<PolicySettled>(replay = 8, extraBufferCapacity = 8)
     val settled: SharedFlow<PolicySettled> = _settled.asSharedFlow()
 
     fun tryEmitSettled(s: PolicySettled): Boolean = try {
         _settled.tryEmit(s)
     } catch (_: Exception) {
         false
+    }
+
+    // Stage J4 lossless 發射：tryEmit 命中即回；失敗（buffer 滿）即經 scope 內
+    // suspending emit（有界 2s）補發，不丟棄。呼叫端一律用此者（不再直呼 tryEmit）。
+    fun emitSettledAsync(s: PolicySettled) {
+        if (tryEmitSettled(s)) return
+        try {
+            scope.launch {
+                try {
+                    withTimeoutOrNull(2_000L) { _settled.emit(s) }
+                } catch (_: Exception) {
+                    // Best effort: 兜底失敗不影響本地終態。
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
 
     suspend fun awaitSettled(txId: Long, key: String, timeoutMs: Long): PolicySettled? = try {

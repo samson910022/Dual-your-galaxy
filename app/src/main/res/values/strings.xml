@@ -113,6 +113,8 @@
     <string name="policy_write_busy_queued">"\n（等待中…）"</string>
     <string name="policy_write_cancel_denied">寫入中，無法取消</string>
     <string name="policy_write_saving_announce">政策寫入中</string>
+    <!-- Stage J4：RECONCILING 期手動恢復入口（neutral 按鈕；資源化，前身硬編碼）。 -->
+    <string name="policy_write_snooze">稍後刷新</string>
     <!-- Stage B P2 dialog 完整清單（方案 A Toggle）：溢出時 in-place 展開/收合；
          Toggle 僅 rest>0 顯示，保 ack，播報展開/收合；清單 CD 區分完整/截斷。 -->
     <string name="policy_write_show_all">顯示全部（共 %1$d 項）</string>
