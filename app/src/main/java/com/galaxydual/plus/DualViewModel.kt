@@ -192,9 +192,16 @@ private val policyWriteGeneration = java.util.concurrent.atomic.AtomicLong()
 // Stage2 (hook-policy-source P2 #5):政策草稿版本號，避免晚到的 init/refresh
 // 載入覆寫較新的 save 所寫入的 policyDraft。
 private val policyDraftVersion = java.util.concurrent.atomic.AtomicLong()
+// Stage G1 世代拆分：顯示 vs 所有權。
+// - policyFreshnessGen：refresh/load 顯示 TOCTOU（重疊 load 丟棄、盲清 arm、
+//   成功/失敗顯示 fence）。refresh 期中（Tx 存活）只推進此者，不碰 ownership。
+// - policyOwnershipGen：Tx 所有權（reconciler 世代、late-join 結清判定）。
+//   reconciler 只比 version＋ownership；refresh 期中永不推進 ownership，
+//   故 yielding 不致 TOCTOU 丟棄 reconciler（保留 fence）。
 // Read-generation guard for policy draft loads: overlapping loads discard
 // stale results (load A must not overwrite a newer load B).
-private val policyLoadGeneration = java.util.concurrent.atomic.AtomicLong()
+private val policyFreshnessGen = java.util.concurrent.atomic.AtomicLong()
+private val policyOwnershipGen = java.util.concurrent.atomic.AtomicLong()
 data class PendingPolicyWrite(
     val packages: Set<String>,
     val requestedAtMs: Long,
@@ -424,8 +431,8 @@ data class UiState(
     // - policyEpoch：相位遷移單調計數（request/cancel/confirm/clear 每次相位
     //   變遷即 +1；QUEUED→SAVING 保持同一 epoch 以標示同一 op 推進，僅翻相位）。
     //   與 policyWriteGeneration（pending 身份）/clearGeneration（clear key 唯一）
-    //   /policyDraftVersion+policyLoadGeneration（TOCTOU fence，Phase1 語義不動）
-    //   之關係見 DualViewModel 內各計數器 KDoc。
+    //   /policyDraftVersion+policyFreshnessGen（顯示 TOCTOU fence，Phase1 語義不動）
+    //   之關係見 DualViewModel 內各計數器 KDoc（Tx 所有權另由 policyOwnershipGen）。
     val policyWritePhase: PolicyWritePhase = PolicyWritePhase.IDLE,
     val policyEpoch: Long = 0L,
     // Phase 2：手動重新整理草稿的可觀測位（獨立於全域 loading，避免誤清
@@ -825,11 +832,24 @@ class DualViewModel(
     //   F2 再議 BUSY/預算化 join）。
     // - reconciler 先 join 句柄（有界 withTimeout(policyIoTimeoutMs)，F1-simple；
     //   F2 預算見 StageF2）：true→驗證讀，false/throw→FAILED+Unknown，
-    //   pending→保留 fence 續讀（pending 中 Known==B 視 inconclusive 續等，不搶結）。
+    //   pending→保留 fence 續讀（Stage G1：deferred 未完成時任何 Known（A 或 B）
+    //   皆 inconclusive 續留，不搶結；Known(B) 永 inconclusive（刪末輪特例），
+    //   Known(A) 視 stale 續留，不得 mismatch-settle）。
     // - 快徑收斂（P2#3）：ok==true 先一次 fresh read-after-ack，==sanitized 才
-    //   WRITE_SUCCESS，否則 REFRESHED（Unknown 則信 ack，保既有語義）。
+    //   WRITE_SUCCESS，!=sanitized 即 REFRESHED；Unknown 信 ack（保既有版本守衛
+    //   語義：stalePending／slowUnknown 的 ackRead 可能 Unknown（阻塞逾時／空後
+    //   端），仍以 sanitized 發布 SUCCESS；Stage G1 的嚴格 settle（Unknown 不信
+    //   ack）僅適用 reconciler／late-join 權威讀，見 decidePolicyTxSettle，快徑
+    //   維持既有以免既有 fence 測試抖動）。
+    // - Stage G1 settle 唯一真相（decidePolicyTxSettle）：可 settle IFF
+    //   （deferred 已完成＋權威讀==預期→SUCCESS；deferred 已證失敗→FAILED+Unknown；
+    //   deferred 完成＋權威讀非預期→mismatch REFRESHED）。deferred 未完成時任何
+    //   Known（A 或 B）都不 settle（保留 fence＋RECONCILING＋pending；顯示可
+    //   yielding 更新但 Known=false 或維持 Unknown）。
     // - TOCTOU-discard：F1-simple 仍回 IDLE+REFRESHED（保 84 綠；F2 再改移交/
     //   保留不回 IDLE，屆時 refresh 推進不終止）。
+    // - Stage G1 世代拆分：reconciler 只比 version＋ownership（policyOwnershipGen）；
+    //   refresh 期中（Tx 存活）永不推進 ownership，只 yielding（不碰 phase/pending）。
     data class PolicyTx(
         val txId: Long,
         val key: String,
@@ -862,6 +882,39 @@ class DualViewModel(
         val owned = activePolicyTx.compareAndSet(tx, null)
         if (owned) policyReconciling.remove(tx.key)
         return owned
+    }
+    // Stage G1 settle helper（Tx 釋放唯一真相；reconciler／refresh late-join／
+    // 快徑共用，免三處漂移）。
+    // - 可 settle IFF：deferred 已完成＋權威讀==預期→SUCCESS；deferred 已證失敗
+    //   （await 回 false／拋出）→FAILED＋Unknown（樂觀讀不得翻案）；deferred 完成
+    //   ＋權威讀非預期→mismatch REFRESHED（ground truth）。
+    // - deferred 未完成時任何 Known（A 或 B）都不 settle→Unresolved（保留 fence＋
+    //   RECONCILING＋pending；顯示可 yielding 更新但 Known=false 或維持 Unknown）。
+    // - deferred 完成＋讀 Unknown→Unresolved（reconciler／late-join 不信 ack，
+    //   等自動重查；快徑為保既有版本守衛綠仍信 ack，見上，不經此 helper）。
+    // CE 透傳（scope 取消，不吞為失敗）。
+    private sealed interface PolicyTxSettle {
+        data class Success(val packages: Set<String>) : PolicyTxSettle
+        data class Mismatch(val packages: Set<String>) : PolicyTxSettle
+        object Failed : PolicyTxSettle
+        object Unresolved : PolicyTxSettle
+    }
+    private suspend fun decidePolicyTxSettle(tx: PolicyTx, read: LoadResult): PolicyTxSettle {
+        if (!tx.deferred.isCompleted) return PolicyTxSettle.Unresolved
+        val ok: Boolean = try {
+            tx.deferred.await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+        if (!ok) return PolicyTxSettle.Failed
+        return when (read) {
+            is LoadResult.Known ->
+                if (read.packages == tx.sanitized) PolicyTxSettle.Success(read.packages)
+                else PolicyTxSettle.Mismatch(read.packages)
+            LoadResult.Unknown -> PolicyTxSettle.Unresolved
+        }
     }
     // F1 有界 join（F1-simple：withTimeout(policyIoTimeoutMs)；F2 再預算化）：
     // true=句柄已證成功，false=已證失敗（含回 false 與拋出），null=仍 pending
@@ -912,10 +965,12 @@ class DualViewModel(
             LoadResult.Unknown to false
         }
     }
-    // F1 快徑 read-after-ack（fresh，有界；失敗即 Unknown，信 ack 保既有語義）。
+    // F1 快徑 read-after-ack（fresh，有界；失敗即 Unknown，信 ack 保既有語義，
+    // Stage G1 維持：reconciler／late-join 才嚴格（Unknown 不信），快徑不改）。
     // 有界取 min(policyIoTimeoutMs, 1s)：預設 10s 下阻塞式測試 load（latch）會
     // pin opMutex 10s 致既有 5s await 超時；1s 上限保快徑即時性（生產 binder IPC
-    // 皆 ms 級，1s 已充裕；注入短超時 200ms 仍尊重原值）。Unknown 即信 ack。
+    // 皆 ms 級，1s 已充裕；注入短超時 200ms 仍尊重原值）。Unknown 即信 ack
+    // （保既有 stalePending／slowUnknown 綠；G1 嚴格化見 reconciler／late-join）。
     // detach 式（同 save）：讀跑獨立 async，await 僅等 bound；測試 latch 式
     // loadRaw 以 Thread.sleep 迴圈無視協程取消（catch InterruptedException 續跑），
     // withTimeout 包 onIo 無法搶佔，必須 detach 放棄慢讀（結果不再採納，僅免
@@ -954,7 +1009,8 @@ class DualViewModel(
     // UI 可觀測相位另由 policyPhaseEpoch 推進（見下），三者皆單調但用途正交：
     // clearGeneration/policyWriteGeneration＝操作身份，policyPhaseEpoch＝
     // UiState.policyEpoch（相位遷移可觀測），policyDraftVersion＋
-    // policyLoadGeneration＝TOCTOU fence（Phase1 語義不動，寫入成功/失敗才 bump）。
+    // policyFreshnessGen＝顯示 TOCTOU fence（Phase1 語義不動，寫入成功/失敗才 bump）；
+    // Tx 所有權另由 policyOwnershipGen（Stage G1 拆分，reconciler 只比此者）。
     private val clearGeneration = java.util.concurrent.atomic.AtomicLong()
     // Phase 3：UiState.policyEpoch 的推進源（相位變遷即 +1；QUEUED→SAVING 保持
     // 同一 epoch，僅翻相位，見 request/cancel/confirm/clear 各點）。
@@ -963,29 +1019,31 @@ class DualViewModel(
     // 僅告警並 arm，第二次才執行（防靜默單步刪除未見內容；見 clearPolicyDraft）。
     // Known（或 null-store）下直接單步執行並順手 disarm。
     // - blindClearArmedAtMs：arm 時刻 nowMonoMs()，-1＝未 arm（disarmed）。
-    // - blindClearArmedVersion／LoadGen：arm 當下 policyDraftVersion／
-    //   policyLoadGeneration 快照；第二 tap 比對失配即視為 stale（期間有
+    // - blindClearArmedVersion／FreshGen：arm 當下 policyDraftVersion／
+    //   policyFreshnessGen 快照；第二 tap 比對失配即視為 stale（期間有
     //   save/clear/refresh/load 推進）→重 arm（視為新的第一次）。
+    //   Stage G1：追 freshness（顯示），不追 ownership（Tx 期中 refresh yielding
+    //   只推 freshness，仍應視為新事實而重 arm）。
     // - TTL：now - armedAt > BLIND_CLEAR_TTL_MS 即過期→重 arm＋EXPIRED 文案。
     // 三者以 -1 哨兵同步（disarm 全置 -1，arm 全寫當下值）；isArmed 以
     // armedAtMs != -1 判定。AtomicLong：Unconfined 測試下多執行緒可見，
     // 生產全 Main 串行。
     private val blindClearArmedAtMs = AtomicLong(-1L)
     private val blindClearArmedVersion = AtomicLong(-1L)
-    private val blindClearArmedLoadGen = AtomicLong(-1L)
+    private val blindClearArmedFreshGen = AtomicLong(-1L)
 
     private fun isBlindClearArmed(): Boolean = blindClearArmedAtMs.get() != -1L
 
     private fun armBlindClearLocked() {
         blindClearArmedAtMs.set(nowMonoMs())
         blindClearArmedVersion.set(policyDraftVersion.get())
-        blindClearArmedLoadGen.set(policyLoadGeneration.get())
+        blindClearArmedFreshGen.set(policyFreshnessGen.get())
     }
 
     private fun disarmBlindClear() {
         blindClearArmedAtMs.set(-1L)
         blindClearArmedVersion.set(-1L)
-        blindClearArmedLoadGen.set(-1L)
+        blindClearArmedFreshGen.set(-1L)
     }
     // Phase 2 手動重新整理在途計數：policyRefreshing = count > 0（最後完成者清位，
     // 世代/版本丟棄的 stale 結果不提前清位，save bump 亦不洩漏）。
@@ -1197,9 +1255,9 @@ class DualViewModel(
             }
         }
         // Stage2:冷啟動載入政策草稿 (唯讀，不觸發任何寫入；失敗即留空，
-        // 不擋 probe/refresh)。
+        // 不擋 probe/refresh)。Stage G1：顯示 fence（version＋freshness）。
         viewModelScope.launch {
-            val generation = policyLoadGeneration.incrementAndGet()
+            val generation = policyFreshnessGen.incrementAndGet()
             val versionAtStart = policyDraftVersion.get()
             val store = hookPolicyStore
             val result = if (store == null) {
@@ -1212,7 +1270,7 @@ class DualViewModel(
             }
             _state.update { cur ->
                 if (policyDraftVersion.get() != versionAtStart ||
-                    policyLoadGeneration.get() != generation
+                    policyFreshnessGen.get() != generation
                 ) {
                     cur
                 } else if (result is LoadResult.Known) {
@@ -3797,8 +3855,10 @@ class DualViewModel(
     // 用法：所有將 policyDraftKnown 翻為 false 的寫入路徑（confirm-fail、
     // clear-fail、confirm/clear null-store、unknown-gate 拒絕重申）在同一次
     // _state.update（只翻 known、不清 draft）之前先呼叫此函數
-    // bump policyDraftVersion + policyLoadGeneration。bump 必須在 update 之前，
-    // 使晚到的 load 因 versionAtStart/generation 失配被丟棄。
+    // bump policyDraftVersion + policyFreshnessGen + policyOwnershipGen。
+    // bump 必須在 update 之前，
+    // 使晚到的 load 因 versionAtStart/freshness 失配被丟棄；晚到的 reconciler 因
+    // versionAtStart/ownership 失配被丟棄（Stage G1 拆分：顯示 vs 所有權）。
     //
     // 不變量：本函數與其後的 _state.update 之間不得插入 suspend，否則 fence
     // 失效（bump 與翻 Unknown 必須背靠背發生；一旦讓出，併發 load 可能插隊
@@ -3818,7 +3878,8 @@ class DualViewModel(
     //   Unknown，本就無 Known 可 fence；bump 只為統一寫入路徑語意）。
     private fun markPolicyUnknownLocked() {
         policyDraftVersion.incrementAndGet()
-        policyLoadGeneration.incrementAndGet()
+        policyFreshnessGen.incrementAndGet()
+        policyOwnershipGen.incrementAndGet()
     }
 
     // Stage A：核對中守衛（phase OR 集合雙層，防 state/集合瞬時窗口漂移）。
@@ -3839,9 +3900,11 @@ class DualViewModel(
     //   包裹；終態 _state.update 亦非 suspend。
     // - Stage F1：先有界 join 句柄（withTimeout 簡單版），再驗證讀（先join後讀）：
     //   false/throw（已證失敗）即 FAILED+Unknown 結清，不再重讀（樂觀污染不得
-    //   掩蓋已證失敗）；true 即正常驗證讀；pending（null）則保留 fence 續讀，
-    //   其中 Known==sanitized(B) 視 inconclusive 續等（不搶結，防 stale/樂觀讀
-    //   早熟；末輪仍結，保終止）。
+    //   掩蓋已證失敗）；true 即正常驗證讀；pending（null）則保留 fence 續讀。
+    // - Stage G1：deferred 未完成時任何 Known（A 或 B）都不 settle（保留 fence＋
+    //   RECONCILING＋pending；顯示可 yielding 更新但 Known=false）。joinPending
+    //   Known(B) 永 inconclusive（刪末輪特例）；Known(A) 不得 mismatch-settle
+    //   （視 stale 續留）。結清唯一真相見 decidePolicyTxSettle。
     // - loadResult 重試 N=3（store 零 API 新增，僅重讀）：每次重讀經
     //   boundedReconcileRead（withTimeout(policyIoTimeoutMs)＋獨立池 detach；
     //   Binder 不可中斷：逾時執行緒滯留獨立池，呼叫側計預算 hadReadTimeout）；
@@ -3855,9 +3918,11 @@ class DualViewModel(
     // - Stage F2 late-join：三讀皆 Unknown 且曾逾時時，句柄可能在讀期間已結；
     //   已完成即補 join 一次（即時回值，不耗預算）：已證失敗即 FAILED 結清
     //   （樂觀讀不得翻案），否則 unresolved 保留。
-    // - 終態 TOCTOU 守衛：啟動時取號（version 取樣 + generation 遞增），發布前
-    //   比對，期間若有新 save/refresh/load 推進即丟棄（最新者勝，不覆寫新事實）。
-    //   F1-simple 丟棄仍回 IDLE+REFRESHED（保 84 綠；F2 再改移交/保留不回 IDLE）。
+    // - 終態 TOCTOU 守衛：啟動時取號（version 取樣 + ownership 遞增），發布前
+    //   比對，期間若有新 save/fail 推進（version＋ownership）即丟棄（最新者勝，
+    //   不覆寫新事實）。Stage G1：reconciler 只比 ownership（version＋
+    //   ownershipGen）；refresh 期中 yielding 只推 freshness，永不致丟棄
+    //   （保留 fence，見 T3）。
     // - 終態不碰 loading（不擁有 busy：核對期間 refresh 可能持有 loading，誤清
     //   即消 spinner）；成功即 disarm。
     // - fence 移除只許 Tx-settle CAS（settlePolicyTx；終態分支直接結、unresolved
@@ -3868,7 +3933,7 @@ class DualViewModel(
         val sanitized = tx.sanitized
         viewModelScope.launch {
             val versionAtStart = policyDraftVersion.get()
-            val generation = policyLoadGeneration.incrementAndGet()
+            val ownership = policyOwnershipGen.incrementAndGet()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
             // 保留＋phase 續留 RECONCILING。外部取消（CE 重拋）仍經 settle=true
             // 清場，不殘留。
@@ -3888,8 +3953,9 @@ class DualViewModel(
                                 // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
                                 // 內判以 expected 為準（期間再有推進即丟棄，否則 FAILED）。
                                 // F1-5 鎖定：樂觀讀 B 不得翻案，已證失敗即 FAILED+Unknown。
+                                // Stage G1：只比 ownership（version＋ownershipGen）。
                                 if (policyDraftVersion.get() != versionAtStart ||
-                                    policyLoadGeneration.get() != generation
+                                    policyOwnershipGen.get() != ownership
                                 ) {
                                     _state.update { cur ->
                                         cur.copy(
@@ -3903,10 +3969,10 @@ class DualViewModel(
                                 } else {
                                     markPolicyUnknownLocked()
                                     val expV = versionAtStart + 1
-                                    val expG = generation + 1
+                                    val expO = ownership + 1
                                     _state.update { cur ->
                                         if (policyDraftVersion.get() != expV ||
-                                            policyLoadGeneration.get() != expG
+                                            policyOwnershipGen.get() != expO
                                         ) {
                                             cur.copy(
                                                 pendingPolicyWrite = null,
@@ -3934,7 +4000,6 @@ class DualViewModel(
                             settle = false
                             return@withTimeout
                         }
-                        val joinPending = join == null
                         var result: LoadResult = LoadResult.Unknown
                         var hadReadTimeout = false
                         delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
@@ -3942,13 +4007,15 @@ class DualViewModel(
                             val (r, timedOut) = boundedReconcileRead(store)
                             if (timedOut) hadReadTimeout = true
                             result = r
-                            // F1 inconclusive：pending 中 Known==B 不搶結，續等下一輪
-                            // （末輪仍結，保終止）。
+                            // Stage G1 inconclusive：deferred 未完成時任何 Known
+                            // （A 或 B）都不 settle，續等下一輪（刪末輪特例；
+                            // Known(A) 視 stale 續留，不得 mismatch-settle）。
+                            // deferred 已完成才可 break 交 settle helper 判定。
                             if (r is LoadResult.Known) {
-                                if (joinPending && r.packages == sanitized &&
-                                    i < POLICY_RECONCILE_RETRIES - 1
-                                ) {
-                                    delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                if (!tx.deferred.isCompleted) {
+                                    if (i < POLICY_RECONCILE_RETRIES - 1) {
+                                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                    }
                                     continue
                                 }
                                 break
@@ -3976,16 +4043,16 @@ class DualViewModel(
                         }
                         if (lateProvenFailed &&
                             policyDraftVersion.get() == versionAtStart &&
-                            policyLoadGeneration.get() == generation
+                            policyOwnershipGen.get() == ownership
                         ) {
                             // late-join 已證失敗：同 join==false，FAILED+Unknown
                             // （樂觀讀 B 不得翻案；mark＋expected  pattern 同上）。
                             markPolicyUnknownLocked()
                             val expV = versionAtStart + 1
-                            val expG = generation + 1
+                            val expO = ownership + 1
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != expV ||
-                                    policyLoadGeneration.get() != expG
+                                    policyOwnershipGen.get() != expO
                                 ) {
                                     cur.copy(
                                         pendingPolicyWrite = null,
@@ -4007,15 +4074,29 @@ class DualViewModel(
                             }
                         } else {
                             var keepFence = false
+                            // Stage G1：Known 結清經 settle helper（deferred 未完成
+                            // 即 Unresolved 續留；已完成才 Success/Mismatch/Failed）。
+                            // Unknown 維持既有逾時語義（逾時即 unresolved 續留，
+                            // 否則 IDLE＋Unknown）。
+                            val settleDecision: PolicyTxSettle? = if (finalResult is LoadResult.Known) {
+                                try {
+                                    decidePolicyTxSettle(tx, finalResult)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                }
+                            } else {
+                                null
+                            }
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != versionAtStart ||
-                                    policyLoadGeneration.get() != generation
+                                    policyOwnershipGen.get() != ownership
                                 ) {
                                     // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實
-                                    // （refresh/新 save 發布）勝出，核對放棄；保留當下
+                                    // （新 save/fail 發布）勝出，核對放棄；保留當下
                                     // draft/Known（不覆寫新事實），清 pending、回 IDLE＋
                                     // epoch+1＋REFRESHED，否則相位永留 RECONCILING 卡死
-                                    // 後續請求。
+                                    // 後續請求。Stage G1：refresh 期中 yielding 只推
+                                    // freshness，永不致此丟棄（保留 fence）。
                                     cur.copy(
                                         pendingPolicyWrite = null,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -4024,29 +4105,75 @@ class DualViewModel(
                                         msgKind = MsgKind.INFO,
                                     )
                                 } else if (finalResult is LoadResult.Known) {
-                                    disarmBlindClear()
-                                    if (finalResult.packages == sanitized) {
-                                        cur.copy(
-                                            pendingPolicyWrite = null,
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraft = finalResult.packages,
-                                            policyDraftKnown = true,
-                                            msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
-                                            msgKind = MsgKind.INFO,
-                                        )
-                                    } else {
-                                        // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
-                                        // truth 為準 + REFRESHED 明示（INFO）。
-                                        cur.copy(
-                                            pendingPolicyWrite = null,
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraft = finalResult.packages,
-                                            policyDraftKnown = true,
-                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                            msgKind = MsgKind.INFO,
-                                        )
+                                    when (settleDecision) {
+                                        is PolicyTxSettle.Success -> {
+                                            disarmBlindClear()
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = finalResult.packages,
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                        is PolicyTxSettle.Mismatch -> {
+                                            disarmBlindClear()
+                                            // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
+                                            // truth 為準 + REFRESHED 明示（INFO）。
+                                            // Stage G1：僅 deferred 完成才至此；
+                                            // 未完成（stale A）已在上行 Unresolved 續留。
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = finalResult.packages,
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                        is PolicyTxSettle.Failed -> {
+                                            // 已證失敗：FAILED＋Unknown（樂觀讀 B
+                                            // 不得翻案；mark＋expected pattern）。
+                                            markPolicyUnknownLocked()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraftKnown = false,
+                                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                                    msgKind = MsgKind.FAILED,
+                                                )
+                                            }
+                                        }
+                                        else -> {
+                                            // Unresolved（deferred 未完成＋Known）：
+                                            // 保留 fence＋RECONCILING＋pending；
+                                            // 顯示維持 Unknown（Known=false），
+                                            // 不解 fence（settle=false，late-join 可見）。
+                                            keepFence = true
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.RECONCILING,
+                                                policyDraftKnown = false,
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                                msgKind = MsgKind.CHANNEL,
+                                            )
+                                        }
                                     }
                                 } else if (hadReadTimeout) {
                                     // Stage F2 誠實 unresolved：Binder 滯留獨立池，
@@ -4057,7 +4184,7 @@ class DualViewModel(
                                     // 世代未變才到此（上行外判已過；此處內判兜底，
                                     // 期間推進即丟棄，免覆寫新事實）。
                                     if (policyDraftVersion.get() != versionAtStart ||
-                                        policyLoadGeneration.get() != generation
+                                        policyOwnershipGen.get() != ownership
                                     ) {
                                         cur.copy(
                                             pendingPolicyWrite = null,
@@ -4091,13 +4218,14 @@ class DualViewModel(
                     }
                 } catch (te: TimeoutCancellationException) {
                     // Stage F2 總預算超限：誠實 unresolved（不回 IDLE、不解 fence），
-                    // 但期間若有新事實（refresh/新 save 推進世代）則丟棄回 IDLE＋
+                    // 但期間若有新事實（新 save/fail 推進 ownership）則丟棄回 IDLE＋
                     // REFRESHED（保留新事實的 draft/Known，清 pending，解 fence），
                     // 免覆寫新事實（同 hadReadTimeout 內判）。
+                    // Stage G1：refresh 期中 yielding 只推 freshness，不致此丟棄。
                     var keepFenceBudget = true
                     _state.update { cur ->
                         if (policyDraftVersion.get() != versionAtStart ||
-                            policyLoadGeneration.get() != generation
+                            policyOwnershipGen.get() != ownership
                         ) {
                             keepFenceBudget = false
                             cur.copy(
@@ -4146,8 +4274,10 @@ class DualViewModel(
     // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
     // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
     // 呈現；成功即 disarm；不碰 loading；子 job 可取消，見 confirm 註記）。
-    // Stage F1：同 confirm 先有界 join（false/throw→FAILED+Unknown 結清；
-    // pending 中 Known-empty(B) 視 inconclusive 續等，末輪仍結）。
+    // Stage F1：同 confirm 先有界 join（false/throw→FAILED+Unknown 結清）。
+    // Stage G1：deferred 未完成時任何 Known（empty 或非空）都不 settle，續留
+    // （刪末輪特例；非空 A 視 stale 續留，不得 mismatch-settle）。結清經
+    // decidePolicyTxSettle（clear 的 sanitized＝empty）。
     // Stage F2：本體跑 Main、僅讀切獨立池、總預算寫死上限、超限/三讀逾時即誠實
     // unresolved（REFRESH_FAILED/CHANNEL＋Known=false＋phase 續留 RECONCILING，
     // clear 本無 pending；不回 IDLE、不解 fence），餘見 confirm。
@@ -4155,7 +4285,7 @@ class DualViewModel(
         val store = tx.store
         viewModelScope.launch {
             val versionAtStart = policyDraftVersion.get()
-            val generation = policyLoadGeneration.incrementAndGet()
+            val ownership = policyOwnershipGen.incrementAndGet()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋phase 續留
             // RECONCILING。外部取消（CE 重拋）仍經 settle=true 清場，不殘留。
             var settle = true
@@ -4170,8 +4300,9 @@ class DualViewModel(
                         if (join == false) {
                             try {
                                 // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
+                                // Stage G1：只比 ownership。
                                 if (policyDraftVersion.get() != versionAtStart ||
-                                    policyLoadGeneration.get() != generation
+                                    policyOwnershipGen.get() != ownership
                                 ) {
                                     _state.update { cur ->
                                         cur.copy(
@@ -4184,10 +4315,10 @@ class DualViewModel(
                                 } else {
                                     markPolicyUnknownLocked()
                                     val expV = versionAtStart + 1
-                                    val expG = generation + 1
+                                    val expO = ownership + 1
                                     _state.update { cur ->
                                         if (policyDraftVersion.get() != expV ||
-                                            policyLoadGeneration.get() != expG
+                                            policyOwnershipGen.get() != expO
                                         ) {
                                             cur.copy(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
@@ -4213,7 +4344,6 @@ class DualViewModel(
                             settle = false
                             return@withTimeout
                         }
-                        val joinPending = join == null
                         var result: LoadResult = LoadResult.Unknown
                         var hadReadTimeout = false
                         delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
@@ -4222,11 +4352,12 @@ class DualViewModel(
                             if (timedOut) hadReadTimeout = true
                             result = r
                             if (r is LoadResult.Known) {
-                                // clear 的 B=empty：pending 中 Known-empty 不搶結，續等。
-                                if (joinPending && r.packages.isEmpty() &&
-                                    i < POLICY_RECONCILE_RETRIES - 1
-                                ) {
-                                    delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                // Stage G1：deferred 未完成時任何 Known 續留
+                                // （empty B 永 inconclusive，非空 A 視 stale）。
+                                if (!tx.deferred.isCompleted) {
+                                    if (i < POLICY_RECONCILE_RETRIES - 1) {
+                                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                    }
                                     continue
                                 }
                                 break
@@ -4252,14 +4383,14 @@ class DualViewModel(
                         }
                         if (lateProvenFailed &&
                             policyDraftVersion.get() == versionAtStart &&
-                            policyLoadGeneration.get() == generation
+                            policyOwnershipGen.get() == ownership
                         ) {
                             markPolicyUnknownLocked()
                             val expV = versionAtStart + 1
-                            val expG = generation + 1
+                            val expO = ownership + 1
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != expV ||
-                                    policyLoadGeneration.get() != expG
+                                    policyOwnershipGen.get() != expO
                                 ) {
                                     cur.copy(
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -4279,13 +4410,23 @@ class DualViewModel(
                             }
                         } else {
                             var keepFence = false
+                            val settleDecision: PolicyTxSettle? = if (finalResult is LoadResult.Known) {
+                                try {
+                                    decidePolicyTxSettle(tx, finalResult)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                }
+                            } else {
+                                null
+                            }
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != versionAtStart ||
-                                    policyLoadGeneration.get() != generation
+                                    policyOwnershipGen.get() != ownership
                                 ) {
                                     // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實勝出，
                                     // 核對放棄；保留當下 draft/Known，回 IDLE＋epoch+1＋
                                     // REFRESHED（見 confirm 分支）。
+                                    // Stage G1：refresh yielding 不致此丟棄。
                                     cur.copy(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -4293,31 +4434,67 @@ class DualViewModel(
                                         msgKind = MsgKind.INFO,
                                     )
                                 } else if (finalResult is LoadResult.Known) {
-                                    disarmBlindClear()
-                                    if (finalResult.packages.isEmpty()) {
-                                        cur.copy(
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraft = emptySet(),
-                                            policyDraftKnown = true,
-                                            msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                                            msgKind = MsgKind.INFO,
-                                        )
-                                    } else {
-                                        cur.copy(
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraft = finalResult.packages,
-                                            policyDraftKnown = true,
-                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                            msgKind = MsgKind.INFO,
-                                        )
+                                    when (settleDecision) {
+                                        is PolicyTxSettle.Success -> {
+                                            disarmBlindClear()
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = emptySet(),
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                        is PolicyTxSettle.Mismatch -> {
+                                            disarmBlindClear()
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = finalResult.packages,
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                        is PolicyTxSettle.Failed -> {
+                                            markPolicyUnknownLocked()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraftKnown = false,
+                                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                                    msgKind = MsgKind.FAILED,
+                                                )
+                                            }
+                                        }
+                                        else -> {
+                                            keepFence = true
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.RECONCILING,
+                                                policyDraftKnown = false,
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                                msgKind = MsgKind.CHANNEL,
+                                            )
+                                        }
                                     }
                                 } else if (hadReadTimeout) {
                                     // Stage F2 誠實 unresolved：同 confirm（clear 本無
                                     // pending；phase 續留 RECONCILING，不解 fence）。
                                     if (policyDraftVersion.get() != versionAtStart ||
-                                        policyLoadGeneration.get() != generation
+                                        policyOwnershipGen.get() != ownership
                                     ) {
                                         cur.copy(
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -4349,11 +4526,12 @@ class DualViewModel(
                     }
                 } catch (te: TimeoutCancellationException) {
                     // Stage F2 總預算超限：誠實 unresolved（clear 本無 pending；
-                    // 世代推進即丟棄回 IDLE＋REFRESHED，同 confirm）。
+                    // ownership 推進即丟棄回 IDLE＋REFRESHED，同 confirm）。
+                    // Stage G1：refresh yielding 不致此丟棄。
                     var keepFenceBudget = true
                     _state.update { cur ->
                         if (policyDraftVersion.get() != versionAtStart ||
-                            policyLoadGeneration.get() != generation
+                            policyOwnershipGen.get() != ownership
                         ) {
                             keepFenceBudget = false
                             cur.copy(
@@ -4394,33 +4572,38 @@ class DualViewModel(
 
     // 重讀草稿 (供 init 後/外部變化後手動同步)：唯讀，不觸發寫入。
     // Phase 2 可觀測化最小版：獨立 policyRefreshing 位（不碰全域 loading，
-    // 故無 sibling 誤清問題；連打由 generation 丟棄保證最新者勝，計數器保證
+    // 故無 sibling 誤清問題；連打由 freshness 丟棄保證最新者勝，計數器保證
     // 最後完成者才清位）。失敗（Unknown，含 null-store）寫 CHANNEL 一次；
     // 成功（Known）正常更新 draft/Known；若前 msg 為 FAILED/CHANNEL 則改寫為
     // INFO「已重新整理」以免舊錯誤洗屏，其餘保留既有 msg。
     // 手動入口：MainActivity 政策區塊「重新整理草稿」按鈕直呼本函數。
-    // Stage F2 honest-unresolved 恢復（late-join）：
+    // Stage F2 honest-unresolved 恢復（late-join）＋G1 世代拆分：
     // - Tx 存活（reconciler 已誠實 unresolved 退出，settle=false 保留 fence）
     //   時，本函數為唯一恢復路徑：
-    //   - 本次讀 Known 且 deferred 已完成→late-join 結清並 Tx-settle CAS：
-    //     成功（await true）→IDLE＋Known（==sanitized 即 WRITE_SUCCESS/
-    //     CLEAR_SUCCESS，否則 REFRESHED ground truth）＋pending 清空；
-    //     失敗（false/拋出）→IDLE＋FAILED/Unknown（WRITE_FAILED/CLEAR_FAILED，
-    //     樂觀讀不得翻案）＋pending 清空。
-    //   - 其餘（deferred 未完成或本次 Unknown）→讓位（yielding）：按正常
-    //     refresh 發布（覆寫 TIMEOUT 的 msg/draft/Known，但不碰 phase/pending；
-    //     phase 續留 RECONCILING，pending 保留），reconciler 若仍在跑見世代
-    //     推進即 TOCTOU 丟棄回 IDLE（見 reconcilerStalePublish 測試）；若
-    //     reconciler 已退出（unresolved），則 phase 續留 RECONCILING 待下一次
-    //     late-join（deferred 完成後再 refresh 即結清）。
-    //   世代失配（期間另有新事實）一律丟棄，不覆寫。
+    //   - 本次讀 Known 且 deferred 已完成→late-join 結清並 Tx-settle CAS
+    //     （經 decidePolicyTxSettle：成功→IDLE＋Known（==sanitized 即
+    //     WRITE_SUCCESS/CLEAR_SUCCESS，否則 REFRESHED ground truth）＋pending
+    //     清空；失敗→IDLE＋FAILED/Unknown＋pending 清空，樂觀讀不得翻案）。
+    //     結清判定只比 ownership（version＋ownershipGen），refresh 期中永不
+    //     推進 ownership，故 yielding 不致丟棄 reconciler（保留 fence）。
+    //   - 其餘（deferred 未完成或本次 Unknown）→讓位（yielding）：可更新顯示
+    //     （draft/msg），但 Known=false 或維持 Unknown，不碰 phase/pending；
+    //     phase 續留 RECONCILING，pending 保留，不 disarm；reconciler 見
+    //     ownership 未變即續留（不丟棄）；若 reconciler 已退出（unresolved），
+    //     則 phase 續留 RECONCILING 待下一次 late-join（deferred 完成後再
+    //     refresh 即結清）。
+    //   世代失配（期間另有新事實：version/ownership 推進）一律丟棄，不覆寫。
+    // - 無 Tx 時：顯示 fence（version＋freshness），最新者勝。
     fun refreshPolicyDraft() {
         viewModelScope.launch {
             policyRefreshInFlight.incrementAndGet()
             _state.update { it.copy(policyRefreshing = true) }
             try {
-                val generation = policyLoadGeneration.incrementAndGet()
+                // Stage G1：顯示取號（freshness 遞增），所有權快照（不遞增，
+                // Tx 期中永不推進 ownership）。
+                val freshGen = policyFreshnessGen.incrementAndGet()
                 val versionAtStart = policyDraftVersion.get()
+                val ownershipSnap = policyOwnershipGen.get()
                 val store = hookPolicyStore
                 val result = if (store == null) {
                     LoadResult.Unknown
@@ -4435,7 +4618,9 @@ class DualViewModel(
                 val txSnap = activePolicyTx.get()
                 // late-join 僅在「Tx 存活＋本次 Known＋deferred 已完成」時嘗試：
                 // await 即時回值（不耗預算）；CE 透傳；異常視為已證失敗。
-                // 非此條件一律 null（走丟棄/正常路徑，不搶結）。
+                // 非此條件一律 null（走 yielding/正常路徑，不搶結）。
+                // Stage G1：經 settle helper（deferred 未完成＋Known 即 yielding，
+                // 不 settle）。
                 val lateJoinOk: Boolean? = if (txSnap != null && result is LoadResult.Known &&
                     txSnap.deferred.isCompleted
                 ) {
@@ -4450,35 +4635,47 @@ class DualViewModel(
                     null
                 }
                 // 已證失敗的 fence 必須在 update 前背靠背 bump（Phase 1 語義：
-                // 失敗是新事實，舊 load 的 Known 已過期）。僅當「世代未變＋
+                // 失敗是新事實，舊 load 的 Known 已過期）。僅當「ownership 未變＋
                 // Tx 仍為同一」才 bump；否則不 bump（直接丟棄）。
                 // 成功路徑不 bump（發布 Known 本身即新事實，舊 load 世代已落後）。
+                // Stage G1：只比 ownership（version＋ownershipGen），不比 freshness。
                 val lateFailMarked: Boolean
                 val lateFailExpV: Long
-                val lateFailExpG: Long
+                val lateFailExpO: Long
                 if (txSnap != null && result is LoadResult.Known && lateJoinOk == false &&
                     policyDraftVersion.get() == versionAtStart &&
-                    policyLoadGeneration.get() == generation &&
+                    policyOwnershipGen.get() == ownershipSnap &&
                     activePolicyTx.get() === txSnap
                 ) {
                     markPolicyUnknownLocked()
                     lateFailMarked = true
                     lateFailExpV = versionAtStart + 1
-                    lateFailExpG = generation + 1
+                    lateFailExpO = ownershipSnap + 1
                 } else {
                     lateFailMarked = false
                     lateFailExpV = -1L
-                    lateFailExpG = -1L
+                    lateFailExpO = -1L
                 }
                 var lateSettled = false
                 _state.update { cur ->
-                    if (!lateFailMarked &&
-                        (policyDraftVersion.get() != versionAtStart ||
-                            policyLoadGeneration.get() != generation)
+                    // Stage G1 丟棄 guard：Tx 期中比 ownership（late-join／yielding
+                    // 的 Tx fence），無 Tx 比 freshness（顯示 fence）。
+                    // lateFailMarked 自 bump 已納入期望，不經此前判。
+                    val staleForTx = policyDraftVersion.get() != versionAtStart ||
+                        policyOwnershipGen.get() != ownershipSnap
+                    val staleForDisplay = policyDraftVersion.get() != versionAtStart ||
+                        policyFreshnessGen.get() != freshGen
+                    if (!lateFailMarked && txSnap != null && staleForTx &&
+                        !(result is LoadResult.Known && lateJoinOk == null)
                     ) {
+                        // Tx 期中 late-join／失敗路徑：ownership 失配即丟棄。
+                        // yielding（Known＋未完成）走下行 freshness 判定，不經此處
+                        // （refresh yielding 只推 freshness，永不致 Tx 丟棄）。
+                        cur
+                    } else if (!lateFailMarked && txSnap == null && staleForDisplay) {
                         cur
                     } else if (txSnap != null) {
-                        // Tx 期中：先判 late-join（Known＋已完成），否則丟棄。
+                        // Tx 期中：先判 late-join（Known＋已完成），否則 yielding。
                         if (result is LoadResult.Known && lateJoinOk != null) {
                             // 世代未變（上行外判已過），可結清。仍需確認 Tx
                             // 仍為同一（期間無人結清/替換，否則丟棄免雙結）。
@@ -4490,7 +4687,7 @@ class DualViewModel(
                                 // expected 為準：期間再有推進即丟棄轉
                                 // IDLE＋REFRESHED，免覆寫新事實）。
                                 if (policyDraftVersion.get() != lateFailExpV ||
-                                    policyLoadGeneration.get() != lateFailExpG
+                                    policyOwnershipGen.get() != lateFailExpO
                                 ) {
                                     lateSettled = true
                                     cur.copy(
@@ -4570,23 +4767,34 @@ class DualViewModel(
                                 }
                             }
                         } else {
-                            // Tx 期中讓位（yielding）：deferred 未完成或本次 Unknown
-                            // 時，仍按正常 refresh 發布（覆寫 TIMEOUT/REFRESH_FAILED
-                            // 的 msg/draft/Known，但不碰 phase/pending；phase 續留
-                            // RECONCILING，pending 保留，reconciler 見世代推進即
-                            // TOCTOU 丟棄回 IDLE，見 reconcilerStalePublish 測試）。
+                            // Stage G1 Tx 期中讓位（yielding）：deferred 未完成或
+                            // 本次 Unknown 時，可更新顯示（draft/msg），但
+                            // Known=false 或維持 Unknown，不碰 phase/pending；
+                            // phase 續留 RECONCILING，pending 保留，不 disarm；
+                            // ownership 未推進，reconciler 續留（不丟棄）。
                             // 唯 late-join（Known＋已完成，上行分支）才結清 Tx。
-                            if (result is LoadResult.Known) {
-                                disarmBlindClear()
+                            // 世代失配（新事實：version 推進，或同顯示新 refresh
+                            // 的 freshness 推進）即丟棄，不覆寫。
+                            // Tx 已結（late-join 併發先結）亦丟棄，免覆寫已結 IDLE。
+                            if (activePolicyTx.get() !== txSnap) {
+                                cur
+                            } else if (policyDraftVersion.get() != versionAtStart ||
+                                policyFreshnessGen.get() != freshGen
+                            ) {
+                                cur
+                            } else if (result is LoadResult.Known) {
+                                // G1：deferred 未完成＋Known（A 或 B）不 settle；
+                                // 顯示可 yielding 更新（draft＝讀值），但 Known=false，
+                                // 不 disarm，不碰 phase/pending（保留 fence）。
                                 if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                                     cur.copy(
                                         policyDraft = result.packages,
-                                        policyDraftKnown = true,
+                                        policyDraftKnown = false,
                                         msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
                                         msgKind = MsgKind.INFO,
                                     )
                                 } else {
-                                    cur.copy(policyDraft = result.packages, policyDraftKnown = true)
+                                    cur.copy(policyDraft = result.packages, policyDraftKnown = false)
                                 }
                             } else {
                                 if (store == null) {
@@ -5047,7 +5255,9 @@ class DualViewModel(
                         if (ok) {
                             // Stage F1 快徑收斂（P2#3）：ok==true 先一次 fresh
                             // read-after-ack，==sanitized 才 WRITE_SUCCESS，
-                            // 否則 REFRESHED（Unknown 則信 ack，保既有語義）。
+                            // !=sanitized 即 REFRESHED；Unknown 信 ack（保既有
+                            // 版本守衛語義；Stage G1 的 settle 嚴格化僅適用
+                            // reconciler／late-join，見 decidePolicyTxSettle）。
                             // 仍在 opMutex 內，讀寫同一 store，無需另取號；
                             // 發布前 bump 照舊（TOCTOU #2）。
                             val ackRead = try {
@@ -5055,11 +5265,14 @@ class DualViewModel(
                             } catch (e: CancellationException) {
                                 throw e
                             }
-                            // TOCTOU (#2): bump version + load-generation so any in-flight
-                            // load started before this save is discarded instead of
-                            // overwriting the fresh Known state.
+                            // TOCTOU (#2): bump version + freshness + ownership
+                            // so any in-flight load started before this save is
+                            // discarded instead of overwriting the fresh Known
+                            // state. Stage G1：顯示＋所有權同推（無 Tx 在途，
+                            // ownership 推進無害；有舊 reconciler 亦應丟棄）。
                             policyDraftVersion.incrementAndGet()
-                            policyLoadGeneration.incrementAndGet()
+                            policyFreshnessGen.incrementAndGet()
+                            policyOwnershipGen.incrementAndGet()
                             // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                             disarmBlindClear()
                             if (ackRead is LoadResult.Known && ackRead.packages != sanitized) {
@@ -5142,9 +5355,9 @@ class DualViewModel(
     // clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠覆寫未見內容，
     // 故第二步不受 unknown 門控阻擋）。Known（或 null-store，無遠端內容可刪）
     // 維持單步。保持 clearGeneration/inFlight 互斥。
-    // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／loadGen
+    // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／freshGen
     // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
-    // EXPIRED 文案），再判世代（version／loadGen 失配→重 arm＋FIRST 文案），
+    // EXPIRED 文案），再判世代（version／freshGen 失配→重 arm＋FIRST 文案），
     // 兩者皆過才 disarm 執行。BUSY／RECONCILING 拒絕一律保留既有 arm（不碰
     // 三元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
     fun clearPolicyDraft() {
@@ -5205,7 +5418,7 @@ class DualViewModel(
                 return
             }
             if (blindClearArmedVersion.get() != policyDraftVersion.get() ||
-                blindClearArmedLoadGen.get() != policyLoadGeneration.get()
+                blindClearArmedFreshGen.get() != policyFreshnessGen.get()
             ) {
                 armBlindClearLocked()
                 _state.update {
@@ -5354,17 +5567,18 @@ class DualViewModel(
                     if (ok) {
                         // Stage F1 快徑收斂（clear 對稱）：ok==true 先一次 fresh
                         // read-after-ack，Known-empty 才 CLEAR_SUCCESS，否則
-                        // REFRESHED（Unknown 信 ack，保既有語義）。
+                        // REFRESHED；Unknown 信 ack（保既有語義）。
                         val ackRead = try {
                             readAfterAck(store)
                         } catch (e: CancellationException) {
                             throw e
                         }
-                        // TOCTOU (#2): bump version + load-generation so any in-flight
-                        // load started before this clear is discarded instead of
-                        // overwriting the fresh Known state.
+                        // TOCTOU (#2): bump version + freshness + ownership
+                        // so any in-flight load started before this clear is
+                        // discarded instead of overwriting the fresh Known state.
                         policyDraftVersion.incrementAndGet()
-                        policyLoadGeneration.incrementAndGet()
+                        policyFreshnessGen.incrementAndGet()
+                        policyOwnershipGen.incrementAndGet()
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         disarmBlindClear()
                         if (ackRead is LoadResult.Known && ackRead.packages.isNotEmpty()) {
