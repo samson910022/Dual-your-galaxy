@@ -16,6 +16,10 @@ import kotlinx.coroutines.CancellationException
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
+    // Stage G2：App-scoped PolicyTxCoordinator（跨 VM 最小 coordinator；
+    // MainActivity factory 經 applicationContext 取用；VM onCleared 不清除）。
+    val policyTxCoordinator = PolicyTxCoordinator()
+
     override fun onCreate() {
         super.onCreate()
         XposedServiceHelper.registerListener(this)

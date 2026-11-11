@@ -87,6 +87,8 @@
          正在核對、請勿重試；pending 保留，reconciler 核對中）。 -->
     <string name="policy_write_timeout">寫入政策逾時，結果未知，正在核對，請勿重試</string>
     <string name="policy_clear_timeout">清除草稿逾時，結果未知，正在核對，請勿重試</string>
+    <!-- Stage G2：deferred 完成後單次權威重查仍未知（unresolved；按鈕即重新整理草稿）。 -->
+    <string name="policy_unresolved_refresh">結果仍未知，請點「重新整理草稿」確認結果</string>
     <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
     <string name="policy_refreshed">已重新整理政策草稿</string>
     <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>

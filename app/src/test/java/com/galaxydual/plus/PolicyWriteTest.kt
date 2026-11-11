@@ -82,6 +82,7 @@ class PolicyWriteTest {
         selectionStore: SelectionStore? = null,
         policyIoTimeoutMs: Long = DualViewModel.POLICY_IO_TIMEOUT_MS,
         policyText: (PolicyText) -> String = { it.defaultText() },
+        policyTxCoordinator: PolicyTxCoordinator? = null,
     ): DualViewModel {
         val vm = DualViewModel(
             repo = DualRepository(NoOpGateway()),
@@ -102,6 +103,7 @@ class PolicyWriteTest {
             selectionStore = selectionStore,
             policyIoTimeoutMs = policyIoTimeoutMs,
             policyText = policyText,
+            policyTxCoordinator = policyTxCoordinator,
         )
         vms.add(vm)
         // 等 init 的政策草稿載入完成,避免其 _state.update 與 confirm 競爭。
@@ -4110,5 +4112,209 @@ class PolicyWriteTest {
         await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
         assertEquals(setOf("com.B"), vm.state.value.policyDraft)
         assertNull(activeTxOf(vm))
+    }
+
+    // Stage G2 跨 VM 反射輔助（P3：認領 fence／舊 settle 不清／新 settle 雙清）。
+    private fun coordinatorTxOf(coord: PolicyTxCoordinator): Any? = coord.activeTx.get()
+
+    private fun setLocalTx(vm: DualViewModel, tx: Any?) {
+        val f = DualViewModel::class.java.getDeclaredField("activePolicyTx").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val ref = f.get(vm) as java.util.concurrent.atomic.AtomicReference<Any?>
+        ref.set(tx)
+    }
+
+    private fun callSettlePolicyTx(vm: DualViewModel, tx: Any?): Boolean {
+        val m = DualViewModel::class.java.getDeclaredMethod("settlePolicyTx", DualViewModel.PolicyTx::class.java)
+            .apply { isAccessible = true }
+        return m.invoke(vm, tx) as Boolean
+    }
+
+    private fun callTryClaim(vm: DualViewModel, tx: Any?): Boolean {
+        val m = DualViewModel::class.java.getDeclaredMethod(
+            "tryClaimCoordinatorPublish",
+            DualViewModel.PolicyTx::class.java,
+        ).apply { isAccessible = true }
+        return m.invoke(vm, tx) as Boolean
+    }
+
+    private fun newTestTx(
+        store: HookPolicyStore,
+        sanitized: Set<String> = setOf("com.B"),
+        isClear: Boolean = false,
+    ): DualViewModel.PolicyTx {
+        return DualViewModel.PolicyTx(
+            txId = -1L,
+            key = "policy-test",
+            deferred = kotlinx.coroutines.CompletableDeferred(true),
+            sanitized = sanitized,
+            store = store,
+            isClear = isClear,
+        )
+    }
+
+    // Stage G2 P3-1：跨 VM 認領 fence——舊 VM 逾時 handover 後重建，新 VM init
+    // 認領同一 Tx（RECONCILING＋pending 保留＋Unknown），init load 不覆寫 fence；
+    // 放行 save＋load 後新 VM 終態 IDLE＋Known(B)＋雙清（本地＋coordinator）。
+    @Test
+    fun g2_claimFence_newVmInheritsAndSettles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            val field = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            (field.get(vm1) as MutableStateFlow<UiState>).value =
+                (field.get(vm1) as MutableStateFlow<UiState>).value.copy(pendingPolicyWrite = pendingB)
+
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(pendingB, vm1.state.value.pendingPolicyWrite)
+            val tx1 = activeTxOf(vm1)
+            assertNotNull(tx1)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // 模擬旋轉：舊 VM scope 取消（reconciler 取消、settle=false 保留 coordinator；
+            // 慢 save 跑在 coordinator 域故存活）。
+            vm1.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(300)
+            // coordinator 仍持 Tx（舊 VM 未清），本地仍持（取消不清除）。
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // 新 VM 同一 coordinator＋store 建構，init 同步認領（不經 makeVm 的 Known 等待）。
+            val vm2 = DualViewModel(
+                repo = DualRepository(NoOpGateway()),
+                gatewayPrivilege = Privilege.NONE,
+                elevators = emptyList(),
+                preference = ChannelPreference.AUTO,
+                appPackageName = "com.example.test",
+                persistPreference = null,
+                suPresentCheck = { false },
+                shizukuAuthCheck = { false },
+                activeGateway = NoOpGateway(),
+                currentChannel = ResolvedChannel.NOOP,
+                hookDirectReads = { listOf(MarkerRead.Readable(null)) },
+                hookDiagnosticGateways = { emptyList() },
+                hookPolicyStore = store,
+                currentUserId = { 0 },
+                policyIoTimeoutMs = 200,
+                policyTxCoordinator = coord,
+            )
+            vms.add(vm2)
+            // 認領 fence：RECONCILING＋pending(B)＋Unknown，不被 init load 覆寫。
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            assertSame(tx1, activeTxOf(vm2))
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // 放行：save 落盤 B＋讀回 B，新 VM 終態 IDLE＋Known(B)＋雙清。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            loadRelease.set(true)
+            await(timeoutMs = 15_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+            await(timeoutMs = 5_000L) { reconcilingKeysOf(vm2).isEmpty() }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage G2 P3-2：舊 VM settle 不清——coordinator 已持新 Tx 時，舊 Tx 的 settle
+    // （含 tryClaim）不得清掉新 Tx（CAS 失配回 false，coordinator 仍為新 Tx）。
+    @Test
+    fun g2_oldSettle_doesNotClearNewTx() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyTxCoordinator = coord)
+            val oldTx = newTestTx(fake.store, setOf("com.OLD"))
+            val newTx = newTestTx(fake.store, setOf("com.NEW"))
+            coord.activeTx.set(newTx)
+            setLocalTx(vm, oldTx)
+
+            // 舊 settle：本地失配清除（回 true）但 coordinator 不得被清（仍新 Tx）。
+            assertTrue(callSettlePolicyTx(vm, oldTx))
+            assertSame(newTx, coordinatorTxOf(coord))
+            // tryClaim 同理：敗者回 false、不碰 coordinator（仍新 Tx），僅清本地。
+            setLocalTx(vm, oldTx)
+            assertFalse(callTryClaim(vm, oldTx))
+            assertSame(newTx, coordinatorTxOf(coord))
+            assertNull(activeTxOf(vm))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage G2 P3-3：新 VM settle 雙清——coordinator＋本地同為當前 Tx 時 settle
+    // 成功回 true，雙欄同清＋reconciling 移除（舊測試僅斷本地，此處鎖定雙清）。
+    @Test
+    fun g2_newSettle_clearsBothLocalAndCoordinator() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyTxCoordinator = coord)
+            val tx = newTestTx(fake.store, setOf("com.B"))
+            setLocalTx(vm, tx)
+            coord.activeTx.set(tx)
+            val rf = DualViewModel::class.java.getDeclaredField("policyReconciling").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            (rf.get(vm) as MutableSet<String>).add(tx.key)
+
+            assertTrue(callSettlePolicyTx(vm, tx))
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 }

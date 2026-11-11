@@ -689,6 +689,10 @@ class DualViewModel(
     // CancellationException 捕捉順序亦由該測試鎖定——順序顛倒則超時被重拋為
     // 取消，測試失敗）。生產一律預設值，不另傳。
     private val policyIoTimeoutMs: Long = POLICY_IO_TIMEOUT_MS,
+    // Stage G2 (P2#4#5)：跨 VM 最小 coordinator（App-scoped，見 PolicyTxCoordinator）。
+    // null=本地單 VM 模式（既有測試路徑，行為不變）；非 null 時 handoverTx 同步
+    // 登記本地＋coordinator，onCleared 刻意不清除，新 VM init 認領。
+    private val policyTxCoordinator: PolicyTxCoordinator? = null,
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
@@ -850,6 +854,8 @@ class DualViewModel(
     //   保留不回 IDLE，屆時 refresh 推進不終止）。
     // - Stage G1 世代拆分：reconciler 只比 version＋ownership（policyOwnershipGen）；
     //   refresh 期中（Tx 存活）永不推進 ownership，只 yielding（不碰 phase/pending）。
+    // - Stage G2：Tx 攜 pending（跨 VM 認領：新 VM 繼承 pending＋
+    //   RECONCILING＋Unknown＋reconciler join 同一 deferred）。
     data class PolicyTx(
         val txId: Long,
         val key: String,
@@ -857,6 +863,7 @@ class DualViewModel(
         val sanitized: Set<String>,
         val store: HookPolicyStore,
         val isClear: Boolean,
+        val pending: PendingPolicyWrite? = null,
     )
     private val policyTxId = AtomicLong(0L)
     private val activePolicyTx = AtomicReference<PolicyTx?>(null)
@@ -878,10 +885,213 @@ class DualViewModel(
     }
     // F1 Tx-settle：唯擁有者可清 fence（CAS＋reconciling移除同組）。回 true 表
     // 本 Tx 結清（含首次）；false 表 Tx 已非擁有者（併發已結，不重複移除）。
+    // Stage G2：同清 coordinator（CAS，跨 VM 唯一真相；onCleared 刻意不清除，
+    // 僅 settle 清）。
     private fun settlePolicyTx(tx: PolicyTx): Boolean {
         val owned = activePolicyTx.compareAndSet(tx, null)
+        policyTxCoordinator?.activeTx?.compareAndSet(tx, null)
         if (owned) policyReconciling.remove(tx.key)
         return owned
+    }
+
+    // Stage G2 P2-1：settle-CAS 先行、勝者才發布（取代 write-only 的
+    // creatorEpoch/vmEpoch：刪除該二欄，以 CAS 仲裁防雙發布）。
+    // - coordinator 存在時以其為跨 VM 仲裁：publish 前先 CAS(tx→null) 搶發布權；
+    //   勝者（CAS 成功）才發布，本地 fence 仍保留至發布後經 settlePolicyTx 清
+    //   （發布期間本地仍持 Tx，新 save 仍被擋）；敗者（CAS 失敗，coordinator 已空
+    //   或被新 Tx 替換）僅清本地＋reconciling，不發布、不碰 coordinator（舊 VM
+    //   殘留 handler 不得覆寫新 VM fence，亦不得清掉新 Tx——不同物件 CAS 本就失敗）。
+    // - 無 coordinator（本地單 VM 既有測試路徑）一律回 true，維持既有
+    //   publish-then-settle 語義（單發布者，行為不變；併發仲裁仍經本地 settle CAS）。
+    // 回 true=勝者（可發布），false=敗者（跳過發布）。
+    private fun tryClaimCoordinatorPublish(tx: PolicyTx): Boolean {
+        val coord = policyTxCoordinator ?: return true
+        if (!coord.activeTx.compareAndSet(tx, null)) {
+            activePolicyTx.compareAndSet(tx, null)
+            policyReconciling.remove(tx.key)
+            return false
+        }
+        return true
+    }
+
+    // Stage G2：handoverTx 登記（本地＋coordinator 同組＋reconciling＋
+    // deferred.invokeOnCompletion 自動重查＋reconciler 啟動）。
+    // 调用方在外層 finally 調用（mutex 已釋放）。
+    private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean) {
+        activePolicyTx.set(tx)
+        policyTxCoordinator?.activeTx?.set(tx)
+        policyReconciling.add(tx.key)
+        attachDeferredAutoRecheck(tx)
+        if (isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+    }
+
+    // Stage G2 (P2#4#5)：deferred 完成自動重查。
+    // handoverTx 登記時掛 invokeOnCompletion：若 activePolicyTx 仍為該 Tx，
+    // 啟動單次權威重查（fresh read bounded，獨立池，不耗 reconciler 預算）→走
+    // settle helper；讀 Unknown 保持 unresolved＋發布明確 unresolved-refresh
+    // 動作（UNRESOLVED_REFRESH＋按鈕即 refreshPolicyDraft）。
+    // - 單次：invokeOnCompletion 本身單次；重查內再判擁有者，併發已結即丟棄。
+    // - 有界獨立池：經 boundedReconcileRead 單次（withTimeout(policyIoTimeoutMs)
+    //   ＋policyReconcileDispatcher，不佔共用 IO 池，不耗 reconciler 三讀預算）。
+    // - settle helper：decidePolicyTxSettle（Known＋已完成才 Success/Mismatch/
+    //   Failed；Unknown 一律 Unresolved 續留，不信 ack）。
+    // - P2-1 防雙發布：終態（Success/Mismatch/Failed）發布前先經
+    //   tryClaimCoordinatorPublish 做 settle-CAS 先行、勝者才發布（coordinator
+    //   CAS 成功才發布，敗者跳過）；unresolved 不搶發布權（不碰 fence）。
+    private fun attachDeferredAutoRecheck(tx: PolicyTx) {
+        try {
+            tx.deferred.invokeOnCompletion {
+                // 非同步交接：仍為擁有者才啟動單次重查（已結／被替換即丟棄）。
+                if (activePolicyTx.get() !== tx) {
+                    // 跨 VM：本地已空但 coordinator 仍為該 Tx（新 VM 未及認領？
+                    // 舊 VM 已死）→舊 handler 不啟動，待新 VM 認領後自掛。
+                    return@invokeOnCompletion
+                }
+                viewModelScope.launch {
+                    autoRecheckTx(tx)
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: 掛載失敗不影響 reconciler 主路徑。
+        }
+    }
+
+    // Stage G2 單次權威重查本體（viewModelScope 上跑，讀切獨立池）。
+    private suspend fun autoRecheckTx(tx: PolicyTx) {
+        // 擁有者再判（併發已結／被替換即丟棄，防雙發布）。
+        if (activePolicyTx.get() !== tx) return
+        if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+        // 終態發布權以 settle-CAS 先行仲裁（見 tryClaimCoordinatorPublish），此處
+        // 僅做擁有者預檢；同一 Tx 被新 VM 認領時舊 handler 與新 handler 競爭發布權，
+        // 首個 CAS 成功者勝出發布，敗者跳過（不覆寫勝者 fence）。
+        val read: LoadResult = try {
+            val (r, _) = boundedReconcileRead(tx.store)
+            r
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            LoadResult.Unknown
+        }
+        // 讀 Unknown 保持 unresolved（不信 ack，不結清；即使 deferred 已證失敗，
+        // 無 ground truth 仍續留，待手動 refresh late-join）。
+        if (read !is LoadResult.Known) {
+            // 仍為擁有者才發布 unresolved-refresh 動作（併發已結即丟棄）。
+            if (activePolicyTx.get() !== tx) return
+            if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+            _state.update { cur ->
+                // 期間已有新事實（version/ownership 推進）即丟棄，不覆寫。
+                // （auto-recheck 不取號，以當下 Tx 存活為準；新 save/fail 會先結清
+                // 舊 Tx，故此處僅判 Tx 同一性。）
+                if (activePolicyTx.get() !== tx) cur
+                else cur.copy(
+                    policyWritePhase = PolicyWritePhase.RECONCILING,
+                    policyDraftKnown = false,
+                    msg = policyText(PolicyText(PolicyTextKind.UNRESOLVED_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        // Known：走 settle helper（deferred 未完成→Unresolved 續留；完成＋符合→
+        // Success；完成＋不符→Mismatch；已證失敗→Failed）。
+        val decision: PolicyTxSettle = try {
+            decidePolicyTxSettle(tx, read)
+        } catch (e: CancellationException) {
+            throw e
+        }
+        when (decision) {
+            is PolicyTxSettle.Success -> {
+                if (activePolicyTx.get() !== tx) return
+                if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+                // P2-1 settle-CAS 先行、勝者才發布（coordinator CAS 成功才發布）。
+                if (!tryClaimCoordinatorPublish(tx)) return
+                disarmBlindClear()
+                _state.update { cur ->
+                    if (activePolicyTx.get() !== tx) cur
+                    else if (tx.isClear) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = emptySet(),
+                        policyDraftKnown = true,
+                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                        msgKind = MsgKind.INFO,
+                    )
+                    else cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = decision.packages,
+                        policyDraftKnown = true,
+                        msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, decision.packages.size)),
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+                settlePolicyTx(tx)
+            }
+            is PolicyTxSettle.Mismatch -> {
+                if (activePolicyTx.get() !== tx) return
+                if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+                // P2-1 settle-CAS 先行、勝者才發布。
+                if (!tryClaimCoordinatorPublish(tx)) return
+                disarmBlindClear()
+                _state.update { cur ->
+                    if (activePolicyTx.get() !== tx) cur
+                    else cur.copy(
+                        pendingPolicyWrite = if (tx.isClear) cur.pendingPolicyWrite else null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = decision.packages,
+                        policyDraftKnown = true,
+                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+                settlePolicyTx(tx)
+            }
+            is PolicyTxSettle.Failed -> {
+                if (activePolicyTx.get() !== tx) return
+                if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+                // P2-1 settle-CAS 先行、勝者才發布（先搶發布權，再 mark＋發布）。
+                if (!tryClaimCoordinatorPublish(tx)) return
+                markPolicyUnknownLocked()
+                val expV = policyDraftVersion.get()
+                val expO = policyOwnershipGen.get()
+                _state.update { cur ->
+                    if (activePolicyTx.get() !== tx) cur
+                    else if (tx.isClear) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
+                    else cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
+                }
+                // Failed 的 mark 已在上行同步 bump（背靠背）；此處直接結清。
+                // （expV/expO 僅診斷保留，不另判。）
+                settlePolicyTx(tx)
+            }
+            is PolicyTxSettle.Unresolved -> {
+                if (activePolicyTx.get() !== tx) return
+                if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+                _state.update { cur ->
+                    if (activePolicyTx.get() !== tx) cur
+                    else cur.copy(
+                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                        policyDraftKnown = false,
+                        msg = policyText(PolicyText(PolicyTextKind.UNRESOLVED_REFRESH)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+            }
+        }
     }
     // Stage G1 settle helper（Tx 釋放唯一真相；reconciler／refresh late-join／
     // 快徑共用，免三處漂移）。
@@ -1244,6 +1454,36 @@ class DualViewModel(
     }
 
     init {
+        // Stage G2：跨 VM 認領（同步， ран於 probe/load 續發）。
+        // coordinator 仍有在途 Tx（舊 VM handover 後未結清、onCleared 刻意不清除）
+        // 即認領：繼承 fence＋RECONCILING＋pending＋Unknown＋啟動 reconciler join
+        // 同一 deferred；終態防雙發布經 tryClaimCoordinatorPublish 做 settle-CAS
+        // 先行、勝者才發布（認領沿用同一 Tx 物件；舊 VM 殘留 handler 以 coordinator
+        // CAS 判定丟棄，敗者不發布）。
+        // 認領同步 bump version/freshness/ownership，晚到的 init load 因世代失配被
+        // 丟棄（不覆寫 fence）；state 同步翻 RECONCILING＋Unknown＋pending。
+        policyTxCoordinator?.activeTx?.get()?.let { tx ->
+            if (activePolicyTx.get() == null) {
+                activePolicyTx.set(tx)
+                policyReconciling.add(tx.key)
+                attachDeferredAutoRecheck(tx)
+                markPolicyUnknownLocked()
+                _state.update { cur ->
+                    cur.copy(
+                        pendingPolicyWrite = tx.pending ?: cur.pendingPolicyWrite,
+                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        loading = false,
+                        msg = policyText(
+                            PolicyText(if (tx.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT),
+                        ),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                if (tx.isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+            }
+        }
         // Probe elevation channels first; later ops queue behind this, so the
         // first refresh always sees the routed privilege, never a default.
         viewModelScope.launch {
@@ -1269,7 +1509,10 @@ class DualViewModel(
                 LoadResult.Unknown
             }
             _state.update { cur ->
-                if (policyDraftVersion.get() != versionAtStart ||
+                // Stage G2：認領 fence 優先——Tx 存活時 init load 一律丟棄（不覆寫
+                // RECONCILING＋Unknown＋pending；新 VM 認領已同步發布 fence）。
+                if (hasActivePolicyTx()) cur
+                else if (policyDraftVersion.get() != versionAtStart ||
                     policyFreshnessGen.get() != generation
                 ) {
                     cur
@@ -1334,7 +1577,7 @@ class DualViewModel(
             // BUSY：全局 refresh 不擁有 policy busy，誤發 BUSY/loading=true 會
             // 覆寫 TIMEOUT 提示並搶 loading；丟棄即無聲 no-op，保留
             // RECONCILING＋TIMEOUT＋pending，draft 不被覆寫；phase 恆 RECONCILING）。
-            if (activePolicyTx.get() != null) return@launch
+            if (hasActivePolicyTx()) return@launch
             _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 refreshPending = true
@@ -1400,7 +1643,8 @@ class DualViewModel(
         // Stage F1：Tx 存活即併發丟棄（鎖內兜底，覆蓋 trailing；不碰 loading，
         // 保留 RECONCILING；disarm 仍執行與否？此處直接返回，連 disarm 都不做，
         // Tx 終態才 disarm，避免重連誤清核對中的 stale-arm 洩漏修復語義）。
-        if (activePolicyTx.get() != null) return
+        // Stage G2：含 coordinator（跨 VM）。
+        if (hasActivePolicyTx()) return
         // Phase D P2 busy (#24): mark busy BEFORE any suspending probe IO.
         // swapAutoLocked() suspends on `su -c id -u` (auth prompt can block)
         // while probeChannels() is the first place that used to set
@@ -1485,7 +1729,8 @@ class DualViewModel(
     private suspend fun refreshLocked() {
         // Stage F1：Tx 存活即併發丟棄（鎖內兜底，覆蓋 drainCoalesced trailing：
         // 不碰 loading/msg/phase/draft，保留 RECONCILING＋TIMEOUT）。
-        if (activePolicyTx.get() != null) return
+        // Stage G2：含 coordinator（跨 VM）。
+        if (hasActivePolicyTx()) return
         // NOTE (Phase 3): the pendingRemove-preserve guard below is
         // intentionally duplicated per RefreshOutcome branch (no helper
         // extracted). Only the GroundTruth listed branch can actually
@@ -3887,10 +4132,18 @@ class DualViewModel(
     // cancel 靜默 no-op（pending 保留，沿用 SAVING 語義）。
     // Stage F1：改讀 Tx（activePolicyTx!=null OR phase OR 集合三層，防 Tx 登記與
     // state 翻轉間的瞬時窗口漂移；Tx 為唯一真相，phase/集合為可觀測投影）。
+    // Stage G2：跨 VM 加讀 coordinator（新 VM 認領前本地仍空，舊 B 落盤前試 C
+    // 必須拒絕；認領後本地亦設，雙層）。
     private fun isPolicyReconcilingLocked(): Boolean =
         activePolicyTx.get() != null ||
+            policyTxCoordinator?.activeTx?.get() != null ||
             _state.value.policyWritePhase == PolicyWritePhase.RECONCILING ||
             policyReconciling.isNotEmpty()
+
+    // Stage G2：跨 VM Tx 存活判定（本地 OR coordinator；全域 refresh／select
+    // 入口併發丟棄用，不碰 phase/集合）。
+    private fun hasActivePolicyTx(): Boolean =
+        activePolicyTx.get() != null || policyTxCoordinator?.activeTx?.get() != null
 
     // Stage A：confirm 逾時後的背景核對器（獨立 job，不持 opMutex/mutex 已釋放）。
     // - Stage F2：本體跑 Main（viewModelScope 預設，不佔 IO 執行緒），僅讀切獨立
@@ -3948,6 +4201,12 @@ class DualViewModel(
                             throw e
                         }
                         if (join == false) {
+                            // P2-1 settle-CAS 先行、勝者才發布：coordinator CAS 成功
+                            // 才發布終態，敗者（舊 VM 殘留 handler）跳過發布。
+                            if (!tryClaimCoordinatorPublish(tx)) {
+                                settle = false
+                                return@withTimeout
+                            }
                             try {
                                 // F1 自觸修正 v2：mark 自 bump 必須納入期望（expected=start+1），
                                 // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
@@ -4045,6 +4304,11 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
+                            // P2-1 settle-CAS 先行、勝者才發布（同 join==false）。
+                            if (!tryClaimCoordinatorPublish(tx)) {
+                                settle = false
+                                return@withTimeout
+                            }
                             // late-join 已證失敗：同 join==false，FAILED+Unknown
                             // （樂觀讀 B 不得翻案；mark＋expected  pattern 同上）。
                             markPolicyUnknownLocked()
@@ -4086,6 +4350,22 @@ class DualViewModel(
                                 }
                             } else {
                                 null
+                            }
+                            // P2-1 settle-CAS 先行、勝者才發布：終態（TOCTOU 丟棄／
+                            // Success／Mismatch／Failed／非逾時 Unknown）先搶
+                            // coordinator 發布權，勝者才發布；unresolved 續留不搶
+                            // （保留 fence，late-join 可見）。
+                            run {
+                                val staleOutside = policyDraftVersion.get() != versionAtStart ||
+                                    policyOwnershipGen.get() != ownership
+                                val unresolvedOutside = !staleOutside && (
+                                    settleDecision is PolicyTxSettle.Unresolved ||
+                                        (finalResult is LoadResult.Unknown && hadReadTimeout)
+                                    )
+                                if (!unresolvedOutside && !tryClaimCoordinatorPublish(tx)) {
+                                    settle = false
+                                    return@withTimeout
+                                }
                             }
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != versionAtStart ||
@@ -4222,7 +4502,16 @@ class DualViewModel(
                     // REFRESHED（保留新事實的 draft/Known，清 pending，解 fence），
                     // 免覆寫新事實（同 hadReadTimeout 內判）。
                     // Stage G1：refresh 期中 yielding 只推 freshness，不致此丟棄。
+                    // P2-1：丟棄終態先搶發布權（勝者才發布），unresolved 不搶。
                     var keepFenceBudget = true
+                    run {
+                        val staleOutside = policyDraftVersion.get() != versionAtStart ||
+                            policyOwnershipGen.get() != ownership
+                        if (staleOutside && !tryClaimCoordinatorPublish(tx)) {
+                            settle = false
+                            return@launch
+                        }
+                    }
                     _state.update { cur ->
                         if (policyDraftVersion.get() != versionAtStart ||
                             policyOwnershipGen.get() != ownership
@@ -4247,6 +4536,10 @@ class DualViewModel(
                     settle = !keepFenceBudget
                 }
             } catch (e: CancellationException) {
+                // Stage G2：VM 清除（onCleared/scope 取消）不清除 fence——保留 Tx
+                // 供新 VM 認領（coordinator 存活，同一 deferred 續 join）；不經
+                // settle（settle=false），本地＋coordinator 皆保留。
+                settle = false
                 throw e
             } finally {
                 if (settle) settlePolicyTx(tx)
@@ -4298,6 +4591,12 @@ class DualViewModel(
                             throw e
                         }
                         if (join == false) {
+                            // P2-1 settle-CAS 先行、勝者才發布：coordinator CAS 成功
+                            // 才發布終態，敗者（舊 VM 殘留 handler）跳過發布。
+                            if (!tryClaimCoordinatorPublish(tx)) {
+                                settle = false
+                                return@withTimeout
+                            }
                             try {
                                 // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
                                 // Stage G1：只比 ownership。
@@ -4385,6 +4684,11 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
+                            // P2-1 settle-CAS 先行、勝者才發布（同 join==false）。
+                            if (!tryClaimCoordinatorPublish(tx)) {
+                                settle = false
+                                return@withTimeout
+                            }
                             markPolicyUnknownLocked()
                             val expV = versionAtStart + 1
                             val expO = ownership + 1
@@ -4418,6 +4722,19 @@ class DualViewModel(
                                 }
                             } else {
                                 null
+                            }
+                            // P2-1 settle-CAS 先行、勝者才發布（clear 對稱，同 confirm）。
+                            run {
+                                val staleOutside = policyDraftVersion.get() != versionAtStart ||
+                                    policyOwnershipGen.get() != ownership
+                                val unresolvedOutside = !staleOutside && (
+                                    settleDecision is PolicyTxSettle.Unresolved ||
+                                        (finalResult is LoadResult.Unknown && hadReadTimeout)
+                                    )
+                                if (!unresolvedOutside && !tryClaimCoordinatorPublish(tx)) {
+                                    settle = false
+                                    return@withTimeout
+                                }
                             }
                             _state.update { cur ->
                                 if (policyDraftVersion.get() != versionAtStart ||
@@ -4528,7 +4845,16 @@ class DualViewModel(
                     // Stage F2 總預算超限：誠實 unresolved（clear 本無 pending；
                     // ownership 推進即丟棄回 IDLE＋REFRESHED，同 confirm）。
                     // Stage G1：refresh yielding 不致此丟棄。
+                    // P2-1：丟棄終態先搶發布權（勝者才發布），同 confirm。
                     var keepFenceBudget = true
+                    run {
+                        val staleOutside = policyDraftVersion.get() != versionAtStart ||
+                            policyOwnershipGen.get() != ownership
+                        if (staleOutside && !tryClaimCoordinatorPublish(tx)) {
+                            settle = false
+                            return@launch
+                        }
+                    }
                     _state.update { cur ->
                         if (policyDraftVersion.get() != versionAtStart ||
                             policyOwnershipGen.get() != ownership
@@ -4552,6 +4878,10 @@ class DualViewModel(
                     settle = !keepFenceBudget
                 }
             } catch (e: CancellationException) {
+                // Stage G2：VM 清除（onCleared/scope 取消）不清除 fence——保留 Tx
+                // 供新 VM 認領（coordinator 存活，同一 deferred 續 join）；不經
+                // settle（settle=false），本地＋coordinator 皆保留。
+                settle = false
                 throw e
             } finally {
                 if (settle) settlePolicyTx(tx)
@@ -4639,10 +4969,46 @@ class DualViewModel(
                 // Tx 仍為同一」才 bump；否則不 bump（直接丟棄）。
                 // 成功路徑不 bump（發布 Known 本身即新事實，舊 load 世代已落後）。
                 // Stage G1：只比 ownership（version＋ownershipGen），不比 freshness。
+                // P2-1 跨 VM late-join 先搶發布權（settle-CAS 先行、勝者才發布）：
+                // coordinator 存在且 late-join 嘗試（Known＋已完成）時，發布前先
+                // CAS 搶權；敗者（coordinator 已空或被新 Tx 替換）跳過終態發布
+                // （含 mark），免舊 VM 殘留 refresh 覆寫新 VM fence。無 coordinator
+                // 維持既有語義（單發布者）。
+                var lateJoinPreClaimLost = false
+                if (txSnap != null && result is LoadResult.Known && lateJoinOk != null &&
+                    policyTxCoordinator != null
+                ) {
+                    val staleOutside = policyDraftVersion.get() != versionAtStart ||
+                        policyOwnershipGen.get() != ownershipSnap
+                    if (!staleOutside) {
+                        if (policyTxCoordinator.activeTx.get() !== txSnap ||
+                            !tryClaimCoordinatorPublish(txSnap)
+                        ) {
+                            lateJoinPreClaimLost = true
+                        }
+                    } else if (policyTxCoordinator.activeTx.get() !== txSnap) {
+                        lateJoinPreClaimLost = true
+                    }
+                }
+                // P2-1 敗者本地清理：coordinator 已非同一 Tx 時清本地＋reconciling，
+                // 後續 update 經 Tx 同一性丟棄（不覆寫勝者終態）。勝者剛 claim（coordinator
+                // 空係自己清的、本地仍持 Tx 待發布）不得清——以 lost 旗區分；非 late-join
+                // 嘗試（yielding/Unknown）而 coordinator 已空即他結，逕清。
+                if (txSnap != null && policyTxCoordinator != null &&
+                    policyTxCoordinator.activeTx.get() !== txSnap
+                ) {
+                    if (lateJoinPreClaimLost) {
+                        activePolicyTx.compareAndSet(txSnap, null)
+                        policyReconciling.remove(txSnap.key)
+                    } else if (!(result is LoadResult.Known && lateJoinOk != null)) {
+                        activePolicyTx.compareAndSet(txSnap, null)
+                        policyReconciling.remove(txSnap.key)
+                    }
+                }
                 val lateFailMarked: Boolean
                 val lateFailExpV: Long
                 val lateFailExpO: Long
-                if (txSnap != null && result is LoadResult.Known && lateJoinOk == false &&
+                if (!lateJoinPreClaimLost && txSnap != null && result is LoadResult.Known && lateJoinOk == false &&
                     policyDraftVersion.get() == versionAtStart &&
                     policyOwnershipGen.get() == ownershipSnap &&
                     activePolicyTx.get() === txSnap
@@ -4978,6 +5344,8 @@ class DualViewModel(
         ) return
         if (policyReconciling.contains(policyWriteKey(expected))) return
         if (activePolicyTx.get()?.key == policyWriteKey(expected)) return
+        // Stage G2：跨 VM（新 VM 認領前本地仍空，coordinator 仍為舊 B 的 key）。
+        if (policyTxCoordinator?.activeTx?.get()?.key == policyWriteKey(expected)) return
         _state.update { cur ->
             val pending = cur.pendingPolicyWrite ?: return@update cur
             if (pending != expected) return@update cur
@@ -5179,7 +5547,10 @@ class DualViewModel(
                         // TimeoutCancellationException 須先於
                         // CancellationException 捕捉（前者為後者子類）；外部取消
                         // 仍透傳（detach 一併取消，不吞為失敗）。
-                        val deferred = viewModelScope.async(Dispatchers.IO) {
+                        // Stage G2：save 跑在 coordinator 域（若有）使慢 save 存活過
+                        // VM 重建（viewModelScope 隨 VM 清除而取消）；無 coordinator
+                        // 仍走 viewModelScope（既有測試路徑不變）。
+                        val deferred = (policyTxCoordinator?.scope ?: viewModelScope).async(Dispatchers.IO) {
                             store.save(sanitized)
                         }
                         val ok: Boolean? = try {
@@ -5249,6 +5620,7 @@ class DualViewModel(
                                 sanitized = sanitized,
                                 store = store,
                                 isClear = false,
+                                pending = pendingAtCall,
                             )
                             return@withLock
                         }
@@ -5332,13 +5704,12 @@ class DualViewModel(
                 // 非逾時走原清理。交接後 reconciler 在 mutex 外啟動，慢 save
                 // 續跑（句柄由 Tx 保留，reconciler 先 join 再驗證讀）。
                 // Stage F1：Tx 登記與 reconciling add 同組（Tx 為唯一真相）。
+                // Stage G2：經 registerHandoverTx（本地＋coordinator＋自動重查）。
                 val htx = handoverTx
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
                     policyWriteSaving.remove(htx.key)
-                    activePolicyTx.set(htx)
-                    policyReconciling.add(htx.key)
-                    launchConfirmReconciler(htx)
+                    registerHandoverTx(htx, isClear = false)
                 } else {
                     // Covers early-return paths (TTL/null-store) while the inner
                     // finally covers the save itself.
@@ -5513,7 +5884,8 @@ class DualViewModel(
                     }
                     // Stage A：同 confirm，detach 式有界超時（null=逾時未知，
                     // mutex 即釋放，reconciler 接手；false=已證明失敗）。
-                    val deferred = viewModelScope.async(Dispatchers.IO) {
+                    // Stage G2：同 confirm 跑 coordinator 域（若有）。
+                    val deferred = (policyTxCoordinator?.scope ?: viewModelScope).async(Dispatchers.IO) {
                         store.clear()
                     }
                     val ok: Boolean? = try {
@@ -5561,6 +5933,7 @@ class DualViewModel(
                             sanitized = emptySet(),
                             store = store,
                             isClear = true,
+                            pending = null,
                         )
                         return@withLock
                     }
@@ -5628,9 +6001,7 @@ class DualViewModel(
                 val htx = handoverTx
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
-                    activePolicyTx.set(htx)
-                    policyReconciling.add(htx.key)
-                    launchClearReconciler(htx)
+                    registerHandoverTx(htx, isClear = true)
                 } else {
                     inFlightWrites.remove(key)
                 }
@@ -6762,7 +7133,7 @@ class DualViewModel(
         viewModelScope.launch {
             // Stage F1：同 refresh()，Tx 存活即併發丟棄（保留 RECONCILING；
             // disarm 照舊同步執行，見上）。
-            if (activePolicyTx.get() != null) return@launch
+            if (hasActivePolicyTx()) return@launch
             _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 reconnectPending = true
@@ -6826,7 +7197,7 @@ class DualViewModel(
             // RECONCILING＋TIMEOUT/REFRESH_FAILED＋pending＋draft/Known，不碰
             // msg/phase；見 PolicyWriteTest selectDuringTx）。入口先判，免搶
             // loading 覆寫核對提示。
-            if (activePolicyTx.get() != null) return@launch
+            if (hasActivePolicyTx()) return@launch
             // F2/P3 leading busy (msg-preserving): the picker tap reads busy
             // even while queued behind opMutex; the locked body re-sets it
             // idempotently below.
@@ -6852,7 +7223,8 @@ class DualViewModel(
                     }
                     // Stage F2 內層重檢（排隊期間出現 Tx）：僅清 loading 並返回，
                     // 不碰 probe/refresh/msg/phase/pending（保留核對 fence）。
-                    if (activePolicyTx.get() != null) {
+                    // Stage G2：含 coordinator。
+                    if (hasActivePolicyTx()) {
                         _state.update { it.copy(loading = false) }
                         return@withLock
                     }
@@ -7924,7 +8296,7 @@ class DualViewModel(
             // Stage F2 honest-unresolved：Tx 存活即跳過（保留 RECONCILING＋
             // TIMEOUT/REFRESH_FAILED＋pending，不碰 msg/phase；見 selectChannel
             // 同級守衛＋測試）。入口先判，免搶 loading。
-            if (activePolicyTx.get() != null) return@launch
+            if (hasActivePolicyTx()) return@launch
             _state.update { it.copy(loading = true) }
             if (foregroundJob?.isActive == true) {
                 foregroundPending = true
@@ -7964,7 +8336,8 @@ class DualViewModel(
     private suspend fun foregroundLocked() {
         // Stage F2 內層重檢（排隊期間出現 Tx）：僅清 loading 並返回，不碰
         // probe/refresh/msg/phase/pending/draft（保留核對 fence；trailing 亦經此）。
-        if (activePolicyTx.get() != null) {
+        // Stage G2：含 coordinator。
+        if (hasActivePolicyTx()) {
             _state.update { it.copy(loading = false) }
             return
         }
@@ -8230,6 +8603,11 @@ enum class PolicyTextKind {
     //（不新增 enum），文案口徑「逾時、結果未知、正在核對、請勿重試」。
     WRITE_TIMEOUT,
     CLEAR_TIMEOUT,
+    // Stage G2：deferred 完成後單次權威重查仍未知（unresolved）。msgKind 複用
+    // CHANNEL（未知＋明確動作）；文案明示按鈕即 refreshPolicyDraft（點
+    // 「重新整理草稿」確認結果），與 REFRESH_FAILED（重試失敗）區分：本態為
+    // 自動重查後仍未知、待手動刷新 late-join。
+    UNRESOLVED_REFRESH,
 }
 
 data class PolicyText(
@@ -8266,6 +8644,7 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.BLIND_CLEAR_EXPIRED -> "清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理"
     PolicyTextKind.WRITE_TIMEOUT -> "寫入政策逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.CLEAR_TIMEOUT -> "清除草稿逾時，結果未知，正在核對，請勿重試"
+    PolicyTextKind.UNRESOLVED_REFRESH -> "結果仍未知，請點「重新整理草稿」確認結果"
 }
 
 sealed interface BlockReason {

@@ -6510,14 +6510,36 @@ private class DualViewModelFactory(
                         PolicyTextKind.BLIND_CLEAR_EXPIRED -> res.getString(R.string.policy_blind_clear_expired)
                         PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
                         PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
+                        PolicyTextKind.UNRESOLVED_REFRESH -> res.getString(R.string.policy_unresolved_refresh)
                     }
                 },
+                // Stage G2：跨 VM 最小 coordinator（App-scoped；Application 單例，
+                // VM onCleared 不清除，新 VM init 認領）。
+                policyTxCoordinator = (appContext.applicationContext as? GalaxyApp)?.policyTxCoordinator
+                    ?: appCoordinatorFallback,
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }
 
     companion object {
+        // Stage G2 P2-2：fallback 改實例級語義＋測試重置入口。
+        // 生產一律走 GalaxyApp 單例（App-scoped）；此 fallback 僅用於 Application
+        // 非 GalaxyApp 的極罕路徑（如 JVM/測試 factory 直構）。原靜態單例的 scope
+        // 永不關＋activeTx 跨用例共享，故改為可重置：測試經 resetFallbackForTest
+        // 清 activeTx 並重建 scope（舊 scope 取消），免跨測試污染。
+        @Volatile
+        private var appCoordinatorFallback = PolicyTxCoordinator()
+
+        internal fun resetFallbackForTest() {
+            try {
+                appCoordinatorFallback.close()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            appCoordinatorFallback = PolicyTxCoordinator()
+        }
+
         // Canonical su locations; presence heuristic only (see header).
         private val SU_PATHS = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su")
 
