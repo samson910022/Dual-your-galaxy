@@ -57,9 +57,9 @@
     <string name="action_refresh_policy_draft">重新整理草稿</string>
     <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
     <string name="refresh_policy_draft_cd_refreshing">正在重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
-    <string name="policy_draft_format">白名單政策（草稿）：%1$d 項</string>
-    <string name="policy_draft_unknown">白名單政策（草稿）：未知（LSPosed 服務未連線，請點「重新整理草稿」重試）</string>
-    <string name="policy_write_title">確認寫入政策</string>
+    <string name="policy_draft_format">白名單政策（草稿・尚未生效）：%1$d 項</string>
+    <string name="policy_draft_unknown">白名單政策（草稿・尚未生效）：未知（LSPosed 服務未連線，請點「重新整理草稿」重試）</string>
+    <string name="policy_write_title">確認寫入政策（僅草稿，不生效）</string>
     <plurals name="policy_write_message">
         <item quantity="one">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
         <item quantity="other">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
@@ -209,12 +209,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">雙開白名單注入器</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後（待實機驗證），方可突破限制注入白名單；寫入分身仍需特權通道（Auto／Root／Shizuku）</string>
+    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後（待實機驗證），方可突破限制注入白名單；寫入分身仍需特權通道（Auto／Root／Shizuku）；政策預設為空，hooks 預設 observe-only（只觀察、不改變行為，草稿尚未生效）</string>
     <string name="hero_subtitle_engine">隔離環境 · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
-    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後（待實機驗證），方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道。</string>
+    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後（待實機驗證），方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道；政策預設為空，hooks 預設 observe-only（只觀察、不改變行為，草稿尚未生效）。</string>
     <string name="hook_mode_subtitle_ops">當前特權通道（Auto／Root／Shizuku）可直接在已驗證分身中建立／移除分身，無需 Hook；LSPosed 僅用於更深度的三星白名單與原生介面整合。</string>
     <string name="hook_badge_sec_hook">已注入 SecPackageHook</string>
     <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>

@@ -34,6 +34,10 @@
   TTL 重讀同一 group 的 cached 實例（此 60 秒為 hook 側快取 TTL，與 App 側寫入確認 dialog 的 5 分鐘 TTL 不同），屬 redundancy（若框架未推送，重讀同一
   實例也不會強制重新抓取），非主要新鮮度機制。端到端仍需 on-device 驗證
   （DEVICE-UNVERIFIED）。
+   hook 側 TTL 一覽（皆見 `EffectivePolicyCache`，與 App 側 TTL 對照見 `docs/USAGE.md` 政策 TTL 對照表）：
+   - 快取 TTL `maxCacheAgeMs` 60 秒：到期後下次讀取 fail-closed 回 seed（`invalidated=true`），不復活過期值；TTL 到期不 bump 世代（到期前已發起的在途新鮮讀仍可滿足到期）。
+   - 失敗節流 `failureCooldownMs` 5 秒：遠端讀取失敗後不重試 reader，回 `last-known-good`（未 invalidate 時）或 seed；`invalidate()` 顯式重置節流。
+   - 閘門關閉短路（Stage C）：`NON_EMPTY_POLICY_EFFECTIVE_GATE` 關閉時 `get()` 直接回空集合，不碰 reader、不加鎖、不讀時鐘——observe-only 下零 IPC 讀取，故上述 TTL 在閘門關閉時皆不觸發。
 - 樂觀快取限制：`RemotePreferences.commit()` 先更新行程內快取再走 binder，
   故 save/clear 失敗後同一行程的 `load()` 可能樂觀讀到未落盤的值；冷啟動
   會從 daemon 重新抓取。hook 側框架的快取／讀取行為（是否一律讀取 daemon
@@ -236,10 +240,18 @@ hook 是否真的安裝、攔截器 callback 是否被命中、符合 eligibilit
 LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPosed 執行行為、ART 內聯／
 去最佳化效果亦不在 JVM 測試範圍（見 §1.2 反內聯待辦）。
 
+JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLICY_EFFECTIVE_GATE` 的依據**——開 gate 只認下列硬閘門的裝置證據，不以 JVM 綠燈開啟 gate。
+
 **程式碼層級非空政策閘門（code gate，非裝置驗證）：** `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`
 （預設 `false`）關閉時，`PolicySource.effective(...)` 即使在 sanitized 合併後產生非空集合，也會
 **fail-closed 回傳空集合**（Stage 1 預設 observe-only 不變）。此閘門僅為程式碼層級阻擋，必須保持
 `false`，直到下列裝置硬閘門（hard gate）以裝置證據滿足後才考慮開啟；開啟本身不構成裝置驗證。
+**程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
+
+| # | sealed gate | 行為 | JVM 鎖定 |
+| --- | --- | --- | --- |
+| S1 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（`const val = false`，編譯期封緘，執行期不可翻轉） | `effective()` 的 sanitized 非空合併一律回空集合 | `PolicySourceTest`（gate 預設關閉斷言） |
+| S2 | `EffectivePolicyCache.get()` 閘門關閉短路（Stage C） | 關閉時直接回空，不碰 reader、不加鎖、不讀時鐘（零 IPC 讀取） | `EffectivePolicyCacheTest`（gate-closed 零讀取） |
 
 **啟用任何非空政策前的硬閘門（hard gate，缺一不可）：**
 
