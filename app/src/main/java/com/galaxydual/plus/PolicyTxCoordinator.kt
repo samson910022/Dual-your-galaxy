@@ -6,6 +6,7 @@
 // 同一 deferred）。
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,8 +24,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 // txId==本地即應用 IDLE+draft/Known/msg。replay=1 使晚訂閱仍可見最後終態。
 // 終態攜 msg 字面（勝者當下 _state 快照），敗者直接應用不經 policyText 二次解析
 //（同行程同語系，字面一致；免 textKind 映射漂移）。
+// Stage I1 (P1#1+P2#2)：終態攜 key（Tx 全域身份 txId+key 雙元；awaitSettled 精確
+// 比對，免跨 VM 計數器碰撞導致的 stale 誤同步）。
 data class PolicySettled(
     val txId: Long,
+    val key: String,
     val draft: Set<String>,
     val known: Boolean,
     val msgKind: MsgKind,
@@ -42,6 +46,14 @@ class PolicyTxCoordinator {
     // SAVING 即在 coordinator 可見，新 VM 可認領（RECONCILING＋Unknown＋
     // pending＋世代bump＋reconciler join 同一 deferred）。
     val activeTx = AtomicReference<DualViewModel.PolicyTx?>(null)
+
+    // Stage I1 (P1#1)：Tx 全域身份——App-scoped 單調計數器，跨 VM 唯一。
+    // VM 本地 policyTxId 隨 VM 重建歸零（A→重建→B 皆取 1，碰撞致 settled 誤配），
+    // 故 coordinator 側統一發號；DualViewModel 四處建 Tx 皆經 nextTxId()（無
+    // coordinator 舊測試路徑才回退本地計數器）。
+    private val globalTxId = AtomicLong(0L)
+
+    fun nextTxId(): Long = globalTxId.incrementAndGet()
 
     // Stage H1：App-scoped 單寫者鎖（fail-fast 經 tryLock，不排隊）。
     // - IO 在途（SAVING）期間持有，併發第二寫經 tryLock 失敗即 BUSY/
@@ -65,10 +77,19 @@ class PolicyTxCoordinator {
         false
     }
 
-    suspend fun awaitSettled(txId: Long, timeoutMs: Long): PolicySettled? = try {
-        withTimeoutOrNull(timeoutMs) { settled.first { it.txId == txId } }
+    suspend fun awaitSettled(txId: Long, key: String, timeoutMs: Long): PolicySettled? = try {
+        withTimeoutOrNull(timeoutMs) { settled.first { it.txId == txId && it.key == key } }
     } catch (_: Exception) {
         null
+    }
+
+    // Stage I1 (P2#2)：exactly-once 結算 CAS——activeTx(tx→null) 恰一勝者。
+    // 勝者才發布終態＋結清；敗者 early-return（不發布、不碰勝者 fence）。
+    // settlePolicyTx 經此做 coordinator 側 claim（claim 先行，免先讀後 emit 窗口）。
+    fun tryCompleteClaim(tx: DualViewModel.PolicyTx): Boolean = try {
+        activeTx.compareAndSet(tx, null)
+    } catch (_: Exception) {
+        false
     }
 
     // App-scoped save IO 域：逾時 save 的 deferred 跑在此域（SupervisorJob＋IO），
@@ -84,6 +105,7 @@ class PolicyTxCoordinator {
     // 清空＋鎖釋放同組，後續可新寫）。
     fun resetForTest() {
         activeTx.set(null)
+        globalTxId.set(0L)
         try {
             _settled.resetReplayCache()
         } catch (_: Exception) {

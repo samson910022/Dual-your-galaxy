@@ -5173,4 +5173,205 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
         assertNull(activeTxOf(vm))
     }
+
+    // Stage I1 T1：A→重建→B碰撞→C訂閱阻塞（舊碼敗新碼過）。
+    // VM-A 快寫 B 結清（settled 留 replay）後銷毀；VM-B 同一 coordinator 新寫 C
+    // 逾時（RECONCILING）：舊碼以 VM 本地計數器發號→TxB txId 撞 TxA（皆為 1），
+    // txId-only 訂閱立得 stale A 終態（誤同步）；新碼全域發號→TxB txId==2，
+    // txId+key 精確比對下訂閱阻塞待勝者（回 null），放行後得 C 終態。
+    @Test
+    fun i1_rebuildTxIdCollision_staleSettledIgnored() {
+        val coord = PolicyTxCoordinator()
+        try {
+            coord.resetForTest()
+            // A：快寫 B 結清（全域首號）。
+            val fakeA = FakePolicyStore()
+            val vmA = makeVm(fakeA.store, userId = 0, policyTxCoordinator = coord)
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB)
+            await { vmA.state.value.pendingPolicyWrite == null }
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+            assertTrue(vmA.state.value.policyDraftKnown)
+            // 旋轉銷毀 A（慢 save 無，replay 殘留 A 終態）。
+            vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(200)
+
+            // B：同 coordinator 新寫 C，save 阻塞＋短超時→RECONCILING。
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.B"))
+            val calls = java.util.concurrent.atomic.AtomicInteger(0)
+            val saveStarted = java.util.concurrent.CountDownLatch(1)
+            val saveFinished = java.util.concurrent.CountDownLatch(1)
+            val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+            val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+            val storeB = HookPolicyStore(
+                loadRaw = {
+                    if (calls.incrementAndGet() == 1) {
+                        backend.get()
+                    } else {
+                        while (!loadRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                },
+                saveRaw = { raw ->
+                    saveStarted.countDown()
+                    while (!saveRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    if (raw != null) backend.set(raw)
+                    saveFinished.countDown()
+                    true
+                },
+            )
+            val vmB = makeVm(
+                storeB,
+                userId = 0,
+                initialDraft = setOf("com.B"),
+                policyIoTimeoutMs = 200,
+                policyTxCoordinator = coord,
+            )
+            val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmB, pendingC)
+            vmB.confirmPolicyWrite(pendingC)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            val txB = activeTxOf(vmB) as DualViewModel.PolicyTx
+            // 全域發號：B 不撞 A（舊碼本地計數器下皆為 1，本斷言舊碼敗）。
+            assertEquals(2L, txB.txId)
+
+            // C 訂閱：等 TxB 終態（短預算）→阻塞中（回 null），不誤取 A 的 stale settled。
+            // （舊碼 txId-only 比對：立得 A 終態，本斷言舊碼敗。）
+            val stale = kotlinx.coroutines.runBlocking { coord.awaitSettled(txB.txId, txB.key, 500) }
+            assertNull(stale)
+
+            // 放行：勝者結清 C，訂閱即得 C 終態（txId+key 精確命中）。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            loadRelease.set(true)
+            await(timeoutMs = 15_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(setOf("com.C"), vmB.state.value.policyDraft)
+            assertNull(vmB.state.value.pendingPolicyWrite)
+            val got = kotlinx.coroutines.runBlocking { coord.awaitSettled(txB.txId, txB.key, 5_000) }
+            assertNotNull(got)
+            assertEquals(setOf("com.C"), got!!.draft)
+            assertTrue(got.known)
+            assertNull(activeTxOf(vmB))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage I1 T1b：key 精確比對——同 txId 異 key 不匹配（舊碼 txId-only 誤配），
+    // 且 resetForTest 清計數器（重置後首號回 1）。
+    @Test
+    fun i1_settledKeyMismatch_doesNotMatchAndResetClearsCounter() {
+        val coord = PolicyTxCoordinator()
+        try {
+            coord.resetForTest()
+            val txId = coord.nextTxId()
+            assertEquals(1L, txId)
+            kotlinx.coroutines.runBlocking {
+                coord.tryEmitSettled(
+                    PolicySettled(txId, "k1", setOf("com.X"), true, MsgKind.INFO, "x", false),
+                )
+                val hit = coord.awaitSettled(txId, "k1", 2_000)
+                assertNotNull(hit)
+                assertEquals(setOf("com.X"), hit!!.draft)
+                // 同 txId 異 key：阻塞至超時（回 null），不誤取。
+                val miss = coord.awaitSettled(txId, "k2", 300)
+                assertNull(miss)
+            }
+            // resetForTest 清計數器。
+            coord.resetForTest()
+            assertEquals(1L, coord.nextTxId())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage I1 T2：雙活快徑 vs reconciler 衝突——恰一勝者（舊碼敗新碼過）。
+    // VM 慢 save 在途（SAVING＋前置認領＋writeMutex 持有）；併發勝者（模擬雙活
+    // 對端 reconciler 先勝，經 settle 結清認領）後放行 save：快徑 ok==true＋
+    // read-after-ack 到達時認領已失→敗者 early-return（不發布：pending 保留、
+    // draft 不動、無終態廣播），cancel 讀 job＋解鎖 writeMutex；舊碼
+    // publish-then-settle 直接覆寫勝者終態（pending 清空＋draft=B＋廣播，
+    // 以下斷言舊碼敗）。
+    @Test
+    fun i1_fastPathLoser_earlyReturnPreservesWinner() {
+        val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx = activeTxOf(vm) as DualViewModel.PolicyTx
+            assertNotNull(coordinatorTxOf(coord))
+            assertTrue(coord.writeMutex.isLocked)
+
+            // 模擬雙活對端先勝結清（同一 Tx；勝者終態已發布，認領清空）。
+            assertTrue(callSettlePolicyTx(vm, tx))
+            assertNull(coordinatorTxOf(coord))
+            assertNull(activeTxOf(vm))
+
+            // 放行 save：快徑 ok==true，但認領已失→敗者 early-return，不發布。
+            saveRelease.set(true)
+            await { backend.get() == setOf("com.B") }
+            await { inFlightKeysOf(vm).none { it.startsWith("policy-") } }
+
+            // 恰一勝者：快徑敗者未發布——pending 保留、draft 未動。
+            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            assertEquals(1, saveCalls.get())
+            // 無終態廣播（勝者之外無第二發射）。
+            val noDouble = kotlinx.coroutines.runBlocking { coord.awaitSettled(tx.txId, tx.key, 300) }
+            assertNull(noDouble)
+            // 解鎖：單寫者已釋放，後續可新寫。
+            assertFalse(coord.writeMutex.isLocked)
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

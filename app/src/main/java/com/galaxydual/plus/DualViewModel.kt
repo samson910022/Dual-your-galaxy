@@ -866,6 +866,8 @@ class DualViewModel(
         val isClear: Boolean,
         val pending: PendingPolicyWrite? = null,
     )
+    // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
+    // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
     private val policyTxId = AtomicLong(0L)
     private val activePolicyTx = AtomicReference<PolicyTx?>(null)
     // Stage F2 (P2#4)：reconciler 專用獨立讀池（per-VM 單執行緒，執行緒名
@@ -888,33 +890,47 @@ class DualViewModel(
     // 本 Tx 結清（含首次）；false 表 Tx 已非擁有者（併發已結，不重複移除）。
     // Stage G2：同清 coordinator（CAS，跨 VM 唯一真相；onCleared 刻意不清除，
     // 僅 settle 清）。
-    // Stage H2：勝者在 settle 前 tryEmit 終態（集中式：取當下 _state 已發布的
-    // IDLE 終態快照，replay=1 供敗者跟隨；unresolved 續留不經此處故不發射）。
-    // Known 成功同步 bump 版本三元（同快徑），使晚到 stale 讀丟棄（敗者 refresh
-    // 不覆寫勝者）；Failed/Unknown 經 mark 已 bump，此處不重複。
+    // Stage I1：claim 先行——先經 tryCompleteClaim 做 coordinator 側 CAS，再清
+    // 本地；刪除舊集中式「先讀 _state 後 emit」（讀-發窗口可被併發終態污染，敗者
+    // 誤發射）；發射改由各終態發布點顯式 emitTxSettledSnapshot（claim 持有下呼叫，
+    // 見下），settle 本體只做 CAS＋清理。
     private fun settlePolicyTx(tx: PolicyTx): Boolean {
         val coord = policyTxCoordinator
         if (coord != null) {
             try {
-                val s = _state.value
-                if (s.policyWritePhase == PolicyWritePhase.IDLE) {
-                    if (s.policyDraftKnown) {
-                        policyDraftVersion.incrementAndGet()
-                        policyFreshnessGen.incrementAndGet()
-                        policyOwnershipGen.incrementAndGet()
-                    }
-                    coord.tryEmitSettled(
-                        PolicySettled(tx.txId, s.policyDraft, s.policyDraftKnown, s.msgKind, s.msg, tx.isClear),
-                    )
-                }
+                coord.tryCompleteClaim(tx)
             } catch (_: Exception) {
                 // Best effort.
             }
         }
         val owned = activePolicyTx.compareAndSet(tx, null)
-        policyTxCoordinator?.activeTx?.compareAndSet(tx, null)
         if (owned) policyReconciling.remove(tx.key)
         return owned
+    }
+
+    // Stage I1：終態快照顯式發射（原 settle 集中式先讀後 emit 的遷出）。
+    // 呼叫方須在 claim 持有下、終態 _state.update 之後、settlePolicyTx 之前呼叫
+    // （同舊集中式時序：發射→CAS；無併發發布者，讀到即本次終態）。
+    // 語義同舊集中式：僅 phase==IDLE 發射（unresolved 續留不發射）；Known 成功
+    // 同步 bump 版本三元（同快徑），使晚到 stale 讀丟棄；Failed/Unknown 經 mark
+    // 已 bump，此處不重複。coordinator 為 null 即 no-op。
+    private fun emitTxSettledSnapshot(tx: PolicyTx) {
+        val coord = policyTxCoordinator ?: return
+        try {
+            val s = _state.value
+            if (s.policyWritePhase == PolicyWritePhase.IDLE) {
+                if (s.policyDraftKnown) {
+                    policyDraftVersion.incrementAndGet()
+                    policyFreshnessGen.incrementAndGet()
+                    policyOwnershipGen.incrementAndGet()
+                }
+                coord.tryEmitSettled(
+                    PolicySettled(tx.txId, tx.key, s.policyDraft, s.policyDraftKnown, s.msgKind, s.msg, tx.isClear),
+                )
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
 
     // Stage G2 P2-1：settle-CAS 先行、勝者才發布（取代 write-only 的
@@ -951,7 +967,7 @@ class DualViewModel(
     ) {
         try {
             policyTxCoordinator?.tryEmitSettled(
-                PolicySettled(tx.txId, draft, known, msgKind, msg, tx.isClear),
+                PolicySettled(tx.txId, tx.key, draft, known, msgKind, msg, tx.isClear),
             )
         } catch (_: Exception) {
             // Best effort: 廣播失敗不影響本地終態。
@@ -970,13 +986,25 @@ class DualViewModel(
         val coord = policyTxCoordinator ?: return
         viewModelScope.launch {
             val settled: PolicySettled? = try {
-                coord.awaitSettled(tx.txId, policyIoTimeoutMs)
+                coord.awaitSettled(tx.txId, tx.key, policyIoTimeoutMs)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 null
             }
             if (settled != null) {
+                // Stage I1：訂閱端 activeTx===tx 再檢——期間已有新 Tx（本地或
+                // coordinator 持有他者）即丟棄，免 stale 終態覆寫新 fence/終態；
+                // 僅清自身 key（新 Tx key 不同，不相干）。
+                val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
+                val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
+                if ((curLocal != null && curLocal !== tx) || (curCoord != null && curCoord !== tx)) {
+                    try {
+                        policyReconciling.remove(tx.key)
+                    } catch (_: Exception) {
+                    }
+                    return@launch
+                }
                 // Stage H2：敗者應用勝者終態即 bump（同勝者），使本地晚到 stale
                 // refresh 丟棄（敗者 refresh 不覆寫勝者）。
                 if (settled.known) {
@@ -1011,6 +1039,16 @@ class DualViewModel(
                 return@launch
             }
             // 兜底：可信重讀後顯式 reconcile 本地 phase，不永久卡死。
+            // Stage I1：同上再檢——新 Tx 在途即丟棄（不發布、不碰新 fence），僅清自身 key。
+            val curLocalFb = try { activePolicyTx.get() } catch (_: Exception) { null }
+            val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
+            if ((curLocalFb != null && curLocalFb !== tx) || (curCoordFb != null && curCoordFb !== tx)) {
+                try {
+                    policyReconciling.remove(tx.key)
+                } catch (_: Exception) {
+                }
+                return@launch
+            }
             val read: LoadResult = try {
                 val (r, _) = boundedReconcileRead(tx.store)
                 r
@@ -1046,21 +1084,32 @@ class DualViewModel(
         }
     }
 
-    // Stage H2：init/認領後訂閱（同一 txId 即應用，replay=1 晚到仍可見）。
+    // Stage H2：init/認領後訂閱（同一 txId+key 即應用，replay=1 晚到仍可見）。
     // 認領即啟動，勝者終態一到即收斂本地（與 reconciler 敗者跟隨同 helper，冪等）。
     // 訂閱僅跟隨（長預算等待，不做顯式 reconcile 兜底，免與進行中 reconciler 競爭
     // 提前 IDLE 殘留 Tx；reconciler 敗者路徑另經 launchLoserSync 兜底）。
+    // Stage I1：txId+key 精確比對（免重建後新 Tx 撞舊 id 致 stale 誤同步）＋
+    // 應用前 activeTx===tx 再檢（新 Tx 在途即丟棄，僅清自身 key）。
     private fun observeSettledFor(tx: PolicyTx) {
         val coord = policyTxCoordinator ?: return
         viewModelScope.launch {
             val settled: PolicySettled? = try {
-                coord.awaitSettled(tx.txId, POLICY_RECONCILE_TOTAL_BUDGET_MS)
+                coord.awaitSettled(tx.txId, tx.key, POLICY_RECONCILE_TOTAL_BUDGET_MS)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 null
             }
             if (settled == null) return@launch
+            val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
+            val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
+            if ((curLocal != null && curLocal !== tx) || (curCoord != null && curCoord !== tx)) {
+                try {
+                    policyReconciling.remove(tx.key)
+                } catch (_: Exception) {
+                }
+                return@launch
+            }
             if (settled.known) {
                 policyDraftVersion.incrementAndGet()
                 policyFreshnessGen.incrementAndGet()
@@ -1201,8 +1250,8 @@ class DualViewModel(
                 if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
                 // P2-1 settle-CAS 先行、勝者才發布（coordinator CAS 成功才發布）。
                 if (!tryClaimCoordinatorPublish(tx)) return
-                // Stage H2：勝者在 settle 前 tryEmit 終態（敗者跟隨用；集中式
-                // settle 發射兜底，此處顯式發射保時序，見 settlePolicyTx）。
+                // Stage H2/I1：勝者在 settle 前 tryEmit 終態（敗者跟隨用；此處顯式
+                // 發射為唯一發射點，settle 本體不再發射，見 emitTxSettledSnapshot）。
                 if (tx.isClear) emitTxSettled(
                     tx, emptySet(), true, MsgKind.INFO,
                     policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
@@ -4477,6 +4526,9 @@ class DualViewModel(
                                     }
                                 }
                             } finally {
+                                // Stage I1：結清前顯式發射終態快照（reconciler 終態
+                                // 已證失敗分支；claim 持有下，settle 本體不再發射）。
+                                emitTxSettledSnapshot(tx)
                                 settlePolicyTx(tx)
                             }
                             // 已自行結清，外層 finally 跳過（冪等兜底亦可，但明示跳過）。
@@ -4766,7 +4818,12 @@ class DualViewModel(
                 settle = false
                 throw e
             } finally {
-                if (settle) settlePolicyTx(tx)
+                // Stage I1：結清前顯式發射終態快照（reconciler 終態；settle=false 的
+                // 誠實 unresolved 不經此處故不發射）。
+                if (settle) {
+                    emitTxSettledSnapshot(tx)
+                    settlePolicyTx(tx)
+                }
             }
         }
     }
@@ -4861,6 +4918,9 @@ class DualViewModel(
                                     }
                                 }
                             } finally {
+                                // Stage I1：結清前顯式發射終態快照（reconciler 終態
+                                // 已證失敗分支；claim 持有下，settle 本體不再發射）。
+                                emitTxSettledSnapshot(tx)
                                 settlePolicyTx(tx)
                             }
                             // 已自行結清，外層 finally 跳過。
@@ -5108,7 +5168,12 @@ class DualViewModel(
                 settle = false
                 throw e
             } finally {
-                if (settle) settlePolicyTx(tx)
+                // Stage I1：結清前顯式發射終態快照（reconciler 終態；settle=false 的
+                // 誠實 unresolved 不經此處故不發射）。
+                if (settle) {
+                    emitTxSettledSnapshot(tx)
+                    settlePolicyTx(tx)
+                }
             }
         }
     }
@@ -5412,7 +5477,9 @@ class DualViewModel(
                 }
                 // late-join 結清：Tx-settle CAS（唯擁有者清 fence；併發已結則
                 // no-op，不重複移除）。
+                // Stage I1：結清前顯式發射終態快照（claim 持有下，供雙活敗者跟隨）。
                 if (lateSettled && txSnap != null) {
+                    emitTxSettledSnapshot(txSnap)
                     settlePolicyTx(txSnap)
                 }
             } finally {
@@ -5746,7 +5813,7 @@ class DualViewModel(
                             store.save(sanitized)
                         }
                         val tx = PolicyTx(
-                            txId = policyTxId.incrementAndGet(),
+                            txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
                             key = key,
                             deferred = lazy,
                             sanitized = sanitized,
@@ -5978,7 +6045,7 @@ class DualViewModel(
                                 }
                             } else {
                                 handoverTx = PolicyTx(
-                                    txId = policyTxId.incrementAndGet(),
+                                    txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
                                     key = key,
                                     deferred = deferred,
                                     sanitized = sanitized,
@@ -5997,9 +6064,24 @@ class DualViewModel(
                             // reconciler／late-join，見 decidePolicyTxSettle）。
                             // 仍在 opMutex 內，讀寫同一 store，無需另取號；
                             // 發布前 bump 照舊（TOCTOU #2）。
-                            val ackRead = try {
-                                readAfterAck(store)
+                            // Stage I1：讀 job 顯式化（detach＋有界 min(policyIoTimeoutMs,1s)，
+                            // 語義同 readAfterAck；敗者可 cancel，見下 claim 先行）。
+                            val ackJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                            val ackRead: LoadResult = try {
+                                withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { ackJob.await() }
+                            } catch (te: TimeoutCancellationException) {
+                                try {
+                                    ackJob.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                LoadResult.Unknown
                             } catch (e: CancellationException) {
+                                try {
+                                    ackJob.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
                                 // Stage H1：快徑讀被取消時已認領 fence 須回滾
                                 // （settle）＋解鎖，免殘留卡死；未認領即透傳。
                                 val pc = preClaimTx
@@ -6015,6 +6097,38 @@ class DualViewModel(
                                     }
                                 }
                                 throw e
+                            } catch (_: Exception) {
+                                try {
+                                    ackJob.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                LoadResult.Unknown
+                            }
+                            // Stage I1：快徑 claim 先行（coordinator 路徑）——認領
+                            // 已失（同 Tx 另有勝者已搶發布權）即敗者 early-return：
+                            // 不發布（免覆寫勝者終態，恰一勝者）、不結清（勝者清）、
+                            // cancel 讀 job＋解鎖 writeMutex；_state 不碰（勝者終態
+                            // 保留）。無 coordinator 舊路徑 preClaimTx 為 null，
+                            // 行為不變。
+                            val pcFast = preClaimTx
+                            if (pcFast != null &&
+                                (activePolicyTx.get() !== pcFast ||
+                                    policyTxCoordinator?.activeTx?.get() !== pcFast)
+                            ) {
+                                try {
+                                    ackJob.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                                return@withLock
                             }
                             // TOCTOU (#2): bump version + freshness + ownership
                             // so any in-flight load started before this save is
@@ -6060,8 +6174,11 @@ class DualViewModel(
                             // Stage H1：快徑成功即結清前置認領（settle 清本地＋
                             // coordinator）＋解鎖 writeMutex（同一 opMutex 內，
                             // 與發布背靠背，免窗口漏發 BUSY）。
+                            // Stage I1：結清前顯式發射終態快照（claim 持有下，
+                            // 供敗者跟隨；settle 本體不再發射）。
                             val pc = preClaimTx
                             if (pc != null) {
+                                emitTxSettledSnapshot(pc)
                                 settlePolicyTx(pc)
                                 preClaimTx = null
                             }
@@ -6073,6 +6190,22 @@ class DualViewModel(
                                 writeLocked = false
                             }
                         } else {
+                            // Stage I1：快徑 claim 先行（失敗分支同成功：敗者
+                            // early-return＋解鎖，不發布；勝者發布終態）。
+                            val pcFailFast = preClaimTx
+                            if (pcFailFast != null &&
+                                (activePolicyTx.get() !== pcFailFast ||
+                                    policyTxCoordinator?.activeTx?.get() !== pcFailFast)
+                            ) {
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                                return@withLock
+                            }
                             // Phase 1：寫入失敗即 Unknown（保留 draft、不清 draft），
                             // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
                             markPolicyUnknownLocked()
@@ -6088,8 +6221,10 @@ class DualViewModel(
                                 )
                             }
                             // Stage H1：快徑失敗同成功結清前置＋解鎖。
+                            // Stage I1：結清前顯式發射終態快照（同成功分支）。
                             val pc = preClaimTx
                             if (pc != null) {
+                                emitTxSettledSnapshot(pc)
                                 settlePolicyTx(pc)
                                 preClaimTx = null
                             }
@@ -6320,7 +6455,7 @@ class DualViewModel(
                             store.clear()
                         }
                         val txClear = PolicyTx(
-                            txId = policyTxId.incrementAndGet(),
+                            txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
                             key = key,
                             deferred = lazyClear,
                             sanitized = emptySet(),
@@ -6454,7 +6589,7 @@ class DualViewModel(
                             }
                         } else {
                             handoverTx = PolicyTx(
-                                txId = policyTxId.incrementAndGet(),
+                                txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
                                 key = key,
                                 deferred = deferred,
                                 sanitized = emptySet(),
@@ -6469,9 +6604,23 @@ class DualViewModel(
                         // Stage F1 快徑收斂（clear 對稱）：ok==true 先一次 fresh
                         // read-after-ack，Known-empty 才 CLEAR_SUCCESS，否則
                         // REFRESHED；Unknown 信 ack（保既有語義）。
-                        val ackRead = try {
-                            readAfterAck(store)
+                        // Stage I1：讀 job 顯式化（同 confirm 快徑；敗者可 cancel）。
+                        val ackJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                        val ackRead: LoadResult = try {
+                            withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { ackJob.await() }
+                        } catch (te: TimeoutCancellationException) {
+                            try {
+                                ackJob.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            LoadResult.Unknown
                         } catch (e: CancellationException) {
+                            try {
+                                ackJob.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
                             val pc = preClaimTx
                             if (pc != null) {
                                 settlePolicyTx(pc)
@@ -6485,6 +6634,34 @@ class DualViewModel(
                                 }
                             }
                             throw e
+                        } catch (_: Exception) {
+                            try {
+                                ackJob.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            LoadResult.Unknown
+                        }
+                        // Stage I1：快徑 claim 先行（同 confirm：敗者 early-return＋
+                        // cancel 讀 job＋解鎖，不發布不結清）。
+                        val pcClearFast = preClaimTx
+                        if (pcClearFast != null &&
+                            (activePolicyTx.get() !== pcClearFast ||
+                                policyTxCoordinator?.activeTx?.get() !== pcClearFast)
+                        ) {
+                            try {
+                                ackJob.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                            return@withLock
                         }
                         // TOCTOU (#2): bump version + freshness + ownership
                         // so any in-flight load started before this clear is
@@ -6521,6 +6698,8 @@ class DualViewModel(
                         }
                         val pc = preClaimTx
                         if (pc != null) {
+                            // Stage I1：結清前顯式發射終態快照（同 confirm 快徑）。
+                            emitTxSettledSnapshot(pc)
                             settlePolicyTx(pc)
                             preClaimTx = null
                         }
@@ -6532,6 +6711,22 @@ class DualViewModel(
                             writeLocked = false
                         }
                     } else {
+                        // Stage I1：快徑 claim 先行（clear 失敗分支：敗者
+                        // early-return＋解鎖，不發布）。
+                        val pcClearFailFast = preClaimTx
+                        if (pcClearFailFast != null &&
+                            (activePolicyTx.get() !== pcClearFailFast ||
+                                policyTxCoordinator?.activeTx?.get() !== pcClearFailFast)
+                        ) {
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                            return@withLock
+                        }
                         // Phase 1：清除失敗即 Unknown（保留 draft、不清 draft），
                         // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
                         // Stage A：僅已證明失敗（回 false/拋出）走此分支（FAILED）；
@@ -6549,6 +6744,8 @@ class DualViewModel(
                         }
                         val pc = preClaimTx
                         if (pc != null) {
+                            // Stage I1：結清前顯式發射終態快照（同成功分支）。
+                            emitTxSettledSnapshot(pc)
                             settlePolicyTx(pc)
                             preClaimTx = null
                         }
