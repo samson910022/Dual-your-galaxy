@@ -1513,7 +1513,7 @@ class DualViewModel(
                 )
                 else emitTxSettled(
                     tx, decision.packages, true, MsgKind.INFO,
-                    policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, decision.packages.size)),
+                    writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized),
                 )
                 disarmBlindClear()
                 _state.update { cur ->
@@ -1532,7 +1532,7 @@ class DualViewModel(
                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                         policyDraft = decision.packages,
                         policyDraftKnown = true,
-                        msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, decision.packages.size)),
+                        msg = writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized),
                         msgKind = MsgKind.INFO,
                     )
                 }
@@ -1845,6 +1845,19 @@ class DualViewModel(
     // saving-set lookups; single source so the three sites never drift).
     private fun policyWriteKey(p: PendingPolicyWrite) =
         "policy-write:${p.requestedAtMs}#${p.generation}"
+    // P2 persist 訊息含捨去數（single source）：WRITE_SUCCESS＋DROPPED 後綴，
+    // 與 request 警語/dialog 對齊，免靜默。dropped 含 request 時 catalog 捨去
+    // （pending.droppedCount）與 confirm 重消毒增量（packages - sanitized）。
+    private fun writeSuccessMsg(count: Int, pending: PendingPolicyWrite?, sanitized: Set<String>): String {
+        val base = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, count))
+        val confirmExtra = if (pending != null) {
+            (pending.packages.size - sanitized.size).coerceAtLeast(0)
+        } else 0
+        val total = (pending?.droppedCount ?: 0) + confirmExtra
+        return if (total > 0) {
+            base + "\n" + policyText(PolicyText(PolicyTextKind.DROPPED, total))
+        } else base
+    }
     // PR-7 P2 (issue #26):已對哪個目標自動恢復過持久選取 (in-memory marker)。
     // SELECTION_RESTORE_NONE = 從未恢復;恢復只在 selectedKeys 為空時執行
     // 一次 (永不覆蓋使用者當前勾選,永不自動重送寫入)。目標改變 (profile
@@ -4793,7 +4806,7 @@ class DualViewModel(
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                 policyDraft = groundDecision.packages,
                                                 policyDraftKnown = true,
-                                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, groundDecision.packages.size)),
+                                                msg = writeSuccessMsg(groundDecision.packages.size, tx.pending, tx.sanitized),
                                                 msgKind = MsgKind.INFO,
                                             )
                                         }
@@ -4982,7 +4995,7 @@ class DualViewModel(
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                 policyDraft = finalResult.packages,
                                                 policyDraftKnown = true,
-                                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
+                                                msg = writeSuccessMsg(finalResult.packages.size, tx.pending, tx.sanitized),
                                                 msgKind = MsgKind.INFO,
                                             )
                                         }
@@ -5754,9 +5767,7 @@ class DualViewModel(
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraft = result.packages,
                                         policyDraftKnown = true,
-                                        msg = policyText(
-                                            PolicyText(PolicyTextKind.WRITE_SUCCESS, result.packages.size),
-                                        ),
+                                        msg = writeSuccessMsg(result.packages.size, txSnap.pending, txSnap.sanitized),
                                         msgKind = MsgKind.INFO,
                                     )
                                 } else {
@@ -6192,7 +6203,27 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // P2 部分捨去 confirmer 門控：confirm 重消毒（與 request 同
+                    // sanitizeHookPolicy）；dropped 重算由下行 writeSuccessMsg
+                    // single source 重做（request 段 pending.droppedCount＋
+                    // 本段 packages - sanitized 增量），re-announce 於 persist
+                    // 訊息（WRITE_SUCCESS＋DROPPED 後綴），寫入照常以 sanitized
+                    // 執行（沿用 sanitizesDraftAndPersistsOnlyValidTokens 語義）。
+                    // - sanitized 為空：整包被捨去，abort（CATALOG_MISSING＋清
+                    //   pending，不碰 store；本 op 未持有 loading，不碰 loading）。
                     val sanitized = sanitizeHookPolicy(cur.packages)
+                    if (sanitized.isEmpty()) {
+                        _state.update {
+                            it.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.CATALOG_MISSING)),
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
                     // Stage H1：所有權前置＋單寫者序列化（opMutex 內、store IO 前
                     // 同步 CAS claim；LAZY async，失敗即 IN_PROGRESS 不啟 IO）。
                     // - coordinator 非 null 才走前置（無 coordinator 舊測試路徑
@@ -6770,6 +6801,8 @@ class DualViewModel(
                                     )
                                 }
                             } else {
+                                // P2：persist 訊息含 dropped（single source
+                                // writeSuccessMsg，與 request 警語/dialog 對齊）。
                                 _state.update {
                                     it.copy(
                                         loading = false,
@@ -6781,7 +6814,7 @@ class DualViewModel(
                                         // 持久化值不符。
                                         policyDraft = sanitized,
                                         policyDraftKnown = true,
-                                        msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, sanitized.size)),
+                                        msg = writeSuccessMsg(sanitized.size, cur, sanitized),
                                         msgKind = MsgKind.INFO,
                                     )
                                 }
@@ -10304,6 +10337,8 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.WRITE_FAILED -> "寫入政策失敗"
     PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（不影響已安裝分身與目前勾選）"
     PolicyTextKind.CLEAR_FAILED -> "清除草稿失敗"
+    // Dedicated string (R.string.policy_refreshed): JVM default mirrors the
+    // resource verbatim; production resolves via resources (see factory).
     PolicyTextKind.REFRESHED -> "已重新整理政策草稿"
     PolicyTextKind.REFRESH_FAILED -> "重新整理政策草稿失敗：遠端內容未知"
     PolicyTextKind.BLIND_CLEAR_FIRST -> "遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理"

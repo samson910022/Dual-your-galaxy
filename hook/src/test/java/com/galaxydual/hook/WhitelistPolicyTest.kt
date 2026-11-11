@@ -3,12 +3,20 @@ package com.galaxydual.hook
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 // JVM unit tests for the signature-guard policy (WhitelistPolicy).
 // Pure Kotlin/JUnit4 with hand-written inputs -- no Mockito, no framework
 // stubs: WhitelistPolicy takes plain result/args and a log lambda.
 class WhitelistPolicyTest {
+
+    @Before
+    fun resetLogBudget() {
+        // P2-4 bounded-log isolation: the 8-log process budget would otherwise
+        // leak across tests in one JVM (each test below expects its own log).
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+    }
 
     private val logs = mutableListOf<String>()
     private val log: (String) -> Unit = { logs.add(it) }

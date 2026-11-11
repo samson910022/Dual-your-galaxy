@@ -256,7 +256,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | 寫入確認 `POLICY_CONFIRM_TTL_MS` | 5 分鐘 | App | dialog pending 逾時→清 pending＋`TTL_EXPIRED` 訊息，不碰 draft（零寫入） |
 | blind-clear arm `BLIND_CLEAR_TTL_MS` | 5 分鐘（與上同值，別名） | App | arm 逾時→重 arm＋`policy_blind_clear_expired` 文案，需重新確認 |
 | store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op；終態正常回 `IDLE`，唯有界讀耗盡（3 次皆 Unknown 且曾逾時）／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留），可由後續 `refreshPolicyDraft` late-join 結清回 `IDLE`（讀到 Known 且原 save 已完成：成功→Known＋成功訊息，失敗→`FAILED`＋Unknown）；核對中 `refresh()`／`reconnect()`／`selectChannel`／`onForeground` 的 probe＋refresh 一律跳過（保留核對提示），`refreshPolicyDraft` 期中讓位（覆寫 msg/draft 但不碰 phase/pending，reconciler 只比 version＋ownership，期中 yielding 只推 freshness 不致丟棄） |
-| 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 冗餘重讀同一 `RemotePreferences` 實例（框架推送才是主要新鮮度機制，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
+| 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 輪詢重讀同一 `RemotePreferences` 實例（poll-only，無跨行程推送，新鮮度僅靠 TTL 輪詢＋重啟，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
 | 失敗節流 `failureCooldownMs` | 5 秒 | hook | 遠端讀取失敗後查詢節流，不重試 reader（`last-known-good` 保留或回 seed，見 `docs/HOOK.md` §1.1） |
 | 單次 auto-recheck（Stage G2） | 1 次（`invokeOnCompletion` 單次；讀 `withTimeout(policyIoTimeoutMs)` 有界獨立池） | App | deferred 完成即觸發單次權威重查（不耗 reconciler 三讀預算，走 settle helper）；Unknown→unresolved＋`UNRESOLVED_REFRESH` 待手動 refresh late-join |
 

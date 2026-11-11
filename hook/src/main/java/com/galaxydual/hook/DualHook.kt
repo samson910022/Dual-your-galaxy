@@ -556,13 +556,36 @@ class DualHook : XposedModule() {
     // cached), so a transient service absence does not silently empty the
     // policy; with no cached value the policy stays observe-only. Single seam
     // for any future policy work. NOTE: not covered by JVM tests (instantiating
-    // DualHook needs the framework); the cache is pure and unit-tested in
-    // EffectivePolicyCacheTest.
+    // DualHook needs the framework); the cache + budget + latch are pure and
+    // unit-tested (EffectivePolicyCacheTest / PolicyRefreshBudgetTest /
+    // RemoteCapabilityLatchTest).
+    //
+    // Freshness model (P1-1, corrected for LSPosed API 102.0.0): there is NO
+    // cross-process push. IXposedService 102.0.0 exposes no remote-preference
+    // callback transaction; RemotePreferences fetches mMap once and only
+    // notifies LOCAL listeners; XposedService.getRemotePreferences is
+    // computeIfAbsent cached forever. The registered listener below is therefore
+    // same-process only and never fires for an app-process write. Freshness is
+    // POLL ONLY: the cache TTL (60s) re-reads the cached instance; even the
+    // poll may return stale data until reboot (daemon restart rebuilds the
+    // map). See docs/HOOK.md §1.1 + CrossProcessFreshnessContractTest.
+    //
+    // Hot-path budget (P1-2): the reader below runs on a bounded executor with
+    // a 50ms stall budget (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on
+    // timeout the query falls back to seed/last-known-good and never blocks the
+    // hooked whitelist-query thread beyond the budget.
     internal fun effectivePolicy(): Set<String> =
-        effectiveCache.get(EXTRA_WHITELIST_PACKAGES) { readRemotePolicy() }
+        effectiveCache.get(EXTRA_WHITELIST_PACKAGES) {
+            PolicyRefreshBudget.readBounded(
+                reader = { readRemotePolicy() },
+                timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+                executor = policyRefreshExecutor,
+            )
+        }
 
     // RemotePreferences-backed policy reader (Stage H2-P1 plumbing, hardened in
-    // H2-P2), reached through EffectivePolicyCache (see effectivePolicy).
+    // H2-P2), reached through EffectivePolicyCache via a bounded executor
+    // (see effectivePolicy).
     //
     // Reads the same LSPosed remote-prefs group/key the app writes via
     // XposedService.getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
@@ -572,15 +595,24 @@ class DualHook : XposedModule() {
     // logged best-effort only on the good->failed transition. Null is NOT
     // cached: the last known good value stays applied, or the seed alone when
     // none is cached (fail-closed observe-only). A successful read (even empty)
-    // returns a set and IS cached. LSPosed delivers remote-prefs changes to
-    // the hook process via IRemotePreferenceCallback; the registered listener
-    // invalidates the cache on change (near-real-time freshness). The cache's
-    // TTL is only a redundant safety net that re-reads the cached instance.
+    // returns a set and IS cached.
+    //
+    // NO cross-process push on API 102.0.0 (P1-1 correction): LSPosed does NOT
+    // deliver remote-prefs changes to this process via IRemotePreferenceCallback
+    // (no such transaction exists); the listener registered below is
+    // same-process only (best-effort hygiene, never the freshness mechanism).
+    // Freshness is poll-only via the cache TTL; a version/sequence key bump by
+    // the writer + reboot semantics are documented in docs/HOOK.md §1.1.
     // DEVICE-UNVERIFIED: end-to-end read-after-write still needs on-device proof.
     private fun readRemotePolicy(): Set<String>? {
-        // PROP_CAP_REMOTE probe: a definitive "no" caches an empty (observe-only)
-        // policy; a probe that throws is NOT latched and returns null, so the
-        // cache does not cache the failure and the next query retries.
+        // PROP_CAP_REMOTE probe via RemoteCapabilityLatch (P2-1): only a
+        // definitive true is latched; a probe that throws is NOT latched and
+        // returns null, so the cache does not cache the failure and the next
+        // query retries. A definitive false reports through the latch and
+        // returns emptySet() (successful empty read, cached 60s): the latch 5s
+        // is an INNER gate reached only on a cache miss (TTL expiry or
+        // explicit invalidate), so effective false retry = max(60s TTL, 5s
+        // latch); invalidate clears both for an immediate retry.
         val capable = isRemoteCapable() ?: return null
         if (!capable) return emptySet()
         return try {
@@ -598,16 +630,31 @@ class DualHook : XposedModule() {
         }
     }
 
-    // PROP_CAP_REMOTE probe (cached once it resolves). A framework without
-    // remote prefs never attempts the read, so the hook stays observe-only
-    // without retrying. A probe that throws is NOT latched false: it is logged
-    // best-effort and retried on the next call (only a definitive answer is
-    // cached).
+    // PROP_CAP_REMOTE probe via RemoteCapabilityLatch (P2-1). A framework
+    // without remote prefs stays observe-only with a TTL-gated retry (never
+    // a forever latch): a definitive false returns emptySet() (successful
+    // empty read, cached 60s by EffectivePolicyCache), so the latch 5s
+    // cooldown is an INNER gate reached only on a cache miss (TTL expiry or
+    // explicit invalidate). Effective false retry = max(60s TTL, 5s latch).
+    // A probe that throws is NOT latched false: it is logged best-effort
+    // and retried on the next call (returns null, not cached, so the cache
+    // 5s failure cooldown -- not the TTL -- governs throw retries). Only a
+    // definitive true is latched forever. Latch state is cleared for false
+    // on invalidate() so a policy-change signal re-probes immediately
+    // (cache.invalidate + latch.onInvalidate together).
     private fun isRemoteCapable(): Boolean? {
-        remoteCapable?.let { return it }
+        // Fast path: latched true never re-probes.
+        if (capabilityLatch.isLatchedTrue()) return true
+        if (!capabilityLatch.shouldProbe()) return remoteCapableFalseCached
         return try {
             val capable = (getFrameworkProperties() and XposedInterface.PROP_CAP_REMOTE) != 0L
-            remoteCapable = capable
+            if (capable) {
+                capabilityLatch.reportTrue()
+                remoteCapableFalseCached = null
+            } else {
+                capabilityLatch.reportFalse()
+                remoteCapableFalseCached = false
+            }
             capable
         } catch (t: Throwable) {
             if (!remoteCapabilityProbeFailureLogged) {
@@ -618,6 +665,12 @@ class DualHook : XposedModule() {
         }
     }
 
+    // Same-process listener hygiene only (P1-1 correction): on API 102.0.0
+    // this listener NEVER fires for a cross-process (app -> hook) write --
+    // RemotePreferences only notifies local listeners. Registration is kept
+    // best-effort (prevents a stale-instance leak and preserves the JVM seam)
+    // but freshness never depends on it; the TTL poll is the mechanism.
+    //
     // Phase 4: synchronized + compareAndSet with unregister of the old
     // instance. A stale listener on a replaced prefs instance would both leak
     // and invalidate on irrelevant changes; unregister best-effort (never
@@ -759,18 +812,34 @@ class DualHook : XposedModule() {
     companion object {
         private const val TAG = "GalaxyDualHook"
 
-        // Stage H2-P2: effective-policy cache + remote-prefs change listener.
+        // Stage H2-P2: effective-policy cache + same-process prefs listener
+        // (listener is local-only hygiene on API 102.0.0, never cross-process).
         // Companion (static) so a hot-reload instance replacement cannot leak
         // the listener through the instance; the cache survives reloads.
-        // Production reads go through this cache (effectivePolicy); the
-        // PolicySource.remotePolicyReader seam remains for JVM tests.
+        // Production reads go through this cache via a bounded executor
+        // (effectivePolicy); the PolicySource.remotePolicyReader seam remains
+        // for JVM tests.
         private val effectiveCache = EffectivePolicyCache()
 
-        // Null = not probed yet (a thrown probe is not latched; see
-        // isRemoteCapable). PROP_CAP_REMOTE gates the remote read; a framework
-        // without remote prefs stays observe-only without retrying.
+        // Bounded refresh executor (P1-2): single daemon thread shared by all
+        // policy refreshes so a slow binder read never pins the hooked query
+        // thread beyond PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS. Daemon so
+        // it never blocks process exit; single thread bounds IPC fan-out under
+        // query herds (EffectivePolicyCache single-flight already collapses
+        // concurrent misses to one leader). Intentionally never shut down:
+        // process-lifetime executor for system_server/daagent (shutdown would
+        // strand future refreshes; daemon thread exits with the process).
+        private val policyRefreshExecutor: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "GalaxyDual-policy-refresh").apply { isDaemon = true }
+            }
+
+        // Remote-capability latch (P2-1): only true is latched forever; false
+        // is cooldown-gated and re-probed (see RemoteCapabilityLatch). The
+        // last-observed false is cached here for the cooldown fast path.
+        private val capabilityLatch = RemoteCapabilityLatch()
         @Volatile
-        private var remoteCapable: Boolean? = null
+        private var remoteCapableFalseCached: Boolean? = null
 
         // Rate-limits the capability-probe failure log: a persistently throwing
         // probe would otherwise spam the hot path on every query.
@@ -782,11 +851,14 @@ class DualHook : XposedModule() {
         // only after a successful registration (see registerPolicyChangeListener).
         // Phase 4: guarded by listenerLock (synchronized + compareAndSet);
         // re-registration unregisters the old instance best-effort.
+        // P1-1: same-process hygiene only -- invalidating here never proves a
+        // cross-process write arrived (API 102.0.0 has no push).
         private val listenerLock = Any()
         @Volatile
         private var registeredPrefs: SharedPreferences? = null
         private val remotePolicyListener =
             SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+                capabilityLatch.onInvalidate()
                 effectiveCache.invalidate()
             }
 

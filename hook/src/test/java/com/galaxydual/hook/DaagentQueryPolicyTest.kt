@@ -4,6 +4,7 @@ package com.galaxydual.hook
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 // Stage1 method-level apply path (JVM-testable pure-logic part).
@@ -19,6 +20,13 @@ import org.junit.Test
 // install/callback itself needs an LSPosed daagent process and is
 // DEVICE-UNVERIFIED (not covered here).
 class DaagentQueryPolicyTest {
+
+    @Before
+    fun resetLogBudget() {
+        // P2-4 bounded-log isolation: the 8-log process budget would otherwise
+        // leak across tests in one JVM (each test below expects its own log).
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+    }
 
     private val logs = mutableListOf<String>()
     private val log: (String) -> Unit = { logs.add(it) }

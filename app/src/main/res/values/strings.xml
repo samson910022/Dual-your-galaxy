@@ -306,4 +306,50 @@
     <string name="nav_tab_cd_selected">%1$s，%2$s</string>
     <!-- Phase 3 P3 B7: 設定 nav 開啟對話框 (非切頁)，CD 明示開啟對話框。 -->
     <string name="settings_tab_cd">關於，點兩下開啟對話框</string>
+    <!-- P2：VM 硬編碼字串資源化（前身 DualViewModel msg="..." 硬編碼中英混雜；VM 本體
+         無 Context，顯示經 MainActivity.localizeVmMessage/vmMessageRes 解析；JVM 以
+         vmMessageRes 鎖定映射）。%1$s=原文動態後綴（包名/數量/技術細節透傳，不翻譯）。
+         已知限制（locale-mixed by design）：前綴模板已本地化，%1$s 餘部原文透傳；
+         包名/技術細節餘部為 locale-neutral 故完整，但結構化中文訊息餘部含中文子句
+         （verified-id/serial/label、select-target、rebound、saved-selection、batch、
+         serial 缺失後綴），EN 下為「EN 前綴＋中文餘部」混合（見 MainActivity
+         vmMessageRes KDoc＋StageJ5PolishTest 混合斷言）；VM 改發結構化參數前維持透傳。 -->
+    <string name="vm_no_dual_profile">無雙開設定檔</string>
+    <string name="vm_no_pending_remove">沒有待確認的移除</string>
+    <string name="vm_busy_batch_clone">批次建立進行中，請稍候</string>
+    <string name="vm_selection_cleared">已清除勾選（未卸載任何分身）</string>
+    <string name="vm_save_failed">保存選取失敗</string>
+    <string name="vm_unsave_failed">取消保存失敗</string>
+    <string name="vm_save_cancelled">已取消保存選取（不影響已安裝分身與目前勾選）</string>
+    <string name="vm_no_store_save">無選取 store，無法保存</string>
+    <string name="vm_no_store_unsave">無選取 store，無法取消保存</string>
+    <string name="vm_remove_ttl_expired">確認已過期，請重新確認移除</string>
+    <string name="vm_target_unverifiable">移除目標無法驗證（serial 缺失），請重新確認</string>
+    <string name="vm_serial_unknown_retry">無法驗證分身身分（serial 缺失），請重試</string>
+    <string name="vm_list_stale_resave">清單已過期（STALE），請重新查詢後再保存</string>
+    <string name="vm_in_progress">進行中，請稍候：%1$s</string>
+    <string name="vm_cloned">已建立分身：%1$s</string>
+    <string name="vm_removed">已移除：%1$s</string>
+    <string name="vm_clone_failed">建立分身失敗：%1$s</string>
+    <string name="vm_clone_verify_failed">建立分身驗證失敗：%1$s</string>
+    <string name="vm_clone_mismatch">建立分身驗證不一致：%1$s</string>
+    <string name="vm_clone_unknown">建立分身結果未知：%1$s</string>
+    <string name="vm_remove_failed">移除失敗：%1$s</string>
+    <string name="vm_remove_unknown">移除結果未知：%1$s</string>
+    <string name="vm_remove_cancelled">已取消移除：%1$s</string>
+    <string name="vm_await_remove">等待確認移除：%1$s</string>
+    <string name="vm_not_installed">未安裝，無需移除：%1$s</string>
+    <string name="vm_target_changed_verified_id">移除目標已變更（verified id %1$s</string>
+    <string name="vm_target_changed_serial">移除目標已變更（serial %1$s</string>
+    <string name="vm_target_changed_label">移除目標已變更（%1$s</string>
+    <string name="vm_serial_unknown_suffix">無法驗證分身身分（serial 缺失），%1$s</string>
+    <string name="vm_select_target_user">選取目標已變更（user %1$s</string>
+    <string name="vm_select_target_serial">選取目標已變更（serial %1$s</string>
+    <string name="vm_target_rebound">選取已綁定舊目標%1$s</string>
+    <string name="vm_saved_selection">已保存選取 %1$s</string>
+    <string name="vm_batch_no_start">批次無法開始：channel error: %1$s</string>
+    <string name="vm_batch_target_changed">批次中斷：目標已變更（user %1$s</string>
+    <string name="vm_batch_partial">批次中斷：已完成 %1$s</string>
+    <string name="vm_probe_failed">探測失敗：%1$s</string>
+    <string name="vm_foreground_failed">前台恢復失敗：%1$s</string>
 </resources>

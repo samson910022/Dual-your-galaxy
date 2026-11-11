@@ -3182,7 +3182,9 @@ class PolicyWriteTest {
         vm.refreshPolicyDraft()
         await { vm.state.value.policyDraftKnown }
         vm.clearPolicyDraft()
-        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
+        // 等完整終態（store 調用＋UI 發布同一語義；僅等 clearCalls 會在負載下撞見
+        // store 已調而 UI 更新（CLEAR_SUCCESS INFO）在途，誤判 NONE）。
+        await(timeoutMs = 5_000L) { fake.clearCalls == 1 && vm.state.value.msgKind == MsgKind.INFO }
         assertEquals(1, fake.clearCalls)
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
@@ -4870,7 +4872,18 @@ class PolicyWriteTest {
         val coord = PolicyTxCoordinator()
         try {
             val vm = makeVm(fake.store, userId = 0, policyTxCoordinator = coord)
-            val winner = newTestTx(fake.store, setOf("com.WINNER"))
+            // 註冊 CAS 語義與事後核對競速無關：winner 用未完成 deferred，使隨後啟動的
+            // reconciler／auto-recheck 恆走 Unresolved（不結清、不清本地），註冊態斷言
+            // 不依賴「測試執行緒跑贏核對協程」的時序（已完成 deferred＋Known 讀會立刻
+            // Mismatch 結清並清空本地，負載高時必現 flake）。
+            val winner = DualViewModel.PolicyTx(
+                txId = -1L,
+                key = "policy-test",
+                deferred = kotlinx.coroutines.CompletableDeferred(),
+                sanitized = setOf("com.WINNER"),
+                store = fake.store,
+                isClear = false,
+            )
             val loser = DualViewModel.PolicyTx(
                 txId = -2L,
                 key = "policy-test-loser",
@@ -5196,61 +5209,79 @@ class PolicyWriteTest {
     // 續留舊 A。
     @Test
     fun h2_provenFailed_optimisticDoesNotOverturn() {
-        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
-        val calls = java.util.concurrent.atomic.AtomicInteger(0)
-        val saveStarted = java.util.concurrent.CountDownLatch(1)
-        val saveFinished = java.util.concurrent.CountDownLatch(1)
-        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
-        val store = HookPolicyStore(
-            // call 1：init 回真值 A；放行前恆回樂觀 B（==sanitized，在途 inconclusive）；
-            // 放行後回權威 A（ground truth !=B，late-join 仍 FAILED）。J2 語義同上。
-            loadRaw = {
-                val n = calls.incrementAndGet()
-                if (n == 1) backend.get()
-                else if (!saveRelease.get()) setOf("com.B")
-                else backend.get()
-            },
-            saveRaw = { _ ->
-                saveStarted.countDown()
-                while (!saveRelease.get()) {
-                    try {
-                        Thread.sleep(10)
-                    } catch (_: InterruptedException) {
+        // 生產一律經 coordinator 仲裁 settle（恰一次發布）；null-coordinator 下
+        // refresh late-join loser 無仲裁可跳過，版本丟棄分支會以 REFRESHED INFO 覆寫
+        // 勝者的 FAILED（與 auto-recheck／reconciler 三方競速，負載高時必現 flake）。
+        // 此處傳真實 coordinator 鎖定恰一次 FAILED 終態（意圖不變）。
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val calls = java.util.concurrent.atomic.AtomicInteger(0)
+            val saveStarted = java.util.concurrent.CountDownLatch(1)
+            val saveFinished = java.util.concurrent.CountDownLatch(1)
+            val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+            val store = HookPolicyStore(
+                // call 1：init 回真值 A；放行前恆回樂觀 B（==sanitized，在途 inconclusive）；
+                // 放行後回權威 A（ground truth !=B，late-join 仍 FAILED）。J2 語義同上。
+                loadRaw = {
+                    val n = calls.incrementAndGet()
+                    if (n == 1) backend.get()
+                    else if (!saveRelease.get()) setOf("com.B")
+                    else backend.get()
+                },
+                saveRaw = { _ ->
+                    saveStarted.countDown()
+                    while (!saveRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
                     }
-                }
-                saveFinished.countDown()
-                false
-            },
-        )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(setOf("com.A"), vm.state.value.policyDraft)
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+                    saveFinished.countDown()
+                    false
+                },
+            )
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
-        // 三輪樂觀 B（deferred 未完成）皆 inconclusive，不搶結為 SUCCESS。
-        await(timeoutMs = 15_000L) {
-            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            // 三輪樂觀 B（deferred 未完成）皆 inconclusive，不搶結為 SUCCESS。
+            await(timeoutMs = 15_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertNotNull(activeTxOf(vm))
+
+            // 放行已證失敗＋late-join（讀權威 A != sanitized B＋deferred false）→FAILED，不翻案。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            vm.refreshPolicyDraft()
+            // 等完整終態（IDLE＋FAILED 同一原子更新；僅等 phase 會在負載下撞見
+            // 中間態，見上 coordinator 註記）。
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && vm.state.value.msgKind == MsgKind.FAILED }
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+            assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
+            // 終態發布（IDLE＋FAILED）與本地 fence 釋放（settlePolicyTx）分兩步：
+            // 有 coordinator 時中間隔著終態快照發射（含可能的 suspending 補發），
+            // UI 已終態而本地 Tx 尚未清空屬合法中間態，此處等待收斂再斷言。
+            await(timeoutMs = 10_000L) { activeTxOf(vm) == null }
+            assertNull(activeTxOf(vm))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
         }
-        assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertNotNull(activeTxOf(vm))
-
-        // 放行已證失敗＋late-join（讀樂觀 B＋deferred false）→FAILED，不翻案。
-        saveRelease.set(true)
-        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        vm.refreshPolicyDraft()
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
-        assertNull(vm.state.value.pendingPolicyWrite)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.A"), vm.state.value.policyDraft)
-        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
-        assertNull(activeTxOf(vm))
     }
 
     // Stage I1 T1：A→重建→B碰撞→C訂閱阻塞（舊碼敗新碼過）。

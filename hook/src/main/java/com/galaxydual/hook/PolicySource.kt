@@ -63,15 +63,40 @@ object PolicySource {
     fun sanitize(raw: Set<*>): Set<String> {
         val out = LinkedHashSet<String>()
         var seen = 0
-        for (it in raw) {
-            // Bound total input traversal (defense against huge invalid-token
-            // payloads that never reach the valid-entry cap).
-            if (seen++ >= MAX_POLICY_ENTRIES * 8) break
-            if (out.size >= MAX_POLICY_ENTRIES) break
-            if (it is String &&
-                it.length <= MAX_PACKAGE_LENGTH &&
-                isValidPackage(it)
-            ) out.add(it)
+        val iter: Iterator<*> = try {
+            raw.iterator()
+        } catch (_: Throwable) {
+            // Hostile set whose iterator() throws: fail closed to empty
+            // (standalone-safe; never propagates out of sanitize).
+            return emptySet()
+        }
+        try {
+            while (true) {
+                val hasNext: Boolean = try {
+                    iter.hasNext()
+                } catch (_: Throwable) {
+                    break
+                }
+                if (!hasNext) break
+                val it: Any? = try {
+                    iter.next()
+                } catch (_: Throwable) {
+                    break
+                }
+                // Bound total input traversal (defense against huge invalid-token
+                // payloads that never reach the valid-entry cap).
+                if (seen++ >= MAX_POLICY_ENTRIES * 8) break
+                if (out.size >= MAX_POLICY_ENTRIES) break
+                if (it is String &&
+                    it.length <= MAX_PACKAGE_LENGTH &&
+                    isValidPackage(it)
+                ) out.add(it)
+            }
+        } catch (_: Throwable) {
+            // Hostile iterator machinery (hasNext/next throwing mid-walk):
+            // keep the valid prefix collected so far (fail-closed partial).
+            // Callers that need all-or-nothing use effective(), which applies
+            // the gate on the sanitized result.
         }
         return out
     }
@@ -101,10 +126,47 @@ object PolicySource {
         remote: Set<String?> = emptySet(),
         nonEmptyPolicyGateOpen: Boolean = NON_EMPTY_POLICY_EFFECTIVE_GATE,
     ): Set<String> {
-        if (seed.isEmpty() && remote.isEmpty()) return emptySet()
+        // Standalone Throwable-safety (P2-3): hostile set views (iterator /
+        // hasNext / next / contains throwing, including Error) must fail
+        // closed here instead of propagating out of the hook chain. Each side
+        // is sanitized independently so a hostile remote can never poison the
+        // seed side (fail-closed seed-only) and a hostile seed fails to empty.
+        val seedEmpty: Boolean = try {
+            seed.isEmpty()
+        } catch (_: Throwable) {
+            false
+        }
+        val remoteEmpty0: Boolean = try {
+            remote.isEmpty()
+        } catch (_: Throwable) {
+            false
+        }
+        if (seedEmpty && remoteEmpty0) return emptySet()
+        val seedPart: Set<String> = try {
+            @Suppress("UNCHECKED_CAST")
+            sanitize(seed as Set<*>)
+        } catch (_: Throwable) {
+            emptySet()
+        }
+        // isEmpty() itself runs on caller-supplied machinery and may throw.
+        val remoteEmpty: Boolean = try {
+            remote.isEmpty()
+        } catch (_: Throwable) {
+            false
+        }
+        val remotePart: Set<String> = if (remoteEmpty) {
+            emptySet()
+        } else {
+            try {
+                @Suppress("UNCHECKED_CAST")
+                sanitize(remote as Set<*>)
+            } catch (_: Throwable) {
+                emptySet()
+            }
+        }
         val out = LinkedHashSet<String>()
-        out.addAll(sanitize(seed))
-        out.addAll(sanitize(remote))
+        out.addAll(seedPart)
+        out.addAll(remotePart)
         if (out.isNotEmpty() && !nonEmptyPolicyGateOpen) return emptySet()
         // Enforce a single global cap on the merged set (seed + remote), so a
         // hostile split between the two sides cannot double the bound.

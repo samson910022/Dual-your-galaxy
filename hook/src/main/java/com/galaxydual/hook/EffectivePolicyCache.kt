@@ -36,12 +36,18 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // every query. Phase 5: comment language unified to English (was Chinese).
     private val failureCooldownMs = 5_000L
 
-    // Redundant safety net for freshness: LSPosed delivers remote-prefs
-    // changes to the hook process via IRemotePreferenceCallback, which the
-    // DualHook listener uses to invalidate this cache. This TTL only forces a
-    // re-read of the same cached RemotePreferences instance (it cannot force a
-    // fresh daemon fetch if the framework ever stops pushing), so it is a
-    // bounded redundancy, not the primary freshness mechanism.
+    // Redundant safety net for freshness: on LSPosed API 102.0.0 there is NO
+    // cross-process push (IXposedService has no remote-preference callback
+    // transaction; RemotePreferences fetches mMap once and only notifies
+    // local listeners; XposedService.getRemotePreferences is computeIfAbsent
+    // cached forever). A same-process listener therefore never fires for an
+    // app-process write. Freshness here is POLL ONLY: this TTL forces a
+    // re-read of the cached RemotePreferences instance after maxCacheAgeMs.
+    // Because the instance is cached forever, even the poll may return stale
+    // data until reboot (reboot semantics: daemon restart rebuilds the map).
+    // See docs/HOOK.md §1.1 (poll/TTL + version/sequence key + reboot) and
+    // the JVM contract test pinning no cross-process notify
+    // (CrossProcessFreshnessContractTest).
     private val maxCacheAgeMs = 60_000L
     private var lastRefreshMs = 0L
     // Null means "no failure recorded yet" (also used after invalidate), so the

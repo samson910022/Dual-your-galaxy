@@ -219,8 +219,20 @@ class EffectivePolicyCacheTest {
         assertEquals(1, reads)
     }
 
+    // P2-3: a hostile remote set (iterator throws) is sanitized to seed-only
+    // and CACHED as a successful read (fail-closed observe-only). Contrast
+    // with a null/throwing READER (failed read, not cached, retried under the
+    // 5s failure cooldown above).
+    //
+    // Tradeoff (60s TTL vs 5s cooldown): caching the sanitized seed-only value
+    // for the full TTL avoids a hostile-entry retry storm (every query would
+    // otherwise re-run hostile iteration + sanitize on the hot path), at the
+    // cost of delaying a concurrent legitimate remote fix until TTL/invalidate.
+    // This is preferred because (a) a throwing iterator signals corrupt prefs
+    // content, not a transient IPC blip, and (b) an explicit invalidate()
+    // (same-process listener hygiene or TTL expiry) still recovers promptly.
     @Test
-    fun hostileRemoteSetThatThrowsIsFailedRead() {
+    fun hostileRemoteSanitizesToSeedOnlyAndCaches() {
         var reads = 0
         val time = java.util.concurrent.atomic.AtomicLong(0)
         val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
@@ -235,7 +247,8 @@ class EffectivePolicyCacheTest {
                 hostile
             },
         )
-        // The throwing set is treated as a failed read: not cached, retried.
+        // Sanitized to seed-only and cached: the hostile value is never
+        // resurrected, and the reader is not retried while cached.
         assertEquals(
             setOf("com.seed.app"),
             cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
@@ -243,7 +256,7 @@ class EffectivePolicyCacheTest {
                 hostile
             },
         )
-        assertEquals(2, reads)
+        assertEquals(1, reads)
     }
 
     // Stage C single-flight: exactly one reader call under concurrency. The
