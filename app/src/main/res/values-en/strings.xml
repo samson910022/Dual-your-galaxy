@@ -85,6 +85,8 @@
          timed out, result unknown, reconciling, do not retry; pending kept). -->
     <string name="policy_write_timeout">Policy write timed out with unknown result; reconciling, do not retry</string>
     <string name="policy_clear_timeout">Draft clear timed out with unknown result; reconciling, do not retry</string>
+    <!-- Stage G2: single authoritative recheck after deferred completion still unknown (unresolved; button is refresh draft). -->
+    <string name="policy_unresolved_refresh">Result still unknown; tap “Refresh draft” to confirm</string>
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
     <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
