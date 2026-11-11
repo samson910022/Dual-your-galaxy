@@ -21,6 +21,9 @@ object PolicySource {
     // after on-device proof; until then it stays empty.
     val STATIC_SEED: Set<String> = emptySet()
 
+    // Code gate for non-empty effective policy. Remains false until HOOK.md §1.4 hard gate is satisfied with device evidence (signatures/returns, hook-install counts, callback hits, user/profile/install-state, controlled empty vs non-empty). This is a code gate only, not device verification.
+    const val NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = false
+
     fun isValidPackage(pkg: String): Boolean =
         pkg.isNotEmpty() && PKG.matches(pkg)
 
@@ -34,14 +37,22 @@ object PolicySource {
 
     // Effective policy: sanitized seed + sanitized remote snapshot.
     // Union-only: entries are never removed by the remote side.
+    // Fail-closed: a sanitized non-empty merge is returned only when the
+    // explicit code gate is open; otherwise returns empty. Stage 1 default
+    // gate is closed, so behavior is observe-only (identical to empty inputs).
     // TODO(future-perf): cache the merged set and recompute only when the
     // remote snapshot changes; today the seed is empty so the fast path below
     // short-circuits with zero allocation.
-    fun effective(seed: Set<String?> = STATIC_SEED, remote: Set<String?> = emptySet()): Set<String> {
+    fun effective(
+        seed: Set<String?> = STATIC_SEED,
+        remote: Set<String?> = emptySet(),
+        nonEmptyPolicyGateOpen: Boolean = NON_EMPTY_POLICY_EFFECTIVE_GATE,
+    ): Set<String> {
         if (seed.isEmpty() && remote.isEmpty()) return emptySet()
         val out = LinkedHashSet<String>()
         out.addAll(sanitize(seed))
         out.addAll(sanitize(remote))
+        if (out.isNotEmpty() && !nonEmptyPolicyGateOpen) return emptySet()
         return out
     }
 }
