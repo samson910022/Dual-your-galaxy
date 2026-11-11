@@ -24,10 +24,13 @@ import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -40,6 +43,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -709,6 +713,12 @@ class DualViewModel(
         // ground truth 應來自重讀而非殘留 future。
         const val POLICY_RECONCILE_INITIAL_DELAY_MS = 500L
         const val POLICY_RECONCILE_RETRY_DELAY_MS = 1_000L
+        // Stage F2 (P2#4)：reconciler 總預算寫死上限（join＋3 讀＋退避合計）。
+        // 無論注入 policyIoTimeoutMs 多大（預設 10s 下三讀即 30s），總耗時有界；
+        // 超限即誠實 unresolved（REFRESH_FAILED/CHANNEL＋Known=false＋pending
+        // 保留＋phase 續留 RECONCILING，不回 IDLE、不解 fence）。15s 容納測試
+        // 小超時全程（200ms 檔約 3.3s）與生產 binder 抖動，預設大超時則提前截斷。
+        const val POLICY_RECONCILE_TOTAL_BUDGET_MS = 15_000L
     }
     private val _state = MutableStateFlow(
         UiState(
@@ -830,6 +840,22 @@ class DualViewModel(
     )
     private val policyTxId = AtomicLong(0L)
     private val activePolicyTx = AtomicReference<PolicyTx?>(null)
+    // Stage F2 (P2#4)：reconciler 專用獨立讀池（per-VM 單執行緒，執行緒名
+    // policyReconcile）。Binder 不可中斷：逾時讀的執行緒滯留此池（不佔共用 IO
+    // 池），呼叫側計預算（withTimeout 照常到期）。per-VM 而非全域：無限阻塞測
+    // 試滯留的執行緒不得堵住其他 VM 的後續核對。執行緒 lazy 啟動（無核對即無
+    // 執行緒）；onCleared/dispose 盡力關閉（阻塞中執行緒仍滯留至行程結束）。
+    private val policyReconcileDispatcher: CoroutineDispatcher =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "policyReconcile") }
+            .asCoroutineDispatcher()
+
+    private fun closeReconcileDispatcher() {
+        try {
+            (policyReconcileDispatcher as? ExecutorCoroutineDispatcher)?.close()
+        } catch (_: Exception) {
+            // Best effort: 阻塞中執行緒隨行程結束回收。
+        }
+    }
     // F1 Tx-settle：唯擁有者可清 fence（CAS＋reconciling移除同組）。回 true 表
     // 本 Tx 結清（含首次）；false 表 Tx 已非擁有者（併發已結，不重複移除）。
     private fun settlePolicyTx(tx: PolicyTx): Boolean {
@@ -840,6 +866,8 @@ class DualViewModel(
     // F1 有界 join（F1-simple：withTimeout(policyIoTimeoutMs)；F2 再預算化）：
     // true=句柄已證成功，false=已證失敗（含回 false 與拋出），null=仍 pending
     // （逾時未知，保留 fence 續讀）。CE 透傳（scope 取消，不吞為失敗）。
+    // Stage F2：本 join 納入 reconciler 總預算（外層
+    // withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS)），此處內界不變。
     private suspend fun joinPolicyTxBounded(tx: PolicyTx): Boolean? = try {
         withTimeout(policyIoTimeoutMs) { tx.deferred.await() }
     } catch (te: TimeoutCancellationException) {
@@ -848,6 +876,41 @@ class DualViewModel(
         throw e
     } catch (_: Exception) {
         false
+    }
+    // Stage F2 有界讀（獨立池＋detach）：每次讀外包 withTimeout(policyIoTimeoutMs)，
+    // 最多 POLICY_RECONCILE_RETRIES 次。Binder 不可中斷：loadRaw 若無視取消
+    // （測試 latch/無限迴圈皆 catch InterruptedException 續跑），逾時僅放棄等待
+    // （d.cancel 盡力），執行緒滯留獨立池，呼叫側計預算（timedOut=true）。回
+    // (結果，是否逾時)：逾時一律 Unknown＋true；真異常 Unknown＋false；CE 透傳。
+    // child-async（viewModelScope 子協程：VM 清除可取消；總預算/單讀逾時經手動
+    // d.cancel 收斂，見下）。
+    private suspend fun boundedReconcileRead(store: HookPolicyStore): Pair<LoadResult, Boolean> {
+        val d = viewModelScope.async(policyReconcileDispatcher) { store.loadResult() }
+        return try {
+            val v: LoadResult = withTimeout(policyIoTimeoutMs) { d.await() }
+            Pair(v, false)
+        } catch (te: TimeoutCancellationException) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort: 執行緒滯留獨立池，呼叫側已計預算。
+            }
+            LoadResult.Unknown to true
+        } catch (e: CancellationException) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            throw e
+        } catch (_: Exception) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            LoadResult.Unknown to false
+        }
     }
     // F1 快徑 read-after-ack（fresh，有界；失敗即 Unknown，信 ack 保既有語義）。
     // 有界取 min(policyIoTimeoutMs, 1s)：預設 10s 下阻塞式測試 load（latch）會
@@ -1078,14 +1141,17 @@ class DualViewModel(
     // Test-visible entry: onCleared is protected, so JVM tests drive disposal
     // through here (same idempotent body).
     // Stage D：同步 disarm blind-clear（VM 丟棄後不得殘留確認態）。
+    // Stage F2：盡力關閉獨立讀池（阻塞中執行緒仍滯留至行程結束）。
     fun dispose() {
         disarmBlindClear()
         teardownShizukuBindings()
+        closeReconcileDispatcher()
     }
 
     override fun onCleared() {
         disarmBlindClear()
         teardownShizukuBindings()
+        closeReconcileDispatcher()
         super.onCleared()
     }
 
@@ -3766,176 +3832,279 @@ class DualViewModel(
             policyReconciling.isNotEmpty()
 
     // Stage A：confirm 逾時後的背景核對器（獨立 job，不持 opMutex/mutex 已釋放）。
-    // - 子 job 可取消（Dispatchers.IO，不加 NonCancellable）：backoff delay 與
-    //   load 皆響應外部取消（VM 清除），CE 透傳、不發布終態；finally（非 suspend
-    //   的 Tx-settle CAS）仍跑，故無殘留。清理本身非 suspend，不需 withContext
-    //   (NonCancellable) 包裹；終態 _state.update 亦非 suspend。
+    // - Stage F2：本體跑 Main（viewModelScope 預設，不佔 IO 執行緒），僅讀切獨立
+    //   池 policyReconcileDispatcher（見欄位註記）。backoff delay 與 load 皆響應
+    //   外部取消（VM 清除），CE 透傳、不發布終態；finally（非 suspend 的 Tx-settle
+    //   CAS，有條件）仍跑。清理本身非 suspend，不需 withContext(NonCancellable)
+    //   包裹；終態 _state.update 亦非 suspend。
     // - Stage F1：先有界 join 句柄（withTimeout 簡單版），再驗證讀（先join後讀）：
     //   false/throw（已證失敗）即 FAILED+Unknown 結清，不再重讀（樂觀污染不得
     //   掩蓋已證失敗）；true 即正常驗證讀；pending（null）則保留 fence 續讀，
     //   其中 Known==sanitized(B) 視 inconclusive 續等（不搶結，防 stale/樂觀讀
-    //   早熟；末輪仍結，保終止，F2 再預算化）。
-    // - loadResult 重試 N=3（store 零 API 新增，僅重讀）：每次重讀外包
-    //   withTimeout(policyIoTimeoutMs)，逾時視 Unknown 進下次重試；任一次
-    //   Known 即採納；全 Unknown 才判未知（REFRESH_FAILED/CHANNEL）。
+    //   早熟；末輪仍結，保終止）。
+    // - loadResult 重試 N=3（store 零 API 新增，僅重讀）：每次重讀經
+    //   boundedReconcileRead（withTimeout(policyIoTimeoutMs)＋獨立池 detach；
+    //   Binder 不可中斷：逾時執行緒滯留獨立池，呼叫側計預算 hadReadTimeout）；
+    //   任一次 Known 即採納；全 Unknown 才判未知。
     // - 首讀前短退避 500ms、重試間隔 1s（見 POLICY_RECONCILE_* 常數註記選 (a)
     //   理由）：讓脫鉤慢 save 先落盤，免 stale-read 誤判。
+    // - Stage F2 總預算：join＋3 讀＋退避全程包
+    //   withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS) 寫死上限；超限即誠實
+    //   unresolved（REFRESH_FAILED/CHANNEL＋Known=false＋pending 保留＋phase 續留
+    //   RECONCILING，不回 IDLE、不解 fence，late-join 可見）。
+    // - Stage F2 late-join：三讀皆 Unknown 且曾逾時時，句柄可能在讀期間已結；
+    //   已完成即補 join 一次（即時回值，不耗預算）：已證失敗即 FAILED 結清
+    //   （樂觀讀不得翻案），否則 unresolved 保留。
     // - 終態 TOCTOU 守衛：啟動時取號（version 取樣 + generation 遞增），發布前
     //   比對，期間若有新 save/refresh/load 推進即丟棄（最新者勝，不覆寫新事實）。
     //   F1-simple 丟棄仍回 IDLE+REFRESHED（保 84 綠；F2 再改移交/保留不回 IDLE）。
     // - 終態不碰 loading（不擁有 busy：核對期間 refresh 可能持有 loading，誤清
-    //   即消 spinner）；只翻 pending/phase/Known/draft/msg。成功即 disarm。
-    // - fence 移除只許 Tx-settle CAS（settlePolicyTx；finally 兜底同式，不殘留）。
+    //   即消 spinner）；成功即 disarm。
+    // - fence 移除只許 Tx-settle CAS（settlePolicyTx；終態分支直接結、unresolved
+    //   保留、外部取消經 finally 兜底，不殘留）。
     private fun launchConfirmReconciler(tx: PolicyTx) {
         val key = tx.key
         val store = tx.store
         val sanitized = tx.sanitized
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             val versionAtStart = policyDraftVersion.get()
             val generation = policyLoadGeneration.incrementAndGet()
-            // F1 先 join：已證失敗即短路 FAILED+Unknown（不讀）。
-            val join: Boolean? = try {
-                joinPolicyTxBounded(tx)
-            } catch (e: CancellationException) {
-                throw e
-            }
-            if (join == false) {
+            // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
+            // 保留＋phase 續留 RECONCILING。外部取消（CE 重拋）仍經 settle=true
+            // 清場，不殘留。
+            var settle = true
+            try {
                 try {
-                    // F1 自觸修正 v2：mark 自 bump 必須納入期望（expected=start+1），
-                    // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
-                    // 內判以 expected 為準（期間再有推進即丟棄，否則 FAILED）。
-                    // F1-5 鎖定：樂觀讀 B 不得翻案，已證失敗即 FAILED+Unknown。
-                    if (policyDraftVersion.get() != versionAtStart ||
-                        policyLoadGeneration.get() != generation
-                    ) {
-                        _state.update { cur ->
-                            cur.copy(
-                                pendingPolicyWrite = null,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                msgKind = MsgKind.INFO,
-                            )
+                    withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS) {
+                        // F1 先 join：已證失敗即短路 FAILED+Unknown（不讀）。
+                        val join: Boolean? = try {
+                            joinPolicyTxBounded(tx)
+                        } catch (e: CancellationException) {
+                            throw e
                         }
-                    } else {
-                        markPolicyUnknownLocked()
-                        val expV = versionAtStart + 1
-                        val expG = generation + 1
-                        _state.update { cur ->
-                            if (policyDraftVersion.get() != expV ||
-                                policyLoadGeneration.get() != expG
-                            ) {
-                                cur.copy(
-                                    pendingPolicyWrite = null,
-                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                    msgKind = MsgKind.INFO,
-                                )
-                            } else {
-                                cur.copy(
-                                    pendingPolicyWrite = null,
-                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    policyDraftKnown = false,
-                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
-                                    msgKind = MsgKind.FAILED,
-                                )
+                        if (join == false) {
+                            try {
+                                // F1 自觸修正 v2：mark 自 bump 必須納入期望（expected=start+1），
+                                // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
+                                // 內判以 expected 為準（期間再有推進即丟棄，否則 FAILED）。
+                                // F1-5 鎖定：樂觀讀 B 不得翻案，已證失敗即 FAILED+Unknown。
+                                if (policyDraftVersion.get() != versionAtStart ||
+                                    policyLoadGeneration.get() != generation
+                                ) {
+                                    _state.update { cur ->
+                                        cur.copy(
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                } else {
+                                    markPolicyUnknownLocked()
+                                    val expV = versionAtStart + 1
+                                    val expG = generation + 1
+                                    _state.update { cur ->
+                                        if (policyDraftVersion.get() != expV ||
+                                            policyLoadGeneration.get() != expG
+                                        ) {
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        } else {
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraftKnown = false,
+                                                msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                                msgKind = MsgKind.FAILED,
+                                            )
+                                        }
+                                    }
+                                }
+                            } finally {
+                                settlePolicyTx(tx)
+                            }
+                            // 已自行結清，外層 finally 跳過（冪等兜底亦可，但明示跳過）。
+                            settle = false
+                            return@withTimeout
+                        }
+                        val joinPending = join == null
+                        var result: LoadResult = LoadResult.Unknown
+                        var hadReadTimeout = false
+                        delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
+                        for (i in 0 until POLICY_RECONCILE_RETRIES) {
+                            val (r, timedOut) = boundedReconcileRead(store)
+                            if (timedOut) hadReadTimeout = true
+                            result = r
+                            // F1 inconclusive：pending 中 Known==B 不搶結，續等下一輪
+                            // （末輪仍結，保終止）。
+                            if (r is LoadResult.Known) {
+                                if (joinPending && r.packages == sanitized &&
+                                    i < POLICY_RECONCILE_RETRIES - 1
+                                ) {
+                                    delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                    continue
+                                }
+                                break
+                            }
+                            if (i < POLICY_RECONCILE_RETRIES - 1) {
+                                delay(POLICY_RECONCILE_RETRY_DELAY_MS)
                             }
                         }
-                    }
-                } finally {
-                    settlePolicyTx(tx)
-                }
-                return@launch
-            }
-            val joinPending = join == null
-            var result: LoadResult = LoadResult.Unknown
-            try {
-                delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
-                for (i in 0 until POLICY_RECONCILE_RETRIES) {
-                    val r = try {
-                        withTimeout(policyIoTimeoutMs) {
-                            onIo { store.loadResult() }
-                        }
-                    } catch (te: TimeoutCancellationException) {
-                        LoadResult.Unknown
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        LoadResult.Unknown
-                    }
-                    result = r
-                    // F1 inconclusive：pending 中 Known==B 不搶結，續等下一輪
-                    // （末輪仍結，保終止）。
-                    if (r is LoadResult.Known) {
-                        if (joinPending && r.packages == sanitized &&
-                            i < POLICY_RECONCILE_RETRIES - 1
+                        val finalResult = result
+                        // Stage F2 late-join：三讀皆 Unknown 且曾逾時時，句柄可能在讀
+                        // 期間已結；已完成即補 join 一次（await 即時回值，不耗預算）：
+                        // 已證失敗（false/拋出）即 FAILED 結清，否則 unresolved。
+                        val lateProvenFailed = if (finalResult is LoadResult.Unknown &&
+                            hadReadTimeout && tx.deferred.isCompleted
                         ) {
-                            delay(POLICY_RECONCILE_RETRY_DELAY_MS)
-                            continue
-                        }
-                        break
-                    }
-                    if (i < POLICY_RECONCILE_RETRIES - 1) {
-                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
-                    }
-                }
-                val finalResult = result
-                _state.update { cur ->
-                    if (policyDraftVersion.get() != versionAtStart ||
-                        policyLoadGeneration.get() != generation
-                    ) {
-                        // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實
-                        // （refresh/新 save 發布）勝出，核對放棄；保留當下
-                        // draft/Known（不覆寫新事實），清 pending、回 IDLE＋
-                        // epoch+1＋REFRESHED，否則相位永留 RECONCILING 卡死
-                        // 後續請求。
-                        cur.copy(
-                            pendingPolicyWrite = null,
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                            msgKind = MsgKind.INFO,
-                        )
-                    } else if (finalResult is LoadResult.Known) {
-                        disarmBlindClear()
-                        if (finalResult.packages == sanitized) {
-                            cur.copy(
-                                pendingPolicyWrite = null,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                policyDraft = finalResult.packages,
-                                policyDraftKnown = true,
-                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
-                                msgKind = MsgKind.INFO,
-                            )
+                            try {
+                                !tx.deferred.await()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                true
+                            }
                         } else {
-                            // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
-                            // truth 為準 + REFRESHED 明示（INFO）。
-                            cur.copy(
-                                pendingPolicyWrite = null,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                policyDraft = finalResult.packages,
-                                policyDraftKnown = true,
-                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                msgKind = MsgKind.INFO,
-                            )
+                            false
                         }
-                    } else {
+                        if (lateProvenFailed &&
+                            policyDraftVersion.get() == versionAtStart &&
+                            policyLoadGeneration.get() == generation
+                        ) {
+                            // late-join 已證失敗：同 join==false，FAILED+Unknown
+                            // （樂觀讀 B 不得翻案；mark＋expected  pattern 同上）。
+                            markPolicyUnknownLocked()
+                            val expV = versionAtStart + 1
+                            val expG = generation + 1
+                            _state.update { cur ->
+                                if (policyDraftVersion.get() != expV ||
+                                    policyLoadGeneration.get() != expG
+                                ) {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                        msgKind = MsgKind.FAILED,
+                                    )
+                                }
+                            }
+                        } else {
+                            var keepFence = false
+                            _state.update { cur ->
+                                if (policyDraftVersion.get() != versionAtStart ||
+                                    policyLoadGeneration.get() != generation
+                                ) {
+                                    // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實
+                                    // （refresh/新 save 發布）勝出，核對放棄；保留當下
+                                    // draft/Known（不覆寫新事實），清 pending、回 IDLE＋
+                                    // epoch+1＋REFRESHED，否則相位永留 RECONCILING 卡死
+                                    // 後續請求。
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (finalResult is LoadResult.Known) {
+                                    disarmBlindClear()
+                                    if (finalResult.packages == sanitized) {
+                                        cur.copy(
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraft = finalResult.packages,
+                                            policyDraftKnown = true,
+                                            msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    } else {
+                                        // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
+                                        // truth 為準 + REFRESHED 明示（INFO）。
+                                        cur.copy(
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraft = finalResult.packages,
+                                            policyDraftKnown = true,
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                } else if (hadReadTimeout) {
+                                    // Stage F2 誠實 unresolved：Binder 滯留獨立池，
+                                    // 呼叫側預算已盡，無 ground truth 可採納。
+                                    // REFRESH_FAILED/CHANNEL＋Known=false＋pending
+                                    // 保留＋phase 續留 RECONCILING（不回 IDLE）；
+                                    // 不解 fence（settle=false，late-join 可見）。
+                                    // 世代未變才到此（上行外判已過；此處內判兜底，
+                                    // 期間推進即丟棄，免覆寫新事實）。
+                                    if (policyDraftVersion.get() != versionAtStart ||
+                                        policyLoadGeneration.get() != generation
+                                    ) {
+                                        cur.copy(
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    } else {
+                                        keepFence = true
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.RECONCILING,
+                                            policyDraftKnown = false,
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                            msgKind = MsgKind.CHANNEL,
+                                        )
+                                    }
+                                } else {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                            if (keepFence) settle = false
+                        }
+                    }
+                } catch (te: TimeoutCancellationException) {
+                    // Stage F2 總預算超限：誠實 unresolved（同上，不回 IDLE、不解 fence）。
+                    _state.update { cur ->
                         cur.copy(
-                            pendingPolicyWrite = null,
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyWritePhase = PolicyWritePhase.RECONCILING,
                             policyDraftKnown = false,
                             msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                             msgKind = MsgKind.CHANNEL,
                         )
                     }
+                    settle = false
                 }
+            } catch (e: CancellationException) {
+                throw e
             } finally {
-                settlePolicyTx(tx)
+                if (settle) settlePolicyTx(tx)
             }
         }
     }
@@ -3959,142 +4128,224 @@ class DualViewModel(
 
     // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
     // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
-    // 呈現，全 Unknown→REFRESH_FAILED/CHANNEL；成功即 disarm；不碰 loading；
-    // 子 job 可取消、每次重讀 withTimeout、首延 500ms＋重試間 1s，見 confirm 註記）。
+    // 呈現；成功即 disarm；不碰 loading；子 job 可取消，見 confirm 註記）。
     // Stage F1：同 confirm 先有界 join（false/throw→FAILED+Unknown 結清；
     // pending 中 Known-empty(B) 視 inconclusive 續等，末輪仍結）。
+    // Stage F2：本體跑 Main、僅讀切獨立池、總預算寫死上限、超限/三讀逾時即誠實
+    // unresolved（REFRESH_FAILED/CHANNEL＋Known=false＋phase 續留 RECONCILING，
+    // clear 本無 pending；不回 IDLE、不解 fence），餘見 confirm。
     private fun launchClearReconciler(tx: PolicyTx) {
         val store = tx.store
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             val versionAtStart = policyDraftVersion.get()
             val generation = policyLoadGeneration.incrementAndGet()
-            val join: Boolean? = try {
-                joinPolicyTxBounded(tx)
-            } catch (e: CancellationException) {
-                throw e
-            }
-            if (join == false) {
+            // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋phase 續留
+            // RECONCILING。外部取消（CE 重拋）仍經 settle=true 清場，不殘留。
+            var settle = true
+            try {
                 try {
-                    // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
-                    if (policyDraftVersion.get() != versionAtStart ||
-                        policyLoadGeneration.get() != generation
-                    ) {
-                        _state.update { cur ->
-                            cur.copy(
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                msgKind = MsgKind.INFO,
-                            )
+                    withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS) {
+                        val join: Boolean? = try {
+                            joinPolicyTxBounded(tx)
+                        } catch (e: CancellationException) {
+                            throw e
                         }
-                    } else {
-                        markPolicyUnknownLocked()
-                        val expV = versionAtStart + 1
-                        val expG = generation + 1
-                        _state.update { cur ->
-                            if (policyDraftVersion.get() != expV ||
-                                policyLoadGeneration.get() != expG
-                            ) {
-                                cur.copy(
-                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                    msgKind = MsgKind.INFO,
-                                )
-                            } else {
-                                cur.copy(
-                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    policyDraftKnown = false,
-                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
-                                    msgKind = MsgKind.FAILED,
-                                )
+                        if (join == false) {
+                            try {
+                                // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
+                                if (policyDraftVersion.get() != versionAtStart ||
+                                    policyLoadGeneration.get() != generation
+                                ) {
+                                    _state.update { cur ->
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                } else {
+                                    markPolicyUnknownLocked()
+                                    val expV = versionAtStart + 1
+                                    val expG = generation + 1
+                                    _state.update { cur ->
+                                        if (policyDraftVersion.get() != expV ||
+                                            policyLoadGeneration.get() != expG
+                                        ) {
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        } else {
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraftKnown = false,
+                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                                msgKind = MsgKind.FAILED,
+                                            )
+                                        }
+                                    }
+                                }
+                            } finally {
+                                settlePolicyTx(tx)
+                            }
+                            // 已自行結清，外層 finally 跳過。
+                            settle = false
+                            return@withTimeout
+                        }
+                        val joinPending = join == null
+                        var result: LoadResult = LoadResult.Unknown
+                        var hadReadTimeout = false
+                        delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
+                        for (i in 0 until POLICY_RECONCILE_RETRIES) {
+                            val (r, timedOut) = boundedReconcileRead(store)
+                            if (timedOut) hadReadTimeout = true
+                            result = r
+                            if (r is LoadResult.Known) {
+                                // clear 的 B=empty：pending 中 Known-empty 不搶結，續等。
+                                if (joinPending && r.packages.isEmpty() &&
+                                    i < POLICY_RECONCILE_RETRIES - 1
+                                ) {
+                                    delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                                    continue
+                                }
+                                break
+                            }
+                            if (i < POLICY_RECONCILE_RETRIES - 1) {
+                                delay(POLICY_RECONCILE_RETRY_DELAY_MS)
                             }
                         }
-                    }
-                } finally {
-                    settlePolicyTx(tx)
-                }
-                return@launch
-            }
-            val joinPending = join == null
-            var result: LoadResult = LoadResult.Unknown
-            try {
-                delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
-                for (i in 0 until POLICY_RECONCILE_RETRIES) {
-                    val r = try {
-                        withTimeout(policyIoTimeoutMs) {
-                            onIo { store.loadResult() }
-                        }
-                    } catch (te: TimeoutCancellationException) {
-                        LoadResult.Unknown
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        LoadResult.Unknown
-                    }
-                    result = r
-                    if (r is LoadResult.Known) {
-                        // clear 的 B=empty：pending 中 Known-empty 不搶結，續等。
-                        if (joinPending && r.packages.isEmpty() &&
-                            i < POLICY_RECONCILE_RETRIES - 1
+                        val finalResult = result
+                        // Stage F2 late-join：同 confirm；已證失敗即 FAILED 結清。
+                        val lateProvenFailed = if (finalResult is LoadResult.Unknown &&
+                            hadReadTimeout && tx.deferred.isCompleted
                         ) {
-                            delay(POLICY_RECONCILE_RETRY_DELAY_MS)
-                            continue
-                        }
-                        break
-                    }
-                    if (i < POLICY_RECONCILE_RETRIES - 1) {
-                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
-                    }
-                }
-                val finalResult = result
-                _state.update { cur ->
-                    if (policyDraftVersion.get() != versionAtStart ||
-                        policyLoadGeneration.get() != generation
-                    ) {
-                        // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實勝出，
-                        // 核對放棄；保留當下 draft/Known，回 IDLE＋epoch+1＋
-                        // REFRESHED（見 confirm 分支）。
-                        cur.copy(
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                            msgKind = MsgKind.INFO,
-                        )
-                    } else if (finalResult is LoadResult.Known) {
-                        disarmBlindClear()
-                        if (finalResult.packages.isEmpty()) {
-                            cur.copy(
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                policyDraft = emptySet(),
-                                policyDraftKnown = true,
-                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                                msgKind = MsgKind.INFO,
-                            )
+                            try {
+                                !tx.deferred.await()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                true
+                            }
                         } else {
-                            cur.copy(
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                policyDraft = finalResult.packages,
-                                policyDraftKnown = true,
-                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                msgKind = MsgKind.INFO,
-                            )
+                            false
                         }
-                    } else {
+                        if (lateProvenFailed &&
+                            policyDraftVersion.get() == versionAtStart &&
+                            policyLoadGeneration.get() == generation
+                        ) {
+                            markPolicyUnknownLocked()
+                            val expV = versionAtStart + 1
+                            val expG = generation + 1
+                            _state.update { cur ->
+                                if (policyDraftVersion.get() != expV ||
+                                    policyLoadGeneration.get() != expG
+                                ) {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                        msgKind = MsgKind.FAILED,
+                                    )
+                                }
+                            }
+                        } else {
+                            var keepFence = false
+                            _state.update { cur ->
+                                if (policyDraftVersion.get() != versionAtStart ||
+                                    policyLoadGeneration.get() != generation
+                                ) {
+                                    // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實勝出，
+                                    // 核對放棄；保留當下 draft/Known，回 IDLE＋epoch+1＋
+                                    // REFRESHED（見 confirm 分支）。
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (finalResult is LoadResult.Known) {
+                                    disarmBlindClear()
+                                    if (finalResult.packages.isEmpty()) {
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraft = emptySet(),
+                                            policyDraftKnown = true,
+                                            msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    } else {
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraft = finalResult.packages,
+                                            policyDraftKnown = true,
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    }
+                                } else if (hadReadTimeout) {
+                                    // Stage F2 誠實 unresolved：同 confirm（clear 本無
+                                    // pending；phase 續留 RECONCILING，不解 fence）。
+                                    if (policyDraftVersion.get() != versionAtStart ||
+                                        policyLoadGeneration.get() != generation
+                                    ) {
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                            msgKind = MsgKind.INFO,
+                                        )
+                                    } else {
+                                        keepFence = true
+                                        cur.copy(
+                                            policyWritePhase = PolicyWritePhase.RECONCILING,
+                                            policyDraftKnown = false,
+                                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                            msgKind = MsgKind.CHANNEL,
+                                        )
+                                    }
+                                } else {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                            if (keepFence) settle = false
+                        }
+                    }
+                } catch (te: TimeoutCancellationException) {
+                    // Stage F2 總預算超限：誠實 unresolved（同上，不回 IDLE、不解 fence）。
+                    _state.update { cur ->
                         cur.copy(
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyWritePhase = PolicyWritePhase.RECONCILING,
                             policyDraftKnown = false,
                             msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                             msgKind = MsgKind.CHANNEL,
                         )
                     }
+                    settle = false
                 }
+            } catch (e: CancellationException) {
+                throw e
             } finally {
-                settlePolicyTx(tx)
+                if (settle) settlePolicyTx(tx)
             }
         }
     }
