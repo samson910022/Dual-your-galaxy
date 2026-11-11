@@ -642,9 +642,11 @@ class DualViewModel(
     // Stage2:政策草稿寫入的 owner-user 門控。hook 讀 user 0 的 remote prefs
     // (此為 assertion,非實機證明,DEVICE-UNVERIFIED);非 owner 用戶實例寫入的
     // 是自己 user 的 group,hook 讀不到,故要求由 owner user 寫入。生產由
-    // factory 以 Process.myUid() 拆解 (見 MainActivity);JVM 測試預設 0
-    // (owner),僅專用測試注入非 0。
-    private val currentUserId: () -> Int = { 0 },
+    // factory 以 Process.myUid() 拆解注入 (見 MainActivity userIdFromUid);
+    // 預設 -1 (未知即拒絕,fail-closed):未經注入的實例一律擋在門控外,不得
+    // 誤用預設 0 (owner) 放行寫入。JVM 測試顯式注入所需 userId (owner 測
+    // 試傳 0,非 owner 測試傳非 0)。
+    private val currentUserId: () -> Int = { -1 },
     // p28-1 review（en 殘留）：寫入拒絕理由在地化。VM 本體不碰 Android
     // Context：文字解析經此注入——生產由 factory 以 Application Context 對接
     // values/strings.xml（見 MainActivity.resolveBlockReason）；JVM 測試注入

@@ -4654,6 +4654,9 @@ class MainActivity : ComponentActivity() {
             val apps: List<SourceAppEntry>? = withContext(Dispatchers.IO) {
                 try {
                     loadSourceApps(packageManager, selfSerial())
+                } catch (e: CancellationException) {
+                    // catalogJob 取消透傳 (loadSourceApps 內層同語義,不吞為 null)。
+                    throw e
                 } catch (_: Exception) {
                     null
                 }

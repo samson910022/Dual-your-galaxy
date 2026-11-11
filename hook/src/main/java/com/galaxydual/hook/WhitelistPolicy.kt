@@ -99,6 +99,17 @@ object WhitelistPolicy {
         strictSignature: Boolean = false,
         genericReturnType: Type? = null,
     ): Any? {
+        // Hostile extra view guard: isEmpty() runs on caller-supplied set
+        // machinery and may throw. Fail closed to the original result
+        // (observe-only). This matches the per-branch semantics below:
+        // Boolean-false + empty returns false (== result here), and
+        // List/Set/Array + empty return result unchanged; result == true
+        // never reaches extra at all (returned above-equivalently as result).
+        val extraEmpty: Boolean = try {
+            extra.isEmpty()
+        } catch (_: Throwable) {
+            return result
+        }
         if (result is Boolean) {
             if (declaredReturnType != null && !isBooleanLikeDeclaredReturn(declaredReturnType)) {
                 onLog(
@@ -109,7 +120,7 @@ object WhitelistPolicy {
                 return result
             }
             if (result) return true
-            if (extra.isEmpty()) return false
+            if (extraEmpty) return false
             val effectiveIndex = packageArgIndex ?: if (strictSignature) {
                 null
             } else {
@@ -140,7 +151,7 @@ object WhitelistPolicy {
                 false
             }
         }
-        if (extra.isEmpty()) return result
+        if (extraEmpty) return result
         if (result is List<*>) {
             try {
                 if (result.any { it !is String }) {

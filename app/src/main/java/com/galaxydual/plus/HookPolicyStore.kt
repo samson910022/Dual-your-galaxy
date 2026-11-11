@@ -95,6 +95,10 @@ class HookPolicyStore(
     }
 
     // 相容別名:回傳 Set (Unknown -> 空)。新程式請優先使用 loadResult()。
+    // blind-overwrite 誤用防線:直接回空會把 Unknown (未確認) 偽裝成確認空，
+    // 呼叫端若以此為基礎寫回即覆寫未見內容；故標 Deprecated,新程式一律用
+    // loadResult() 區分 Known/Unknown。
+    @Deprecated("Use loadResult()", ReplaceWith("loadResult()"))
     fun load(): Set<String> = when (val r = loadResult()) {
         is LoadResult.Known -> r.packages
         LoadResult.Unknown -> emptySet()
