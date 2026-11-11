@@ -15,6 +15,21 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 - `core`: pure-Kotlin privilege routing, command gateway, and `pm` output parsing.
 - `hook`: LSPosed module (API 102), loaded only inside target Samsung processes.
 
+## GuardXposedProvider (policy provider parity)
+
+- The libxposed `service` AAR declares its own exported `XposedProvider` at
+  `content://<applicationId>.XposedService` with no permission, so any app could
+  call `SendBinder` and deliver a fake `IBinder` to hijack the policy channel
+  (`XposedServiceHelper.onBinderReceived`). The app manifest removes that node
+  (`tools:node="remove"`) and declares `GuardXposedProvider` at the same
+  authority.
+- `GuardXposedProvider` delegates `call()` to the library provider instance but
+  gates it: only LSPosed daemon UIDs (`uid < FIRST_APPLICATION_UID`, including
+  shell 2000) or the app itself (`uid == Process.myUid()`) may deliver a binder;
+  everything else gets `null`. CRUD stays inert (`null`/`0`).
+- The pure decision function `isTrustedXposedCaller` / `guardedPolicyCall` is
+  JVM-tested; the real SendBinder round-trip remains DEVICE-UNVERIFIED.
+
 ## PrivilegeRouter
 
 ```kotlin
@@ -36,8 +51,8 @@ val privilege: Privilege = when {
 > 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
 >（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
 > 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
-> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
-> observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
+> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（政策來源已接線至 LSPosed
+> remote preferences，端到端未驗；靜態種子預設空，故預設 observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
 > 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
@@ -59,6 +74,14 @@ val privilege: Privilege = when {
 > plus no Shizuku => `ROOT`) would have become hasShizuku true, hasRoot false
 > => `SHELL` (silent de-escalation). The rename changes the JVM method
 > identity so old binaries fail to bind instead of silently changing meaning.
+
+> Build-note: `gradle.properties` sets
+> `android.experimental.disableCompileSdkChecks=true` as an **accepted, documented
+> risk** for the `io.github.libxposed` 102.0.0 AARs (`service`/`interface`/`api`),
+> whose AAR metadata declares `minCompileSdk=37` while this project compiles
+> against SDK 34 on the AGP 8.5.2 baseline. The app only uses APIs available in
+> 34; the API 29 instrumentation run is the runtime-compatibility guard. This
+> flag will be revisited on the next AGP/compileSdk upgrade.
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
@@ -95,7 +118,8 @@ val privilege: Privilege = when {
   authorized, else `NoOp` fail-closed; hook never auto-selected). Explicit
   LSPosed maps to the NoOp placeholder with the picker UI + file-marker
   enable detection done in P2 (hook writes /data/system marker, app reads
-  direct + gateway cat; whitelist policy still pending).
+  direct + gateway cat; whitelist policy source wired to LSPosed remote
+  preferences, end-to-end DEVICE-UNVERIFIED).
 
 ## PmOutputParser
 
@@ -124,9 +148,15 @@ val privilege: Privilege = when {
    `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
    註（#53）：`DualViewModel.refreshLocked()` 已遷移到 `refreshVerified()` 8 命令單一快照（snapshot 1 ＋ typed target 3 ＋ list 1 ＋ re-verify triple 3），VM 只做 `RefreshOutcome→UiState` 映射，第二次 triple 即 strict-equality fence；pinned target 攜帶真 parentId，parent drift fail-closed；serial intra-triple conflict fail-closed, inter-refresh rebuild = whole-world FRESH。 Refresh `Unknown` keeps the old `cloned` list, marks the inventory STALE, and reports `pmReadable=true` (vs `NoDual` which clears `cloned`), an inter-refresh rebuild no longer emits `VERIFY_MISMATCH` (a rebuild between refreshes publishes the whole new world as FRESH on the next refresh), and `Unknown` has four shapes (typed refusal, confirmed id missing from the pm snapshot, Absent with an empty snapshot, and post-list identity drift). `TargetMoved` (confirmed post-list drift → `VERIFY_MISMATCH`, STALE live target, selection cleared; inter-refresh rebuild still whole FRESH). serial==null 前後時 strict equality 僅為 (id,null,parent)：FRESH 只保證同 id/parent 兩次確認 + 列舉成功，不保證 incarnation continuity（能力限制；有 serial 時才消除 resolve→list 漂移）。
 
-   測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
+   測試驗收分階段：JVM unit tests（CI `testDebugUnitTest` 全綠）只保證併發語意，不替代 S24 實機驗收。
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
-   `app/src/androidTest/` 現已含 8 個檔案 / 7 個 test class 的 harness（27 個自動化測試：20 JUnit4 + 7 JUnit3，見 docs/ACCEPTANCE.md §5）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
+   `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
+
+## Policy draft flow (hook-policy-source P2-P4 semantics)
+
+- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
+- 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉既有 FAILED＋Unknown fence，不新增語義）；主執行緒永不打 binder。
+- UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
 
 ## Non-Goals
 

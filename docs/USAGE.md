@@ -17,24 +17,25 @@
 - [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
 - [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；寫後主驗證以 listing 為準（`pm path` 僅輔助診斷，見 #22）；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行、callback 可驗日誌、非空政策生效、當前 source 可追溯部署仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
-- [待實作] 非空 whitelist policy（預設為空，hook 為 observe-only）。
+- [已支援] 非空 whitelist policy 政策來源（App 寫入 LSPosed remote preferences group `dual_policy`／hook 讀同一 group/key；僅 owner user（user 0）能寫入草稿，非 owner 的寫入 hook 讀不到；JVM 測試覆蓋，端到端 [待實機驗證] DEVICE-UNVERIFIED；靜態種子預設為空，故預設仍 observe-only）。
 - [部分已驗證] LSPosed 載入（system hook 雙方法 deoptimize＋hooked [S24 已驗證]、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取） [S24 已驗證]、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效） [S24 已驗證]，其餘 LSPosed 寫入、非空政策 [待實機驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端；其中
   `install-existing --user 95`＋`pm list packages --user 95` 二次確認
   [S24 已驗證]：裸 pm shell 通道兩次獨立成功）。
 
-Hook 誠實聲明（`docs/HOOK.md` 第 1.1 節，本文引用不再重述為已生效）：
-hook 政策集合預設為空，hooks 為 observe-only 佔位——會安裝、會記 log，
-但不改變任何行為、不放寬任何包名；接上政策來源前，本文凡提及「hook 通道／白名單放寬」
-皆指設計意圖，不是現有效果。
+Hook 誠實聲明（`docs/HOOK.md` 第 1.1 節）：
+hook 靜態種子政策集合預設為空，故 hooks 預設為 observe-only——會安裝、會記 log，
+但預設不改變任何行為；政策來源已接線（App 寫入 LSPosed remote preferences
+group `dual_policy`／hook 讀同一 group/key），非空草稿是否真生效需 on-device
+端到端證明（DEVICE-UNVERIFIED）。
 
 ## 1. 通道選擇與優先順序（`core` 純函數 [已支援]＋真通道已接線（ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）；自動路由順序為 su ROOT → Shizuku → NONE，下列為手動 picker 表面）
 
 路由純函數（[已支援]）依序判斷；開機／開 App 探測框架（`probeChannels`／`recheckPrivilege`／`selectChannel`＋Shizuku 生命週期）已接真 gateway（ROOT→`SuCmdGateway` 經 `su -c`；SHELL→`ShizukuCmdGateway` 經 UserService，`newProcess` 在 13.1.5 已移除；hook 訊號為 file marker 存在性證據，僅顯示、永不進入路由，[待實機驗證]；`ChannelPreference` 手動選擇 AUTO 預設，`selectChannel` 動態換 gateway；選不到回 `NoOp` fail-closed；`channelReady` 為各通道探測通過才 `true`，`channelReadyFor` [已支援]），
 以下順序為接線後預期行為，App 內 Shizuku 切換（未授權路徑／首次選路／marker gateway-`cat` 顯示 [待實機驗證]；已授權一鍵、ROOT 一鍵／su／uninstall 已驗，見 §0）：
 
-1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook 為
-   observe-only（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗），不可描述為已能擴展包名。
+1. **LSPosed 模式（NoOp 佔位）**：App 內 picker 選 LSPosed → 顯示 file marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，[待實機驗證]），執行通道為 NoOp 佔位、寫入一律拒絕；hook
+   預設 observe-only，非空草稿生效需實機驗證（見上文引用；App 內 ROOT 一鍵 [S24 已驗證]，marker gateway-`cat` 顯示未驗）。
 2. **AUTO 降級（SHELL）**：無可用 su ROOT（不論 LSPosed 模組／marker 是否存在），且 Shizuku 授權及能力探測通過 → `Privilege.SHELL`；明選 LSPosed 仍為 NoOp 佔位（hook 訊號不進入路由）
    - 走 `pm` 指令通道（`install-existing` / `uninstall --user` / `path --user`），F4a 的 `ShizukuCmdGateway` 經 UserService `GalaxyExecService` 已接線（`newProcess` 在 13.1.5 已移除故不用；Factory 在無 su 且 binder alive＋已授權時選擇，`ShizukuElevator` 探測通過才 `channelReady`）；
      binder round-trip、未授權路徑／首次選路／binder 死引導 [待實機驗證] DEVICE-UNVERIFIED。
@@ -56,7 +57,7 @@ Clone／Remove／重新連線並更新／請求 Shizuku 授權按鈕＋四通道
 
 - 併發邊界（#24；術語：busy 即 `UiState.loading`，merge 即 coalesce）：`重新連線並更新`（`reconnectAndRefresh()`：probe 含 Auto 降級＋refresh，單一入口）快速連點合併為一次 trailing 重跑（coalesce，in-flight 之後最多一次待跑，不堆積 mutex 等待者；純 `refresh()` 仍為探測-free 的舊路徑，僅供 coalesced trailing 內部使用）；`clone`／`request-remove`／`confirm` 按操作 key 去重，同 key 第二次報 `already in progress` 不排隊，三命名空間全稱 `clone:<pkg>`／`request-remove:<pkg>`／`remove:<pkg>@<id>#<serial>#<ts>`（世代 key，serial 綁定：同包不同世代不互擋，同世代重複才去重；clone 與 request／confirm 互不干擾）；寫回覆 `timedOut‖transportUnknown‖isPostSpawnTransportText‖isServiceTimeoutText` 一律 verify-first（單次有界唯讀 `verifyListProbe` 定奪，不重發寫入；同向成功才認 Success，反向觀測一律 Unknown；before／after pin 漂移→`VerifyUnknown`（identity-changed），不計成功）；執行期間 busy（`UiState.loading=true`，7 鈕＋dialog 按鈕禁用，cancel／pending 保留語義見 ARCH）；所有 repo 呼叫經 `Dispatchers.IO`（`onIo`），settle wait 預設可取消 `delay()`（經 `delayFn`），cancel 在等待間傳播。
 - 錯誤優先（error-first，`combineWithDegradeNote`，見 `DualViewModel.refreshLocked`）：refresh 結果與 Auto 降級說明疊加時，錯誤保持優先——`CHANNEL`／`FAILED`／`NO_DUAL`／`VERIFY`／`INVALID` 保持原 kind 不降級為 `INFO`，以降級原因附加（`；` join，恢復入口 `重新連線並更新` 隨附後）；`NONE` 顯示降級說明 alone（`INFO`），`INFO` 中性結果附加說明（`INFO`）。狀態列因此同時攜帶刷新失敗與雙通道恢復指引。
-- 文案術語（`notReadyMsg`／`isWritable`）：`禁用` ＝ 未就緒 fail-closed（通用 NoOp 回退 `通道未就緒…寫入已禁用`＋明選失敗 `…寫入已禁用（明選不跨通道）`，寫入一律拒絕）；`拒絕` ＝ LSPosed 政策佔位（`LSPosed 通道為佔位…寫入已拒絕`，whitelist 政策分支待實作）。兩詞不混用；測試以 `contains` 鎖定三條分支關鍵字。
+- 文案術語（`notReadyMsg`／`isWritable`）：`禁用` ＝ 未就緒 fail-closed（通用 NoOp 回退 `通道未就緒…寫入已禁用`＋明選失敗 `…寫入已禁用（明選不跨通道）`，寫入一律拒絕）；`拒絕` ＝ LSPosed 政策佔位（`LSPosed 通道為佔位…寫入已拒絕`；白名單政策來源已接線，端到端 DEVICE-UNVERIFIED）。兩詞不混用；測試以 `contains` 鎖定三條分支關鍵字。
 - 探測通過 ≠ PM可讀（P25 Item 4＋Phase 3 fail-closed）：`anyProbePassed`/`writeReady` 僅為探測門（`id -u == 0` 即可通過），**NOT** PM可讀證明；真可讀 ＝ `pmReadable == true`（`pm list users` 經 refresh 證明）＋`writeReady`。`pmReadable == false`（PM不可讀）時寫入被拒（fail-closed，`探測通過但 PM 不可讀…寫入已禁用`，`CHANNEL`），不嘗試寫入；`null`（未知，未刷新或已過期）仍允許嘗試，由 repo 層重驗 fail-closed。
 
 ## 2. Shizuku 配對教學（無線調試，Android 11+，流程 [待實機驗證]）
@@ -174,10 +175,10 @@ adb shell pm uninstall --user <dualId> com.example.chat
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
-  作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（whitelist 政策分支待實作）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
+  作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.4／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.4）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（白名單政策來源已接線，端到端 DEVICE-UNVERIFIED）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
 - AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；Auto probe 降級已實作（P25：首次探測即依 live probes 修正啟動猜測——su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，暫態失敗後點 `重新連線並更新` 即重探恢復）；實機切換 [待實機驗證] DEVICE-UNVERIFIED。
-- LSPosed 模組僅 hook 雙開白名單查詢（observe-only 佔位，不放寬任何包名，見 `docs/HOOK.md` 第 1.1 節），
-  絕不讀寫 Knox 容器；白名單真正放寬需等非空政策接上（[待實作]）。
+- LSPosed 模組僅 hook 雙開白名單查詢（靜態種子預設空，故預設 observe-only；政策來源已接線，非空草稿經 LSPosed remote preferences 寫入，端到端 DEVICE-UNVERIFIED，見 `docs/HOOK.md` 第 1.1 節），
+  絕不讀寫 Knox 容器。
 - P1 診斷限制（配合 [#27](https://github.com/samson910022/Galaxy-Dual-app-Plus/issues/27)）：Hook 狀態為四態——偵測到歷史 Hook 標記（僅存在性證據，未確認本次開機是否生效）／未偵測到／狀態未知（無權限讀取）／狀態未知（無可用診斷通道）。明選 LSPosed（NoOp）時診斷讀取獨立於所選寫入通道：仍嘗試直接讀取＋經當時已探測通過的真通道（ROOT／SHIZUKU）`cat`；切換通道時保留當時已驗證的診斷實例（新實例未驗證前仍以後者 `cat`，不觸發新 `su` 授權；新驗證通過即覆寫，授權撤銷即失效回未知）；若無任何真通道且直接讀取不可讀（App uid 對 `/data/system` 恆 EACCES），顯示「狀態未知」而非「未偵測到」——後者只保留給確定可讀但缺失的情況（fail-closed 誠實顯示，不再假陰性）。要完整診斷需至少一個探測通過的真通道；診斷結果永不進入路由／`channelReady`（hook-neutral，沿襲 #19）。
 
 ## 5. 常見問題
@@ -229,6 +230,17 @@ adb shell pm uninstall --user <dualId> com.example.chat
   TalkBack 朗讀、旋轉重建實機表現、長清單圖示效能、真通道 batch 端到端仍 [待實機驗證]（與 §0／§4 及 PR body 的 Device verification left open 口徑一致），
   不得宣稱為已通過實機驗證。
 
+### 政策寫入流程（Stage2：白名單政策草稿）
+
+- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘、同世代保留勾選；包名逾 10 項時 dialog 清單限高 320dp，少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
+- `清除草稿` 只刪該持久化條目，不清記憶體勾選。
+- 只有 owner user（user 0）能寫入／清除草稿；非 owner 的寫入 hook 讀不到（訊息明確拒絕）。
+- `勾選≠安裝`、`寫草稿≠安裝`：政策寫入只放寬 hook 的白名單查詢，永不觸發 clone/remove/install。
+- `Unknown`（草稿未知）時拒絕建 pending／拒絕覆寫：須先點「重新整理草稿」讀到 Known 後再寫入（fail-closed，不覆寫未見內容）。
+- 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unknown（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）。
+- 寫入／清除失敗（`FAILED`）即標 Unknown 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unknown（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
+- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警，第二次才刪，防靜默刪除未見內容）。
+
 ## English Summary
 
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
@@ -238,8 +250,9 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm list packages --user` ground truth (not `pm path` alone);
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).
   `core` encapsulation plus gateway assembly are unit-tested; in-app ROOT one-click `cloned:`, authorized-SHIZUKU one-click (installed-verify single), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24; system hook dual-method deoptimize+hooked (registration only), daagent `using provider.WhiteListApps` hits (category selection only), and marker main-path scope=system_server (historical, ~5.5h before this boot) verified as historical evidence only; callback logs, Shizuku unauthorized flows, first-time selection, binder dead-guidance, gateway-`cat` display, LSPosed writes, and non-empty policy remain DEVICE-UNVERIFIED (`pm path` auxiliary only, see #22); outside the specified normal SHELL clone/remove + manual channel history (see UX_REVIEW_S24.md §5), full binder/auth matrix, end-to-end matrix, and traceable build of current source remain unverified.
-- Hook is an observe-only placeholder (empty policy, see `docs/HOOK.md`); it does not extend
-  any package yet.
+- Hook is observe-only by default (empty static seed; the policy source is wired to LSPosed
+  remote preferences, owner-user write only — a non-owner write is invisible to the hook —
+  end-to-end DEVICE-UNVERIFIED — see `docs/HOOK.md`).
 - GitHub sideload builds only; no Play release. Manifest audit per #26 done:
   `REQUEST_INSTALL_PACKAGES`/`MANAGE_EXTERNAL_STORAGE` removed (no call chain);
   only `QUERY_ALL_PACKAGES` kept (source catalog enumeration).

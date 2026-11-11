@@ -544,4 +544,48 @@ class WhitelistPolicyTest {
         assertEquals(setOf("a", "b"), out)
         assertTrue(logs.isEmpty())
     }
+
+    // Phase 4:空 extra 時 unexpected-args 不記錄 (熱路徑靜默,observe-only)。
+    @Test
+    fun booleanFalseUnexpectedArgsWithEmptyExtraIsSilent() {
+        val localLogs = mutableListOf<String>()
+        assertEquals(false, WhitelistPolicy.apply(false, emptyList(), emptySet(), "m", { localLogs.add(it) }))
+        assertTrue(localLogs.isEmpty())
+    }
+
+    // Phase 4:describe 快取一致 (二次呼叫同值,不拋)。
+    @Test
+    fun describeIsCachedConsistently() {
+        val m = String::class.java.getMethod("length")
+        val first = WhitelistPolicy.describe(m)
+        val second = WhitelistPolicy.describe(m)
+        assertEquals(first, second)
+        assertEquals("java.lang.String#length()", first)
+    }
+
+    // Phase 4:hostile extra（迭代即拋）不得越過邊界：第二段 addAll 與第一段
+    // 同 try，失敗退回無 extra 的拷貝（observe-only，不拋）。
+    @Test
+    fun hostileExtraSetFallsBackWithoutThrowing() {
+        val hostileExtra = object : AbstractSet<String>() {
+            override val size: Int get() = 1
+            override fun iterator(): MutableIterator<String> =
+                throw IllegalStateException("boom")
+        }
+        val out = WhitelistPolicy.apply(setOf("a"), emptyList(), hostileExtra, "m", log)
+        assertEquals(setOf("a"), out)
+    }
+
+    // Phase 4:hostile result（toMutableSet 拷貝即拋）退回原值（observe-only，
+    // 同一實例，不拋）。
+    @Test
+    fun hostileResultSetReturnsOriginalWithoutThrowing() {
+        val hostile = object : AbstractSet<String>() {
+            override val size: Int get() = 1
+            override fun iterator(): MutableIterator<String> =
+                throw IllegalStateException("boom")
+        }
+        val out = WhitelistPolicy.apply(hostile, emptyList(), setOf("b"), "m", log)
+        assertSame(hostile, out)
+    }
 }

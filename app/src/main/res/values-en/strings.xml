@@ -45,6 +45,64 @@
     <string name="save_selection_cd">Save current checks (checks only, never writes clones)</string>
     <string name="action_unsave_selection">Unsave selection</string>
     <string name="unsave_selection_cd">Drop the saved selection (never uninstalls, keeps current checks)</string>
+    <!-- Stage2 (hook-policy-source P1): minimal whitelist-policy (draft) entry. -->
+    <string name="action_write_policy">Write policy</string>
+    <string name="write_policy_cd">Write current checks into the whitelist policy draft (draft only, never installs clones)</string>
+    <string name="action_clear_policy_draft">Clear policy draft</string>
+    <string name="clear_policy_draft_cd">Drop the saved policy draft (never touches installed clones or current checks)</string>
+    <string name="action_refresh_policy_draft">Refresh draft</string>
+    <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
+    <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
+    <string name="policy_draft_format">Whitelist policy (draft): %1$d entries</string>
+    <string name="policy_draft_unknown">Whitelist policy (draft): unknown (LSPosed service not connected; tap Refresh draft to retry)</string>
+    <string name="policy_write_title">Confirm policy write</string>
+    <plurals name="policy_write_message">
+        <item quantity="one">Write the following %1$d package into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
+        <item quantity="other">Write the following %1$d packages into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
+    </plurals>
+    <string name="policy_write_acknowledge">I confirm the packages above should be relaxed in the whitelist.</string>
+    <string name="policy_write_positive">Write policy</string>
+    <!-- Phase 5 polish: resourced policy VM messages (were hardcoded Traditional
+         Chinese + one English "already in progress"); same keys across locales,
+         resolved via the policyText injection (production Context, JVM zh default). -->
+    <string name="policy_busy">Policy write in progress, please wait</string>
+    <string name="policy_owner_write">Policy draft must be written by the owner user, otherwise the hook cannot see it</string>
+    <string name="policy_owner_operate">Policy draft must be operated by the owner user, otherwise the hook cannot see it</string>
+    <string name="policy_unknown_refresh">Remote policy unknown; refresh before writing</string>
+    <string name="policy_empty_selection">No apps selected</string>
+    <string name="policy_catalog_loading">Source list not loaded yet, please retry shortly</string>
+    <string name="policy_catalog_missing">Selected apps are no longer in the source list; please reselect</string>
+    <string name="policy_cancelled">Policy write cancelled (no draft written)</string>
+    <string name="policy_no_pending">No pending policy write</string>
+    <string name="policy_in_progress">Policy write already in progress</string>
+    <string name="policy_ttl_expired">Confirmation expired; please reconfirm before writing</string>
+    <string name="policy_no_store_write">No policy store; cannot write policy</string>
+    <string name="policy_no_store_clear">No policy store; cannot clear draft</string>
+    <string name="policy_no_store_read">No policy store; cannot read draft</string>
+    <string name="policy_write_failed">Policy write failed</string>
+    <string name="policy_clear_failed">Failed to clear draft</string>
+    <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
+    <string name="policy_refreshed">Policy draft refreshed</string>
+    <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
+    <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content. Clear again to confirm.</string>
+    <plurals name="policy_dropped">
+        <item quantity="one">Dropped %1$d checked item not in the source list</item>
+        <item quantity="other">Dropped %1$d checked items not in the source list</item>
+    </plurals>
+    <plurals name="policy_written">
+        <item quantity="one">Wrote %1$d package into the policy draft (checks never install, clear anytime)</item>
+        <item quantity="other">Wrote %1$d packages into the policy draft (checks never install, clear anytime)</item>
+    </plurals>
+    <!-- Phase 5 dialog/a11y: package preview truncation, list summary, busy suffix, cancel-denied toast, saving announcement. -->
+    <plurals name="policy_write_preview_more">
+        <item quantity="one">… %1$d row total, showing the first %2$d</item>
+        <item quantity="other">… %1$d rows total, showing the first %2$d</item>
+    </plurals>
+    <string name="policy_write_list_cd">Policy package list, %1$d items total</string>
+    <string name="policy_write_busy_saving">"\n(writing…)"</string>
+    <string name="policy_write_busy_queued">"\n(waiting…)"</string>
+    <string name="policy_write_cancel_denied">Write in progress, cannot cancel</string>
+    <string name="policy_write_saving_announce">Policy write in progress</string>
     <plurals name="batch_create">
         <item quantity="one">Create %1$d clone</item>
         <item quantity="other">Create %1$d clones</item>
@@ -111,7 +169,7 @@
     <!-- p28-1 review: user-visible write-block reasons (were hardcoded Traditional
          Chinese in DualViewModel.writeBlockReason). %1$s=hook state; explicit
          branch %1$s=mode %2$s=channel identity. -->
-    <string name="write_block_lsposed">LSPosed channel is a placeholder (NoOp): whitelist policy branch pending, writes are refused. Hook state: %1$s. To write, switch to Auto/Root/Shizuku, then tap Reconnect and refresh.</string>
+    <string name="write_block_lsposed">LSPosed channel is a placeholder (NoOp): writes are refused; the whitelist policy source is wired (end-to-end DEVICE-UNVERIFIED). Hook state: %1$s. To write, switch to Auto/Root/Shizuku, then tap Reconnect and refresh.</string>
     <string name="write_block_noop">Channel not ready: a real channel is connected but not selected (NoOp fallback); currently read-only and writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
     <string name="write_block_explicit">Selected mode %1$s (%2$s channel) failed probing; writes are disabled (an explicit mode never crosses channels). Switch to Auto, or tap Reconnect and refresh to retry.</string>
     <string name="write_block_pm">Probing passed but PM is not readable (pm list users failed); writes are disabled. Check authorization, then tap Reconnect and refresh.</string>

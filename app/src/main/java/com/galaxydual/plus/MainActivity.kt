@@ -76,6 +76,7 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
 import androidx.annotation.VisibleForTesting
@@ -89,6 +90,7 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
+import com.galaxydual.hook.PolicySource
 import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
@@ -160,6 +162,20 @@ class MainActivity : ComponentActivity() {
     private lateinit var clearSelBtn: Button
     private lateinit var saveSelBtn: Button
     private lateinit var cancelSaveBtn: Button
+    // Stage2 (hook-policy-source P1)：白名單政策（草稿）最小入口（核心引擎頁
+    // 技術卡一節＋兩階段寫入對話框，沿用 remove ack 模式；不改首頁大佈局）。
+    private lateinit var policyDraftView: TextView
+    private lateinit var writePolicyBtn: Button
+    private lateinit var clearPolicyBtn: Button
+    private lateinit var refreshPolicyBtn: Button
+    private var policyWriteDialog: AlertDialog? = null
+    private var serviceBindListener: (() -> Unit)? = null
+    private var shownPolicyWrite: PendingPolicyWrite? = null
+    // Phase 5：已顯示 dialog 的 saving 相位快照（early-return 偵測 QUEUED→SAVING
+    // 翻轉，翻轉沿播報一次；僅 UI 播報用，不參與門控）。
+    private var shownPolicyWriteSaving: Boolean = false
+    private var policyAcknowledged = false
+    private var policyAckGeneration: Long? = null
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
@@ -439,6 +455,14 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
+        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）。
+        policyAcknowledged = savedInstanceState?.getBoolean(KEY_POLICY_ACK) ?: false
+        policyAckGeneration =
+            if (savedInstanceState?.containsKey(KEY_POLICY_ACK_GEN) == true) {
+                savedInstanceState.getLong(KEY_POLICY_ACK_GEN)
+            } else {
+                null
+            }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -454,6 +478,13 @@ class MainActivity : ComponentActivity() {
             msgView.text = getString(R.string.shizuku_listener_failed, sanitizeForDisplay(e.message ?: "unknown"))
             msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
         }
+        // 5.1.5:service 綁定時刷新政策草稿 (避免晚綁定導致草稿看似空)。
+        val serviceBindListener = { vm.refreshPolicyDraft() }
+        this.serviceBindListener = serviceBindListener
+        GalaxyApp.addServiceBindListener(serviceBindListener)
+        // 補發：若服務在訂閱前已綁定，listener 不會收到 onServiceBind，
+        // 此處主動觸發一次刷新，避免 lost-event 競態。
+        if (GalaxyApp.isServiceConnected()) serviceBindListener()
         // Lifecycle-aware collection: renders every state update while STARTED.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -522,6 +553,9 @@ class MainActivity : ComponentActivity() {
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
+        // Stage2：政策寫入確認勾選綁定世代保留。
+        outState.putBoolean(KEY_POLICY_ACK, policyAcknowledged)
+        if (policyAckGeneration != null) outState.putLong(KEY_POLICY_ACK_GEN, policyAckGeneration!!)
     }
 
     override fun onDestroy() {
@@ -543,6 +577,13 @@ class MainActivity : ComponentActivity() {
         pendingBatchRequest = null
         shownBatchRequest = null
         shownBatchWasFresh = null
+            policyWriteDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        policyWriteDialog = null
+        shownPolicyWrite = null
+        shownPolicyWriteSaving = false
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -568,6 +609,8 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             // Best effort: listeners are already gone with the process anyway.
         }
+        serviceBindListener?.let { GalaxyApp.removeServiceBindListener(it) }
+        serviceBindListener = null
         super.onDestroy()
     }
 
@@ -921,6 +964,43 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             contentDescription = getString(R.string.unsave_selection_cd)
             setOnClickListener { vm.cancelSavedSelection() }
+        }
+        // Stage2：白名單政策（草稿）最小入口。寫入需二次確認
+        // (requestPolicyWrite 建 pending，dialog 勾選後 confirm)；勾選≠安裝、
+        // 寫草稿≠安裝 (見 DualViewModel/confirmPolicyWrite)。
+        policyDraftView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        writePolicyBtn = Button(this).apply {
+            text = getString(R.string.action_write_policy)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.write_policy_cd)
+            setOnClickListener { vm.requestPolicyWrite() }
+        }
+        clearPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_clear_policy_draft)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.clear_policy_draft_cd)
+            setOnClickListener { vm.clearPolicyDraft() }
+        }
+        // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
+        // 未知提示，不改 dialog 主流程）。
+        refreshPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_refresh_policy_draft)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.refresh_policy_draft_cd)
+            setOnClickListener { vm.refreshPolicyDraft() }
         }
         sourceContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1558,6 +1638,16 @@ class MainActivity : ComponentActivity() {
         techCard.addView(inventoryView)
         techCard.addView(lastOpView)
         techCard.addView(diagView)
+        // Stage2：白名單政策（草稿）一節（最小入口：計數行＋寫入/清除/重新整理列；
+        // 寫入走兩階段確認 dialog，見 syncPolicyWriteDialog）。
+        techCard.addView(policyDraftView)
+        val policyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(writePolicyBtn, rowParams())
+            addView(clearPolicyBtn, rowParams())
+            addView(refreshPolicyBtn, rowParams())
+        }
+        techCard.addView(policyRow)
         tabEngineLayout.addView(techCard)
 
         // Engine Action Buttons
@@ -2981,6 +3071,18 @@ class MainActivity : ComponentActivity() {
         // P4 a11y：同步更新 contentDescription (含展開狀態)。
         diagView.text = renderDiagnoseText(s, diagExpanded)
         diagView.contentDescription = renderDiagnoseDescription(s, diagExpanded)
+        // Stage2：白名單政策（草稿）計數行（最小入口；buildUi 前 render 走守衛）。
+        try {
+            if (::policyDraftView.isInitialized) {
+                policyDraftView.text = if (s.policyDraftKnown) {
+                    getString(R.string.policy_draft_format, s.policyDraft.size)
+                } else {
+                    getString(R.string.policy_draft_unknown)
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
 
         // One UI 6 Modern Views dynamic update
         // Phase B B4：分身列表移出此 try（獨立指紋＋獨立 try/catch，下見），
@@ -3241,6 +3343,19 @@ class MainActivity : ComponentActivity() {
         saveSelBtn.isEnabled = !busy && verifiedTargetAvailable(s)
         cancelSaveBtn.isEnabled = !busy
         batchBtn.isEnabled = batchEnabled(s)
+        // Phase 2 政策重新整理可觀測：刷新在途時禁用按鈕並帶狀態 CD，
+        // 避免連打誤解；buildUi 前 render 走守衛（測試路徑）。
+        try {
+            if (::refreshPolicyBtn.isInitialized) {
+                refreshPolicyBtn.isEnabled = !s.policyRefreshing
+                refreshPolicyBtn.contentDescription = getString(
+                    if (s.policyRefreshing) R.string.refresh_policy_draft_cd_refreshing
+                    else R.string.refresh_policy_draft_cd,
+                )
+            }
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
         searchInput.isEnabled = !busy
         // p28-1 禁用原因行：只在非 busy 且不可寫時顯示 VM 拒絕理由。
@@ -3349,6 +3464,21 @@ class MainActivity : ComponentActivity() {
             syncBatchDialog(pendingBatchRequest, s)
         } catch (e: Exception) {
             Log.w(TAG, "syncBatchDialog failed", e)
+        // Stage2：兩階段政策寫入 dialog（state-driven，同 pendingRemove 模式；
+        // 旋轉由 retained ViewModel 重播 state，無需重送）。
+        // Phase 3：唯一真相為 state（s.policyWritePhase）；不再讀
+        // vm.policyOperationInProgress / policyWriteCommitInProgress getter
+        //（相容保留，見 DualViewModel）。四參：pending＋全域 loading（僅顯示用，
+        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/policySaving。
+        try {
+            syncPolicyWriteDialog(
+                s.pendingPolicyWrite,
+                s.loading,
+                s.policyWritePhase != PolicyWritePhase.IDLE,
+                s.policyWritePhase == PolicyWritePhase.SAVING,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "syncPolicyWriteDialog failed", e)
         }
     }
 
@@ -3533,13 +3663,13 @@ class MainActivity : ComponentActivity() {
             setText(R.string.remove_confirm_acknowledge)
             // 窄螢幕可見可操作：24px 改 dp 換算＋WRAP_CONTENT＋最小觸控高 48dp。
             val d = resources.displayMetrics.density
-            val hPad = (24 * d).toInt()
+            val hPad = (CONFIRM_ACK_HPAD_DP * d).toInt()
             setPadding(hPad, 0, hPad, 0)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
-            minimumHeight = (48 * d).toInt()
+            minimumHeight = (CONFIRM_ACK_MIN_HEIGHT_DP * d).toInt()
             // 同世代重建（旋轉）恢復勾選；跨世代已在上重置為 false。
             isChecked = removeAcknowledged
         }
@@ -3658,10 +3788,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Stage1 批次建立兩步確認（Activity 本地，沿用 remove ack 世代契約）：
-    // batchBtn 點擊只建立請求快照（世代/數量/目標）並顯示對話框，確認後才
-    // vm.cloneSelected()。VM 守衛（isWritable、起始 pin）完全不經手，此處只做
-    // UI 門控（canConfirmBatch）與文案呈現（buildBatchConfirmMessage）。
     private fun requestBatchConfirm() {
         if (isFinishing || isDestroyed) return
         val s = try {
@@ -3898,6 +4024,283 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: 無障礙屬性失敗不影響顯示。
         }
+    }
+
+    private fun syncPolicyWriteDialog(
+        pending: PendingPolicyWrite?,
+        globalLoading: Boolean,
+        policyOp: Boolean,
+        policySaving: Boolean,
+    ) {
+        if (isFinishing || isDestroyed) return
+        if (pending == null) {
+            try {
+                policyWriteDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            // 無待確認即無世代可綁定：勾選與世代一併清除，避免殘留污染下一世代。
+            policyAcknowledged = false
+            policyAckGeneration = null
+            return
+        }
+        if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyDialogCanConfirm(policyOp, policyAcknowledged)
+            // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
+            // Back/觸外仍以 !policySaving 門控。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+            policyWriteDialog?.setCancelable(policyDialogShouldBeCancelable(policySaving))
+            policyWriteDialog?.setCanceledOnTouchOutside(policyDialogShouldBeCancelable(policySaving))
+            // queued/saving 忙碌文案：全量重建（冪等），render 每幀同步。
+            // Phase 5：SAVING 翻轉播報寫入中（POLITE，不洗掉 dialog 內容）。
+            val wasSaving = shownPolicyWriteSaving
+            try {
+                policyWriteDialog?.setMessage(policyWriteMessage(pending, policyOp, policySaving))
+            } catch (_: Exception) {
+                // Best effort: 文案更新失敗不影響門控。
+            }
+            if (policySaving && !wasSaving) {
+                shownPolicyWriteSaving = true
+                try {
+                    val announce = try {
+                        getString(R.string.policy_write_saving_announce)
+                    } catch (_: Exception) {
+                        "政策寫入中"
+                    }
+                    policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
+                } catch (_: Exception) {
+                    // Best effort: 播報失敗不影響門控。
+                }
+            } else if (!policySaving) {
+                shownPolicyWriteSaving = false
+            }
+            return
+        }
+        try {
+            policyWriteDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        shownPolicyWrite = pending
+        shownPolicyWriteSaving = policySaving
+        // 同世代（旋轉重建）保留勾選，跨世代重置（見 policyAckShouldReset 純函數；
+        // 此處為 Activity 側實現，JVM 以該純函數鎖定語義）。
+        if (policyAckShouldReset(policyAckGeneration, pending.generation)) {
+            policyAcknowledged = false
+            policyAckGeneration = null
+        }
+        val message = policyWriteMessage(pending, policyOp, policySaving)
+        // 破壞性確認顯示完整包名以供核對（政策寫入放寬白名單，需明示對象；
+        // 包名來自 catalog/PM，非使用者隱私輸入；匯出/日誌仍經遮蔽）。
+        // Phase 5：僅渲染前 50 項＋溢出行（全量 200 行會擠出 ack）；寫入仍用
+        // 完整 pending.packages（截斷僅顯示）。
+        val sorted = pending.packages.sorted()
+        val (shown, rest) = truncatePolicyPreview(sorted)
+        val lines = ArrayList<String>(shown.size + 1)
+        lines.addAll(shown)
+        if (rest > 0) {
+            val more = try {
+                resources.getQuantityString(
+                    R.plurals.policy_write_preview_more,
+                    sorted.size,
+                    sorted.size,
+                    shown.size,
+                )
+            } catch (_: Exception) {
+                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項"
+            }
+            lines.add(more)
+        }
+        val listSummary = try {
+            getString(R.string.policy_write_list_cd, sorted.size)
+        } catch (_: Exception) {
+            "政策包名列表，共 ${sorted.size} 項"
+        }
+        val packagesText = TextView(this).apply {
+            text = lines.joinToString("\n")
+            // 無 contentDescription：摘要由外層 ScrollView 承載，內外重複會致
+            // TalkBack 朗讀兩次。
+            setTextIsSelectable(true)
+        }
+        val scrollView = ScrollView(this).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            contentDescription = listSummary
+            addView(
+                packagesText,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            // Phase 5 a11y：dialog 內容區 POLITE（TalkBack 跟隨訊息/相位變化）。
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            // Phase 5：包名超過 POLICY_DIALOG_LIST_INLINE_MAX 項時 ScrollView 限高
+            // POLICY_DIALOG_LIST_MAX_HEIGHT_DP（maxHeight），
+            // ack checkbox 永遠可見；少量時 WRAP_CONTENT 不留空。
+            val listParams = if (sorted.size > POLICY_DIALOG_LIST_INLINE_MAX) {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(POLICY_DIALOG_LIST_MAX_HEIGHT_DP),
+                )
+            } else {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+            }
+            addView(scrollView, listParams)
+        }
+        val acknowledgement = CheckBox(this).apply {
+            setText(R.string.policy_write_acknowledge)
+            val d = resources.displayMetrics.density
+            val hPad = (CONFIRM_ACK_HPAD_DP * d).toInt()
+            setPadding(hPad, 0, hPad, 0)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            minimumHeight = (CONFIRM_ACK_MIN_HEIGHT_DP * d).toInt()
+            isChecked = policyAcknowledged
+        }
+        // 把 ack checkbox 放在 scrollable list 之下。
+        container.addView(
+            acknowledgement,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        try {
+            policyWriteDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.policy_write_title))
+                .setMessage(message)
+                .setView(container)
+                .setCancelable(!policySaving)
+                .setPositiveButton(getString(R.string.policy_write_positive), null)
+                .setNegativeButton(getString(R.string.dialog_cancel), null)
+                .setOnCancelListener { vm.cancelPolicyWrite(pending) }
+                .show()
+        } catch (_: Exception) {
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            return
+        }
+        acknowledgement.setOnCheckedChangeListener { _, checked ->
+            policyAcknowledged = checked
+            policyAckGeneration = if (checked) pending.generation else null
+            // 確定性路徑：用本次 sync 傳入的 render 幀 policyOp（同 remove dialog
+            // 的 loading/blockKey 模式），不即時重讀 live 狀態；loading 變化由
+            // 下一次 render 的 early-return 同步，真正寫入門控在 Positive 點擊
+            // 即時重讀＋VM confirmPolicyWrite 世代守衛雙層 fail-closed。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyDialogCanConfirm(policyOp, checked)
+        }
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），與舊碼
+            // 讀 vm.policyOperationInProgress 同語義，現改讀 state 唯一真相。
+            val curPolicyOp = try {
+                vm.state.value.policyWritePhase != PolicyWritePhase.IDLE
+            } catch (_: Exception) {
+                policyOp
+            }
+            if (policyDialogCanConfirm(curPolicyOp, policyAcknowledged)) vm.confirmPolicyWrite(pending)
+        }
+        // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
+        // 點按時即時重讀 phase，SAVING 即 toast「寫入中，無法取消」且不調 VM；
+        // queued 才調 vm.cancelPolicyWrite（維持 P1 #1 語義）。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+            val savingNow = try {
+                vm.state.value.policyWritePhase == PolicyWritePhase.SAVING
+            } catch (_: Exception) {
+                policySaving
+            }
+            if (savingNow) {
+                val denied = try {
+                    getString(R.string.policy_write_cancel_denied)
+                } catch (_: Exception) {
+                    "寫入中，無法取消"
+                }
+                try {
+                    Toast.makeText(this, denied, Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
+                    // Best effort: toast 失敗不影響門控。
+                }
+            } else {
+                vm.cancelPolicyWrite(pending)
+            }
+        }
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+            policyDialogCanConfirm(policyOp, policyAcknowledged)
+        // Phase 5：negative 保持可點（見上 toast），Back/觸外仍以 !saving 門控。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+        policyWriteDialog?.setCancelable(policyDialogShouldBeCancelable(policySaving))
+        policyWriteDialog?.setCanceledOnTouchOutside(policyDialogShouldBeCancelable(policySaving))
+        // Phase 5：初建即 SAVING 時播報一次（early-return 分支覆蓋後續翻轉）。
+        if (policySaving) {
+            try {
+                val announce = try {
+                    getString(R.string.policy_write_saving_announce)
+                } catch (_: Exception) {
+                    "政策寫入中"
+                }
+                policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
+    }
+
+    // 政策寫入 dialog 訊息（含 dropped 與 busy 後綴；皆經資源解析，JVM 縫合語義
+    // 由純函數 policyWriteBusySuffix/truncatePolicyPreview 鎖定）。
+    // - 主模板走 R.plurals.policy_write_message（Phase 5：前身 <string> 帶無用 %2$s，
+    //   現移除 %2$s，清單另以 ScrollView 顯示，僅留計數 %1$d；中英 plurals 化）。
+    // - dropped 後綴走 R.plurals.policy_dropped（前身硬編碼拼接，現資源化）。
+    // - busy 後綴走 R.string.policy_write_busy_*（前身僅純函數硬編碼，生產改資源；
+    //   純函數保留為 JVM seam，文案與 zh 資源同字）。
+    private fun policyWriteMessage(
+        pending: PendingPolicyWrite,
+        policyOp: Boolean,
+        policySaving: Boolean,
+    ): String {
+        var message = try {
+            resources.getQuantityString(
+                R.plurals.policy_write_message,
+                pending.packages.size,
+                pending.packages.size,
+            )
+        } catch (_: Exception) {
+            "政策寫入（${pending.packages.size} 項）"
+        }
+        if (pending.droppedCount > 0) {
+            val droppedSuffix = try {
+                resources.getQuantityString(
+                    R.plurals.policy_dropped,
+                    pending.droppedCount,
+                    pending.droppedCount,
+                )
+            } catch (_: Exception) {
+                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+            }
+            message += "\n$droppedSuffix"
+        }
+        val busySuffix = try {
+            if (policySaving) getString(R.string.policy_write_busy_saving)
+            else if (policyOp) getString(R.string.policy_write_busy_queued)
+            else ""
+        } catch (_: Exception) {
+            policyWriteBusySuffix(policyOp, policySaving)
+        }
+        message += busySuffix
+        return message
     }
 
     // Best-effort display name for the dialog: the PackageManager label when
@@ -5061,6 +5464,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
+        // Stage2：政策寫入確認勾選綁定世代（同 remove ack 模式，旋轉保留）。
+        private const val KEY_POLICY_ACK = "policyAck"
+        private const val KEY_POLICY_ACK_GEN = "policyAckGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -5089,6 +5495,17 @@ class MainActivity : ComponentActivity() {
 
         // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
         private const val MAX_LABEL_CACHE = 200
+
+        // Phase 5 政策寫入 dialog 尺寸閾值（等值提取字面量，行為不變）：
+        // POLICY_DIALOG_LIST_INLINE_MAX = 清單超過此項數才限高（少量
+        // WRAP_CONTENT 不留空，ack 永遠可見）；
+        // POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 限高（經 dp() 轉 px）；
+        // CONFIRM_ACK_HPAD_DP／CONFIRM_ACK_MIN_HEIGHT_DP = 確認勾選
+        // 水平內邊距／最小觸控高（remove／policy 兩 dialog 共用，48dp 觸控目標）。
+        private const val POLICY_DIALOG_LIST_INLINE_MAX = 10
+        private const val POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 320
+        private const val CONFIRM_ACK_HPAD_DP = 24
+        private const val CONFIRM_ACK_MIN_HEIGHT_DP = 48
 
         // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
         // (orderedKeys.size >= maxSize) 時回傳最久未用 key（Phase D 起 LRU：
@@ -5469,7 +5886,7 @@ internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
             HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
                 "Unknown (no diagnostic channel; switch to a ROOT/Shizuku channel and re-probe, see #27)"
         }
-        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), whitelist policy branch pending, writes disabled"
+        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), writes disabled; whitelist policy source wired (end-to-end DEVICE-UNVERIFIED)"
     }
     // ACTIVE is historical existence+scope evidence only (the marker
     // survives reboots; S24 evidence shows it predating boot by ~5.5h
@@ -5487,7 +5904,7 @@ internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
             "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27）"
     }
     return "LSPosed Hook：$status${s.hookEvidence().timeEvidenceText()}；寫入通道為佔位（NoOp），" +
-        "待 whitelist 政策分支，寫入已禁用"
+        "寫入已禁用；白名單政策來源已接線（端到端 DEVICE-UNVERIFIED）"
 }
 
 // 診斷事件行：穩定碼 + 繁中摘要/下一步常顯（scope-limited 繁中，非雙語）；展開時加 exit/技術 detail。
@@ -5537,6 +5954,24 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 const val BATCH_REPORT_MAX_ROWS = 50
 
 // 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派)。
+// Phase 5 polish：政策寫入 dialog 包名預覽上限（效能＋a11y 護欄）：清單最多
+// 顯示前 N 項，超出以「…等共 M 項」收尾（與批次報告同式）；完整集合仍在
+// pending.packages 內，寫入數不受截斷影響。contentDescription 另給摘要
+// （見 syncPolicyWriteDialog），TalkBack 不逐項朗讀 200 行。
+const val POLICY_DIALOG_PREVIEW_MAX = 50
+
+// 政策寫入 dialog 包名預覽截斷（MainActivity 頂層 internal，JVM 可測）：回傳
+// （顯示列，溢出數）。呼叫端顯示列 join＋溢出行（資源
+// policy_write_preview_more），寫入仍用完整 pending.packages。
+internal fun truncatePolicyPreview(
+    sorted: List<String>,
+    max: Int = POLICY_DIALOG_PREVIEW_MAX,
+): Pair<List<String>, Int> {
+    if (sorted.size <= max) return sorted to 0
+    return sorted.take(max) to (sorted.size - max)
+}
+
+// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派；保留繁中 scope-limited，非雙語)。
 // - 未知口徑與 DualViewModel.isBatchUnknownOutcome 一致：VerifyUnknown 與
 //   ChannelError（身份暫時無法判定、零寫入，需重查）皆計未知；NoDual 計失敗
 //   （真 Absent＋M13 短路語意），其餘非 Success 皆計失敗。彙總計數由呼叫端
@@ -5658,6 +6093,24 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
         live,
         request.wasFresh,
     )
+// Phase 3（hook-policy-source P1，階段 3）：政策寫入 dialog 純門控（JVM 可測，
+// 無需 Robolectric；Activity 側 syncPolicyWriteDialog 只呼叫此三函數）。
+// - positive：任一政策操作在途（QUEUED/SAVING）即禁用＋需 ack 勾選。
+// - negative/Back：僅 SAVING 禁用（queued 仍可取消，P1 #1 語義）。
+// - busy 後綴：SAVING 顯示寫入中，QUEUED（op 非 saving）顯示等待中，皆附換行。
+internal fun policyDialogCanConfirm(policyOp: Boolean, acknowledged: Boolean): Boolean =
+    !policyOp && acknowledged
+
+internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !policySaving
+
+internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
+    storedGeneration != pendingGeneration
+
+internal fun policyWriteBusySuffix(policyOp: Boolean, policySaving: Boolean): String = when {
+    policySaving -> "\n（寫入中…）"
+    policyOp -> "\n（等待中…）"
+    else -> ""
+}
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
@@ -5718,6 +6171,13 @@ internal fun buildBatchConfirmMessage(
     targetId: Int,
     targetSerial: Int,
 ): String = String.format(java.util.Locale.ROOT, template, count, targetId, targetSerial)
+// owner-user 門控用:由 uid 拆出 userId。
+// uid = userId * UserHandle.PER_USER_RANGE + appId (AOSP 公式);
+// PER_USER_RANGE 為 @hide,公開 SDK 無法引用,故 100_000 字面單點存放在此。
+// Phase 4:負值守衛 (<0 回 -1):Process.myUid() 恆非負,負值僅出現在測試/
+// 異常路徑;舊碼整數除法向零截斷會把負值誤判為 user 0 (owner),直接 fail-open,
+// 故顯式回 -1 拒絕。
+internal fun userIdFromUid(uid: Int): Int = if (uid < 0) -1 else uid / 100_000
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
 // DEVICE-UNVERIFIED: selection/exec never ran on a device.
@@ -5740,8 +6200,9 @@ internal fun buildBatchConfirmMessage(
 // F4b-P2 (issue #6): the picker UI above calls selectChannel() for all four
 // preferences; the LSPosed hook-enable signal comes from the marker file
 // (HookStateProvider, refreshed on every probe) and is display-only. The
-// LSPosed gateway stays the NoOp placeholder: the real hook gateway (plus
-// the whitelist policy branch) is still future work.
+// LSPosed gateway stays the NoOp placeholder: the whitelist policy source is
+// wired (end-to-end DEVICE-UNVERIFIED), but the real hook execution channel
+// remains a NoOp placeholder.
 // DEVICE-UNVERIFIED: marker read + LSPosed placeholder behavior never ran
 // on a device (staleness/SELinux limits documented in HookMarker).
 private class DualViewModelFactory(
@@ -5797,6 +6258,17 @@ private class DualViewModelFactory(
                 nowWallMs = { System.currentTimeMillis() },
                 nowMonoMs = { SystemClock.elapsedRealtime() },
                 selectionStore = selPrefs.selectionStore(),
+                // Stage2:政策草稿 store 綁定 LSPosed remote preferences
+                // (dual_policy/extra_whitelist_packages,與 hook 側同一 group)。
+                // service 缺席時 store 仍有 instance,但 save/clear 回 false、
+                // load 回空 (fail-closed),見 remoteHookPolicyStore。
+                hookPolicyStore = remoteHookPolicyStore {
+                    GalaxyApp.remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                },
+                // Stage2:owner-user 門控 (hook 讀 user 0;非 owner 寫入無效)。
+                // UserHandle.myUserId()/getUserId() 皆 @hide 公開 SDK 無法引用;
+                // 以公開的 Process.myUid() 拆解 (見 userIdFromUid)。
+                currentUserId = { userIdFromUid(Process.myUid()) },
                 // p28-1 review（en 殘留）：寫入拒絕理由經 Application Context
                 // 解析資源（applicationContext，不持 Activity；JVM 測試注入假值）。
                 blockText = { block ->
@@ -5804,6 +6276,37 @@ private class DualViewModelFactory(
                         block.stringRes(),
                         *block.args.toTypedArray(),
                     )
+                },
+                // Phase 5 polish：政策 VM 訊息經 Application Context 解析資源
+                // （applicationContext，不持 Activity；JVM 預設繁中 defaultText，
+                // 測試可注入假值）。plurals（DROPPED/WRITE_SUCCESS）走
+                // getQuantityString；其餘走 getString。
+                policyText = { pt ->
+                    val res = appContext.applicationContext.resources
+                    when (pt.kind) {
+                        PolicyTextKind.BUSY -> res.getString(R.string.policy_busy)
+                        PolicyTextKind.OWNER_WRITE -> res.getString(R.string.policy_owner_write)
+                        PolicyTextKind.OWNER_OPERATE -> res.getString(R.string.policy_owner_operate)
+                        PolicyTextKind.UNKNOWN_REFRESH -> res.getString(R.string.policy_unknown_refresh)
+                        PolicyTextKind.EMPTY_SELECTION -> res.getString(R.string.policy_empty_selection)
+                        PolicyTextKind.CATALOG_LOADING -> res.getString(R.string.policy_catalog_loading)
+                        PolicyTextKind.CATALOG_MISSING -> res.getString(R.string.policy_catalog_missing)
+                        PolicyTextKind.DROPPED -> res.getQuantityString(R.plurals.policy_dropped, pt.count, pt.count)
+                        PolicyTextKind.CANCELLED -> res.getString(R.string.policy_cancelled)
+                        PolicyTextKind.NO_PENDING -> res.getString(R.string.policy_no_pending)
+                        PolicyTextKind.IN_PROGRESS -> res.getString(R.string.policy_in_progress)
+                        PolicyTextKind.TTL_EXPIRED -> res.getString(R.string.policy_ttl_expired)
+                        PolicyTextKind.NO_STORE_WRITE -> res.getString(R.string.policy_no_store_write)
+                        PolicyTextKind.NO_STORE_CLEAR -> res.getString(R.string.policy_no_store_clear)
+                        PolicyTextKind.NO_STORE_READ -> res.getString(R.string.policy_no_store_read)
+                        PolicyTextKind.WRITE_SUCCESS -> res.getQuantityString(R.plurals.policy_written, pt.count, pt.count)
+                        PolicyTextKind.WRITE_FAILED -> res.getString(R.string.policy_write_failed)
+                        PolicyTextKind.CLEAR_SUCCESS -> res.getString(R.string.policy_cleared)
+                        PolicyTextKind.CLEAR_FAILED -> res.getString(R.string.policy_clear_failed)
+                        PolicyTextKind.REFRESHED -> res.getString(R.string.policy_refreshed)
+                        PolicyTextKind.REFRESH_FAILED -> res.getString(R.string.policy_refresh_failed)
+                        PolicyTextKind.BLIND_CLEAR_FIRST -> res.getString(R.string.policy_blind_clear_first)
+                    }
                 },
             ) as T
         }

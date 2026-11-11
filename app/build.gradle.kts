@@ -161,6 +161,11 @@ dependencies {
     // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    // Stage2 (hook-policy-source P1): module-app side of the LSPosed remote
+    // preferences channel. The service AAR contributes XposedProvider
+    // (authority ${applicationId}.XposedService) via manifest merge; GalaxyApp
+    // registers XposedServiceHelper to obtain the XposedService binder.
+    implementation(libs.libxposed.service)
     // Phase F2 (issue #6): observable state (StateFlow + viewModelScope) and
     // lifecycle-aware collection in MainActivity (lifecycleScope/viewModels).
     implementation(libs.coroutines.android)

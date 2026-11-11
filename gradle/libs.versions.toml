@@ -7,6 +7,8 @@ compileSdk = "34"
 minSdk = "29"
 targetSdk = "34"
 shizuku = "13.1.5"
+# Stage2 (hook-policy-source P1): LSPosed remote preferences service AAR.
+libxposedService = "102.0.0"
 # Phase F2 (issue #6): observable app state needs coroutines + lifecycle.
 # coroutines 1.9.0: first stable line with official Kotlin 2.0 support
 # (matches kotlin 2.0.21); pure-Kotlin artifact, no compileSdk constraint.
@@ -30,6 +32,7 @@ junit = "4.13.2"
 [libraries]
 shizuku-api = { group = "dev.rikka.shizuku", name = "api", version.ref = "shizuku" }
 shizuku-provider = { group = "dev.rikka.shizuku", name = "provider", version.ref = "shizuku" }
+libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposedService" }
 coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
 # Test-only dispatcher control (StandardTestDispatcher) for the deterministic

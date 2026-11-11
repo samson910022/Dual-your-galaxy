@@ -22,10 +22,13 @@ import com.galaxydual.core.channelReadyFor
 import com.galaxydual.core.PmOutputParser
 import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
+import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,6 +38,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 // Pending two-phase remove confirmation (PR-4 P1, issue #23).
@@ -145,7 +149,43 @@ fun ProbeScope.displayLabel(): String = when (this) {
     ProbeScope.NONE -> "未探測"
 }
 
+// Phase 3 (hook-policy-source P1, 階段 3):政策寫入可觀測相位，唯一真相在
+// UiState.policyWritePhase（render 只讀 state，不讀 ConcurrentHashMap）。
+// - IDLE：無政策寫入/清除在途（無論有無 pending；request 建 pending 後為 QUEUED）。
+// - QUEUED：已排隊等 opMutex（confirm 已呼叫但 save 未開始；request 建 pending
+//   後亦為 QUEUED；clear 已呼叫但 store IO 未開始亦為 QUEUED）。此時取消仍有效。
+// - SAVING：store save/clear IO 已實際開始（不可取消；cancel 為 no-op）。
+// 相位與 loading 在同一 _state.update 翻轉（特別是 QUEUED→SAVING 與
+// loading=true 同一 emission），消除「loading 已 true 但 saving 集合尚未 add」
+// 的一幀 stale（舊碼先 update loading=true 才 add，dialog 仍可取消一幀）。
+enum class PolicyWritePhase {
+    IDLE,
+    QUEUED,
+    SAVING,
+}
+
 private val removeGeneration = java.util.concurrent.atomic.AtomicLong()
+
+// Stage2 (hook-policy-source P1, 階段 2):兩階段政策寫入的待確認快照。
+//
+// 由 requestPolicyWrite() 建立 (當下已勾選映射出的包名集合)，confirmPolicyWrite()
+// 執行寫入 HookPolicyStore，cancelPolicyWrite() 丟棄 (取消≠寫入≠安裝)。
+// 世代單調唯一 (policyWriteGeneration)，跨請求覆寫即舊世代失效 (與
+// PendingRemove 同式)。
+private val policyWriteGeneration = java.util.concurrent.atomic.AtomicLong()
+
+// Stage2 (hook-policy-source P2 #5):政策草稿版本號，避免晚到的 init/refresh
+// 載入覆寫較新的 save 所寫入的 policyDraft。
+private val policyDraftVersion = java.util.concurrent.atomic.AtomicLong()
+// Read-generation guard for policy draft loads: overlapping loads discard
+// stale results (load A must not overwrite a newer load B).
+private val policyLoadGeneration = java.util.concurrent.atomic.AtomicLong()
+data class PendingPolicyWrite(
+    val packages: Set<String>,
+    val requestedAtMs: Long,
+    val droppedCount: Int = 0,
+    val generation: Long = policyWriteGeneration.incrementAndGet(),
+)
 
 data class PendingRemove(
     val pkg: String,
@@ -349,6 +389,35 @@ data class UiState(
     // Survives config rotation (ViewModel retained); a recreated ViewModel
     // starts null (fail closed, must request again).
     val pendingRemove: PendingRemove? = null,
+    // Stage2 (hook-policy-source P1, 階段 2):白名單政策草稿。
+    // - policyDraft:HookPolicyStore 內已保存的包名集合 (顯示計數用；預設空，
+    //   只在 init/寫入/清除/refreshPolicyDraft 後更新，勾選變更永不自動寫入)。
+    // - pendingPolicyWrite:兩階段寫入的待確認快照 (沿用 remove ack 模式：
+    //   世代綁定＋二次確認＋TTL，見 request/confirm/cancelPolicyWrite)。
+    val policyDraft: Set<String> = emptySet(),
+    // True once a policy draft has been successfully read from the store
+    // (unknown/unavailable is distinct from a confirmed empty draft).
+    val policyDraftKnown: Boolean = false,
+    val pendingPolicyWrite: PendingPolicyWrite? = null,
+    // Phase 3：政策寫入可觀測相位＋單一 epoch（唯一真相，render 只讀此二欄）。
+    // - policyWritePhase：IDLE/QUEUED/SAVING（見 PolicyWritePhase KDoc）。
+    //   request 建 pending 即 QUEUED；confirm 在 opMutex 內同一 _state.update
+    //   翻 QUEUED→SAVING（與 loading=true 同 emission）；完成/取消/TTL/拒絕
+    //   即回 IDLE（abort 但 pending 保留時回 QUEUED，見 confirm 內註）。
+    //   clear 在途亦經 QUEUED→SAVING→IDLE（clear 起始即清 pending，故 dialog
+    //   以 pending==null 關閉，phase 僅供 positive/negative 門控與測試）。
+    // - policyEpoch：相位遷移單調計數（request/cancel/confirm/clear 每次相位
+    //   變遷即 +1；QUEUED→SAVING 保持同一 epoch 以標示同一 op 推進，僅翻相位）。
+    //   與 policyWriteGeneration（pending 身份）/clearGeneration（clear key 唯一）
+    //   /policyDraftVersion+policyLoadGeneration（TOCTOU fence，Phase1 語義不動）
+    //   之關係見 DualViewModel 內各計數器 KDoc。
+    val policyWritePhase: PolicyWritePhase = PolicyWritePhase.IDLE,
+    val policyEpoch: Long = 0L,
+    // Phase 2：手動重新整理草稿的可觀測位（獨立於全域 loading，避免誤清
+    // sibling busy；見 refreshPolicyDraft + hasActiveSibling 守衛說明）。
+    // true = 至少一次 refreshPolicyDraft 在途；完成（成功/Unknown/丟棄）
+    // 即回 false（多重疊加由計數器兜底，最後完成者清位）。
+    val policyRefreshing: Boolean = false,
     // PR-7 P2 (issue #26, 階段 1):個人來源 catalog + 多選狀態 (唯讀展示 +
     // 勾選,執行見 cloneSelected)。sourceCatalog 由 MainActivity 經
     // loadSourceApps 載入後注入;搜尋/篩選/排序走 SourceInventory 純函數。
@@ -409,9 +478,10 @@ data class UiState(
 // Phase F4b-P2 (issue #6): the picker UI (MainActivity) calls selectChannel
 // for all four preferences; the LSPosed hook-enable signal (HookState from
 // the marker file) is tracked in UiState.hookActive/hookScopes for display
-// in LSPosed mode. The LSPosed gateway stays the NoOp placeholder (whitelist
-// policy branch pending): writes under it are refused with an explicit
-// reason, never executed. The marker never feeds privilege routing
+// in LSPosed mode. The LSPosed gateway stays the NoOp placeholder (the
+// whitelist policy source is wired, end-to-end DEVICE-UNVERIFIED, but the
+// LSPosed execution channel remains a NoOp placeholder): writes under it are
+// refused with an explicit reason, never executed. The marker never feeds privilege routing
 // (hook signal never enters routing; `routePrivilegeFromProbes` has no `hasLsposed`
 // parameter): a present marker is not proof of a live, effective hook, so it
 // must not grant privilege.
@@ -563,18 +633,53 @@ class DualViewModel(
     // SharedPreferences (selectionStore());JVM 測試注入 HashMap 後端;null
     // 表示無持久化 (既有測試路徑,所有選取操作退化為純記憶體)。
     private val selectionStore: SelectionStore? = null,
+    // Stage2 (hook-policy-source P1, 階段 2):政策草稿 store。生產由 factory 綁定
+    // LSPosed remote preferences (remoteHookPolicyStore,group dual_policy,與
+    // hook 側同一 group；service 缺席時 fail-closed)；JVM 測試注入
+    // HookPolicyStore lambda 後端；null 表示無持久化 (所有政策操作退化為
+    // 拒絕並說明，不碰裝置)。
+    private val hookPolicyStore: HookPolicyStore? = null,
+    // Stage2:政策草稿寫入的 owner-user 門控。hook 讀 user 0 的 remote prefs
+    // (此為 assertion,非實機證明,DEVICE-UNVERIFIED);非 owner 用戶實例寫入的
+    // 是自己 user 的 group,hook 讀不到,故要求由 owner user 寫入。生產由
+    // factory 以 Process.myUid() 拆解 (見 MainActivity);JVM 測試預設 0
+    // (owner),僅專用測試注入非 0。
+    private val currentUserId: () -> Int = { 0 },
     // p28-1 review（en 殘留）：寫入拒絕理由在地化。VM 本體不碰 Android
     // Context：文字解析經此注入——生產由 factory 以 Application Context 對接
     // values/strings.xml（見 MainActivity.resolveBlockReason）；JVM 測試注入
     // 假值（見 BlockReasonTestFake.zhTestBlockText）。預設回退 key 名
     // （WriteBlockKind.name），保證主程式碼零硬編碼字面。
     private val blockText: (WriteBlock) -> String = { it.kind.name },
+    // Phase 5 polish：政策 VM 訊息資源化。VM 本體不碰 Android Context：文字
+    // 經此注入——生產由 factory 以 Application Context 對接 values/*/strings.xml
+    // （policy_busy/policy_owner_* 等＋policy_dropped/policy_written plurals，
+    // 見 MainActivity.DualViewModelFactory）；JVM 測試預設即繁中字面
+    // （PolicyText.defaultText，與 zh 資源同文），或注入假值鎖定調用點
+    // （見 PolicyWriteTest policyTextInjection）。前身硬編碼繁中＋一處英文
+    // "already in progress: policy write"，現一律經此 single source。
+    private val policyText: (PolicyText) -> String = { it.defaultText() },
+    // Phase 4:confirm/clear 持 opMutex 橫跨 onIo 的有界超時（預設 10s）。
+    // 可注入以便 JVM 測試鎖定超時轉 FAILED+Unknown（fake delay > timeout，
+    // 見 PolicyWriteTest 超時測試；TimeoutCancellationException 先於
+    // CancellationException 捕捉順序亦由該測試鎖定——順序顛倒則超時被重拋為
+    // 取消，測試失敗）。生產一律預設值，不另傳。
+    private val policyIoTimeoutMs: Long = POLICY_IO_TIMEOUT_MS,
 ) : ViewModel() {
     companion object {
         // Consent 有效期，超期 confirm 拒絕重請 (PR-33 R3, P2): a dialog left
         // open longer than this must re-request; confirmRemove clears the
         // stale pending with INVALID + 重新確認 and runs zero uninstalls.
         const val REMOVE_CONFIRM_TTL_MS = 5 * 60 * 1000L
+        // Phase 3：政策寫入同意有效期別名＝REMOVE_CONFIRM_TTL_MS（共用同一值：
+        // 移除與政策寫入皆為「對話框開啟後 generation 綁定＋二次確認＋TTL」，
+        // 同意有效期語意相同，故不另設值；政策路徑一律用此別名，移除路徑續用
+        // 原名，grep 可區分調用點）。
+        const val POLICY_CONFIRM_TTL_MS = REMOVE_CONFIRM_TTL_MS
+        // Phase 4:confirm/clear 持 opMutex 橫跨 onIo save/clear 的有界超時。
+        // RemotePreferences 為 binder IPC,無超時會長 pin opMutex 餓死其他操作;
+        // 超時轉既有 FAILED + Unknown fence (不新增語義,見下 withTimeout 處)。
+        const val POLICY_IO_TIMEOUT_MS = 10_000L
     }
     private val _state = MutableStateFlow(
         UiState(
@@ -653,7 +758,59 @@ class DualViewModel(
     // 皆同，成功/失敗清位不變；取消路徑補清）。唯 selectChannel 無 CE catch (latest-wins 靠
     // successor 的 leading busy 覆寫)；terminal scope-cancel 隨 ViewModel
     // 丟棄狀態，無殘留。
-    private val inFlightWrites = mutableSetOf<String>()
+    // Thread-safe: touched from multiple coroutines on viewModelScope.
+    private val inFlightWrites = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // P1 #1 queued-vs-committing: subset of policy-write keys whose store-save
+    // IO has actually started (added just before onIo { store.save(...) },
+    // removed after the commit decision). A cancel that lands while the key is
+    // merely queued (in inFlightWrites but not here) still clears pending so
+    // the queued confirm aborts; only a save already in flight is uncancellable.
+    private val policyWriteSaving = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // Monotonic counter for unique clear-in-flight keys (avoids timestamp collisions).
+    // Phase 3 關係註記：本計數器僅保證 "policy-clear:<n>" key 唯一（與
+    // policyWriteGeneration 保證 PendingPolicyWrite.generation 唯一分工）；
+    // UI 可觀測相位另由 policyPhaseEpoch 推進（見下），三者皆單調但用途正交：
+    // clearGeneration/policyWriteGeneration＝操作身份，policyPhaseEpoch＝
+    // UiState.policyEpoch（相位遷移可觀測），policyDraftVersion＋
+    // policyLoadGeneration＝TOCTOU fence（Phase1 語義不動，寫入成功/失敗才 bump）。
+    private val clearGeneration = java.util.concurrent.atomic.AtomicLong()
+    // Phase 3：UiState.policyEpoch 的推進源（相位變遷即 +1；QUEUED→SAVING 保持
+    // 同一 epoch，僅翻相位，見 request/cancel/confirm/clear 各點）。
+    private val policyPhaseEpoch = java.util.concurrent.atomic.AtomicLong()
+    // Phase 2 blind-clear 兩步確認：Unknown 下第一次 clear 僅告警並 arm，
+    // 第二次才執行（防靜默單步刪除未見內容；見 clearPolicyDraft）。
+    // Known（或 null-store）下直接單步執行並順手 disarm。
+    private val blindClearArmed = AtomicBoolean(false)
+    // Phase 2 手動重新整理在途計數：policyRefreshing = count > 0（最後完成者清位，
+    // 世代/版本丟棄的 stale 結果不提前清位，save bump 亦不洩漏）。
+    private val policyRefreshInFlight = AtomicInteger(0)
+
+    // Exposed for UI gating (policy confirm enablement) independent of the
+    // global loading flag. True while a policy write/clear is queued OR its
+    // store IO has started. Cancelability uses policyWriteCommitInProgress
+    // (saving only): a merely-queued confirm is still cancellable.
+    // Phase 3：唯一真相已遷入 UiState.policyWritePhase，render 不再讀此二 getter
+    //（見 render：s.policyWritePhase != IDLE / == SAVING）。此二 getter 僅為相容
+    // 保留（舊測試/外部調用），以「state OR 集合」實現，避免 state 更新與集合
+    // add 之間的瞬時窗口漏報；新碼一律讀 state。
+    @Deprecated(
+        "Render 請讀 state.policyWritePhase != IDLE；僅相容保留",
+        ReplaceWith("state.value.policyWritePhase != PolicyWritePhase.IDLE"),
+    )
+    val policyOperationInProgress: Boolean
+        get() = _state.value.policyWritePhase != PolicyWritePhase.IDLE ||
+            inFlightWrites.any { it.startsWith("policy-") }
+
+    // True only once a policy save IO has actually started
+    // (policyWriteSaving non-empty); queued-behind-mutex is still cancellable.
+    // Phase 3：同上，唯一真相為 state.policyWritePhase == SAVING；此 getter 僅相容。
+    @Deprecated(
+        "Render 請讀 state.policyWritePhase == SAVING；僅相容保留",
+        ReplaceWith("state.value.policyWritePhase == PolicyWritePhase.SAVING"),
+    )
+    val policyWriteCommitInProgress: Boolean
+        get() = _state.value.policyWritePhase == PolicyWritePhase.SAVING ||
+            policyWriteSaving.isNotEmpty()
 
     // Busy ownership (階段L P2): a cancelled waiter must not clear loading
     // while a sibling holder still owns the mutex. All four coalesced entries
@@ -669,6 +826,10 @@ class DualViewModel(
     // Single constructor for in-flight write dedup keys; keeps the
     // "clone:<pkg>" / "request-remove:<pkg>" namespaces consistent.
     private fun opKey(op: String, pkg: String) = "$op:$pkg"
+    // Policy-write confirm dedup key (generation-bound, matches cancel +
+    // saving-set lookups; single source so the three sites never drift).
+    private fun policyWriteKey(p: PendingPolicyWrite) =
+        "policy-write:${p.requestedAtMs}#${p.generation}"
     // PR-7 P2 (issue #26):已對哪個目標自動恢復過持久選取 (in-memory marker)。
     // SELECTION_RESTORE_NONE = 從未恢復;恢復只在 selectedKeys 為空時執行
     // 一次 (永不覆蓋使用者當前勾選,永不自動重送寫入)。目標改變 (profile
@@ -818,6 +979,38 @@ class DualViewModel(
                     allowPrivilegedHookDiagnosis = false,
                     resolvedBeforeOp = null,
                 )
+            }
+        }
+        // Stage2:冷啟動載入政策草稿 (唯讀，不觸發任何寫入；失敗即留空，
+        // 不擋 probe/refresh)。
+        viewModelScope.launch {
+            val generation = policyLoadGeneration.incrementAndGet()
+            val versionAtStart = policyDraftVersion.get()
+            val store = hookPolicyStore
+            val result = if (store == null) {
+                LoadResult.Unknown
+            } else try {
+                onIo { store.loadResult() }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                LoadResult.Unknown
+            }
+            _state.update { cur ->
+                if (policyDraftVersion.get() != versionAtStart ||
+                    policyLoadGeneration.get() != generation
+                ) {
+                    cur
+                } else if (result is LoadResult.Known) {
+                    // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏：arm→Known→
+                    // Unknown→單次 clear 必須仍告警，不可因舊 arm 直接執行）。
+                    blindClearArmed.set(false)
+                    cur.copy(policyDraft = result.packages, policyDraftKnown = true)
+                } else {
+                    // Unknown: preserve the last known draft but mark it unknown.
+                    // Phase 1：此為 load 結果本身的 Unknown，刻意不 bump（見
+                    // markPolicyUnknownLocked KDoc）：bump 會丟棄併發的新 load。
+                    cur.copy(policyDraftKnown = false)
+                }
             }
         }
     }
@@ -3316,6 +3509,638 @@ class DualViewModel(
         }
     }
 
+    // Stage2 (hook-policy-source P1, 階段 2):白名單政策草稿 (讀/寫/清)。
+    //
+    // - 草稿內容為包名集合 (plain package names)，由當下已勾選 (selectedKeys,
+    //   AppKey "serial:package") 映射：仍在當前 catalog 的 key 取包名，去 serial
+    //   前綴；catalog 缺失的 key 直接捨去 (與 persistSelection 同口徑)。
+    // - 勾選≠安裝，寫草稿≠安裝：本組方法只碰 HookPolicyStore (LSPosed
+    //   remote preferences group dual_policy)，永不呼叫 repo/寫入通道；與
+    //   cloneSelected 完全分離。
+    // - 預設空，不自動寫入：toggle/selectVisible/clear 等勾選變更永不觸碰本
+    //   store；只有 confirmPolicyWrite (二次確認後) 才存。
+    // - 兩階段寫入沿用 remove ack 模式：request 建世代快照 -> dialog 勾選確認 ->
+    //   confirm 世代全等＋TTL 內才寫；cancel 只清 pending，永不寫入。
+    // - 寫入政策不經特權通道 (app 經 LSPosed remote preferences 落盤)，故
+    //   confirm 不設 isWritable 門控；store 為 null 即拒絕並說明。
+
+    // 已勾選映射出政策包名 (純狀態讀取)：空勾選回空；catalog 缺失 key 捨去。
+    // 以完整 AppKey 比對來源清單 (P2 #7)，避免同包名不同 serial 塌陷；
+    // legacy 無冒號 key（舊版包名格式）走同一 byPackageFirst 映射（與
+    // restoreSelectionLocked 一致：同包多來源取 catalog 首個，舊資料永不硬寫回
+    // AppKey）。刻意與 restore 一致而非更嚴：寫入映射與恢復映射同源，同一舊
+    // key 在兩處不會一收一捨。
+    // 回傳 (包名集合, 因不在當前 catalog 而捨去的勾選數)；比對整 AppKey
+    // (serial:package) 而非僅包名，避免跨 serial 的同名包被誤收或誤捨。
+    // 空 catalog 由呼叫端 requestPolicyWrite 先行守衛（「來源清單尚未載入」），
+    // 本函數不另設空分支（空 catalog 下全捨去，dropped＝選取數，語意不變）。
+    // Phase 5 polish：文法前置檢查（PolicySource.isValidPackage，與 hook 側
+    // sanitize 同文法 [a-zA-Z0-9._-]+）：catalog 內理論皆合法（PM 包名為該
+    // 文法的子集：PM 另要求至少一個 '.' 且首字為字母，見 PackageManager 文檔；
+    // 此處以前置寬鬆文法過濾顯示/寫入快照，真正消毒仍由 confirm sanitizeHookPolicy
+    // 兜底），非法 token 計入 dropped（與 catalog 缺失同口徑），不連坐整包。
+    private fun selectedPackagesForPolicy(): Pair<Set<String>, Int> {
+        val catalog = _state.value.sourceCatalog
+        val byKey = catalog.associateBy { it.appKey }
+        val byPackageFirst = catalog.groupBy { it.packageName }
+            .mapValues { (_, v) -> v.first() }
+        var dropped = 0
+        val pkgs = _state.value.selectedKeys.mapNotNull { key ->
+            val entry = if (":" in key) {
+                byKey[key]
+            } else {
+                byPackageFirst[key.trim()]
+            }
+            if (entry == null) { dropped++; return@mapNotNull null }
+            val pkg = entry.packageName.takeIf { it.isNotEmpty() }
+                ?: run { dropped++; return@mapNotNull null }
+            // 文法前置檢查：非法包名計入 dropped（顯示數與寫入數一致，見 request）。
+            if (!PolicySource.isValidPackage(pkg)) { dropped++; return@mapNotNull null }
+            pkg
+        }.toSet()
+        return pkgs to dropped
+    }
+
+    // Phase 1 fail-closed generation fence：寫入失敗導致的 Unknown 必須作廢
+    // 在途 load（late Known 不得蓋掉 Unknown）。
+    //
+    // 用法：所有將 policyDraftKnown 翻為 false 的寫入路徑（confirm-fail、
+    // clear-fail、confirm/clear null-store、unknown-gate 拒絕重申）在同一次
+    // _state.update（只翻 known、不清 draft）之前先呼叫此函數
+    // bump policyDraftVersion + policyLoadGeneration。bump 必須在 update 之前，
+    // 使晚到的 load 因 versionAtStart/generation 失配被丟棄。
+    //
+    // 不變量：本函數與其後的 _state.update 之間不得插入 suspend，否則 fence
+    // 失效（bump 與翻 Unknown 必須背靠背發生；一旦讓出，併發 load 可能插隊
+    // 取號，使其晚到結果反被採納）。
+    //
+    // 區分（刻意不對稱）：
+    // - 寫入失敗導致的 Unknown → 必須 bump（本函數）：失敗是新事實，舊 load 的
+    //   Known 已過期，留之即把 Unknown 蓋回 Known（Phase 1 缺口）。
+    // - load 結果本身的 Unknown（init 冷啟動 / refreshPolicyDraft 的 Unknown
+    //   分支）→ 不得呼叫本函數：Unknown 只是本次讀值，bump 會連帶丟棄併發的
+    //   新 load（同為讀值、無新舊之分），破壞現有 overlapping-load 語意
+    //  （見 refreshPolicyDraft_overlappingLoads 世代守衛測試）。
+    // - TTL 過期 → 不得呼叫本函數：TTL 只清 pending、不翻 known/draft，無新事實
+    //   需作廢舊 load；refresh/init 的 update 永不碰 pending，load 不可能復活
+    //   pending；bump 會無辜丟棄併發的正常 refresh。
+    // - null-store bump 刻意保留以求統一、終態不變（null-store 下 load 恆為
+    //   Unknown，本就無 Known 可 fence；bump 只為統一寫入路徑語意）。
+    private fun markPolicyUnknownLocked() {
+        policyDraftVersion.incrementAndGet()
+        policyLoadGeneration.incrementAndGet()
+    }
+
+    // 重讀草稿 (供 init 後/外部變化後手動同步)：唯讀，不觸發寫入。
+    // Phase 2 可觀測化最小版：獨立 policyRefreshing 位（不碰全域 loading，
+    // 故無 sibling 誤清問題；連打由 generation 丟棄保證最新者勝，計數器保證
+    // 最後完成者才清位）。失敗（Unknown，含 null-store）寫 CHANNEL 一次；
+    // 成功（Known）正常更新 draft/Known；若前 msg 為 FAILED/CHANNEL 則改寫為
+    // INFO「已重新整理」以免舊錯誤洗屏，其餘保留既有 msg。
+    // 手動入口：MainActivity 政策區塊「重新整理草稿」按鈕直呼本函數。
+    fun refreshPolicyDraft() {
+        viewModelScope.launch {
+            policyRefreshInFlight.incrementAndGet()
+            _state.update { it.copy(policyRefreshing = true) }
+            try {
+                val generation = policyLoadGeneration.incrementAndGet()
+                val versionAtStart = policyDraftVersion.get()
+                val store = hookPolicyStore
+                val result = if (store == null) {
+                    LoadResult.Unknown
+                } else try {
+                    onIo { store.loadResult() }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    LoadResult.Unknown
+                }
+                _state.update { cur ->
+                    if (policyDraftVersion.get() != versionAtStart ||
+                        policyLoadGeneration.get() != generation
+                    ) {
+                        cur
+                    } else if (result is LoadResult.Known) {
+                        // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
+                        blindClearArmed.set(false)
+                        if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
+                            cur.copy(
+                                policyDraft = result.packages,
+                                policyDraftKnown = true,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            cur.copy(policyDraft = result.packages, policyDraftKnown = true)
+                        }
+                    } else {
+                        // Unknown: preserve the last known draft but mark it unknown.
+                        // Phase 1：此為 load 結果本身的 Unknown，刻意不 bump（見
+                        // markPolicyUnknownLocked KDoc）：bump 會丟棄併發的新 load。
+                        // Phase 2：手動重新整理失敗可觀測（CHANNEL 一次），成功不洗 msg。
+                        if (store == null) {
+                            cur.copy(
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.NO_STORE_READ)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        } else {
+                            cur.copy(
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                    }
+                }
+            } finally {
+                if (policyRefreshInFlight.decrementAndGet() <= 0) {
+                    policyRefreshInFlight.set(0)
+                    _state.update { it.copy(policyRefreshing = false) }
+                }
+            }
+        }
+    }
+
+    // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。
+    fun requestPolicyWrite() {
+        // 5.1.1:不再以全域 loading 旗標阻擋新請求 (refresh/其他操作進行中
+        // 仍可開啟確認對話框),但若政策寫入 confirm 正在進行中則拒絕,避免
+        // 併發寫入造成 UI/store 不一致 (opMutex 之外仍有 inFlight 去重)。
+        // 任何政策寫入/清除進行中皆拒絕新請求,避免覆寫進行中的操作。
+        if (inFlightWrites.any { it.startsWith("policy-") }) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // owner-user 門控:hook 只讀 user 0;非 owner 實例寫入的 group 不會被
+        // 看到,故直接拒絕且不建 pending (不進入兩階段流程)。
+        if (currentUserId() != 0) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.OWNER_WRITE)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        // P2 #3:先前遠端政策未知時拒絕建 pending (fail closed,避免整包覆寫
+        // 未曾示出的內容)。store 為 null 時走既有 null-store 路徑,不在此攔截。
+        // clear 刻意不設 unknown 門控：明確刪除≠覆寫未見內容。
+        if (hookPolicyStore != null && !_state.value.policyDraftKnown) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        if (_state.value.selectedKeys.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.EMPTY_SELECTION)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        // Phase 3：catalog 空守衛（與「勾選已不在清單」區分：空 catalog 是載入
+        // 時序問題而非使用者選錯，訊息明示「尚未載入」，免誤導重選）。
+        if (_state.value.sourceCatalog.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.CATALOG_LOADING)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        val (mapped, catalogDropped) = selectedPackagesForPolicy()
+        // Phase 5 polish：request 建 pending 前先 sanitize（與 confirm 同消毒）：
+        // 顯示數與寫入數一致；dropped 拆 catalog 缺失＋非法文法兩類（後者經
+        // sanitizeHookPolicy 計數：除文法另有長度上限 256／總量上限 512，
+        // 故 invalidDropped 亦含超長／超量被截斷者；此處 catalog 映射已做
+        // isValidPackage 前置，故通常為 0，仍顯式計算以防映射/消毒漂移）。
+        val sanitized = sanitizeHookPolicy(mapped)
+        val invalidDropped = mapped.size - sanitized.size
+        val dropped = catalogDropped + invalidDropped
+        if (sanitized.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.CATALOG_MISSING)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        if (dropped > 0) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.DROPPED, dropped)),
+                    msgKind = MsgKind.INFO,
+                )
+            }
+        }
+        // Phase 3：建 pending 即進 QUEUED（同一 _state.update 翻相位＋epoch+1；
+        // dropped 警語在上一次 emission，第二次 copy 保留其 msg 不覆寫）。
+        _state.update {
+            it.copy(
+                pendingPolicyWrite = PendingPolicyWrite(sanitized, nowMonoMs(), dropped),
+                policyWritePhase = PolicyWritePhase.QUEUED,
+                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+            )
+        }
+    }
+
+    fun cancelPolicyWrite() {
+        _state.value.pendingPolicyWrite?.let { cancelPolicyWrite(it) }
+    }
+
+    // 取消確認：只清 pending，永不寫入 store (取消≠寫入≠安裝)。
+    // 5.1.1:全域 loading 不再阻擋取消 (refresh/其他操作進行中仍可取消),
+    // 但 save 已開始的預期寫入則 no-op,避免 store
+    // 已寫入而 UI 未提交的不一致;confirm 路徑在 save 後仍會 re-check pending。
+    // P1 #1 queued-vs-committing:僅當此 expected 的 save 已實際開始
+    // (policyWriteSaving 持有 key) 才 no-op；僅排隊等 mutex 的 confirm 仍可
+    // 取消 (清 pending 後，排隊的 confirm 在取到 mutex 時 abort，不寫入)。
+    fun cancelPolicyWrite(expected: PendingPolicyWrite) {
+        // 非政策操作 (含慢速 selection 持久化) 永不阻擋取消；只有此 key 的
+        // save 已開始才拒絕。Phase 3：state 相位同步兜底（SAVING 且 pending 仍是
+        // 此 expected 即視為已提交，不可取消；QUEUED 仍可取消）。
+        if (policyWriteSaving.contains(policyWriteKey(expected))) return
+        if (_state.value.policyWritePhase == PolicyWritePhase.SAVING &&
+            _state.value.pendingPolicyWrite == expected
+        ) return
+        _state.update { cur ->
+            val pending = cur.pendingPolicyWrite ?: return@update cur
+            if (pending != expected) return@update cur
+            cur.copy(
+                pendingPolicyWrite = null,
+                policyWritePhase = PolicyWritePhase.IDLE,
+                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                msg = policyText(PolicyText(PolicyTextKind.CANCELLED)),
+                msgKind = MsgKind.INFO,
+            )
+        }
+    }
+
+    fun confirmPolicyWrite() {
+        val pending = _state.value.pendingPolicyWrite
+        if (pending != null) confirmPolicyWrite(pending) else {
+            _state.update { cur ->
+                if (cur.pendingPolicyWrite != null) cur
+                else cur.copy(msg = policyText(PolicyText(PolicyTextKind.NO_PENDING)), msgKind = MsgKind.INVALID)
+            }
+        }
+    }
+
+    // 兩階段寫入 phase 2：世代全等＋TTL 內才寫 store；任何不符清 pending 拒絕。
+    fun confirmPolicyWrite(expected: PendingPolicyWrite) {
+        // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
+        // 寫入不會被 hook 看到，故直接拒絕、清 pending 且不寫 store。
+        if (currentUserId() != 0) {
+            _state.update {
+                it.copy(
+                    pendingPolicyWrite = null,
+                    policyWritePhase = PolicyWritePhase.IDLE,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    msg = policyText(PolicyText(PolicyTextKind.OWNER_WRITE)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            val pendingAtCall = expected
+            if (_state.value.pendingPolicyWrite != pendingAtCall) return@launch
+            val key = policyWriteKey(pendingAtCall)
+            if (!inFlightWrites.add(key)) {
+                _state.update {
+                    if (it.pendingPolicyWrite != pendingAtCall) return@update it
+                    it.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+                return@launch
+            }
+            // Phase 3：排隊即 QUEUED（inFlight 已持 key 但尚未取到 mutex；request
+            // 已設 QUEUED 時此為冪等；直接注入 pending 的測試路徑在此補上 QUEUED，
+            // 使 state 與 inFlight 同步，render 顯示等待中）。
+            _state.update { cur ->
+                if (cur.pendingPolicyWrite != pendingAtCall) return@update cur
+                if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
+                cur.copy(
+                    policyWritePhase = PolicyWritePhase.QUEUED,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                )
+            }
+            try {
+                opMutex.withLock {
+                    val cur = _state.value.pendingPolicyWrite ?: return@withLock
+                    if (cur != pendingAtCall) return@withLock
+                    if (nowMonoMs() - cur.requestedAtMs > POLICY_CONFIRM_TTL_MS) {
+                        // Phase 3：TTL 只清 pending＋msg，不碰 loading（本 op 尚未
+                        // 持有 loading；逕清會誤清 sibling refresh 的 busy，見
+                        // hasActiveSibling 守衛說明）。無 active sibling 時 loading
+                        // 本就為 false，不碰即等價。
+                        _state.update {
+                            it.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.TTL_EXPIRED)),
+                                msgKind = MsgKind.INVALID,
+                            )
+                        }
+                        return@withLock
+                    }
+                    val store = hookPolicyStore
+                    if (store == null) {
+                        // Phase 1：null-store 即 Unknown，fence 在途 Known load。
+                        // Phase 3：同 TTL，本 op 未持有 loading，不碰 loading。
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.NO_STORE_WRITE)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return@withLock
+                    }
+                    // P2 #3:先前遠端政策未知時拒絕覆寫 (fail closed,defense-in-depth)。
+                    // 未曾示出的內容不得整包覆寫：清 pending、不碰 store、保留
+                    // policyDraft（不清 draft）；重申 Unknown + fence，晚到的舊
+                    // Known load 不得把 Unknown 蓋回。clear 刻意不設 unknown 門控：
+                    // 明確刪除≠覆寫未見內容。
+                    // Phase 3：同 TTL，本 op 未持有 loading，不碰 loading。
+                    if (!_state.value.policyDraftKnown) {
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return@withLock
+                    }
+                    val sanitized = sanitizeHookPolicy(cur.packages)
+                    // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission（消除
+                    // 一幀 stale：舊碼先 update loading=true 才 add saving 集合，
+                    // render 若讀集合會見 loading=true＋saving=false 而誤允取消；
+                    // 現 render 只讀 state，此二者在同一 copy 內翻轉）。
+                    // epoch 保持同一（同一 op 推進，僅翻相位）。
+                    _state.update {
+                        it.copy(
+                            loading = true,
+                            msg = "",
+                            msgKind = MsgKind.NONE,
+                            policyWritePhase = PolicyWritePhase.SAVING,
+                        )
+                    }
+                    // P1 #1:從此處起 save 已開始，cancel 不得再清 pending
+                    // (post-save re-check 接手一致性)；此前僅排隊的 confirm
+                    // 仍可被取消 (上面的 post-acquire re-check 會 abort)。
+                    policyWriteSaving.add(key)
+                    // Defense-in-depth: cancel may have cleared pending between
+                    // the post-acquire re-check and the save-commit point
+                    // (no suspension between, cheap).
+                    if (_state.value.pendingPolicyWrite != pendingAtCall) {
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                policyWritePhase = PolicyWritePhase.QUEUED,
+                            )
+                        }
+                        return@withLock
+                    }
+                    try {
+                        // Phase 4:有界超時 (10s) 轉失敗分支 (走既有 FAILED +
+                        // Unknown fence,不新增語義)。TimeoutCancellationException
+                        // 須先於 CancellationException 捕捉 (前者為後者子類);
+                        // 外部取消仍透傳 (不吞為失敗)。
+                        val ok = try {
+                            withTimeout(policyIoTimeoutMs) {
+                                // 存 sanitized（與成功分支顯示用 policyDraft 同源；store.save
+                                // 內部亦消毒且冪等，此處顯式傳 sanitized 防禦收斂）。
+                                onIo { store.save(sanitized) }
+                            }
+                        } catch (te: TimeoutCancellationException) {
+                            false
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            false
+                        }
+                        // Cancel-during-confirm race: a cancel/request that landed
+                        // during the save invalidates this confirmation. Clear only
+                        // loading (preserve pending/msg) and do not commit.
+                        // Phase 3：pending 保留即回 QUEUED（同一 epoch，可重試）。
+                        if (_state.value.pendingPolicyWrite != pendingAtCall) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.QUEUED,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (ok) {
+                            // TOCTOU (#2): bump version + load-generation so any in-flight
+                            // load started before this save is discarded instead of
+                            // overwriting the fresh Known state.
+                            policyDraftVersion.incrementAndGet()
+                            policyLoadGeneration.incrementAndGet()
+                            // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
+                            blindClearArmed.set(false)
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    // 顯示用草稿/計數與 store 實際持久化內容一致
+                                    // (store 會過濾非法 token),否則顯示計數會與
+                                    // 持久化值不符。
+                                    policyDraft = sanitized,
+                                    policyDraftKnown = true,
+                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, sanitized.size)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                        } else {
+                            // Phase 1：寫入失敗即 Unknown（保留 draft、不清 draft），
+                            // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                    msgKind = MsgKind.FAILED,
+                                )
+                            }
+                        }
+                    } finally {
+                        policyWriteSaving.remove(key)
+                    }
+                }
+            } finally {
+                // Covers early-return paths (TTL/null-store) while the inner
+                // finally covers the save itself.
+                inFlightWrites.remove(key)
+                policyWriteSaving.remove(key)
+            }
+        }
+    }
+
+    // 清除草稿：只刪 HookPolicyStore 條目，不清記憶體勾選，不碰裝置寫入路徑
+    // (≠卸載≠安裝)。Phase 2 blind-clear 門控：Unknown 下不再靜默單步執行——
+    // 第一次呼叫僅告警「遠端內容未知，清除將刪除未見內容」並 arm，不清 pending、
+    // 不碰 store、不耗 clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠
+    // 覆寫未見內容，故第二步不受 unknown 門控阻擋）。Known（或 null-store，
+    // 無遠端內容可刪）維持單步。保持 clearGeneration/inFlight 互斥。
+    fun clearPolicyDraft() {
+        // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
+        // 清除不會被 hook 看到，故直接拒絕且不碰 store。
+        if (currentUserId() != 0) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.OWNER_OPERATE)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        // 同步門控：任何「政策」操作進行中皆拒絕清除,避免覆蓋進行中的寫入;
+        // clone/remove/batch 等非政策操作不阻擋 (Phase 2 narrowing)。
+        if (inFlightWrites.any { it.startsWith("policy-") }) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        if (hookPolicyStore != null && !_state.value.policyDraftKnown) {
+            if (blindClearArmed.compareAndSet(false, true)) {
+                // 第一次：僅告警，不執行（不清 pending，不碰 store）。
+                _state.update {
+                    it.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                return
+            }
+            // 第二次確認：consume 後落到正常清除路徑。
+            blindClearArmed.set(false)
+        } else {
+            blindClearArmed.set(false)
+        }
+        val key = "policy-clear:${clearGeneration.incrementAndGet()}"
+        if (!inFlightWrites.add(key)) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // Phase 3：clear 在途亦經 QUEUED→SAVING→IDLE（dialog 以 pending==null
+        // 關閉，phase 供 positive/negative 門控與「進行中請稍候」守衛觀測）。
+        _state.update { cur ->
+            if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
+            cur.copy(
+                policyWritePhase = PolicyWritePhase.QUEUED,
+                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+            )
+        }
+        viewModelScope.launch {
+            try {
+                opMutex.withLock {
+                    // 清除作廢任何開啟中的政策寫入確認 (P2 #6):VM 端把 pending 清空,
+                    // UI 在 pending==null 時重置 ack 世代。
+                    // Phase 3：僅清 pending，不動相位（clear 本身仍在途，保持
+                    // QUEUED，待下行 loading=true 處同翻 SAVING）。
+                    if (_state.value.pendingPolicyWrite != null) {
+                        _state.update { it.copy(pendingPolicyWrite = null) }
+                    }
+                    val store = hookPolicyStore
+                    if (store == null) {
+                        // Phase 1：null-store 即 Unknown，fence 在途 Known load。
+                        // Phase 3：同 confirm，本 op 未持有 loading，不碰 loading。
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                policyDraftKnown = false,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.NO_STORE_CLEAR)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return@withLock
+                    }
+                    // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission。
+                    _state.update {
+                        it.copy(
+                            loading = true,
+                            msg = "",
+                            msgKind = MsgKind.NONE,
+                            policyWritePhase = PolicyWritePhase.SAVING,
+                        )
+                    }
+                    // Phase 4:同 confirm,有界超時轉失敗分支 (FAILED + Unknown)。
+                    val ok = try {
+                        withTimeout(policyIoTimeoutMs) {
+                            onIo { store.clear() }
+                        }
+                    } catch (te: TimeoutCancellationException) {
+                        false
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        false
+                    }
+                    if (ok) {
+                        // TOCTOU (#2): bump version + load-generation so any in-flight
+                        // load started before this clear is discarded instead of
+                        // overwriting the fresh Known state.
+                        policyDraftVersion.incrementAndGet()
+                        policyLoadGeneration.incrementAndGet()
+                        // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
+                        blindClearArmed.set(false)
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                policyDraft = emptySet(),
+                            policyDraftKnown = true,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                    } else {
+                        // Phase 1：清除失敗即 Unknown（保留 draft、不清 draft），
+                        // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                policyDraftKnown = false,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                msgKind = MsgKind.FAILED,
+                            )
+                        }
+                    }
+                }
+            } finally {
+                inFlightWrites.remove(key)
+            }
+        }
+    }
+
     // 從 SelectionStore 恢復勾選 (供重啟/Activity 重建後呼叫):
     // - 僅在 selectedKeys 為空時恢復 (永不覆蓋使用者當前勾選)。
     // - 保存的是 AppKey 集合；只恢復仍在 catalog (availableKeys,預設為當前
@@ -5222,10 +6047,12 @@ class DualViewModel(
             val notReadyMsg: String = when {
                 currentChannel == ResolvedChannel.LSPOSED_PLACEHOLDER -> {
                     // LSPosed mode semantics (F4b-P2): the gateway is still
-                    // the NoOp placeholder (whitelist policy branch pending),
-                    // so the channel is honestly never ready. The message
-                    // states the reason plus the hook signal; it never claims
-                    // the channel can execute.
+                    // the NoOp placeholder (the whitelist policy source is
+                    // wired, end-to-end DEVICE-UNVERIFIED, but the LSPosed
+                    // execution channel remains a NoOp placeholder), so the
+                    // channel is honestly never ready. The message states the
+                    // reason plus the hook signal; it never claims the channel
+                    // can execute.
                     blockText(WriteBlock(WriteBlockKind.LSPOSED_PLACEHOLDER, listOf(hookDesc)))
                 }
                 gatewayPrivilege == Privilege.NONE -> {
@@ -5436,9 +6263,11 @@ class DualViewModel(
     // Must run under opMutex.
     //
     // F4b-P2 LSPosed semantics: the placeholder gateway is a NoOp by policy
-    // (whitelist branch pending), so writes are refused with the reason
-    // stated, including the hook signal. Nothing is ever executed here: the
-    // channel must not be mistaken for a working hook path.
+    // (the whitelist policy source is wired, end-to-end DEVICE-UNVERIFIED, but
+    // the LSPosed execution channel remains a NoOp placeholder), so writes are
+    // refused with the reason stated, including the hook signal. Nothing is
+    // ever executed here: the channel must not be mistaken for a working hook
+    // path.
     // p28-1 review：BlockReason -> 顯示文字（isWritable/probeChannels 共用
     // single source；Activity 側另有 Context 版 resolveBlockReason，見
     // MainActivity）。
@@ -5835,6 +6664,69 @@ data class WriteBlock(
     val kind: WriteBlockKind,
     val args: List<String> = emptyList(),
 )
+
+// Phase 5 polish：政策 VM 訊息 single source（前身硬編碼繁中＋一處英文）。
+// VM 本體不碰 Android Context：顯示文字一律經 policyText 注入解析；預設
+// defaultText() 即繁中字面（與 values/strings.xml 同文，三語系同鍵），JVM
+// 測試无需 Context 即可斷言。count 僅 DROPPED/WRITE_SUCCESS 使用（plurals
+// 數量）；其餘忽略。
+enum class PolicyTextKind {
+    BUSY,
+    OWNER_WRITE,
+    OWNER_OPERATE,
+    UNKNOWN_REFRESH,
+    EMPTY_SELECTION,
+    CATALOG_LOADING,
+    CATALOG_MISSING,
+    DROPPED,
+    CANCELLED,
+    NO_PENDING,
+    IN_PROGRESS,
+    TTL_EXPIRED,
+    NO_STORE_WRITE,
+    NO_STORE_CLEAR,
+    NO_STORE_READ,
+    WRITE_SUCCESS,
+    WRITE_FAILED,
+    CLEAR_SUCCESS,
+    CLEAR_FAILED,
+    REFRESHED,
+    REFRESH_FAILED,
+    BLIND_CLEAR_FIRST,
+}
+
+data class PolicyText(
+    val kind: PolicyTextKind,
+    val count: Int = 0,
+)
+
+// 預設繁中字面（與 values/strings.xml 同文；en 見 values-en/）：生產 factory
+// 以 Application Context 解析同鍵資源（plurals 走 getQuantityString），JVM
+// 預設走此分支，語義不動。
+internal fun PolicyText.defaultText(): String = when (kind) {
+    PolicyTextKind.BUSY -> "政策寫入進行中，請稍候"
+    PolicyTextKind.OWNER_WRITE -> "政策草稿必須由主用戶（owner user）寫入，否則 hook 讀不到"
+    PolicyTextKind.OWNER_OPERATE -> "政策草稿必須由主用戶（owner user）操作，否則 hook 讀不到"
+    PolicyTextKind.UNKNOWN_REFRESH -> "遠端政策未知，請先重新整理後再寫入"
+    PolicyTextKind.EMPTY_SELECTION -> "未勾選任何應用"
+    PolicyTextKind.CATALOG_LOADING -> "來源清單尚未載入，請稍候再試"
+    PolicyTextKind.CATALOG_MISSING -> "勾選的應用已不在來源清單，請重選"
+    PolicyTextKind.DROPPED -> "已捨去 $count 項不在來源清單的勾選"
+    PolicyTextKind.CANCELLED -> "已取消寫入政策（未寫入任何草稿）"
+    PolicyTextKind.NO_PENDING -> "沒有待確認的政策寫入"
+    PolicyTextKind.IN_PROGRESS -> "政策寫入已在進行中，請稍候"
+    PolicyTextKind.TTL_EXPIRED -> "確認已逾時，請重新確認後再寫入"
+    PolicyTextKind.NO_STORE_WRITE -> "無政策 store，無法寫入政策"
+    PolicyTextKind.NO_STORE_CLEAR -> "無政策 store，無法清除草稿"
+    PolicyTextKind.NO_STORE_READ -> "無政策 store，無法讀取草稿"
+    PolicyTextKind.WRITE_SUCCESS -> "已寫入政策草稿 $count 項（勾選≠安裝，可隨時清除）"
+    PolicyTextKind.WRITE_FAILED -> "寫入政策失敗"
+    PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（不影響已安裝分身與目前勾選）"
+    PolicyTextKind.CLEAR_FAILED -> "清除草稿失敗"
+    PolicyTextKind.REFRESHED -> "已重新整理政策草稿"
+    PolicyTextKind.REFRESH_FAILED -> "重新整理政策草稿失敗：遠端內容未知"
+    PolicyTextKind.BLIND_CLEAR_FIRST -> "遠端內容未知，清除將刪除未見內容，請再次清除以確認"
+}
 
 sealed interface BlockReason {
     data class Keyed(val block: WriteBlock) : BlockReason

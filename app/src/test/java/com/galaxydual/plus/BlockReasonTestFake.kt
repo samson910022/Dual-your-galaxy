@@ -11,8 +11,8 @@ package com.galaxydual.plus
 internal fun zhTestBlockText(): (WriteBlock) -> String = { block ->
     when (block.kind) {
         WriteBlockKind.LSPOSED_PLACEHOLDER ->
-            "LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，" +
-                "寫入已拒絕；Hook 狀態：${block.args.getOrElse(0) { "" }}；" +
+            "LSPosed 通道為佔位（NoOp）：寫入已拒絕；白名單政策來源已接線" +
+                "（端到端 DEVICE-UNVERIFIED）。Hook 狀態：${block.args.getOrElse(0) { "" }}；" +
                 "如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」"
         WriteBlockKind.NOOP_FALLBACK ->
             "通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，" +

@@ -1002,6 +1002,23 @@ class DiagnoseFreshnessPhase5Test {
         assertNotNull("LSPosed mode must render a hook row", hookRow)
         assertTrue("hook row names itself, got: $hookRow", hookRow!!.contains("LSPosed Hook"))
         assertTrue("hook row shows scope, got: $hookRow", hookRow.contains(HookMarker.SCOPE_SYSTEM_SERVER))
+        assertTrue(
+            "hook row must name the wired policy source (zh), got: $hookRow",
+            hookRow.contains("白名單政策來源已接線"),
+        )
+        val hookRowEn = renderHookText(
+            UiState(
+                channel = ChannelPreference.LSPOSED,
+                hookStatus = HookStatus.ACTIVE,
+                hookScopes = setOf(HookMarker.SCOPE_SYSTEM_SERVER),
+            ),
+            isEnglish = true,
+        )
+        assertNotNull("LSPosed mode must render an EN hook row", hookRowEn)
+        assertTrue(
+            "hook row must name the wired policy source (en), got: $hookRowEn",
+            hookRowEn!!.contains("whitelist policy source wired"),
+        )
     }
 
     // ---- 11. Phase 1 語意 (p25-rebase 適配)：拋錯 gateway 由新 base

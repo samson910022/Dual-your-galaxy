@@ -9,6 +9,8 @@ import java.lang.reflect.WildcardType
 
 import java.util.NavigableSet
 import java.util.SortedSet
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 // Pure (framework-free) whitelist-extension policy shared by all hooks.
 //
@@ -17,11 +19,39 @@ import java.util.SortedSet
 // chain.proceed(); this object never touches the chain itself.
 object WhitelistPolicy {
 
+    // Bounded describe cache (Phase 4 hot-path): describe() runs on every
+    // whitelist query and reflects over parameterTypes each time. Cache up to
+    // 128 entries keyed by Executable (Method/Constructor equality covers the
+    // hook targets); best-effort LRU-ish eviction (reinsert on hit, drop an
+    // arbitrary eldest on overflow). Holds at most 128 Class refs in this
+    // process (system_server/daagent classloaders are permanent, no leak).
+    private const val DESCRIBE_CACHE_MAX = 128
+    private val describeCache = ConcurrentHashMap<Executable, String>()
+
+    // Caps unexpected-args observe-only spam on the hot path: the Boolean-false
+    // shape log fires only while extra is non-empty, and at most the first N
+    // times per process (a persistently mismatched method would otherwise log
+    // on every query).
+    private const val MAX_UNEXPECTED_ARGS_LOGS = 8
+    private val unexpectedArgsLogs = AtomicInteger(0)
+
     // Human-readable hook target for logs, e.g.
     // "com.foo.Bar#isWhitelisted(java.lang.String)".
     fun describe(executable: Executable): String {
+        describeCache[executable]?.let { hit ->
+            // Touch for LRU-ish recency (remove + reinsert is atomic enough
+            // for a diagnostic cache; a lost touch only affects eviction).
+            describeCache.remove(executable, hit)
+            describeCache[executable] = hit
+            return hit
+        }
         val params = executable.parameterTypes.joinToString(",") { it.name }
-        return "${executable.declaringClass.name}#${executable.name}($params)"
+        val computed = "${executable.declaringClass.name}#${executable.name}($params)"
+        if (describeCache.size >= DESCRIBE_CACHE_MAX) {
+            describeCache.keys.firstOrNull()?.let { describeCache.remove(it) }
+        }
+        describeCache[executable] = computed
+        return computed
     }
 
     // Shared whitelist policy: extend-only, never shrink.
@@ -148,9 +178,22 @@ object WhitelistPolicy {
                 return result
             }
             // Preserve Set semantics; rebuilding as a List would break callers
-            // that cast the result back to Set.
-            val merged = result.toMutableSet()
-            merged.addAll(extra.filter { !merged.contains(it) })
+            // that cast the result back to Set. Hostile view safe: a throwing
+            // set view fails closed to the original (observe-only).
+            val merged = try {
+                result.toMutableSet()
+            } catch (_: Throwable) {
+                return result
+            }
+            try {
+                merged.addAll(extra.filter { !merged.contains(it) })
+            } catch (_: Throwable) {
+                return try {
+                    result.toMutableSet()
+                } catch (_: Throwable) {
+                    result
+                }
+            }
             return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         if (result is Collection<*>) {
