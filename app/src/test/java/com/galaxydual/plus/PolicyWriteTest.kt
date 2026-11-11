@@ -1836,11 +1836,12 @@ class PolicyWriteTest {
     // Phase 3：dialog 純門控（無需 Robolectric；鎖定 syncPolicyWriteDialog 語義）。
     @Test
     fun phase3_policyDialogGating_pureFunctions() {
-        // positive：僅無 op＋已 ack 才允許（queued/saving 一律禁用，避免重送）。
-        assertTrue(policyDialogCanConfirm(policyOp = false, acknowledged = true))
-        assertFalse(policyDialogCanConfirm(policyOp = true, acknowledged = true))
-        assertFalse(policyDialogCanConfirm(policyOp = false, acknowledged = false))
-        assertFalse(policyDialogCanConfirm(policyOp = true, acknowledged = false))
+        // positive：僅非 saving＋已 ack 才允許（SAVING 禁用防重送；QUEUED 可確認，
+        // 避免 request 即 QUEUED 導致恆禁用死鎖）。
+        assertTrue(policyDialogCanConfirm(policySaving = false, acknowledged = true))
+        assertFalse(policyDialogCanConfirm(policySaving = true, acknowledged = true))
+        assertFalse(policyDialogCanConfirm(policySaving = false, acknowledged = false))
+        assertFalse(policyDialogCanConfirm(policySaving = true, acknowledged = false))
         // negative/Back：僅 saving 禁止（queued 仍可取消，P1 #1 語義）。
         assertTrue(policyDialogShouldBeCancelable(policySaving = false))
         assertFalse(policyDialogShouldBeCancelable(policySaving = true))
@@ -1852,6 +1853,27 @@ class PolicyWriteTest {
         assertEquals("", policyWriteBusySuffix(policyOp = false, policySaving = false))
         assertTrue(policyWriteBusySuffix(policyOp = true, policySaving = false).contains("等待"))
         assertTrue(policyWriteBusySuffix(policyOp = true, policySaving = true).contains("寫入"))
+    }
+
+    // Stage 3 P0 死鎖回歸：request 建 pending 即 QUEUED，dialog positive 必須仍可確認
+    //（門控讀 SAVING 而非任一 op 在途；QUEUED＋ack 即 true，SAVING＋ack 才 false）。
+    @Test
+    fun stage3_queuedDialogCanConfirm_noDeadlock() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        seedSelection(vm)
+
+        vm.requestPolicyWrite()
+
+        assertNotNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+        // render 派生：QUEUED 即 policySaving=false，positive 門控必須放行。
+        val savingAfterRequest = vm.state.value.policyWritePhase == PolicyWritePhase.SAVING
+        assertFalse(savingAfterRequest)
+        assertTrue(policyDialogCanConfirm(policySaving = savingAfterRequest, acknowledged = true))
+        // SAVING 才禁用；未勾選一律禁用。
+        assertFalse(policyDialogCanConfirm(policySaving = true, acknowledged = true))
+        assertFalse(policyDialogCanConfirm(policySaving = savingAfterRequest, acknowledged = false))
     }
 
     // Phase 3：request 建 pending 即 QUEUED＋epoch 推進；cancel 回 IDLE。

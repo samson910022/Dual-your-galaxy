@@ -3346,6 +3346,7 @@ class MainActivity : ComponentActivity() {
         batchBtn.isEnabled = batchEnabled(s)
         // Phase 2 政策重新整理可觀測：刷新在途時禁用按鈕並帶狀態 CD，
         // 避免連打誤解；buildUi 前 render 走守衛（測試路徑）。
+        // 政策寫入/清除鈕比照 refreshBtn：任一寫入相位在途（QUEUED/SAVING）即禁用。
         try {
             if (::refreshPolicyBtn.isInitialized) {
                 refreshPolicyBtn.isEnabled = !s.policyRefreshing
@@ -3353,6 +3354,12 @@ class MainActivity : ComponentActivity() {
                     if (s.policyRefreshing) R.string.refresh_policy_draft_cd_refreshing
                     else R.string.refresh_policy_draft_cd,
                 )
+            }
+            if (::writePolicyBtn.isInitialized) {
+                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            if (::clearPolicyBtn.isInitialized) {
+                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
             }
         } catch (_: Exception) {
             // Best effort: render may run before buildUi in tests.
@@ -4051,7 +4058,7 @@ class MainActivity : ComponentActivity() {
         }
         if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(policyOp, policyAcknowledged)
+                policyDialogCanConfirm(policySaving, policyAcknowledged)
             // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
             // Back/觸外仍以 !policySaving 門控。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
@@ -4199,22 +4206,22 @@ class MainActivity : ComponentActivity() {
         acknowledgement.setOnCheckedChangeListener { _, checked ->
             policyAcknowledged = checked
             policyAckGeneration = if (checked) pending.generation else null
-            // 確定性路徑：用本次 sync 傳入的 render 幀 policyOp（同 remove dialog
+            // 確定性路徑：用本次 sync 傳入的 render 幀 policySaving（同 remove dialog
             // 的 loading/blockKey 模式），不即時重讀 live 狀態；loading 變化由
             // 下一次 render 的 early-return 同步，真正寫入門控在 Positive 點擊
             // 即時重讀＋VM confirmPolicyWrite 世代守衛雙層 fail-closed。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(policyOp, checked)
+                policyDialogCanConfirm(policySaving, checked)
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），與舊碼
-            // 讀 vm.policyOperationInProgress 同語義，現改讀 state 唯一真相。
-            val curPolicyOp = try {
-                vm.state.value.policyWritePhase != PolicyWritePhase.IDLE
+            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING 才禁用
+            //（QUEUED 可確認，避免 request 即 QUEUED 導致恆禁用死鎖）；世代守衛在 VM。
+            val curPolicySaving = try {
+                vm.state.value.policyWritePhase == PolicyWritePhase.SAVING
             } catch (_: Exception) {
-                policyOp
+                policySaving
             }
-            if (policyDialogCanConfirm(curPolicyOp, policyAcknowledged)) vm.confirmPolicyWrite(pending)
+            if (policyDialogCanConfirm(curPolicySaving, policyAcknowledged)) vm.confirmPolicyWrite(pending)
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
         // 點按時即時重讀 phase，SAVING 即 toast「寫入中，無法取消」且不調 VM；
@@ -4241,7 +4248,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-            policyDialogCanConfirm(policyOp, policyAcknowledged)
+            policyDialogCanConfirm(policySaving, policyAcknowledged)
         // Phase 5：negative 保持可點（見上 toast），Back/觸外仍以 !saving 門控。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
         policyWriteDialog?.setCancelable(policyDialogShouldBeCancelable(policySaving))
@@ -6097,11 +6104,11 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
     )
 // Phase 3（hook-policy-source P1，階段 3）：政策寫入 dialog 純門控（JVM 可測，
 // 無需 Robolectric；Activity 側 syncPolicyWriteDialog 只呼叫此三函數）。
-// - positive：任一政策操作在途（QUEUED/SAVING）即禁用＋需 ack 勾選。
+// - positive：僅寫入中（SAVING）禁用＋需 ack 勾選；排隊（QUEUED）可確認/可取消。
 // - negative/Back：僅 SAVING 禁用（queued 仍可取消，P1 #1 語義）。
 // - busy 後綴：SAVING 顯示寫入中，QUEUED（op 非 saving）顯示等待中，皆附換行。
-internal fun policyDialogCanConfirm(policyOp: Boolean, acknowledged: Boolean): Boolean =
-    !policyOp && acknowledged
+internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean): Boolean =
+    !policySaving && acknowledged
 
 internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !policySaving
 
