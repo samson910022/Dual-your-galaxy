@@ -24,6 +24,7 @@ import com.galaxydual.core.routePrivilegeFromProbes
 import com.galaxydual.hook.HookMarker
 import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -42,6 +43,7 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 // Pending two-phase remove confirmation (PR-4 P1, issue #23).
 //
@@ -798,6 +800,91 @@ class DualViewModel(
     // 移除。入口守衛讀 phase==RECONCILING OR 本集合非空（雙層，防 state/集合
     // 瞬時窗口漂移）；store 零 API 新增，僅 VM 側追蹤。
     private val policyReconciling = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // Stage F1 (交易所有權核心 P1#1+P1#2排序+P2#3)：逾時交易的唯一擁有者。
+    // - Tx{txId,deferred,sanitized,store,isClear,key}：confirm/clear 逾時即保留
+    //   脫鉤 deferred 句柄並登記 Tx（opMutex 照常釋放，但 Tx 存活＋RECONCILING＋
+    //   reconcilingKeys 三者同生同滅）；終態只許 Tx-settle CAS 清除
+    //   （settlePolicyTx：activePolicyTx.compareAndSet(tx,null)＋reconciling移除），
+    //   任何非擁有者不得移除 fence。
+    // - 守衛一律讀 Tx（isPolicyReconcilingLocked 含 activePolicyTx!=null，防
+    //   state/集合瞬時窗口漂移；request/confirm/clear/cancel 共用）。
+    // - 全域 refresh()/reconnect() 入口 Tx 存活即併發丟棄（選併發丟棄，不選短路
+    //   BUSY：全局 refresh 不擁有 policy busy，誤發 BUSY 會覆寫 TIMEOUT 提示；
+    //   丟棄即無聲 no-op，保留 RECONCILING＋TIMEOUT＋pending，draft 不被覆寫。
+    //   政策 refreshPolicyDraft() 仍允許併發，世代守衛最新者勝，F1-simple；
+    //   F2 再議 BUSY/預算化 join）。
+    // - reconciler 先 join 句柄（有界 withTimeout(policyIoTimeoutMs)，F1-simple；
+    //   F2 預算見 StageF2）：true→驗證讀，false/throw→FAILED+Unknown，
+    //   pending→保留 fence 續讀（pending 中 Known==B 視 inconclusive 續等，不搶結）。
+    // - 快徑收斂（P2#3）：ok==true 先一次 fresh read-after-ack，==sanitized 才
+    //   WRITE_SUCCESS，否則 REFRESHED（Unknown 則信 ack，保既有語義）。
+    // - TOCTOU-discard：F1-simple 仍回 IDLE+REFRESHED（保 84 綠；F2 再改移交/
+    //   保留不回 IDLE，屆時 refresh 推進不終止）。
+    data class PolicyTx(
+        val txId: Long,
+        val key: String,
+        val deferred: Deferred<Boolean>,
+        val sanitized: Set<String>,
+        val store: HookPolicyStore,
+        val isClear: Boolean,
+    )
+    private val policyTxId = AtomicLong(0L)
+    private val activePolicyTx = AtomicReference<PolicyTx?>(null)
+    // F1 Tx-settle：唯擁有者可清 fence（CAS＋reconciling移除同組）。回 true 表
+    // 本 Tx 結清（含首次）；false 表 Tx 已非擁有者（併發已結，不重複移除）。
+    private fun settlePolicyTx(tx: PolicyTx): Boolean {
+        val owned = activePolicyTx.compareAndSet(tx, null)
+        if (owned) policyReconciling.remove(tx.key)
+        return owned
+    }
+    // F1 有界 join（F1-simple：withTimeout(policyIoTimeoutMs)；F2 再預算化）：
+    // true=句柄已證成功，false=已證失敗（含回 false 與拋出），null=仍 pending
+    // （逾時未知，保留 fence 續讀）。CE 透傳（scope 取消，不吞為失敗）。
+    private suspend fun joinPolicyTxBounded(tx: PolicyTx): Boolean? = try {
+        withTimeout(policyIoTimeoutMs) { tx.deferred.await() }
+    } catch (te: TimeoutCancellationException) {
+        null
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        false
+    }
+    // F1 快徑 read-after-ack（fresh，有界；失敗即 Unknown，信 ack 保既有語義）。
+    // 有界取 min(policyIoTimeoutMs, 1s)：預設 10s 下阻塞式測試 load（latch）會
+    // pin opMutex 10s 致既有 5s await 超時；1s 上限保快徑即時性（生產 binder IPC
+    // 皆 ms 級，1s 已充裕；注入短超時 200ms 仍尊重原值）。Unknown 即信 ack。
+    // detach 式（同 save）：讀跑獨立 async，await 僅等 bound；測試 latch 式
+    // loadRaw 以 Thread.sleep 迴圈無視協程取消（catch InterruptedException 續跑），
+    // withTimeout 包 onIo 無法搶佔，必須 detach 放棄慢讀（結果不再採納，僅免
+    // pin opMutex；殘留 job 待 latch 放行後自收，不發布）。
+    private suspend fun readAfterAck(store: HookPolicyStore): LoadResult {
+        val bound = minOf(policyIoTimeoutMs, 1_000L)
+        val d = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+        return try {
+            withTimeout(bound) { d.await() }
+        } catch (te: TimeoutCancellationException) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            LoadResult.Unknown
+        } catch (e: CancellationException) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            throw e
+        } catch (_: Exception) {
+            try {
+                d.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            LoadResult.Unknown
+        }
+    }
     // Monotonic counter for unique clear-in-flight keys (avoids timestamp collisions).
     // Phase 3 關係註記：本計數器僅保證 "policy-clear:<n>" key 唯一（與
     // policyWriteGeneration 保證 PendingPolicyWrite.generation 唯一分工）；
@@ -1119,6 +1206,11 @@ class DualViewModel(
         // cancelled job clears loading before rethrowing (see class doc);
         // selectChannel is the only path relying on the successor overwrite.
         viewModelScope.launch {
+            // Stage F1：全域 refresh 入口 Tx 存活即併發丟棄（選併發丟棄，不選短路
+            // BUSY：全局 refresh 不擁有 policy busy，誤發 BUSY/loading=true 會
+            // 覆寫 TIMEOUT 提示並搶 loading；丟棄即無聲 no-op，保留
+            // RECONCILING＋TIMEOUT＋pending，draft 不被覆寫；phase 恆 RECONCILING）。
+            if (activePolicyTx.get() != null) return@launch
             _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 refreshPending = true
@@ -1181,6 +1273,10 @@ class DualViewModel(
     // probeChannels): every reconnect caller passes false (a reconnect tap is
     // NOT consent for privileged diagnosis; LSPOSED stays direct-only).
     private suspend fun reconnectLocked(allowPrivilegedHookDiagnosis: Boolean = false) {
+        // Stage F1：Tx 存活即併發丟棄（鎖內兜底，覆蓋 trailing；不碰 loading，
+        // 保留 RECONCILING；disarm 仍執行與否？此處直接返回，連 disarm 都不做，
+        // Tx 終態才 disarm，避免重連誤清核對中的 stale-arm 洩漏修復語義）。
+        if (activePolicyTx.get() != null) return
         // Phase D P2 busy (#24): mark busy BEFORE any suspending probe IO.
         // swapAutoLocked() suspends on `su -c id -u` (auth prompt can block)
         // while probeChannels() is the first place that used to set
@@ -1263,6 +1359,9 @@ class DualViewModel(
     }
 
     private suspend fun refreshLocked() {
+        // Stage F1：Tx 存活即併發丟棄（鎖內兜底，覆蓋 drainCoalesced trailing：
+        // 不碰 loading/msg/phase/draft，保留 RECONCILING＋TIMEOUT）。
+        if (activePolicyTx.get() != null) return
         // NOTE (Phase 3): the pendingRemove-preserve guard below is
         // intentionally duplicated per RefreshOutcome branch (no helper
         // extracted). Only the GroundTruth listed branch can actually
@@ -3659,15 +3758,23 @@ class DualViewModel(
     // Stage A：核對中守衛（phase OR 集合雙層，防 state/集合瞬時窗口漂移）。
     // request/cancel/clear/confirm 入口共用：核對中一律拒絕新寫入（BUSY/進行中），
     // cancel 靜默 no-op（pending 保留，沿用 SAVING 語義）。
+    // Stage F1：改讀 Tx（activePolicyTx!=null OR phase OR 集合三層，防 Tx 登記與
+    // state 翻轉間的瞬時窗口漂移；Tx 為唯一真相，phase/集合為可觀測投影）。
     private fun isPolicyReconcilingLocked(): Boolean =
-        _state.value.policyWritePhase == PolicyWritePhase.RECONCILING ||
+        activePolicyTx.get() != null ||
+            _state.value.policyWritePhase == PolicyWritePhase.RECONCILING ||
             policyReconciling.isNotEmpty()
 
     // Stage A：confirm 逾時後的背景核對器（獨立 job，不持 opMutex/mutex 已釋放）。
     // - 子 job 可取消（Dispatchers.IO，不加 NonCancellable）：backoff delay 與
     //   load 皆響應外部取消（VM 清除），CE 透傳、不發布終態；finally（非 suspend
-    //   的 key 移除）仍跑，故無殘留。清理本身非 suspend，不需 withContext
+    //   的 Tx-settle CAS）仍跑，故無殘留。清理本身非 suspend，不需 withContext
     //   (NonCancellable) 包裹；終態 _state.update 亦非 suspend。
+    // - Stage F1：先有界 join 句柄（withTimeout 簡單版），再驗證讀（先join後讀）：
+    //   false/throw（已證失敗）即 FAILED+Unknown 結清，不再重讀（樂觀污染不得
+    //   掩蓋已證失敗）；true 即正常驗證讀；pending（null）則保留 fence 續讀，
+    //   其中 Known==sanitized(B) 視 inconclusive 續等（不搶結，防 stale/樂觀讀
+    //   早熟；末輪仍結，保終止，F2 再預算化）。
     // - loadResult 重試 N=3（store 零 API 新增，僅重讀）：每次重讀外包
     //   withTimeout(policyIoTimeoutMs)，逾時視 Unknown 進下次重試；任一次
     //   Known 即採納；全 Unknown 才判未知（REFRESH_FAILED/CHANNEL）。
@@ -3675,18 +3782,74 @@ class DualViewModel(
     //   理由）：讓脫鉤慢 save 先落盤，免 stale-read 誤判。
     // - 終態 TOCTOU 守衛：啟動時取號（version 取樣 + generation 遞增），發布前
     //   比對，期間若有新 save/refresh/load 推進即丟棄（最新者勝，不覆寫新事實）。
+    //   F1-simple 丟棄仍回 IDLE+REFRESHED（保 84 綠；F2 再改移交/保留不回 IDLE）。
     // - 終態不碰 loading（不擁有 busy：核對期間 refresh 可能持有 loading，誤清
     //   即消 spinner）；只翻 pending/phase/Known/draft/msg。成功即 disarm。
-    // - finally 交接：移除 reconcilingKeys（與外層 finally 的 inFlight→reconciling
-    //   交接配對，不殘留）。
-    private fun launchConfirmReconciler(
-        key: String,
-        store: HookPolicyStore,
-        sanitized: Set<String>,
-    ) {
+    // - fence 移除只許 Tx-settle CAS（settlePolicyTx；finally 兜底同式，不殘留）。
+    private fun launchConfirmReconciler(tx: PolicyTx) {
+        val key = tx.key
+        val store = tx.store
+        val sanitized = tx.sanitized
         viewModelScope.launch(Dispatchers.IO) {
             val versionAtStart = policyDraftVersion.get()
             val generation = policyLoadGeneration.incrementAndGet()
+            // F1 先 join：已證失敗即短路 FAILED+Unknown（不讀）。
+            val join: Boolean? = try {
+                joinPolicyTxBounded(tx)
+            } catch (e: CancellationException) {
+                throw e
+            }
+            if (join == false) {
+                try {
+                    // F1 自觸修正 v2：mark 自 bump 必須納入期望（expected=start+1），
+                    // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
+                    // 內判以 expected 為準（期間再有推進即丟棄，否則 FAILED）。
+                    // F1-5 鎖定：樂觀讀 B 不得翻案，已證失敗即 FAILED+Unknown。
+                    if (policyDraftVersion.get() != versionAtStart ||
+                        policyLoadGeneration.get() != generation
+                    ) {
+                        _state.update { cur ->
+                            cur.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                    } else {
+                        markPolicyUnknownLocked()
+                        val expV = versionAtStart + 1
+                        val expG = generation + 1
+                        _state.update { cur ->
+                            if (policyDraftVersion.get() != expV ||
+                                policyLoadGeneration.get() != expG
+                            ) {
+                                cur.copy(
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            } else {
+                                cur.copy(
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                    msgKind = MsgKind.FAILED,
+                                )
+                            }
+                        }
+                    }
+                } finally {
+                    settlePolicyTx(tx)
+                }
+                return@launch
+            }
+            val joinPending = join == null
             var result: LoadResult = LoadResult.Unknown
             try {
                 delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
@@ -3703,7 +3866,17 @@ class DualViewModel(
                         LoadResult.Unknown
                     }
                     result = r
-                    if (r is LoadResult.Known) break
+                    // F1 inconclusive：pending 中 Known==B 不搶結，續等下一輪
+                    // （末輪仍結，保終止）。
+                    if (r is LoadResult.Known) {
+                        if (joinPending && r.packages == sanitized &&
+                            i < POLICY_RECONCILE_RETRIES - 1
+                        ) {
+                            delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                            continue
+                        }
+                        break
+                    }
                     if (i < POLICY_RECONCILE_RETRIES - 1) {
                         delay(POLICY_RECONCILE_RETRY_DELAY_MS)
                     }
@@ -3762,19 +3935,89 @@ class DualViewModel(
                     }
                 }
             } finally {
-                policyReconciling.remove(key)
+                settlePolicyTx(tx)
             }
         }
+    }
+
+    // F1 相容過載：舊 (key,store,sanitized) 調用轉 Tx 調用（無句柄即無 join，
+    // 直接走驗證讀；僅測試/舊路徑兜底，生產一律 Tx 路徑）。
+    private fun launchConfirmReconciler(
+        key: String,
+        store: HookPolicyStore,
+        sanitized: Set<String>,
+    ) {
+        val tx = activePolicyTx.get()?.takeIf { it.key == key }
+        if (tx != null) {
+            launchConfirmReconciler(tx)
+            return
+        }
+        // 無 Tx（不應發生）：退化為空 Tx 驗證讀，fence 仍經集合移除保終止。
+        val fallback = PolicyTx(-1L, key, kotlinx.coroutines.CompletableDeferred(true), sanitized, store, false)
+        launchConfirmReconciler(fallback)
     }
 
     // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
     // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
     // 呈現，全 Unknown→REFRESH_FAILED/CHANNEL；成功即 disarm；不碰 loading；
     // 子 job 可取消、每次重讀 withTimeout、首延 500ms＋重試間 1s，見 confirm 註記）。
-    private fun launchClearReconciler(key: String, store: HookPolicyStore) {
+    // Stage F1：同 confirm 先有界 join（false/throw→FAILED+Unknown 結清；
+    // pending 中 Known-empty(B) 視 inconclusive 續等，末輪仍結）。
+    private fun launchClearReconciler(tx: PolicyTx) {
+        val store = tx.store
         viewModelScope.launch(Dispatchers.IO) {
             val versionAtStart = policyDraftVersion.get()
             val generation = policyLoadGeneration.incrementAndGet()
+            val join: Boolean? = try {
+                joinPolicyTxBounded(tx)
+            } catch (e: CancellationException) {
+                throw e
+            }
+            if (join == false) {
+                try {
+                    // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
+                    if (policyDraftVersion.get() != versionAtStart ||
+                        policyLoadGeneration.get() != generation
+                    ) {
+                        _state.update { cur ->
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                    } else {
+                        markPolicyUnknownLocked()
+                        val expV = versionAtStart + 1
+                        val expG = generation + 1
+                        _state.update { cur ->
+                            if (policyDraftVersion.get() != expV ||
+                                policyLoadGeneration.get() != expG
+                            ) {
+                                cur.copy(
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            } else {
+                                cur.copy(
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                    msgKind = MsgKind.FAILED,
+                                )
+                            }
+                        }
+                    }
+                } finally {
+                    settlePolicyTx(tx)
+                }
+                return@launch
+            }
+            val joinPending = join == null
             var result: LoadResult = LoadResult.Unknown
             try {
                 delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
@@ -3791,7 +4034,16 @@ class DualViewModel(
                         LoadResult.Unknown
                     }
                     result = r
-                    if (r is LoadResult.Known) break
+                    if (r is LoadResult.Known) {
+                        // clear 的 B=empty：pending 中 Known-empty 不搶結，續等。
+                        if (joinPending && r.packages.isEmpty() &&
+                            i < POLICY_RECONCILE_RETRIES - 1
+                        ) {
+                            delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                            continue
+                        }
+                        break
+                    }
                     if (i < POLICY_RECONCILE_RETRIES - 1) {
                         delay(POLICY_RECONCILE_RETRY_DELAY_MS)
                     }
@@ -3842,9 +4094,20 @@ class DualViewModel(
                     }
                 }
             } finally {
-                policyReconciling.remove(key)
+                settlePolicyTx(tx)
             }
         }
+    }
+
+    // F1 相容過載：舊 (key,store) 調用轉 Tx 調用。
+    private fun launchClearReconciler(key: String, store: HookPolicyStore) {
+        val tx = activePolicyTx.get()?.takeIf { it.key == key }
+        if (tx != null) {
+            launchClearReconciler(tx)
+            return
+        }
+        val fallback = PolicyTx(-1L, key, kotlinx.coroutines.CompletableDeferred(true), emptySet(), store, true)
+        launchClearReconciler(fallback)
     }
 
     // 重讀草稿 (供 init 後/外部變化後手動同步)：唯讀，不觸發寫入。
@@ -4025,6 +4288,8 @@ class DualViewModel(
         // 此 expected 即視為已提交，不可取消；QUEUED 仍可取消）。
         // Stage A：核對中靜默 no-op（pending 保留，沿用 SAVING 語義；請勿重試，
         // 待 reconciler 終態）。
+        // Stage F1：守衛改讀 Tx（Tx 存活且 key 對應此 expected 即 no-op；Tx 為
+        // 唯一真相，phase/集合為投影，三者任一命中皆 no-op，防窗口漂移）。
         if (policyWriteSaving.contains(policyWriteKey(expected))) return
         if (_state.value.policyWritePhase == PolicyWritePhase.SAVING &&
             _state.value.pendingPolicyWrite == expected
@@ -4033,6 +4298,7 @@ class DualViewModel(
             _state.value.pendingPolicyWrite == expected
         ) return
         if (policyReconciling.contains(policyWriteKey(expected))) return
+        if (activePolicyTx.get()?.key == policyWriteKey(expected)) return
         _state.update { cur ->
             val pending = cur.pendingPolicyWrite ?: return@update cur
             if (pending != expected) return@update cur
@@ -4112,9 +4378,8 @@ class DualViewModel(
             }
             // Stage A：逾時交接槽（外層 finally 自 inFlight/saving 交接至
             // reconciling；非逾時路徑為 null，走原清理）。
-            var handoverKey: String? = null
-            var handoverStore: HookPolicyStore? = null
-            var handoverSanitized: Set<String>? = null
+            // Stage F1：交接改攜 Tx（deferred 句柄保留，登記 activePolicyTx）。
+            var handoverTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
@@ -4285,6 +4550,8 @@ class DualViewModel(
                             // msg TIMEOUT/CHANNEL（口徑：逾時、結果未知、正在
                             // 核對、請勿重試）。reconciler 由外層 finally 在
                             // mutex 釋放後啟動（見下 handover）。
+                            // Stage F1：保留 deferred 句柄並登記 Tx（opMutex 照常
+                            // 釋放，但 Tx 存活＋RECONCILING＋reconcilingKeys）。
                             markPolicyUnknownLocked()
                             _state.update {
                                 it.copy(
@@ -4296,12 +4563,27 @@ class DualViewModel(
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }
-                            handoverKey = key
-                            handoverStore = store
-                            handoverSanitized = sanitized
+                            handoverTx = PolicyTx(
+                                txId = policyTxId.incrementAndGet(),
+                                key = key,
+                                deferred = deferred,
+                                sanitized = sanitized,
+                                store = store,
+                                isClear = false,
+                            )
                             return@withLock
                         }
                         if (ok) {
+                            // Stage F1 快徑收斂（P2#3）：ok==true 先一次 fresh
+                            // read-after-ack，==sanitized 才 WRITE_SUCCESS，
+                            // 否則 REFRESHED（Unknown 則信 ack，保既有語義）。
+                            // 仍在 opMutex 內，讀寫同一 store，無需另取號；
+                            // 發布前 bump 照舊（TOCTOU #2）。
+                            val ackRead = try {
+                                readAfterAck(store)
+                            } catch (e: CancellationException) {
+                                throw e
+                            }
                             // TOCTOU (#2): bump version + load-generation so any in-flight
                             // load started before this save is discarded instead of
                             // overwriting the fresh Known state.
@@ -4309,20 +4591,36 @@ class DualViewModel(
                             policyLoadGeneration.incrementAndGet()
                             // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                             disarmBlindClear()
-                            _state.update {
-                                it.copy(
-                                    loading = false,
-                                    pendingPolicyWrite = null,
-                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    // 顯示用草稿/計數與 store 實際持久化內容一致
-                                    // (store 會過濾非法 token),否則顯示計數會與
-                                    // 持久化值不符。
-                                    policyDraft = sanitized,
-                                    policyDraftKnown = true,
-                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, sanitized.size)),
-                                    msgKind = MsgKind.INFO,
-                                )
+                            if (ackRead is LoadResult.Known && ackRead.packages != sanitized) {
+                                // 併發覆寫/樂觀殘留：以 ground truth 為準＋REFRESHED。
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = ackRead.packages,
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            } else {
+                                _state.update {
+                                    it.copy(
+                                        loading = false,
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        // 顯示用草稿/計數與 store 實際持久化內容一致
+                                        // (store 會過濾非法 token),否則顯示計數會與
+                                        // 持久化值不符。
+                                        policyDraft = sanitized,
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, sanitized.size)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
                             }
                         } else {
                             // Phase 1：寫入失敗即 Unknown（保留 draft、不清 draft），
@@ -4346,17 +4644,17 @@ class DualViewModel(
                 }
             } finally {
                 // Stage A 交接：逾時即自 inFlight/saving 交接至 reconciling
-                //（mutex 已釋放），reconciler 終態 finally 移除 reconciling；
+                //（mutex 已釋放），reconciler 終態 Tx-settle CAS 清 fence；
                 // 非逾時走原清理。交接後 reconciler 在 mutex 外啟動，慢 save
-                // 續跑但結果不再採納（以 loadResult 核對為準）。
-                val hk = handoverKey
-                val hs = handoverStore
-                val hsan = handoverSanitized
-                if (hk != null && hs != null && hsan != null) {
-                    inFlightWrites.remove(hk)
-                    policyWriteSaving.remove(hk)
-                    policyReconciling.add(hk)
-                    launchConfirmReconciler(hk, hs, hsan)
+                // 續跑（句柄由 Tx 保留，reconciler 先 join 再驗證讀）。
+                // Stage F1：Tx 登記與 reconciling add 同組（Tx 為唯一真相）。
+                val htx = handoverTx
+                if (htx != null) {
+                    inFlightWrites.remove(htx.key)
+                    policyWriteSaving.remove(htx.key)
+                    activePolicyTx.set(htx)
+                    policyReconciling.add(htx.key)
+                    launchConfirmReconciler(htx)
                 } else {
                     // Covers early-return paths (TTL/null-store) while the inner
                     // finally covers the save itself.
@@ -4470,8 +4768,8 @@ class DualViewModel(
         }
         viewModelScope.launch {
             // Stage A：逾時交接槽（見 confirm）。
-            var handover = false
-            var handoverStore: HookPolicyStore? = null
+            // Stage F1：交接改攜 Tx（clear 句柄保留，sanitized=empty）。
+            var handoverTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
@@ -4560,6 +4858,7 @@ class DualViewModel(
                         // Stage A 逾時分支：pending 已於本 op 起始清空（無保留
                         // 問題），Known=false，msg CLEAR_TIMEOUT/CHANNEL。
                         // mark + update 背靠背；reconciler 由外層 finally 啟動。
+                        // Stage F1：保留 deferred 句柄並登記 Tx。
                         markPolicyUnknownLocked()
                         _state.update {
                             it.copy(
@@ -4571,11 +4870,25 @@ class DualViewModel(
                                 msgKind = MsgKind.CHANNEL,
                             )
                         }
-                        handover = true
-                        handoverStore = store
+                        handoverTx = PolicyTx(
+                            txId = policyTxId.incrementAndGet(),
+                            key = key,
+                            deferred = deferred,
+                            sanitized = emptySet(),
+                            store = store,
+                            isClear = true,
+                        )
                         return@withLock
                     }
                     if (ok) {
+                        // Stage F1 快徑收斂（clear 對稱）：ok==true 先一次 fresh
+                        // read-after-ack，Known-empty 才 CLEAR_SUCCESS，否則
+                        // REFRESHED（Unknown 信 ack，保既有語義）。
+                        val ackRead = try {
+                            readAfterAck(store)
+                        } catch (e: CancellationException) {
+                            throw e
+                        }
                         // TOCTOU (#2): bump version + load-generation so any in-flight
                         // load started before this clear is discarded instead of
                         // overwriting the fresh Known state.
@@ -4583,16 +4896,30 @@ class DualViewModel(
                         policyLoadGeneration.incrementAndGet()
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         disarmBlindClear()
-                        _state.update {
-                            it.copy(
-                                loading = false,
-                                policyDraft = emptySet(),
-                            policyDraftKnown = true,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                                msgKind = MsgKind.INFO,
-                            )
+                        if (ackRead is LoadResult.Known && ackRead.packages.isNotEmpty()) {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraft = ackRead.packages,
+                                    policyDraftKnown = true,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                        } else {
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraft = emptySet(),
+                                policyDraftKnown = true,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
                         }
                     } else {
                         // Phase 1：清除失敗即 Unknown（保留 draft、不清 draft），
@@ -4613,11 +4940,12 @@ class DualViewModel(
                     }
                 }
             } finally {
-                val hs = handoverStore
-                if (handover && hs != null) {
-                    inFlightWrites.remove(key)
-                    policyReconciling.add(key)
-                    launchClearReconciler(key, hs)
+                val htx = handoverTx
+                if (htx != null) {
+                    inFlightWrites.remove(htx.key)
+                    activePolicyTx.set(htx)
+                    policyReconciling.add(htx.key)
+                    launchClearReconciler(htx)
                 } else {
                     inFlightWrites.remove(key)
                 }
@@ -5747,6 +6075,9 @@ class DualViewModel(
         // F2/P3 leading busy (msg-preserving, same as refresh()): queued
         // behind opMutex still reads busy.
         viewModelScope.launch {
+            // Stage F1：同 refresh()，Tx 存活即併發丟棄（保留 RECONCILING；
+            // disarm 照舊同步執行，見上）。
+            if (activePolicyTx.get() != null) return@launch
             _state.update { it.copy(loading = true) }
             if (refreshJob?.isActive == true) {
                 reconnectPending = true
