@@ -91,6 +91,7 @@ val privilege: Privilege = when {
 > | Emulator API 29（minSdk floor） | API 29 | CI `locale-instrumentation` job：`:app:connectedDebugAndroidTest` | 每 PR 自動執行 |
 > | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
 > | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
+> | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 

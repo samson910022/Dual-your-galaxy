@@ -742,7 +742,7 @@ class PolicyWriteTest {
     // Load latch（首調即 init 即時回，後續 reconciler/refresh 阻塞）使
     // RECONCILING 穩定可觀測，釋放後 reconciler 終態回 IDLE。
     @Test
-    fun confirmPolicyWrite_timeout_reportsFailedAndUnknown() {
+    fun confirmPolicyWrite_timeout_entersReconcilingWithChannelAndUnknown() {
         val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val saveStarted = java.util.concurrent.CountDownLatch(1)
@@ -811,7 +811,7 @@ class PolicyWriteTest {
     // Stage A:clear 超時轉 RECONCILING + Unknown fence（同 confirm，順序鎖定同上）。
     // clear 起始即清 pending，故逾時斷言 pending==null；其餘同 confirm。
     @Test
-    fun clearPolicyDraft_timeout_reportsFailedAndUnknown() {
+    fun clearPolicyDraft_timeout_entersReconcilingWithChannelAndUnknown() {
         val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val saveStarted = java.util.concurrent.CountDownLatch(1)
@@ -2763,7 +2763,7 @@ class PolicyWriteTest {
     // IDLE＋Unknown＋REFRESH_FAILED/CHANNEL＋pending 清空＋reconciling 清空；
     // 之後 refresh Known 即可新 request（證明未卡 RECONCILING）。
     @Test
-    fun reconcilerAllUnknown_reportsRefreshFailedAndAllowsNewRequest() {
+    fun reconcilerAllUnknown_reportsChannelRefreshFailedAndAllowsNewRequest() {
         val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val saveStarted = java.util.concurrent.CountDownLatch(1)

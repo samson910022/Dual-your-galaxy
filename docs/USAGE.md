@@ -232,7 +232,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ### 政策寫入流程（Stage2：白名單政策草稿）
 
-- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高 320dp，少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
+- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高（一般 320dp，小螢幕 smallestWidth<360 或 screenHeight<640 回 240dp，見 `policyDialogListMaxHeightDp`），少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
 - 同世代（same-generation）綁定：pending 攜帶建立當下的 `policyDraftVersion`／`policyLoadGeneration` 快照；`確認寫入` 僅在世代全等＋TTL 內才寫 store，任一不符即清 pending 拒寫（零寫入）；寫入成功／失敗才 bump 世代（fence 在途載入，見下一條）。旋轉同世代保留 ack 勾選與清單展開，跨世代重置。
 - `清除草稿` 只刪該持久化條目，不清記憶體勾選。
 - 只有 owner user（user 0）能寫入／清除草稿；非 owner 的寫入 hook 讀不到（訊息明確拒絕）。
