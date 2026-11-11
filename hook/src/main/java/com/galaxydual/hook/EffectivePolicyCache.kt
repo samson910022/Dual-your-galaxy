@@ -73,14 +73,14 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 valid = false
                 invalidated = true
             }
-            if (valid) return cached
+            if (valid) return cached.toSet()
             // During the cooldown, do not retry the reader; return the cache/seed.
             // Phase 5: comment language unified to English (was Chinese).
             val lf = lastFailureMs
             if (lf != null && now0 - lf < failureCooldownMs) {
                 // After an explicit invalidation, never resurrect a stale
                 // pre-invalidation cached value: fall back to the seed alone.
-                return if (hadGoodValue && !invalidated) cached
+                return if (hadGoodValue && !invalidated) cached.toSet()
                 else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
             gen0 = generation
@@ -107,25 +107,28 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             // Loser discards: invalidated while IO was in flight, or a peer
             // already committed a good value.
             if (gen0 != generation) {
-                return if (valid) cached else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                return if (valid) cached.toSet() else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
-            if (valid) return cached
+            if (valid) return cached.toSet()
             if (mergeOk && merged != null) {
-                cached = merged
+                // Defensive snapshot: callers receive copies (see returns
+                // above), so a caller-held mutable view can never shrink or
+                // poison the cached value.
+                cached = merged.toSet()
                 valid = true
                 hadGoodValue = true
                 invalidated = false
                 lastFailureMs = null
                 failureLogged = false
                 lastRefreshMs = now1
-                return cached
+                return cached.toSet()
             } else {
                 // Sliding cooldown: refresh lastFailureMs on every failure
                 // unconditionally; consecutive failures stay throttled (see
                 // cooldownThrottlesConsecutiveFailures). Success/invalidate clears
                 // it (branch above). Phase 5: unified to English.
                 lastFailureMs = now1
-                return if (hadGoodValue && !invalidated) cached
+                return if (hadGoodValue && !invalidated) cached.toSet()
                 else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
         }

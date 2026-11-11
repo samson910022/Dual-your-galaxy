@@ -17,6 +17,7 @@ package com.galaxydual.plus
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import com.galaxydual.hook.PolicySource
+import kotlinx.coroutines.CancellationException
 
 // 個人來源 catalog 的一列 (唯讀展示用,不做寫入授權依據)。
 // 寫入目標仍以 DualRepository 的跨來源 verified dualId 為準 (#21),本表
@@ -101,12 +102,17 @@ class SourceIconState {
 // - API 30+ 完整列表需 QUERY_ALL_PACKAGES (見 manifest 註解);若系統過濾,
 //   回傳即為授權可見子集,不偽造、不補全。
 // 穩健性:逐項 try/catch,單項失敗跳過;整體載入失敗回傳 null (呼叫方保留舊列表),
-// 空列表=裝置確實無應用 (合法寫入)。除整體失敗回 null 外永不拋出。
+// 空列表=裝置確實無應用 (合法寫入)。除整體失敗回 null 外永不拋出,但
+// CancellationException 一律透傳 (協程取消不得被吞為 null/跳過,與 store 層
+// Throwable 語義對齊)。
 fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry>? {
     val installed: List<ApplicationInfo> = try {
         @Suppress("DEPRECATION")
         pm.getInstalledApplications(0)
-    } catch (_: Exception) {
+    } catch (e: CancellationException) {
+        // 協程取消永不吞為 null:透傳由外層 (MainActivity.reloadCatalog) 處理。
+        throw e
+    } catch (_: Throwable) {
         return null
     }
     val out = ArrayList<SourceAppEntry>(installed.size)
@@ -124,7 +130,9 @@ fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry>?
             if (!PolicySource.isValidPackage(pkg)) continue
             val label = try {
                 pm.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
-            } catch (_: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
                 pkg
             }
             val system = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
@@ -137,7 +145,9 @@ fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry>?
                     isSystemApp = system,
                 ),
             )
-        } catch (_: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
             // 單項損壞跳過,不影響整表。
             continue
         }
