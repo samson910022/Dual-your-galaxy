@@ -132,27 +132,39 @@ object WhitelistPolicy {
                 )
                 return result
             }
-            return extra.contains(pkg)
+            return try {
+                extra.contains(pkg)
+            } catch (_: Throwable) {
+                // Hostile extra set (contains throws): fail closed to false
+                // (original Boolean result, which is false here).
+                false
+            }
         }
         if (extra.isEmpty()) return result
         if (result is List<*>) {
-            if (result.any { it !is String }) {
-                onLog(
-                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                        "list with non-String elements; returning original",
-                )
+            try {
+                if (result.any { it !is String }) {
+                    onLog(
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "list with non-String elements; returning original",
+                    )
+                    return result
+                }
+                val wouldAddElements = extra.any { !result.contains(it) }
+                if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
+                    onLog(
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "unverified collection element type/generic for list; returning original",
+                    )
+                    return result
+                }
+                val merged = result + extra.filter { !result.contains(it) }
+                return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
+            } catch (_: Throwable) {
+                // Hostile list/extra view (any/filter/contains/+ throws):
+                // fail closed to the original (observe-only).
                 return result
             }
-            val wouldAddElements = extra.any { !result.contains(it) }
-            if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
-                onLog(
-                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                        "unverified collection element type/generic for list; returning original",
-                )
-                return result
-            }
-            val merged = result + extra.filter { !result.contains(it) }
-            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         if (result is Set<*>) {
             if (result is SortedSet<*> || result is NavigableSet<*>) {
@@ -162,39 +174,45 @@ object WhitelistPolicy {
                 )
                 return result
             }
-            if (result.any { it !is String }) {
-                onLog(
-                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                        "set with non-String elements; returning original",
-                )
-                return result
-            }
-            val wouldAddElements = extra.any { !result.contains(it) }
-            if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
-                onLog(
-                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                        "unverified collection element type/generic for set; returning original",
-                )
-                return result
-            }
-            // Preserve Set semantics; rebuilding as a List would break callers
-            // that cast the result back to Set. Hostile view safe: a throwing
-            // set view fails closed to the original (observe-only).
-            val merged = try {
-                result.toMutableSet()
-            } catch (_: Throwable) {
-                return result
-            }
             try {
-                merged.addAll(extra.filter { !merged.contains(it) })
-            } catch (_: Throwable) {
-                return try {
+                if (result.any { it !is String }) {
+                    onLog(
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "set with non-String elements; returning original",
+                    )
+                    return result
+                }
+                val wouldAddElements = extra.any { !result.contains(it) }
+                if (wouldAddElements && !isVerifiedStringCollectionGeneric(genericReturnType, result)) {
+                    onLog(
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "unverified collection element type/generic for set; returning original",
+                    )
+                    return result
+                }
+                // Preserve Set semantics; rebuilding as a List would break callers
+                // that cast the result back to Set. Hostile view safe: a throwing
+                // set view fails closed to the original (observe-only).
+                val merged = try {
                     result.toMutableSet()
                 } catch (_: Throwable) {
-                    result
+                    return result
                 }
+                try {
+                    merged.addAll(extra.filter { !merged.contains(it) })
+                } catch (_: Throwable) {
+                    return try {
+                        result.toMutableSet()
+                    } catch (_: Throwable) {
+                        result
+                    }
+                }
+                return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
+            } catch (_: Throwable) {
+                // Hostile result/extra view (any/contains/filter/toMutableSet
+                // throws): fail closed to the original (observe-only).
+                return result
             }
-            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
         }
         if (result is Collection<*>) {
             // Other Collection kinds (Queue, etc.) have unknown contracts;
@@ -211,9 +229,15 @@ object WhitelistPolicy {
         ) {
             @Suppress("UNCHECKED_CAST")
             val current = result as Array<String>
-            val merged = (current.toList() + extra.filter { !current.contains(it) })
-                .toTypedArray()
-            return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
+            return try {
+                val merged = (current.toList() + extra.filter { !current.contains(it) })
+                    .toTypedArray()
+                compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
+            } catch (_: Throwable) {
+                // Hostile extra view (filter/contains throws): fail closed to
+                // the original (observe-only).
+                result
+            }
         }
         onLog(
             "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +

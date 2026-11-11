@@ -56,7 +56,11 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // fresh read and may satisfy the expiry.
     private var generation = 0L
 
-    fun get(seed: Set<String>, reader: () -> Set<String>?): Set<String> {
+    fun get(
+        seed: Set<String>,
+        nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
+        reader: () -> Set<String>?,
+    ): Set<String> {
         // Phase 4: lock only for state check + generation snapshot. The
         // reader() IPC/sanitize runs OUTSIDE the lock (hot-path fix: every
         // whitelist query previously held the lock across binder IPC).
@@ -77,7 +81,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 // After an explicit invalidation, never resurrect a stale
                 // pre-invalidation cached value: fall back to the seed alone.
                 return if (hadGoodValue && !invalidated) cached
-                else PolicySource.effective(seed, emptySet())
+                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
             gen0 = generation
         }
@@ -91,7 +95,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         var mergeOk = false
         if (remote != null) {
             try {
-                merged = PolicySource.effective(seed, remote)
+                merged = PolicySource.effective(seed, remote, nonEmptyPolicyGateOpen)
                 mergeOk = true
             } catch (_: Throwable) {
                 // Corrupt/hostile remote set: treat as a failed read (not cached).
@@ -103,7 +107,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             // Loser discards: invalidated while IO was in flight, or a peer
             // already committed a good value.
             if (gen0 != generation) {
-                return if (valid) cached else PolicySource.effective(seed, emptySet())
+                return if (valid) cached else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
             if (valid) return cached
             if (mergeOk && merged != null) {
@@ -122,7 +126,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 // it (branch above). Phase 5: unified to English.
                 lastFailureMs = now1
                 return if (hadGoodValue && !invalidated) cached
-                else PolicySource.effective(seed, emptySet())
+                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
         }
     }
