@@ -109,6 +109,13 @@
     <string name="policy_write_busy_queued">"\n（等待中…）"</string>
     <string name="policy_write_cancel_denied">寫入中，無法取消</string>
     <string name="policy_write_saving_announce">政策寫入中</string>
+    <!-- Stage B P2 dialog 完整清單（方案 A Toggle）：溢出時 in-place 展開/收合；
+         Toggle 僅 rest>0 顯示，保 ack，播報展開/收合；清單 CD 區分完整/截斷。 -->
+    <string name="policy_write_show_all">顯示全部（共 %1$d 項）</string>
+    <string name="policy_write_show_less">收合（僅顯示前 %1$d 項）</string>
+    <string name="policy_write_list_cd_collapsed">政策包名列表，共 %1$d 項，僅顯示前 %2$d 項</string>
+    <string name="policy_write_expanded_announce">已展開完整清單，共 %1$d 項</string>
+    <string name="policy_write_collapsed_announce">已收合，僅顯示前 %1$d 項</string>
     <plurals name="batch_create">
         <item quantity="one">建立 %1$d 個分身</item>
         <item quantity="other">建立 %1$d 個分身</item>

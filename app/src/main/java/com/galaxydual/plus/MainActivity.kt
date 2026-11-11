@@ -176,6 +176,11 @@ class MainActivity : ComponentActivity() {
     private var shownPolicyWriteSaving: Boolean = false
     private var policyAcknowledged = false
     private var policyAckGeneration: Long? = null
+    // Stage B P2 dialog 完整清單（方案 A Toggle）：展開/收合純 UI 開關。
+    // rest>0 才顯示 Toggle；in-place 切換保 ack；世代重置同步重置 expanded；
+    // 旋轉經 KEY_POLICY_EXPANDED(/GEN) 保留，同世代保留、跨世代重置。
+    private var policyWriteExpanded = false
+    private var policyWriteExpandedGeneration: Long? = null
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
@@ -463,6 +468,14 @@ class MainActivity : ComponentActivity() {
             } else {
                 null
             }
+        // Stage B P2：完整清單展開開關保留（同世代旋轉保留，跨世代重置見 sync）。
+        policyWriteExpanded = savedInstanceState?.getBoolean(KEY_POLICY_EXPANDED) ?: false
+        policyWriteExpandedGeneration =
+            if (savedInstanceState?.containsKey(KEY_POLICY_EXPANDED_GEN) == true) {
+                savedInstanceState.getLong(KEY_POLICY_EXPANDED_GEN)
+            } else {
+                null
+            }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -556,6 +569,9 @@ class MainActivity : ComponentActivity() {
         // Stage2：政策寫入確認勾選綁定世代保留。
         outState.putBoolean(KEY_POLICY_ACK, policyAcknowledged)
         if (policyAckGeneration != null) outState.putLong(KEY_POLICY_ACK_GEN, policyAckGeneration!!)
+        // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
+        outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
+        if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
     }
 
     override fun onDestroy() {
@@ -4057,6 +4073,9 @@ class MainActivity : ComponentActivity() {
             // 無待確認即無世代可綁定：勾選與世代一併清除，避免殘留污染下一世代。
             policyAcknowledged = false
             policyAckGeneration = null
+            // Stage B P2：展開開關同步重置（同 ack，避免殘留污染下一世代）。
+            policyWriteExpanded = false
+            policyWriteExpandedGeneration = null
             return
         }
         if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
@@ -4105,62 +4124,37 @@ class MainActivity : ComponentActivity() {
             policyAcknowledged = false
             policyAckGeneration = null
         }
+        // Stage B P2：世代重置同步重置 expanded（同 ack 契約，見
+        // policyWriteExpandedShouldReset；early-return 分支不動，此處僅新 dialog）。
+        if (policyWriteExpandedShouldReset(policyWriteExpandedGeneration, pending.generation)) {
+            policyWriteExpanded = false
+            policyWriteExpandedGeneration = null
+        }
         val message = policyWriteMessage(pending, policyOp, policySaving)
         // 破壞性確認顯示完整包名以供核對（政策寫入放寬白名單，需明示對象；
         // 包名來自 catalog/PM，非使用者隱私輸入；匯出/日誌仍經遮蔽）。
-        // Phase 5：僅渲染前 50 項＋溢出行（全量 200 行會擠出 ack）；寫入仍用
-        // 完整 pending.packages（截斷僅顯示）。
+        // Stage B P2（方案 A Toggle）：預設收合前 50 項＋溢出行（全量 200 行會擠出
+        // ack）；rest>0 才顯示 Toggle，in-place 切換完整/收合，保 ack，播報；
+        // 寫入仍用完整 pending.packages（截斷僅顯示）。
         val sorted = pending.packages.sorted()
-        val (shown, rest) = truncatePolicyPreview(sorted)
-        val lines = ArrayList<String>(shown.size + 1)
-        lines.addAll(shown)
-        if (rest > 0) {
-            val more = try {
-                resources.getQuantityString(
-                    R.plurals.policy_write_preview_more,
-                    sorted.size,
-                    sorted.size,
-                    shown.size,
-                )
-            } catch (_: Exception) {
-                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項"
-            }
-            lines.add(more)
-        }
-        val listSummary = try {
-            getString(R.string.policy_write_list_cd, sorted.size)
-        } catch (_: Exception) {
-            "政策包名列表，共 ${sorted.size} 項"
-        }
-        val packagesText = TextView(this).apply {
-            text = lines.joinToString("\n")
-            // 無 contentDescription：摘要由外層 ScrollView 承載，內外重複會致
-            // TalkBack 朗讀兩次。
-            setTextIsSelectable(true)
-        }
-        val scrollView = ScrollView(this).apply {
-            isFocusable = true
-            isFocusableInTouchMode = true
-            contentDescription = listSummary
-            addView(
-                packagesText,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ),
-            )
-        }
+        val hasOverflow = sorted.size > POLICY_DIALOG_PREVIEW_MAX
+        // 溢出不存在時強制收合（expanded 無意義，Toggle 隱藏）。
+        val effectiveExpanded = policyWriteExpanded && hasOverflow
+        val listViews = buildPolicyListView(sorted, effectiveExpanded)
+        val packagesText = listViews.packagesText
+        val scrollView = listViews.scrollView
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // Phase 5 a11y：dialog 內容區 POLITE（TalkBack 跟隨訊息/相位變化）。
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-            // Phase 5：包名超過 POLICY_DIALOG_LIST_INLINE_MAX 項時 ScrollView 限高
-            // POLICY_DIALOG_LIST_MAX_HEIGHT_DP（maxHeight），
+            // Stage B P2：包名超過 POLICY_DIALOG_LIST_INLINE_MAX 項時 ScrollView 限高
+            // policyDialogListMaxHeightDp（小螢幕回 SMALL，否則 NORMAL），
             // ack checkbox 永遠可見；少量時 WRAP_CONTENT 不留空。
+            val maxHeightDp = currentPolicyDialogListMaxHeightDp()
             val listParams = if (sorted.size > POLICY_DIALOG_LIST_INLINE_MAX) {
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
-                    dp(POLICY_DIALOG_LIST_MAX_HEIGHT_DP),
+                    dp(maxHeightDp),
                 )
             } else {
                 LinearLayout.LayoutParams(
@@ -4169,6 +4163,56 @@ class MainActivity : ComponentActivity() {
                 )
             }
             addView(scrollView, listParams)
+        }
+        // Stage B P2 Toggle：僅 rest>0（即 hasOverflow）顯示；in-place 切換保 ack。
+        var toggleBtn: Button? = null
+        if (hasOverflow) {
+            val initialLabel = policyWriteToggleLabel(effectiveExpanded, sorted.size, POLICY_DIALOG_PREVIEW_MAX)
+            toggleBtn = Button(this).apply {
+                text = initialLabel
+                minimumHeight = dp(48)
+                contentDescription = initialLabel
+            }
+            container.addView(
+                toggleBtn,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            val toggleRef = toggleBtn
+            toggleRef.setOnClickListener {
+                val newExpanded = !policyWriteExpanded
+                policyWriteExpanded = newExpanded
+                policyWriteExpandedGeneration = if (newExpanded) pending.generation else null
+                // in-place 切換：重算可見列＋CD＋按鈕文案＋播報，不重建 dialog，保 ack。
+                try {
+                    val (newShown, _) = policyWriteVisibleList(sorted, newExpanded)
+                    packagesText.text = buildPolicyListText(sorted, newShown)
+                    scrollView.contentDescription = policyWriteListSummary(sorted.size, newShown.size, newExpanded)
+                    // Toggle 文案的計數語義：show_less 的 %1$d 為收合預覽數（50），
+                    // show_all/expanded 播報的 %1$d 為總數，collapsed 播報為預覽數。
+                    val previewSize = minOf(sorted.size, POLICY_DIALOG_PREVIEW_MAX)
+                    val newLabel = policyWriteToggleLabel(newExpanded, sorted.size, previewSize)
+                    toggleRef.text = newLabel
+                    try {
+                        toggleRef.contentDescription = newLabel
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        scrollView.scrollTo(0, 0)
+                    } catch (_: Exception) {
+                    }
+                    val announce = policyWriteToggleAnnounce(newExpanded, sorted.size, previewSize)
+                    try {
+                        scrollView.announceForAccessibility(announce)
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                } catch (_: Exception) {
+                    // Best effort: 切換失敗不影響門控與 ack。
+                }
+            }
         }
         val acknowledgement = CheckBox(this).apply {
             setText(R.string.policy_write_acknowledge)
@@ -4271,6 +4315,103 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 // Best effort.
             }
+        }
+    }
+
+    // Stage B P2 完整清單視圖（方案 A Toggle 抽取）：依 expanded 決定可見列＋CD。
+    // - 收合：前 POLICY_DIALOG_PREVIEW_MAX 項＋溢出行，CD 走 list_cd_collapsed；
+    // - 展開：完整清單無溢出行，CD 走 list_cd（完整）。
+    // 資源缺失 fail-closed 回中文 fallback（見純函數 policyWriteListCdFallback）。
+    private data class PolicyListViews(
+        val scrollView: ScrollView,
+        val packagesText: TextView,
+    )
+
+    private fun buildPolicyListView(sorted: List<String>, expanded: Boolean): PolicyListViews {
+        val (shown, _) = policyWriteVisibleList(sorted, expanded)
+        val packagesText = TextView(this).apply {
+            text = buildPolicyListText(sorted, shown)
+            // 無 contentDescription：摘要由外層 ScrollView 承載，內外重複會致
+            // TalkBack 朗讀兩次。
+            setTextIsSelectable(true)
+        }
+        val summary = policyWriteListSummary(sorted.size, shown.size, expanded)
+        val scrollView = ScrollView(this).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            contentDescription = summary
+            addView(
+                packagesText,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        return PolicyListViews(scrollView, packagesText)
+    }
+
+    private fun buildPolicyListText(sorted: List<String>, shown: List<String>): String {
+        val rest = sorted.size - shown.size
+        val lines = ArrayList<String>(shown.size + 1)
+        lines.addAll(shown)
+        if (rest > 0) {
+            val more = try {
+                resources.getQuantityString(
+                    R.plurals.policy_write_preview_more,
+                    sorted.size,
+                    sorted.size,
+                    shown.size,
+                )
+            } catch (_: Exception) {
+                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項"
+            }
+            lines.add(more)
+        }
+        return lines.joinToString("\n")
+    }
+
+    private fun policyWriteListSummary(total: Int, shownSize: Int, expanded: Boolean): String {
+        val rest = total - shownSize
+        return if (expanded || rest <= 0) {
+            try {
+                getString(R.string.policy_write_list_cd, total)
+            } catch (_: Exception) {
+                policyWriteListCdFallback(total, shownSize, true)
+            }
+        } else {
+            try {
+                getString(R.string.policy_write_list_cd_collapsed, total, shownSize)
+            } catch (_: Exception) {
+                policyWriteListCdFallback(total, shownSize, false)
+            }
+        }
+    }
+
+    private fun policyWriteToggleLabel(expanded: Boolean, total: Int, shownSize: Int): String {
+        return try {
+            if (expanded) getString(R.string.policy_write_show_less, shownSize)
+            else getString(R.string.policy_write_show_all, total)
+        } catch (_: Exception) {
+            policyWriteToggleLabelFallback(expanded, total, shownSize)
+        }
+    }
+
+    private fun policyWriteToggleAnnounce(expanded: Boolean, total: Int, shownSize: Int): String {
+        return try {
+            if (expanded) getString(R.string.policy_write_expanded_announce, total)
+            else getString(R.string.policy_write_collapsed_announce, shownSize)
+        } catch (_: Exception) {
+            policyWriteToggleAnnounceFallback(expanded, total, shownSize)
+        }
+    }
+
+    private fun currentPolicyDialogListMaxHeightDp(): Int {
+        return try {
+            val cfg = resources.configuration
+            policyDialogListMaxHeightDp(cfg.smallestScreenWidthDp, cfg.screenHeightDp)
+        } catch (_: Exception) {
+            POLICY_DIALOG_LIST_MAX_HEIGHT_DP
         }
     }
 
@@ -5485,6 +5626,9 @@ class MainActivity : ComponentActivity() {
         // Stage2：政策寫入確認勾選綁定世代（同 remove ack 模式，旋轉保留）。
         private const val KEY_POLICY_ACK = "policyAck"
         private const val KEY_POLICY_ACK_GEN = "policyAckGen"
+        // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
+        private const val KEY_POLICY_EXPANDED = "policyExpanded"
+        private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -5518,10 +5662,13 @@ class MainActivity : ComponentActivity() {
         // POLICY_DIALOG_LIST_INLINE_MAX = 清單超過此項數才限高（少量
         // WRAP_CONTENT 不留空，ack 永遠可見）；
         // POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 限高（經 dp() 轉 px）；
+        // POLICY_DIALOG_LIST_MAX_HEIGHT_SMALL_DP = 小螢幕限高（smallestWidth<360
+        // 或 screenHeight<640 經 dp() 轉 px；見 policyDialogListMaxHeightDp）；
         // CONFIRM_ACK_HPAD_DP／CONFIRM_ACK_MIN_HEIGHT_DP = 確認勾選
         // 水平內邊距／最小觸控高（remove／policy 兩 dialog 共用，48dp 觸控目標）。
         private const val POLICY_DIALOG_LIST_INLINE_MAX = 10
         private const val POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 320
+        private const val POLICY_DIALOG_LIST_MAX_HEIGHT_SMALL_DP = 240
         private const val CONFIRM_ACK_HPAD_DP = 24
         private const val CONFIRM_ACK_MIN_HEIGHT_DP = 48
 
@@ -6129,6 +6276,42 @@ internal fun policyWriteBusySuffix(policyOp: Boolean, policySaving: Boolean): St
     policyOp -> "\n（等待中…）"
     else -> ""
 }
+
+// Stage B P2 dialog 完整清單（方案 A Toggle）純函數（JVM 可測，無 Android 依賴）：
+// - policyDialogListMaxHeightDp：小螢幕（smallestWidth<360 或 screenHeight<640）
+//   回 SMALL（240dp），否則回 NORMAL（320dp）；非法輸入（<=0）fail-closed 回 SMALL。
+// - policyWriteVisibleList：expanded 即完整清單（rest=0），否則走 truncate 预览。
+// - policyWriteExpandedShouldReset：同 ack 世代契約（stored != pending 即重置為收合）。
+// - policyWriteListCdFallback / ToggleLabel/AnnounceFallback：資源缺失時的
+//   中文 fallback（生產經 getString，catch 即回此；JVM 以此鎖定算術與文案）。
+internal fun policyDialogListMaxHeightDp(smallestWidthDp: Int, screenHeightDp: Int): Int =
+    if (smallestWidthDp <= 0 || screenHeightDp <= 0) {
+        240
+    } else if (smallestWidthDp < 360 || screenHeightDp < 640) {
+        240
+    } else {
+        320
+    }
+
+internal fun policyWriteVisibleList(
+    sorted: List<String>,
+    expanded: Boolean,
+    max: Int = POLICY_DIALOG_PREVIEW_MAX,
+): Pair<List<String>, Int> =
+    if (expanded) sorted to 0 else truncatePolicyPreview(sorted, max)
+
+internal fun policyWriteExpandedShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
+    storedGeneration != pendingGeneration
+
+internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean): String =
+    if (expanded || total <= shown) "政策包名列表，共 $total 項"
+    else "政策包名列表，共 $total 項，僅顯示前 $shown 項"
+
+internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String =
+    if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）"
+
+internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String =
+    if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)

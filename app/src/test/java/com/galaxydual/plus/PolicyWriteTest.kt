@@ -2186,6 +2186,103 @@ class PolicyWriteTest {
         await { !vm.state.value.policyRefreshing }
     }
 
+    // Stage B P2 dialog 完整清單（方案 A Toggle）：截斷邊界 51/exact50＋算術。
+    @Test
+    fun stageB_truncate_boundaries_51_exact50_arithmetic() {
+        // 51 項：顯示前 50，溢出 1（Toggle 出現條件 rest>0）。
+        val sorted51 = (1..51).map { "com.example.%03d".format(it) }
+        val (shown51, rest51) = truncatePolicyPreview(sorted51)
+        assertEquals(50, shown51.size)
+        assertEquals(sorted51.take(50), shown51)
+        assertEquals(1, rest51)
+        assertEquals(sorted51.size - shown51.size, rest51)
+        // 可見列：收合走截斷，展開走完整（rest=0）。
+        val (collapsedShown, collapsedRest) = policyWriteVisibleList(sorted51, false)
+        assertEquals(shown51, collapsedShown)
+        assertEquals(1, collapsedRest)
+        val (expandedShown, expandedRest) = policyWriteVisibleList(sorted51, true)
+        assertEquals(sorted51, expandedShown)
+        assertEquals(0, expandedRest)
+
+        // exact50：無溢出（Toggle 隱藏條件 rest==0）。
+        val sorted50 = (1..50).map { "com.example.%03d".format(it) }
+        val (shown50, rest50) = truncatePolicyPreview(sorted50)
+        assertEquals(50, shown50.size)
+        assertEquals(0, rest50)
+        assertEquals(sorted50.size - shown50.size, rest50)
+        val (collapsed50, collapsedRest50) = policyWriteVisibleList(sorted50, false)
+        assertEquals(sorted50, collapsed50)
+        assertEquals(0, collapsedRest50)
+
+        // 算術：200 項＝50＋150（與 Phase5 200 鎖定一致，溢出行計數不斷言資源文案）。
+        val sorted200 = (1..200).map { "com.example.%03d".format(it) }
+        val (shown200, rest200) = truncatePolicyPreview(sorted200)
+        assertEquals(POLICY_DIALOG_PREVIEW_MAX, shown200.size)
+        assertEquals(150, rest200)
+        assertEquals(sorted200.size - shown200.size, rest200)
+    }
+
+    // Stage B P2：maxHeight 分檔（小螢幕 SMALL，否則 NORMAL；非法 fail-closed SMALL）。
+    @Test
+    fun stageB_maxHeight_buckets_small_normal_invalid() {
+        val small = policyDialogListMaxHeightDp(320, 800)
+        val normal = policyDialogListMaxHeightDp(400, 800)
+        // SMALL 必須小於 NORMAL（ack 在小螢幕仍可見）。
+        assertTrue(small < normal)
+        assertEquals(240, small)
+        assertEquals(320, normal)
+        // 邊界：<360 或 <640 即 SMALL；(360,640) 恰為 NORMAL 下限。
+        assertEquals(240, policyDialogListMaxHeightDp(359, 800))
+        assertEquals(240, policyDialogListMaxHeightDp(400, 639))
+        assertEquals(320, policyDialogListMaxHeightDp(360, 640))
+        assertEquals(320, policyDialogListMaxHeightDp(411, 900))
+        // 非法輸入 fail-closed 回 SMALL（保守限高，不擠出 ack）。
+        assertEquals(240, policyDialogListMaxHeightDp(0, 0))
+        assertEquals(240, policyDialogListMaxHeightDp(-1, 800))
+        assertEquals(240, policyDialogListMaxHeightDp(400, -10))
+    }
+
+    // Stage B P2：expanded 世代重置契約（同 ack：stored != pending 即收合）。
+    @Test
+    fun stageB_expandedReset_generationContract() {
+        assertTrue(policyWriteExpandedShouldReset(null, 1L))
+        assertTrue(policyWriteExpandedShouldReset(1L, 2L))
+        assertFalse(policyWriteExpandedShouldReset(2L, 2L))
+        // 與 ack 契約同構（防殘留污染下一世代，同世代旋轉保留）。
+        assertEquals(
+            policyAckShouldReset(null, 1L),
+            policyWriteExpandedShouldReset(null, 1L),
+        )
+        assertEquals(
+            policyAckShouldReset(2L, 2L),
+            policyWriteExpandedShouldReset(2L, 2L),
+        )
+    }
+
+    // Stage B P2：CD/文案 fallback 含計數（資源缺失時中文兜底不斷言資源文案本身）。
+    @Test
+    fun stageB_listCd_toggle_fallback_containsCounts() {
+        // 收合 CD 含總數＋預覽數；展開 CD 僅含總數。
+        val collapsedCd = policyWriteListCdFallback(total = 51, shown = 50, expanded = false)
+        assertTrue(collapsedCd.contains("51"))
+        assertTrue(collapsedCd.contains("50"))
+        val expandedCd = policyWriteListCdFallback(total = 51, shown = 51, expanded = true)
+        assertTrue(expandedCd.contains("51"))
+        // 無溢出時即使 expanded=false 亦回完整 CD（total<=shown）。
+        val noOverflowCd = policyWriteListCdFallback(total = 10, shown = 10, expanded = false)
+        assertTrue(noOverflowCd.contains("10"))
+        assertFalse(noOverflowCd.contains("僅顯示前"))
+        // Toggle 文案：收合鈕含總數，展開鈕含預覽數；播報同式。
+        val showAll = policyWriteToggleLabelFallback(expanded = false, total = 51, shown = 50)
+        assertTrue(showAll.contains("51"))
+        val showLess = policyWriteToggleLabelFallback(expanded = true, total = 51, shown = 50)
+        assertTrue(showLess.contains("50"))
+        val expandedAnnounce = policyWriteToggleAnnounceFallback(expanded = true, total = 51, shown = 50)
+        assertTrue(expandedAnnounce.contains("51"))
+        val collapsedAnnounce = policyWriteToggleAnnounceFallback(expanded = false, total = 51, shown = 50)
+        assertTrue(collapsedAnnounce.contains("50"))
+    }
+
     // Phase 3：dialog 純門控（無需 Robolectric；鎖定 syncPolicyWriteDialog 語義）。
     @Test
     fun phase3_policyDialogGating_pureFunctions() {

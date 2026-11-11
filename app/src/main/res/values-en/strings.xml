@@ -107,6 +107,14 @@
     <string name="policy_write_busy_queued">"\n(waiting…)"</string>
     <string name="policy_write_cancel_denied">Write in progress, cannot cancel</string>
     <string name="policy_write_saving_announce">Policy write in progress</string>
+    <!-- Stage B P2 full-list dialog (option A Toggle): in-place expand/collapse on
+         overflow; Toggle only when rest>0, preserves ack, announces; list CD
+         distinguishes full vs truncated. -->
+    <string name="policy_write_show_all">Show all (%1$d total)</string>
+    <string name="policy_write_show_less">Collapse (first %1$d only)</string>
+    <string name="policy_write_list_cd_collapsed">Policy package list, %1$d items total, showing first %2$d</string>
+    <string name="policy_write_expanded_announce">Expanded full list, %1$d items total</string>
+    <string name="policy_write_collapsed_announce">Collapsed, showing first %1$d only</string>
     <plurals name="batch_create">
         <item quantity="one">Create %1$d clone</item>
         <item quantity="other">Create %1$d clones</item>
