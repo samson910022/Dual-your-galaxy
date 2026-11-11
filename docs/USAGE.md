@@ -241,6 +241,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unknown（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）。
 - 寫入／清除失敗（`FAILED`）即標 Unknown 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unknown（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
 - 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyLoadGeneration` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
+- 取消語義：`QUEUED` 可取消（清 pending 回 `IDLE`）；`SAVING`／`RECONCILING` 不可取消（no-op，pending 保留；核對中請勿重試，待 reconciler 終態回 `IDLE`）。
 
 ### 政策 TTL 對照（App 側 vs hook 側，時鐘皆為 monotonic，不受 wall-clock 回撥影響）
 
@@ -248,7 +249,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | --- | --- | --- | --- |
 | 寫入確認 `POLICY_CONFIRM_TTL_MS` | 5 分鐘 | App | dialog pending 逾時→清 pending＋`TTL_EXPIRED` 訊息，不碰 draft（零寫入） |
 | blind-clear arm `BLIND_CLEAR_TTL_MS` | 5 分鐘（與上同值，別名） | App | arm 逾時→重 arm＋`policy_blind_clear_expired` 文案，需重新確認 |
-| store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `FAILED`＋Unknown fence，pending 保留由 reconciler 核對，不自動重送 |
+| store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op，終態回 `IDLE` |
 | 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 冗餘重讀同一 `RemotePreferences` 實例（框架推送才是主要新鮮度機制，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
 | 失敗節流 `failureCooldownMs` | 5 秒 | hook | 遠端讀取失敗後查詢節流，不重試 reader（`last-known-good` 保留或回 seed，見 `docs/HOOK.md` §1.1） |
 

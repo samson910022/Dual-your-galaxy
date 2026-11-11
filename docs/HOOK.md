@@ -52,7 +52,7 @@
 - App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
   Phase4 timeout，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
-  （Unknown fence、兩步清除、手動重整、超時轉 FAILED）；端到端仍
+  （Unknown fence、兩步清除、手動重整、超時轉 RECONCILING 核對）；端到端仍
   DEVICE-UNVERIFIED。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），

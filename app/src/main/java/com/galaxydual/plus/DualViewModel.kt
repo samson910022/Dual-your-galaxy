@@ -39,7 +39,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -820,7 +819,7 @@ class DualViewModel(
     // - TTL：now - armedAt > BLIND_CLEAR_TTL_MS 即過期→重 arm＋EXPIRED 文案。
     // 三者以 -1 哨兵同步（disarm 全置 -1，arm 全寫當下值）；isArmed 以
     // armedAtMs != -1 判定。AtomicLong：Unconfined 測試下多執行緒可見，
-    // 生產全 Main 串行（與既有 blindClearArmed AtomicBoolean 同理）。
+    // 生產全 Main 串行。
     private val blindClearArmedAtMs = AtomicLong(-1L)
     private val blindClearArmedVersion = AtomicLong(-1L)
     private val blindClearArmedLoadGen = AtomicLong(-1L)
@@ -3714,7 +3713,18 @@ class DualViewModel(
                     if (policyDraftVersion.get() != versionAtStart ||
                         policyLoadGeneration.get() != generation
                     ) {
-                        cur
+                        // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實
+                        // （refresh/新 save 發布）勝出，核對放棄；保留當下
+                        // draft/Known（不覆寫新事實），清 pending、回 IDLE＋
+                        // epoch+1＋REFRESHED，否則相位永留 RECONCILING 卡死
+                        // 後續請求。
+                        cur.copy(
+                            pendingPolicyWrite = null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                            msgKind = MsgKind.INFO,
+                        )
                     } else if (finalResult is LoadResult.Known) {
                         disarmBlindClear()
                         if (finalResult.packages == sanitized) {
@@ -3791,7 +3801,15 @@ class DualViewModel(
                     if (policyDraftVersion.get() != versionAtStart ||
                         policyLoadGeneration.get() != generation
                     ) {
-                        cur
+                        // TOCTOU 丟棄亦須離開 RECONCILING：期間已有新事實勝出，
+                        // 核對放棄；保留當下 draft/Known，回 IDLE＋epoch+1＋
+                        // REFRESHED（見 confirm 分支）。
+                        cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                            msgKind = MsgKind.INFO,
+                        )
                     } else if (finalResult is LoadResult.Known) {
                         disarmBlindClear()
                         if (finalResult.packages.isEmpty()) {
