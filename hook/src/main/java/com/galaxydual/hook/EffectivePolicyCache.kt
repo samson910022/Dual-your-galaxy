@@ -56,11 +56,23 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // fresh read and may satisfy the expiry.
     private var generation = 0L
 
+    // Stage C (P2 single-flight): non-null while a leader read is in flight,
+    // holding the generation it claimed under. Guarded by [lock] (like
+    // [generation], never volatile-read on the hot path). A follower that
+    // observes non-null returns without calling reader (seed-only or a valid
+    // snapshot). Cleared by the leader's finally (generation-matched, so a
+    // stale leader never clears a successor) and by invalidate().
+    private var inFlightGen: Long? = null
+
     fun get(
         seed: Set<String>,
         nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
         reader: () -> Set<String>?,
     ): Set<String> {
+        // Stage C: gate-closed short-circuit. Returns empty without touching
+        // the reader or any cache state (no lock, no nowMs, no mutation), so
+        // observe-only callers never trigger IPC reads.
+        if (!nonEmptyPolicyGateOpen) return emptySet()
         // Phase 4: lock only for state check + generation snapshot. The
         // reader() IPC/sanitize runs OUTSIDE the lock (hot-path fix: every
         // whitelist query previously held the lock across binder IPC).
@@ -83,6 +95,15 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 return if (hadGoodValue && !invalidated) cached.toSet()
                 else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
+            // Stage C single-flight claim: a second concurrent miss becomes a
+            // follower and returns without calling reader (valid snapshot if
+            // a peer already committed, else seed-only). Only the leader
+            // proceeds to the IO below.
+            if (inFlightGen != null) {
+                return if (valid) cached.toSet()
+                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+            }
+            inFlightGen = generation
             gen0 = generation
         }
         // OUTSIDE lock: fallible IO + merge (sanitize may traverse hostile input).
@@ -104,32 +125,39 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         }
         val now1 = nowMs()
         synchronized(lock) {
-            // Loser discards: invalidated while IO was in flight, or a peer
-            // already committed a good value.
-            if (gen0 != generation) {
-                return if (valid) cached.toSet() else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
-            }
-            if (valid) return cached.toSet()
-            if (mergeOk && merged != null) {
-                // Defensive snapshot: callers receive copies (see returns
-                // above), so a caller-held mutable view can never shrink or
-                // poison the cached value.
-                cached = merged.toSet()
-                valid = true
-                hadGoodValue = true
-                invalidated = false
-                lastFailureMs = null
-                failureLogged = false
-                lastRefreshMs = now1
-                return cached.toSet()
-            } else {
-                // Sliding cooldown: refresh lastFailureMs on every failure
-                // unconditionally; consecutive failures stay throttled (see
-                // cooldownThrottlesConsecutiveFailures). Success/invalidate clears
-                // it (branch above). Phase 5: unified to English.
-                lastFailureMs = now1
-                return if (hadGoodValue && !invalidated) cached.toSet()
-                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+            try {
+                // Loser discards: invalidated while IO was in flight, or a peer
+                // already committed a good value.
+                if (gen0 != generation) {
+                    return if (valid) cached.toSet() else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                }
+                if (valid) return cached.toSet()
+                if (mergeOk && merged != null) {
+                    // Defensive snapshot: callers receive copies (see returns
+                    // above), so a caller-held mutable view can never shrink or
+                    // poison the cached value.
+                    cached = merged.toSet()
+                    valid = true
+                    hadGoodValue = true
+                    invalidated = false
+                    lastFailureMs = null
+                    failureLogged = false
+                    lastRefreshMs = now1
+                    return cached.toSet()
+                } else {
+                    // Sliding cooldown: refresh lastFailureMs on every failure
+                    // unconditionally; consecutive failures stay throttled (see
+                    // cooldownThrottlesConsecutiveFailures). Success/invalidate clears
+                    // it (branch above). Phase 5: unified to English.
+                    lastFailureMs = now1
+                    return if (hadGoodValue && !invalidated) cached.toSet()
+                    else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                }
+            } finally {
+                // Stage C: release the single-flight claim, but only if it is
+                // still ours -- an invalidate() (which clears inFlightGen) or
+                // a successor leader must never be cleared by a stale leader.
+                if (inFlightGen == gen0) inFlightGen = null
             }
         }
     }
@@ -143,6 +171,10 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         invalidated = true
         cached = emptySet()
         failureLogged = false
+        // Stage C: release any in-flight single-flight claim so the next miss
+        // elects a fresh leader under the new generation (the stale leader
+        // discards via the gen0 != generation loser-drop above).
+        inFlightGen = null
         generation++
     }
 

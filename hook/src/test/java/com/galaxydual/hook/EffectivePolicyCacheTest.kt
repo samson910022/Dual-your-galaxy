@@ -122,7 +122,8 @@ class EffectivePolicyCacheTest {
             emptySet()
         }
         assertEquals(emptySet<String>(), result)
-        assertEquals(1, reads)
+        // Stage C: gate closed short-circuits without touching the reader.
+        assertEquals(0, reads)
     }
 
     @Test
@@ -245,22 +246,27 @@ class EffectivePolicyCacheTest {
         assertEquals(2, reads)
     }
 
-    // Phase 4:鎖外 IO 併發語義 -- 結果至少一致 (全等),讀取至多 N 次
-    // (不再斷言恰一次:鎖外 IO 允許多個 in-flight 讀,勝者提交、輸者丟棄)。
+    // Stage C single-flight: exactly one reader call under concurrency. The
+    // leader performs the read (sleep guarantees overlap so followers arrive
+    // while it is in flight); followers never call reader and return the
+    // seed-only fallback (or the merged snapshot if they arrive after the
+    // commit), so each result is either merged or seed-only.
     @Test
-    fun concurrentGetsReadOnceAndAgree() {
+    fun concurrentGetsSingleFlightExactlyOnce() {
         val threads = 8
         val barrier = CyclicBarrier(threads)
         val reads = AtomicInteger()
         val cache = EffectivePolicyCache()
         val results = Collections.synchronizedList(mutableListOf<Set<String>>())
-        val expected = setOf("com.seed.app", "com.remote.app")
+        val seed = setOf("com.seed.app")
+        val merged = setOf("com.seed.app", "com.remote.app")
         val workers = (1..threads).map {
             Thread {
                 barrier.await()
                 results.add(
-                    cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                    cache.get(seed, nonEmptyPolicyGateOpen = true) {
                         reads.incrementAndGet()
+                        Thread.sleep(200)
                         setOf("com.remote.app")
                     },
                 )
@@ -270,11 +276,115 @@ class EffectivePolicyCacheTest {
         workers.forEach { it.join() }
         assertEquals(threads, results.size)
         for (result in results) {
-            assertEquals(expected, result)
+            assertTrue(result == merged || result == seed)
         }
-        // 至少一次、至多 N 次 (鎖外 IO 不再保證單次)。
-        assertTrue(reads.get() >= 1)
-        assertTrue(reads.get() <= threads)
+        assertEquals(1, reads.get())
+    }
+
+    // Stage C: after an explicit invalidate, a concurrent herd still performs
+    // exactly one read; followers fall back to seed-only (empty here).
+    @Test
+    fun invalidateHerdSingleFlightExactlyOnce() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") },
+        )
+        cache.invalidate()
+        val threads = 8
+        val barrier = CyclicBarrier(threads)
+        val reads = AtomicInteger()
+        val results = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val workers = (1..threads).map {
+            Thread {
+                barrier.await()
+                results.add(
+                    cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                        reads.incrementAndGet()
+                        Thread.sleep(200)
+                        setOf("b")
+                    },
+                )
+            }
+        }
+        workers.forEach { it.start() }
+        workers.forEach { it.join() }
+        assertEquals(threads, results.size)
+        for (result in results) {
+            assertTrue(result == setOf("b") || result == emptySet<String>())
+        }
+        assertEquals(1, reads.get())
+        // The leader committed: a follow-up get is served cached, no new read.
+        assertEquals(
+            setOf("b"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads.incrementAndGet()
+                setOf("c")
+            },
+        )
+        assertEquals(1, reads.get())
+    }
+
+    // Stage C: after TTL expiry, a concurrent herd still performs exactly one
+    // read; followers fall back to seed-only (empty here).
+    @Test
+    fun ttlHerdSingleFlightExactlyOnce() {
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") },
+        )
+        time = 1_000L + 60_000L
+        val threads = 8
+        val barrier = CyclicBarrier(threads)
+        val reads = AtomicInteger()
+        val results = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val workers = (1..threads).map {
+            Thread {
+                barrier.await()
+                results.add(
+                    cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                        reads.incrementAndGet()
+                        Thread.sleep(200)
+                        setOf("b")
+                    },
+                )
+            }
+        }
+        workers.forEach { it.start() }
+        workers.forEach { it.join() }
+        assertEquals(threads, results.size)
+        for (result in results) {
+            assertTrue(result == setOf("b") || result == emptySet<String>())
+        }
+        assertEquals(1, reads.get())
+    }
+
+    // Stage C: gate closed short-circuits to empty with zero reader calls and
+    // no state change (a later gate-open read still performs a fresh read).
+    @Test
+    fun gateClosedShortCircuitsWithZeroReads() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(0, reads)
+        assertFalse(cache.isCached())
+        // No state was populated: the first gate-open read still reads once.
+        assertEquals(
+            setOf("com.seed.app", "com.remote.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(1, reads)
     }
 
     @Test
