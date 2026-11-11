@@ -36,9 +36,13 @@ package com.galaxydual.plus
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+
+// Stage J2 cross-instance poison fence (shared mMap): see below.
+private val remotePoisonedInstances: MutableSet<android.content.SharedPreferences> =
+    java.util.concurrent.ConcurrentHashMap.newKeySet<android.content.SharedPreferences>()
 
 // Phase 2 fail-closed 旗標：同實例失敗後不再試探（第 2 層已刪除，見下）。
 // （曾有 REMOTE_POLICY_RETRY_AFTER_MS 同實例超時試探，現已移除以免誤用。）
@@ -127,32 +131,40 @@ class HookPolicyStore(
 // 生產綁定:LSPosed remote preferences (由 GalaxyApp 提供 XposedService)。
 // provider 在每次操作時解析當今 service;service 缺席 (未啟用 LSPosed/尚未
 // binder) 時 load 回空、save/clear 回 false,統一 fail-closed。
-// 樂觀快取 (optimistic-cache) 風險與 needsRefetch 防線:
+// 樂觀快取 (optimistic-cache) 風險與單原子圍欄:
 // RemotePreferences.Editor.commit() 先更新行程內 mMap (doUpdate) 再走 binder
 // doCommit;doCommit 可因 RemoteException 回 false,此時 daemon 未落盤但同行程
 // mMap 已被污染——同一 prefs 實例的後續 getStringSet 會讀到未確認的樂觀值，
 // 若直接回 Known 即把「失敗的 save/clear」誤報為已確認。單純每次重解 provider
-// 無法修復 (同一快取實例)。故綁定閉包內以 needsRefetch (AtomicBoolean) 追蹤:
-// 唯有「已拿到 prefs 實例且 commit 回 false 或 edit/commit 拋出」才設 true
-// (含 clear(false));唯有 saveRaw 回傳 true 成功 (commit 同步落盤,本地+daemon
-// 重同步) 才清旗標，讀數重新可信。
+// 無法修復 (同一快取實例)。故綁定閉包內以單一 AtomicReference<SharedPreferences?>
+// failedPrefs 追蹤 (null=乾淨，非 null=最後一次失敗的實例；取代舊 needsRefetch+
+// failedPrefs 雙原子，消除 (true,null)/(false,non-null) 撕裂態)：
+// 唯有「已拿到 prefs 實例且 commit 回 false 或 edit/commit 拋出」才標記
+// (含 clear(false));唯有 success commit 才以 CAS 清旗，讀數重新可信。
 // provider() 回 null 或拋出時未觸及任何 prefs 實例 → mMap 不可能被污染，故
-// 不設旗標、僅回 false；暫時性缺席經 load-only 恢復 (下次 load 直接重解
+// 不標記、僅回 false；暫時性缺席經 load-only 恢復 (下次 load 直接重解
 // provider,無需先成功寫入)。
-// 旗標為 per-store-instance，provider 更替後仍保留 (by design，唯有成功 commit
+// 圍欄為 per-store-instance，provider 更替後仍保留 (by design，唯有成功 commit
 // 才清除)，以涵蓋「同一快取實例被污染後 provider 重解仍指回它」的情形。
+// Stage J2 新增：
+// - 讀後再驗證 (post-read revalidation)：每次 getStringSet 成功後、回 Known 前
+//   重檢圍欄；若期間併發失敗改寫圍欄（同一或他實例）即回 Unknown，不回毒值。
+//   確保 refetch 成功不贏過併發同實例 failed commit；保存成功清旗僅 CAS 同實例
+//   (compareAndSet(prefs,null))，避免蓋掉併發新失敗。
+// - 跨實例全域毒集合 remotePoisonedInstances：同一 prefs 實例被任一 store 標記後，
+//   全行程所有 store 讀到它皆 Unknown（含從未失敗的 B store），直到成功重同步
+//   移出；解決共享 mMap 下「A 失敗、B 讀毒誤報 Known」。成功即移除，失敗即加入。
 // Phase 2 恢復（僅第 1 層身份穿透；第 2 層同實例超時試探已刪除）：
-// - 同實例 (prefs === failedPrefs) 在旗標下永回 null/Unknown，直到一次成功
-//   save/clear 清旗；不更新時間、不讀 prefs、不自清（fail-closed 優先，
-//   可用性讓位；曾有 REMOTE_POLICY_RETRY_AFTER_MS 超時試探，現已移除）。
-// - 第 1 層（新身份穿透）為 DEVICE-UNVERIFIED 實驗路徑，生產行為保留穿透但
-//   誠實標記：新身份 === 比較僅假設「新 binder 即新 mMap」，未經 on-device
+// - 同實例 (prefs === failedPrefs) 在圍欄下永回 null/Unknown，直到一次成功
+//   save/clear 清旗；不讀 prefs、不自清（fail-closed 優先，可用性讓位）。
+// - 第 1 層（新身份穿透）為 DEVICE-UNVERIFIED 實驗路徑，生產行為保留穿透但加
+//   讀後圍欄再驗證：新身份 === 比較僅假設「新 binder 即新 mMap」，未經 on-device
 //   證明；若 LSPosed 同 group 永回同一快取實例則此層生產永不命中；若 wrapper
-//   共享底層 mMap 則仍有污染風險。詳見 docs/HOOK.md 樂觀快取段。
+//   共享底層 mMap 則仍有污染風險，全域毒集合提供第二道防線。詳見 docs/HOOK.md。
 //   TODO(on-device):以真機驗證 daemon 重建後新實例是否重同步權威值、
 //   同 group 是否回同一實例、wrapper 是否共享 mMap；驗證前此層視為實驗。
 // - 探讀失敗永不觸 CCE 自清：探讀內部吞掉所有例外回 null（Unknown），
-//   外層 HookPolicyStore.loadResult 的 CCE 自清只走「無旗標快照讀」路徑，
+//   外層 HookPolicyStore.loadResult 的 CCE 自清只走「無圍欄快照讀」路徑，
 //   避免把有效草稿刪掉。
 // 有意用 commit() 而非 apply():需要同步落盤語意 (寫入/清除後立即一致);
 // 集合僅數十包名,且 DualViewModel 經 onIo (Dispatchers.IO) 呼叫,不阻塞主執行緒。
@@ -160,15 +172,37 @@ class HookPolicyStore(
 fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
 ): HookPolicyStore {
-    val needsRefetch = AtomicBoolean(false)
+    // Stage J2 單原子圍欄：null=乾淨，非 null=最後失敗實例。
     val failedPrefs = AtomicReference<SharedPreferences?>(null)
     fun markFailed(prefs: SharedPreferences?) {
-        needsRefetch.set(true)
+        if (prefs == null) return
         failedPrefs.set(prefs)
+        try {
+            remotePoisonedInstances.add(prefs)
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
-    fun clearFlag() {
-        needsRefetch.set(false)
-        failedPrefs.set(null)
+    fun clearForSuccess(prefs: SharedPreferences) {
+        try {
+            remotePoisonedInstances.remove(prefs)
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        // 僅同實例 CAS 清旗，避免蓋掉併發新失敗（不同實例失敗仍保留）。
+        failedPrefs.compareAndSet(prefs, null)
+    }
+    fun isGloballyPoisoned(prefs: SharedPreferences): Boolean = try {
+        remotePoisonedInstances.contains(prefs)
+    } catch (_: Exception) {
+        false
+    }
+    fun resolvePrefs(): SharedPreferences? = try {
+        provider()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
     }
     return HookPolicyStore(
         // 防禦性拷貝由 HookPolicyStore.load 的 sanitizeHookPolicy 統一負責
@@ -178,56 +212,99 @@ fun remoteHookPolicyStore(
         // 刪掉有效草稿;值/型別錯亂 (ClassCastException) 則向上拋,由 load() 統一
         // 損壞自清 (見 HookPolicyStore.load 註解)。
         loadRaw = {
-            if (!needsRefetch.get()) {
+            val observed = failedPrefs.get()
+            if (observed == null) {
                 // Phase 4:provider 拋 Throwable (含 Error) 皆視為缺席 -> null
                 // (Unknown,不自清);CancellationException 透傳 (協程取消)。
-                val prefs = try {
-                    provider()
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Throwable) {
-                    null
-                }
+                val prefs = resolvePrefs()
                 // null = service/IPC unavailable (LoadResult.Unknown); a non-null
                 // prefs means the key is confirmed, even when it is absent (empty).
                 if (prefs == null) {
                     null
+                } else if (isGloballyPoisoned(prefs)) {
+                    // J2 跨實例毒：他 store 已標記同一實例，本 store 亦沾黏旗標後
+                    // 短路 Unknown，不讀毒 mMap。
+                    failedPrefs.compareAndSet(null, prefs)
+                    null
                 } else {
-                    prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
-                        ?: emptySet()
+                    try {
+                        val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
+                            ?: emptySet()
+                        // J2 讀後再驗證：併發失敗（本地圍欄升起或全域毒新增）即
+                        // 作廢本次讀，回 Unknown，不回毒值。
+                        if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else v
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (cce: ClassCastException) {
+                        // 真損壞才上拋自清；若併發已升旗則吞為 Unknown，免刪有效草稿。
+                        if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else throw cce
+                    } catch (_: Throwable) {
+                        null
+                    }
                 }
             } else {
-                // 旗標下：provider 未解出（null/拋出）→ 仍 Unknown，不碰旗標。
-                val prefs = try {
-                    provider()
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Throwable) {
-                    null
-                }
+                // 圍欄下：provider 未解出（null/拋出）→ 仍 Unknown，不碰圍欄。
+                val prefs = resolvePrefs()
                 if (prefs == null) {
                     null
-                } else if (prefs === failedPrefs.get()) {
-                    // 同實例：永回 Unknown，不讀 prefs、不更新旗標、不自清，
-                    // 直到一次成功 save/clear 清旗。
+                } else if (prefs === observed) {
+                    // 同實例：原則永回 Unknown；但若全域已解毒（他 store 同實例成功
+                    // 重同步），則跟隨解毒（CAS 清旗後當乾淨讀，讀後仍再驗證）。
+                    if (!isGloballyPoisoned(prefs)) {
+                        failedPrefs.compareAndSet(observed, null)
+                        try {
+                            val v2 = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet()) ?: emptySet()
+                            if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else v2
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (cce: ClassCastException) {
+                            if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else throw cce
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    } else null
+                } else if (isGloballyPoisoned(prefs)) {
+                    // 新身份但全域已毒（他 store 失敗過）：續閂到當今實例，不讀。
+                    try {
+                        failedPrefs.set(prefs)
+                    } catch (_: Exception) {
+                    }
                     null
                 } else {
-                    // 新身份穿透（DEVICE-UNVERIFIED 實驗路徑，見上）：
-                    // 成功（含確認空）即清旗回 Known；失敗仍 Unknown 且續閂到
-                    // 當今實例（避免對壞新實例忙探）；一律吞掉回 null，
+                    // 新身份穿透（DEVICE-UNVERIFIED 實驗路徑，見上）＋讀後再驗證：
+                    // 成功（含確認空）且圍欄未變才 CAS 清旗回 Known；圍欄併發改變
+                    // 即 Unknown；失敗仍 Unknown 且續閂到當今實例；一律吞掉回 null，
                     // 永不觸 CCE 自清。
                     try {
                         val v = prefs.getStringSet(
                             PolicySource.POLICY_KEY_EXTRA_PACKAGES,
                             emptySet(),
                         ) ?: emptySet()
-                        clearFlag()
-                        v
+                        val cur = failedPrefs.get()
+                        if (cur !== observed) {
+                            // 期間圍欄改變：併發成功已清旗 (null) 且無全域毒才可信，
+                            // 否則（併發新失敗）一律 Unknown。
+                            if (cur == null && !isGloballyPoisoned(prefs)) v else null
+                        } else if (isGloballyPoisoned(prefs)) {
+                            try {
+                                failedPrefs.set(prefs)
+                            } catch (_: Exception) {
+                            }
+                            null
+                        } else {
+                            if (failedPrefs.compareAndSet(observed, null)) v else null
+                        }
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {
-                        failedPrefs.set(prefs)
-                        needsRefetch.set(true)
+                        try {
+                            failedPrefs.set(prefs)
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            remotePoisonedInstances.add(prefs)
+                        } catch (_: Exception) {
+                        }
                         null
                     }
                 }
@@ -235,15 +312,9 @@ fun remoteHookPolicyStore(
         },
         saveRaw = { raw ->
             // provider 解析失敗 = 未觸及任何 prefs 實例 → 無 mMap 污染可能，
-            // 不設旗標、僅回 false (暫時性缺席經 load-only 恢復)。
+            // 不設圍欄、僅回 false (暫時性缺席經 load-only 恢復)。
             // Phase 4:含 Error 皆 fail-closed;取消透傳。
-            val prefs: SharedPreferences? = try {
-                provider()
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Throwable) {
-                null
-            }
+            val prefs: SharedPreferences? = resolvePrefs()
             if (prefs == null) {
                 false
             } else {
@@ -254,7 +325,7 @@ fun remoteHookPolicyStore(
                         prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
                             .commit()
                     }
-                    if (ok) clearFlag() else markFailed(prefs)
+                    if (ok) clearForSuccess(prefs) else markFailed(prefs)
                     ok
                 } catch (ce: CancellationException) {
                     markFailed(prefs)

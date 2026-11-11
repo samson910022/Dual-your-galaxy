@@ -1188,10 +1188,12 @@ class DualViewModel(
     // Stage I2 (P2#3#4)：coordinator 級陳舊修訂同步——每 VM init 常駐收集 settled，
     // 不限認領單一 txId（以 lastSeenTxId 去重，replay=1 晚訂閱仍只應用一次）。
     // - 收到 txId+key != 本地 activeTx 的新終態：
-    //   - 本地無 activeTx → bump 版本三元＋更新 draft/Known/msg（phase 保持 IDLE，
-    //     pending/loading 不動；僅 IDLE/QUEUED 才應用，SAVING/RECONCILING 窗口丟棄）。
-    //     外來 Unknown（他者失敗）無新修訂即忽略（不 bump、不 stale）。
-    //   - 本地有 activeTx（異 Tx）→ 丟棄＋記 stale，後續 request/confirm 強制重讀。
+    //   - 本地無 activeTx → Known 成功 bump 版本三元＋更新 draft/Known/msg（phase
+    //     保持 IDLE，pending/loading 不動；僅 IDLE/QUEUED 才應用全量，SAVING/
+    //     RECONCILING 窗口丟棄）；Unknown 失敗亦 bump＋翻 Unknown＋應用 msg（J2，
+    //     不得忽略，防跨 VM 樂觀污染殘留 Known）。
+    //   - 本地有 activeTx（異 Tx）→ 丟棄＋記 stale（Known/Unknown 皆記，J2），後續
+    //     request/confirm 強制重讀。
     // - 自 Tx（同 id+key）即跳過（專屬跟隨路徑處理，此處僅記水位）。
     private fun observeRevisionUpdates() {
         val coord = policyTxCoordinator ?: return
@@ -1220,18 +1222,37 @@ class DualViewModel(
                 lastRevisionSeenKey.set(settled.key)
                 return
             }
-            // 異 Tx 而本地有 activeTx → 丟棄＋記 stale（後續 request/confirm 強制重讀）。
+            // Stage J2: 異 Tx 而本地有 activeTx → 丟棄＋記 stale（Known 與 Unknown
+            // 皆記：共享失敗亦使本地視圖可疑，後續 request/confirm 強制重讀；本地
+            // Tx 仍由自身 reconciler 經 ground-truth 結清，此處不翻 Known、不 bump，
+            // 免干擾在途核對的 version/ownership 守衛）。
             if (localTx != null) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
-                // 僅 Known 成功修訂才記 stale（他者失敗無新修訂，不污染）。
-                if (settled.known) policyRevisionStale.set(true)
+                policyRevisionStale.set(true)
                 return
             }
-            // 本地無 activeTx：外來 Unknown 無新修訂即忽略。
+            // Stage J2: 本地無 activeTx 但收到共享終態失敗/未決 (known==false) 不得
+            // 忽略——必須作廢本地 Known（樂觀快取跨 VM 污染：他 VM 失敗前本 VM 可能
+            // 已讀到其樂觀值 B 並誤存為 Known）。bump 三元作廢在途 load，翻 Unknown
+            // 並要求顯式重讀後才可再寫（!Known 門控）。
             if (!settled.known) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                markPolicyUnknownLocked()
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
+                        cur.policyWritePhase != PolicyWritePhase.QUEUED
+                    ) {
+                        cur.copy(policyDraftKnown = false)
+                    } else {
+                        cur.copy(
+                            policyDraftKnown = false,
+                            msg = settled.msg,
+                            msgKind = settled.msgKind,
+                        )
+                    }
+                }
                 return
             }
             lastRevisionSeenTxId.set(settled.txId)
@@ -1506,7 +1527,18 @@ class DualViewModel(
         } catch (_: Exception) {
             false
         }
-        if (!ok) return PolicyTxSettle.Failed
+        // Stage J2: ok==false 不得純憑句柄結 FAILED，須以已取 ground-truth 校準——
+        // store 圍欄已保證毒讀為 Unknown，故此處 Known==sanitized 必為真值（例如併發
+        // 他 VM 落盤同值），應 Success；否則 Failed。Unknown＋已證失敗 → Failed
+        // （fail-closed，IDLE+Unknown）；Unknown＋ok==true → Unresolved 續留。
+        if (!ok) {
+            return when (read) {
+                is LoadResult.Known ->
+                    if (read.packages == tx.sanitized) PolicyTxSettle.Success(read.packages)
+                    else PolicyTxSettle.Failed
+                LoadResult.Unknown -> PolicyTxSettle.Failed
+            }
+        }
         return when (read) {
             is LoadResult.Known ->
                 if (read.packages == tx.sanitized) PolicyTxSettle.Success(read.packages)
@@ -4603,12 +4635,52 @@ class DualViewModel(
                                 return@withTimeout
                             }
                             try {
-                                // F1 自觸修正 v2：mark 自 bump 必須納入期望（expected=start+1），
-                                // 否則內判必誤判。外判有新事實即丟棄（不 mark）；否則 mark，
-                                // 內判以 expected 為準（期間再有推進即丟棄，否則 FAILED）。
-                                // F1-5 鎖定：樂觀讀 B 不得翻案，已證失敗即 FAILED+Unknown。
-                                // Stage G1：只比 ownership（version＋ownershipGen）。
-                                if (policyDraftVersion.get() != versionAtStart ||
+                                // Stage J2: 已證失敗亦須一次 ground-truth 讀（store 圍欄保證
+                                // 毒讀為 Unknown，故 Known==sanitized 必為真值，如併發他寫同值）。
+                                // Known==sanitized 即 Success，否則 Failed；永不零讀發布 Failed。
+                                val groundRead: LoadResult = try {
+                                    val (gr, _) = boundedReconcileRead(store)
+                                    gr
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    LoadResult.Unknown
+                                }
+                                val groundDecision: PolicyTxSettle = try {
+                                    decidePolicyTxSettle(tx, groundRead)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                }
+                                if (groundDecision is PolicyTxSettle.Success) {
+                                    // F1 自觸修正 v2 語義：外判有新事實即丟棄，否則發布成功。
+                                    // Stage G1：只比 ownership。
+                                    if (policyDraftVersion.get() != versionAtStart ||
+                                        policyOwnershipGen.get() != ownership
+                                    ) {
+                                        _state.update { cur ->
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                    } else {
+                                        disarmBlindClear()
+                                        _state.update { cur ->
+                                            cur.copy(
+                                                pendingPolicyWrite = null,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = groundDecision.packages,
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, groundDecision.packages.size)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                    }
+                                } else if (policyDraftVersion.get() != versionAtStart ||
                                     policyOwnershipGen.get() != ownership
                                 ) {
                                     _state.update { cur ->
@@ -5001,9 +5073,47 @@ class DualViewModel(
                                 return@withTimeout
                             }
                             try {
-                                // F1 自觸修正 v2：同 confirm，expected=start+1（見上）。
-                                // Stage G1：只比 ownership。
-                                if (policyDraftVersion.get() != versionAtStart ||
+                                // Stage J2: 同 confirm，已證失敗亦須一次 ground-truth 讀；
+                                // Known 空即 CLEAR_SUCCESS，否則 Failed；永不零讀發布 Failed。
+                                val groundRead: LoadResult = try {
+                                    val (gr, _) = boundedReconcileRead(store)
+                                    gr
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    LoadResult.Unknown
+                                }
+                                val groundDecision: PolicyTxSettle = try {
+                                    decidePolicyTxSettle(tx, groundRead)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                }
+                                if (groundDecision is PolicyTxSettle.Success) {
+                                    if (policyDraftVersion.get() != versionAtStart ||
+                                        policyOwnershipGen.get() != ownership
+                                    ) {
+                                        _state.update { cur ->
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                    } else {
+                                        disarmBlindClear()
+                                        _state.update { cur ->
+                                            cur.copy(
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                policyDraft = emptySet(),
+                                                policyDraftKnown = true,
+                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                    }
+                                } else if (policyDraftVersion.get() != versionAtStart ||
                                     policyOwnershipGen.get() != ownership
                                 ) {
                                     _state.update { cur ->
@@ -5565,6 +5675,12 @@ class DualViewModel(
                             }
                         }
                     } else if (result is LoadResult.Known) {
+                        // Stage J2: 刷新期中有任一 app-scoped Tx（本地或 coordinator
+                        // 他 VM 在途）即視為 Unverified：僅翻 Known=false、保留舊快照，
+                        // 不 disarm、不洗 stale、不發布 Known（免把樂觀中間值當確認）。
+                        if (hasActivePolicyTx()) {
+                            cur.copy(policyDraftKnown = false)
+                        } else {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         disarmBlindClear()
                         // Stage I2：顯式重讀 Known 即洗白陳舊修訂 stale（後續
@@ -5580,6 +5696,7 @@ class DualViewModel(
                             )
                         } else {
                             cur.copy(policyDraft = result.packages, policyDraftKnown = true)
+                        }
                         }
                     } else {
                         // Unknown: preserve the last known draft but mark it unknown.
