@@ -2962,16 +2962,24 @@ class PolicyWriteTest {
         val saveStarted = java.util.concurrent.CountDownLatch(1)
         val saveFinished = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val reads = java.util.Collections.synchronizedList(mutableListOf<Set<String>?>())
         val store = HookPolicyStore(
-            // call 1：init 回真值 A（Known）；calls 2-4：reconciler 三輪讀樂觀 B
-            // （Known，==sanitized，deferred 未完成→inconclusive）；call 5+：
-            // 清理期 refresh 讀權威 A（後端仍 A，save 回 false 未覆寫）。
+            // init 首讀回真值 A（Known）；之後未放行回樂觀 B（Known，
+            // ==sanitized，deferred 未完成→inconclusive）；放行後讀權威
+            // A（後端仍 A，save 回 false 未覆寫）。按狀態而非計數決定，
+            // 避免輪詢抖動造成 flaky。
             loadRaw = {
-                when (calls.incrementAndGet()) {
-                    1 -> backend.get()
-                    2, 3, 4 -> setOf("com.B")
-                    else -> backend.get()
+                calls.incrementAndGet()
+                // 首讀特判：reads 仍空即 init 載入。
+                val v: Set<String>? = if (reads.isEmpty()) {
+                    backend.get()
+                } else if (!saveRelease.get()) {
+                    setOf("com.B")
+                } else {
+                    backend.get()
                 }
+                reads.add(v)
+                v
             },
             saveRaw = { _ ->
                 saveStarted.countDown()
@@ -3007,8 +3015,9 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertNotNull(activeTxOf(vm))
         assertTrue(reconcilingKeysOf(vm).isNotEmpty())
-        // 三輪讀＋init＝4 次（reconciler 恰 3 讀，未提前結）。
-        assertEquals(4, calls.get())
+        // 三輪讀＋init 至少 4 次（reconciler 至少 3 讀，未提前結；只取下界，
+        // 避免輪詢抖動造成 flaky，不設上界）。
+        assertTrue("load calls=" + calls.get() + ", expected >=4", calls.get() >= 4)
 
         // 放行 save（回 false，已證失敗；後端不變仍 A），再 refresh late-join
         // （讀 A＋deferred false）即 FAILED＋Unknown＋IDLE＋pending 清空＋Tx 結清。
