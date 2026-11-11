@@ -232,6 +232,7 @@ class HookPolicyRemoteStoreTest {
 
     @Test
     fun corruptTypeSelfClearsThroughRemoteBinding() {
+        // Stage J3:型別損壞永不自清——load 回空（Unknown 的相容別名），但金鑰必須保留。
         val prefs = RecordingPrefs()
         assertTrue(remoteHookPolicyStore { prefs }.save(setOf("com.example.a")))
         assertTrue(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
@@ -240,8 +241,9 @@ class HookPolicyRemoteStoreTest {
         val store = remoteHookPolicyStore { prefs }
 
         assertTrue(store.load().isEmpty())
-        // 與暫時性 IPC 失敗不同:型別損壞走 load() 的既有自清路線,金鑰必須被移除。
-        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        // 與暫時性 IPC 失敗同：型別損壞亦不自清，key 仍在，待顯式重讀恢復。
+        assertTrue(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
     }
 
     @Test

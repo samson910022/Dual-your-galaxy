@@ -46,7 +46,12 @@ class PolicyWriteTest {
                 saveCalls++
                 if (raw == null) {
                     clearCalls++
-                    if (clearSucceeds) saved = null
+                    // Stage J3:成功清除後端為確認空（Known empty），非 Unknown。
+                    // 真實綁定中 prefs 非空＋key 缺席即 Known 空；Fake 以 emptySet
+                    // 精確建模，使快徑 read-after-ack 能以 ground truth 驗證
+                    // CLEAR_SUCCESS（Unknown 永不信 ack，見 DualViewModel）。
+                    // 以 saved=null 模擬 Unknown 的測試仍經直接賦值達成，不受影響。
+                    if (clearSucceeds) saved = emptySet()
                     clearSucceeds
                 } else {
                     if (saveSucceeds) saved = raw
@@ -373,27 +378,38 @@ class PolicyWriteTest {
     }
 
     // 晚到的 init 載入不得覆寫較新的 save 所寫入的 policyDraft。
+    // Stage J3:ackRead 須 Known（Unknown 不信 ack）。harness 以 backend＋計數區分
+    // init 阻塞舊讀（stale A）與 ackRead 新值（B），使快徑以 ground truth 驗證 SUCCESS。
     @Test
     fun confirmPolicyWrite_stalePendingLoadDoesNotOverwriteNewerSave() {
         val loadStarted = java.util.concurrent.CountDownLatch(1)
         val released = java.util.concurrent.atomic.AtomicBoolean(false)
         val loadCompleted = java.util.concurrent.CountDownLatch(1)
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.B"))
         val store = HookPolicyStore(
             loadRaw = {
-                // Handshake: signal that the init load has entered its blocked
-                // section *before* capturing versionAtStart, so the version guard
-                // is exercised rather than relying on scheduling.
-                loadStarted.countDown()
-                while (!released.get()) {
-                    try {
-                        Thread.sleep(10)
-                    } catch (_: InterruptedException) {
+                if (calls.incrementAndGet() == 1) {
+                    // Handshake: signal that the init load has entered its blocked
+                    // section *before* capturing versionAtStart, so the version guard
+                    // is exercised rather than relying on scheduling.
+                    loadStarted.countDown()
+                    while (!released.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
                     }
+                    loadCompleted.countDown()
+                    setOf("com.A")
+                } else {
+                    backend.get()
                 }
-                loadCompleted.countDown()
-                setOf("com.A")
             },
-            saveRaw = { _ -> true },
+            saveRaw = { raw ->
+                if (raw != null) backend.set(raw)
+                true
+            },
         )
         val vm = makeVm(store, userId = 0, initialDraft = null)
 
@@ -502,6 +518,8 @@ class PolicyWriteTest {
     // Stage F1 誠實化：save 落盤更新 backend，非阻塞讀回 backend（快徑
     // read-after-ack 回新值才 WRITE_SUCCESS）；阻塞 refresh 仍回 stale A 以
     // 演練丟棄（版本已推進，晚到不得覆寫）。
+    // Stage J3:ackRead 須 Known（Unknown 不信 ack）。harness 以 blockedOnce 確保
+    // 僅 refresh 阻塞（stale A），ackRead 皆回 backend（Known），使快徑 SUCCESS。
     @Test
     fun refreshPolicyDraft_stalePendingLoadDoesNotOverwriteNewerSave() {
         val blockLoad = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -509,9 +527,10 @@ class PolicyWriteTest {
         val refreshStarted = java.util.concurrent.CountDownLatch(1)
         val refreshCompleted = java.util.concurrent.CountDownLatch(1)
         val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.A"))
+        val blockedOnce = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
             loadRaw = {
-                if (blockLoad.get()) {
+                if (blockLoad.get() && !blockedOnce.getAndSet(true)) {
                     refreshStarted.countDown()
                     while (!releaseLoad.get()) {
                         try {
@@ -824,7 +843,9 @@ class PolicyWriteTest {
         val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
         val slowStore = HookPolicyStore(
             loadRaw = {
-                if (calls.incrementAndGet() == 1) {
+                // Stage J3:pre-read（call2）直通 Known，使 clear 得以啟動 save 並逾時
+                // 進 RECONCILING；reconciler／ack 後續讀（calls>=3）仍阻塞待放行。
+                if (calls.incrementAndGet() <= 2) {
                     backend.get()
                 } else {
                     while (!loadRelease.get()) {
@@ -992,7 +1013,9 @@ class PolicyWriteTest {
         val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
             loadRaw = {
-                if (calls.incrementAndGet() == 1) {
+                // Stage J3:pre-read（call2）直通 Known，使 clear 得以啟動 save 並逾時
+                // 進 RECONCILING；後續核對讀（calls>=3）仍阻塞待放行。
+                if (calls.incrementAndGet() <= 2) {
                     backend.get()
                 } else {
                     while (!loadRelease.get()) {
@@ -1499,8 +1522,8 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("已寫入政策草稿"))
     }
 
-    // Blind clear (Phase 2)：unknown draft → 第一次僅告警不執行（不清 pending、
-    // 不碰 store），第二次才執行（防靜默單步刪除未見內容）。
+    // Blind clear (Phase 2, Stage J3)：unknown draft → 第一次僅告警不執行（不清 pending、
+    // 不碰 store）；第二次重讀仍 Unknown→abort（不刪未見內容，clear 起始清 pending）。
     @Test
     fun clearPolicyDraft_unknownDraft_requiresDoubleConfirm() {
         val fake = FakePolicyStore()
@@ -1521,16 +1544,14 @@ class PolicyWriteTest {
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(0, fake.clearCalls)
 
-        // 第二次：執行清除並作廢 pending。
+        // 第二次：重讀仍 Unknown→abort，不執行、不耗 clear；clear 起始即清 pending
+        // （P2 #6，作廢確認），故 pending 為 null（J3）。
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-
-        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
-        assertTrue(vm.state.value.policyDraftKnown)
-        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
-        assertEquals(1, fake.clearCalls)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
         assertNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
 
     // TOCTOU (#2):慢速 refresh 載入在途 → 成功 save 先提交 → 釋放舊載入不得覆寫。
@@ -1686,9 +1707,9 @@ class PolicyWriteTest {
         assertEquals(commitsBeforeSecond, prefs.commitCalls)
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // 3) 翻轉成功旗標 → blind clear 恢復 sticky 旗標 (明確刪除≠覆寫未見內容，
-        //    故不受未知門控阻擋；成功 clear 清 needsRefetch)。Phase 2 需兩步：
-        //    第一次僅告警不耗 commit，第二次才執行。
+        // 3) Stage J3:翻轉成功旗標後，blind clear 仍不得刪未見內容——同實例毒旗標下
+        //    重讀仍 Unknown→abort（REFRESH_FAILED＋Unknown＋0 commit），不恢復 sticky。
+        //    （明確刪除亦須 Known；毒旗標須經新身份穿透或成功寫入恢復，同實例不清。）
         prefs.commitSucceeds = true
         val commitsBeforeClear = prefs.commitCalls
         vm.clearPolicyDraft()
@@ -1698,27 +1719,34 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(commitsBeforeClear, prefs.commitCalls)
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
-        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        Thread.sleep(300)
+        assertEquals(commitsBeforeClear, prefs.commitCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
 
-        vm.refreshPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
+        // 4) 新身份恢復（DEVICE-UNVERIFIED 實驗路徑：第 1 層穿透）：以乾淨 prefs
+        //    新建 VM，refresh 即 Known，後續 request+confirm 成功（真實 store→VM 鏈）。
+        val cleanPrefs = MinimalPrefs(commitSucceeds = true)
+        val cleanStore = remoteHookPolicyStore { cleanPrefs }
+        val vm2 = makeVm(cleanStore, userId = 0, initialDraft = emptySet())
+        await { vm2.state.value.policyDraftKnown }
+        vm2.refreshPolicyDraft()
+        await { vm2.state.value.policyDraftKnown }
 
-        // 4) 已知後 request+confirm 成功 (真實 store→VM 鏈)。
-        seedSelection(vm)
-        vm.requestPolicyWrite()
-        val pending3 = vm.state.value.pendingPolicyWrite
+        // 已知後 request+confirm 成功 (真實 store→VM 鏈)。
+        seedSelection(vm2)
+        vm2.requestPolicyWrite()
+        val pending3 = vm2.state.value.pendingPolicyWrite
         assertNotNull(pending3)
-        vm.confirmPolicyWrite(pending3!!)
-        await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
-        assertTrue(vm.state.value.policyDraftKnown)
-        assertTrue(vm.state.value.msg.contains("已寫入政策草稿"))
+        vm2.confirmPolicyWrite(pending3!!)
+        await { vm2.state.value.pendingPolicyWrite == null }
+        assertEquals(setOf("com.example.a"), vm2.state.value.policyDraft)
+        assertTrue(vm2.state.value.policyDraftKnown)
+        assertTrue(vm2.state.value.msg.contains("已寫入政策草稿"))
         // 持久化經真實綁定落到同一 prefs 實例。
         assertEquals(
             setOf("com.example.a"),
-            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+            cleanPrefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
         )
     }
 
@@ -1923,6 +1951,8 @@ class PolicyWriteTest {
     // Phase 1 非對稱鎖定：慢速 Unknown load 在途時成功 save NEW，釋放後終態仍為
     // Known NEW（load 結果本身的 Unknown 不得 bump 丟棄新寫入；寫入成功側的 bump
     // 作廢舊 load，晚到的 Unknown 被丟棄）。
+    // Stage J3：快徑 ack 須 Known（Unknown 永不信 ack）。本測試 harness 以 backend
+    // 使 ackRead 回 Known NEW（SUCCESS），慢速 Unknown 仍被丟棄，保原意圖。
     @Test
     fun slowUnknownLoad_doesNotDiscardNewerKnown() {
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
@@ -1930,6 +1960,7 @@ class PolicyWriteTest {
         val aFinished = java.util.concurrent.CountDownLatch(1)
         val releaseA = java.util.concurrent.atomic.AtomicBoolean(false)
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val backend = java.util.concurrent.atomic.AtomicReference(setOf("com.INIT"))
         val store = HookPolicyStore(
             loadRaw = {
                 when (calls.incrementAndGet()) {
@@ -1945,11 +1976,14 @@ class PolicyWriteTest {
                         aFinished.countDown()
                         null
                     }
-                    else -> null
+                    // Stage J3:ackRead 及後續讀回 backend（save 已更新為 NEW），
+                    // 使快徑以 ground truth 驗證 SUCCESS，而非依賴 Unknown 信 ack。
+                    else -> backend.get()
                 }
             },
-            saveRaw = { _ ->
+            saveRaw = { raw ->
                 saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
                 true
             },
         )
@@ -2558,7 +2592,9 @@ class PolicyWriteTest {
                         } catch (_: InterruptedException) {
                         }
                     }
-                    fake.saved = null
+                    // Stage J3:成功清除後端為確認空（Known empty），使 ackRead 以
+                    // ground truth 驗證 CLEAR_SUCCESS（Unknown 永不信 ack）。
+                    fake.saved = emptySet()
                     true
                 } else {
                     fake.saveCalls++
@@ -3113,7 +3149,9 @@ class PolicyWriteTest {
         assertNull(activeTxOf(vm))
     }
 
-    // Stage D blind-clear 有界＋世代綁定 (P2)：TTL 內第二 tap 執行。
+    // Stage J3 blind-clear：Unknown 下第二 tap 亦須重讀＋abort（永不刪未見內容）。
+    // TTL 內第二 tap 因 store 仍 Unknown（null）而 abort，不耗 clear，需顯式 refresh
+    // Known 後方可清除。
     @Test
     fun blindClear_secondTapWithinTtl_executes() {
         var now = 10_000L
@@ -3128,10 +3166,22 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
         assertEquals(0, fake.clearCalls)
 
+        // Stage J3:第二 tap 重讀仍 Unknown→abort（REFRESH_FAILED＋Unknown＋IDLE），
+        // 不耗 clear、不刪未見內容。
         now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("重新整理"))
 
+        // 顯式 refresh Known（遠端恢復為確認空）後，單步清除即成功。
+        fake.saved = emptySet()
+        vm.refreshPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        vm.clearPolicyDraft()
+        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
         assertEquals(1, fake.clearCalls)
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
@@ -3167,6 +3217,7 @@ class PolicyWriteTest {
     }
 
     // Stage D：過期重 arm 後、TTL 內第三 tap 執行（重 arm 鏈）。
+    // Stage J3：第三 tap 重讀仍 Unknown→abort，不執行（0 clear）。
     @Test
     fun blindClear_expiredRearm_thirdTapWithinTtl_executes() {
         var now = 30_000L
@@ -3183,13 +3234,12 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("已逾時"))
         assertEquals(0, fake.clearCalls)
 
+        // Stage J3:第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
         now += 1_000L
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-
-        assertEquals(1, fake.clearCalls)
-        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
-        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
     // Stage D：斷開/重連 disarm——arm 後 reconnect，再次 clear 僅告警不執行。
@@ -3215,13 +3265,15 @@ class PolicyWriteTest {
         assertEquals(0, fake.clearCalls)
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // 重 arm 後第二 tap 執行。
+        // Stage J3:重 arm 後第二 tap 重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(1, fake.clearCalls)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
     // Stage D：foreground disarm——arm 後 onForeground，再次 clear 僅告警。
+    // Stage J3:第二 tap 重讀仍 Unknown→abort，不執行。
     @Test
     fun blindClear_foreground_disarms() {
         val fake = FakePolicyStore()
@@ -3244,12 +3296,14 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(1, fake.clearCalls)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
     // Stage D：世代失配重 arm——arm 後 unknown-gate confirm 推進版本，
     // 第二 tap 視為新的第一次（FIRST，不執行），第三 tap 執行。
+    // Stage J3:第三 tap 重讀仍 Unknown→abort，不執行。
     @Test
     fun blindClear_generationMismatch_rearms() {
         val fake = FakePolicyStore()
@@ -3279,15 +3333,16 @@ class PolicyWriteTest {
         assertEquals(0, fake.clearCalls)
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // 第三 tap（同世代、TTL 內）執行。
+        // 第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(1, fake.clearCalls)
-        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
     // Stage D：busy 保留 arm——inFlight 期間 clear 拒 BUSY 不耗 arm，
     // 解除後第二 tap 仍執行（非重 arm）。
+    // Stage J3:解除後第二 tap 重讀仍 Unknown→abort，不執行。
     @Test
     fun blindClear_busy_preservesArm() {
         val fake = FakePolicyStore()
@@ -3314,11 +3369,11 @@ class PolicyWriteTest {
             keys.remove("policy-write:fake-busy")
         }
 
-        // arm 被保留：直接執行（TTL／世代皆過），不重 arm。
+        // arm 被保留，但重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(1, fake.clearCalls)
-        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        Thread.sleep(300)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
     // Stage A review (c) 外部取消透傳：await 期間 scope 取消→CE 重拋，不進
@@ -4782,6 +4837,12 @@ class PolicyWriteTest {
             assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
             assertNull(coordinatorTxOf(coord))
 
+            // Stage J3:VM2 在 VM1 成功期間持有 pending C，外來終態已記 stale＋Unknown
+            // （防盲覆寫）。重試前須顯式 refresh 洗白（Known B），否則 stale 門控拒寫。
+            vm2.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm2.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+
             // 後試者重試即成功（終態 C）。
             vm2.confirmPolicyWrite(pendingC)
             await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
@@ -6221,6 +6282,283 @@ class PolicyWriteTest {
             saveRelease.set(true)
             try { coord.close() } catch (_: Exception) { }
         }
+    }
+
+    // Stage J3-1 pending-vs-foreign：request 建 pending（綁定 base 修訂）後，外來
+    // Known(C) 經 tryEmit 到達→無 activeTx＋有 pending 即跳過 draft 覆寫＋記 stale＋
+    // Unknown；後續 confirm 須拒 UNKNOWN_REFRESH，store 零觸碰（pending 清除重請）。
+    @Test
+    fun j3_pendingVsForeign_confirmRefusesUnknownRefresh() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+
+            // request 建 pending（stamped base＝當下版本）。
+            seedSelection(vm)
+            vm.requestPolicyWrite()
+            val pending = vm.state.value.pendingPolicyWrite
+            assertNotNull(pending)
+            assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+
+            // 外來修訂 Known(C)（異 Tx 終態）。
+            coord.tryEmitSettled(
+                PolicySettled(9999L, "foreign-key", setOf("com.C"), true, MsgKind.INFO, "foreign-msg", false),
+            )
+            await(timeoutMs = 5_000L) { revisionStaleOf(vm) }
+            // 跳過 draft 覆寫（續留 A）、翻 Unknown、pending 保留（待 confirm 拒寫）。
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(pending, vm.state.value.pendingPolicyWrite)
+
+            // confirm 須拒 UNKNOWN_REFRESH，store 零觸碰，pending 清除。
+            vm.confirmPolicyWrite(pending!!)
+            await { vm.state.value.pendingPolicyWrite == null }
+            assertEquals(0, saveCalls.get())
+            assertEquals(setOf("com.A"), backend.get())
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertTrue(vm.state.value.msg.contains("未知"))
+            assertTrue(vm.state.value.msg.contains("重新整理"))
+            assertFalse(vm.state.value.policyDraftKnown)
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Stage J3-4 version-skew-after-wash：stale==false && baseMismatch==true 路徑
+    //（confirm 內 pre-IO 版本門控）。request 綁定 base V0 後，外來 settled 記 stale
+    //＋Unknown（mark bump→V1），再顯式 refresh Known(C) 洗白 stale（版本續留 V1，
+    //不回退）；舊 pending 的 base(V0) 與當下(V1)失配，confirm 須經版本門控 abort
+    //（UNKNOWN_REFRESH＋清 pending），store 零觸碰。與 J3-1（stale 直拒）／J3-2
+    //（legacy -1 經 stale 門控）互補，覆蓋洗白後純版本失配。
+    @Test
+    fun j3_versionSkewAfterWash_abortsWithoutIO() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+
+            // request 建 pending（stamped base＝當下版本，非 legacy -1）。
+            seedSelection(vm)
+            vm.requestPolicyWrite()
+            val pending = vm.state.value.pendingPolicyWrite
+            assertNotNull(pending)
+            assertTrue(pending!!.baseDraftVersion != -1L)
+            assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+
+            // 外來修訂 Known(C)：pending 存活即跳過 draft 覆寫＋記 stale＋Unknown。
+            coord.tryEmitSettled(
+                PolicySettled(9999L, "foreign-key", setOf("com.C"), true, MsgKind.INFO, "foreign-msg", false),
+            )
+            await(timeoutMs = 5_000L) { revisionStaleOf(vm) }
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(pending, vm.state.value.pendingPolicyWrite)
+
+            // 外來寫入已落盤，顯式重讀 Known(C) 洗白 stale（pending 保留）。
+            backend.set(setOf("com.C"))
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { vm.state.value.policyDraftKnown }
+            assertEquals(setOf("com.C"), vm.state.value.policyDraft)
+            assertFalse(revisionStaleOf(vm))
+            assertEquals(pending, vm.state.value.pendingPolicyWrite)
+
+            // 舊 pending confirm：stale 已洗白但 base(V0)!=當下(V1)，須版本門控 abort。
+            vm.confirmPolicyWrite(pending)
+            await(timeoutMs = 5_000L) { vm.state.value.pendingPolicyWrite == null }
+            assertEquals(0, saveCalls.get())
+            assertEquals(setOf("com.C"), backend.get())
+            assertEquals(setOf("com.C"), vm.state.value.policyDraft)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertTrue(vm.state.value.msg.contains("未知"))
+            assertTrue(vm.state.value.msg.contains("重新整理"))
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Stage J3-2 stale-base abort（queued）：VM-A confirm 排隊（opMutex 被慢速無關
+    // op 持有、尚未啟 IO）期間，VM-B clear 成功（{}）＋settled；放行後 VM-A 因 stale
+    // abort（UNKNOWN_REFRESH＋清 pending），store 仍 {}（零覆寫）。
+    // 註：此處 pending 經 setPendingPolicyWrite 直接注入（legacy base=-1，版本門控
+    // 跳過），故走 stale/unknown 門控 abort；stamped base 的純版本失配
+    //（stale 已洗白＋baseMismatch）由 j3_versionSkewAfterWash_abortsWithoutIO 覆蓋。
+    @Test
+    fun j3_staleBaseAbort_queuedConfirmAbortsWithoutOverwrite() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == null) backend.set(emptySet()) else backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            // VM-A 慢速無關 op 先佔自身 opMutex（selectionStore 阻塞）。
+            val blockerEntered = java.util.concurrent.CountDownLatch(1)
+            val blockerRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+            val blockingSelection = SelectionStore(
+                loadRaw = { null },
+                saveRaw = { _ ->
+                    blockerEntered.countDown()
+                    while (!blockerRelease.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    true
+                },
+            )
+            val vmA = DualViewModel(
+                repo = DualRepository(NoOpGateway()),
+                gatewayPrivilege = Privilege.NONE,
+                elevators = emptyList(),
+                preference = ChannelPreference.AUTO,
+                appPackageName = "com.example.test",
+                persistPreference = null,
+                suPresentCheck = { false },
+                shizukuAuthCheck = { false },
+                activeGateway = NoOpGateway(),
+                currentChannel = ResolvedChannel.NOOP,
+                hookDirectReads = { listOf(MarkerRead.Readable(null)) },
+                hookDiagnosticGateways = { emptyList() },
+                hookPolicyStore = store,
+                currentUserId = { 0 },
+                selectionStore = blockingSelection,
+                policyTxCoordinator = coord,
+            )
+            vms.add(vmA)
+            await { vmA.state.value.policyDraftKnown }
+            await { !vmA.state.value.loading }
+            val vmB = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vmB.state.value.policyDraftKnown }
+
+            // VM-A 慢速無關 op 持有其 opMutex。
+            vmA.cancelSavedSelection()
+            assertTrue(blockerEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // VM-A confirm 排隊（pending B，尚未啟 IO；H1 未 claim，writeMutex 空閒）。
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB)
+            // 排隊中（opMutex 被 blocker 持有，尚未取鎖）。
+            await(timeoutMs = 5_000L) { inFlightKeysOf(vmA).any { it.startsWith("policy-") } }
+
+            // VM-B clear 成功（{}）＋ settled 廣播（共享 coordinator＋backend）。
+            vmB.clearPolicyDraft()
+            await(timeoutMs = 10_000L) { backend.get() == emptySet<String>() }
+            await(timeoutMs = 5_000L) { revisionStaleOf(vmA) }
+
+            // 放行 blocker，VM-A 取鎖後因 stale abort，不啟 IO，store 仍 {}。
+            blockerRelease.set(true)
+            await(timeoutMs = 10_000L) { vmA.state.value.pendingPolicyWrite == null }
+            assertEquals(emptySet<String>(), backend.get())
+            assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+            assertTrue(vmA.state.value.msg.contains("未知"))
+            assertFalse(vmA.state.value.policyDraftKnown)
+            assertEquals(PolicyWritePhase.IDLE, vmA.state.value.policyWritePhase)
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Stage J3-3 stalled-read-no-SUCCESS：save=true 但 ackRead 阻塞超 1s bound→
+    // Unknown→RECONCILING＋Known=false，永不發 SUCCESS（即使 save 已證成功）。
+    @Test
+    fun j3_stalledAckRead_entersReconcilingWithoutSuccess() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        var saveCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    // ackRead＋reconciler 讀皆阻塞（>1s bound），放行後回 backend。
+                    while (!loadRelease.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls++
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        // policyIoTimeout 5s（save 不超時），ack bound min(5s,1s)=1s；load 阻塞 3s＋。
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        // ack 超 1s  bound→Unknown→RECONCILING（非 SUCCESS），pending 保留。
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertFalse(vm.state.value.msg.contains("已寫入政策草稿"))
+        assertEquals(1, saveCalls)
+
+        // 清理：放行 load，reconciler 讀到 backend（B）即 SUCCESS 結清。
+        loadRelease.set(true)
+        await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+    }
+
+    // Stage J3-5 blind-clear-requires-Known：load→Unknown，TTL 內 double clear→
+    // store.clear 永不呼叫（不刪未見內容）。
+    @Test
+    fun j3_blindClearRequiresKnown_doubleClearNeverCallsStore() {
+        var now = 50_000L
+        var clearCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = { null },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls++
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null, nowMonoMs = { now })
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertEquals(0, clearCalls)
+
+        now = 50_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
+        vm.clearPolicyDraft()
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm.state.value.loading }
+        assertEquals(0, clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 
 }

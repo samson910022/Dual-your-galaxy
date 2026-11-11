@@ -57,8 +57,8 @@ class HookPolicyStoreTest {
 
     @Test
     fun throwingBackendRecoversEmptyAndSelfClears() {
-        // 型別錯亂 (如裝置上條目被誤寫成 String 致 ClassCastException)：
-        // load 回空且主動清除損壞條目。
+        // Stage J3 (P1 blind-overwrite CCE self-clear)：型別錯亂 (ClassCastException)
+        // 永不 auto-delete——loadResult 回 Unknown，不呼叫 saveRaw(null)，保留舊快照。
         var cleared = false
         val store = HookPolicyStore(
             loadRaw = { throw ClassCastException("String cannot be cast to Set") },
@@ -67,8 +67,9 @@ class HookPolicyStoreTest {
                 true
             },
         )
+        assertTrue(store.loadResult() is LoadResult.Unknown)
         assertTrue(store.load().isEmpty())
-        assertTrue(cleared)
+        assertFalse(cleared)
     }
 
     @Test
@@ -199,6 +200,27 @@ class HookPolicyStoreTest {
         } catch (ce: kotlinx.coroutines.CancellationException) {
             // expected
         }
+    }
+
+    // Stage J3 (P1 blind-overwrite CCE self-clear)：CCE 永不 auto-delete。
+    // backing 有有效草稿時，即使 loadRaw 拋 CCE（類型混淆），亦不得呼叫
+    // saveRaw(null) 刪除，backing 保留，僅回 Unknown。
+    @Test
+    fun cce_noDelete_retainsDraft() {
+        val backing = HashMap<String, Set<String>>()
+        backing[PolicySource.POLICY_KEY_EXTRA_PACKAGES] = setOf("com.keep.a", "com.keep.b")
+        var nullDeletes = 0
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("untrusted type confusion") },
+            saveRaw = { raw ->
+                if (raw == null) nullDeletes++
+                else backing[PolicySource.POLICY_KEY_EXTRA_PACKAGES] = raw.toSet()
+                true
+            },
+        )
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(0, nullDeletes)
+        assertEquals(setOf("com.keep.a", "com.keep.b"), backing[PolicySource.POLICY_KEY_EXTRA_PACKAGES])
     }
 
     // clear 遇 CE 透傳（不轉 false）。
