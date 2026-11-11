@@ -75,7 +75,6 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
@@ -316,7 +315,7 @@ class MainActivity : ComponentActivity() {
     // IO 回主線後比對，過期丟棄；cancel 保留（快速釋放）＋gen 比對（正確性），雙保險。
     private var shizukuGen = 0
     // Phase B B4：分身列表指紋（cloned hash + targetSerial + loading）。
-    // 未變只同步 Switch enabled（比照 renderSourceList 差量）。
+    // 未變只同步移除鈕 enabled（比照 renderSourceList 差量）。
     private var lastClonedListKey: String? = null
     // Phase B B2：分身列表世代 token。renderClonedApps 進入 ++，coroutine
     // capture gen，完成時比對過期丟棄（避免重建後舊圖貼到新行）。
@@ -607,7 +606,7 @@ class MainActivity : ComponentActivity() {
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (light #FFFFFF 5.42 on primary; night
             // #002958 4.52 on primary_container via drawable-night).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener { vm.clone(pkgInput.text.toString()) }
@@ -616,7 +615,7 @@ class MainActivity : ComponentActivity() {
             id = R.id.remove_btn
             text = getString(R.string.action_remove)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             contentDescription = getString(R.string.remove_cd)
             minimumHeight = dp(48)
             setOnClickListener { vm.requestRemove(pkgInput.text.toString()) }
@@ -626,7 +625,7 @@ class MainActivity : ComponentActivity() {
             text = getString(R.string.action_reconnect)
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (see cloneBtn).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             setOnClickListener {
@@ -638,7 +637,7 @@ class MainActivity : ComponentActivity() {
             id = R.id.perm_btn
             text = getString(R.string.action_request_shizuku)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             minimumHeight = dp(48)
             setOnClickListener { requestShizukuPermission() }
         }
@@ -699,7 +698,7 @@ class MainActivity : ComponentActivity() {
         hookDiagBtn = Button(this).apply {
             text = getString(R.string.action_diagnose_hook)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             contentDescription = getString(R.string.diagnose_hook_cd)
             minimumHeight = dp(48)
             setOnClickListener { vm.requestHookRedDiagnosis() }
@@ -750,7 +749,7 @@ class MainActivity : ComponentActivity() {
         exportBtn = Button(this).apply {
             text = getString(R.string.action_export_diagnosis)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             minimumHeight = dp(48)
             setOnClickListener { showDiagnosticExport() }
         }
@@ -787,7 +786,7 @@ class MainActivity : ComponentActivity() {
         systemToggleBtn = Button(this).apply {
             text = getString(R.string.system_apps_hidden)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (height is
             // WRAP_CONTENT so large fonts grow instead of clipping).
@@ -798,7 +797,7 @@ class MainActivity : ComponentActivity() {
         selectAllBtn = Button(this).apply {
             text = getString(R.string.action_select_visible)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -812,7 +811,7 @@ class MainActivity : ComponentActivity() {
         clearSelBtn = Button(this).apply {
             text = getString(R.string.action_clear_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -822,7 +821,7 @@ class MainActivity : ComponentActivity() {
         saveSelBtn = Button(this).apply {
             text = getString(R.string.action_save_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -832,7 +831,7 @@ class MainActivity : ComponentActivity() {
         cancelSaveBtn = Button(this).apply {
             text = getString(R.string.action_unsave_selection)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
-            setTextColor(getColor(R.color.oneui_text_primary))
+            setTextColor(getColorStateList(R.color.pill_button_secondary_text))
             textSize = 12f
             // Phase C: 48dp touch target via minimumHeight (see systemToggleBtn).
             minimumHeight = dp(48)
@@ -853,7 +852,7 @@ class MainActivity : ComponentActivity() {
             text = resources.getQuantityString(R.plurals.batch_create, 0, 0)
             background = getDrawable(R.drawable.bg_pill_button)
             // Phase C: theme token (see cloneBtn).
-            setTextColor(getColor(R.color.oneui_button_text))
+            setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
@@ -1203,8 +1202,8 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
             }
-            addView(cloneBtn, rowParams())
-            addView(removeBtn, rowParams())
+            addView(cloneBtn, spacedRowButtonParams())
+            addView(removeBtn, spacedRowButtonParams())
         }
         manualCard.addView(writeRow)
         tabAppsLayout.addView(manualCard)
@@ -1482,8 +1481,8 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(16)
             }
-            addView(refreshBtn, rowParams())
-            addView(exportBtn, rowParams())
+            addView(refreshBtn, spacedRowButtonParams())
+            addView(exportBtn, spacedRowButtonParams())
         }
         tabEngineLayout.addView(engineActionRow)
 
@@ -1518,6 +1517,7 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
                 val icon = ImageView(context).apply {
                     setImageDrawable(getDrawable(iconRes))
+                    tag = iconRes
                     setColorFilter(getColor(R.color.oneui_text_tertiary))
                     importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
@@ -1543,7 +1543,7 @@ class MainActivity : ComponentActivity() {
         navTabEngine = createNavItem(R.drawable.ic_nav_engine, getString(R.string.tab_core_engine)) {
             switchTab(TAB_CORE_ENGINE)
         }
-        navTabSettings = createNavItem(R.drawable.ic_nav_settings, getString(R.string.tab_settings)) {
+        navTabSettings = createNavItem(R.drawable.ic_nav_about, getString(R.string.tab_settings)) {
             showSettingsDialog()
         }
 
@@ -2089,11 +2089,11 @@ class MainActivity : ComponentActivity() {
     }
 
     // Phase B B1/B2/B4：分身列表渲染。
-    // B1：Switch 為 momentary action（彈回 checked，防視覺翻轉）＋門控
+    // B1：明確「移除」文字鈕（48dp）為 momentary action＋門控
     // isEnabled = !loading && blockKey == null（呼叫端傳 render 已算好的 blockKey，
     // 與 clone/remove/batch 同源）＋48dp 觸控目標＋移除語意 contentDescription。
     // B2：ImageView 先設 tag=appKey；coroutine capture clonedGen，過期丟棄。
-    // B4：指紋未變只同步 Switch enabled，不重建（比照 renderSourceList）。
+    // B4：指紋未變只同步移除鈕 enabled，不重建（比照 renderSourceList）。
     private fun renderClonedApps(s: UiState, blockKey: BlockReason?, catalogKey: Int) {
         if (!::clonedAppsContainer.isInitialized) return
         // Phase E E2：逐行成功宣稱哨兵。tag 顯隱由 Hook live 證據驅動（與徽章區同源
@@ -2106,12 +2106,17 @@ class MainActivity : ComponentActivity() {
         val key = buildClonedListKey(s, catalogKey)
         if (key == lastClonedListKey) {
             val writable = blockKey == null
-            for (i in 0 until clonedAppsContainer.childCount) {
-                val row = clonedAppsContainer.getChildAt(i) as? LinearLayout ?: continue
-                for (j in 0 until row.childCount) {
-                    val child = row.getChildAt(j)
-                    if (child is Switch) child.isEnabled = !s.loading && writable
+            fun syncRemoveButtons(root: android.view.View) {
+                if (root is Button && (root.tag as? String)?.startsWith("remove:") == true) {
+                    root.isEnabled = !s.loading && writable
+                    return
                 }
+                if (root is ViewGroup) {
+                    for (j in 0 until root.childCount) syncRemoveButtons(root.getChildAt(j))
+                }
+            }
+            for (i in 0 until clonedAppsContainer.childCount) {
+                syncRemoveButtons(clonedAppsContainer.getChildAt(i))
             }
             return
         }
@@ -2135,9 +2140,10 @@ class MainActivity : ComponentActivity() {
         // Phase L L1：sync 已在指紋比對前完成，此處不再重算 hash／重 sync。
         val catalogLabels = catalogLabelsFor(s.sourceCatalog)
         for (pkg in s.cloned) {
+            // PR #63 re-review #4 P2：外層改垂直堆疊（每 app 一個 row，childCount/key 語意不變）；
+            // 上方 icon+文字佔滿寬度，下方移除鈕獨立一行可自然伸展，避免 320dp/大字體英文截斷。
             val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.VERTICAL
                 val p = dp(8)
                 setPadding(p, p, p, p)
                 layoutParams = LinearLayout.LayoutParams(
@@ -2147,6 +2153,14 @@ class MainActivity : ComponentActivity() {
                     bottomMargin = dp(6)
                 }
                 background = getDrawable(R.drawable.bg_island_card_high)
+            }
+            val topContent = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
             }
 
             // Left icon container with #2 badge overlay
@@ -2199,14 +2213,13 @@ class MainActivity : ComponentActivity() {
             }
             iconContainer.addView(appIconView)
             iconContainer.addView(badgeView)
-            row.addView(iconContainer)
 
             // Center details
             val textContainer = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
+                minimumWidth = dp(96)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     marginStart = dp(10)
-                    marginEnd = dp(8)
                 }
             }
             val titleRow = LinearLayout(this).apply {
@@ -2273,19 +2286,29 @@ class MainActivity : ComponentActivity() {
             }
             textContainer.addView(titleRow)
             textContainer.addView(subtitleView)
-            row.addView(textContainer)
+            topContent.addView(iconContainer)
+            topContent.addView(textContainer)
+            row.addView(topContent)
 
-            // Switch toggle: momentary removal action, always visually checked.
-            // Toggling initiates safe two-phase removal (dialog), never a direct
-            // on/off state flip; disabled while busy or channel unwritable.
-            val toggleSwitch = Switch(this).apply {
-                isChecked = true
+            // 明確「移除」文字鈕（48dp）：點按仍走 requestRemove 二階段確認
+            // （對話框），行為與改版前相同；不再以開關偽裝成移除操作
+            // （取消勾選 ≠ 移除）。disabled while busy or channel unwritable.
+            val removeRowBtn = Button(this).apply {
+                // PR #63 re-review #3/#4：視覺用短標籤；完整動作語意保留於 contentDescription。
+                // 按鈕置於獨立底列（全寬）可避免 320dp/大字體截斷，不再以 90dp 硬上限擠壓。
+                text = getString(R.string.action_remove_row)
+                background = getDrawable(R.drawable.bg_pill_button_secondary)
+                setTextColor(getColorStateList(R.color.pill_button_secondary_text))
+                textSize = 12f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
                 isEnabled = !s.loading && writable
                 minimumHeight = dp(48)
                 minimumWidth = dp(48)
                 // Phase F F1：tag 供非同步 label 回填定位（rebindClonedLabel）。
-                tag = "switch:$pkg"
+                tag = "remove:$pkg"
                 // Phase G: full-width colon via remove_row_cd (was hardcoded ":").
+                // CD action 保持完整語意（R.string.action_remove），不隨視覺短標籤縮短。
                 contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 setOnClickListener { v ->
                     // 僅以 live View.isEnabled 門控：early-return 路徑每輪 render 皆同步
@@ -2294,15 +2317,24 @@ class MainActivity : ComponentActivity() {
                     // 會誤擋有效點按；VM requestRemove 內含 fail-closed isWritable() 複查
                     // （權威門控，與 a28b56c 行為一致），此處不再用 captured 值攔截。
                     if (v?.isEnabled != true) return@setOnClickListener
-                    try {
-                        (v as? Switch)?.isChecked = true
-                    } catch (_: Exception) {
-                        // Best effort: 彈回失敗不阻塞移除請求。
-                    }
                     vm.requestRemove(pkg)
                 }
             }
-            row.addView(toggleSwitch)
+            val actionRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    topMargin = dp(4)
+                }
+            }
+            actionRow.addView(
+                removeRowBtn,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
+            row.addView(actionRow)
             clonedAppsContainer.addView(row)
             // Phase F F1：快取＋catalog 皆 miss 才起 IO（首輪每列連續 binder 的來源）。
             // 回填＋重綁（tag/世代檢查，過期丟棄，快取保留，下次同步命中）。
@@ -2329,7 +2361,8 @@ class MainActivity : ComponentActivity() {
                         }
                         try {
                             // Phase G: full-width colon via remove_row_cd.
-                            toggleSwitch.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
+                            // CD action 保持完整語意（R.string.action_remove）。
+                            removeRowBtn.contentDescription = getString(R.string.remove_row_cd, getString(R.string.action_remove), fresh)
                         } catch (_: Exception) {
                             // Best effort.
                         }
@@ -2350,7 +2383,7 @@ class MainActivity : ComponentActivity() {
     // Phase L L1：追加 catalogKey（labelCacheKey／catalog.hashCode 同源，呼叫端
     // 單次計算傳入，sync＋key 共用一次 hash）。catalog label 變化即重建，
     // 舊快取不再經 !isLabelCached 命中殘留；同內容同 hash，不致過度重建。
-    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步 Switch enabled；
+    // Phase 1a：移除 loading——busy 邊沿只走 early-return 同步移除鈕 enabled；
     // 納入指紋會致每次 op 全量 removeAllViews＋重建＋圖示/label 重發兩次，並推進
     // clonedGen 使在途回調失效。
     private fun buildClonedListKey(s: UiState, catalogKey: Int): String =
@@ -2413,6 +2446,15 @@ class MainActivity : ComponentActivity() {
 
     private fun rowParams(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+    // PR #63 review: spacing only for paired pill-button rows. Leaking margins
+    // from rowParams() inset single-button rows (hookDiag) and added extra width.
+    private fun spacedRowButtonParams(): LinearLayout.LayoutParams =
+        rowParams().apply {
+            val m = dp(6)
+            marginStart = m
+            marginEnd = m
+        }
 
     // p28-1 通道 RadioButton 佈局（窄螢幕安全）：HorizontalScrollView 量測為
     // UNSPECIFIED，weight 權重（0 寬）在橫滑容器內會塌陷為零寬；此處改
@@ -2658,7 +2700,7 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
-        // renderClonedApps 的 Switch 與稍後按鈕/dialog 共用此 blockKey，不重算。
+        // renderClonedApps 的移除鈕與稍後按鈕/dialog 共用此 blockKey，不重算。
         val busy = s.loading
         // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
         // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
@@ -2989,7 +3031,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "render OneUI badges failed", e)
         }
-        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋Switch 寫入門控 blockKey）。
+        // Phase B B1/B4：分身列表獨立渲染（指紋差量＋移除鈕寫入門控 blockKey）。
         // 移出上段 try：列表失敗不吞徽章更新，徽章失敗不吞列表。
         try {
             renderClonedApps(s, blockKey, catalogKey)
@@ -3145,7 +3187,7 @@ class MainActivity : ComponentActivity() {
         // Two-phase remove (PR-4 P1, issue #23): the dialog is state-driven.
         // A config rotation re-collects the same pendingRemove from the
         // retained ViewModel and re-shows the dialog; no click is re-sent.
-        // Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫 blockKey==null）。
+        // Phase B B1：confirm 門控同移除鈕（loading＋ack＋可寫 blockKey==null）。
         // try 包裝比照 renderClonedApps：未來契約 misfire 時降級，不殺 StateFlow collector。
         try {
             syncRemoveDialog(s.pendingRemove, s.loading, blockKey, catalogKey)
@@ -3257,7 +3299,7 @@ class MainActivity : ComponentActivity() {
     // 在途 loading 時對話框保留但按鈕禁用，靠 VM dedup + 按鈕禁用雙保險：
     // 同一 pending 只更新按鈕 enabled（不重建）；confirm 點下後下一幀
     // render(loading=true) 會自動 disable，不用在 click 內手動 disable。
-    // Phase B B1：confirm 另須通道可寫（blockKey == null，與 Switch/按鈕同源；
+    // Phase B B1：confirm 另須通道可寫（blockKey == null，與移除鈕/其他寫入按鈕同源；
     // busy 時 blockKey 為 null 但 loading 仍禁用，不可繞過）。
     private fun syncRemoveDialog(pending: PendingRemove?, loading: Boolean, blockKey: BlockReason?, catalogKey: Int) {
         if (isFinishing || isDestroyed) return
@@ -3743,9 +3785,9 @@ class MainActivity : ComponentActivity() {
 
     // Phase F F1：分身行 label 回填 fallback（發起行已 detach 時走容器按 tag 查找）。
     // 同行內按 tag 更新：title（tag=pkg）設文字，badge（tag=badge:pkg）與
-    // Switch（tag=switch:pkg）更新 contentDescription；找不到丟棄（快取保留）。
-    // Switch 亦為 TextView 子類，故 title 查找另加型別守衛（title 建時只給純 TextView
-    // 設 tag=pkg，Switch 的 tag 為 switch:pkg）。
+    // 移除鈕（tag=remove:pkg）更新 contentDescription；找不到丟棄（快取保留）。
+    // 移除鈕為 Button（TextView 子類），故 title 查找另加型別守衛（title 建時只給
+    // 純 TextView 設 tag=pkg，移除鈕的 tag 為 remove:pkg）。
     private fun rebindClonedLabel(pkg: String, label: String) {
         try {
             if (!::clonedAppsContainer.isInitialized) return
@@ -3756,7 +3798,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     null
                 } ?: continue
-                if (title is Switch) continue
+                if (title is Button) continue
                 try {
                     title.text = label
                 } catch (_: Exception) {
@@ -3770,7 +3812,8 @@ class MainActivity : ComponentActivity() {
                 }
                 try {
                     // Phase G: full-width colon via remove_row_cd.
-                    row.findViewWithTag<Switch>("switch:$pkg")?.contentDescription =
+                    // CD action 保持完整語意（R.string.action_remove）。
+                    row.findViewWithTag<Button>("remove:$pkg")?.contentDescription =
                         getString(R.string.remove_row_cd, getString(R.string.action_remove), label)
                 } catch (_: Exception) {
                     // Best effort.
@@ -4584,7 +4627,7 @@ class MainActivity : ComponentActivity() {
 // 副作用留 Activity；呼叫端 when 窮舉無 else，新臂加入即編譯失敗）。
 // 行覆寫引理：B-epoch waiter 的行 rowGen／tag／dialog 守衛對當代 waiter 合法
 // 通過——若 stale 成功仍把舊 pm label 派發給當代 waiter，會以舊資料覆寫
-// title／badge CD／Switch CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
+// title／badge CD／移除鈕 CD 且不排重查；故唯有 FANOUT_SAME_EPOCH（同 epoch
 // 成功）可派發本次 pm label，stale 完成只允許 DROP（丟棄）、SERVE_FROM_CACHE
 //（派發 B-render 已預填的當代快取，永非舊 label）、RELAUNCH_FRESH（重掛 fresh
 // waiter＋重發一次 IO）。same-epoch 失敗語義不變（DROP 全丟，下次 render 重註冊）。
@@ -4618,7 +4661,7 @@ internal fun arbitrateLabelCompletion(
 }
 
 // Phase 1a 分身列表指紋鍵（純函數，JVM 可測；buildClonedListKey 委派，
-// 刻意不含 loading——busy 邊沿只走 early-return 同步 Switch enabled，納入
+// 刻意不含 loading——busy 邊沿只走 early-return 同步移除鈕 enabled，納入
 // 指紋會致每次 op 全量重建＋圖示／label 重發兩次並推進 clonedGen 使在途回調失效）。
 internal fun clonedListKeyFor(
     cloned: List<String>,
@@ -5064,7 +5107,7 @@ internal fun formatBatchReportText(report: BatchReport?): String {
 // Trusted isolates keep normal RTL text from reordering the surrounding identity.
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean): Boolean = !loading && acknowledged
 
-// Phase B B1：confirm 門控同 Switch（loading＋ack＋可寫）。二參版保留供既有
+// Phase B B1：confirm 門控同移除鈕（loading＋ack＋可寫）。二參版保留供既有
 // JVM 測試；生產呼叫端一律用三參版（writable 即 blockKey == null）。
 internal fun canConfirmRemove(loading: Boolean, acknowledged: Boolean, writable: Boolean): Boolean =
     !loading && acknowledged && writable
