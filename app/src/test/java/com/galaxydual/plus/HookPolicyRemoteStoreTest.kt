@@ -710,4 +710,126 @@ class HookPolicyRemoteStoreTest {
         assertTrue(result is LoadResult.Known)
         assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
     }
+    // Stage J2: 跨實例毒——同一 prefs 被 A 失敗污染後，從未失敗的 B store 讀到它
+    // 亦須 Unknown（不得把樂觀毒值誤報 Known）。成功重同步後雙方恢復 Known。
+    @Test
+    fun crossInstancePoisonedReadIsUnknownUntilResync() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val storeA = remoteHookPolicyStore { prefs }
+        val storeB = remoteHookPolicyStore { prefs }
+
+        assertFalse(storeA.save(setOf("com.example.a")))
+        assertTrue(storeA.loadResult() is LoadResult.Unknown)
+        // B 從未失敗，但同一 mMap 已毒：必須 Unknown，不可 Known(B)。
+        assertTrue(storeB.loadResult() is LoadResult.Unknown)
+        // 污染確實存在（證明此測試踩到樂觀快取）。
+        assertEquals(
+            setOf("com.example.a"),
+            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+        )
+
+        // 成功重同步（任一 store 成功即全域解毒）後雙方恢復 Known。
+        prefs.commitSucceeds = true
+        assertTrue(storeA.save(setOf("com.example.a")))
+        val ra = storeA.loadResult()
+        assertTrue(ra is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (ra as LoadResult.Known).packages)
+        val rb = storeB.loadResult()
+        assertTrue(rb is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (rb as LoadResult.Known).packages)
+    }
+
+    // Stage J2: clear(false) 跨實例毒——A clear 失敗（樂觀刪鍵）後，B 讀亦 Unknown。
+    @Test
+    fun crossInstanceFailedClearIsUnknown() {
+        val prefs = RecordingPrefs()
+        val seedStore = remoteHookPolicyStore { prefs }
+        assertTrue(seedStore.save(setOf("com.example.keep")))
+
+        prefs.commitSucceeds = false
+        val storeA = remoteHookPolicyStore { prefs }
+        val storeB = remoteHookPolicyStore { prefs }
+        assertFalse(storeA.clear())
+        assertTrue(storeA.loadResult() is LoadResult.Unknown)
+        assertTrue(storeB.loadResult() is LoadResult.Unknown)
+
+        prefs.commitSucceeds = true
+        assertTrue(storeA.clear())
+        assertTrue(storeA.loadResult() is LoadResult.Known)
+        assertTrue((storeA.loadResult() as LoadResult.Known).packages.isEmpty())
+    }
+
+    // Stage J2: 讀後再驗證——fail-mark 與 loadResult 併發時，毒讀不得勝出。
+    // 讀線程阻塞在 getStringSet 內時，主線程標記失敗；放行後讀必須 Unknown。
+    @Test
+    fun barrierFailMarkConcurrentWithLoadReturnsUnknown() {
+        val readEntered = java.util.concurrent.CountDownLatch(1)
+        val readRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        var backing: MutableSet<String>? = mutableSetOf("com.seed")
+        val blockingPrefs = object : SharedPreferences {
+            override fun getAll(): MutableMap<String, *> = HashMap<String, Any?>()
+            override fun getString(key: String?, defValue: String?): String? = defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+                if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) {
+                    readEntered.countDown()
+                    while (!readRelease.get()) {
+                        try {
+                            Thread.sleep(5)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    // 放行時底層已被樂觀污染為 B（由他線程 save 失敗寫入）。
+                    return backing?.toMutableSet() ?: defValues
+                }
+                return defValues
+            }
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+            override fun contains(key: String?): Boolean = key == PolicySource.POLICY_KEY_EXTRA_PACKAGES && backing != null
+            override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+                override fun putString(key: String?, value: String?): SharedPreferences.Editor = this
+                override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
+                    if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) {
+                        backing = values?.toMutableSet()
+                    }
+                    return this
+                }
+                override fun putInt(key: String?, value: Int): SharedPreferences.Editor = this
+                override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
+                override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = this
+                override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
+                override fun remove(key: String?): SharedPreferences.Editor {
+                    if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) backing = null
+                    return this
+                }
+                override fun clear(): SharedPreferences.Editor = this
+                // 先樂觀污染 backing 再回 false（模擬 doUpdate 先於 doCommit）。
+                override fun commit(): Boolean {
+                    return false
+                }
+                override fun apply(): Unit = Unit
+            }
+            override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+            override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        }
+        val store = remoteHookPolicyStore { blockingPrefs }
+        // 讀線程先進入並阻塞。
+        var loadResult: LoadResult? = null
+        val reader = Thread {
+            loadResult = store.loadResult()
+        }
+        reader.start()
+        assertTrue(readEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        // 主線程併發標記失敗（樂觀污染 backing 為 B，commit 回 false）。
+        backing = mutableSetOf("com.example.B")
+        assertFalse(store.save(setOf("com.example.B")))
+        // 放行讀：即使底層是 B，也必須 Unknown（讀後再驗證作廢毒讀）。
+        readRelease.set(true)
+        reader.join(5_000)
+        assertTrue(loadResult is LoadResult.Unknown)
+    }
+
 }
