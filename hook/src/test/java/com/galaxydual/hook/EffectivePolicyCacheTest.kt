@@ -16,7 +16,7 @@ class EffectivePolicyCacheTest {
     fun firstGetComputesAndCaches() {
         var reads = 0
         val cache = EffectivePolicyCache()
-        val first = cache.get(setOf("com.seed.app")) {
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
@@ -28,11 +28,11 @@ class EffectivePolicyCacheTest {
     fun secondGetReturnsCachedValue() {
         var reads = 0
         val cache = EffectivePolicyCache()
-        cache.get(setOf("com.seed.app")) {
+        cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
-        val second = cache.get(setOf("com.seed.app")) {
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
@@ -44,14 +44,14 @@ class EffectivePolicyCacheTest {
     fun invalidateForcesRecompute() {
         var reads = 0
         val cache = EffectivePolicyCache()
-        cache.get(emptySet()) {
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("a")
         }
         cache.invalidate()
         assertEquals(
             setOf("a"),
-            cache.get(emptySet()) {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
                 reads++
                 setOf("a")
             },
@@ -64,7 +64,7 @@ class EffectivePolicyCacheTest {
         var reads = 0
         val time = java.util.concurrent.atomic.AtomicLong(0)
         val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
-        val first = cache.get(setOf("com.seed.app")) {
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             null
         }
@@ -73,7 +73,7 @@ class EffectivePolicyCacheTest {
 
         // A failed read is not cached: the reader is retried on the next get
         // (cooldown elapsed).
-        val second = cache.get(setOf("com.seed.app")) {
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             null
         }
@@ -88,14 +88,14 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
         assertEquals(
             setOf("com.seed.app"),
-            cache.get(setOf("com.seed.app")) {
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                 reads++
                 null
             },
         )
         assertEquals(
             setOf("com.seed.app", "com.remote.app"),
-            cache.get(setOf("com.seed.app")) {
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                 reads++
                 setOf("com.remote.app")
             },
@@ -105,7 +105,7 @@ class EffectivePolicyCacheTest {
         // Now cached: the reader is not called again.
         assertEquals(
             setOf("com.seed.app", "com.remote.app"),
-            cache.get(setOf("com.seed.app")) {
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                 reads++
                 setOf("com.remote.app")
             },
@@ -129,14 +129,14 @@ class EffectivePolicyCacheTest {
     fun emptyRemoteReadIsCachedLikeAnySuccess() {
         var reads = 0
         val cache = EffectivePolicyCache()
-        val first = cache.get(setOf("com.seed.app")) {
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             emptySet()
         }
         assertEquals(setOf("com.seed.app"), first)
         // An empty-but-successful read is still a success: it must be cached,
         // not retried (kills `if (remote != null && remote.isNotEmpty())`).
-        val second = cache.get(setOf("com.seed.app")) {
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             emptySet()
         }
@@ -150,7 +150,7 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache()
         assertEquals(
             setOf("a"),
-            cache.get(emptySet()) {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
                 reads++
                 setOf("a")
             },
@@ -160,7 +160,7 @@ class EffectivePolicyCacheTest {
         // value" (would return "a" + "b").
         assertEquals(
             setOf("b"),
-            cache.get(emptySet()) {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
                 reads++
                 setOf("b")
             },
@@ -173,13 +173,13 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache()
         assertEquals(
             setOf("com.seed.app", "com.remote.app"),
-            cache.get(setOf("com.seed.app")) { setOf("com.remote.app") },
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { setOf("com.remote.app") },
         )
         cache.invalidate()
         // After invalidation a failed read must not resurrect the stale cache.
         assertEquals(
             setOf("com.seed.app"),
-            cache.get(setOf("com.seed.app")) { null },
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
         )
     }
 
@@ -188,7 +188,7 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache()
         assertEquals(
             setOf("com.ok.app"),
-            cache.get(setOf("com.ok.app", "bad pkg")) { null },
+            cache.get(setOf("com.ok.app", "bad pkg"), nonEmptyPolicyGateOpen = true) { null },
         )
     }
 
@@ -202,7 +202,7 @@ class EffectivePolicyCacheTest {
         val corrupt = setOf("com.ok.app", 42) as Set<String>
         assertEquals(
             setOf("com.ok.app"),
-            cache.get(emptySet()) {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
                 reads++
                 corrupt
             },
@@ -210,7 +210,7 @@ class EffectivePolicyCacheTest {
         // The sanitized set is a successful read and must be cached.
         assertEquals(
             setOf("com.ok.app"),
-            cache.get(emptySet()) {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
                 reads++
                 corrupt
             },
@@ -229,7 +229,7 @@ class EffectivePolicyCacheTest {
         }
         assertEquals(
             setOf("com.seed.app"),
-            cache.get(setOf("com.seed.app")) {
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                 reads++
                 hostile
             },
@@ -237,7 +237,7 @@ class EffectivePolicyCacheTest {
         // The throwing set is treated as a failed read: not cached, retried.
         assertEquals(
             setOf("com.seed.app"),
-            cache.get(setOf("com.seed.app")) {
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                 reads++
                 hostile
             },
@@ -259,7 +259,7 @@ class EffectivePolicyCacheTest {
             Thread {
                 barrier.await()
                 results.add(
-                    cache.get(setOf("com.seed.app")) {
+                    cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
                         reads.incrementAndGet()
                         setOf("com.remote.app")
                     },
@@ -282,19 +282,19 @@ class EffectivePolicyCacheTest {
         var reads = 0
         var time = 1_000L
         val cache = EffectivePolicyCache(nowMs = { time })
-        cache.get(setOf("com.seed.app")) {
+        cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
         cache.invalidate()
-        val r1 = cache.get(setOf("com.seed.app")) {
+        val r1 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             null
         }
         assertEquals(setOf("com.seed.app"), r1)
         assertEquals(2, reads)
 
-        val r2 = cache.get(setOf("com.seed.app")) {
+        val r2 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
@@ -304,7 +304,7 @@ class EffectivePolicyCacheTest {
         assertEquals(2, reads)
 
         time = 7_000
-        val r3 = cache.get(setOf("com.seed.app")) {
+        val r3 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             setOf("com.remote.app")
         }
@@ -317,14 +317,14 @@ class EffectivePolicyCacheTest {
         var reads = 0
         val time = java.util.concurrent.atomic.AtomicLong(0)
         val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
-        val first = cache.get(setOf("com.seed.app")) {
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             throw RuntimeException("boom")
         }
         assertEquals(setOf("com.seed.app"), first)
         assertEquals(1, reads)
 
-        val second = cache.get(setOf("com.seed.app")) {
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             throw RuntimeException("boom")
         }
@@ -337,7 +337,7 @@ class EffectivePolicyCacheTest {
         var reads = 0
         var time = 0L
         val cache = EffectivePolicyCache(nowMs = { time })
-        val first = cache.get(setOf("com.seed.app")) {
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             null
         }
@@ -345,7 +345,7 @@ class EffectivePolicyCacheTest {
         assertEquals(1, reads)
 
         time = 1_000L
-        val second = cache.get(setOf("com.seed.app")) {
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
             reads++
             null
         }
@@ -361,16 +361,16 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache(nowMs = { time })
         // First a successful read, then invalidate, then a failed read that
         // starts a cooldown.
-        cache.get(emptySet()) { reads++; setOf("a") }
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("a") }
         cache.invalidate()
-        val r1 = cache.get(emptySet()) { reads++; null }
+        val r1 = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; null }
         assertEquals(emptySet<String>(), r1)
         assertEquals(2, reads)
         // Within the cooldown window, a second read would normally be
         // throttled; but an explicit invalidate resets the cooldown and lets
         // the reader run again immediately.
         cache.invalidate()
-        val r2 = cache.get(emptySet()) { reads++; setOf("b") }
+        val r2 = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("b") }
         assertEquals(setOf("b"), r2)
         assertEquals(3, reads)
     }
@@ -380,7 +380,7 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache()
         assertFalse(cache.isCached())
         assertFalse(cache.hadGoodValue())
-        cache.get(emptySet()) { setOf("a") }
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
         assertTrue(cache.isCached())
         assertTrue(cache.hadGoodValue())
         cache.invalidate()
@@ -388,7 +388,7 @@ class EffectivePolicyCacheTest {
         assertTrue(cache.hadGoodValue())
         // A failed read with no prior good value keeps both false.
         val c2 = EffectivePolicyCache()
-        c2.get(emptySet()) { null }
+        c2.get(emptySet(), nonEmptyPolicyGateOpen = true) { null }
         assertFalse(c2.isCached())
         assertFalse(c2.hadGoodValue())
     }
@@ -401,7 +401,7 @@ class EffectivePolicyCacheTest {
         // Repeated failure does not log again.
         assertFalse(cache.shouldLogFailure())
         // A successful read resets the transition, so the next failure logs.
-        cache.get(emptySet()) { setOf("a") }
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
         assertTrue(cache.shouldLogFailure())
         // Invalidate resets the transition as well.
         cache.invalidate()
@@ -413,12 +413,12 @@ class EffectivePolicyCacheTest {
         var reads = 0
         var time = 1_000L
         val cache = EffectivePolicyCache(nowMs = { time })
-        assertEquals(setOf("a"), cache.get(emptySet()) { reads++; setOf("a") })
+        assertEquals(setOf("a"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("a") })
         assertEquals(1, reads)
         // After the bounded freshness TTL, a valid cache is re-read even
         // without an explicit invalidation.
         time = 1_000L + 60_000L
-        assertEquals(setOf("b"), cache.get(emptySet()) { reads++; setOf("b") })
+        assertEquals(setOf("b"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("b") })
         assertEquals(2, reads)
     }
 
@@ -426,11 +426,11 @@ class EffectivePolicyCacheTest {
     fun ttlExpiryThenFailedReadFallsBackToSeed() {
         var time = 1_000L
         val cache = EffectivePolicyCache(nowMs = { time })
-        assertEquals(setOf("a"), cache.get(emptySet()) { setOf("a") })
+        assertEquals(setOf("a"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") })
         // Expire the cache, then a failed re-read must not resurrect the stale
         // value: it falls back to the seed alone (fail-closed).
         time = 1_000L + 60_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app")) { null })
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null })
     }
 
     // 冷卻滑動回歸：連續失敗仍節流。四次 get、時間推進跨兩窗口，reads==2。
@@ -444,20 +444,46 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache(nowMs = { time })
         val failing: () -> Set<String>? = { reads++; null }
 
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
         assertEquals(1, reads)
 
         time = 2_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
         assertEquals(1, reads)
 
         time = 7_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
         assertEquals(2, reads)
 
         // 舊窗口（自 1_000 起 5s）已過，新窗口（自 7_000 起 5s）內：必須節流。
         time = 8_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
         assertEquals(2, reads)
+    }
+
+    @Test
+    fun gateClosedNonEmptyRemoteReturnsEmpty() {
+        // Default gate (closed): sanitized non-empty merge must not reach
+        // callers even through the cache layer (observe-only).
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) { setOf("com.remote.app") },
+        )
+        assertEquals(
+            emptySet<String>(),
+            cache.get(emptySet()) { setOf("a") },
+        )
+    }
+
+    @Test
+    fun gateClosedSeedFallbackReturnsEmpty() {
+        // Default gate (closed): seed-only fallback is also blocked while the
+        // gate is closed (fail-closed to empty, not the seed alone).
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) { null },
+        )
     }
 }
