@@ -4090,16 +4090,33 @@ class DualViewModel(
                         }
                     }
                 } catch (te: TimeoutCancellationException) {
-                    // Stage F2 總預算超限：誠實 unresolved（同上，不回 IDLE、不解 fence）。
+                    // Stage F2 總預算超限：誠實 unresolved（不回 IDLE、不解 fence），
+                    // 但期間若有新事實（refresh/新 save 推進世代）則丟棄回 IDLE＋
+                    // REFRESHED（保留新事實的 draft/Known，清 pending，解 fence），
+                    // 免覆寫新事實（同 hadReadTimeout 內判）。
+                    var keepFenceBudget = true
                     _state.update { cur ->
-                        cur.copy(
-                            policyWritePhase = PolicyWritePhase.RECONCILING,
-                            policyDraftKnown = false,
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
-                            msgKind = MsgKind.CHANNEL,
-                        )
+                        if (policyDraftVersion.get() != versionAtStart ||
+                            policyLoadGeneration.get() != generation
+                        ) {
+                            keepFenceBudget = false
+                            cur.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.RECONCILING,
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
                     }
-                    settle = false
+                    settle = !keepFenceBudget
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -4331,16 +4348,30 @@ class DualViewModel(
                         }
                     }
                 } catch (te: TimeoutCancellationException) {
-                    // Stage F2 總預算超限：誠實 unresolved（同上，不回 IDLE、不解 fence）。
+                    // Stage F2 總預算超限：誠實 unresolved（clear 本無 pending；
+                    // 世代推進即丟棄回 IDLE＋REFRESHED，同 confirm）。
+                    var keepFenceBudget = true
                     _state.update { cur ->
-                        cur.copy(
-                            policyWritePhase = PolicyWritePhase.RECONCILING,
-                            policyDraftKnown = false,
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
-                            msgKind = MsgKind.CHANNEL,
-                        )
+                        if (policyDraftVersion.get() != versionAtStart ||
+                            policyLoadGeneration.get() != generation
+                        ) {
+                            keepFenceBudget = false
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.RECONCILING,
+                                policyDraftKnown = false,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
                     }
-                    settle = false
+                    settle = !keepFenceBudget
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -4368,6 +4399,21 @@ class DualViewModel(
     // 成功（Known）正常更新 draft/Known；若前 msg 為 FAILED/CHANNEL 則改寫為
     // INFO「已重新整理」以免舊錯誤洗屏，其餘保留既有 msg。
     // 手動入口：MainActivity 政策區塊「重新整理草稿」按鈕直呼本函數。
+    // Stage F2 honest-unresolved 恢復（late-join）：
+    // - Tx 存活（reconciler 已誠實 unresolved 退出，settle=false 保留 fence）
+    //   時，本函數為唯一恢復路徑：
+    //   - 本次讀 Known 且 deferred 已完成→late-join 結清並 Tx-settle CAS：
+    //     成功（await true）→IDLE＋Known（==sanitized 即 WRITE_SUCCESS/
+    //     CLEAR_SUCCESS，否則 REFRESHED ground truth）＋pending 清空；
+    //     失敗（false/拋出）→IDLE＋FAILED/Unknown（WRITE_FAILED/CLEAR_FAILED，
+    //     樂觀讀不得翻案）＋pending 清空。
+    //   - 其餘（deferred 未完成或本次 Unknown）→讓位（yielding）：按正常
+    //     refresh 發布（覆寫 TIMEOUT 的 msg/draft/Known，但不碰 phase/pending；
+    //     phase 續留 RECONCILING，pending 保留），reconciler 若仍在跑見世代
+    //     推進即 TOCTOU 丟棄回 IDLE（見 reconcilerStalePublish 測試）；若
+    //     reconciler 已退出（unresolved），則 phase 續留 RECONCILING 待下一次
+    //     late-join（deferred 完成後再 refresh 即結清）。
+    //   世代失配（期間另有新事實）一律丟棄，不覆寫。
     fun refreshPolicyDraft() {
         viewModelScope.launch {
             policyRefreshInFlight.incrementAndGet()
@@ -4384,11 +4430,180 @@ class DualViewModel(
                     if (e is CancellationException) throw e
                     LoadResult.Unknown
                 }
+                // Tx 快照（IO 後取值：覆蓋讀期間出現的 Tx；reconciler 已退出時
+                // 仍可見滯留 Tx，late-join 可恢復）。
+                val txSnap = activePolicyTx.get()
+                // late-join 僅在「Tx 存活＋本次 Known＋deferred 已完成」時嘗試：
+                // await 即時回值（不耗預算）；CE 透傳；異常視為已證失敗。
+                // 非此條件一律 null（走丟棄/正常路徑，不搶結）。
+                val lateJoinOk: Boolean? = if (txSnap != null && result is LoadResult.Known &&
+                    txSnap.deferred.isCompleted
+                ) {
+                    try {
+                        txSnap.deferred.await()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        false
+                    }
+                } else {
+                    null
+                }
+                // 已證失敗的 fence 必須在 update 前背靠背 bump（Phase 1 語義：
+                // 失敗是新事實，舊 load 的 Known 已過期）。僅當「世代未變＋
+                // Tx 仍為同一」才 bump；否則不 bump（直接丟棄）。
+                // 成功路徑不 bump（發布 Known 本身即新事實，舊 load 世代已落後）。
+                val lateFailMarked: Boolean
+                val lateFailExpV: Long
+                val lateFailExpG: Long
+                if (txSnap != null && result is LoadResult.Known && lateJoinOk == false &&
+                    policyDraftVersion.get() == versionAtStart &&
+                    policyLoadGeneration.get() == generation &&
+                    activePolicyTx.get() === txSnap
+                ) {
+                    markPolicyUnknownLocked()
+                    lateFailMarked = true
+                    lateFailExpV = versionAtStart + 1
+                    lateFailExpG = generation + 1
+                } else {
+                    lateFailMarked = false
+                    lateFailExpV = -1L
+                    lateFailExpG = -1L
+                }
+                var lateSettled = false
                 _state.update { cur ->
-                    if (policyDraftVersion.get() != versionAtStart ||
-                        policyLoadGeneration.get() != generation
+                    if (!lateFailMarked &&
+                        (policyDraftVersion.get() != versionAtStart ||
+                            policyLoadGeneration.get() != generation)
                     ) {
                         cur
+                    } else if (txSnap != null) {
+                        // Tx 期中：先判 late-join（Known＋已完成），否則丟棄。
+                        if (result is LoadResult.Known && lateJoinOk != null) {
+                            // 世代未變（上行外判已過），可結清。仍需確認 Tx
+                            // 仍為同一（期間無人結清/替換，否則丟棄免雙結）。
+                            if (activePolicyTx.get() !== txSnap) {
+                                cur
+                            } else if (!lateJoinOk) {
+                                // 已證失敗：FAILED＋Unknown＋IDLE＋pending 清空
+                                // （樂觀讀不得翻案；外層已 mark，此處以
+                                // expected 為準：期間再有推進即丟棄轉
+                                // IDLE＋REFRESHED，免覆寫新事實）。
+                                if (policyDraftVersion.get() != lateFailExpV ||
+                                    policyLoadGeneration.get() != lateFailExpG
+                                ) {
+                                    lateSettled = true
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (txSnap.isClear) {
+                                    lateSettled = true
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                        msgKind = MsgKind.FAILED,
+                                    )
+                                } else {
+                                    lateSettled = true
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                                        msgKind = MsgKind.FAILED,
+                                    )
+                                }
+                            } else if (txSnap.isClear) {
+                                lateSettled = true
+                                disarmBlindClear()
+                                if (result.packages.isEmpty()) {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = emptySet(),
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = result.packages,
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            } else {
+                                lateSettled = true
+                                disarmBlindClear()
+                                if (result.packages == txSnap.sanitized) {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = result.packages,
+                                        policyDraftKnown = true,
+                                        msg = policyText(
+                                            PolicyText(PolicyTextKind.WRITE_SUCCESS, result.packages.size),
+                                        ),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = result.packages,
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            }
+                        } else {
+                            // Tx 期中讓位（yielding）：deferred 未完成或本次 Unknown
+                            // 時，仍按正常 refresh 發布（覆寫 TIMEOUT/REFRESH_FAILED
+                            // 的 msg/draft/Known，但不碰 phase/pending；phase 續留
+                            // RECONCILING，pending 保留，reconciler 見世代推進即
+                            // TOCTOU 丟棄回 IDLE，見 reconcilerStalePublish 測試）。
+                            // 唯 late-join（Known＋已完成，上行分支）才結清 Tx。
+                            if (result is LoadResult.Known) {
+                                disarmBlindClear()
+                                if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
+                                    cur.copy(
+                                        policyDraft = result.packages,
+                                        policyDraftKnown = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(policyDraft = result.packages, policyDraftKnown = true)
+                                }
+                            } else {
+                                if (store == null) {
+                                    cur.copy(
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.NO_STORE_READ)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        policyDraftKnown = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                        }
                     } else if (result is LoadResult.Known) {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         disarmBlindClear()
@@ -4421,6 +4636,11 @@ class DualViewModel(
                             )
                         }
                     }
+                }
+                // late-join 結清：Tx-settle CAS（唯擁有者清 fence；併發已結則
+                // no-op，不重複移除）。
+                if (lateSettled && txSnap != null) {
+                    settlePolicyTx(txSnap)
                 }
             } finally {
                 if (policyRefreshInFlight.decrementAndGet() <= 0) {
@@ -6388,6 +6608,11 @@ class DualViewModel(
         // clears its successor.
         selectJob?.cancel()
         val job = viewModelScope.launch {
+            // Stage F2 honest-unresolved：Tx 存活時跳過 probe＋refresh（保留
+            // RECONCILING＋TIMEOUT/REFRESH_FAILED＋pending＋draft/Known，不碰
+            // msg/phase；見 PolicyWriteTest selectDuringTx）。入口先判，免搶
+            // loading 覆寫核對提示。
+            if (activePolicyTx.get() != null) return@launch
             // F2/P3 leading busy (msg-preserving): the picker tap reads busy
             // even while queued behind opMutex; the locked body re-sets it
             // idempotently below.
@@ -6410,6 +6635,12 @@ class DualViewModel(
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         // Best effort: a failing store never blocks the swap.
+                    }
+                    // Stage F2 內層重檢（排隊期間出現 Tx）：僅清 loading 並返回，
+                    // 不碰 probe/refresh/msg/phase/pending（保留核對 fence）。
+                    if (activePolicyTx.get() != null) {
+                        _state.update { it.copy(loading = false) }
+                        return@withLock
                     }
                     // 鏈式共用一次 loading：probe 保留 busy，refresh 結尾才清除。
                     probeChannels(allowPrivilegedHookDiagnosis = allowPrivilegedHookDiagnosis, keepLoadingOnExit = true)
@@ -7476,6 +7707,10 @@ class DualViewModel(
         // F2/P3 leading busy (msg-preserving, same as refresh()): queued
         // behind opMutex still reads busy.
         viewModelScope.launch {
+            // Stage F2 honest-unresolved：Tx 存活即跳過（保留 RECONCILING＋
+            // TIMEOUT/REFRESH_FAILED＋pending，不碰 msg/phase；見 selectChannel
+            // 同級守衛＋測試）。入口先判，免搶 loading。
+            if (activePolicyTx.get() != null) return@launch
             _state.update { it.copy(loading = true) }
             if (foregroundJob?.isActive == true) {
                 foregroundPending = true
@@ -7513,6 +7748,12 @@ class DualViewModel(
     // 的清除點 → 同殘 true；外層補取消清 loading 作保險 (僅取消路徑，
     // 不改成功/失敗語意)。
     private suspend fun foregroundLocked() {
+        // Stage F2 內層重檢（排隊期間出現 Tx）：僅清 loading 並返回，不碰
+        // probe/refresh/msg/phase/pending/draft（保留核對 fence；trailing 亦經此）。
+        if (activePolicyTx.get() != null) {
+            _state.update { it.copy(loading = false) }
+            return
+        }
         _state.update { it.copy(loading = true) }
         try {
             // 過期 FRESH 補 STALE 放 try 內：時鐘拋錯走取消/異常路徑清 loading，
