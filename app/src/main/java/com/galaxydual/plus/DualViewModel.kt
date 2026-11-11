@@ -27,7 +27,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -155,6 +158,12 @@ fun ProbeScope.displayLabel(): String = when (this) {
 // - QUEUED：已排隊等 opMutex（confirm 已呼叫但 save 未開始；request 建 pending
 //   後亦為 QUEUED；clear 已呼叫但 store IO 未開始亦為 QUEUED）。此時取消仍有效。
 // - SAVING：store save/clear IO 已實際開始（不可取消；cancel 為 no-op）。
+// - RECONCILING：save/clear 已逾時、結果未知，mutex 已釋放，reconciler 正在
+//   背景核對（loadResult 重試 N=3）。pending 保留（confirm；clear 本無 pending），
+//   新 request/confirm/clear/cancel 一律拒絕（BUSY/核對中），render 視同 SAVING
+//   禁用確認/取消。終態由 reconciler 以 TOCTOU 守衛發布（Known→成功/REFRESHED，
+//   Unknown→REFRESH_FAILED），相位回 IDLE。Additive：既有 IDLE/QUEUED/SAVING
+//   語義不動，僅新增此相位。
 // 相位與 loading 在同一 _state.update 翻轉（特別是 QUEUED→SAVING 與
 // loading=true 同一 emission），消除「loading 已 true 但 saving 集合尚未 add」
 // 的一幀 stale（舊碼先 update loading=true 才 add，dialog 仍可取消一幀）。
@@ -162,6 +171,7 @@ enum class PolicyWritePhase {
     IDLE,
     QUEUED,
     SAVING,
+    RECONCILING,
 }
 
 private val removeGeneration = java.util.concurrent.atomic.AtomicLong()
@@ -681,7 +691,19 @@ class DualViewModel(
         // Phase 4:confirm/clear 持 opMutex 橫跨 onIo save/clear 的有界超時。
         // RemotePreferences 為 binder IPC,無超時會長 pin opMutex 餓死其他操作;
         // 超時轉既有 FAILED + Unknown fence (不新增語義,見下 withTimeout 處)。
+        // Stage A：逾時改走 RECONCILING + reconciler（見 confirm/clear），FAILED
+        // 僅保留給「已證明失敗」（store 回 false/拋出），逾時（未知）一律 CHANNEL。
         const val POLICY_IO_TIMEOUT_MS = 10_000L
+        // Stage A：reconciler loadResult 重試次數（store 零 API 新增，僅重讀）。
+        const val POLICY_RECONCILE_RETRIES = 3
+        // Stage A review：reconciler 退避（選 (a)：加退避＋重試間隔，不 await
+        // 脫鉤的慢 save future）。逾時交接後慢 save 仍在背景續跑，首讀若立即發出
+        // 極可能讀到寫前舊值（stale-read 誤判 mismatch）；500ms 首延給慢 save
+        // 落盤機會，重試間 1s 避免對 binder 熱迴圈。捨 (b) 延長 await 脫鉤句柄：
+        // 逾時已證明該 future 不可信（可能永不回），再等只會重 pin reconciler，
+        // ground truth 應來自重讀而非殘留 future。
+        const val POLICY_RECONCILE_INITIAL_DELAY_MS = 500L
+        const val POLICY_RECONCILE_RETRY_DELAY_MS = 1_000L
     }
     private val _state = MutableStateFlow(
         UiState(
@@ -768,6 +790,11 @@ class DualViewModel(
     // merely queued (in inFlightWrites but not here) still clears pending so
     // the queued confirm aborts; only a save already in flight is uncancellable.
     private val policyWriteSaving = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // Stage A (P1 超時不確定性)：核對中 key 集合。confirm/clear 逾時即由外層
+    // finally 自 inFlight/saving 交接至此（mutex 已釋放），reconciler 終態 finally
+    // 移除。入口守衛讀 phase==RECONCILING OR 本集合非空（雙層，防 state/集合
+    // 瞬時窗口漂移）；store 零 API 新增，僅 VM 側追蹤。
+    private val policyReconciling = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     // Monotonic counter for unique clear-in-flight keys (avoids timestamp collisions).
     // Phase 3 關係註記：本計數器僅保證 "policy-clear:<n>" key 唯一（與
     // policyWriteGeneration 保證 PendingPolicyWrite.generation 唯一分工）；
@@ -792,8 +819,8 @@ class DualViewModel(
     // store IO has started. Cancelability uses policyWriteCommitInProgress
     // (saving only): a merely-queued confirm is still cancellable.
     // Phase 3：唯一真相已遷入 UiState.policyWritePhase，render 不再讀此二 getter
-    //（見 render：s.policyWritePhase != IDLE / == SAVING）。此二 getter 僅為相容
-    // 保留（舊測試/外部調用），以「state OR 集合」實現，避免 state 更新與集合
+    //（見 render：s.policyWritePhase != IDLE / == SAVING || == RECONCILING）。
+    // 此二 getter 僅為相容保留（舊測試/外部調用），以「state OR 集合」實現，避免 state 更新與集合
     // add 之間的瞬時窗口漏報；新碼一律讀 state。
     @Deprecated(
         "Render 請讀 state.policyWritePhase != IDLE；僅相容保留",
@@ -806,13 +833,16 @@ class DualViewModel(
     // True only once a policy save IO has actually started
     // (policyWriteSaving non-empty); queued-behind-mutex is still cancellable.
     // Phase 3：同上，唯一真相為 state.policyWritePhase == SAVING；此 getter 僅相容。
+    // Stage A：核對中視同提交中（render 同 SAVING 禁用；集合另有 reconciling 交接，
+    // 此處以 state OR 三集合實現，避免窗口漏報）。
     @Deprecated(
         "Render 請讀 state.policyWritePhase == SAVING；僅相容保留",
         ReplaceWith("state.value.policyWritePhase == PolicyWritePhase.SAVING"),
     )
     val policyWriteCommitInProgress: Boolean
         get() = _state.value.policyWritePhase == PolicyWritePhase.SAVING ||
-            policyWriteSaving.isNotEmpty()
+            _state.value.policyWritePhase == PolicyWritePhase.RECONCILING ||
+            policyWriteSaving.isNotEmpty() || policyReconciling.isNotEmpty()
 
     // Busy ownership (階段L P2): a cancelled waiter must not clear loading
     // while a sibling holder still owns the mutex. All four coalesced entries
@@ -3593,6 +3623,178 @@ class DualViewModel(
         policyLoadGeneration.incrementAndGet()
     }
 
+    // Stage A：核對中守衛（phase OR 集合雙層，防 state/集合瞬時窗口漂移）。
+    // request/cancel/clear/confirm 入口共用：核對中一律拒絕新寫入（BUSY/進行中），
+    // cancel 靜默 no-op（pending 保留，沿用 SAVING 語義）。
+    private fun isPolicyReconcilingLocked(): Boolean =
+        _state.value.policyWritePhase == PolicyWritePhase.RECONCILING ||
+            policyReconciling.isNotEmpty()
+
+    // Stage A：confirm 逾時後的背景核對器（獨立 job，不持 opMutex/mutex 已釋放）。
+    // - 子 job 可取消（Dispatchers.IO，不加 NonCancellable）：backoff delay 與
+    //   load 皆響應外部取消（VM 清除），CE 透傳、不發布終態；finally（非 suspend
+    //   的 key 移除）仍跑，故無殘留。清理本身非 suspend，不需 withContext
+    //   (NonCancellable) 包裹；終態 _state.update 亦非 suspend。
+    // - loadResult 重試 N=3（store 零 API 新增，僅重讀）：每次重讀外包
+    //   withTimeout(policyIoTimeoutMs)，逾時視 Unknown 進下次重試；任一次
+    //   Known 即採納；全 Unknown 才判未知（REFRESH_FAILED/CHANNEL）。
+    // - 首讀前短退避 500ms、重試間隔 1s（見 POLICY_RECONCILE_* 常數註記選 (a)
+    //   理由）：讓脫鉤慢 save 先落盤，免 stale-read 誤判。
+    // - 終態 TOCTOU 守衛：啟動時取號（version 取樣 + generation 遞增），發布前
+    //   比對，期間若有新 save/refresh/load 推進即丟棄（最新者勝，不覆寫新事實）。
+    // - 終態不碰 loading（不擁有 busy：核對期間 refresh 可能持有 loading，誤清
+    //   即消 spinner）；只翻 pending/phase/Known/draft/msg。成功即 disarm。
+    // - finally 交接：移除 reconcilingKeys（與外層 finally 的 inFlight→reconciling
+    //   交接配對，不殘留）。
+    private fun launchConfirmReconciler(
+        key: String,
+        store: HookPolicyStore,
+        sanitized: Set<String>,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val versionAtStart = policyDraftVersion.get()
+            val generation = policyLoadGeneration.incrementAndGet()
+            var result: LoadResult = LoadResult.Unknown
+            try {
+                delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
+                for (i in 0 until POLICY_RECONCILE_RETRIES) {
+                    val r = try {
+                        withTimeout(policyIoTimeoutMs) {
+                            onIo { store.loadResult() }
+                        }
+                    } catch (te: TimeoutCancellationException) {
+                        LoadResult.Unknown
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        LoadResult.Unknown
+                    }
+                    result = r
+                    if (r is LoadResult.Known) break
+                    if (i < POLICY_RECONCILE_RETRIES - 1) {
+                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                    }
+                }
+                val finalResult = result
+                _state.update { cur ->
+                    if (policyDraftVersion.get() != versionAtStart ||
+                        policyLoadGeneration.get() != generation
+                    ) {
+                        cur
+                    } else if (finalResult is LoadResult.Known) {
+                        blindClearArmed.set(false)
+                        if (finalResult.packages == sanitized) {
+                            cur.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraft = finalResult.packages,
+                                policyDraftKnown = true,
+                                msg = policyText(PolicyText(PolicyTextKind.WRITE_SUCCESS, finalResult.packages.size)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
+                            // truth 為準 + REFRESHED 明示（INFO）。
+                            cur.copy(
+                                pendingPolicyWrite = null,
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraft = finalResult.packages,
+                                policyDraftKnown = true,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                    } else {
+                        cur.copy(
+                            pendingPolicyWrite = null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
+                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
+                    }
+                }
+            } finally {
+                policyReconciling.remove(key)
+            }
+        }
+    }
+
+    // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
+    // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
+    // 呈現，全 Unknown→REFRESH_FAILED/CHANNEL；成功即 disarm；不碰 loading；
+    // 子 job 可取消、每次重讀 withTimeout、首延 500ms＋重試間 1s，見 confirm 註記）。
+    private fun launchClearReconciler(key: String, store: HookPolicyStore) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val versionAtStart = policyDraftVersion.get()
+            val generation = policyLoadGeneration.incrementAndGet()
+            var result: LoadResult = LoadResult.Unknown
+            try {
+                delay(POLICY_RECONCILE_INITIAL_DELAY_MS)
+                for (i in 0 until POLICY_RECONCILE_RETRIES) {
+                    val r = try {
+                        withTimeout(policyIoTimeoutMs) {
+                            onIo { store.loadResult() }
+                        }
+                    } catch (te: TimeoutCancellationException) {
+                        LoadResult.Unknown
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        LoadResult.Unknown
+                    }
+                    result = r
+                    if (r is LoadResult.Known) break
+                    if (i < POLICY_RECONCILE_RETRIES - 1) {
+                        delay(POLICY_RECONCILE_RETRY_DELAY_MS)
+                    }
+                }
+                val finalResult = result
+                _state.update { cur ->
+                    if (policyDraftVersion.get() != versionAtStart ||
+                        policyLoadGeneration.get() != generation
+                    ) {
+                        cur
+                    } else if (finalResult is LoadResult.Known) {
+                        blindClearArmed.set(false)
+                        if (finalResult.packages.isEmpty()) {
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraft = emptySet(),
+                                policyDraftKnown = true,
+                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        } else {
+                            cur.copy(
+                                policyWritePhase = PolicyWritePhase.IDLE,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                policyDraft = finalResult.packages,
+                                policyDraftKnown = true,
+                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                    } else {
+                        cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
+                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
+                    }
+                }
+            } finally {
+                policyReconciling.remove(key)
+            }
+        }
+    }
+
     // 重讀草稿 (供 init 後/外部變化後手動同步)：唯讀，不觸發寫入。
     // Phase 2 可觀測化最小版：獨立 policyRefreshing 位（不碰全域 loading，
     // 故無 sibling 誤清問題；連打由 generation 丟棄保證最新者勝，計數器保證
@@ -3670,6 +3872,14 @@ class DualViewModel(
         // 併發寫入造成 UI/store 不一致 (opMutex 之外仍有 inFlight 去重)。
         // 任何政策寫入/清除進行中皆拒絕新請求,避免覆寫進行中的操作。
         if (inFlightWrites.any { it.startsWith("policy-") }) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // Stage A：核對中拒絕新請求（BUSY；render 按鈕亦因非 IDLE 禁用，此為
+        // 程式化調用兜底，pending 保留，請勿重試）。
+        if (isPolicyReconcilingLocked()) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
@@ -3761,10 +3971,16 @@ class DualViewModel(
         // 非政策操作 (含慢速 selection 持久化) 永不阻擋取消；只有此 key 的
         // save 已開始才拒絕。Phase 3：state 相位同步兜底（SAVING 且 pending 仍是
         // 此 expected 即視為已提交，不可取消；QUEUED 仍可取消）。
+        // Stage A：核對中靜默 no-op（pending 保留，沿用 SAVING 語義；請勿重試，
+        // 待 reconciler 終態）。
         if (policyWriteSaving.contains(policyWriteKey(expected))) return
         if (_state.value.policyWritePhase == PolicyWritePhase.SAVING &&
             _state.value.pendingPolicyWrite == expected
         ) return
+        if (_state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+            _state.value.pendingPolicyWrite == expected
+        ) return
+        if (policyReconciling.contains(policyWriteKey(expected))) return
         _state.update { cur ->
             val pending = cur.pendingPolicyWrite ?: return@update cur
             if (pending != expected) return@update cur
@@ -3790,6 +4006,19 @@ class DualViewModel(
 
     // 兩階段寫入 phase 2：世代全等＋TTL 內才寫 store；任何不符清 pending 拒絕。
     fun confirmPolicyWrite(expected: PendingPolicyWrite) {
+        // Stage A：核對中拒絕新確認（IN_PROGRESS；pending 保留，請勿重試）。
+        // 置於 owner 門控之前：核對中不得清 pending（owner 拒絕會清 pending，
+        // 此處必須先擋）。
+        if (isPolicyReconcilingLocked()) {
+            _state.update { cur ->
+                if (cur.pendingPolicyWrite != expected) return@update cur
+                cur.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                    msgKind = MsgKind.INFO,
+                )
+            }
+            return
+        }
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
         // 寫入不會被 hook 看到，故直接拒絕、清 pending 且不寫 store。
         if (currentUserId() != 0) {
@@ -3829,8 +4058,36 @@ class DualViewModel(
                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                 )
             }
+            // Stage A：逾時交接槽（外層 finally 自 inFlight/saving 交接至
+            // reconciling；非逾時路徑為 null，走原清理）。
+            var handoverKey: String? = null
+            var handoverStore: HookPolicyStore? = null
+            var handoverSanitized: Set<String>? = null
             try {
                 opMutex.withLock {
+                    // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
+                    // 保留 RECONCILING（reconciler 擁有終態發布權）：僅確保
+                    // loading=false 並提示 IN_PROGRESS，不得回 QUEUED/IDLE 覆寫
+                    // RECONCILING；集合先行窗口（phase 尚未翻）才回 QUEUED 待
+                    // reconciler 接手。直接注入 pending 的測試路徑亦經此守衛。
+                    if (isPolicyReconcilingLocked()) {
+                        _state.update { cur ->
+                            if (cur.policyWritePhase == PolicyWritePhase.RECONCILING) {
+                                if (cur.pendingPolicyWrite != pendingAtCall) cur.copy(loading = false)
+                                else cur.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            } else {
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.QUEUED,
+                                )
+                            }
+                        }
+                        return@withLock
+                    }
                     val cur = _state.value.pendingPolicyWrite ?: return@withLock
                     if (cur != pendingAtCall) return@withLock
                     if (nowMonoMs() - cur.requestedAtMs > POLICY_CONFIRM_TTL_MS) {
@@ -3917,20 +4174,38 @@ class DualViewModel(
                         return@withLock
                     }
                     try {
-                        // Phase 4:有界超時 (10s) 轉失敗分支 (走既有 FAILED +
-                        // Unknown fence,不新增語義)。TimeoutCancellationException
-                        // 須先於 CancellationException 捕捉 (前者為後者子類);
-                        // 外部取消仍透傳 (不吞為失敗)。
-                        val ok = try {
+                        // Stage A：detach 式有界超時——save 跑在獨立 async（IO），
+                        // await 僅等 policyIoTimeoutMs；逾時不等阻塞慢 save，
+                        // mutex 即釋放（return@withLock），慢 save 在背景續跑
+                        // （結果由 reconciler 的 loadResult 核對取代，不再採納）。
+                        // ok 語義：true=已證明成功，false=已證明失敗（回 false/
+                        // 拋出），null=逾時未知（reconciler 接手）。
+                        // TimeoutCancellationException 須先於
+                        // CancellationException 捕捉（前者為後者子類）；外部取消
+                        // 仍透傳（detach 一併取消，不吞為失敗）。
+                        val deferred = viewModelScope.async(Dispatchers.IO) {
+                            store.save(sanitized)
+                        }
+                        val ok: Boolean? = try {
                             withTimeout(policyIoTimeoutMs) {
-                                // 存 sanitized（與成功分支顯示用 policyDraft 同源；store.save
-                                // 內部亦消毒且冪等，此處顯式傳 sanitized 防禦收斂）。
-                                onIo { store.save(sanitized) }
+                                deferred.await()
                             }
                         } catch (te: TimeoutCancellationException) {
-                            false
+                            null
                         } catch (e: Exception) {
-                            if (e is CancellationException) throw e
+                            if (e is CancellationException) {
+                                try {
+                                    deferred.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                                throw e
+                            }
+                            try {
+                                deferred.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
                             false
                         }
                         // Cancel-during-confirm race: a cancel/request that landed
@@ -3938,12 +4213,40 @@ class DualViewModel(
                         // loading (preserve pending/msg) and do not commit.
                         // Phase 3：pending 保留即回 QUEUED（同一 epoch，可重試）。
                         if (_state.value.pendingPolicyWrite != pendingAtCall) {
+                            try {
+                                deferred.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
                             _state.update {
                                 it.copy(
                                     loading = false,
                                     policyWritePhase = PolicyWritePhase.QUEUED,
                                 )
                             }
+                            return@withLock
+                        }
+                        if (ok == null) {
+                            // Stage A 逾時分支：結果未知，mutex 即釋放。
+                            // mark + update 背靠背（其間無 suspend，fence 有效）：
+                            // pending 保留（可核對/不可重試），Known=false，
+                            // msg TIMEOUT/CHANNEL（口徑：逾時、結果未知、正在
+                            // 核對、請勿重試）。reconciler 由外層 finally 在
+                            // mutex 釋放後啟動（見下 handover）。
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.RECONCILING,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.WRITE_TIMEOUT)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            handoverKey = key
+                            handoverStore = store
+                            handoverSanitized = sanitized
                             return@withLock
                         }
                         if (ok) {
@@ -3990,10 +4293,24 @@ class DualViewModel(
                     }
                 }
             } finally {
-                // Covers early-return paths (TTL/null-store) while the inner
-                // finally covers the save itself.
-                inFlightWrites.remove(key)
-                policyWriteSaving.remove(key)
+                // Stage A 交接：逾時即自 inFlight/saving 交接至 reconciling
+                //（mutex 已釋放），reconciler 終態 finally 移除 reconciling；
+                // 非逾時走原清理。交接後 reconciler 在 mutex 外啟動，慢 save
+                // 續跑但結果不再採納（以 loadResult 核對為準）。
+                val hk = handoverKey
+                val hs = handoverStore
+                val hsan = handoverSanitized
+                if (hk != null && hs != null && hsan != null) {
+                    inFlightWrites.remove(hk)
+                    policyWriteSaving.remove(hk)
+                    policyReconciling.add(hk)
+                    launchConfirmReconciler(hk, hs, hsan)
+                } else {
+                    // Covers early-return paths (TTL/null-store) while the inner
+                    // finally covers the save itself.
+                    inFlightWrites.remove(key)
+                    policyWriteSaving.remove(key)
+                }
             }
         }
     }
@@ -4019,6 +4336,13 @@ class DualViewModel(
         // 同步門控：任何「政策」操作進行中皆拒絕清除,避免覆蓋進行中的寫入;
         // clone/remove/batch 等非政策操作不阻擋 (Phase 2 narrowing)。
         if (inFlightWrites.any { it.startsWith("policy-") }) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // Stage A：核對中拒絕清除（BUSY；按鈕亦因非 IDLE 禁用，此為程式化兜底）。
+        if (isPolicyReconcilingLocked()) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
@@ -4057,8 +4381,34 @@ class DualViewModel(
             )
         }
         viewModelScope.launch {
+            // Stage A：逾時交接槽（見 confirm）。
+            var handover = false
+            var handoverStore: HookPolicyStore? = null
             try {
                 opMutex.withLock {
+                    // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
+                    // 保留 RECONCILING（reconciler 擁有終態發布權）：僅確保
+                    // loading=false 並提示 BUSY，不得回 IDLE 覆寫 RECONCILING；
+                    // 集合先行窗口（phase 尚未翻）才回 IDLE。
+                    if (isPolicyReconcilingLocked()) {
+                        _state.update { cur ->
+                            if (cur.policyWritePhase == PolicyWritePhase.RECONCILING) {
+                                cur.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            } else {
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                        }
+                        return@withLock
+                    }
                     // 清除作廢任何開啟中的政策寫入確認 (P2 #6):VM 端把 pending 清空,
                     // UI 在 pending==null 時重置 ack 世代。
                     // Phase 3：僅清 pending，不動相位（clear 本身仍在途，保持
@@ -4091,16 +4441,51 @@ class DualViewModel(
                             policyWritePhase = PolicyWritePhase.SAVING,
                         )
                     }
-                    // Phase 4:同 confirm,有界超時轉失敗分支 (FAILED + Unknown)。
-                    val ok = try {
+                    // Stage A：同 confirm，detach 式有界超時（null=逾時未知，
+                    // mutex 即釋放，reconciler 接手；false=已證明失敗）。
+                    val deferred = viewModelScope.async(Dispatchers.IO) {
+                        store.clear()
+                    }
+                    val ok: Boolean? = try {
                         withTimeout(policyIoTimeoutMs) {
-                            onIo { store.clear() }
+                            deferred.await()
                         }
                     } catch (te: TimeoutCancellationException) {
-                        false
+                        null
                     } catch (e: Exception) {
-                        if (e is CancellationException) throw e
+                        if (e is CancellationException) {
+                            try {
+                                deferred.cancel()
+                            } catch (_: Exception) {
+                                // Best effort.
+                            }
+                            throw e
+                        }
+                        try {
+                            deferred.cancel()
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
                         false
+                    }
+                    if (ok == null) {
+                        // Stage A 逾時分支：pending 已於本 op 起始清空（無保留
+                        // 問題），Known=false，msg CLEAR_TIMEOUT/CHANNEL。
+                        // mark + update 背靠背；reconciler 由外層 finally 啟動。
+                        markPolicyUnknownLocked()
+                        _state.update {
+                            it.copy(
+                                loading = false,
+                                policyDraftKnown = false,
+                                policyWritePhase = PolicyWritePhase.RECONCILING,
+                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_TIMEOUT)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        handover = true
+                        handoverStore = store
+                        return@withLock
                     }
                     if (ok) {
                         // TOCTOU (#2): bump version + load-generation so any in-flight
@@ -4124,6 +4509,8 @@ class DualViewModel(
                     } else {
                         // Phase 1：清除失敗即 Unknown（保留 draft、不清 draft），
                         // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
+                        // Stage A：僅已證明失敗（回 false/拋出）走此分支（FAILED）；
+                        // 逾時（未知）走上 RECONCILING/CHANNEL，不經此處。
                         markPolicyUnknownLocked()
                         _state.update {
                             it.copy(
@@ -4138,7 +4525,14 @@ class DualViewModel(
                     }
                 }
             } finally {
-                inFlightWrites.remove(key)
+                val hs = handoverStore
+                if (handover && hs != null) {
+                    inFlightWrites.remove(key)
+                    policyReconciling.add(key)
+                    launchClearReconciler(key, hs)
+                } else {
+                    inFlightWrites.remove(key)
+                }
             }
         }
     }
@@ -6695,6 +7089,10 @@ enum class PolicyTextKind {
     REFRESHED,
     REFRESH_FAILED,
     BLIND_CLEAR_FIRST,
+    // Stage A：IO 逾時（結果未知，正在核對，請勿重試）。msgKind 複用 CHANNEL
+    //（不新增 enum），文案口徑「逾時、結果未知、正在核對、請勿重試」。
+    WRITE_TIMEOUT,
+    CLEAR_TIMEOUT,
 }
 
 data class PolicyText(
@@ -6728,6 +7126,8 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.REFRESHED -> "已重新整理政策草稿"
     PolicyTextKind.REFRESH_FAILED -> "重新整理政策草稿失敗：遠端內容未知"
     PolicyTextKind.BLIND_CLEAR_FIRST -> "遠端內容未知，清除將刪除未見內容，請再次清除以確認"
+    PolicyTextKind.WRITE_TIMEOUT -> "寫入政策逾時，結果未知，正在核對，請勿重試"
+    PolicyTextKind.CLEAR_TIMEOUT -> "清除草稿逾時，結果未知，正在核對，請勿重試"
 }
 
 sealed interface BlockReason {

@@ -724,16 +724,50 @@ class PolicyWriteTest {
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
     }
 
-    // Phase 4:confirm 超時轉 FAILED + Unknown fence（可注入超時鎖定）。
-    // fake delay (2s) 遠大於注入超時 (200ms)；超時走既有 FAILED 分支，不新增
-    // 語義。順序鎖定：TimeoutCancellationException 須先於 CancellationException
-    // 捕捉（前者為後者子類）——若順序顛倒，超時會被重拋為取消而非 FAILED，
-    // 本測試（pending 清空＋FAILED＋Unknown）即失敗。
+    // Stage A:confirm 超時轉 RECONCILING + Unknown fence（可注入超時鎖定）。
+    // fake save 阻塞（latch）遠超注入超時 (200ms)；超時走 RECONCILING/CHANNEL
+    //（pending 保留，請勿重試），mutex 即釋放，reconciler 接手核對。
+    // 順序鎖定：TimeoutCancellationException 須先於 CancellationException
+    // 捕捉（前者為後者子類）——若順序顛倒，超時會被重拋為取消而非 RECONCILING，
+    // 本測試（RECONCILING＋CHANNEL＋Unknown＋pending 保留）即失敗。
+    // Load latch（首調即 init 即時回，後續 reconciler/refresh 阻塞）使
+    // RECONCILING 穩定可觀測，釋放後 reconciler 終態回 IDLE。
     @Test
     fun confirmPolicyWrite_timeout_reportsFailedAndUnknown() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val loadStarted = java.util.concurrent.CountDownLatch(1)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
         val slowStore = HookPolicyStore(
-            loadRaw = { setOf("com.seed") },
-            saveRaw = { Thread.sleep(2_000); true },
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    loadStarted.countDown()
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
         )
         val vm = makeVm(slowStore, userId = 0, policyIoTimeoutMs = 200)
         await { vm.state.value.policyDraftKnown }
@@ -741,31 +775,350 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
 
         vm.confirmPolicyWrite(pending)
-        await(timeoutMs = 10_000L) { vm.state.value.pendingPolicyWrite == null }
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
-        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
+        // Stage A 終態：CHANNEL（未知）＋pending 保留＋Unknown＋TIMEOUT 文案。
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("逾時"))
+        assertTrue(vm.state.value.msg.contains("結果未知"))
+        assertTrue(vm.state.value.msg.contains("正在核對"))
+        assertTrue(vm.state.value.msg.contains("請勿重試"))
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertFalse(vm.state.value.loading)
+
+        // 清理：放行 save＋load，reconciler 終態回 IDLE（成功，draft=新值）。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        loadRelease.set(true)
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+        assertNull(vm.state.value.pendingPolicyWrite)
     }
 
-    // Phase 4:clear 超時轉 FAILED + Unknown fence（同 confirm，順序鎖定同上）。
+    // Stage A:clear 超時轉 RECONCILING + Unknown fence（同 confirm，順序鎖定同上）。
+    // clear 起始即清 pending，故逾時斷言 pending==null；其餘同 confirm。
     @Test
     fun clearPolicyDraft_timeout_reportsFailedAndUnknown() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
         val slowStore = HookPolicyStore(
-            loadRaw = { setOf("com.seed") },
-            saveRaw = { Thread.sleep(2_000); true },
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw == null) backend.set(emptySet()) else backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
         )
         val vm = makeVm(slowStore, userId = 0, policyIoTimeoutMs = 200)
         await { vm.state.value.policyDraftKnown }
 
         vm.clearPolicyDraft()
-        await(timeoutMs = 10_000L) { vm.state.value.msgKind == MsgKind.FAILED }
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
-        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("清除草稿失敗"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("逾時"))
+        assertTrue(vm.state.value.msg.contains("結果未知"))
+        assertTrue(vm.state.value.msg.contains("正在核對"))
+        assertTrue(vm.state.value.msg.contains("請勿重試"))
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertFalse(vm.state.value.loading)
+
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        loadRelease.set(true)
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+    }
+
+    // Stage A latch 版 confirm-timeout（4 維斷言：backend/UI/後續/重複）。
+    // - backend：逾時時 save 仍在途（saveCalls==1、後端未更新、mutex 已釋放）。
+    // - UI：RECONCILING＋pending 保留＋Known=false＋TIMEOUT/CHANNEL＋loading=false。
+    // - 後續：核對中 request/clear 拒 BUSY、cancel 靜默 no-op（pending 保留）。
+    // - 重複：核對中重複 confirm 拒 IN_PROGRESS，不耗第二次 save。
+    // 放行後 reconciler 終態回 IDLE（Known＋新值＋pending 清空），後續 request 可用。
+    @Test
+    fun confirmPolicyWrite_timeout_latch_entersReconcilingAndReconciles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val loadStarted = java.util.concurrent.CountDownLatch(1)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    loadStarted.countDown()
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+        assertTrue(loadStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+        // backend 維：save 仍在途，後端未更新。
+        assertEquals(1, saveCalls.get())
+        assertEquals(setOf("com.seed"), backend.get())
+        assertEquals(1, saveFinished.count)
+        // UI 維：RECONCILING＋pending 保留＋Unknown＋TIMEOUT/CHANNEL＋不持 loading。
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("逾時"))
+        assertTrue(vm.state.value.msg.contains("正在核對"))
+        assertTrue(vm.state.value.msg.contains("請勿重試"))
+        assertFalse(vm.state.value.loading)
+        assertEquals(
+            PolicyText(PolicyTextKind.WRITE_TIMEOUT).defaultText(),
+            vm.state.value.msg,
+        )
+
+        // 重複維：核對中重複 confirm 不耗第二次 save。
+        vm.confirmPolicyWrite(pending)
+        Thread.sleep(100)
+        assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
+        // IN_PROGRESS 覆寫 TIMEOUT 後，pending/相位仍保留（僅 msg 變化）。
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+        assertEquals(1, saveCalls.get())
+
+        // 後續維：核對中 request/clear 拒 BUSY、cancel 靜默 no-op。
+        // 注意：IN_PROGRESS 已覆寫 TIMEOUT，此處先記 msg 再比 BUSY 覆寫。
+        vm.requestPolicyWrite()
+        assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        vm.clearPolicyDraft()
+        assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+        val msgBeforeCancel = vm.state.value.msg
+        vm.cancelPolicyWrite(pending)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(msgBeforeCancel, vm.state.value.msg)
+
+        // 放行：save 完成＋reconciler 讀到新值，終態 IDLE＋Known＋新值。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        loadRelease.set(true)
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+        assertEquals(setOf("com.example.a"), backend.get())
+        assertEquals(1, saveCalls.get())
+    }
+
+    // Stage A clear 變體：clear 逾時進 RECONCILING（pending 本無），重複 clear 拒
+    // BUSY，放行後終態 IDLE＋Known-empty＋CLEAR_SUCCESS。
+    @Test
+    fun clearPolicyDraft_timeout_latch_entersReconcilingAndReconciles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw == null) backend.set(emptySet()) else backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+
+        vm.clearPolicyDraft()
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+        assertEquals(1, clearCalls.get())
+        assertEquals(setOf("com.seed"), backend.get())
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.CLEAR_TIMEOUT).defaultText(),
+            vm.state.value.msg,
+        )
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertFalse(vm.state.value.loading)
+
+        // 重複 clear 拒 BUSY，不耗第二次 clear。
+        vm.clearPolicyDraft()
+        assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+        assertEquals(1, clearCalls.get())
+
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        loadRelease.set(true)
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
+    }
+
+    // Stage A fail 變體：已證明失敗（save 回 false）仍走 FAILED＋IDLE，不進
+    // RECONCILING（逾時未知才核對；失敗已知不核對）。
+    @Test
+    fun confirmPolicyWrite_storeFalse_staysFailedNotReconciling() {
+        val fake = FakePolicyStore()
+        fake.saveSucceeds = false
+        val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000)
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        await { vm.state.value.pendingPolicyWrite == null }
+
+        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(1, fake.saveCalls)
+    }
+
+    // Stage A mismatch 變體：reconciler 以 ground truth 為準（不謊稱寫入成功）。
+    // save 新值完成後，外部併發寫入覆蓋為他值；reconciler 讀到他值即發布他值＋
+    // REFRESHED（INFO），而非 WRITE_SUCCESS。
+    @Test
+    fun confirmPolicyWrite_timeout_mismatchReconcilesToLoadedValue() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    while (!loadRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+        // save 先完成（後端=新值），再由外部覆寫為他值，reconciler 只能見他值。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        backend.set(setOf("com.other"))
+        loadRelease.set(true)
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.other"), vm.state.value.policyDraft)
+        assertEquals(setOf("com.other"), backend.get())
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.REFRESHED).defaultText(),
+            vm.state.value.msg,
+        )
+        assertNull(vm.state.value.pendingPolicyWrite)
     }
 
     // 4.1 #6 重複 confirm 去重。
@@ -2169,5 +2522,234 @@ class PolicyWriteTest {
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
         assertEquals(0, fake.saveCalls)
+    }
+
+    // 反射讀核對中/在途集合（Stage A review 補測：斷言無殘留）。
+    private fun reconcilingKeysOf(vm: DualViewModel): Set<String> {
+        val f = DualViewModel::class.java.getDeclaredField("policyReconciling").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        return (f.get(vm) as MutableSet<String>).toSet()
+    }
+
+    private fun inFlightKeysOf(vm: DualViewModel): Set<String> {
+        val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        return (f.get(vm) as MutableSet<String>).toSet()
+    }
+
+    private fun savingKeysOf(vm: DualViewModel): Set<String> {
+        val f = DualViewModel::class.java.getDeclaredField("policyWriteSaving").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        return (f.get(vm) as MutableSet<String>).toSet()
+    }
+
+    // Stage A review (a) TOCTOU 丟棄：RECONCILING 期間 refresh 推進 generation，
+    // reconciler 的晚到發布必須被丟棄（最新者勝，不覆寫新事實）。
+    // 定序：save 阻塞觸逾時→RECONCILING；reconciler 首延 500ms 空窗內 refresh
+    // 先讀到 NEW 並發布；再放行 reconciler 讀到 stale OLD（Known），世代已變即
+    // 丟棄（draft 續為 NEW，穩定窗口斷言）。
+    @Test
+    fun reconcilerStalePublish_discardedWhenRefreshAdvancesGeneration() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val reconcilerStarted = java.util.concurrent.CountDownLatch(1)
+        val reconcilerFinished = java.util.concurrent.CountDownLatch(1)
+        val reconcilerRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when (calls.incrementAndGet()) {
+                    1 -> backend.get()
+                    // call 2：空窗內的 refresh 即時讀（NEW），不阻塞。
+                    2 -> backend.get()
+                    // call 3+：reconciler 晚到讀 stale OLD（Known），阻塞待放行。
+                    else -> {
+                        reconcilerStarted.countDown()
+                        while (!reconcilerRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        reconcilerFinished.countDown()
+                        setOf("com.stale")
+                    }
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+        // 等 reconciler 交接完成（外層 finally 在 mutex 釋放後啟動，取號先於
+        // refresh），仍在 500ms 首延空窗內，再做 refresh 使其世代更新。
+        Thread.sleep(200)
+        backend.set(setOf("com.fresh"))
+        vm.refreshPolicyDraft()
+        await(timeoutMs = 10_000L) { vm.state.value.policyDraft == setOf("com.fresh") }
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertTrue(reconcilerStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+        // 放行晚到的 stale 讀；世代已變必須丟棄（穩定窗口斷言續為 NEW）。
+        reconcilerRelease.set(true)
+        assertTrue(reconcilerFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        val stableUntil = System.currentTimeMillis() + 500
+        while (System.currentTimeMillis() < stableUntil) {
+            assertEquals(setOf("com.fresh"), vm.state.value.policyDraft)
+            assertTrue(vm.state.value.policyDraftKnown)
+            Thread.sleep(20)
+        }
+        // reconciler 終態 finally 已清 key（發布被丟棄，相位保持 RECONCILING 待
+        // 終態——本測試僅鎖定 draft 不被覆寫，不鎖定相位回位）。
+        await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
+
+        // 清理：放行脫鉤慢 save（結果不再採納，僅免執行緒殘留）。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+    }
+
+    // Stage A review (b) 全 Unknown 終態：load 恆 null（3 次重試皆 Unknown）→
+    // IDLE＋Unknown＋REFRESH_FAILED/CHANNEL＋pending 清空＋reconciling 清空；
+    // 之後 refresh Known 即可新 request（證明未卡 RECONCILING）。
+    @Test
+    fun reconcilerAllUnknown_reportsRefreshFailedAndAllowsNewRequest() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+        // 恆 Unknown：init 後即撤掉後端，後續 3 次重讀皆 null。
+        backend.set(null)
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+        // 3 次重試皆 Unknown（首延 500ms＋間隔 1s×2，10s 內必達終態）。
+        await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
+            vm.state.value.msg,
+        )
+        assertNull(vm.state.value.pendingPolicyWrite)
+        // 重試恰 3 次：init 1＋reconciler 3。
+        assertEquals(4, calls.get())
+        assertTrue(reconcilingKeysOf(vm).isEmpty())
+        assertTrue(savingKeysOf(vm).isEmpty())
+        assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
+
+        // 清理脫鉤慢 save，再以 refresh 恢復 Known 證明可新 request。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        backend.set(setOf("com.remote"))
+        vm.refreshPolicyDraft()
+        await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown }
+        assertEquals(setOf("com.remote"), vm.state.value.policyDraft)
+
+        seedSelection(vm)
+        vm.requestPolicyWrite()
+        val pending2 = vm.state.value.pendingPolicyWrite
+        assertNotNull(pending2)
+        assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+    }
+
+    // Stage A review (c) 外部取消透傳：await 期間 scope 取消→CE 重拋，不進
+    // RECONCILING（handover 空），不殘留 inFlight/saving/reconciling key，
+    // 且不啟動 reconciler（load 呼叫數不增）。
+    @Test
+    fun confirmAwait_externalCancel_rethrowsWithoutReconcilingOrResidue() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                calls.incrementAndGet()
+                backend.get()
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        // 超時設大：取消先於逾時，排除 TIMEOUT 路徑干擾。
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 10_000)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+        val loadsBeforeCancel = calls.get()
+
+        vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("test-cancel"))
+        Thread.sleep(500)
+
+        // 不進 RECONCILING、不發 TIMEOUT、不啟 reconciler、不殘留 key。
+        assertFalse(vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING)
+        assertFalse(vm.state.value.msg.contains("正在核對"))
+        assertEquals(loadsBeforeCancel, calls.get())
+        assertTrue(reconcilingKeysOf(vm).isEmpty())
+        assertTrue(savingKeysOf(vm).isEmpty())
+        assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
+
+        // 清理阻塞 save（scope 已取消，殘留迴圈僅免執行緒洩漏）。
+        saveRelease.set(true)
+        Thread.sleep(200)
     }
 }

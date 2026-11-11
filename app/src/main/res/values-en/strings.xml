@@ -81,6 +81,10 @@
     <string name="policy_no_store_read">No policy store; cannot read draft</string>
     <string name="policy_write_failed">Policy write failed</string>
     <string name="policy_clear_failed">Failed to clear draft</string>
+    <!-- Stage A (P1 timeout uncertainty): IO timeout copy (CHANNEL wording:
+         timed out, result unknown, reconciling, do not retry; pending kept). -->
+    <string name="policy_write_timeout">Policy write timed out with unknown result; reconciling, do not retry</string>
+    <string name="policy_clear_timeout">Draft clear timed out with unknown result; reconciling, do not retry</string>
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
     <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
