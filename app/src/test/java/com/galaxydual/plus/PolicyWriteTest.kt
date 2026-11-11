@@ -559,7 +559,7 @@ class PolicyWriteTest {
         assertEquals(setOf("com.C"), vm.state.value.policyDraft)
     }
 
-    // policyLoadGeneration 世代守衛:重疊的兩次 refresh,慢速 A 不得覆寫快速 B。
+    // policyFreshnessGen 世代守衛:重疊的兩次 refresh,慢速 A 不得覆寫快速 B。
     // A 先發但阻塞在 loadRaw,B 後發但立即回較新值並先發布;晚到的 A 必須被
     // 世代檢查丟棄 (version 不變,僅 generation 決定)。
     @Test

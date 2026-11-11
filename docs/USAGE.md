@@ -233,15 +233,21 @@ adb shell pm uninstall --user <dualId> com.example.chat
 ### 政策寫入流程（Stage2：白名單政策草稿）
 
 - `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高（一般 320dp，小螢幕 smallestWidth<360 或 screenHeight<640 回 240dp，見 `policyDialogListMaxHeightDp`），少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
-- 同世代（same-generation）綁定：pending 攜帶建立當下的 `policyDraftVersion`／`policyLoadGeneration` 快照；`確認寫入` 僅在世代全等＋TTL 內才寫 store，任一不符即清 pending 拒寫（零寫入）；寫入成功／失敗才 bump 世代（fence 在途載入，見下一條）。旋轉同世代保留 ack 勾選與清單展開，跨世代重置。
+- 同世代（same-generation）綁定：pending 攜帶 `PendingPolicyWrite.generation`（`policyWriteGeneration` 單調唯一，新請求覆寫即舊世代失效，見 `DualViewModel` 205-210）；`確認寫入` 僅在傳入 pending 與 live pending 全等＋TTL 內才寫 store（見 confirm 5455-5472），不符即拒寫（零寫入，舊世代傳入保留 live pending）；旋轉同世代保留 ack 勾選與清單展開，跨世代重置（UI 以 `pending.generation` 比對，見 `MainActivity` 3657/3729/4123）。
 - `清除草稿` 只刪該持久化條目，不清記憶體勾選。
 - 只有 owner user（user 0）能寫入／清除草稿；非 owner 的寫入 hook 讀不到（訊息明確拒絕）。
 - `勾選≠安裝`、`寫草稿≠安裝`：政策寫入只放寬 hook 的白名單查詢，永不觸發 clone/remove/install。
 - `Unknown`（草稿未知）時拒絕建 pending／拒絕覆寫：須先點「重新整理草稿」讀到 Known 後再寫入（fail-closed，不覆寫未見內容）。
 - 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unknown（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）。
 - 寫入／清除失敗（`FAILED`）即標 Unknown 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unknown（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
-- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyLoadGeneration` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
+- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyFreshnessGen` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
 - 取消語義：`QUEUED` 可取消（清 pending 回 `IDLE`）；`SAVING`／`RECONCILING` 不可取消（no-op，pending 保留；核對中請勿重試；reconciler 終態正常回 `IDLE`，唯有界讀耗盡／總預算超限滯留 `RECONCILING` 待 `refreshPolicyDraft` late-join 恢復，見下表）。
+- Tx 釋放條件（Stage G1 `decidePolicyTxSettle`，reconciler／refresh late-join／auto-recheck 共用唯一真相）：可 settle IFF deferred 已完成＋權威讀為預期→SUCCESS（`WRITE_SUCCESS`／`CLEAR_SUCCESS`＋Known）；deferred 已證失敗（await 回 false／拋出）→FAILED＋Unknown（樂觀讀不得翻案）；deferred 完成＋權威讀非預期→mismatch `REFRESHED`（ground truth）；其餘一律 Unresolved（保留 fence＋`RECONCILING`＋pending）。快徑 read-after-ack 維持既有信 ack 語義（Unknown 即信 ack 發布 SUCCESS），不經此 helper（保版本守衛既有測試語義）。
+- Known(A)/Known(B) inconclusive：deferred 未完成時任何 Known（A 或 B）都不 settle 續留；Known(B)（讀到值==sanitized）永 inconclusive（刪末輪特例）；Known(A)（讀到值!=sanitized）視 stale 續留，不得 mismatch-settle（防 stale／樂觀讀早熟）。
+- refresh 世代分離（freshness vs ownership）：`policyFreshnessGen` 管顯示 TOCTOU（refresh/load 重疊丟棄、盲清 arm），`policyOwnershipGen` 管 Tx 所有權（reconciler／late-join 結清判定只比 version＋ownership）；Tx 存活期 `refreshPolicyDraft` 期中讓位（yielding）：可更新顯示但 Known=false 或維持 Unknown，不碰 phase/pending、不 disarm、不推進 ownership，故 yielding 永不致 TOCTOU 丟棄 reconciler（保留 fence）；`markPolicyUnknownLocked` 同步 bump 三者（version＋freshness＋ownership）。
+- auto-recheck（Stage G2 P2#4）：handoverTx 登記時掛 `deferred.invokeOnCompletion` 單次權威重查（`boundedReconcileRead` 單次，`withTimeout(policyIoTimeoutMs)`＋獨立 `policyReconcileDispatcher`，不佔共用 IO 池、不耗 reconciler 三讀預算）→走 settle helper；讀 Unknown 保持 unresolved＋發布 `UNRESOLVED_REFRESH` 動作（`policy_unresolved_refresh`，按鈕即「重新整理草稿」）；終態（Success/Mismatch/Failed）發布前先經 coordinator settle-CAS 先行、勝者才發布，unresolved 不搶發布權。
+- coordinator 認領（Stage G2 P2#5）：`PolicyTxCoordinator` App-scoped（`GalaxyApp` 單例；`MainActivity` 經 applicationContext 取用，另有靜態 fallback＋測試重置入口），`activeTx` 為跨 VM 唯一真相；Tx 攜 pending（`PolicyTx.pending`）；handover 登記同步寫本地＋coordinator＋reconciling；`onCleared`/scope 取消刻意不清除（reconciler `catch CE` 設 settle=false 保留 Tx）；新 VM init 同步認領（繼承 pending＋`RECONCILING`＋Unknown＋`TIMEOUT` 訊息，啟動 reconciler join 同一 deferred，認領同步 bump 世代使在途 init load 丟棄）；save deferred 跑 coordinator `scope`（SupervisorJob＋IO）存活過 VM 重建；終態 `tryClaimCoordinatorPublish` CAS 仲裁防雙發布（勝者發布後 `settlePolicyTx` 雙清，敗者僅清本地＋reconciling 不發布；無 coordinator 本地單 VM 路徑維持既有 publish-then-settle）。
+- unresolved 手動 refresh 恢復：reconciler 誠實 unresolved 退出（有界讀耗盡／總預算 `POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s 超限，`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留＋`RECONCILING` 續留，Tx 存活）後，`refreshPolicyDraft` 為唯一恢復路徑（late-join）：Tx 存活＋本次 Known＋deferred 已完成→結清（成功／mismatch／已證失敗 FAILED，樂觀讀不得翻案）；其餘 yielding 續留待下一次 refresh；全域 `refresh()`／`reconnect()`／`selectChannel`／`onForeground` 期中一律跳過（Tx 存活即併發丟棄，保留核對提示），僅 `refreshPolicyDraft` 期中讓位。
 
 ### 政策 TTL 對照（App 側 vs hook 側，時鐘皆為 monotonic，不受 wall-clock 回撥影響）
 
@@ -249,9 +255,10 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | --- | --- | --- | --- |
 | 寫入確認 `POLICY_CONFIRM_TTL_MS` | 5 分鐘 | App | dialog pending 逾時→清 pending＋`TTL_EXPIRED` 訊息，不碰 draft（零寫入） |
 | blind-clear arm `BLIND_CLEAR_TTL_MS` | 5 分鐘（與上同值，別名） | App | arm 逾時→重 arm＋`policy_blind_clear_expired` 文案，需重新確認 |
-| store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op；終態正常回 `IDLE`，唯有界讀耗盡（3 次皆 Unknown 且曾逾時）／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留），可由後續 `refreshPolicyDraft` late-join 結清回 `IDLE`（讀到 Known 且原 save 已完成：成功→Known＋成功訊息，失敗→`FAILED`＋Unknown）；核對中 `refresh()`／`reconnect()`／`selectChannel`／`onForeground` 的 probe＋refresh 一律跳過（保留核對提示），`refreshPolicyDraft` 期中讓位（覆寫 msg/draft 但不碰 phase/pending，reconciler 見世代推進即丟棄） |
+| store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op；終態正常回 `IDLE`，唯有界讀耗盡（3 次皆 Unknown 且曾逾時）／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留），可由後續 `refreshPolicyDraft` late-join 結清回 `IDLE`（讀到 Known 且原 save 已完成：成功→Known＋成功訊息，失敗→`FAILED`＋Unknown）；核對中 `refresh()`／`reconnect()`／`selectChannel`／`onForeground` 的 probe＋refresh 一律跳過（保留核對提示），`refreshPolicyDraft` 期中讓位（覆寫 msg/draft 但不碰 phase/pending，reconciler 只比 version＋ownership，期中 yielding 只推 freshness 不致丟棄） |
 | 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 冗餘重讀同一 `RemotePreferences` 實例（框架推送才是主要新鮮度機制，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
 | 失敗節流 `failureCooldownMs` | 5 秒 | hook | 遠端讀取失敗後查詢節流，不重試 reader（`last-known-good` 保留或回 seed，見 `docs/HOOK.md` §1.1） |
+| 單次 auto-recheck（Stage G2） | 1 次（`invokeOnCompletion` 單次；讀 `withTimeout(policyIoTimeoutMs)` 有界獨立池） | App | deferred 完成即觸發單次權威重查（不耗 reconciler 三讀預算，走 settle helper）；Unknown→unresolved＋`UNRESOLVED_REFRESH` 待手動 refresh late-join |
 
 ## English Summary
 

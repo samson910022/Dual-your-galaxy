@@ -92,6 +92,7 @@ val privilege: Privilege = when {
 > | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
 > | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
 > | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據 |
+> | 政策 Tx 結清／coordinator（Stage G1/G2） | —（VM 語義，非裝置驗證） | JVM 鎖定（`PolicyWriteTest`：settle helper／世代拆分／跨 VM 認領（auto-recheck 間接覆蓋）；reconciler 總預算 15 秒） | JVM 綠燈不等於裝置驗收；旋轉重建實機恢復未驗 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
@@ -167,7 +168,9 @@ val privilege: Privilege = when {
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活，後續全 `BUSY`，由 `refreshPolicyDraft` late-join 結清回 `IDLE`）；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
-- 完整語義（pending 世代、TTL、fence、二步清除）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒 vs hook 側快取 60 秒／失敗節流 5 秒）。
+- Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。
+- 跨 VM（Stage G2）：`PolicyTxCoordinator` App-scoped（`GalaxyApp` 單例），`activeTx` 跨 VM 唯一真相；Tx 攜 pending，新 VM init 認領（繼承 fence＋`RECONCILING`＋Unknown＋reconciler join 同一 deferred）；`deferred.invokeOnCompletion` 單次 auto-recheck（有界獨立池，不耗 reconciler 預算，Unknown→unresolved 待手動 `refreshPolicyDraft` late-join）；終態 `tryClaimCoordinatorPublish` CAS 勝者發布；reconciler 總預算 15 秒，超限誠實 unresolved 滯留待 late-join。
+- 完整語義（pending 世代、TTL、fence、二步清除）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒、reconciler 總預算 15 秒、auto-recheck 單次 vs hook 側快取 60 秒／失敗節流 5 秒）。
 
 ## Non-Goals
 
