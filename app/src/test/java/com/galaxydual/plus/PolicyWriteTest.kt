@@ -2797,6 +2797,214 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
     }
 
+    // Stage D blind-clear 有界＋世代綁定 (P2)：TTL 內第二 tap 執行。
+    @Test
+    fun blindClear_secondTapWithinTtl_executes() {
+        var now = 10_000L
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null, nowMonoMs = { now })
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+
+        assertEquals(1, fake.clearCalls)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
+    }
+
+    // Stage D：延遲 tap（超過 TTL）→重 arm＋EXPIRED 文案，不執行。
+    @Test
+    fun blindClear_secondTapAfterTtl_showsExpiredAndRearms() {
+        var now = 20_000L
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null, nowMonoMs = { now })
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        now = 20_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
+        vm.clearPolicyDraft()
+
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("已逾時"))
+        assertTrue(vm.state.value.msg.contains("重新清除"))
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(
+            PolicyText(PolicyTextKind.BLIND_CLEAR_EXPIRED).defaultText(),
+            vm.state.value.msg,
+        )
+    }
+
+    // Stage D：過期重 arm 後、TTL 內第三 tap 執行（重 arm 鏈）。
+    @Test
+    fun blindClear_expiredRearm_thirdTapWithinTtl_executes() {
+        var now = 30_000L
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null, nowMonoMs = { now })
+        await { !vm.state.value.loading }
+
+        vm.clearPolicyDraft()
+        assertEquals(0, fake.clearCalls)
+
+        now = 30_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("已逾時"))
+        assertEquals(0, fake.clearCalls)
+
+        now += 1_000L
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+
+        assertEquals(1, fake.clearCalls)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+    }
+
+    // Stage D：斷開/重連 disarm——arm 後 reconnect，再次 clear 僅告警不執行。
+    @Test
+    fun blindClear_reconnect_disarms() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        vm.reconnectAndRefresh()
+        await { !vm.state.value.loading }
+
+        vm.clearPolicyDraft()
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        // 重 arm 後第二 tap 執行。
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        assertEquals(1, fake.clearCalls)
+    }
+
+    // Stage D：foreground disarm——arm 後 onForeground，再次 clear 僅告警。
+    @Test
+    fun blindClear_foreground_disarms() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        vm.onForeground()
+        await { !vm.state.value.loading }
+
+        vm.clearPolicyDraft()
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        assertEquals(1, fake.clearCalls)
+    }
+
+    // Stage D：世代失配重 arm——arm 後 unknown-gate confirm 推進版本，
+    // 第二 tap 視為新的第一次（FIRST，不執行），第三 tap 執行。
+    @Test
+    fun blindClear_generationMismatch_rearms() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        // unknown-gate confirm：不碰 store 但 bump 版本＋世代。
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+        vm.confirmPolicyWrite(pending)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(0, fake.saveCalls)
+
+        // 世代已變：第二 tap 重 arm（FIRST），不執行。
+        vm.clearPolicyDraft()
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(),
+            vm.state.value.msg,
+        )
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        // 第三 tap（同世代、TTL 內）執行。
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        assertEquals(1, fake.clearCalls)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+    }
+
+    // Stage D：busy 保留 arm——inFlight 期間 clear 拒 BUSY 不耗 arm，
+    // 解除後第二 tap 仍執行（非重 arm）。
+    @Test
+    fun blindClear_busy_preservesArm() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        assertFalse(vm.state.value.policyDraftKnown)
+
+        vm.clearPolicyDraft()
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        // 以反射注入政策在途 key，模擬寫入進行中（不經 mutex，同步可觀測）。
+        val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val keys = f.get(vm) as MutableSet<String>
+        keys.add("policy-write:fake-busy")
+        try {
+            vm.clearPolicyDraft()
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(0, fake.clearCalls)
+        } finally {
+            keys.remove("policy-write:fake-busy")
+        }
+
+        // arm 被保留：直接執行（TTL／世代皆過），不重 arm。
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        assertEquals(1, fake.clearCalls)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+    }
+
     // Stage A review (c) 外部取消透傳：await 期間 scope 取消→CE 重拋，不進
     // RECONCILING（handover 空），不殘留 inFlight/saving/reconciling key，
     // 且不啟動 reconciler（load 呼叫數不增）。

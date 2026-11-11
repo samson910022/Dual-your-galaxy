@@ -6507,6 +6507,7 @@ private class DualViewModelFactory(
                         PolicyTextKind.REFRESHED -> res.getString(R.string.policy_refreshed)
                         PolicyTextKind.REFRESH_FAILED -> res.getString(R.string.policy_refresh_failed)
                         PolicyTextKind.BLIND_CLEAR_FIRST -> res.getString(R.string.policy_blind_clear_first)
+                        PolicyTextKind.BLIND_CLEAR_EXPIRED -> res.getString(R.string.policy_blind_clear_expired)
                         PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
                         PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
                     }
