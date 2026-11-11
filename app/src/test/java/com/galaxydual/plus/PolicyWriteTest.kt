@@ -3453,4 +3453,97 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
         assertNull(activeTxOf(vm))
     }
+
+    // Stage F2-1：無限阻塞讀有界＋誠實 unresolved（P2#4）。
+    // - 讀跑獨立單執行緒池（執行緒名含 policyReconcile，不佔共用 IO 池）。
+    // - 每次讀 withTimeout(200ms)＋最多 3 次：Binder 不可中斷（無視中斷續跑），
+    //   逾時執行緒滯留獨立池，呼叫側計預算；總耗時有界（join＋3 讀＋退避 < 10s）。
+    // - 共用池對照：核對期間 Dispatchers.IO 任務仍即時完成（未被拖住）。
+    // - 終態誠實 unresolved：REFRESH_FAILED/CHANNEL＋Known=false＋pending 保留＋
+    //   phase 續留 RECONCILING（不回 IDLE）；3 次 Unknown 不解 fence（Tx 存活＋
+    //   reconciling key 存活，late-join 可見）。
+    @Test
+    fun f2_infiniteBlockingRead_boundedUnresolvedRetainsFence() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val readThreads = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (calls.incrementAndGet() == 1) {
+                    backend.get()
+                } else {
+                    // 無限阻塞：無視中斷續跑（模擬不可中斷 binder）。
+                    readThreads.add(Thread.currentThread().name)
+                    while (true) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    @Suppress("UNREACHABLE_CODE")
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+        await { vm.state.value.policyDraftKnown }
+        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pendingB)
+
+        vm.confirmPolicyWrite(pendingB)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+        val t0 = System.currentTimeMillis()
+
+        // 共用池對照：核對讀阻塞獨立池期間，共用 IO 池任務必須即時完成。
+        val control = kotlinx.coroutines.runBlocking {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { 42 }
+        }
+        assertEquals(42, control)
+
+        // 終態：由 TIMEOUT 翻為 REFRESH_FAILED（仍 RECONCILING，非 IDLE）。
+        await(timeoutMs = 15_000L) {
+            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                !vm.state.value.policyDraftKnown &&
+                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+        }
+        val elapsed = System.currentTimeMillis() - t0
+        // 總耗時有界：join(200ms)＋首延(500ms)＋3 讀(3×200ms)＋2 退避(2×1s)
+        // 約 3.3s；10s 上限含 CI 抖動餘量（無界實作將永不到終態而超時失敗）。
+        assertTrue("reconcile total must be bounded, was ${elapsed}ms", elapsed < 10_000L)
+
+        // 誠實 unresolved：CHANNEL＋Known=false＋pending 保留＋RECONCILING。
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+        assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+        // 3 次 Unknown 不解 fence（late-join）：Tx 存活＋reconciling key 存活。
+        assertNotNull(activeTxOf(vm))
+        assertTrue(reconcilingKeysOf(vm).isNotEmpty())
+        assertTrue(savingKeysOf(vm).isEmpty())
+
+        // 獨立池：實際執行的讀執行緒名含 policyReconcile（非共用池執行緒）。
+        assertTrue(readThreads.isNotEmpty())
+        assertTrue(readThreads.all { it.contains("policyReconcile") })
+
+        // 清理脫鉤慢 save（讀執行緒無限滯留獨立池，隨行程結束回收）。
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+    }
 }
