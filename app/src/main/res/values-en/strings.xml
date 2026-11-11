@@ -88,7 +88,9 @@
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
     <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
-    <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content. Clear again to confirm.</string>
+    <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
+    <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
+    <string name="policy_blind_clear_expired">Clear confirmation expired (over 5 minutes); clear again to confirm. Refresh first if reachable.</string>
     <plurals name="policy_dropped">
         <item quantity="one">Dropped %1$d checked item not in the source list</item>
         <item quantity="other">Dropped %1$d checked items not in the source list</item>

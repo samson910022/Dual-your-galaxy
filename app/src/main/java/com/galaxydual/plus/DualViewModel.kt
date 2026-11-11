@@ -688,6 +688,10 @@ class DualViewModel(
         // 同意有效期語意相同，故不另設值；政策路徑一律用此別名，移除路徑續用
         // 原名，grep 可區分調用點）。
         const val POLICY_CONFIRM_TTL_MS = REMOVE_CONFIRM_TTL_MS
+        // Stage D (P2 blind-clear 有界 + 世代綁定)：blind-clear 二次確認有效期
+        // ＝POLICY_CONFIRM_TTL_MS（與政策寫入同意同值：皆為「對話框/告警後
+        // generation 綁定＋二次確認＋TTL」，5min 語意相同，故不另設值）。
+        const val BLIND_CLEAR_TTL_MS = POLICY_CONFIRM_TTL_MS
         // Phase 4:confirm/clear 持 opMutex 橫跨 onIo save/clear 的有界超時。
         // RemotePreferences 為 binder IPC,無超時會長 pin opMutex 餓死其他操作;
         // 超時轉既有 FAILED + Unknown fence (不新增語義,見下 withTimeout 處)。
@@ -806,10 +810,34 @@ class DualViewModel(
     // Phase 3：UiState.policyEpoch 的推進源（相位變遷即 +1；QUEUED→SAVING 保持
     // 同一 epoch，僅翻相位，見 request/cancel/confirm/clear 各點）。
     private val policyPhaseEpoch = java.util.concurrent.atomic.AtomicLong()
-    // Phase 2 blind-clear 兩步確認：Unknown 下第一次 clear 僅告警並 arm，
-    // 第二次才執行（防靜默單步刪除未見內容；見 clearPolicyDraft）。
+    // Stage D blind-clear 兩步確認（有界＋世代綁定）：Unknown 下第一次 clear
+    // 僅告警並 arm，第二次才執行（防靜默單步刪除未見內容；見 clearPolicyDraft）。
     // Known（或 null-store）下直接單步執行並順手 disarm。
-    private val blindClearArmed = AtomicBoolean(false)
+    // - blindClearArmedAtMs：arm 時刻 nowMonoMs()，-1＝未 arm（disarmed）。
+    // - blindClearArmedVersion／LoadGen：arm 當下 policyDraftVersion／
+    //   policyLoadGeneration 快照；第二 tap 比對失配即視為 stale（期間有
+    //   save/clear/refresh/load 推進）→重 arm（視為新的第一次）。
+    // - TTL：now - armedAt > BLIND_CLEAR_TTL_MS 即過期→重 arm＋EXPIRED 文案。
+    // 三者以 -1 哨兵同步（disarm 全置 -1，arm 全寫當下值）；isArmed 以
+    // armedAtMs != -1 判定。AtomicLong：Unconfined 測試下多執行緒可見，
+    // 生產全 Main 串行（與既有 blindClearArmed AtomicBoolean 同理）。
+    private val blindClearArmedAtMs = AtomicLong(-1L)
+    private val blindClearArmedVersion = AtomicLong(-1L)
+    private val blindClearArmedLoadGen = AtomicLong(-1L)
+
+    private fun isBlindClearArmed(): Boolean = blindClearArmedAtMs.get() != -1L
+
+    private fun armBlindClearLocked() {
+        blindClearArmedAtMs.set(nowMonoMs())
+        blindClearArmedVersion.set(policyDraftVersion.get())
+        blindClearArmedLoadGen.set(policyLoadGeneration.get())
+    }
+
+    private fun disarmBlindClear() {
+        blindClearArmedAtMs.set(-1L)
+        blindClearArmedVersion.set(-1L)
+        blindClearArmedLoadGen.set(-1L)
+    }
     // Phase 2 手動重新整理在途計數：policyRefreshing = count > 0（最後完成者清位，
     // 世代/版本丟棄的 stale 結果不提前清位，save bump 亦不洩漏）。
     private val policyRefreshInFlight = AtomicInteger(0)
@@ -963,11 +991,14 @@ class DualViewModel(
 
     // Test-visible entry: onCleared is protected, so JVM tests drive disposal
     // through here (same idempotent body).
+    // Stage D：同步 disarm blind-clear（VM 丟棄後不得殘留確認態）。
     fun dispose() {
+        disarmBlindClear()
         teardownShizukuBindings()
     }
 
     override fun onCleared() {
+        disarmBlindClear()
         teardownShizukuBindings()
         super.onCleared()
     }
@@ -1035,7 +1066,7 @@ class DualViewModel(
                 } else if (result is LoadResult.Known) {
                     // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏：arm→Known→
                     // Unknown→單次 clear 必須仍告警，不可因舊 arm 直接執行）。
-                    blindClearArmed.set(false)
+                    disarmBlindClear()
                     cur.copy(policyDraft = result.packages, policyDraftKnown = true)
                 } else {
                     // Unknown: preserve the last known draft but mark it unknown.
@@ -1161,7 +1192,10 @@ class DualViewModel(
         // 永不到 probe/refresh 的清除點 → 同殘 true；外層補取消清 loading
         // (僅取消路徑，成功/失敗語意不動；生產 job 只隨 scope 清除被取消，
         // 無手動 cancel，此為保險)。
+        // Stage D：斷開/重連即 disarm blind-clear（通道/遠端可能已變，舊 arm
+        // 不得殘留；含 coalesced trailing 經此路徑）。
         _state.update { it.copy(loading = true) }
+        disarmBlindClear()
         try {
             // P25 Item 3: one probe per round — swapAutoLocked probes once and
             // returns the result for probeChannels to reuse (previously each
@@ -3682,7 +3716,7 @@ class DualViewModel(
                     ) {
                         cur
                     } else if (finalResult is LoadResult.Known) {
-                        blindClearArmed.set(false)
+                        disarmBlindClear()
                         if (finalResult.packages == sanitized) {
                             cur.copy(
                                 pendingPolicyWrite = null,
@@ -3759,7 +3793,7 @@ class DualViewModel(
                     ) {
                         cur
                     } else if (finalResult is LoadResult.Known) {
-                        blindClearArmed.set(false)
+                        disarmBlindClear()
                         if (finalResult.packages.isEmpty()) {
                             cur.copy(
                                 policyWritePhase = PolicyWritePhase.IDLE,
@@ -3825,7 +3859,7 @@ class DualViewModel(
                         cur
                     } else if (result is LoadResult.Known) {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
-                        blindClearArmed.set(false)
+                        disarmBlindClear()
                         if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                             cur.copy(
                                 policyDraft = result.packages,
@@ -4256,7 +4290,7 @@ class DualViewModel(
                             policyDraftVersion.incrementAndGet()
                             policyLoadGeneration.incrementAndGet()
                             // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
-                            blindClearArmed.set(false)
+                            disarmBlindClear()
                             _state.update {
                                 it.copy(
                                     loading = false,
@@ -4317,14 +4351,21 @@ class DualViewModel(
 
     // 清除草稿：只刪 HookPolicyStore 條目，不清記憶體勾選，不碰裝置寫入路徑
     // (≠卸載≠安裝)。Phase 2 blind-clear 門控：Unknown 下不再靜默單步執行——
-    // 第一次呼叫僅告警「遠端內容未知，清除將刪除未見內容」並 arm，不清 pending、
-    // 不碰 store、不耗 clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠
-    // 覆寫未見內容，故第二步不受 unknown 門控阻擋）。Known（或 null-store，
-    // 無遠端內容可刪）維持單步。保持 clearGeneration/inFlight 互斥。
+    // 第一次呼叫僅告警並 arm，不清 pending、不碰 store、不耗
+    // clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠覆寫未見內容，
+    // 故第二步不受 unknown 門控阻擋）。Known（或 null-store，無遠端內容可刪）
+    // 維持單步。保持 clearGeneration/inFlight 互斥。
+    // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／loadGen
+    // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
+    // EXPIRED 文案），再判世代（version／loadGen 失配→重 arm＋FIRST 文案），
+    // 兩者皆過才 disarm 執行。BUSY／RECONCILING 拒絕一律保留既有 arm（不碰
+    // 三元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
     fun clearPolicyDraft() {
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
-        // 清除不會被 hook 看到，故直接拒絕且不碰 store。
+        // 清除不會被 hook 看到，故直接拒絕且不碰 store。Stage D：同步 disarm
+        //（非 owner tap 不得殘留 arm，免切回 owner 後單步誤刪）。
         if (currentUserId() != 0) {
+            disarmBlindClear()
             _state.update {
                 it.copy(
                     msg = policyText(PolicyText(PolicyTextKind.OWNER_OPERATE)),
@@ -4335,6 +4376,7 @@ class DualViewModel(
         }
         // 同步門控：任何「政策」操作進行中皆拒絕清除,避免覆蓋進行中的寫入;
         // clone/remove/batch 等非政策操作不阻擋 (Phase 2 narrowing)。
+        // Stage D：BUSY 保留既有 arm（不碰三元組，待在途結束後仍需二次確認）。
         if (inFlightWrites.any { it.startsWith("policy-") }) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
@@ -4342,6 +4384,7 @@ class DualViewModel(
             return
         }
         // Stage A：核對中拒絕清除（BUSY；按鈕亦因非 IDLE 禁用，此為程式化兜底）。
+        // Stage D：同上保留 arm。
         if (isPolicyReconcilingLocked()) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
@@ -4349,8 +4392,9 @@ class DualViewModel(
             return
         }
         if (hookPolicyStore != null && !_state.value.policyDraftKnown) {
-            if (blindClearArmed.compareAndSet(false, true)) {
+            if (!isBlindClearArmed()) {
                 // 第一次：僅告警，不執行（不清 pending，不碰 store）。
+                armBlindClearLocked()
                 _state.update {
                     it.copy(
                         msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST)),
@@ -4359,10 +4403,36 @@ class DualViewModel(
                 }
                 return
             }
-            // 第二次確認：consume 後落到正常清除路徑。
-            blindClearArmed.set(false)
+            // 第二次：先判 TTL，再判世代；任一失敗即重 arm（視為新的第一次），
+            // 兩者皆過才 disarm 落到正常清除路徑。
+            val now = nowMonoMs()
+            val armedAt = blindClearArmedAtMs.get()
+            if (now - armedAt > BLIND_CLEAR_TTL_MS) {
+                armBlindClearLocked()
+                _state.update {
+                    it.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_EXPIRED)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                return
+            }
+            if (blindClearArmedVersion.get() != policyDraftVersion.get() ||
+                blindClearArmedLoadGen.get() != policyLoadGeneration.get()
+            ) {
+                armBlindClearLocked()
+                _state.update {
+                    it.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                return
+            }
+            // 兩者皆過：consume 後落到正常清除路徑。
+            disarmBlindClear()
         } else {
-            blindClearArmed.set(false)
+            disarmBlindClear()
         }
         val key = "policy-clear:${clearGeneration.incrementAndGet()}"
         if (!inFlightWrites.add(key)) {
@@ -4494,7 +4564,7 @@ class DualViewModel(
                         policyDraftVersion.incrementAndGet()
                         policyLoadGeneration.incrementAndGet()
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
-                        blindClearArmed.set(false)
+                        disarmBlindClear()
                         _state.update {
                             it.copy(
                                 loading = false,
@@ -5653,6 +5723,9 @@ class DualViewModel(
     // false too (direct reads only under LSPOSED). Only requestHookRedDiagnosis
     // passes true, so only that dedicated entry gains privilege.
     fun reconnectAndRefresh(allowPrivilegedHookDiagnosis: Boolean = false) {
+        // Stage D：同步 disarm（Unconfined 測試下 launch 體前即可觀測；鎖內
+        // reconnectLocked 另有 disarm 覆蓋 coalesced trailing 路徑）。
+        disarmBlindClear()
         // F2/P3 leading busy (msg-preserving, same as refresh()): queued
         // behind opMutex still reads busy.
         viewModelScope.launch {
@@ -5689,6 +5762,9 @@ class DualViewModel(
     // privileged diagnosis). Only requestHookRedDiagnosis passes true. Auto
     // lifecycle never calls selectChannel.
     fun selectChannel(pref: ChannelPreference, allowPrivilegedHookDiagnosis: Boolean = false) {
+        // Stage D：通道切換即 disarm（目標/遠端可能已變；同步執行以便
+        // latest-wins 取消前即清除，鎖內不再重複）。
+        disarmBlindClear()
         // Latest-wins (P2-2): a new picker tap cancels the previous select
         // job, so rapid AUTO -> ROOT -> SHIZUKU taps collapse to the last
         // choice instead of queueing a mutex waiter per event. Eager assign:
@@ -6788,6 +6864,9 @@ class DualViewModel(
     // P2-6：hook UNKNOWN 不再觸發全量 refresh——probeChannels 本就重跑 hook
     // 診斷，hook 未知只重 probe 即可；反覆前景只探不明顯增加裝置呼叫。
     fun onForeground() {
+        // Stage D：前景返回即 disarm（切換期間遠端可能已變；同步執行以便
+        // burst coalesce 前即清除，foregroundLocked 不再重複）。
+        disarmBlindClear()
         // Single-flight coalesce (Phase B P0 B2): same gate shape as refresh()/
         // recheckPrivilege(). A burst while a foreground round is in flight
         // (including waiting on opMutex) only records one trailing re-run, so
@@ -7089,6 +7168,9 @@ enum class PolicyTextKind {
     REFRESHED,
     REFRESH_FAILED,
     BLIND_CLEAR_FIRST,
+    // Stage D：blind-clear 確認逾時（arm 超過 BLIND_CLEAR_TTL_MS）。msgKind 複用
+    // CHANNEL（與 FIRST 同級：未知＋需重新確認＋建議先重新整理）。
+    BLIND_CLEAR_EXPIRED,
     // Stage A：IO 逾時（結果未知，正在核對，請勿重試）。msgKind 複用 CHANNEL
     //（不新增 enum），文案口徑「逾時、結果未知、正在核對、請勿重試」。
     WRITE_TIMEOUT,
@@ -7125,7 +7207,8 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.CLEAR_FAILED -> "清除草稿失敗"
     PolicyTextKind.REFRESHED -> "已重新整理政策草稿"
     PolicyTextKind.REFRESH_FAILED -> "重新整理政策草稿失敗：遠端內容未知"
-    PolicyTextKind.BLIND_CLEAR_FIRST -> "遠端內容未知，清除將刪除未見內容，請再次清除以確認"
+    PolicyTextKind.BLIND_CLEAR_FIRST -> "遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理"
+    PolicyTextKind.BLIND_CLEAR_EXPIRED -> "清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理"
     PolicyTextKind.WRITE_TIMEOUT -> "寫入政策逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.CLEAR_TIMEOUT -> "清除草稿逾時，結果未知，正在核對，請勿重試"
 }

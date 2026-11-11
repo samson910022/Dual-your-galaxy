@@ -90,7 +90,9 @@
     <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
     <string name="policy_refreshed">已重新整理政策草稿</string>
     <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>
-    <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容，請再次清除以確認</string>
+    <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理</string>
+    <!-- Stage D：blind-clear 確認逾時（arm 超過 5 分鐘，需重 arm；CHANNEL 口徑）。 -->
+    <string name="policy_blind_clear_expired">清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理</string>
     <plurals name="policy_dropped">
         <item quantity="one">已捨去 %1$d 項不在來源清單的勾選</item>
         <item quantity="other">已捨去 %1$d 項不在來源清單的勾選</item>
