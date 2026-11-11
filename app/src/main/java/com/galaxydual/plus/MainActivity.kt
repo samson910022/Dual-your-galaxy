@@ -577,6 +577,7 @@ class MainActivity : ComponentActivity() {
         pendingBatchRequest = null
         shownBatchRequest = null
         shownBatchWasFresh = null
+        try {
             policyWriteDialog?.dismiss()
         } catch (_: Exception) {
             // Best effort: the window is going away anyway.
@@ -3464,6 +3465,7 @@ class MainActivity : ComponentActivity() {
             syncBatchDialog(pendingBatchRequest, s)
         } catch (e: Exception) {
             Log.w(TAG, "syncBatchDialog failed", e)
+        }
         // Stage2：兩階段政策寫入 dialog（state-driven，同 pendingRemove 模式；
         // 旋轉由 retained ViewModel 重播 state，無需重送）。
         // Phase 3：唯一真相為 state（s.policyWritePhase）；不再讀
