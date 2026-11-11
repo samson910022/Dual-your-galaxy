@@ -2226,4 +2226,135 @@ class InventorySelectionTest {
         assertEquals(96, unknownDrift.targetId)
         assertNull(unknownDrift.targetSerial)
     }
+
+    // PR64 P1：核准快照與 live 勾選不符（同數量換選取 A→B）時，VM 必須拒絕，零寫入。
+    @Test
+    fun cloneSelected_approvedKeysMismatch_sameCount_refusesZeroWrites() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(
+            listOf(
+                SourceAppEntry("com.example.a", "A", 0, false),
+                SourceAppEntry("com.example.b", "B", 0, false),
+            ),
+        )
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a")
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 95,
+            targetSerial = 15,
+            selectedKeys = setOf("0:com.example.a"),
+        )
+        // 模擬確認後、鎖內前 live 換成 B（數量仍 1）。
+        vm.clearSelectionLocal()
+        vm.toggleSelection("0:com.example.b")
+        val beforeInstalls = gw.installCalls.size
+        vm.cloneSelected(approved)
+        await { !vm.state.value.loading && vm.state.value.msg.contains("重新確認") }
+        val st = vm.state.value
+        assertEquals(MsgKind.INVALID, st.msgKind)
+        assertTrue(st.msg.contains("請重新確認"))
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
+        assertEquals(beforeInstalls, gw.installCalls.size)
+        assertNull(st.batchReport)
+    }
+
+    // PR64 P1：核准目標與 live/pin 不符時，VM 必須拒絕，零寫入。
+    @Test
+    fun cloneSelected_approvedTargetMismatch_refusesZeroWrites() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.a", "A", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.a")
+        // 核准目標與 live(95#15) 不符。
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 96,
+            targetSerial = 16,
+            selectedKeys = setOf("0:com.example.a"),
+        )
+        val beforeInstalls = gw.installCalls.size
+        vm.cloneSelected(approved)
+        await { !vm.state.value.loading && vm.state.value.msg.contains("重新確認") }
+        val st = vm.state.value
+        assertEquals(MsgKind.INVALID, st.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
+        assertEquals(beforeInstalls, gw.installCalls.size)
+        assertNull(st.batchReport)
+    }
+
+    // PR64：合法核准快照（keys+target）→ 依快照執行，單筆成功寫入。
+    @Test
+    fun cloneSelected_approvedSnapshot_executesSuccessfully() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.good", "Good", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        vm.toggleSelection("0:com.example.good")
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 95,
+            targetSerial = 15,
+            selectedKeys = setOf("0:com.example.good"),
+        )
+        vm.cloneSelected(approved)
+        await { vm.state.value.batchReport != null && !vm.state.value.loading }
+        val st = vm.state.value
+        val report = st.batchReport!!
+        assertEquals(1, report.items.size)
+        assertTrue(report.items.single().outcome is CloneOutcome.Success)
+        assertEquals(1, report.successCount)
+        assertEquals(0, report.failedCount)
+        assertEquals(0, report.unknownCount)
+        assertEquals(listOf("com.example.good"), gw.installCalls)
+    }
+
+    // PR64 P1：核准與 live 相符，但 pin 時 fetchDualTarget 漂移到不同目標→拒絕，零寫入。
+    @Test
+    fun cloneSelected_approvedMatchesLive_butPinResolvesDifferentTarget_refusesZeroWrites() {
+        val backend = MapBackend()
+        val gw = FakeRepo() // default: dualId=95, dualSerial=15
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.a", "A", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        vm.toggleSelection("0:com.example.a")
+        val approved = ApprovedBatchCloneRequest(
+            targetId = 95,
+            targetSerial = 15,
+            selectedKeys = setOf("0:com.example.a"),
+        )
+        // 讓 cloneSelected pin-time 的 fetchDualTarget 解析到不同目標 (96#16)。
+        gw.dualId = 96
+        gw.dualSerial = 16
+        val beforeInstalls = gw.installCalls.size
+        vm.cloneSelected(approved)
+        await { !vm.state.value.loading && vm.state.value.msg.contains("重新確認") }
+        val st = vm.state.value
+        assertEquals(beforeInstalls, gw.installCalls.size)
+        assertNull(st.batchReport)
+        assertEquals(MsgKind.INVALID, st.msgKind)
+        assertEquals(DiagnoseCode.VERIFY_MISMATCH, st.diagnose?.code)
+        assertTrue(st.msg.contains("目標已變更"))
+        assertTrue(st.msg.contains("已清空舊勾選"))
+        assertTrue(st.msg.contains("請重新確認"))
+        assertEquals("pin mismatch must clear stale selection", emptySet<String>(), st.selectedKeys)
+        assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
+        assertEquals(96, st.inventory.targetId)
+        assertEquals(16, st.inventory.targetSerial)
+    }
 }
