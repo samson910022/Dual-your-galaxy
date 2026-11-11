@@ -37,6 +37,8 @@
    hook 側 TTL 一覽（皆見 `EffectivePolicyCache`，與 App 側 TTL 對照見 `docs/USAGE.md` 政策 TTL 對照表）：
    - 快取 TTL `maxCacheAgeMs` 60 秒：到期後下次讀取 fail-closed 回 seed（`invalidated=true`），不復活過期值；TTL 到期不 bump 世代（到期前已發起的在途新鮮讀仍可滿足到期）。
    - 失敗節流 `failureCooldownMs` 5 秒：遠端讀取失敗後不重試 reader，回 `last-known-good`（未 invalidate 時）或 seed；`invalidate()` 顯式重置節流。
+    - reconciler 總預算 `POLICY_RECONCILE_TOTAL_BUDGET_MS` 15 秒（App 側，Stage F2/G2）：reconciler join＋3 讀＋退避合計有界；超限即誠實 unresolved（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留＋`RECONCILING` 續留，Tx 存活），由手動 `refreshPolicyDraft` late-join 結清回 `IDLE`（見 `docs/USAGE.md` 政策 TTL 對照表）。
+    - 單次 auto-recheck（App 側，Stage G2）：`deferred.invokeOnCompletion` 在 handoverTx 登記時掛單次權威重查（`boundedReconcileRead` 有界獨立池，不耗 reconciler 三讀預算）→走 settle helper（deferred 完成＋Known==預期才結清）；Unknown 保持 unresolved＋`UNRESOLVED_REFRESH`（按鈕即重新整理草稿，待手動 refresh late-join）。
    - 閘門關閉短路（Stage C）：`NON_EMPTY_POLICY_EFFECTIVE_GATE` 關閉時 `get()` 直接回空集合，不碰 reader、不加鎖、不讀時鐘——observe-only 下零 IPC 讀取，故上述 TTL 在閘門關閉時皆不觸發。
 - 樂觀快取限制：`RemotePreferences.commit()` 先更新行程內快取再走 binder，
   故 save/clear 失敗後同一行程的 `load()` 可能樂觀讀到未落盤的值；冷啟動
@@ -50,7 +52,7 @@
   若 wrapper 共享底層 mMap 則仍有污染風險。TODO(on-device)：驗證 daemon 重建
   後新實例是否重同步權威值、同 group 是否回同一實例、wrapper 是否共享 mMap。
 - App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
-  Phase4 timeout，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
+  Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
   （Unknown fence、兩步清除、手動重整、超時轉 RECONCILING 核對）；端到端仍
   DEVICE-UNVERIFIED。
