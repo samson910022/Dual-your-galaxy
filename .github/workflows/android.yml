@@ -272,6 +272,46 @@ jobs:
           echo "app versionName=$APP_VER module.prop version=$MOD_VER"
           test "$APP_VER" = "$MOD_VER"
           echo "PASS: scope parity + module fail-safe + version sync"
+      # Stage2 (hook-policy-source P1): the app-owned guard provider must replace
+      # the libxposed service AAR's exported XposedProvider at the same authority.
+      # Why: the AAR's provider is exported with no permission, so any app could
+      # call SendBinder and hijack the policy channel; the merged manifest must
+      # carry only GuardXposedProvider at ${applicationId}.XposedService.
+      - name: Policy provider parity
+        run: |
+          set -e
+          set -o pipefail
+          echo "== source manifest =="
+          MAN=app/src/main/AndroidManifest.xml
+          # Same provider node: libxposed provider removed, guard provider declared
+          # with the identical authority (remove + re-declare is the reliable form;
+          # tools:node="replace" would duplicate the authority).
+          grep -F -A1 'android:name="io.github.libxposed.service.XposedProvider"' "$MAN" | grep -F 'tools:node="remove"'
+          grep -F -A1 'android:name=".GuardXposedProvider"' "$MAN" | grep -F 'android:authorities="${applicationId}.XposedService"'
+          echo "== merged manifest =="
+          if [ ! -d app/build/intermediates/merged_manifests ]; then
+            echo "FAIL: app/build/intermediates/merged_manifests missing; run :app:assembleDebug first"
+            exit 1
+          fi
+          # Exactly one merged manifest: zero means the merge task did not run;
+          # more than one means an unexpected variant is present, and grepping an
+          # arbitrary pick would silently weaken the gate.
+          MERGED_COUNT=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml | wc -l)
+          if [ "$MERGED_COUNT" != "1" ]; then
+            echo "FAIL: expected exactly 1 merged AndroidManifest.xml, found $MERGED_COUNT"
+            exit 1
+          fi
+          MERGED=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml)
+          echo "merged manifest: $MERGED"
+          # Exact attribute values, not a bare FQN substring: the merged manifest
+          # must carry the guard provider at the debug-suffixed authority.
+          grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
+          grep -F 'android:authorities="com.galaxydual.plus.debug.XposedService"' "$MERGED"
+          if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
+            echo "FAIL: merged manifest still declares the libxposed XposedProvider"
+            exit 1
+          fi
+          echo "PASS: policy provider parity"
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |

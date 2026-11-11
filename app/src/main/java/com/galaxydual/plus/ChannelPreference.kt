@@ -24,8 +24,9 @@
 //   the marker signal is display-only evidence, see HookMarker, and must
 //   never grant privilege without on-device verification).
 // - LSPOSED explicitly selected resolves to LSPOSED_PLACEHOLDER, which still
-//   builds a NoOp gateway (whitelist policy branch pending -- writes refused
-//   with the reason stated, never executed).
+//   builds a NoOp gateway (the whitelist policy source is wired, end-to-end
+//   DEVICE-UNVERIFIED, but the LSPosed execution channel remains a NoOp
+//   placeholder -- writes refused with the reason stated, never executed).
 package com.galaxydual.plus
 
 import android.content.SharedPreferences
@@ -170,11 +171,13 @@ fun resolveAutoProbe(
 
 // Builds the gateway for a resolved channel. Constructor-only, no I/O, so
 // JVM-constructible (same pattern as GatewayAssemblyTest). LSPosed builds
-// NoOp by policy until the whitelist branch lands (F4b-P2): the placeholder
-// must never be mistaken for an executable channel -- DualViewModel refuses
-// writes under it with the reason stated.
+// NoOp by policy (the whitelist policy source is wired, end-to-end
+// DEVICE-UNVERIFIED, but the LSPosed execution channel remains a NoOp
+// placeholder, F4b-P2): the placeholder must never be mistaken for an
+// executable channel -- DualViewModel refuses writes under it with the reason
+// stated.
 // TODO(hook-channel): return the real LSPosed hook gateway for
-// LSPOSED_PLACEHOLDER once the whitelist policy branch is verified on-device.
+// LSPOSED_PLACEHOLDER once the hook execution channel is verified on-device.
 fun buildGatewayForChannel(channel: ResolvedChannel, packageName: String): CmdGateway =
     when (channel) {
         ResolvedChannel.ROOT -> SuCmdGateway()
@@ -212,8 +215,10 @@ fun assembleChannel(
     val gateway: CmdGateway = when (channel) {
         ResolvedChannel.ROOT -> suGateway
         ResolvedChannel.SHIZUKU -> shizukuGateway
-        // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only) until the
-        // whitelist policy branch is verified on-device; see TODO above.
+        // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only); the
+        // whitelist policy source is wired (end-to-end DEVICE-UNVERIFIED) but
+        // the LSPosed execution channel remains a NoOp placeholder. See TODO
+        // above.
         ResolvedChannel.NOOP,
         ResolvedChannel.LSPOSED_PLACEHOLDER,
         -> NoOpGateway()

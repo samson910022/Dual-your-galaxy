@@ -48,6 +48,63 @@
     <string name="save_selection_cd">保存目前勾選（只保存勾選，不寫入分身）</string>
     <string name="action_unsave_selection">取消保存</string>
     <string name="unsave_selection_cd">取消保存選取（不卸載分身，不清除目前勾選）</string>
+    <!-- Stage2 (hook-policy-source P1)：白名單政策（草稿）最小入口。 -->
+    <string name="action_write_policy">寫入政策</string>
+    <string name="write_policy_cd">將目前勾選寫入白名單政策草稿（只寫草稿，不安裝分身）</string>
+    <string name="action_clear_policy_draft">清除草稿</string>
+    <string name="clear_policy_draft_cd">清除已保存的政策草稿（不影響已安裝分身與目前勾選）</string>
+    <!-- Phase 2：手動重新整理草稿（唯讀，不觸發寫入）。 -->
+    <string name="action_refresh_policy_draft">重新整理草稿</string>
+    <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
+    <string name="refresh_policy_draft_cd_refreshing">正在重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
+    <string name="policy_draft_format">白名單政策（草稿）：%1$d 項</string>
+    <string name="policy_draft_unknown">白名單政策（草稿）：未知（LSPosed 服務未連線，請點「重新整理草稿」重試）</string>
+    <string name="policy_write_title">確認寫入政策</string>
+    <plurals name="policy_write_message">
+        <item quantity="one">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
+        <item quantity="other">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
+    </plurals>
+    <string name="policy_write_acknowledge">我已確認上述包名為要放寬白名單的對象。</string>
+    <string name="policy_write_positive">確認寫入</string>
+    <!-- Phase 5 polish：政策 VM 訊息資源化（前身硬編碼繁中＋一處英文 "already in progress"）；三語系同鍵，VM 經 policyText 注入解析（生產 Context，JVM 預設繁中），見 DualViewModel.PolicyText。 -->
+    <string name="policy_busy">政策寫入進行中，請稍候</string>
+    <string name="policy_owner_write">政策草稿必須由主用戶（owner user）寫入，否則 hook 讀不到</string>
+    <string name="policy_owner_operate">政策草稿必須由主用戶（owner user）操作，否則 hook 讀不到</string>
+    <string name="policy_unknown_refresh">遠端政策未知，請先重新整理後再寫入</string>
+    <string name="policy_empty_selection">未勾選任何應用</string>
+    <string name="policy_catalog_loading">來源清單尚未載入，請稍候再試</string>
+    <string name="policy_catalog_missing">勾選的應用已不在來源清單，請重選</string>
+    <string name="policy_cancelled">已取消寫入政策（未寫入任何草稿）</string>
+    <string name="policy_no_pending">沒有待確認的政策寫入</string>
+    <string name="policy_in_progress">政策寫入已在進行中，請稍候</string>
+    <string name="policy_ttl_expired">確認已逾時，請重新確認後再寫入</string>
+    <string name="policy_no_store_write">無政策 store，無法寫入政策</string>
+    <string name="policy_no_store_clear">無政策 store，無法清除草稿</string>
+    <string name="policy_no_store_read">無政策 store，無法讀取草稿</string>
+    <string name="policy_write_failed">寫入政策失敗</string>
+    <string name="policy_clear_failed">清除草稿失敗</string>
+    <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
+    <string name="policy_refreshed">已重新整理政策草稿</string>
+    <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>
+    <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容，請再次清除以確認</string>
+    <plurals name="policy_dropped">
+        <item quantity="one">已捨去 %1$d 項不在來源清單的勾選</item>
+        <item quantity="other">已捨去 %1$d 項不在來源清單的勾選</item>
+    </plurals>
+    <plurals name="policy_written">
+        <item quantity="one">已寫入政策草稿 %1$d 項（勾選≠安裝，可隨時清除）</item>
+        <item quantity="other">已寫入政策草稿 %1$d 項（勾選≠安裝，可隨時清除）</item>
+    </plurals>
+    <!-- Phase 5 dialog/a11y：包名預覽截斷、清單摘要、忙碌後綴、取消拒絕 toast、寫入中播報。 -->
+    <plurals name="policy_write_preview_more">
+        <item quantity="one">…等共 %1$d 項，僅顯示前 %2$d 項</item>
+        <item quantity="other">…等共 %1$d 項，僅顯示前 %2$d 項</item>
+    </plurals>
+    <string name="policy_write_list_cd">政策包名列表，共 %1$d 項</string>
+    <string name="policy_write_busy_saving">"\n（寫入中…）"</string>
+    <string name="policy_write_busy_queued">"\n（等待中…）"</string>
+    <string name="policy_write_cancel_denied">寫入中，無法取消</string>
+    <string name="policy_write_saving_announce">政策寫入中</string>
     <plurals name="batch_create">
         <item quantity="one">建立 %1$d 個分身</item>
         <item quantity="other">建立 %1$d 個分身</item>
@@ -113,7 +170,7 @@
     <string name="status_ready">就緒</string>
     <!-- p28-1 review：寫入拒絕理由（使用者可見短句；原 DualViewModel.writeBlockReason
          全文硬編碼繁中）。%1$s=Hook 狀態（動態證據）、明選分支 %1$s=模式 %2$s=通道身份。 -->
-    <string name="write_block_lsposed">LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，寫入已拒絕；Hook 狀態：%1$s；如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」</string>
+    <string name="write_block_lsposed">LSPosed 通道為佔位（NoOp）：寫入已拒絕；白名單政策來源已接線（端到端 DEVICE-UNVERIFIED）。Hook 狀態：%1$s；如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」</string>
     <string name="write_block_noop">通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，寫入已禁用；請檢查授權後點「重新連線並更新」</string>
     <string name="write_block_explicit">所選模式 %1$s（%2$s 通道）探測未通過，寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試</string>
     <string name="write_block_pm">探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；請檢查授權後點「重新連線並更新」</string>

@@ -1,0 +1,713 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+//
+// Stage2 (hook-policy-source P1):remoteHookPolicyStore 綁定語意 JVM 測。
+// 以手寫 in-memory SharedPreferences (比照 ChannelPreferenceInMemoryStoreTest)
+// 鎖定:group/key 字面值、save/clear 走 commit (非 apply)、同 provider 新
+// store 可重讀、provider 回 null 時 fail-closed、回傳集合防禦性拷貝。
+// 這只證明 app 側綁定;app 寫入後 hook 是否真讀到 (LSPosed remote
+// preferences 跨行程通道) 仍需 on-device 端到端證明 (DEVICE-UNVERIFIED)。
+package com.galaxydual.plus
+
+import android.content.SharedPreferences
+import com.galaxydual.hook.PolicySource
+import java.util.concurrent.atomic.AtomicReference
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class HookPolicyRemoteStoreTest {
+
+    // Minimal in-memory SharedPreferences with an Editor that records explicit
+    // commit()/apply() calls so the binding's synchronous-commit contract is
+    // observable (the production binding must use commit(), never apply()).
+    //
+    // Fidelity notes (本假實現與真實 SharedPreferences/RemotePreferences 的差異):
+    // - getStringSet 回傳後方 live set (與真實 RemotePreferences 一致);防禦性
+    //   拷貝由 HookPolicyStore.load 的 sanitizeHookPolicy 統一負責,故
+    //   mutatingLoadedSetDoesNotCorruptStore 才真的測到該防線。
+    // - commit() 為同步原子 flush 且一律成功;只有在專用的 failing-commit 測試
+    //   以 commitSucceeds=false 模擬失敗 (真實 RemotePreferences.commit 可能因
+    //   binder 失敗回 false)。
+    // - listener 註冊/反註冊為 no-op (綁定不依賴 listener)。
+    private class RecordingPrefs : SharedPreferences {
+        private val data = linkedMapOf<String, Any?>()
+        var commitCalls = 0
+            private set
+        var applyCalls = 0
+            private set
+        var removeCalls = 0
+            private set
+        var getStringSetCalls = 0
+            private set
+        // 測試開關:模擬 commit 失敗 / commit 拋出 / 型別錯亂 (見各專用測試)。
+        var commitSucceeds = true
+        var commitThrows = false
+        var corruptType = false
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(data)
+        override fun getString(key: String?, defValue: String?): String? =
+            if (data[key] is String) data[key] as? String else defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+            getStringSetCalls++
+            if (corruptType) {
+                // 模擬條目型別錯亂 (如被誤寫成 String):真實 RemotePreferences
+                // 會在內部轉型時擲出 ClassCastException。
+                throw ClassCastException("java.lang.String cannot be cast to java.util.Set")
+            }
+            @Suppress("UNCHECKED_CAST")
+            val stored = data[key] as? MutableSet<String>
+            return stored ?: defValues
+        }
+        override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            (data[key] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = data.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = RecordingEditor()
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+
+        private inner class RecordingEditor : SharedPreferences.Editor {
+            private val pending = linkedMapOf<String, Any?>()
+            private val removed = mutableSetOf<String>()
+
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+                if (value == null) {
+                    removed.add(key!!)
+                    pending.remove(key)
+                } else {
+                    pending[key!!] = value
+                    removed.remove(key)
+                }
+                return this
+            }
+
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
+                pending[key!!] = values?.toMutableSet()
+                removed.remove(key)
+                return this
+            }
+
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+
+            override fun remove(key: String?): SharedPreferences.Editor {
+                removeCalls++
+                removed.add(key!!)
+                pending.remove(key)
+                return this
+            }
+
+            override fun clear(): SharedPreferences.Editor {
+                // The remote binding never calls clear(); kept for completeness.
+                removed.addAll(data.keys)
+                pending.clear()
+                return this
+            }
+
+            // 模擬 RemotePreferences 的樂觀更新:先寫進行程內快取 (flush) 再走
+            // binder,並回傳 commitSucceeds;測試只斷言該布林,持久化與否非重點。
+            // commitThrows=true 時模擬 binder RemoteException (flush 已發生、
+            // mMap 已污染後再拋出)，與真實 doUpdate-先於-doCommit 一致。
+            override fun commit(): Boolean {
+                flush()
+                commitCalls++
+                if (commitThrows) throw RuntimeException("commit binder dead")
+                return commitSucceeds
+            }
+
+            override fun apply() {
+                flush()
+                applyCalls++
+            }
+
+            private fun flush() {
+                for (k in removed) data.remove(k)
+                for ((k, v) in pending) data[k] = v
+                pending.clear()
+                removed.clear()
+            }
+        }
+    }
+
+    @Test
+    fun groupAndKeyLiteralsAreStable() {
+        assertEquals("dual_policy", PolicySource.POLICY_PREFS_NAME)
+        assertEquals("extra_whitelist_packages", PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+    }
+
+    @Test
+    fun saveWritesStringSetViaCommitNotApply() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+
+        assertTrue(store.save(setOf("com.example.a", "com.example.b")))
+
+        assertEquals(1, prefs.commitCalls)
+        assertEquals(0, prefs.applyCalls)
+        val persisted = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)
+        assertEquals(setOf("com.example.a", "com.example.b"), persisted?.toSet())
+    }
+
+    @Test
+    fun newStoreInstanceReadsSameValuesThroughSameProvider() {
+        val prefs = RecordingPrefs()
+        val provider = { prefs }
+        val draft = setOf("com.example.a", "com.example.b")
+        assertTrue(remoteHookPolicyStore(provider).save(draft))
+
+        // Same provider, brand-new store instance must observe the write.
+        assertEquals(draft, remoteHookPolicyStore(provider).load())
+    }
+
+    @Test
+    fun clearRemovesKeyViaCommitNotApply() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.save(setOf("com.example.a")))
+        assertEquals(1, prefs.commitCalls)
+        // 哨兵鍵:clear 只能刪政策鍵,不得清空整個 prefs (殺死 remove->clear 變種)。
+        assertTrue(prefs.edit().putString("sentinel", "keep").commit())
+        assertEquals(2, prefs.commitCalls)
+
+        assertTrue(store.clear())
+
+        assertEquals(3, prefs.commitCalls)
+        assertEquals(0, prefs.applyCalls)
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+        assertEquals("keep", prefs.getString("sentinel", null))
+        assertTrue(remoteHookPolicyStore { prefs }.load().isEmpty())
+    }
+
+    @Test
+    fun transientProviderFailureReadsEmptyWithoutSelfClear() {
+        val prefs = RecordingPrefs()
+        // 先寫入一筆有效草稿,模擬已存在的 draft。
+        assertTrue(remoteHookPolicyStore { prefs }.save(setOf("com.example.keep")))
+
+        // provider() 第一次解析拋出 (模擬 XposedService.ServiceException 等暫時性
+        // IPC 失敗):應視為「缺席」-> load 回空,但絕對不得自清 (刪掉有效草稿),
+        // 且不得為自清再解析一次 provider (否則會改寫草稿)。
+        var calls = 0
+        val store = remoteHookPolicyStore {
+            calls++
+            if (calls == 1) throw RuntimeException("transient") else prefs
+        }
+
+        assertTrue(store.load().isEmpty())
+        assertEquals(
+            setOf("com.example.keep"),
+            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+        )
+        assertEquals(1, calls) // only the load resolution; no self-clear resolution
+    }
+
+    @Test
+    fun corruptTypeSelfClearsThroughRemoteBinding() {
+        val prefs = RecordingPrefs()
+        assertTrue(remoteHookPolicyStore { prefs }.save(setOf("com.example.a")))
+        assertTrue(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+        // 模擬型別錯亂:getStringSet 擲出 ClassCastException。
+        prefs.corruptType = true
+        val store = remoteHookPolicyStore { prefs }
+
+        assertTrue(store.load().isEmpty())
+        // 與暫時性 IPC 失敗不同:型別損壞走 load() 的既有自清路線,金鑰必須被移除。
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+    }
+
+    @Test
+    fun failingCommitPropagatesAsFalse() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertFalse(store.clear())
+    }
+
+    @Test
+    fun nullProviderFailsClosed() {
+        val store = remoteHookPolicyStore { null }
+
+        assertTrue(store.load().isEmpty())
+        assertFalse(store.save(setOf("com.example.a")))
+        assertFalse(store.clear())
+    }
+
+    @Test
+    fun throwingProviderFailsSaveAndClearClosed() {
+        // provider() 每次解析都拋出 (模擬 service binder 完全死亡):
+        // load 回空,save/clear 都必須回 false (不可拋出、不可回報成功)。
+        val store = remoteHookPolicyStore { throw RuntimeException("service dead") }
+
+        assertTrue(store.load().isEmpty())
+        assertFalse(store.save(setOf("com.example.a")))
+        assertFalse(store.clear())
+    }
+
+    // Phase 4:provider 拋 Error (如 AssertionError) 亦 fail-closed
+    // (store 層抓 Throwable 對齊 P1-2;取消除外,此處無協程故僅驗 fail-closed)。
+    @Test
+    fun errorThrowingProviderFailsClosed() {
+        val store = remoteHookPolicyStore { throw AssertionError("binder dead") }
+
+        assertTrue(store.load().isEmpty())
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertFalse(store.save(setOf("com.example.a")))
+        assertFalse(store.clear())
+    }
+
+    @Test
+    fun providerResolvedPerOperationRecoversWhenServiceAppears() {
+        var prefs: RecordingPrefs? = null
+        val store = remoteHookPolicyStore { prefs }
+
+        assertTrue(store.load().isEmpty())
+        assertFalse(store.save(setOf("com.example.a")))
+
+        // Service (binder) arrives later; the same store instance re-resolves
+        // the provider per operation and starts persisting.
+        prefs = RecordingPrefs()
+        assertTrue(store.save(setOf("com.example.a")))
+        assertEquals(setOf("com.example.a"), store.load())
+    }
+
+    @Test
+    fun mutatingLoadedSetDoesNotCorruptStore() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        val draft = setOf("com.example.a", "com.example.b")
+        assertTrue(store.save(draft))
+
+        // Phase 5：防禦性拷貝非 vacuous——兩次 load 必須是不同實例（assertNotSame），
+        // 否則「變動不污染」斷言對同一實例恆真。載出集合的變動不得污染持久化草稿。
+        val loaded1 = store.load()
+        val loaded2 = store.load()
+        assertNotSame(loaded1, loaded2)
+        assertEquals(draft, loaded1)
+        assertEquals(draft, loaded2)
+        // 不鎖實作是否回傳可變集合:try/catch 涵蓋不可變/不可新增的副本,
+        // 重點是載出集合的變動不得污染持久化草稿。
+        var mutated = false
+        try {
+            (loaded1 as? MutableSet<String>)?.add("com.example.evil")
+            mutated = (loaded1 as? Set<String>)?.contains("com.example.evil") == true
+        } catch (_: UnsupportedOperationException) {
+            // Immutable copy: nothing to mutate; store integrity is the point.
+        }
+
+        // The mutation must not reach the persisted draft (nor the other snapshot).
+        assertEquals(draft, store.load())
+        assertEquals(draft, loaded2)
+        if (mutated) {
+            assertEquals(draft, store.load())
+        }
+    }
+
+    @Test
+    fun absentKeyIsConfirmedEmptyNotUnknown() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        // Connected service with no draft key is a confirmed empty, not unknown.
+        assertTrue(store.loadResult() is LoadResult.Known)
+        assertTrue(store.load().isEmpty())
+    }
+
+    @Test
+    fun failedSaveMasksOptimisticCacheAsUnknownUntilSuccessfulSave() {
+        // RecordingEditor.commit() 先 flush (樂觀寫進行程內 mMap) 再回
+        // commitSucceeds,與真實 RemotePreferences (doUpdate 先於 binder
+        // doCommit) 一致:commit false 時底層 data 已被污染。
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        // 樂觀值已在本地 mMap,但 daemon 未落盤:必須回 Unknown,不可把樂觀值
+        // 誤報為 Known。
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        // 污染確實存在 (證明此測試真的踩到樂觀快取,而非單純空鍵)。
+        assertEquals(
+            setOf("com.example.a"),
+            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+        )
+
+        // 成功 commit 重同步本地+daemon 後,讀數重新可信。
+        prefs.commitSucceeds = true
+        assertTrue(store.save(setOf("com.example.a")))
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
+    }
+
+    @Test
+    fun failedClearMasksOptimisticCacheAsUnknownUntilSuccessfulClear() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.save(setOf("com.example.a")))
+
+        // clear 的 commit 回 false:本地已樂觀刪鍵,但 daemon 仍有值;若直接讀會
+        // 誤報「已確認空」,必須回 Unknown。
+        prefs.commitSucceeds = false
+        assertFalse(store.clear())
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+
+        // 成功 clear(true) 重同步後恢復 Known 空 (確認空,非 Unknown)。
+        prefs.commitSucceeds = true
+        assertTrue(store.clear())
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertTrue((result as LoadResult.Known).packages.isEmpty())
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+    }
+
+    @Test
+    fun throwingProviderDoesNotMaskSubsequentReads() {
+        // provider() 拋出 = 未觸及任何 prefs 實例 → 無 mMap 污染可能，不設旗標；
+        // 恢復後直接 load 即為 Known (load-only 恢復，無需先成功寫入)。
+        val prefs = RecordingPrefs()
+        var throwOnce = true
+        val store = remoteHookPolicyStore {
+            if (throwOnce) throw RuntimeException("binder dead") else prefs
+        }
+
+        // provider 拋出 -> HookPolicyStore.save 轉 false，但旗標不得升起。
+        assertFalse(store.save(setOf("com.example.a")))
+        throwOnce = false
+        // provider 已恢復且底層實際為空：無污染，直接讀可信 -> Known 空。
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertTrue((result as LoadResult.Known).packages.isEmpty())
+    }
+
+    @Test
+    fun throwingCommitMasksSubsequentReadsAsUnknownUntilSuccessfulSave() {
+        // commit() 拋出 (RemoteException 風格)：已拿到 prefs 實例且樂觀 flush
+        // 已發生，必須回 Unknown；成功 save 後恢復 Known。
+        val prefs = RecordingPrefs()
+        prefs.commitThrows = true
+        val store = remoteHookPolicyStore { prefs }
+
+        // HookPolicyStore.save 捕捉 commit 拋出轉 false，且旗標必須升起。
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        // 污染確實存在 (flush-then-throw，與真實 doUpdate-先於-doCommit 一致)。
+        assertEquals(
+            setOf("com.example.a"),
+            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+        )
+
+        prefs.commitThrows = false
+        assertTrue(store.save(setOf("com.example.a")))
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
+    }
+
+    @Test
+    fun nullProviderSaveDoesNotMaskSubsequentReadsAfterRecovery() {
+        // null-provider save：未觸及任何 prefs 實例 → 不設旗標；provider 恢復為
+        // 乾淨 prefs 後直接 load 即為 Known (load-only 恢復，證明無 sticky
+        // Unknown)。
+        var prefs: RecordingPrefs? = null
+        val store = remoteHookPolicyStore { prefs }
+
+        assertFalse(store.save(setOf("com.example.a")))
+
+        // provider 恢復，底層為乾淨空 prefs。
+        prefs = RecordingPrefs()
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertTrue((result as LoadResult.Known).packages.isEmpty())
+    }
+
+    @Test
+    fun flaggedUnknownDoesNotSelfClearCorruptType() {
+        // 失敗 save (旗標 true) 後即使底層型別損壞，loadRaw 短路不碰 prefs，
+        // 故不得觸發 CCE 自清 (key 仍在)；成功 save 後恢復 Known。
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+
+        // 此時再標記型別損壞：仍為 Unknown，且 key 不得被自清刪除。
+        prefs.corruptType = true
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertTrue(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+
+        // 成功 save 覆寫即恢復可信讀數。
+        prefs.corruptType = false
+        prefs.commitSucceeds = true
+        assertTrue(store.save(setOf("com.example.a")))
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
+    }
+
+    @Test
+    fun swappedCleanInstanceRecoversKnownWithoutSave() {
+        // 舊名 stickyFlagSurvivesProviderSwapUntilSuccessfulSave 已反轉語意，
+        // 改名以誠實反映現行：第 1 層新身份穿透（DEVICE-UNVERIFIED 實驗路徑）——
+        // 換到不同身份的新 prefs 即穿透讀 Known，無需成功 save。
+        val polluted = RecordingPrefs()
+        polluted.commitSucceeds = false
+        val clean = RecordingPrefs()
+        val current = AtomicReference<SharedPreferences?>(polluted)
+        val store = remoteHookPolicyStore { current.get() }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+
+        // Phase 2：第 1 層身份穿透——新實例直接可讀 Known（確認空）。
+        current.set(clean)
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertTrue((result as LoadResult.Known).packages.isEmpty())
+    }
+
+    @Test
+    fun newPrefsInstanceRecoversWithoutClearThenSaveSucceeds() {
+        // Phase 2：transient commit-false → 換新 prefs 實例（含舊值）→ load 即
+        // Known（免 clear）→ 可直接 save 新值免 clear。
+        val polluted = RecordingPrefs()
+        polluted.commitSucceeds = false
+        val current = AtomicReference<SharedPreferences?>(polluted)
+        val store = remoteHookPolicyStore { current.get() }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+
+        // 新實例已重同步舊值（模擬 daemon 真值）。
+        val recovered = RecordingPrefs()
+        assertTrue(
+            recovered.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.keep"),
+            ).commit(),
+        )
+        current.set(recovered)
+
+        // 免 clear 即恢復 Known（舊值），且可直接 save 新值。
+        val probed = store.loadResult()
+        assertTrue(probed is LoadResult.Known)
+        assertEquals(setOf("com.example.keep"), (probed as LoadResult.Known).packages)
+
+        assertTrue(store.save(setOf("com.example.b")))
+        val after = store.loadResult()
+        assertTrue(after is LoadResult.Known)
+        assertEquals(setOf("com.example.b"), (after as LoadResult.Known).packages)
+    }
+
+    @Test
+    fun sameInstanceStaysFailClosedWithoutTouchingPrefs() {
+        // 第 2 層同實例超時試探已刪除：同實例在旗標下永回 Unknown，直到一次
+        // 成功 save/clear 清旗；不更新時間、不讀 prefs、不自清。
+        // 超時推進後仍 Unknown（此處以重複讀模擬時間推進語意）。
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        // 同實例短路不碰 prefs：首次旗標下讀即零 getStringSet。
+        val callsAfterFirst = prefs.getStringSetCalls
+        assertEquals(0, callsAfterFirst)
+
+        // 重複讀仍 Unknown，且未新增 prefs 觸碰（續閂節流證明）。
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsAfterFirst, prefs.getStringSetCalls)
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsAfterFirst, prefs.getStringSetCalls)
+
+        // 不自清：樂觀值仍在（未被刪除），避免刪掉有效草稿。
+        assertTrue(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+
+        // 成功 save 清旗後恢復 Known。
+        prefs.commitSucceeds = true
+        assertTrue(store.save(setOf("com.example.a")))
+        val result = store.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
+    }
+
+    @Test
+    fun flaggedNewIdentityProbeFailureRelatchesWithoutSelfClear() {
+        // 第 1 層新身份穿透失敗：永不觸 CCE 自清，且續閂到當今實例；
+        // 續閂後同實例短路不再碰 prefs（第二次同實例讀 getStringSetCalls 未增）。
+        val polluted = RecordingPrefs()
+        polluted.commitSucceeds = false
+        val current = AtomicReference<SharedPreferences?>(polluted)
+        val store = remoteHookPolicyStore { current.get() }
+
+        assertFalse(store.save(setOf("com.example.a")))
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(0, polluted.getStringSetCalls)
+
+        // 新實例帶型別損壞：穿透探讀失敗 → Unknown，不自清，續閂到新實例。
+        val bad = RecordingPrefs()
+        assertTrue(
+            bad.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.keep"),
+            ).commit(),
+        )
+        bad.corruptType = true
+        current.set(bad)
+
+        val callsBefore = bad.getStringSetCalls
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsBefore + 1, bad.getStringSetCalls)
+        assertTrue(bad.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+
+        // 續閂：同實例第二次讀短路，不再碰 prefs。
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsBefore + 1, bad.getStringSetCalls)
+
+        // 同實例修復損壞仍不恢復（fail-closed：同實例永 Unknown）。
+        bad.corruptType = false
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsBefore + 1, bad.getStringSetCalls)
+    }
+
+    // provider 拋 CancellationException 時 load/save/clear 同步上拋
+    //（store 非 suspend，直接拋；取消不得被吞為 Unknown/false）。
+    @Test
+    fun providerCancellationExceptionRethrownForLoadSaveClear() {
+        val store = remoteHookPolicyStore {
+            throw kotlinx.coroutines.CancellationException("cancel")
+        }
+        try {
+            store.loadResult()
+            org.junit.Assert.fail("loadResult must rethrow CancellationException")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // expected
+        }
+        try {
+            store.load()
+            org.junit.Assert.fail("load must rethrow CancellationException")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // expected
+        }
+        try {
+            store.save(setOf("com.example.a"))
+            org.junit.Assert.fail("save must rethrow CancellationException")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // expected
+        }
+        try {
+            store.clear()
+            org.junit.Assert.fail("clear must rethrow CancellationException")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // expected
+        }
+    }
+
+    // saveRaw 的 edit/commit 拋 CE 時 markFailed + 重拋：後續讀為 Unknown
+    //（旗標已升），成功 save 後清旗回 Known。
+    @Test
+    fun saveCommitCancellationMarksFailedAndRethrows() {
+        // 最小 stub：commit 可拋 CE（RecordingPrefs.commitThrows 僅拋
+        // RuntimeException；且 Editor 裝飾器會因 putStringSet 回傳 inner 而
+        // 繞過 commit 覆寫，故此處用完整 stub）。
+        var throwCe = true
+        var getCalls = 0
+        val data = mutableMapOf<String, Any?>()
+        val cePrefs = object : SharedPreferences {
+            override fun getAll(): MutableMap<String, *> = HashMap(data)
+            override fun getString(key: String?, defValue: String?): String? = defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+                getCalls++
+                @Suppress("UNCHECKED_CAST")
+                return (data[key] as? Set<String>)?.toMutableSet() ?: defValues
+            }
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+            override fun contains(key: String?): Boolean = data.containsKey(key)
+            override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+                private var pending: MutableSet<String>? = null
+                private var removed = false
+                override fun putString(key: String?, value: String?): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor =
+                    apply { pending = values?.toMutableSet(); removed = false }
+                override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun putLong(key: String?, value: Long): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun remove(key: String?): SharedPreferences.Editor =
+                    apply { removed = true; pending = null }
+                override fun clear(): SharedPreferences.Editor =
+                    throw UnsupportedOperationException()
+                override fun commit(): Boolean {
+                    if (throwCe) throw kotlinx.coroutines.CancellationException("cancel")
+                    if (removed) data.remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+                    if (pending != null) {
+                        data[PolicySource.POLICY_KEY_EXTRA_PACKAGES] = pending!!
+                    }
+                    return true
+                }
+                override fun apply() = throw UnsupportedOperationException()
+            }
+            override fun registerOnSharedPreferenceChangeListener(
+                listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+            ) = Unit
+            override fun unregisterOnSharedPreferenceChangeListener(
+                listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+            ) = Unit
+        }
+        val ceStore = remoteHookPolicyStore { cePrefs }
+        try {
+            ceStore.save(setOf("com.example.a"))
+            org.junit.Assert.fail("save must rethrow CancellationException")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // expected: markFailed + rethrow
+        }
+        // 旗標已升：同一實例短路 Unknown（不碰底層 getStringSet）。
+        assertTrue(ceStore.loadResult() is LoadResult.Unknown)
+        assertEquals(0, getCalls)
+
+        // 成功 save 清旗：同一實例恢復 Known。
+        throwCe = false
+        assertTrue(ceStore.save(setOf("com.example.a")))
+        val result = ceStore.loadResult()
+        assertTrue(result is LoadResult.Known)
+        assertEquals(setOf("com.example.a"), (result as LoadResult.Known).packages)
+    }
+}

@@ -136,6 +136,11 @@ object WhitelistPatch {
                 }
                 // Accessible now (or already was); a later get/set failure is
                 // still recorded as Skipped by the precise handlers below.
+                // Phase 5: `isAccessible` is deprecated upstream; spelled as
+                // setAccessible (not trySetAccessible: absent from the
+                // compileSdk 34 android.jar stubs, so it does not compile on
+                // this baseline). Revisit on the compileSdk 37 migration
+                // (see gradle.properties plan): prefer trySetAccessible.
             }
             val current = try {
                 field.get(null)

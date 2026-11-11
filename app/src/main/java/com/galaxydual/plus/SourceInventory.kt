@@ -16,6 +16,7 @@ package com.galaxydual.plus
 
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import com.galaxydual.hook.PolicySource
 
 // 個人來源 catalog 的一列 (唯讀展示用,不做寫入授權依據)。
 // 寫入目標仍以 DualRepository 的跨來源 verified dualId 為準 (#21),本表
@@ -113,6 +114,14 @@ fun loadSourceApps(pm: PackageManager, sourceSerial: Int): List<SourceAppEntry>?
         try {
             val pkg = info.packageName ?: continue
             if (pkg.isBlank()) continue
+            // Phase 5 polish：文法前置過濾（與 hook 側 PolicySource.sanitize 同
+            // 文法 [a-zA-Z0-9._-]+，單一來源）：PM 包名理論為其子集（PM 另要求
+            // 至少一個 '.' 且首字為字母，見 PackageManager 文檔；此處以前置寬鬆
+            // 文法過濾顯示快照，真正消毒仍由 DualViewModel.request/confirm 的
+            // sanitizeHookPolicy 兜底），非法 token 不入 catalog、不計數、不顯示。
+            // 與 PackageManager 文法相容性：PM 合法包名必過此門（寬鬆側），故
+            // 只濾損壞條目，不誤殺正常 App；DEVICE-UNVERIFIED 僅指列表完整性。
+            if (!PolicySource.isValidPackage(pkg)) continue
             val label = try {
                 pm.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() } ?: pkg
             } catch (_: Exception) {

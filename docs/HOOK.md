@@ -15,14 +15,41 @@
 - 原本回傳 `true`／已在名單 → 保持不變。
 - 原本回傳 `false`／不在名單 → 僅當該包名在模組政策集合內才放行。
 - 目前政策集合（`EXTRA_WHITELIST_PACKAGES`，經 `PolicySource.effective(seed, remote)`
-  決策）預設為**空**，即 hooks 為 observe-only 佔位：會安裝、會記 log，
-  但不改變任何行為。接上政策來源（例如 RemotePreferences）後才真正放寬。
-  決策為 union-only（只增不減），包名校驗與 `core/ShellEscaper` 同規則；
-  靜態欄位合併由純函數 `WhitelistPatch` 執行（`MutableList` 原地追加、
-  `String[]` 重建替換，其餘一律放棄並記 log）。`remote` 快照目前為空
- （無政策來源已接線；未來工作才考慮 RemotePreferences 唯讀＋變更監聽），
-  行為與空種子完全一致
-  [待實機驗證]。
+  決策）的靜態種子為**空**，故 hooks 為 observe-only 佔位：會安裝、會記 log，
+  但不改變任何行為。決策為 union-only（只增不減），包名校驗與
+  `core/ShellEscaper` 同規則；靜態欄位合併由純函數 `WhitelistPatch` 執行
+  （`MutableList` 原地追加、`String[]` 重建替換，其餘一律放棄並記 log）。
+- 政策來源已接線：App 端（`GalaxyApp` 取得 `XposedService`）把使用者草稿
+  寫入 LSPosed remote preferences group `dual_policy`／key
+  `extra_whitelist_packages`；hook 側 `DualHook.readRemotePolicy()` 以
+  `getRemotePreferences(PolicySource.POLICY_PREFS_NAME)` 讀同一 group/key。常數單一來源於
+  `PolicySource.POLICY_PREFS_NAME`／`POLICY_KEY_EXTRA_PACKAGES`。
+- owner-user 需求：hook 讀 user 0；草稿必須由 owner user 寫入（非 owner
+  用戶的寫入不會被 hook 讀到）。「hook 讀 user 0」為 assertion，非實機證明；
+  app 寫入後 hook 是否真讀到，需 on-device 端到端證明（DEVICE-UNVERIFIED）。
+- 跨行程新鮮度：LSPosed `RemotePreferences` 會向 daemon 註冊
+  `IRemotePreferenceCallback`，daemon 在遠端偏好變更時推送 diff 並通知
+  hook 行程的 `OnSharedPreferenceChangeListener`，`DualHook` 據此 invalidate
+  快取，故 app 寫入後 hook 近乎即時生效。`EffectivePolicyCache` 另有 60 秒
+  TTL 重讀同一 group 的 cached 實例，屬 redundancy（若框架未推送，重讀同一
+  實例也不會強制重新抓取），非主要新鮮度機制。端到端仍需 on-device 驗證
+  （DEVICE-UNVERIFIED）。
+- 樂觀快取限制：`RemotePreferences.commit()` 先更新行程內快取再走 binder，
+  故 save/clear 失敗後同一行程的 `load()` 可能樂觀讀到未落盤的值；冷啟動
+  會從 daemon 重新抓取。hook 側框架的快取／讀取行為（是否一律讀取 daemon
+  的權威值）尚未實機驗證（DEVICE-UNVERIFIED）。App 在失敗發生時即回報
+  失敗，不以樂觀值宣稱成功。
+  App 側另有新身份穿透實驗路徑（DEVICE-UNVERIFIED）：失敗後僅當 provider
+  解出不同身份的新 `SharedPreferences` 實例才允許一次穿透讀，同實例永回
+  Unknown 直到成功 save/clear；此「新身份＝新 mMap」僅為比較假設，未經
+  on-device 證明——若 LSPosed 同 group 永回同一快取實例則此層生產永不命中，
+  若 wrapper 共享底層 mMap 則仍有污染風險。TODO(on-device)：驗證 daemon 重建
+  後新實例是否重同步權威值、同 group 是否回同一實例、wrapper 是否共享 mMap。
+- App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
+  Phase4 timeout，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
+  生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
+  （Unknown fence、兩步清除、手動重整、超時轉 FAILED）；端到端仍
+  DEVICE-UNVERIFIED。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
@@ -198,6 +225,8 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   （`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，空政策原樣返回 observe-only）。
   JVM 單測僅鎖定 `WhitelistPolicy.apply`／eligibility／guard 決策，安裝與回調需 LSPosed
   daagent 實機驗證。
+- 持久化與生效的區分：App 端成功持久化草稿（`HookPolicyStore` save/clear → LSPosed remote preferences group `dual_policy`）僅證明寫入通道，**不**代表 daagent（或 system_server）已套用或撤銷任何政策。端到端 DEVICE-UNVERIFIED；政策是否真正生效需 on-device 驗證（見 §1.4 硬閘門）。
+
 
 ### 1.4 JVM 測試邊界與啟用非空政策前的硬閘門
 
@@ -330,7 +359,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 ## English Summary
 
 - The hook module extends Samsung Dual whitelist *queries* only (extend-only, never shrink);
-  default policy set is empty so hooks are observe-only placeholders.
+  default policy set is empty so hooks are observe-only placeholders; the draft channel (app → remote prefs group `dual_policy` → hook read) is wired but end-to-end DEVICE-UNVERIFIED.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
   (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/
   `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity
@@ -363,6 +392,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   A code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) until that hard gate is satisfied;
   this is a code gate, not device verification, and Stage 1 defaults remain unchanged.
+
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>observe-only;

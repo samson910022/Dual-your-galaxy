@@ -1,6 +1,7 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import android.content.SharedPreferences
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -18,6 +19,20 @@ import java.lang.reflect.Modifier
 // public LibXposed APIs plus reflection against Samsung ROM classes. No code
 // is copied from OnePlus/GPL hook projects (see docs/CREDITS.md).
 class DualHook : XposedModule() {
+
+    init {
+        // Stage H2-P1: plug the RemotePreferences-backed snapshot into the
+        // pure policy source. Assignment only (no IPC here). NOTE: production
+        // reads go through EffectivePolicyCache (see effectivePolicy), which
+        // calls readRemotePolicy() directly and preserves its null
+        // fail-closed signal ("read failed" keeps last-known-good). This seam
+        // exists ONLY for JVM tests that drive PolicySource in isolation; it
+        // preserves null (no null->empty compression) so
+        // remotePolicySnapshot() fail-closed semantics stay testable.
+        // Phase 4: null is the failed-read signal -- never compress to empty
+        // here (empty is a successful read and would be cached as policy).
+        PolicySource.remotePolicyReader = { readRemotePolicy() }
+    }
 
     // System server entry: hook the Samsung dual-app service whitelist queries.
     //
@@ -443,8 +458,12 @@ class DualHook : XposedModule() {
     //   allowlisted package-arg index (WhitelistSignatureGuard) for Boolean
     //   rewrites so unverified overloads remain observe-only.
     //
-    // H2: effective set = PolicySource.effective(seed + remote); no remote
-    // source wired, so behavior today is identical to the static seed.
+    // H2: effective set = seed + cached remote snapshot (read through
+    // EffectivePolicyCache, see effectivePolicy). The app writes the draft to
+    // the same LSPosed remote-prefs group
+    // (dual_policy/extra_whitelist_packages); DEVICE-UNVERIFIED end-to-end, so
+    // the snapshot may still be empty and behavior stays observe-only when
+    // empty.
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         return try {
@@ -529,20 +548,104 @@ class DualHook : XposedModule() {
         }
     }
 
-    // Effective policy for this process: static seed (+ a RemotePreferences
-    // snapshot if a policy source is ever wired -- none is today, so the
-    // remote snapshot stays empty and behavior is identical to the static
-    // seed). Single seam for any future policy work; IPC-free. NOTE: not
-    // covered by JVM tests (instantiating DualHook needs the framework); the
-    // decision logic inside PolicySource/WhitelistPatch is what tests lock.
+    // Effective policy for this process: static seed + remote snapshot. The
+    // RemotePreferences-backed reader is called through EffectivePolicyCache,
+    // which caches the merged set and recomputes when invalidated, after a
+    // failed read, or once the bounded freshness TTL expires. A failed read
+    // keeps the last known good value applied (or the seed alone when none is
+    // cached), so a transient service absence does not silently empty the
+    // policy; with no cached value the policy stays observe-only. Single seam
+    // for any future policy work. NOTE: not covered by JVM tests (instantiating
+    // DualHook needs the framework); the cache is pure and unit-tested in
+    // EffectivePolicyCacheTest.
     internal fun effectivePolicy(): Set<String> =
-        PolicySource.effective(EXTRA_WHITELIST_PACKAGES, remotePolicySnapshot())
+        effectiveCache.get(EXTRA_WHITELIST_PACKAGES) { readRemotePolicy() }
 
-    // Remote snapshot hook: empty (no policy source wired; a future change
-    // would read LibXposed RemotePreferences here -- hook-side read-only +
-    // change listener into a volatile cache).
-    // Kept as a separate function so that future work touches exactly one seam.
-    internal fun remotePolicySnapshot(): Set<String> = emptySet()
+    // RemotePreferences-backed policy reader (Stage H2-P1 plumbing, hardened in
+    // H2-P2), reached through EffectivePolicyCache (see effectivePolicy).
+    //
+    // Reads the same LSPosed remote-prefs group/key the app writes via
+    // XposedService.getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+    // (owner-user draft; hook reads user 0). Never throws: the not-capable path
+    // returns emptySet() (a successful empty read, cached), while a failed read
+    // (framework not attached / group missing / IPC failure) returns null and is
+    // logged best-effort only on the good->failed transition. Null is NOT
+    // cached: the last known good value stays applied, or the seed alone when
+    // none is cached (fail-closed observe-only). A successful read (even empty)
+    // returns a set and IS cached. LSPosed delivers remote-prefs changes to
+    // the hook process via IRemotePreferenceCallback; the registered listener
+    // invalidates the cache on change (near-real-time freshness). The cache's
+    // TTL is only a redundant safety net that re-reads the cached instance.
+    // DEVICE-UNVERIFIED: end-to-end read-after-write still needs on-device proof.
+    private fun readRemotePolicy(): Set<String>? {
+        // PROP_CAP_REMOTE probe: a definitive "no" caches an empty (observe-only)
+        // policy; a probe that throws is NOT latched and returns null, so the
+        // cache does not cache the failure and the next query retries.
+        val capable = isRemoteCapable() ?: return null
+        if (!capable) return emptySet()
+        return try {
+            val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+            registerPolicyChangeListener(prefs)
+            prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet()).orEmpty()
+        } catch (t: Throwable) {
+            // Log only on the good->failed transition; a persistently absent
+            // service would otherwise spam the hot path. Null is not cached
+            // (see cache).
+            if (effectiveCache.shouldLogFailure()) {
+                logi("remote policy read failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+            null
+        }
+    }
+
+    // PROP_CAP_REMOTE probe (cached once it resolves). A framework without
+    // remote prefs never attempts the read, so the hook stays observe-only
+    // without retrying. A probe that throws is NOT latched false: it is logged
+    // best-effort and retried on the next call (only a definitive answer is
+    // cached).
+    private fun isRemoteCapable(): Boolean? {
+        remoteCapable?.let { return it }
+        return try {
+            val capable = (getFrameworkProperties() and XposedInterface.PROP_CAP_REMOTE) != 0L
+            remoteCapable = capable
+            capable
+        } catch (t: Throwable) {
+            if (!remoteCapabilityProbeFailureLogged) {
+                remoteCapabilityProbeFailureLogged = true
+                logi("remote capability probe failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+            null
+        }
+    }
+
+    // Phase 4: synchronized + compareAndSet with unregister of the old
+    // instance. A stale listener on a replaced prefs instance would both leak
+    // and invalidate on irrelevant changes; unregister best-effort (never
+    // throws out) then register the new one. Assignment only after a
+    // successful registration so a failed registration is retried with the
+    // next prefs instance instead of being skipped.
+    private fun registerPolicyChangeListener(prefs: SharedPreferences) {
+        synchronized(listenerLock) {
+            if (registeredPrefs === prefs) return
+            val old = registeredPrefs
+            if (old != null && old !== prefs) {
+                try {
+                    old.unregisterOnSharedPreferenceChangeListener(remotePolicyListener)
+                } catch (_: Throwable) {
+                    // Best effort: a hostile prefs impl must not break the hook.
+                }
+            }
+            try {
+                prefs.registerOnSharedPreferenceChangeListener(remotePolicyListener)
+            } catch (_: Throwable) {
+                // Failed registration: keep old (already unregistered above) as
+                // null so the next query retries with the next prefs instance.
+                registeredPrefs = null
+                return
+            }
+            registeredPrefs = prefs
+        }
+    }
 
     // Caller-side wiring point (issue #10 Stage1, DEVICE-UNVERIFIED).
     //
@@ -603,10 +706,10 @@ class DualHook : XposedModule() {
     // devices); per-field outcomes are logged best-effort for diagnostics.
     // The original whitelist is never shrunk.
     //
-    // Empty policy today (STATIC_SEED and the remote snapshot are both
-    // empty; no policy source wired): returns before touching reflection,
-    // so current behavior is observe-only and unaffected by the final-field
-    // / dual-field handling below.
+    // Empty policy (STATIC_SEED is empty and the remote draft is not yet
+    // persisted / not yet proven end-to-end): returns before touching
+    // reflection, so behavior stays observe-only and unaffected by the
+    // final-field / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
         val extra = effectivePolicy()
         if (extra.isEmpty()) {
@@ -655,6 +758,37 @@ class DualHook : XposedModule() {
 
     companion object {
         private const val TAG = "GalaxyDualHook"
+
+        // Stage H2-P2: effective-policy cache + remote-prefs change listener.
+        // Companion (static) so a hot-reload instance replacement cannot leak
+        // the listener through the instance; the cache survives reloads.
+        // Production reads go through this cache (effectivePolicy); the
+        // PolicySource.remotePolicyReader seam remains for JVM tests.
+        private val effectiveCache = EffectivePolicyCache()
+
+        // Null = not probed yet (a thrown probe is not latched; see
+        // isRemoteCapable). PROP_CAP_REMOTE gates the remote read; a framework
+        // without remote prefs stays observe-only without retrying.
+        @Volatile
+        private var remoteCapable: Boolean? = null
+
+        // Rate-limits the capability-probe failure log: a persistently throwing
+        // probe would otherwise spam the hot path on every query.
+        @Volatile
+        private var remoteCapabilityProbeFailureLogged = false
+
+        // Listener registration is per SharedPreferences instance; the
+        // framework caches the instance per group, so this is stable. Assigned
+        // only after a successful registration (see registerPolicyChangeListener).
+        // Phase 4: guarded by listenerLock (synchronized + compareAndSet);
+        // re-registration unregisters the old instance best-effort.
+        private val listenerLock = Any()
+        @Volatile
+        private var registeredPrefs: SharedPreferences? = null
+        private val remotePolicyListener =
+            SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+                effectiveCache.invalidate()
+            }
 
         // Scope constants are single-sourced in HookScopes (pure JVM, unit-
         // testable). Kept here as aliases so existing call sites and the CI
@@ -713,9 +847,9 @@ class DualHook : XposedModule() {
         private const val HOOK_ID_WHITELIST_CLINIT = HOOK_ID_PREFIX + "WhiteListApps.<clinit>"
 
         // Static policy seed: empty = observe-only. H2 routes it through
-        // PolicySource.effective(seed, remote); no remote source is wired,
-        // so behavior is identical to the static seed. Union-only: entries
-        // are never removed.
+        // EffectivePolicyCache (seed + remote snapshot); the app writes the
+        // draft to the same remote-prefs group, so the effective set is seed +
+        // draft. Union-only: entries are never removed.
         @JvmField
         val EXTRA_WHITELIST_PACKAGES: Set<String> = PolicySource.STATIC_SEED
     }
