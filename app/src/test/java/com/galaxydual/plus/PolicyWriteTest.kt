@@ -4329,4 +4329,553 @@ class PolicyWriteTest {
             }
         }
     }
+
+    // Stage H1 輔助：不經 makeVm Known 等待、直接以同一 coordinator＋store 建 VM2
+    //（pre-timeout SAVING 認領：VM1 仍 SAVING 未逾時即銷毀，VM2 init 同步認領）。
+    private fun makeVm2Direct(
+        store: HookPolicyStore,
+        coord: PolicyTxCoordinator,
+        policyIoTimeoutMs: Long = 1_000,
+    ): DualViewModel {
+        val vm2 = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = emptyList(),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.NOOP,
+            hookDirectReads = { listOf(MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            hookPolicyStore = store,
+            currentUserId = { 0 },
+            policyIoTimeoutMs = policyIoTimeoutMs,
+            policyTxCoordinator = coord,
+        )
+        vms.add(vm2)
+        return vm2
+    }
+
+    private fun callRegisterHandover(vm: DualViewModel, tx: Any?, isClear: Boolean) {
+        val m = DualViewModel::class.java.getDeclaredMethod(
+            "registerHandoverTx",
+            DualViewModel.PolicyTx::class.java,
+            Boolean::class.javaPrimitiveType!!,
+        ).apply { isAccessible = true }
+        m.invoke(vm, tx, isClear)
+    }
+
+    // Stage H1-1：pre-timeout destroy 繼承（confirm 變體）。
+    // VM1 SAVING（未逾時，save 阻塞）即銷毀（scope cancel，不 cancel 已 claim
+    // deferred，只取消 await；finally 不碰 coordinator）；VM2 認領 pre-timeout
+    // SAVING（RECONCILING＋Unknown＋pending＋世代bump＋reconciler join 同一
+    // deferred）；init load 丟棄（後端已換 fresh，fence 仍 seed＋Unknown，不被覆寫）。
+    // 放行 save 後新 VM 終態 IDLE＋Known(B)＋雙清。
+    @Test
+    fun h1_preTimeoutDestroy_confirm_inheritsAndSucceeds() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 1_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            assertEquals(setOf("com.seed"), vm1.state.value.policyDraft)
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // 前置已認領：coordinator＋本地同為同一 Tx，writeMutex 在途持有。
+            val tx1 = activeTxOf(vm1)
+            assertNotNull(tx1)
+            assertSame(tx1, coordinatorTxOf(coord))
+            assertTrue(coord.writeMutex.isLocked)
+
+            // 後端換 fresh（若 init load 未丟棄即誤設 fresh＋Known，fence 即破）。
+            backend.set(setOf("com.fresh"))
+
+            //  pre-timeout 銷毀（未逾時，SAVING 未進 RECONCILING）：已 claim
+            // deferred 不被 cancel（只取消 await），coordinator 保留供認領。
+            vm1.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(300)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // 新 VM 認領 pre-timeout SAVING。
+            val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 1_000)
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            // init load 丟棄：後端 fresh 未覆寫 fence（VM2 初值 empty＋Unknown，
+            // 若未丟棄即誤設 fresh＋Known，fence 即破）。
+            assertEquals(emptySet<String>(), vm2.state.value.policyDraft)
+            assertSame(tx1, activeTxOf(vm2))
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // 放行：save 落盤 B（同一 deferred 完成 true），reconciler join＋讀 B==B
+            // 即 WRITE_SUCCESS＋IDLE＋雙清。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 15_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertTrue(vm2.state.value.msg.contains("已寫入政策草稿"))
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+            await(timeoutMs = 5_000L) { reconcilingKeysOf(vm2).isEmpty() }
+            assertEquals(1, saveCalls.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-2：pre-timeout destroy 繼承（clear 變體，pending 本無）。
+    @Test
+    fun h1_preTimeoutDestroy_clear_inheritsAndSucceeds() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw == null) backend.set(emptySet()) else backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 1_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+
+            vm1.clearPolicyDraft()
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vm1)
+            assertNotNull(tx1)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            backend.set(setOf("com.fresh"))
+
+            vm1.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(300)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 1_000)
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            // clear 本無 pending；fence 為 Unknown＋RECONCILING＋draft 初值 empty
+            // （fresh 未覆寫，若未丟棄即誤設 fresh＋Known）。
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vm2.state.value.policyDraft)
+            assertSame(tx1, activeTxOf(vm2))
+
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 15_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vm2.state.value.policyDraft)
+            assertTrue(vm2.state.value.msg.contains("已清除政策草稿"))
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(1, clearCalls.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-3：pre-timeout destroy 繼承（失敗變體：save 回 false，已證失敗）。
+    // VM2 認領後放行即 join(false) 短路 FAILED＋Unknown＋IDLE＋pending 清空＋雙清；
+    // 樂觀讀不得翻案（draft 續留 seed）。
+    @Test
+    fun h1_preTimeoutDestroy_fail_inheritsAndReportsFailed() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { _ ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                saveFinished.countDown()
+                false
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 1_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vm1)
+            assertNotNull(tx1)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            vm1.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(300)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 1_000)
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            assertSame(tx1, activeTxOf(vm2))
+
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 15_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            // 失敗保留 VM2 初值 empty（不謊稱 seed，不採納樂觀值）。
+            assertEquals(emptySet<String>(), vm2.state.value.policyDraft)
+            assertEquals(MsgKind.FAILED, vm2.state.value.msgKind)
+            assertTrue(vm2.state.value.msg.contains("寫入政策失敗"))
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-4：雙VM併發 save/save——第二寫 fail-fast（IN_PROGRESS），不啟第二 IO。
+    // VM1 慢 save B 在途（SAVING＋writeMutex 持有＋coordinator 已認領），VM2 試 C
+    // 即拒絕（IN_PROGRESS），save 僅 1 次；放行後 VM1 成功 IDLE＋雙清。
+    @Test
+    fun h1_concurrent_saveSave_secondRejectedNoSecondIo() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val vm2 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm2.state.value.policyDraftKnown }
+
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertTrue(coord.writeMutex.isLocked)
+
+            // VM2 試 C：fail-fast，不啟第二 IO。
+            val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm2, pendingC)
+            vm2.confirmPolicyWrite(pendingC)
+            Thread.sleep(300)
+            assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm2.state.value.msg)
+            assertEquals(MsgKind.INFO, vm2.state.value.msgKind)
+            assertEquals(pendingC, vm2.state.value.pendingPolicyWrite)
+            assertEquals(1, saveCalls.get())
+
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertNull(activeTxOf(vm1))
+            assertNull(coordinatorTxOf(coord))
+            assertFalse(coord.writeMutex.isLocked)
+            assertEquals(1, saveCalls.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-5：雙VM併發 save/clear——clear 側 BUSY，不耗 clear IO。
+    @Test
+    fun h1_concurrent_saveClear_clearRejectedNoClearIo() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls.incrementAndGet() else saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val vm2 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm2.state.value.policyDraftKnown }
+
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+
+            vm2.clearPolicyDraft()
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm2.state.value.msg)
+            assertEquals(MsgKind.INFO, vm2.state.value.msgKind)
+            assertEquals(0, clearCalls.get())
+            assertEquals(1, saveCalls.get())
+            assertEquals(pendingB, vm1.state.value.pendingPolicyWrite)
+
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertEquals(0, clearCalls.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-6：逆序完成——先勝者結清後，後試者重試即成功（序列化＋可恢復，不死鎖）。
+    // VM1 B 在途時 VM2 C 被拒；VM1 成功 IDLE 後 VM2 重試 C 成功，終態 C（後寫勝，
+    // 依序落盤，非併發覆寫）。
+    @Test
+    fun h1_concurrent_reverseCompletion_sequentialSucceeds() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                // 僅首寫阻塞（B），重試 C 即時落盤（免第二 latch）。
+                if (raw == setOf("com.B")) {
+                    saveStarted.countDown()
+                    while (!saveRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val vm2 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm2.state.value.policyDraftKnown }
+
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+
+            val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm2, pendingC)
+            vm2.confirmPolicyWrite(pendingC)
+            Thread.sleep(300)
+            assertEquals(1, saveCalls.get())
+
+            // 先勝者完成。
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertNull(coordinatorTxOf(coord))
+
+            // 後試者重試即成功（終態 C）。
+            vm2.confirmPolicyWrite(pendingC)
+            await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
+            assertEquals(setOf("com.C"), vm2.state.value.policyDraft)
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(2, saveCalls.get())
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-7：registerHandoverTx set->CAS——loser 清本地不碰 winner，不啟 reconciler。
+    // coordinator 已持 winner 時，loser handover 即返回（本地殘留 loser 即清，
+    // coordinator 仍 winner，reconciling 不加 loser key，phase 不動）。
+    @Test
+    fun h1_registerHandover_setCas_loserClearsLocalNotWinner() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyTxCoordinator = coord)
+            val winner = newTestTx(fake.store, setOf("com.WINNER"))
+            val loser = DualViewModel.PolicyTx(
+                txId = -2L,
+                key = "policy-test-loser",
+                deferred = kotlinx.coroutines.CompletableDeferred(true),
+                sanitized = setOf("com.LOSER"),
+                store = fake.store,
+                isClear = false,
+            )
+            coord.activeTx.set(winner)
+            setLocalTx(vm, null)
+
+            // loser 登記：本地 CAS 成功（null->loser）後 coordinator CAS 失配
+            // （已持 winner），即清本地 loser、不碰 winner、不加 key、不啟 reconciler。
+            callRegisterHandover(vm, loser, false)
+            assertSame(winner, coordinatorTxOf(coord))
+            assertNull(activeTxOf(vm))
+            assertTrue(reconcilingKeysOf(vm).none { it == loser.key })
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+
+            // winner 登記（本地空）：雙 CAS 成功，正常加 key＋Tx 同一。
+            callRegisterHandover(vm, winner, false)
+            assertSame(winner, activeTxOf(vm))
+            assertSame(winner, coordinatorTxOf(coord))
+            assertTrue(reconcilingKeysOf(vm).contains(winner.key))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H1-8：writeMutex 單寫者——SAVING 在途持有，結清釋放（後續可新寫）。
+    @Test
+    fun h1_writeMutex_singleWriterLockedDuringSavingReleasedAfterSettle() {
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fake = FakePolicyStore()
+        val blockingStore = HookPolicyStore(
+            loadRaw = { fake.saved },
+            saveRaw = { raw ->
+                fake.saveCalls++
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                fake.saved = raw
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            assertFalse(coord.writeMutex.isLocked)
+            val vm = makeVm(blockingStore, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            vm.confirmPolicyWrite(pending)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // 在途持有：第二寫 tryLock 即失敗（不啟 IO 由 H1-4 鎖定，此處鎖定持有本身）。
+            assertTrue(coord.writeMutex.isLocked)
+            assertFalse(coord.writeMutex.tryLock())
+            assertNotNull(activeTxOf(vm))
+            assertNotNull(coordinatorTxOf(coord))
+
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertFalse(coord.writeMutex.isLocked)
+            assertTrue(coord.writeMutex.tryLock())
+            // 測試借鎖即還，免殘留影響後續（resetForTest 亦兜底）。
+            try {
+                coord.writeMutex.unlock()
+            } catch (_: Exception) {
+            }
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

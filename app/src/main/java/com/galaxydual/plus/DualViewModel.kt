@@ -25,6 +25,7 @@ import com.galaxydual.hook.HookMarker
 import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
@@ -917,9 +918,26 @@ class DualViewModel(
     // Stage G2：handoverTx 登記（本地＋coordinator 同組＋reconciling＋
     // deferred.invokeOnCompletion 自動重查＋reconciler 啟動）。
     // 调用方在外層 finally 調用（mutex 已釋放）。
+    // Stage H1：set->CAS（失敗 loser 清本地不碰 winner；settle/tryClaim 保持
+    // CAS）。已前置認領（同一物件，本地＋coordinator 皆已為該 Tx）即勝者直行；
+    // 本地 CAS 失配（另有 winner）即 loser 直接返回（不加 reconciling、不啟動
+    // reconciler、不碰 winner）；coordinator CAS 失配即 loser 清本地（僅清自身
+    // Tx，不碰 coordinator winner）後返回。
     private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean) {
-        activePolicyTx.set(tx)
-        policyTxCoordinator?.activeTx?.set(tx)
+        val localCur = activePolicyTx.get()
+        if (localCur !== tx) {
+            if (!activePolicyTx.compareAndSet(null, tx)) {
+                return
+            }
+        }
+        val coord = policyTxCoordinator
+        if (coord != null && coord.activeTx.get() !== tx) {
+            if (!coord.activeTx.compareAndSet(null, tx)) {
+                activePolicyTx.compareAndSet(tx, null)
+                policyReconciling.remove(tx.key)
+                return
+            }
+        }
         policyReconciling.add(tx.key)
         attachDeferredAutoRecheck(tx)
         if (isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
@@ -5426,7 +5444,15 @@ class DualViewModel(
             // Stage A：逾時交接槽（外層 finally 自 inFlight/saving 交接至
             // reconciling；非逾時路徑為 null，走原清理）。
             // Stage F1：交接改攜 Tx（deferred 句柄保留，登記 activePolicyTx）。
+            // Stage H1：所有權前置＋單寫者序列化——opMutex 內、store IO 前同步
+            // CAS claim（LAZY async，失敗即 IN_PROGRESS 不啟 IO）；writeLocked
+            // 追蹤 app-scoped writeMutex（在途持有，逾時/快徑/取消皆解鎖，但
+            // finally 永不清除 coordinator.activeTx，僅 settle 清）；preClaimTx
+            // 追蹤已認領 Tx（VM cancel 不 cancel 已 claim deferred，只取消
+            // await，deferred 續跑供新 VM join 同一句柄）。
             var handoverTx: PolicyTx? = null
+            var writeLocked = false
+            var preClaimTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
@@ -5508,6 +5534,93 @@ class DualViewModel(
                         return@withLock
                     }
                     val sanitized = sanitizeHookPolicy(cur.packages)
+                    // Stage H1：所有權前置＋單寫者序列化（opMutex 內、store IO 前
+                    // 同步 CAS claim；LAZY async，失敗即 IN_PROGRESS 不啟 IO）。
+                    // - coordinator 非 null 才走前置（無 coordinator 舊測試路徑
+                    //   行為不變：eager async＋無 writeMutex＋無 CAS）。
+                    // - 先 tryLock app-scoped writeMutex（fail-fast：在途 IO 即
+                    //   BUSY/IN_PROGRESS，不排隊）；再建 LAZY deferred＋Tx 並 CAS
+                    //   coordinator（null->Tx，失敗即不啟 IO）；再認領本地（null
+                    //   ->Tx，失配即回滾 coordinator＋解鎖＋IN_PROGRESS）。
+                    // - 成功即 start() 啟 IO（此後 SAVING＋saving.add＋await）。
+                    // - 失敗一律 loading=false＋IN_PROGRESS（confirm 口徑；clear
+                    //   為 BUSY，見 clear 路徑），pending 不動（保留可重試），不
+                    //   碰 reconciling/reconciler。
+                    var h1Deferred: Deferred<Boolean>? = null
+                    val h1Coord = policyTxCoordinator
+                    if (h1Coord != null) {
+                        if (!h1Coord.writeMutex.tryLock()) {
+                            _state.update { s ->
+                                if (s.pendingPolicyWrite != pendingAtCall) s.copy(loading = false)
+                                else s.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        writeLocked = true
+                        val lazy = h1Coord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                            store.save(sanitized)
+                        }
+                        val tx = PolicyTx(
+                            txId = policyTxId.incrementAndGet(),
+                            key = key,
+                            deferred = lazy,
+                            sanitized = sanitized,
+                            store = store,
+                            isClear = false,
+                            pending = pendingAtCall,
+                        )
+                        if (!h1Coord.activeTx.compareAndSet(null, tx)) {
+                            try {
+                                lazy.cancel()
+                            } catch (_: Exception) {
+                            }
+                            try {
+                                h1Coord.writeMutex.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                            _state.update { s ->
+                                if (s.pendingPolicyWrite != pendingAtCall) s.copy(loading = false)
+                                else s.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (!activePolicyTx.compareAndSet(null, tx)) {
+                            h1Coord.activeTx.compareAndSet(tx, null)
+                            try {
+                                lazy.cancel()
+                            } catch (_: Exception) {
+                            }
+                            try {
+                                h1Coord.writeMutex.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                            _state.update { s ->
+                                if (s.pendingPolicyWrite != pendingAtCall) s.copy(loading = false)
+                                else s.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.IN_PROGRESS)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        h1Deferred = lazy
+                        preClaimTx = tx
+                        try {
+                            lazy.start()
+                        } catch (_: Exception) {
+                        }
+                    }
                     // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission（消除
                     // 一幀 stale：舊碼先 update loading=true 才 add saving 集合，
                     // render 若讀集合會見 loading=true＋saving=false 而誤允取消；
@@ -5528,7 +5641,25 @@ class DualViewModel(
                     // Defense-in-depth: cancel may have cleared pending between
                     // the post-acquire re-check and the save-commit point
                     // (no suspension between, cheap).
+                    // Stage H1：前置已認領時 abort 須回滾認領（settle 清本地＋
+                    // coordinator）＋解鎖，免殘留 fence 卡死後續；未認領走原路。
                     if (_state.value.pendingPolicyWrite != pendingAtCall) {
+                        val pc = preClaimTx
+                        if (pc != null) {
+                            settlePolicyTx(pc)
+                            preClaimTx = null
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                            try {
+                                h1Deferred?.cancel()
+                            } catch (_: Exception) {
+                            }
+                        }
                         _state.update {
                             it.copy(
                                 loading = false,
@@ -5550,7 +5681,10 @@ class DualViewModel(
                         // Stage G2：save 跑在 coordinator 域（若有）使慢 save 存活過
                         // VM 重建（viewModelScope 隨 VM 清除而取消）；無 coordinator
                         // 仍走 viewModelScope（既有測試路徑不變）。
-                        val deferred = (policyTxCoordinator?.scope ?: viewModelScope).async(Dispatchers.IO) {
+                        // Stage H1：前置已認領即沿用同一 deferred（LAZY 已 start，
+                        // 同一句柄供 reconciler／新 VM join）；未認領（無
+                        // coordinator 舊路徑）才建 eager async。
+                        val deferred: Deferred<Boolean> = h1Deferred ?: viewModelScope.async(Dispatchers.IO) {
                             store.save(sanitized)
                         }
                         val ok: Boolean? = try {
@@ -5561,17 +5695,33 @@ class DualViewModel(
                             null
                         } catch (e: Exception) {
                             if (e is CancellationException) {
+                                // Stage H1：VM cancel 不 cancel 已 claim deferred
+                                // （只取消 await，deferred 續跑供新 VM join 同一
+                                // 句柄）；未認領才 cancel。writeMutex 解鎖（釋放
+                                // 單寫者，保留 activeTx fence 供認領），finally
+                                // 不碰 coordinator.activeTx（僅 settle 清）。
+                                if (preClaimTx == null) {
+                                    try {
+                                        deferred.cancel()
+                                    } catch (_: Exception) {
+                                        // Best effort.
+                                    }
+                                }
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                                throw e
+                            }
+                            if (preClaimTx == null) {
                                 try {
                                     deferred.cancel()
                                 } catch (_: Exception) {
                                     // Best effort.
                                 }
-                                throw e
-                            }
-                            try {
-                                deferred.cancel()
-                            } catch (_: Exception) {
-                                // Best effort.
                             }
                             false
                         }
@@ -5579,11 +5729,28 @@ class DualViewModel(
                         // during the save invalidates this confirmation. Clear only
                         // loading (preserve pending/msg) and do not commit.
                         // Phase 3：pending 保留即回 QUEUED（同一 epoch，可重試）。
+                        // Stage H1：前置已認領時 abort 須回滾認領（settle）＋解鎖，
+                        // 未認領走原路；已認領不 cancel deferred（只取消 await，
+                        // 沿用上行 CE 語義，免誤殺供認領句柄——此處為非 CE abort，
+                        // deferred 若仍在途則 best effort cancel 僅限未認領）。
                         if (_state.value.pendingPolicyWrite != pendingAtCall) {
-                            try {
-                                deferred.cancel()
-                            } catch (_: Exception) {
-                                // Best effort.
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                            } else {
+                                try {
+                                    deferred.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
                             }
                             _state.update {
                                 it.copy(
@@ -5602,6 +5769,10 @@ class DualViewModel(
                             // mutex 釋放後啟動（見下 handover）。
                             // Stage F1：保留 deferred 句柄並登記 Tx（opMutex 照常
                             // 釋放，但 Tx 存活＋RECONCILING＋reconcilingKeys）。
+                            // Stage H1：前置已認領即沿用同一 Tx（不新建，同一
+                            // deferred 供 reconciler／新 VM join）；未認領才新建。
+                            // 逾時即釋放 writeMutex（單寫者解鎖）但保留 activeTx
+                            // fence（僅 settle 清）。
                             markPolicyUnknownLocked()
                             _state.update {
                                 it.copy(
@@ -5613,15 +5784,28 @@ class DualViewModel(
                                     msgKind = MsgKind.CHANNEL,
                                 )
                             }
-                            handoverTx = PolicyTx(
-                                txId = policyTxId.incrementAndGet(),
-                                key = key,
-                                deferred = deferred,
-                                sanitized = sanitized,
-                                store = store,
-                                isClear = false,
-                                pending = pendingAtCall,
-                            )
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                handoverTx = pc
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                            } else {
+                                handoverTx = PolicyTx(
+                                    txId = policyTxId.incrementAndGet(),
+                                    key = key,
+                                    deferred = deferred,
+                                    sanitized = sanitized,
+                                    store = store,
+                                    isClear = false,
+                                    pending = pendingAtCall,
+                                )
+                            }
                             return@withLock
                         }
                         if (ok) {
@@ -5635,6 +5819,20 @@ class DualViewModel(
                             val ackRead = try {
                                 readAfterAck(store)
                             } catch (e: CancellationException) {
+                                // Stage H1：快徑讀被取消時已認領 fence 須回滾
+                                // （settle）＋解鎖，免殘留卡死；未認領即透傳。
+                                val pc = preClaimTx
+                                if (pc != null) {
+                                    settlePolicyTx(pc)
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try {
+                                            policyTxCoordinator?.writeMutex?.unlock()
+                                        } catch (_: Exception) {
+                                        }
+                                        writeLocked = false
+                                    }
+                                }
                                 throw e
                             }
                             // TOCTOU (#2): bump version + freshness + ownership
@@ -5678,6 +5876,21 @@ class DualViewModel(
                                     )
                                 }
                             }
+                            // Stage H1：快徑成功即結清前置認領（settle 清本地＋
+                            // coordinator）＋解鎖 writeMutex（同一 opMutex 內，
+                            // 與發布背靠背，免窗口漏發 BUSY）。
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                            }
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
                         } else {
                             // Phase 1：寫入失敗即 Unknown（保留 draft、不清 draft），
                             // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
@@ -5693,6 +5906,19 @@ class DualViewModel(
                                     msgKind = MsgKind.FAILED,
                                 )
                             }
+                            // Stage H1：快徑失敗同成功結清前置＋解鎖。
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                            }
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
                         }
                     } finally {
                         policyWriteSaving.remove(key)
@@ -5705,6 +5931,16 @@ class DualViewModel(
                 // 續跑（句柄由 Tx 保留，reconciler 先 join 再驗證讀）。
                 // Stage F1：Tx 登記與 reconciling add 同組（Tx 為唯一真相）。
                 // Stage G2：經 registerHandoverTx（本地＋coordinator＋自動重查）。
+                // Stage H1：finally 不碰 coordinator.activeTx（僅 settle 清；
+                // 此處僅安全解鎖 writeMutex（best effort，單寫者必須釋放）＋
+                // 交接/清理 inFlight/saving；CE 已認領 deferred 不 cancel（上行
+                // 已跳過），供新 VM join 同一句柄）。
+                if (writeLocked) {
+                    try {
+                        policyTxCoordinator?.writeMutex?.unlock()
+                    } catch (_: Exception) {
+                    }
+                }
                 val htx = handoverTx
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
@@ -5713,6 +5949,9 @@ class DualViewModel(
                 } else {
                     // Covers early-return paths (TTL/null-store) while the inner
                     // finally covers the save itself.
+                    // Stage H1：finally 不碰 coordinator.activeTx（僅 settle 清；
+                    // abort 已在內層回滾結清，CE（VM 銷毀）刻意保留供新 VM 認領，
+                    // 此處一律不結清，免誤清 pre-timeout 繼承 fence）。
                     inFlightWrites.remove(key)
                     policyWriteSaving.remove(key)
                 }
@@ -5824,7 +6063,12 @@ class DualViewModel(
         viewModelScope.launch {
             // Stage A：逾時交接槽（見 confirm）。
             // Stage F1：交接改攜 Tx（clear 句柄保留，sanitized=empty）。
+            // Stage H1：同 confirm 前置＋單寫者（clear 口徑失敗即 BUSY；pending
+            // 本無，abort 即回 IDLE；VM cancel 不 cancel 已 claim deferred，只
+            // 取消 await；finally 不碰 coordinator.activeTx，僅安全解鎖）。
             var handoverTx: PolicyTx? = null
+            var writeLocked = false
+            var preClaimTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     // Stage A review #4：取鎖後重檢（排隊期間可能已進 RECONCILING）。
@@ -5874,6 +6118,81 @@ class DualViewModel(
                         return@withLock
                     }
                     // Phase 3：QUEUED→SAVING 與 loading=true 同一 emission。
+                    // Stage H1：clear 前置（opMutex 內、store IO 前同步 CAS claim；
+                    // LAZY async，失敗即 BUSY 不啟 IO；沿用 confirm 雙層：先
+                    // tryLock writeMutex，再 CAS coordinator＋本地，失敗皆 BUSY）。
+                    var h1ClearDeferred: Deferred<Boolean>? = null
+                    val h1ClearCoord = policyTxCoordinator
+                    if (h1ClearCoord != null) {
+                        if (!h1ClearCoord.writeMutex.tryLock()) {
+                            _state.update { cur ->
+                                cur.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        writeLocked = true
+                        val lazyClear = h1ClearCoord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                            store.clear()
+                        }
+                        val txClear = PolicyTx(
+                            txId = policyTxId.incrementAndGet(),
+                            key = key,
+                            deferred = lazyClear,
+                            sanitized = emptySet(),
+                            store = store,
+                            isClear = true,
+                            pending = null,
+                        )
+                        if (!h1ClearCoord.activeTx.compareAndSet(null, txClear)) {
+                            try {
+                                lazyClear.cancel()
+                            } catch (_: Exception) {
+                            }
+                            try {
+                                h1ClearCoord.writeMutex.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                            _state.update { cur ->
+                                cur.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (!activePolicyTx.compareAndSet(null, txClear)) {
+                            h1ClearCoord.activeTx.compareAndSet(txClear, null)
+                            try {
+                                lazyClear.cancel()
+                            } catch (_: Exception) {
+                            }
+                            try {
+                                h1ClearCoord.writeMutex.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                            _state.update { cur ->
+                                cur.copy(
+                                    loading = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            return@withLock
+                        }
+                        h1ClearDeferred = lazyClear
+                        preClaimTx = txClear
+                        try {
+                            lazyClear.start()
+                        } catch (_: Exception) {
+                        }
+                    }
                     _state.update {
                         it.copy(
                             loading = true,
@@ -5885,7 +6204,9 @@ class DualViewModel(
                     // Stage A：同 confirm，detach 式有界超時（null=逾時未知，
                     // mutex 即釋放，reconciler 接手；false=已證明失敗）。
                     // Stage G2：同 confirm 跑 coordinator 域（若有）。
-                    val deferred = (policyTxCoordinator?.scope ?: viewModelScope).async(Dispatchers.IO) {
+                    // Stage H1：前置已認領即沿用同一 deferred（同一句柄供
+                    // reconciler／新 VM join）；未認領才建 eager。
+                    val deferred: Deferred<Boolean> = h1ClearDeferred ?: viewModelScope.async(Dispatchers.IO) {
                         store.clear()
                     }
                     val ok: Boolean? = try {
@@ -5896,17 +6217,28 @@ class DualViewModel(
                         null
                     } catch (e: Exception) {
                         if (e is CancellationException) {
+                            if (preClaimTx == null) {
+                                try {
+                                    deferred.cancel()
+                                } catch (_: Exception) {
+                                    // Best effort.
+                                }
+                            }
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                            throw e
+                        }
+                        if (preClaimTx == null) {
                             try {
                                 deferred.cancel()
                             } catch (_: Exception) {
                                 // Best effort.
                             }
-                            throw e
-                        }
-                        try {
-                            deferred.cancel()
-                        } catch (_: Exception) {
-                            // Best effort.
                         }
                         false
                     }
@@ -5915,6 +6247,8 @@ class DualViewModel(
                         // 問題），Known=false，msg CLEAR_TIMEOUT/CHANNEL。
                         // mark + update 背靠背；reconciler 由外層 finally 啟動。
                         // Stage F1：保留 deferred 句柄並登記 Tx。
+                        // Stage H1：前置已認領即沿用同一 Tx（同一 deferred 供
+                        // join）；未認領才新建；逾時釋放 writeMutex 但保留 fence。
                         markPolicyUnknownLocked()
                         _state.update {
                             it.copy(
@@ -5926,15 +6260,28 @@ class DualViewModel(
                                 msgKind = MsgKind.CHANNEL,
                             )
                         }
-                        handoverTx = PolicyTx(
-                            txId = policyTxId.incrementAndGet(),
-                            key = key,
-                            deferred = deferred,
-                            sanitized = emptySet(),
-                            store = store,
-                            isClear = true,
-                            pending = null,
-                        )
+                        val pc = preClaimTx
+                        if (pc != null) {
+                            handoverTx = pc
+                            preClaimTx = null
+                            if (writeLocked) {
+                                try {
+                                    policyTxCoordinator?.writeMutex?.unlock()
+                                } catch (_: Exception) {
+                                }
+                                writeLocked = false
+                            }
+                        } else {
+                            handoverTx = PolicyTx(
+                                txId = policyTxId.incrementAndGet(),
+                                key = key,
+                                deferred = deferred,
+                                sanitized = emptySet(),
+                                store = store,
+                                isClear = true,
+                                pending = null,
+                            )
+                        }
                         return@withLock
                     }
                     if (ok) {
@@ -5944,6 +6291,18 @@ class DualViewModel(
                         val ackRead = try {
                             readAfterAck(store)
                         } catch (e: CancellationException) {
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try {
+                                        policyTxCoordinator?.writeMutex?.unlock()
+                                    } catch (_: Exception) {
+                                    }
+                                    writeLocked = false
+                                }
+                            }
                             throw e
                         }
                         // TOCTOU (#2): bump version + freshness + ownership
@@ -5979,6 +6338,18 @@ class DualViewModel(
                                 )
                             }
                         }
+                        val pc = preClaimTx
+                        if (pc != null) {
+                            settlePolicyTx(pc)
+                            preClaimTx = null
+                        }
+                        if (writeLocked) {
+                            try {
+                                policyTxCoordinator?.writeMutex?.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                        }
                     } else {
                         // Phase 1：清除失敗即 Unknown（保留 draft、不清 draft），
                         // fence 在途 Known load，晚到 Known 不得蓋回 Unknown。
@@ -5995,14 +6366,36 @@ class DualViewModel(
                                 msgKind = MsgKind.FAILED,
                             )
                         }
+                        val pc = preClaimTx
+                        if (pc != null) {
+                            settlePolicyTx(pc)
+                            preClaimTx = null
+                        }
+                        if (writeLocked) {
+                            try {
+                                policyTxCoordinator?.writeMutex?.unlock()
+                            } catch (_: Exception) {
+                            }
+                            writeLocked = false
+                        }
                     }
                 }
             } finally {
+                // Stage H1：finally 不碰 coordinator.activeTx（僅 settle 清）；
+                // 僅安全解鎖 writeMutex（best effort）＋交接/清理。
+                if (writeLocked) {
+                    try {
+                        policyTxCoordinator?.writeMutex?.unlock()
+                    } catch (_: Exception) {
+                    }
+                }
                 val htx = handoverTx
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
                     registerHandoverTx(htx, isClear = true)
                 } else {
+                    // Stage H1：finally 不碰 coordinator.activeTx（僅 settle 清；
+                    // abort 已在內層回滾，CE 刻意保留供認領，此處一律不結清）。
                     inFlightWrites.remove(key)
                 }
             }
