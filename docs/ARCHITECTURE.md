@@ -82,6 +82,15 @@ val privilege: Privilege = when {
 > against SDK 34 on the AGP 8.5.2 baseline. The app only uses APIs available in
 > 34; the API 29 instrumentation run is the runtime-compatibility guard. This
 > flag will be revisited on the next AGP/compileSdk upgrade.
+>
+> Device + SDK 矩陣（release gate 實證口徑：JVM／emulator 綠燈不等於 S24 裝置驗收）：
+>
+> | 環境 | SDK／版本 | 用途 | 狀態 |
+> | --- | --- | --- | --- |
+> | S24 SM-S9210（OneUI `oneui=90000`、Android 17／API 37） | API 37 實機 | 五層部分已驗證的唯一實機來源（見 `docs/UX_REVIEW_S24.md` §5） | 歷史證據（2026-11-05）；當前 source 可追溯部署未驗 |
+> | Emulator API 29（minSdk floor） | API 29 | CI `locale-instrumentation` job：`:app:connectedDebugAndroidTest` | 每 PR 自動執行 |
+> | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
+> | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
@@ -157,7 +166,7 @@ val privilege: Privilege = when {
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉既有 FAILED＋Unknown fence，不新增語義）；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
-- 完整語義（pending 世代、TTL、fence、二步清除）見 `docs/USAGE.md` 政策寫入流程。
+- 完整語義（pending 世代、TTL、fence、二步清除）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒 vs hook 側快取 60 秒／失敗節流 5 秒）。
 
 ## Non-Goals
 

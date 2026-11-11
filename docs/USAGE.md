@@ -232,14 +232,25 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ### 政策寫入流程（Stage2：白名單政策草稿）
 
-- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高 320dp，少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
+- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高 320dp，少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
+- 同世代（same-generation）綁定：pending 攜帶建立當下的 `policyDraftVersion`／`policyLoadGeneration` 快照；`確認寫入` 僅在世代全等＋TTL 內才寫 store，任一不符即清 pending 拒寫（零寫入）；寫入成功／失敗才 bump 世代（fence 在途載入，見下一條）。旋轉同世代保留 ack 勾選與清單展開，跨世代重置。
 - `清除草稿` 只刪該持久化條目，不清記憶體勾選。
 - 只有 owner user（user 0）能寫入／清除草稿；非 owner 的寫入 hook 讀不到（訊息明確拒絕）。
 - `勾選≠安裝`、`寫草稿≠安裝`：政策寫入只放寬 hook 的白名單查詢，永不觸發 clone/remove/install。
 - `Unknown`（草稿未知）時拒絕建 pending／拒絕覆寫：須先點「重新整理草稿」讀到 Known 後再寫入（fail-closed，不覆寫未見內容）。
 - 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unknown（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）。
 - 寫入／清除失敗（`FAILED`）即標 Unknown 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unknown（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
-- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警，第二次才刪，防靜默刪除未見內容）。
+- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyLoadGeneration` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
+
+### 政策 TTL 對照（App 側 vs hook 側，時鐘皆為 monotonic，不受 wall-clock 回撥影響）
+
+| TTL | 值 | 所在側 | 語義 |
+| --- | --- | --- | --- |
+| 寫入確認 `POLICY_CONFIRM_TTL_MS` | 5 分鐘 | App | dialog pending 逾時→清 pending＋`TTL_EXPIRED` 訊息，不碰 draft（零寫入） |
+| blind-clear arm `BLIND_CLEAR_TTL_MS` | 5 分鐘（與上同值，別名） | App | arm 逾時→重 arm＋`policy_blind_clear_expired` 文案，需重新確認 |
+| store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `FAILED`＋Unknown fence，pending 保留由 reconciler 核對，不自動重送 |
+| 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 冗餘重讀同一 `RemotePreferences` 實例（框架推送才是主要新鮮度機制，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
+| 失敗節流 `failureCooldownMs` | 5 秒 | hook | 遠端讀取失敗後查詢節流，不重試 reader（`last-known-good` 保留或回 seed，見 `docs/HOOK.md` §1.1） |
 
 ## English Summary
 

@@ -53,9 +53,9 @@
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
-    <string name="policy_draft_format">Whitelist policy (draft): %1$d entries</string>
-    <string name="policy_draft_unknown">Whitelist policy (draft): unknown (LSPosed service not connected; tap Refresh draft to retry)</string>
-    <string name="policy_write_title">Confirm policy write</string>
+    <string name="policy_draft_format">Whitelist policy (draft, not yet effective): %1$d entries</string>
+    <string name="policy_draft_unknown">Whitelist policy (draft, not yet effective): unknown (LSPosed service not connected; tap Refresh draft to retry)</string>
+    <string name="policy_write_title">Confirm policy write (draft only, not effective)</string>
     <plurals name="policy_write_message">
         <item quantity="one">Write the following %1$d package into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
         <item quantity="other">Write the following %1$d packages into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
@@ -210,12 +210,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">Dual App Whitelist Injector</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">Requires an active LSPosed Hook (pending device verification) to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku)</string>
+    <string name="hero_subtitle_apps">Requires an active LSPosed Hook (pending device verification) to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku); the policy set is empty by default so hooks stay observe-only (drafts are not yet effective)</string>
     <string name="hero_subtitle_engine">Isolated Environment · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
-    <string name="hook_mode_subtitle">Requires an active LSPosed Hook (pending device verification) to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
+    <string name="hook_mode_subtitle">Requires an active LSPosed Hook (pending device verification) to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku; the policy set is empty by default so hooks stay observe-only (drafts are not yet effective).</string>
     <string name="hook_mode_subtitle_ops">Clone and remove work on the verified profile through this privileged channel (Auto/Root/Shizuku) with no Hook required; LSPosed only adds deeper Samsung whitelist and native UI integration.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
