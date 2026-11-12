@@ -892,6 +892,10 @@ class DualViewModel(
     //   或自身 Tx 成功結清洗白）。
     private val lastRevisionSeenTxId = AtomicLong(-1L)
     private val lastRevisionSeenKey = AtomicReference<String?>(null)
+    // Stage L3: rev 水位（committedRevision 序號，publish order = claim order）。
+    // 去重＋overtake 守衛：incoming rev < last 即 stale 丟棄（不覆寫新事實）；
+    // gap（rev 跳號）經 metric/log 顯式標記，仍收斂最新（conflated 有序）。
+    private val lastRevisionSeenRev = AtomicLong(-1L)
     private val policyRevisionStale = AtomicBoolean(false)
     // Stage J4 (J3#1 pre-IO TOCTOU)：修訂觀察與寫入路徑序列化的專用互斥。
     // - confirm pre-IO 門控（check base/stale＋lazy.start）在 opMutex 內再持此鎖；
@@ -958,6 +962,8 @@ class DualViewModel(
     // Payload pre-built from _state snapshot, staged (overwrite placeholder)
     // inside withCommitLock with watermark update in same observation,
     // then emitStaged after unlock (never emit while holding mutex).
+    // Stage L3: stage via stageRealPayload (preserve claim rev, _latest monotonic),
+    // emit via emitStaged (rev guard + timeout metric, never silent).
     private suspend fun emitTxSettledSnapshot(tx: PolicyTx) {
         val coord = policyTxCoordinator ?: return
         try {
@@ -972,34 +978,23 @@ class DualViewModel(
                     tx.txId, tx.key, s.policyDraft, s.policyDraftKnown,
                     s.msgKind, s.msg, tx.isClear,
                 )
+                var stamped: PolicySettled? = null
                 try {
-                    coord.withCommitLock {
-                        try {
-                            val cur = try { coord.pendingPublish.get() } catch (_: Exception) { null }
-                            if (cur != null && cur.txId == tx.txId && cur.key == tx.key) {
-                                coord.pendingPublish.set(payload)
-                            } else if (cur == null) {
-                                coord.pendingPublish.set(payload)
-                            }
-                            lastRevisionSeenTxId.set(tx.txId)
-                            lastRevisionSeenKey.set(tx.key)
-                        } catch (_: Exception) {
-                            try {
-                                lastRevisionSeenTxId.set(tx.txId)
-                            } catch (_: Exception) {
-                            }
-                            try {
-                                lastRevisionSeenKey.set(tx.key)
-                            } catch (_: Exception) {
-                            }
-                        }
+                    stamped = coord.stageRealPayload(payload)
+                    try {
+                        val emitForMark = stamped ?: payload
+                        lastRevisionSeenTxId.set(emitForMark.txId)
+                        lastRevisionSeenKey.set(emitForMark.key)
+                        if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                    } catch (_: Exception) {
                     }
                 } catch (_: Exception) {
                     lastRevisionSeenTxId.set(tx.txId)
                     lastRevisionSeenKey.set(tx.key)
                 }
                 // Stage J4 lossless + L1 staged: emit after release.
-                coord.emitStaged(payload)
+                // Superseded (null) → skip SharedFlow emit (metric already surfaced).
+                if (stamped != null) coord.emitStaged(stamped)
             }
         } catch (_: Exception) {
             // Best effort.
@@ -1008,26 +1003,23 @@ class DualViewModel(
 
     // Stage L1 P1: pre-built payload overload (call-sites stage payload under
     // commitMutex, emit after unlock). Takes PolicySettled directly.
+    // Stage L3: same stageRealPayload path (rev preserved, _latest monotonic).
     private suspend fun emitTxSettledSnapshotPayload(tx: PolicyTx, payload: PolicySettled) {
         val coord = policyTxCoordinator ?: return
         try {
+            var stamped: PolicySettled? = null
             try {
-                coord.withCommitLock {
-                    try {
-                        val cur = try { coord.pendingPublish.get() } catch (_: Exception) { null }
-                        if (cur != null && cur.txId == tx.txId && cur.key == tx.key) {
-                            coord.pendingPublish.set(payload)
-                        } else if (cur == null) {
-                            coord.pendingPublish.set(payload)
-                        }
-                        lastRevisionSeenTxId.set(payload.txId)
-                        lastRevisionSeenKey.set(payload.key)
-                    } catch (_: Exception) {
-                    }
+                stamped = coord.stageRealPayload(payload)
+                try {
+                    val emitForMark = stamped ?: payload
+                    lastRevisionSeenTxId.set(emitForMark.txId)
+                    lastRevisionSeenKey.set(emitForMark.key)
+                    if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                } catch (_: Exception) {
                 }
             } catch (_: Exception) {
             }
-            coord.emitStaged(payload)
+            if (stamped != null) coord.emitStaged(stamped)
         } catch (_: Exception) {
             // Best effort.
         }
@@ -1161,25 +1153,21 @@ class DualViewModel(
         val coord = policyTxCoordinator
         try {
             if (coord != null) {
+                var stamped: PolicySettled? = null
                 try {
-                    coord.withCommitLock {
-                        try {
-                            val cur = try { coord.pendingPublish.get() } catch (_: Exception) { null }
-                            if (cur != null && cur.txId == payload.txId && cur.key == payload.key) {
-                                coord.pendingPublish.set(payload)
-                            } else if (cur == null) {
-                                coord.pendingPublish.set(payload)
-                            }
-                            lastRevisionSeenTxId.set(payload.txId)
-                            lastRevisionSeenKey.set(payload.key)
-                        } catch (_: Exception) {
-                        }
+                    stamped = coord.stageRealPayload(payload)
+                    try {
+                        val emitForMark = stamped ?: payload
+                        lastRevisionSeenTxId.set(emitForMark.txId)
+                        lastRevisionSeenKey.set(emitForMark.key)
+                        if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                    } catch (_: Exception) {
                     }
                 } catch (_: Exception) {
                     lastRevisionSeenTxId.set(payload.txId)
                     lastRevisionSeenKey.set(payload.key)
                 }
-                coord.emitStaged(payload)
+                if (stamped != null) coord.emitStaged(stamped)
             } else {
                 lastRevisionSeenTxId.set(payload.txId)
                 lastRevisionSeenKey.set(payload.key)
@@ -1228,8 +1216,10 @@ class DualViewModel(
                     policyOwnershipGen.incrementAndGet()
                 }
                 // Stage I2：跟隨即記水位（不洗 stale：異 Tx 陳舊仍須顯式重讀）。
+                // Stage L3: 同步 rev 水位（overtake 守衛＋gap 檢出）。
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                     else {
@@ -1257,6 +1247,9 @@ class DualViewModel(
                 return@launch
             }
             // 兜底：可信重讀後顯式 reconcile 本地 phase，不永久卡死。
+            // Stage L3: settled==null 永不視為送達——此處顯式 boundedReconcileRead
+            // 兜底（Known 即 IDLE+Known+REFRESHED，Unknown 即 IDLE+Unknown+
+            // REFRESH_FAILED），不經 resync 永不離開 RECONCILING。
             // Stage I1：同上再檢——新 Tx 在途即丟棄（不發布、不碰新 fence），僅清自身 key。
             val curLocalFb = try { activePolicyTx.get() } catch (_: Exception) { null }
             val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
@@ -1386,8 +1379,10 @@ class DualViewModel(
                 policyOwnershipGen.incrementAndGet()
             }
             // Stage I2：跟隨即記水位，免常駐收集重入（不洗 stale：仍須顯式重讀）。
+            // Stage L3: 同步 rev 水位。
             lastRevisionSeenTxId.set(settled.txId)
             lastRevisionSeenKey.set(settled.key)
+            try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                 else {
@@ -1417,21 +1412,16 @@ class DualViewModel(
 
     // Stage I2 (P2#3#4)：coordinator 級陳舊修訂同步——每 VM init 常駐收集 settled，
     // 不限認領單一 txId（以 lastSeenTxId 去重，replay=8 晚訂閱仍只應用一次）。
-    // - 收到 txId+key != 本地 activeTx 的新終態：
-    //   - 本地無 activeTx → Known 成功 bump 版本三元＋更新 draft/Known/msg（phase
-    //     保持 IDLE，pending/loading 不動；僅 IDLE/QUEUED 才應用全量，SAVING/
-    //     RECONCILING 窗口丟棄）；Unknown 失敗亦 bump＋翻 Unknown＋應用 msg（J2，
-    //     不得忽略，防跨 VM 樂觀污染殘留 Known）。
-    //   - 本地有 activeTx（異 Tx）→ 丟棄＋記 stale（Known/Unknown 皆記，J2），後續
-    //     request/confirm 強制重讀。
-    // - 自 Tx（同 id+key）即跳過（專屬跟隨路徑處理，此處僅記水位）。
-    // Stage J4 (J3#1)：stale 標記段經 policyRevisionMutex 與 pre-IO 門控序列化，
-    // 短臨界、無 IO，免 check-and-start 窗口被外來修訂穿透。
+    // Stage L3: 改收斂 _latest StateFlow（conflated、有序、無逐出；晚訂閱收斂最新，
+    // gap 經 rev 檢出，永不靜默丟失）。_settled SharedFlow 僅為瞬態 notifier
+    // （相容保留，不再作為真相）。
     private fun observeRevisionUpdates() {
         val coord = policyTxCoordinator ?: return
         viewModelScope.launch {
             try {
-                coord.settled.collect { settled -> handleForeignSettled(settled) }
+                coord.latest.collect { settled ->
+                    if (settled != null) handleForeignSettled(settled)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -1493,9 +1483,18 @@ class DualViewModel(
             val authoritativeRev = committedRev
             @Suppress("UNUSED_VARIABLE")
             val authoritativePending = stagedPending
+            // Stage L3: rev 守衛 — 舊 rev（overtake 殘留）一律丟棄，免 stale 覆寫
+            // 新事實；gap（跳號）仍收斂最新（下行應用），不靜默丟失。
+            val lastRev = try { lastRevisionSeenRev.get() } catch (_: Exception) { -1L }
+            if (settled.rev != -1L && lastRev != -1L && settled.rev < lastRev) return
             val lastId = lastRevisionSeenTxId.get()
             val lastK = lastRevisionSeenKey.get()
-            if (settled.txId == lastId && settled.key == lastK) return
+            if (settled.txId == lastId && settled.key == lastK) {
+                // Same identity: still advance rev watermark when newer (placeholder
+                // →real 同 rev 覆寫不需動；跨 rev 同 id 極罕，仍推進）。
+                try { if (settled.rev != -1L && settled.rev > lastRev) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
+                return
+            }
             // 全域單調：舊修訂（txId 更小）一律丟棄，免 stale 覆寫新事實。
             if (settled.txId < lastId) return
             val localTx = try { activePolicyTx.get() } catch (_: Exception) { null }
@@ -1503,6 +1502,7 @@ class DualViewModel(
             if (localTx != null && settled.txId == localTx.txId && settled.key == localTx.key) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
                 return
             }
             // Stage J2: 異 Tx 而本地有 activeTx → 丟棄＋記 stale（Known 與 Unknown
@@ -1512,6 +1512,7 @@ class DualViewModel(
             if (localTx != null) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
                 policyRevisionStale.set(true)
                 return
             }
@@ -1530,6 +1531,7 @@ class DualViewModel(
             if (hasPendingForForeign) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
                 policyRevisionStale.set(true)
                 markPolicyUnknownLocked()
                 _state.update { cur ->
@@ -1554,6 +1556,7 @@ class DualViewModel(
             if (!settled.known) {
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
+                try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
                 markPolicyUnknownLocked()
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
@@ -1572,6 +1575,7 @@ class DualViewModel(
             }
             lastRevisionSeenTxId.set(settled.txId)
             lastRevisionSeenKey.set(settled.key)
+            try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
             policyDraftVersion.incrementAndGet()
             policyFreshnessGen.incrementAndGet()
             policyOwnershipGen.incrementAndGet()
@@ -6627,7 +6631,34 @@ class DualViewModel(
                                                 if (s.txId == lastRevisionSeenTxId.get() && s.key == lastK) continue
                                                 lastRevisionSeenTxId.set(s.txId)
                                                 lastRevisionSeenKey.set(s.key)
+                                                try { if (s.rev != -1L) lastRevisionSeenRev.set(s.rev) } catch (_: Exception) { }
                                                 policyRevisionStale.set(true)
+                                            }
+                                            // Stage L3: drain _latest (conflated truth, no eviction).
+                                            // Collector lag cannot hide B: if _latest is foreign
+                                            // and newer than watermark, mark stale (do not advance
+                                            // watermark for staged-not-yet-observed? Here late
+                                            // truth is terminal, so advance rev watermark).
+                                            try {
+                                                val latestOne = try { h1Coord.latest.value } catch (_: Exception) { null }
+                                                if (latestOne != null &&
+                                                    !(latestOne.txId == tx.txId && latestOne.key == tx.key)
+                                                ) {
+                                                    val lastR = try { lastRevisionSeenRev.get() } catch (_: Exception) { -1L }
+                                                    val isNewer = if (latestOne.rev != -1L && lastR != -1L) {
+                                                        latestOne.rev > lastR
+                                                    } else {
+                                                        latestOne.txId != lastRevisionSeenTxId.get() ||
+                                                            latestOne.key != try { lastRevisionSeenKey.get() } catch (_: Exception) { null }
+                                                    }
+                                                    if (isNewer) {
+                                                        lastRevisionSeenTxId.set(latestOne.txId)
+                                                        lastRevisionSeenKey.set(latestOne.key)
+                                                        try { if (latestOne.rev != -1L) lastRevisionSeenRev.set(latestOne.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
+                                            } catch (_: Exception) {
                                             }
                                         } catch (_: Exception) {
                                         }
@@ -7628,7 +7659,30 @@ class DualViewModel(
                                                 if (s.txId == lastRevisionSeenTxId.get() && s.key == lastK) continue
                                                 lastRevisionSeenTxId.set(s.txId)
                                                 lastRevisionSeenKey.set(s.key)
+                                                try { if (s.rev != -1L) lastRevisionSeenRev.set(s.rev) } catch (_: Exception) { }
                                                 policyRevisionStale.set(true)
+                                            }
+                                            // Stage L3: drain _latest truth as well.
+                                            try {
+                                                val latestOne = try { h1ClearCoord.latest.value } catch (_: Exception) { null }
+                                                if (latestOne != null &&
+                                                    !(latestOne.txId == txClear.txId && latestOne.key == txClear.key)
+                                                ) {
+                                                    val lastR = try { lastRevisionSeenRev.get() } catch (_: Exception) { -1L }
+                                                    val isNewer = if (latestOne.rev != -1L && lastR != -1L) {
+                                                        latestOne.rev > lastR
+                                                    } else {
+                                                        latestOne.txId != lastRevisionSeenTxId.get() ||
+                                                            latestOne.key != try { lastRevisionSeenKey.get() } catch (_: Exception) { null }
+                                                    }
+                                                    if (isNewer) {
+                                                        lastRevisionSeenTxId.set(latestOne.txId)
+                                                        lastRevisionSeenKey.set(latestOne.key)
+                                                        try { if (latestOne.rev != -1L) lastRevisionSeenRev.set(latestOne.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
+                                            } catch (_: Exception) {
                                             }
                                         } catch (_: Exception) {
                                         }
