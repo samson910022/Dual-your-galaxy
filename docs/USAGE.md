@@ -232,15 +232,16 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ### 政策寫入流程（Stage2：白名單政策草稿）
 
-- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高（一般 320dp，小螢幕 smallestWidth<360 或 screenHeight<640 回 240dp，見 `policyDialogListMaxHeightDp`），少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。
+- `寫入政策` 只把目前勾選映射為包名快照，建立兩階段確認 dialog（列出前 50 項＋溢出行、需勾選確認框；TTL 5 分鐘（`POLICY_CONFIRM_TTL_MS`，此 5 分鐘為 App 側確認 TTL，與 hook 側 `EffectivePolicyCache` 的 60 秒 TTL 不同，詳見下表）、同 pending 世代保留勾選；包名逾 10 項時 dialog 清單限高（一般 320dp，小螢幕 smallestWidth<360 或 screenHeight<640 回 240dp，見 `policyDialogListMaxHeightDp`），少量時 WRAP_CONTENT 不留空，ack 永遠可見）；`確認寫入` 才經 `HookPolicyStore` 寫入 LSPosed remote preferences 的 `dual_policy` group。Stage L4：展開顯示封頂前 200 項（`POLICY_DIALOG_DISPLAY_MAX`，display≡inspectability）：總數>200 即禁用確認＋超限警告（`policy_write_over_cap_warning`），Toggle/播報切 capped（`show_all_capped`／`expanded_announce_capped`，複用收合語義「已展開前200項，共N項，超出須分批」），須分批勾選寫入（每批 ≤200 項）以確保逐項可檢視確認；寫入仍用完整 pending.packages，但須經門控分批確認（`policyWriteCanConfirmInspectable`）。
 - 同世代（same-generation）綁定：pending 攜帶 `PendingPolicyWrite.generation`（`policyWriteGeneration` 單調唯一，新請求覆寫即舊世代失效，見 `DualViewModel` 205-210）；`確認寫入` 僅在傳入 pending 與 live pending 全等＋TTL 內才寫 store（見 confirm 5455-5472），不符即拒寫（零寫入，舊世代傳入保留 live pending）；旋轉同世代保留 ack 勾選與清單展開，跨世代重置（UI 以 `pending.generation` 比對，見 `MainActivity` 3657/3729/4123）。
 - `清除草稿` 只刪該持久化條目，不清記憶體勾選。
 - 只有 owner user（user 0）能寫入／清除草稿；非 owner 的寫入 hook 讀不到（訊息明確拒絕）。
 - `勾選≠安裝`、`寫草稿≠安裝`：政策寫入只放寬 hook 的白名單查詢，永不觸發 clone/remove/install。
-- `Unknown`（草稿未知）時拒絕建 pending／拒絕覆寫：須先點「重新整理草稿」讀到 Known 後再寫入（fail-closed，不覆寫未見內容）。
-- 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unknown（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）。
-- 寫入／清除失敗（`FAILED`）即標 Unknown 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unknown（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
-- 無手動重整以外的自動重試：blind-clear 下 Unknown 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyFreshnessGen` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
+- `Unknown`（草稿未知）時拒絕建 pending／拒絕覆寫：須先點「重新整理草稿」讀到 Known 後再寫入（fail-closed，不覆寫未見內容）。Stage L4：Unknown 已拆分為瞬斷 Unavailable（null/IPC/timeout/非 CCE）與損壞 Corrupt（CCE）：盲清（blind-clear 二次確認）僅 Unavailable 瞬斷專用；Corrupt 永不盲清，走修復流程（見下）。
+- 「重新整理草稿」為唯讀入口：只重讀遠端草稿，不觸發寫入；服務未連線或讀取失敗時顯示 Unavailable（保留舊草稿，不謊稱空，被拒時訊息帶「請先重新整理」與重試入口）；損壞（CCE）時顯示 `policy_corrupt_detected`（保留舊快照，盲清已拒絕）。
+- 寫入／清除失敗（`FAILED`）即標 Unavailable 並 fence 在途載入：晚到的舊 Known 不得蓋回 Unavailable（見 `DualViewModel.markPolicyUnknownLocked`），須重整後再試；失敗不自動重送。
+- 無手動重整以外的自動重試：blind-clear 下 Unavailable 須二次確認才執行（第一次僅告警並 arm，第二次 tap 先判 TTL（逾 `BLIND_CLEAR_TTL_MS` 5 分鐘→重 arm＋逾時文案）再判世代（`policyDraftVersion`／`policyFreshnessGen` 任一失配→重 arm 視為新的第一次），同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm，防靜默刪除未見內容）。
+- 損壞修復（Corrupt 專用，與盲清平行）：`requestRepairCorruptDraft` 第一次 tap 僅告警並 arm（`policy_corrupt_repair_first`），`confirmRepairCorruptDraft` 第二次 tap 先判 TTL（逾 5 分鐘→重 arm＋`policy_blind_clear_expired` 複用）再判世代（失配→重 arm），兩者皆過才跳過 Known pre-read、直調 `store.repairCorrupt()`（best-effort 備份至 `dual_policy.bak.<ts>`＋`remove(KEY).commit()`＋post-read 驗證 Known(empty)；永不 auto-called）。成功即 `policy_corrupt_repaired`＋Known(empty)＋雙 disarm＋版本 bump；失敗（含 `ServiceUnavailable`）即 `policy_corrupt_repair_failed`＋滯留 Corrupt（FAILED，保留舊快照）。`clearPolicyDraft` 在 Corrupt 下永不盲清（雙 tap 仍零 store 觸碰，導向修復流程）。
 - 取消語義：`QUEUED` 可取消（清 pending 回 `IDLE`）；`SAVING`／`RECONCILING` 不可取消（no-op，pending 保留；核對中請勿重試；reconciler 終態正常回 `IDLE`，唯有界讀耗盡／總預算超限滯留 `RECONCILING` 待 `refreshPolicyDraft` late-join 恢復，見下表）。
 - Tx 釋放條件（Stage G1 `decidePolicyTxSettle`，reconciler／refresh late-join／auto-recheck 共用唯一真相）：可 settle IFF deferred 已完成＋權威讀為預期→SUCCESS（`WRITE_SUCCESS`／`CLEAR_SUCCESS`＋Known）；deferred 已證失敗（await 回 false／拋出）→FAILED＋Unknown（樂觀讀不得翻案）；deferred 完成＋權威讀非預期→mismatch `REFRESHED`（ground truth）；其餘一律 Unresolved（保留 fence＋`RECONCILING`＋pending）。快徑 read-after-ack 維持既有信 ack 語義（Unknown 即信 ack 發布 SUCCESS），不經此 helper（保版本守衛既有測試語義）。
 - Known(A)/Known(B) inconclusive：deferred 未完成時任何 Known（A 或 B）都不 settle 續留；Known(B)（讀到值==sanitized）永 inconclusive（刪末輪特例）；Known(A)（讀到值!=sanitized）視 stale 續留，不得 mismatch-settle（防 stale／樂觀讀早熟）。

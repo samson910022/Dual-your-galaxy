@@ -120,6 +120,15 @@
     <string name="policy_write_list_cd_collapsed">Policy package list, %1$d items total, showing first %2$d</string>
     <string name="policy_write_expanded_announce">Expanded full list, %1$d items total</string>
     <string name="policy_write_collapsed_announce">Collapsed, showing first %1$d only</string>
+    <!-- Stage L4 P2#2 (b) single-confirm inspectability bound 200: over-cap warning + capped toggle/announce (%1$d=total, %2$d=inspectable 200). -->
+    <string name="policy_write_over_cap_warning">Exceeds single-confirm inspectability bound (%1$d total, showing first %2$d); split into batches (≤%2$d each) so every item is inspectable before confirming</string>
+    <string name="policy_write_show_all_capped">Show first %2$d of %1$d (over cap, split into batches)</string>
+    <string name="policy_write_expanded_announce_capped">Expanded first %2$d of %1$d; over cap, split into batches</string>
+    <!-- Stage L4 P2#3 corrupt repair (CCE only, separate from Unavailable blind-clear). -->
+    <string name="policy_corrupt_detected">Remote policy is corrupt (type confusion); kept the old snapshot. Clearing requires repair confirmation; blind clear refused. Refresh first if reachable.</string>
+    <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will back up then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>
+    <string name="policy_corrupt_repaired">Repaired the corrupt policy draft (backed up and cleared, now empty)</string>
+    <string name="policy_corrupt_repair_failed">Failed to repair the corrupt policy draft; still corrupt. Retry or check the service connection.</string>
     <plurals name="batch_create">
         <item quantity="one">Create %1$d clone</item>
         <item quantity="other">Create %1$d clones</item>

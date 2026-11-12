@@ -237,4 +237,86 @@ class HookPolicyStoreTest {
             // expected
         }
     }
+
+    // Stage L4 P2#3 split：CCE→Corrupt，null→Unavailable，非 CCE→Unavailable。
+    @Test
+    fun l4_loadResult_split_corruptVsUnavailable() {
+        val corruptStore = HookPolicyStore(
+            loadRaw = { throw ClassCastException("untrusted type confusion") },
+            saveRaw = { _ -> true },
+        )
+        val corruptResult = corruptStore.loadResult()
+        assertTrue(corruptResult is LoadResult.Corrupt)
+        assertTrue(corruptResult is LoadResult.Unknown)
+
+        val nullStore = HookPolicyStore(
+            loadRaw = { null },
+            saveRaw = { _ -> true },
+        )
+        val nullResult = nullStore.loadResult()
+        assertTrue(nullResult is LoadResult.Unavailable)
+        assertTrue(nullResult is LoadResult.Unknown)
+
+        val ipcStore = HookPolicyStore(
+            loadRaw = { throw RuntimeException("binder timeout") },
+            saveRaw = { _ -> true },
+        )
+        val ipcResult = ipcStore.loadResult()
+        assertTrue(ipcResult is LoadResult.Unavailable)
+        assertTrue(ipcResult is LoadResult.Unknown)
+        assertFalse(ipcResult is LoadResult.Corrupt)
+    }
+
+    // Stage L4 repair：Corrupt→clear＋驗證 Known(empty) 即 Repaired。
+    @Test
+    fun l4_repairCorrupt_success_clearsAndVerifiesEmpty() {
+        var backing: Set<String>? = null // 損壞前不可讀（loadRaw 即拋 CCE）。
+        var corrupt = true
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.Repaired)
+        val after = store.loadResult()
+        assertTrue(after is LoadResult.Known)
+        assertTrue((after as LoadResult.Known).packages.isEmpty())
+    }
+
+    // Stage L4 repair 失敗：clear 回 false→RepairFailed，仍 Corrupt。
+    @Test
+    fun l4_repairCorrupt_clearFails_reportsFailed() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> false },
+        )
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.RepairFailed)
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+    }
+
+    // Stage L4 repair 服務缺席：isServiceAvailable false→ServiceUnavailable。
+    @Test
+    fun l4_repairCorrupt_serviceUnavailable() {
+        val store = HookPolicyStore(
+            loadRaw = { null },
+            saveRaw = { _ -> false },
+            isServiceAvailable = { false },
+        )
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.ServiceUnavailable)
+    }
 }

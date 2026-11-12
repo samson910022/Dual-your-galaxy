@@ -190,39 +190,56 @@ fun sanitizeHookPolicy(raw: Set<String?>): Set<String> = PolicySource.sanitize(r
 // saveRaw 回傳寫入是否成功；save/clear 自身捕捉例外並回傳 false，
 // load 捕捉例外並自清 (見各方法註解)，故本類對呼叫端永不拋出。
 // 讀取結果:區分「已確認值」(含確認空) 與「未知/無法讀取」(service 缺席、
-// IPC 失敗、型別損壞)。UI/VM 不得把 Unknown 當成確認空。
+// IPC 失敗) 與「損壞」(型別損壞 CCE)。UI/VM 不得把 Unknown/損壞當成確認空。
+// Stage L4 P2#3 split: Unknown(interface) -> Unavailable(null/IPC/timeout/
+// non-CCE) | Corrupt(CCE)。`is Unknown` 仍為「非 Known」總稱（保既有 fence 語義）；
+// 值構造一律用 Unavailable/Corrupt（Unknown 本身不再有單例）。
 sealed interface LoadResult {
     data class Known(val packages: Set<String>) : LoadResult
-    object Unknown : LoadResult
+    sealed interface Unknown : LoadResult
+    data object Unavailable : Unknown
+    data object Corrupt : Unknown
+}
+
+// Stage L4 P2#3 repair primitive 結果（永不 auto-called，僅 VM 修復流程調用）。
+sealed interface RepairResult {
+    data object Repaired : RepairResult
+    data object RepairFailed : RepairResult
+    data object ServiceUnavailable : RepairResult
 }
 
 class HookPolicyStore(
     private val loadRaw: () -> Set<String>?,
     private val saveRaw: (Set<String>?) -> Boolean,
+    // Stage L4: service 可用性探針（remote 傳入 provider!=null；測試預設 true）。
+    // repairCorrupt 藉此區分 ServiceUnavailable vs RepairFailed。
+    private val isServiceAvailable: () -> Boolean = { true },
 ) {
-    // 讀草稿結果:損壞 (拋出，如條目型別錯亂的 ClassCastException) -> 視為
-    // Unknown，永不 auto-delete（Stage J3 P1：CCE 自清會在 untrusted type
-    // confusion 下刪除有效草稿，fail-closed 要求保留舊快照、僅標 Unknown；
-    // 如需自癒應 quarantine 至備份鍵，絕不直接刪主鍵）。
+    // 讀草稿結果:損壞 (拋出，如條目型別錯亂的 ClassCastException) -> Corrupt，
+    // 永不 auto-delete（Stage J3 P1：CCE 自清會在 untrusted type
+    // confusion 下刪除有效草稿，fail-closed 要求保留舊快照、僅標 Corrupt；
+    // 自癒僅經 repairCorrupt 備份＋清除，絕不直接刪主鍵）。
     // 與 remoteHookPolicyStore.loadRaw 的分工:provider() 解析失敗 (暫時性
-    // IPC/service 缺席) 已在綁定層轉為 null (Unknown、不自清,避免刪掉有效
+    // IPC/service 缺席) 已在綁定層轉為 null (Unavailable、不自清,避免刪掉有效
     // 草稿);會走到 ClassCastException catch 的只剩值/型別損壞,亦不自清。
-    // 其他例外 (例如 getStringSet 的暫時性 IPC 失敗) 視為 Unknown,不清除
+    // 其他例外 (例如 getStringSet 的暫時性 IPC 失敗) 視為 Unavailable,不清除
     // 有效草稿 (避免資料遺失)。
-    // Phase 4:抓 Throwable (含 Error 如 AssertionError) 轉 Unknown/false,
-    // 但保留 CancellationException 透傳 (協程取消不得被吞為 Unknown)。
+    // Phase 4:抓 Throwable (含 Error 如 AssertionError) 轉 Unavailable/false,
+    // 但保留 CancellationException 透傳 (協程取消不得被吞為 Unavailable)。
     // 與 P1-2 對齊:store 層永不拋出 (取消除外)。
+    // Stage L4: CCE（含其子類）一律 Corrupt；其餘 Throwable 一律 Unavailable。
     fun loadResult(): LoadResult = try {
         val raw = loadRaw()
-        if (raw == null) LoadResult.Unknown else LoadResult.Known(sanitizeHookPolicy(raw))
+        if (raw == null) LoadResult.Unavailable else LoadResult.Known(sanitizeHookPolicy(raw))
     } catch (_: ClassCastException) {
-        // Stage J3:永不 auto-delete（見上）；保留舊快照，僅回 Unknown。
-        LoadResult.Unknown
+        // Stage J3:永不 auto-delete（見上）；保留舊快照，僅回 Corrupt。
+        // Stage L4: CCE 即 Corrupt（非 Unavailable），觸發修復流程而非盲清。
+        LoadResult.Corrupt
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
-        // 暫時性/其他非損壞錯誤 (含 Error):視為 Unknown,不清除有效草稿。
-        LoadResult.Unknown
+        // 暫時性/其他非損壞錯誤 (含 Error):視為 Unavailable,不清除有效草稿。
+        LoadResult.Unavailable
     }
 
     // 相容別名:回傳 Set (Unknown -> 空)。新程式請優先使用 loadResult()。
@@ -232,7 +249,7 @@ class HookPolicyStore(
     @Deprecated("Use loadResult()", ReplaceWith("loadResult()"))
     fun load(): Set<String> = when (val r = loadResult()) {
         is LoadResult.Known -> r.packages
-        LoadResult.Unknown -> emptySet()
+        is LoadResult.Unknown -> emptySet()
     }
 
     // 保存 (原子單鍵 commit)。空集合亦寫出 (明確寫入空草稿)；非法 token
@@ -252,6 +269,71 @@ class HookPolicyStore(
         throw ce
     } catch (_: Throwable) {
         false
+    }
+
+    // Stage L4 P2#3 顯式修復原語（永不 auto-called，僅 VM 修復流程調用）：
+    // best-effort 備份至 dual_policy.bak.<ts>（writable 時，失敗忽略），
+    // remove(KEY).commit()，post-read 驗證 Known(empty)。
+    // - ServiceUnavailable：服務缺席（isServiceAvailable false 或 clear 回 false
+    //   且當下不可寫）。
+    // - Repaired：clear 成功＋post-read 為 Known(empty)。
+    // - RepairFailed：其餘（clear 回 false/拋出、post-read 非空或仍 Unknown/Corrupt）。
+    // CE 透傳（取消不得被吞為失敗）。
+    fun repairCorrupt(): RepairResult {
+        val available = try {
+            isServiceAvailable()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            false
+        }
+        if (!available) return RepairResult.ServiceUnavailable
+        // Best-effort 備份（writable 時）：嘗試讀取原始物件字串化備份，失敗忽略。
+        // 損壞值經 loadRaw 即拋 CCE，故此處僅能備份可讀值；損壞本體無法經型別
+        // 安全通道備份，仍以清除＋驗證為主，備份失敗不擋修復。
+        try {
+            val ts = try { System.currentTimeMillis() } catch (_: Throwable) { 0L }
+            backupCorruptBestEffort(ts)
+        } catch (_: Throwable) {
+            // Best effort: 備份失敗不擋修復。
+        }
+        val cleared: Boolean = try {
+            saveRaw(null)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            return RepairResult.RepairFailed
+        }
+        if (!cleared) {
+            val stillAvailable = try {
+                isServiceAvailable()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                true
+            }
+            return if (!stillAvailable) RepairResult.ServiceUnavailable else RepairResult.RepairFailed
+        }
+        val after: LoadResult = try {
+            loadResult()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            return RepairResult.RepairFailed
+        }
+        return if (after is LoadResult.Known && after.packages.isEmpty()) {
+            RepairResult.Repaired
+        } else {
+            RepairResult.RepairFailed
+        }
+    }
+
+    // Best-effort 備份鉤子（預設 no-op；remote 覆寫經 prefs.all 備份）。
+    // 失敗一律忽略，不擋修復。
+    private var backupCorruptBestEffort: (Long) -> Unit = { _ -> }
+
+    internal fun setBackupHook(hook: (Long) -> Unit) {
+        backupCorruptBestEffort = hook
     }
 }
 
@@ -283,31 +365,40 @@ fun remoteHookPolicyStore(
         loadRaw = {
             // resolve 在圍欄外:provider 缺席未觸 prefs 即無污染可能。
             // Phase 4:provider 拋 Throwable (含 Error) 皆視為缺席 -> null
-            // (Unknown,不設毒);CancellationException 透傳。
+            // (Unavailable,不設毒);CancellationException 透傳。
             val prefs = resolvePrefs()
-            // null = service/IPC unavailable (LoadResult.Unknown);非 null 即
+            // null = service/IPC unavailable (LoadResult.Unavailable);非 null 即
             // 已連上 service,鍵缺席為確認空 (Known 空),由外層 sanitize 區分。
             if (prefs == null) {
                 null
             } else {
                 val before = remotePoison.get()
                 if (isPoisoned(before, prefs)) {
-                    // 已毒短路 Unknown,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
+                    // 已毒短路 Unavailable,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
                     null
                 } else {
                     try {
                         val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
                             ?: emptySet()
                         // 快照拷貝後再驗證:併發 pre/ensure/clear 任一 bump 即丟棄,
-                        // 含 mid-getStringSet 突變 (拷貝期 CME 即 catch 轉 Unknown)。
+                        // 含 mid-getStringSet 突變 (拷貝期 CME 即 catch 轉 Unavailable)。
                         val snap = v.toSet()
                         val after = remotePoison.get()
                         if (after.gen != before.gen || isPoisoned(after, prefs)) null else snap
                     } catch (ce: CancellationException) {
                         throw ce
+                    } catch (cce: ClassCastException) {
+                        // Stage L4: CCE 型別損壞即 Corrupt（非 Unavailable），加毒
+                        // relatch 後重拋，由外層 loadResult 映射為 Corrupt；永不
+                        // 吞為 Unavailable（免損壞走盲清），永不自清。
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
+                        throw cce
                     } catch (_: Throwable) {
-                        // 探讀失敗 (CCE 型別損壞或暫時 IPC) 即加毒 relatch 後 Unknown,
-                        // 永不拋出觸自清 (J3 已無自清,此處統一吞為 Unknown 並沾毒,
+                        // 暫時 IPC 失敗即加毒 relatch 後 Unavailable,
+                        // 永不拋出觸自清 (J3 已無自清,此處統一吞為 Unavailable 並沾毒,
                         // 保證同實例短路、跨實例共毒 fail-closed)。
                         try {
                             ensurePoisoned(prefs)
@@ -362,5 +453,45 @@ fun remoteHookPolicyStore(
                 }
             }
         },
-    )
+        isServiceAvailable = {
+            try {
+                provider() != null
+            } catch (_: Throwable) {
+                false
+            }
+        },
+    ).also { store ->
+        // Stage L4 best-effort 備份鉤子：writable 時嘗試將損壞值拷貝至
+        // dual_policy.bak.<ts>，失敗忽略，不擋修復。
+        store.setBackupHook { ts ->
+            try {
+                val prefs = try { provider() } catch (_: Throwable) { null } ?: return@setBackupHook
+                val rawObj: Any? = try {
+                    prefs.all[PolicySource.POLICY_KEY_EXTRA_PACKAGES]
+                } catch (_: Throwable) {
+                    null
+                }
+                if (rawObj != null) {
+                    val bakKey = "dual_policy.bak.$ts"
+                    try {
+                        val asSet: Set<String>? = try {
+                            @Suppress("UNCHECKED_CAST")
+                            (rawObj as? Set<*>)?.mapNotNull { it?.toString() }?.toSet()
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        if (asSet != null) {
+                            prefs.edit().putStringSet(bakKey, asSet).commit()
+                        } else {
+                            prefs.edit().putStringSet(bakKey, setOf(rawObj.toString())).commit()
+                        }
+                    } catch (_: Throwable) {
+                        // Best effort: 備份失敗不擋修復。
+                    }
+                }
+            } catch (_: Throwable) {
+                // Best effort.
+            }
+        }
+    }
 }

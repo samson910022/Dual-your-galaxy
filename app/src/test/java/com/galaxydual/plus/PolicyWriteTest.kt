@@ -4720,7 +4720,13 @@ class PolicyWriteTest {
             assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
             assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            // 終態發布（IDLE）與本地 fence 釋放（settlePolicyTx）分兩步：
+            // 成功快徑先 update IDLE，後經 suspend emit 再 settle；
+            // 時序重排下 await 可能撞見 IDLE 但 Tx 尚未清空的中間態，
+            // 故此處等待收斂再斷言（同 h2_provenFailed 的既有模式）。
+            await(timeoutMs = 10_000L) { activeTxOf(vm1) == null }
             assertNull(activeTxOf(vm1))
+            await(timeoutMs = 10_000L) { coordinatorTxOf(coord) == null }
             assertNull(coordinatorTxOf(coord))
             assertFalse(coord.writeMutex.isLocked)
             assertEquals(1, saveCalls.get())
@@ -7131,6 +7137,121 @@ class PolicyWriteTest {
             } catch (_: Exception) {
             }
         }
+    }
+
+    // Stage L4 P2#3 corrupt double-clear 仍零 store 觸碰（盲清僅 Unavailable 專用）。
+    @Test
+    fun l4_corruptDoubleClear_stillZeroStoreCalls() {
+        var clearCalls = 0
+        var saveCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls++ else saveCalls++
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        // init 觀測 Corrupt（Known false＋corrupt 旗）。
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+
+        vm.clearPolicyDraft()
+        assertEquals(0, clearCalls)
+        assertEquals(0, saveCalls)
+        assertTrue(vm.state.value.msg.contains("損壞") || vm.state.value.msg.contains("corrupt") || vm.state.value.msg.contains("保留"))
+
+        vm.clearPolicyDraft()
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm.state.value.loading }
+        assertEquals(0, clearCalls)
+        assertEquals(0, saveCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+    }
+
+    // Stage L4 corrupt request 拒絕（Known false＋corrupt，不建 pending，零寫入）。
+    @Test
+    fun l4_corruptRequest_refusesWithoutPending() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> true },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.a", "A", 0, false)))
+        vm.toggleSelection("0:com.example.a")
+
+        vm.requestPolicyWrite()
+
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertTrue(vm.state.value.msg.contains("損壞") || vm.state.value.msg.contains("保留"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+    }
+
+    // Stage L4 repair 成功：兩 tap（arm＋confirm）→ Repaired＋Known(empty)。
+    @Test
+    fun l4_repairCorrupt_success_repairedKnownEmpty() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        var clearCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+
+        vm.requestRepairCorruptDraft()
+        assertTrue(vm.state.value.msg.contains("修復") || vm.state.value.msg.contains("備份"))
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(0, clearCalls)
+
+        vm.confirmRepairCorruptDraft()
+        await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown }
+        assertEquals(1, clearCalls)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertFalse(vm.state.value.policyDraftCorrupt)
+        assertTrue(vm.state.value.policyDraft.isEmpty())
+        assertTrue(vm.state.value.msg.contains("已修復"))
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
+    // Stage L4 repair 失敗：clear 回 false→RepairFailed，滯留 Corrupt。
+    @Test
+    fun l4_repairCorrupt_failed_staysCorrupt() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> false },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+
+        vm.requestRepairCorruptDraft()
+        vm.confirmRepairCorruptDraft()
+        await(timeoutMs = 10_000L) { vm.state.value.msg.contains("失敗") }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
     }
 
 }
