@@ -570,14 +570,16 @@ class DualHook : XposedModule() {
     // poll may return stale data until reboot (daemon restart rebuilds the
     // map). See docs/HOOK.md §1.1 + CrossProcessFreshnessContractTest.
     //
-    // Hot-path budget (P1-2, hardened K4 P2#6): the reader below runs through
-    // PolicyRefreshGate (at-most-one guard + stuck-worker breaker) on a
-    // zero-queue executor with a 50ms stall budget
-    // (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on timeout / contention /
-    // rejection / short-circuit the query falls back to seed/last-known-good
-    // and never blocks the hooked whitelist-query thread beyond the budget.
-    // Queue stays bounded (<=1, no growth) even when cancel(true) cannot stop
-    // an uninterruptible Binder read; breaker resets on invalidate.
+    // Hot-path budget (P1-2, hardened K4 P2#6, half-open M4 P2#6): the reader
+    // below runs through PolicyRefreshGate (at-most-one guard + stuck-worker
+    // breaker with timed half-open probe) on a zero-queue executor with a 50ms
+    // stall budget (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on timeout /
+    // contention / rejection / short-circuit the query falls back to
+    // seed/last-known-good and never blocks the hooked whitelist-query thread
+    // beyond the budget. Queue stays bounded (<=1, no growth) even when
+    // cancel(true) cannot stop an uninterruptible Binder read; breaker resets
+    // on invalidate or on a half-open probe success (30s initial, x2 to 5min
+    // cap) so silent upstream recovery still reopens without a push signal.
     internal fun effectivePolicy(): Set<String> =
         effectiveCache.get(EXTRA_WHITELIST_PACKAGES) {
             policyRefreshGate.readBounded(
@@ -842,11 +844,13 @@ class DualHook : XposedModule() {
         private val policyRefreshExecutor: java.util.concurrent.ThreadPoolExecutor =
             PolicyRefreshBudget.newPolicyRefreshExecutor()
 
-        // K4 P2#6 single-flight gate: at-most-one outstanding guard +
-        // stuck-worker circuit breaker in front of the executor. Contention /
-        // rejection / short-circuit all map to null (seed fallback) with
-        // droppedRefreshCount + throttled log; counters exposed for tests.
-        // Invalidate resets the breaker (recovery path) alongside the cache.
+        // K4 P2#6 single-flight gate (+M4 half-open probe): at-most-one
+        // outstanding guard + stuck-worker circuit breaker in front of the
+        // executor. Contention / rejection / short-circuit all map to null
+        // (seed fallback) with droppedRefreshCount + throttled log; counters
+        // (+halfOpenProbes/cooldown) exposed for tests. Invalidate resets the
+        // breaker (recovery path) alongside the cache; a timed half-open probe
+        // also recovers silently-recovered upstreams without any push signal.
         private val policyRefreshGate = PolicyRefreshGate(
             executor = policyRefreshExecutor,
             log = { msg ->

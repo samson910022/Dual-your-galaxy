@@ -55,7 +55,7 @@
     <string name="clear_policy_draft_cd">清除已保存的政策草稿（不影響已安裝分身與目前勾選）</string>
     <!-- Stage L4 fix(a)：Corrupt 修復模式按鈕（兩步確認：第一 tap 備份警告＋arm，第二 tap 執行）。 -->
     <string name="action_repair_policy_draft">修復損壞草稿</string>
-    <string name="repair_policy_draft_cd">修復損壞的政策草稿（備份後清除，需按兩次確認；不影響已安裝分身與目前勾選）</string>
+    <string name="repair_policy_draft_cd">修復損壞的政策草稿（嘗試備份後清除，備份可能失敗；需按兩次確認；不影響已安裝分身與目前勾選）</string>
     <!-- Phase 2：手動重新整理草稿（唯讀，不觸發寫入）。 -->
     <string name="action_refresh_policy_draft">重新整理草稿</string>
     <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
@@ -132,8 +132,8 @@
     <string name="policy_write_expanded_announce_capped">已展開前 %2$d 項，共 %1$d 項，超出須分批</string>
     <!-- Stage L4 P2#3 corrupt 修復（CCE 損壞專用，與盲清 Unavailable 分離）。 -->
     <string name="policy_corrupt_detected">遠端政策已損壞（類型錯亂），已保留舊快照；清除需經修復確認，盲清已拒絕；若可連線建議先重新整理</string>
-    <string name="policy_corrupt_repair_first">檢測到損壞的政策條目，修復將備份後清除損壞內容（具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理</string>
-    <string name="policy_corrupt_repaired">已修復損壞的政策草稿（已備份並清除，現為空）</string>
+    <string name="policy_corrupt_repair_first">檢測到損壞的政策條目，修復將嘗試備份後清除損壞內容（備份僅 best-effort、可能失敗、無法保證可恢復；具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理</string>
+    <string name="policy_corrupt_repaired">已修復損壞的政策草稿（已嘗試備份並清除，現為空；備份不保證成功）</string>
     <string name="policy_corrupt_repair_failed">修復損壞的政策草稿失敗，仍為損壞狀態；建議重試或檢查服務連線</string>
     <string name="policy_corrupt_repair_timeout">修復損壞政策逾時，結果未知，正在核對，請勿重試</string>
     <plurals name="batch_create">

@@ -52,7 +52,7 @@
     <string name="clear_policy_draft_cd">Drop the saved policy draft (never touches installed clones or current checks)</string>
     <!-- Stage L4 fix(a): corrupt-repair mode button (two-tap confirm: first tap arms with backup warning, second executes). -->
     <string name="action_repair_policy_draft">Repair corrupt draft</string>
-    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (backup then clear, needs two taps to confirm; never touches installed clones or current checks)</string>
+    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; never touches installed clones or current checks)</string>
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
@@ -129,8 +129,8 @@
     <string name="policy_write_expanded_announce_capped">Expanded first %2$d of %1$d; over cap, split into batches</string>
     <!-- Stage L4 P2#3 corrupt repair (CCE only, separate from Unavailable blind-clear). -->
     <string name="policy_corrupt_detected">Remote policy is corrupt (type confusion); kept the old snapshot. Clearing requires repair confirmation; blind clear refused. Refresh first if reachable.</string>
-    <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will back up then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>
-    <string name="policy_corrupt_repaired">Repaired the corrupt policy draft (backed up and cleared, now empty)</string>
+    <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will attempt a best-effort backup (may fail; recovery not guaranteed) then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>
+    <string name="policy_corrupt_repaired">Repaired the corrupt policy draft (attempted backup and cleared, now empty; backup not guaranteed)</string>
     <string name="policy_corrupt_repair_failed">Failed to repair the corrupt policy draft; still corrupt. Retry or check the service connection.</string>
     <string name="policy_corrupt_repair_timeout">Repair of the corrupt policy timed out with unknown result; reconciling, do not retry</string>
     <plurals name="batch_create">

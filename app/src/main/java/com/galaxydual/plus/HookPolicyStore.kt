@@ -273,12 +273,13 @@ class HookPolicyStore(
         false
     }
 
-    // Stage L4 P2#3 顯式修復原語（永不 auto-called，僅 VM 修復流程調用）：
-    // best-effort 備份至 dual_policy.bak.<ts>（writable 時，失敗忽略），
-    // remove(KEY).commit()，post-read 驗證 Known(empty)。
+    // Stage L4 P2#3 顯式修復原語（永不 auto-called，僅 VM 修復流程調用；M4 P3）：
+    // best-effort 備份至 dual_policy.bak.<ts>（writable 時；prefs.all 或型別錯亂值
+    // 皆可能拋出，備份僅 best-effort、可能失敗、無法保證可恢復；備份失敗仍繼續
+    // 刪除，不擋修復），remove(KEY).commit()，post-read 驗證 Known(empty)。
     // - ServiceUnavailable：服務缺席（isServiceAvailable false 或 clear 回 false
     //   且當下不可寫）。
-    // - Repaired：clear 成功＋post-read 為 Known(empty)。
+    // - Repaired：clear 成功＋post-read 為 Known(empty)（備份不保證成功）。
     // - RepairFailed：其餘（clear 回 false/拋出、post-read 非空或仍 Unknown/Corrupt）。
     // CE 透傳（取消不得被吞為失敗）。
     fun repairCorrupt(): RepairResult {
@@ -290,7 +291,9 @@ class HookPolicyStore(
             false
         }
         if (!available) return RepairResult.ServiceUnavailable
-        // Best-effort 備份（writable 時）：嘗試讀取原始物件字串化備份，失敗忽略。
+        // Best-effort 備份（writable 時）：嘗試讀取原始物件字串化備份，prefs.all
+        // 或型別錯亂值皆可能拋出；備份僅 best-effort、可能失敗、無法保證可恢復，
+        // 失敗仍繼續刪除（不擋修復）。故損壞修復為破壞性操作，備份不能視為保證。
         // 損壞值經 loadRaw 即拋 CCE，故此處僅能備份可讀值；損壞本體無法經型別
         // 安全通道備份，仍以清除＋驗證為主，備份失敗不擋修復。
         try {
@@ -464,7 +467,8 @@ fun remoteHookPolicyStore(
         },
     ).also { store ->
         // Stage L4 best-effort 備份鉤子：writable 時嘗試將損壞值拷貝至
-        // dual_policy.bak.<ts>，失敗忽略，不擋修復。
+        // dual_policy.bak.<ts>（僅 best-effort：prefs.all 或型別錯亂值可能拋出，
+        // 備份可能失敗、無法保證可恢復；失敗忽略仍刪除，不擋修復）。
         store.setBackupHook { ts ->
             try {
                 val prefs = try { provider() } catch (_: Throwable) { null } ?: return@setBackupHook
