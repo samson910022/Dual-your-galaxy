@@ -834,4 +834,294 @@ class HookPolicyRemoteStoreTest {
         assertTrue(loadResult is LoadResult.Unknown)
     }
 
+    // Stage L2 P2 #4:distinct-store 原子發佈間隙——A/B 共享同 prefs 實例 (樂觀
+    // commit=false,先 flush 污染 mMap 再回 false)。A 的 save 阻塞在 commit 內
+    // (污染已發生、commit 未回、ensure 未到) 時,B 的 loadResult 必須 Unknown
+    // (pre-poison 已在 commit 前發佈,gen 已 bump);放行 A 後 B 仍 Unknown,直到
+    // 成功重同步才回 Known。舊雙原子 (本地先設、全域後加) 在此窗兩次全域檢查皆
+    // 乾淨而誤回 Known(B),單 store barrier 測不到此交錯。
+    @Test
+    fun distinctStoresCommitGapIsFailClosedUntilResync() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = GapCommitPrefs(commitSucceeds = false)
+            val storeA = remoteHookPolicyStore { prefs }
+            val storeB = remoteHookPolicyStore { prefs }
+
+            prefs.armBlock()
+            var saveResult: Boolean? = null
+            val writer = Thread {
+                saveResult = storeA.save(setOf("com.example.B"))
+            }
+            writer.start()
+            assertTrue(prefs.commitEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 間隙:B 必須 Unknown (不可把樂觀 B 誤報 Known)。
+            assertTrue(storeB.loadResult() is LoadResult.Unknown)
+            // 污染確實存在 (證明踩到樂觀快取,而非空鍵)。
+            assertEquals(
+                setOf("com.example.B"),
+                prefs.peekDirect()?.toSet(),
+            )
+
+            prefs.release()
+            writer.join(5_000)
+            assertEquals(false, saveResult)
+            // 放行後仍 Unknown (毒未解),直到成功重同步。
+            assertTrue(storeB.loadResult() is LoadResult.Unknown)
+            assertTrue(storeA.loadResult() is LoadResult.Unknown)
+
+            // 成功重同步後雙方 Known。
+            prefs.commitSucceeds = true
+            assertTrue(storeA.save(setOf("com.example.B")))
+            val ra = storeA.loadResult()
+            assertTrue(ra is LoadResult.Known)
+            assertEquals(setOf("com.example.B"), (ra as LoadResult.Known).packages)
+            val rb = storeB.loadResult()
+            assertTrue(rb is LoadResult.Known)
+            assertEquals(setOf("com.example.B"), (rb as LoadResult.Known).packages)
+        } finally {
+            resetRemotePoisonForTests()
+            poisonPublishHook = null
+        }
+    }
+
+    // Stage L2 clear 反向間隙:成功 clear 的 commit 阻塞時 (pre-poison 已發佈、
+    // clear 未發佈),B 讀必須 Unknown (fail-closed 誤 Unknown 可接受),放行成功後
+    // 才回 Known 空。驗證 token 條件清除不丟失併發毒 (此處無併發失敗,僅驗反向窗)。
+    @Test
+    fun distinctStoresClearReverseGapStaysFailClosed() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = GapCommitPrefs(commitSucceeds = true)
+            val seed = remoteHookPolicyStore { prefs }
+            assertTrue(seed.save(setOf("com.example.keep")))
+            val storeA = remoteHookPolicyStore { prefs }
+            val storeB = remoteHookPolicyStore { prefs }
+
+            prefs.armBlock()
+            var clearResult: Boolean? = null
+            val writer = Thread {
+                clearResult = storeA.clear()
+            }
+            writer.start()
+            assertTrue(prefs.commitEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 反向間隙:樂觀已刪鍵但未確認,必須 Unknown (不可 premature Known 空)。
+            assertTrue(storeB.loadResult() is LoadResult.Unknown)
+
+            prefs.release()
+            writer.join(5_000)
+            assertEquals(true, clearResult)
+            val ra = storeA.loadResult()
+            assertTrue(ra is LoadResult.Known)
+            assertTrue((ra as LoadResult.Known).packages.isEmpty())
+            val rb = storeB.loadResult()
+            assertTrue(rb is LoadResult.Known)
+            assertTrue((rb as LoadResult.Known).packages.isEmpty())
+        } finally {
+            resetRemotePoisonForTests()
+            poisonPublishHook = null
+        }
+    }
+
+    // Stage L2 distinct-store mid-getStringSet 突變丟棄:讀者 A 阻塞在 getStringSet
+    // 內時,寫者 B 失敗污染 (pre+commit flush+ensure,gen 兩次 bump) 並完成;放行 A
+    // 後 A 必須 Unknown (after.gen!=before.gen 或毒命中),且雙方直到重同步皆 Unknown。
+    @Test
+    fun distinctStoresMidReadMutationDiscardedUntilResync() {
+        resetRemotePoisonForTests()
+        try {
+            val readEntered = java.util.concurrent.CountDownLatch(1)
+            val readRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+            var backing: MutableSet<String>? = mutableSetOf("com.seed")
+            var commitSucceeds = false
+            val prefs = object : SharedPreferences {
+                override fun getAll(): MutableMap<String, *> = HashMap<String, Any?>()
+                override fun getString(key: String?, defValue: String?): String? = defValue
+                override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+                    if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) {
+                        readEntered.countDown()
+                        while (!readRelease.get()) {
+                            try {
+                                Thread.sleep(5)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        return backing?.toMutableSet() ?: defValues
+                    }
+                    return defValues
+                }
+                override fun getInt(key: String?, defValue: Int): Int = defValue
+                override fun getLong(key: String?, defValue: Long): Long = defValue
+                override fun getFloat(key: String?, defValue: Float): Float = defValue
+                override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+                override fun contains(key: String?): Boolean =
+                    key == PolicySource.POLICY_KEY_EXTRA_PACKAGES && backing != null
+                override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+                    override fun putString(key: String?, value: String?): SharedPreferences.Editor = this
+                    override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
+                        if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) {
+                            backing = values?.toMutableSet()
+                        }
+                        return this
+                    }
+                    override fun putInt(key: String?, value: Int): SharedPreferences.Editor = this
+                    override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
+                    override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = this
+                    override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
+                    override fun remove(key: String?): SharedPreferences.Editor {
+                        if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) backing = null
+                        return this
+                    }
+                    override fun clear(): SharedPreferences.Editor = this
+                    override fun commit(): Boolean = commitSucceeds
+                    override fun apply(): Unit = Unit
+                }
+                override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+                override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+            }
+            val storeA = remoteHookPolicyStore { prefs }
+            val storeB = remoteHookPolicyStore { prefs }
+
+            var loadResult: LoadResult? = null
+            val reader = Thread {
+                loadResult = storeA.loadResult()
+            }
+            reader.start()
+            assertTrue(readEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 寫者 B 在讀者阻塞期間失敗 (污染 backing 為 B)。
+            assertFalse(storeB.save(setOf("com.example.B")))
+            // 放行讀:即使底層是 B,也必須 Unknown。
+            readRelease.set(true)
+            reader.join(5_000)
+            assertTrue(loadResult is LoadResult.Unknown)
+            assertTrue(storeA.loadResult() is LoadResult.Unknown)
+            assertTrue(storeB.loadResult() is LoadResult.Unknown)
+
+            // 成功重同步後雙方 Known。
+            commitSucceeds = true
+            assertTrue(storeB.save(setOf("com.example.B")))
+            val ra = storeA.loadResult()
+            assertTrue(ra is LoadResult.Known)
+            assertEquals(setOf("com.example.B"), (ra as LoadResult.Known).packages)
+        } finally {
+            resetRemotePoisonForTests()
+            poisonPublishHook = null
+        }
+    }
+
+    // Gap 測試用 prefs:commit 先樂觀 flush 再 (可選) 阻塞,最後回 commitSucceeds。
+    // armBlock()/release() 控制阻塞;peekDirect() 直讀底層驗污染存在。
+    private class GapCommitPrefs(var commitSucceeds: Boolean) : SharedPreferences {
+        private val data = linkedMapOf<String, Any?>()
+        @Volatile var blockCommit = false
+        @Volatile var commitEntered = java.util.concurrent.CountDownLatch(1)
+        private val commitRelease = java.util.concurrent.atomic.AtomicBoolean(true)
+
+        fun armBlock() {
+            commitEntered = java.util.concurrent.CountDownLatch(1)
+            commitRelease.set(false)
+            blockCommit = true
+        }
+
+        fun release() {
+            blockCommit = false
+            commitRelease.set(true)
+        }
+
+        fun peekDirect(): MutableSet<String>? {
+            @Suppress("UNCHECKED_CAST")
+            return (data[PolicySource.POLICY_KEY_EXTRA_PACKAGES] as? MutableSet<String>)
+        }
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(data)
+        override fun getString(key: String?, defValue: String?): String? =
+            if (data[key] is String) data[key] as? String else defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+            @Suppress("UNCHECKED_CAST")
+            val stored = data[key] as? MutableSet<String>
+            return stored ?: defValues
+        }
+        override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            (data[key] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = data.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = GapEditor()
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+
+        private inner class GapEditor : SharedPreferences.Editor {
+            private val pending = linkedMapOf<String, Any?>()
+            private val removed = mutableSetOf<String>()
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+                if (value == null) {
+                    removed.add(key!!)
+                    pending.remove(key)
+                } else {
+                    pending[key!!] = value
+                    removed.remove(key)
+                }
+                return this
+            }
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
+                pending[key!!] = values?.toMutableSet()
+                removed.remove(key)
+                return this
+            }
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun remove(key: String?): SharedPreferences.Editor {
+                removed.add(key!!)
+                pending.remove(key)
+                return this
+            }
+            override fun clear(): SharedPreferences.Editor {
+                removed.addAll(data.keys)
+                pending.clear()
+                return this
+            }
+            override fun commit(): Boolean {
+                // 樂觀更新先行 (與真實 RemotePreferences doUpdate 先於 doCommit 一致)。
+                for (k in removed) data.remove(k)
+                for ((k, v) in pending) data[k] = v
+                pending.clear()
+                removed.clear()
+                if (blockCommit) {
+                    commitEntered.countDown()
+                    while (!commitRelease.get()) {
+                        try {
+                            Thread.sleep(5)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+                return commitSucceeds
+            }
+            override fun apply() = throw UnsupportedOperationException("must use commit")
+        }
+    }
+
 }
