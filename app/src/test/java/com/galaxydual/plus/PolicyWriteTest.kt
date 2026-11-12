@@ -7179,12 +7179,11 @@ class PolicyWriteTest {
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             // Gate B publish at afterClaimBeforeEmit (CAS done, rev bumped, replay no B).
             val entered = java.util.concurrent.CountDownLatch(1)
-            val releaseGate = java.util.concurrent.CountDownLatch(1)
+            val releaseGate = kotlinx.coroutines.CompletableDeferred<Unit>()
             vm1.afterClaimBeforeEmit = {
                 entered.countDown()
-                releaseGate.await(10, java.util.concurrent.TimeUnit.SECONDS)
-                Unit
-            }
+                releaseGate.await()
+                }
             // Release save → backend=B, deferred completes, autoRecheck claims B.
             saveReleaseB.set(true)
             assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
@@ -7216,7 +7215,7 @@ class PolicyWriteTest {
             )
             assertEquals(MsgKind.CHANNEL, vm2.state.value.msgKind)
             // Release B → late B emits; both converge draft==B/Known.
-            releaseGate.countDown()
+            releaseGate.complete(Unit)
             await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
             await(timeoutMs = 20_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
             await(timeoutMs = 10_000L) { vm1.state.value.policyDraftKnown && vm2.state.value.policyDraftKnown }
@@ -8739,6 +8738,288 @@ class PolicyWriteTest {
             assertEquals(stagedR.rev, coord.latest.value?.rev)
             assertEquals(1L, coord.orphanDropGen.get())
             assertEquals(0L, coord.retiredRealCount.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage J4 P1: winner pre-bump survives a rev-spanning init-load
+    // (spanning-load regression, NOT an identity-branch pin).
+    // VM2 is built EARLY, while the winner save is still blocked by saveRelease
+    // (coordinator activeTx == tx, committedRevision not yet bumped), so VM2's
+    // revBeforeInit is guaranteed pre-commit (the old test built VM2 after the
+    // claim win, when rev had already moved, leaving revMoved恒 false and the
+    // wash path vacuous). VM2's load latch then spans the winner's
+    // claim->bump->update->emit->settle terminal, so committedRevision
+    // deterministically moves mid-IO. Despite revMoved, VM2 must still converge
+    // IDLE+Known(B): the winner pre-bump (claim->bump before update) makes the
+    // spanning load discard via the version/ownership fence instead of entering
+    // revMovedInit and washing Known=false (which used to strand IDLE+Unknown
+    // with a SUCCESS msg). VM1 (winner) asserts the terminal; VM2 asserts the
+    // preserved follow.
+    // NOTE: this test does NOT pin the split-snapshot identity branch
+    // (initLocalSnap/initCoordSnap vs _latest own-commit check): VM2 samples
+    // version+rev together pre-commit, so the version fence discards first.
+    // A true split-snapshot pin would require manually interleaving the bump
+    // between the version sample and the rev sample (no Tx + version sampled
+    // post-bump + rev sampled pre-bump); that interleave has no seam today,
+    // so the identity branch is documented, not pinned here.
+    @Test
+    fun j4_winnerBump_survivesConcurrentInitLoad() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm1Store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val loadEntered = java.util.concurrent.CountDownLatch(1)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm2Store = HookPolicyStore(
+            loadRaw = {
+                loadEntered.countDown()
+                while (!loadRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                backend.get()
+            },
+            saveRaw = { raw ->
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(vm1Store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val vBefore = vm1.policyDraftVersionForTests()
+            val revBefore = coord.currentRevision()
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Winner save blocked: Tx in flight, revision not yet bumped.
+            await(timeoutMs = 10_000L) { coordinatorTxOf(coord) != null }
+            assertEquals(revBefore, coord.currentRevision())
+
+            // Build VM2 EARLY (winner still blocked, rev not bumped). Its init
+            // load samples the pre-commit revision and then blocks, spanning
+            // the winner terminal below.
+            val vm2 = makeVm2Direct(vm2Store, coord, policyIoTimeoutMs = 5_000)
+            assertTrue(loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(revBefore, coord.currentRevision())
+
+            // Release the winner: save lands B, claim bumps rev, pre-bump
+            // advances the version triple, terminal publishes IDLE+Known(B).
+            saveRelease.set(true)
+            await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertTrue(vm1.state.value.msg.contains("已寫入政策草稿"))
+            // Revision deterministically moved while VM2's load was in flight.
+            val revAfter = coord.currentRevision()
+            assertTrue(revAfter != revBefore)
+            assertTrue(vm1.policyDraftVersionForTests() > vBefore)
+
+            // VM2 converges via follow while its init load is still blocked.
+            await(timeoutMs = 10_000L) { vm2.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+
+            // Release the spanning load: revMoved is true, but the version fence
+            // (winner pre-bump) discards instead of washing, preserving Known(B).
+            loadRelease.set(true)
+            Thread.sleep(500)
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertNull(activeTxOf(vm1))
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            saveRelease.set(true)
+            loadRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage J4 P1 (symmetric spanning-load regression, NOT an identity-branch
+    // pin): a FOREIGN commit spanning a fresh VM's init IO must still fail
+    // closed (wash Unknown), never apply the mid-IO revision as Known. VM2
+    // samples with no Tx in flight (both snaps null); the foreign winner is
+    // gated after its claim win (rev bumped, version triple not yet, no terminal
+    // emitted yet), so VM2's init sees hasActiveTx==false, version-fence pass,
+    // revMoved==true with a foreign identity => wash Unknown. Asserted while
+    // the winner is still gated (no _latest yet, so no follow race); releasing
+    // the gate then converges both VMs to Known(B).
+    // NOTE: same downgrade as the winner test above — this exercises the
+    // spanning revMoved wash path, not the split-snapshot own-commit identity
+    // branch (which needs version post-bump + rev pre-bump manual interleave).
+    @Test
+    fun j4_initLoad_foreignCommitWashesUnknown() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+        val vm1Store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val loadEntered = java.util.concurrent.CountDownLatch(1)
+        val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm2Store = HookPolicyStore(
+            loadRaw = {
+                loadEntered.countDown()
+                while (!loadRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                backend.get()
+            },
+            saveRaw = { raw ->
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(vm1Store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            assertEquals(setOf("com.A"), vm1.state.value.policyDraft)
+            val revBefore = coord.currentRevision()
+
+            // Fresh VM2 with no Tx in flight; its init load blocks at entry.
+            val vm2 = makeVm2Direct(vm2Store, coord, policyIoTimeoutMs = 5_000)
+            assertTrue(loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(revBefore, coord.currentRevision())
+
+            // Foreign winner B on VM1, gated after the claim win (rev bumped,
+            // version triple pending, terminal not yet emitted).
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val releaseGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+            vm1.afterClaimBeforeEmit = {
+                entered.countDown()
+                releaseGate.await()
+                }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            // Seed the backend so the fast-path save completes synchronously;
+            // the test gates on the claim hook, not on save IO.
+            backend.set(setOf("com.B"))
+                        vm1.confirmPolicyWrite(pendingB)
+                        assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                        assertTrue(coord.currentRevision() != revBefore)
+
+            // Release the spanning init load while the foreign terminal is still
+            // gated (no _latest, version fence passes, revMoved with foreign
+            // identity): must wash Unknown, never apply as Known.
+            loadRelease.set(true)
+            Thread.sleep(800)
+                        assertFalse(vm2.state.value.policyDraftKnown)
+
+            // Release the winner: both VMs converge IDLE+Known(B).
+            releaseGate.complete(Unit)
+            await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            await(timeoutMs = 10_000L) { vm2.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertNull(activeTxOf(vm1))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            loadRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage H2 P1: winner vs loser fence race (autoRecheck vs refresh late-join).
+    // The winner is gated after its claim win; the concurrent refresh late-join
+    // loses and must NOT clear the local fence synchronously (old code CASed it
+    // to null, discarding the winner terminal via its identity gate and
+    // stranding RECONCILING). Assert the fence survives while gated, then the
+    // winner still publishes IDLE+Known(B) with a version bump after release.
+    @Test
+    fun h2_winnerLoserFenceRace_winnerStillIdles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            val vBefore = vm1.policyDraftVersionForTests()
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            // Gate the winner after its claim win, before emit/update/settle.
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val releaseGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+            vm1.afterClaimBeforeEmit = {
+                entered.countDown()
+                releaseGate.await()
+                }
+            saveRelease.set(true)
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+            // Concurrent loser: refresh late-join for the same Tx. It loses the
+            // publish race and must follow (not clear). While the winner is
+            // still gated, the local fence must survive.
+            vm1.refreshPolicyDraft()
+            Thread.sleep(800)
+            assertNotNull(activeTxOf(vm1))
+
+            // Release the winner: terminal must publish (not strand RECONCILING
+            // via a discarded identity gate), with a version bump.
+            releaseGate.complete(Unit)
+            await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertTrue(vm1.state.value.msg.contains("已寫入政策草稿"))
+            assertTrue(vm1.policyDraftVersionForTests() > vBefore)
+            assertNull(activeTxOf(vm1))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(reconcilingKeysOf(vm1).isEmpty())
         } finally {
             try {
                 coord.close()
