@@ -36,13 +36,144 @@ package com.galaxydual.plus
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
-import java.util.concurrent.ConcurrentHashMap
+import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
-// Stage J2 cross-instance poison fence (shared mMap): see below.
-private val remotePoisonedInstances: MutableSet<android.content.SharedPreferences> =
-    java.util.concurrent.ConcurrentHashMap.newKeySet<android.content.SharedPreferences>()
+// Stage L2 atomic poison fence (P2 #4 + P3a):single global AtomicReference<PoisonState>
+// copy-on-write, weak keys, pre-poison seqlock.
+//
+// - 舊碼雙原子 (per-store failedPrefs + 全域強引用 set) 有發佈間隙:markFailed 先設
+//   本地再加全域,兄弟 store 本地 null 可在間隙兩次 isGloballyPoisoned 皆命中前通過,
+//   誤讀樂觀 mMap 為 Known。單 store barrier 測不到 distinct-store 交錯 (Factory
+//   MainActivity 每 ViewModel 新建 remoteHookPolicyStore,跨 store 共享同 prefs
+//   實例合理)。
+// - 新碼單一全域 CAS:mark/ensure/clear 皆為一次 copy-on-write new map+gen+1,
+//   無本地/全域兩步。讀者 seqlock:before=global.get();讀 mMap+快照拷貝;
+//   after=global.get();若 after.gen!=before.gen 或 after 含 prefs 即 Unknown,
+//   丟棄毒讀 (含併發失敗、併發成功清除、mid-getStringSet 突變)。
+// - commit-vs-publish 窗:樂觀污染發生在第三方 commit.flush 內,早於舊 markFailed。
+//   單 CAS 仍留「污染已發生、發佈未到」窗。故 save 採 pre-poison:resolve 後先 CAS
+//   加毒 (gen+1,token=新 gen),再 commit;成功以 token 相等為條件清除 (防 lost-poison:
+//   併發更新 token 更大即不清除),失敗再 ensure 加毒。重疊讀必見 gen 變化或毒而 Unknown
+//   (成功併發的誤 Unknown 為 fail-closed 可接受)。
+// - 弱鍵:WeakPrefKey (identity hash + WeakReference),map 強引 WeakKey、弱引 prefs;
+//   GC 後條目 get()==null,永不命中活讀者 (活讀者必持強引),fresh resolve 重估。
+//   每次寫入 purge stale (filterKeys get()!=null),讀者忽略 stale;無強引用洩漏 (P3a)。
+// - 讀失敗 (含 CCE/暫時 IPC) 即 ensure 加毒後 Unknown (relatch):同實例短路零觸碰,
+//   新身份探讀失敗續閂,皆 fail-closed。成功清除僅 token 相等才刪,避免蓋掉併發新毒。
+// - resolvePrefs 在圍欄外 (provider 缺席未觸 prefs 即無污染可能,不設旗)。
+// - CancellationException 透傳 (取消不得吞為 Unknown/false)。
+internal data class PoisonState(val entries: Map<WeakPrefKey, Long>, val gen: Long)
+
+internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPreferences>(referent) {
+    private val hash = System.identityHashCode(referent)
+    override fun hashCode(): Int = hash
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is WeakPrefKey) return false
+        val a = this.get()
+        val b = other.get()
+        if (a == null || b == null) return false
+        return a === b
+    }
+}
+
+internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
+
+// Injectable publish hook (tests only,生產 null):在每次 CAS 前調用,可供 latch-pause
+// 模擬發佈間隙;生產路徑不依賴 (pre-poison 已關窗)。
+internal var poisonPublishHook: (() -> Unit)? = null
+
+internal fun resetRemotePoisonForTests() {
+    remotePoison.set(PoisonState(emptyMap(), 0))
+}
+
+private fun isPoisoned(state: PoisonState, prefs: SharedPreferences): Boolean = try {
+    state.entries.containsKey(WeakPrefKey(prefs))
+} catch (_: Throwable) {
+    false
+}
+
+// Pre-publish poison before commit (關 commit-vs-publish 窗)。永遠 bump gen 並以新 gen
+// 為 token 覆寫 (即使已毒,亦更新為最新,保证重疊讀見 gen 變化)。回傳 ownToken 供成功清除比對。
+private fun prePoison(prefs: SharedPreferences): Long {
+    while (true) {
+        val cur = remotePoison.get()
+        val purged = if (cur.entries.isEmpty()) {
+            cur.entries
+        } else {
+            try {
+                cur.entries.filterKeys { it.get() != null }
+            } catch (_: Throwable) {
+                cur.entries
+            }
+        }
+        val cleaned = if (purged.isEmpty()) {
+            purged
+        } else {
+            try {
+                purged.filterKeys { it.get() !== prefs }
+            } catch (_: Throwable) {
+                purged
+            }
+        }
+        val newGen = cur.gen + 1
+        val next = try {
+            PoisonState(cleaned + (WeakPrefKey(prefs) to newGen), newGen)
+        } catch (_: Throwable) {
+            return cur.gen
+        }
+        try {
+            poisonPublishHook?.invoke()
+        } catch (_: Throwable) {
+        }
+        if (remotePoison.compareAndSet(cur, next)) return newGen
+    }
+}
+
+private fun ensurePoisoned(prefs: SharedPreferences): Long = prePoison(prefs)
+
+// 僅 token 相等才刪 (防 lost-poison:併發更新 token 更大即有更新毒,不清除)。
+// 已乾淨時若有 stale 即 purge (bump 發佈),否則 no-op 不 bump。
+private fun clearPoison(prefs: SharedPreferences, ownToken: Long): Boolean {
+    while (true) {
+        val cur = remotePoison.get()
+        val curToken: Long? = try {
+            cur.entries[WeakPrefKey(prefs)]
+        } catch (_: Throwable) {
+            null
+        }
+        if (curToken == null) {
+            if (cur.entries.isEmpty()) return true
+            val purged: Map<WeakPrefKey, Long> = try {
+                cur.entries.filterKeys { it.get() != null }
+            } catch (_: Throwable) {
+                return true
+            }
+            if (purged.size == cur.entries.size) return true
+            val next = PoisonState(purged, cur.gen + 1)
+            try {
+                poisonPublishHook?.invoke()
+            } catch (_: Throwable) {
+            }
+            if (remotePoison.compareAndSet(cur, next)) return true
+        } else {
+            if (curToken != ownToken) return false
+            val newMap: Map<WeakPrefKey, Long> = try {
+                cur.entries.filterKeys { val r = it.get(); r != null && r !== prefs }
+            } catch (_: Throwable) {
+                return false
+            }
+            val next = PoisonState(newMap, cur.gen + 1)
+            try {
+                poisonPublishHook?.invoke()
+            } catch (_: Throwable) {
+            }
+            if (remotePoison.compareAndSet(cur, next)) return true
+        }
+    }
+}
 
 // Phase 2 fail-closed 旗標：同實例失敗後不再試探（第 2 層已刪除，見下）。
 // （曾有 REMOTE_POLICY_RETRY_AFTER_MS 同實例超時試探，現已移除以免誤用。）
@@ -127,72 +258,20 @@ class HookPolicyStore(
 // 生產綁定:LSPosed remote preferences (由 GalaxyApp 提供 XposedService)。
 // provider 在每次操作時解析當今 service;service 缺席 (未啟用 LSPosed/尚未
 // binder) 時 load 回空、save/clear 回 false,統一 fail-closed。
-// 樂觀快取 (optimistic-cache) 風險與單原子圍欄:
+// 樂觀快取 (optimistic-cache) 風險與 Stage L2 單原子圍欄 (見上):
 // RemotePreferences.Editor.commit() 先更新行程內 mMap (doUpdate) 再走 binder
 // doCommit;doCommit 可因 RemoteException 回 false,此時 daemon 未落盤但同行程
 // mMap 已被污染——同一 prefs 實例的後續 getStringSet 會讀到未確認的樂觀值，
-// 若直接回 Known 即把「失敗的 save/clear」誤報為已確認。單純每次重解 provider
-// 無法修復 (同一快取實例)。故綁定閉包內以單一 AtomicReference<SharedPreferences?>
-// failedPrefs 追蹤 (null=乾淨，非 null=最後一次失敗的實例；取代舊 needsRefetch+
-// failedPrefs 雙原子，消除 (true,null)/(false,non-null) 撕裂態)：
-// 唯有「已拿到 prefs 實例且 commit 回 false 或 edit/commit 拋出」才標記
-// (含 clear(false));唯有 success commit 才以 CAS 清旗，讀數重新可信。
-// provider() 回 null 或拋出時未觸及任何 prefs 實例 → mMap 不可能被污染，故
-// 不標記、僅回 false；暫時性缺席經 load-only 恢復 (下次 load 直接重解
-// provider,無需先成功寫入)。
-// 圍欄為 per-store-instance，provider 更替後仍保留 (by design，唯有成功 commit
-// 才清除)，以涵蓋「同一快取實例被污染後 provider 重解仍指回它」的情形。
-// Stage J2 新增：
-// - 讀後再驗證 (post-read revalidation)：每次 getStringSet 成功後、回 Known 前
-//   重檢圍欄；若期間併發失敗改寫圍欄（同一或他實例）即回 Unknown，不回毒值。
-//   確保 refetch 成功不贏過併發同實例 failed commit；保存成功清旗僅 CAS 同實例
-//   (compareAndSet(prefs,null))，避免蓋掉併發新失敗。
-// - 跨實例全域毒集合 remotePoisonedInstances：同一 prefs 實例被任一 store 標記後，
-//   全行程所有 store 讀到它皆 Unknown（含從未失敗的 B store），直到成功重同步
-//   移出；解決共享 mMap 下「A 失敗、B 讀毒誤報 Known」。成功即移除，失敗即加入。
-// Phase 2 恢復（僅第 1 層身份穿透；第 2 層同實例超時試探已刪除）：
-// - 同實例 (prefs === failedPrefs) 在圍欄下永回 null/Unknown，直到一次成功
-//   save/clear 清旗；不讀 prefs、不自清（fail-closed 優先，可用性讓位）。
-// - 第 1 層（新身份穿透）為 DEVICE-UNVERIFIED 實驗路徑，生產行為保留穿透但加
-//   讀後圍欄再驗證：新身份 === 比較僅假設「新 binder 即新 mMap」，未經 on-device
-//   證明；若 LSPosed 同 group 永回同一快取實例則此層生產永不命中；若 wrapper
-//   共享底層 mMap 則仍有污染風險，全域毒集合提供第二道防線。詳見 docs/HOOK.md。
-//   TODO(on-device):以真機驗證 daemon 重建後新實例是否重同步權威值、
-//   同 group 是否回同一實例、wrapper 是否共享 mMap；驗證前此層視為實驗。
-// - 探讀失敗永不觸 CCE 自清：探讀內部吞掉所有例外回 null（Unknown），
-//   外層 HookPolicyStore.loadResult 的 CCE 自清只走「無圍欄快照讀」路徑，
-//   避免把有效草稿刪掉。
+// 若直接回 Known 即把「失敗的 save/clear」誤報為已確認。
+// 圍欄為全域單原子 (無 per-store 本地旗,消除本地/全域發佈間隙 P2 #4)。
+// 成功清除僅 token 相等才刪 (防 lost-poison 蓋掉併發新毒);讀者 seqlock 丟棄
+// 任何 gen 變化期間的讀 (含 mid-getStringSet 突變與 clear 反向間隙,皆 fail-closed)。
 // 有意用 commit() 而非 apply():需要同步落盤語意 (寫入/清除後立即一致);
 // 集合僅數十包名,且 DualViewModel 經 onIo (Dispatchers.IO) 呼叫,不阻塞主執行緒。
 @SuppressLint("ApplySharedPref")
 fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
 ): HookPolicyStore {
-    // Stage J2 單原子圍欄：null=乾淨，非 null=最後失敗實例。
-    val failedPrefs = AtomicReference<SharedPreferences?>(null)
-    fun markFailed(prefs: SharedPreferences?) {
-        if (prefs == null) return
-        failedPrefs.set(prefs)
-        try {
-            remotePoisonedInstances.add(prefs)
-        } catch (_: Exception) {
-            // Best effort.
-        }
-    }
-    fun clearForSuccess(prefs: SharedPreferences) {
-        try {
-            remotePoisonedInstances.remove(prefs)
-        } catch (_: Exception) {
-            // Best effort.
-        }
-        // 僅同實例 CAS 清旗，避免蓋掉併發新失敗（不同實例失敗仍保留）。
-        failedPrefs.compareAndSet(prefs, null)
-    }
-    fun isGloballyPoisoned(prefs: SharedPreferences): Boolean = try {
-        remotePoisonedInstances.contains(prefs)
-    } catch (_: Exception) {
-        false
-    }
     fun resolvePrefs(): SharedPreferences? = try {
         provider()
     } catch (ce: CancellationException) {
@@ -201,104 +280,37 @@ fun remoteHookPolicyStore(
         null
     }
     return HookPolicyStore(
-        // 防禦性拷貝由 HookPolicyStore.load 的 sanitizeHookPolicy 統一負責
-        // (複製進新 LinkedHashSet),故此处不再另行 toSet (多餘拷貝且不可測)。
-        // 只包覆 provider() 解析:service/IPC 暫時性失敗 (如 XposedService
-        // .ServiceException) 視為「缺席」-> 回空且「不」觸發 load() 自清,才不會
-        // 刪掉有效草稿;值/型別錯亂 (ClassCastException) 則向上拋,由 load() 統一
-        // 損壞自清 (見 HookPolicyStore.load 註解)。
         loadRaw = {
-            val observed = failedPrefs.get()
-            if (observed == null) {
-                // Phase 4:provider 拋 Throwable (含 Error) 皆視為缺席 -> null
-                // (Unknown,不自清);CancellationException 透傳 (協程取消)。
-                val prefs = resolvePrefs()
-                // null = service/IPC unavailable (LoadResult.Unknown); a non-null
-                // prefs means the key is confirmed, even when it is absent (empty).
-                if (prefs == null) {
-                    null
-                } else if (isGloballyPoisoned(prefs)) {
-                    // J2 跨實例毒：他 store 已標記同一實例，本 store 亦沾黏旗標後
-                    // 短路 Unknown，不讀毒 mMap。
-                    failedPrefs.compareAndSet(null, prefs)
+            // resolve 在圍欄外:provider 缺席未觸 prefs 即無污染可能。
+            // Phase 4:provider 拋 Throwable (含 Error) 皆視為缺席 -> null
+            // (Unknown,不設毒);CancellationException 透傳。
+            val prefs = resolvePrefs()
+            // null = service/IPC unavailable (LoadResult.Unknown);非 null 即
+            // 已連上 service,鍵缺席為確認空 (Known 空),由外層 sanitize 區分。
+            if (prefs == null) {
+                null
+            } else {
+                val before = remotePoison.get()
+                if (isPoisoned(before, prefs)) {
+                    // 已毒短路 Unknown,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
                     null
                 } else {
                     try {
                         val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
                             ?: emptySet()
-                        // J2 讀後再驗證：併發失敗（本地圍欄升起或全域毒新增）即
-                        // 作廢本次讀，回 Unknown，不回毒值。
-                        if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else v
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (cce: ClassCastException) {
-                        // 真損壞才上拋自清；若併發已升旗則吞為 Unknown，免刪有效草稿。
-                        if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else throw cce
-                    } catch (_: Throwable) {
-                        null
-                    }
-                }
-            } else {
-                // 圍欄下：provider 未解出（null/拋出）→ 仍 Unknown，不碰圍欄。
-                val prefs = resolvePrefs()
-                if (prefs == null) {
-                    null
-                } else if (prefs === observed) {
-                    // 同實例：原則永回 Unknown；但若全域已解毒（他 store 同實例成功
-                    // 重同步），則跟隨解毒（CAS 清旗後當乾淨讀，讀後仍再驗證）。
-                    if (!isGloballyPoisoned(prefs)) {
-                        failedPrefs.compareAndSet(observed, null)
-                        try {
-                            val v2 = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet()) ?: emptySet()
-                            if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else v2
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (cce: ClassCastException) {
-                            if (failedPrefs.get() != null || isGloballyPoisoned(prefs)) null else throw cce
-                        } catch (_: Throwable) {
-                            null
-                        }
-                    } else null
-                } else if (isGloballyPoisoned(prefs)) {
-                    // 新身份但全域已毒（他 store 失敗過）：續閂到當今實例，不讀。
-                    try {
-                        failedPrefs.set(prefs)
-                    } catch (_: Exception) {
-                    }
-                    null
-                } else {
-                    // 新身份穿透（DEVICE-UNVERIFIED 實驗路徑，見上）＋讀後再驗證：
-                    // 成功（含確認空）且圍欄未變才 CAS 清旗回 Known；圍欄併發改變
-                    // 即 Unknown；失敗仍 Unknown 且續閂到當今實例；一律吞掉回 null，
-                    // 永不觸 CCE 自清。
-                    try {
-                        val v = prefs.getStringSet(
-                            PolicySource.POLICY_KEY_EXTRA_PACKAGES,
-                            emptySet(),
-                        ) ?: emptySet()
-                        val cur = failedPrefs.get()
-                        if (cur !== observed) {
-                            // 期間圍欄改變：併發成功已清旗 (null) 且無全域毒才可信，
-                            // 否則（併發新失敗）一律 Unknown。
-                            if (cur == null && !isGloballyPoisoned(prefs)) v else null
-                        } else if (isGloballyPoisoned(prefs)) {
-                            try {
-                                failedPrefs.set(prefs)
-                            } catch (_: Exception) {
-                            }
-                            null
-                        } else {
-                            if (failedPrefs.compareAndSet(observed, null)) v else null
-                        }
+                        // 快照拷貝後再驗證:併發 pre/ensure/clear 任一 bump 即丟棄,
+                        // 含 mid-getStringSet 突變 (拷貝期 CME 即 catch 轉 Unknown)。
+                        val snap = v.toSet()
+                        val after = remotePoison.get()
+                        if (after.gen != before.gen || isPoisoned(after, prefs)) null else snap
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {
+                        // 探讀失敗 (CCE 型別損壞或暫時 IPC) 即加毒 relatch 後 Unknown,
+                        // 永不拋出觸自清 (J3 已無自清,此處統一吞為 Unknown 並沾毒,
+                        // 保證同實例短路、跨實例共毒 fail-closed)。
                         try {
-                            failedPrefs.set(prefs)
-                        } catch (_: Exception) {
-                        }
-                        try {
-                            remotePoisonedInstances.add(prefs)
+                            ensurePoisoned(prefs)
                         } catch (_: Exception) {
                         }
                         null
@@ -308,12 +320,14 @@ fun remoteHookPolicyStore(
         },
         saveRaw = { raw ->
             // provider 解析失敗 = 未觸及任何 prefs 實例 → 無 mMap 污染可能，
-            // 不設圍欄、僅回 false (暫時性缺席經 load-only 恢復)。
+            // 不設毒、僅回 false (暫時性缺席經 load-only 恢復)。
             // Phase 4:含 Error 皆 fail-closed;取消透傳。
             val prefs: SharedPreferences? = resolvePrefs()
             if (prefs == null) {
                 false
             } else {
+                // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
+                val ownToken = prePoison(prefs)
                 try {
                     val ok: Boolean = if (raw == null) {
                         prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES).commit()
@@ -321,16 +335,29 @@ fun remoteHookPolicyStore(
                         prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
                             .commit()
                     }
-                    if (ok) clearForSuccess(prefs) else markFailed(prefs)
+                    if (ok) {
+                        clearPoison(prefs, ownToken)
+                    } else {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
+                    }
                     ok
                 } catch (ce: CancellationException) {
-                    markFailed(prefs)
+                    try {
+                        ensurePoisoned(prefs)
+                    } catch (_: Exception) {
+                    }
                     throw ce
                 } catch (e: Throwable) {
                     // 已拿到實例後的 edit/commit 拋出 (如 binder RemoteException
-                    // 或 Error):樂觀更新可能已污染 mMap，標記後重拋由
+                    // 或 Error):樂觀更新可能已污染 mMap，加毒後重拋由
                     // HookPolicyStore.save/clear 統一轉 false (取消除外)。
-                    markFailed(prefs)
+                    try {
+                        ensurePoisoned(prefs)
+                    } catch (_: Exception) {
+                    }
                     throw e
                 }
             }
