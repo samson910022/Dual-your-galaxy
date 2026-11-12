@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 // Stage H2 (P2#3#4)：敗者同步 settled 終態廣播。
@@ -64,6 +65,109 @@ class PolicyTxCoordinator {
     // - finally 只解鎖（best effort），不清除 activeTx（僅 settle 清；見
     //   DualViewModel confirm/clear「finally 不碰 coordinator」）。
     val writeMutex = Mutex()
+
+    // Stage L1 P1: commit revision + staged publish (CAS visible before event).
+    // - committedRevision: completed-publish monotonic revision (bumped atomically
+    //   with activeTx(tx->null) inside commitMutex). Pre-IO gate compares
+    //   pending.baseCoordinatorRevision against this (authoritative, not VM-local
+    //   baseDraftVersion alone), so a CAS that has not yet emitted still blocks
+    //   a fresh C (pendingPublish!=null-or-self or revision mismatch).
+    // - pendingPublish: staged but not yet emitted payload (set under commitMutex,
+    //   cleared after emit leaves replayCache). Gate drains union
+    //   replayCache + pendingPublish, so collector lag cannot hide B.
+    // - Lock order: opMutex->policyRevisionMutex->commitMutex->writeMutex leaf;
+    //   never emit while holding mutex (stage under lock, emit after release).
+    val commitMutex = Mutex()
+    val committedRevision = AtomicLong(0L)
+    val pendingPublish = AtomicReference<PolicySettled?>(null)
+
+    fun currentRevision(): Long = try {
+        committedRevision.get()
+    } catch (_: Exception) {
+        0L
+    }
+
+    suspend fun <T> withCommitLock(block: suspend () -> T): T = commitMutex.withLock { block() }
+
+    // Stage L1 P1: atomic complete (CAS + revision bump + stage) under commitMutex.
+    // Returns true=winner (staged, caller must invoke afterClaimBeforeEmit hook
+    // then emit after unlock); false=loser (no stage, no bump).
+    suspend fun completeWithRevision(tx: DualViewModel.PolicyTx, payload: PolicySettled): Boolean {
+        var ok = false
+        commitMutex.withLock {
+            try {
+                if (activeTx.compareAndSet(tx, null)) {
+                    committedRevision.incrementAndGet()
+                    pendingPublish.set(payload)
+                    ok = true
+                }
+            } catch (_: Exception) {
+                ok = false
+            }
+        }
+        return ok
+    }
+
+    // Stage L1 P1: atomic pre-IO claim (Busy/Stale/claimed) under commitMutex.
+    // - Busy: activeTx!=null (in-flight or staged fence).
+    // - Stale: committedRevision!=expectedBaseRev (unseen B).
+    // - expectedBaseRev==-1L (legacy injection) skips revision check.
+    enum class ClaimWriteResult { CLAIMED, BUSY, STALE }
+
+    suspend fun tryClaimWrite(tx: DualViewModel.PolicyTx, expectedBaseRev: Long): ClaimWriteResult {
+        var res: ClaimWriteResult = ClaimWriteResult.BUSY
+        commitMutex.withLock {
+            try {
+                if (activeTx.get() != null) {
+                    res = ClaimWriteResult.BUSY
+                } else if (expectedBaseRev != -1L && committedRevision.get() != expectedBaseRev) {
+                    res = ClaimWriteResult.STALE
+                } else {
+                    activeTx.set(tx)
+                    res = ClaimWriteResult.CLAIMED
+                }
+            } catch (_: Exception) {
+                res = ClaimWriteResult.BUSY
+            }
+        }
+        return res
+    }
+
+    // Stage L1 P1: staged emit (call after commitMutex released).
+    // tryEmit hit -> clear pending (replayCache now carries it, union still sees it);
+    // buffer-full -> keep pending until async emit lands, then clear.
+    fun emitStaged(payload: PolicySettled) {
+        try {
+            if (tryEmitSettled(payload)) {
+                try {
+                    pendingPublish.compareAndSet(payload, null)
+                } catch (_: Exception) {
+                }
+                return
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            scope.launch {
+                try {
+                    withTimeoutOrNull(2_000L) { _settled.emit(payload) }
+                } catch (_: Exception) {
+                }
+                try {
+                    pendingPublish.compareAndSet(payload, null)
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun clearPendingPublish(payload: PolicySettled) {
+        try {
+            pendingPublish.compareAndSet(payload, null)
+        } catch (_: Exception) {
+        }
+    }
 
     // Stage H2 settled 廣播：勝者終態（IDLE+draft/Known/msg）replay=8。
     // 勝者在 tryClaim 成功後、settle 前 tryEmit；敗者以有界 withTimeout 訂閱
@@ -129,6 +233,14 @@ class PolicyTxCoordinator {
         activeTx.set(null)
         globalTxId.set(0L)
         try {
+            committedRevision.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            pendingPublish.set(null)
+        } catch (_: Exception) {
+        }
+        try {
             _settled.resetReplayCache()
         } catch (_: Exception) {
             // Best effort.
@@ -136,6 +248,13 @@ class PolicyTxCoordinator {
         try {
             while (writeMutex.isLocked) {
                 writeMutex.unlock()
+            }
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        try {
+            while (commitMutex.isLocked) {
+                commitMutex.unlock()
             }
         } catch (_: Exception) {
             // Best effort.
