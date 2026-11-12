@@ -184,4 +184,102 @@ class PolicyRefreshGateTest {
             executor.shutdownNow()
         }
     }
+
+    // M4 P2#6 fix: timed half-open retry without any invalidate signal (no
+    // cross-process push on API 102.0.0). 3 timeouts trip the breaker; the
+    // upstream then recovers silently; after the cooldown ONE bounded probe
+    // must succeed and close the breaker (no manual invalidate).
+    @Test
+    fun halfOpenProbeRecoversWithoutInvalidate() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-halfopen")
+        try {
+            val clock = AtomicLong(0L)
+            val gate = PolicyRefreshGate(
+                executor = executor,
+                nowMs = { clock.get() },
+                maxConsecutiveTimeouts = 3,
+                halfOpenInitialMs = 200L,
+                halfOpenMaxMs = 1_000L,
+            )
+            repeat(3) {
+                val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+                assertNull(r)
+                Thread.sleep(600)
+            }
+            assertTrue("breaker must be open after 3 consecutive timeouts", gate.isStuck())
+            assertEquals(0L, gate.halfOpenProbes.get())
+            // Cooldown not elapsed: short-circuit, no probe submitted.
+            val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
+            assertNull(shorted)
+            assertEquals("no probe before cooldown", 0L, gate.halfOpenProbes.get())
+            assertTrue(gate.isStuck())
+            // Worker drained (600ms sleeps > 500ms stalls) + cooldown elapsed:
+            // the next read is the single bounded probe — upstream has
+            // recovered, so it succeeds and closes the breaker.
+            clock.addAndGet(300L)
+            assertEquals(0, gate.activeCount())
+            val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
+            assertEquals(setOf("ok"), good)
+            assertEquals("exactly one half-open probe", 1L, gate.halfOpenProbes.get())
+            assertFalse("probe success must close the breaker", gate.isStuck())
+            assertEquals(0L, gate.consecutiveTimeouts.get())
+            assertEquals(0L, gate.halfOpenFailureCount())
+            assertEquals(0, gate.queueDepth())
+            assertEquals(1, gate.outstandingPermitsAvailable())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    // Half-open backoff: a failed probe re-opens + doubles the cooldown; the
+    // next read inside the new window short-circuits without probing; after
+    // the longer cooldown a probe succeeds.
+    @Test
+    fun halfOpenProbeFailBacksOffThenRecovers() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-backoff")
+        try {
+            val clock = AtomicLong(0L)
+            val gate = PolicyRefreshGate(
+                executor = executor,
+                nowMs = { clock.get() },
+                maxConsecutiveTimeouts = 3,
+                halfOpenInitialMs = 200L,
+                halfOpenMaxMs = 1_000L,
+            )
+            repeat(3) {
+                val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+                assertNull(r)
+                Thread.sleep(600)
+            }
+            assertTrue(gate.isStuck())
+            assertEquals(200L, gate.halfOpenCooldownMs())
+            // First probe after cooldown still sees a stuck upstream: it
+            // times out, stays open, and backs off to 400ms.
+            clock.addAndGet(300L)
+            val failedProbe = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+            assertNull(failedProbe)
+            Thread.sleep(600)
+            assertTrue("failed probe must keep the breaker open", gate.isStuck())
+            assertEquals(1L, gate.halfOpenProbes.get())
+            assertEquals(1L, gate.halfOpenFailureCount())
+            assertEquals("cooldown must double after probe fail", 400L, gate.halfOpenCooldownMs())
+            // Inside the new 400ms window: short-circuit, no second probe.
+            clock.addAndGet(100L)
+            val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
+            assertNull(shorted)
+            assertEquals("no probe inside backoff window", 1L, gate.halfOpenProbes.get())
+            // Past the backoff window with a recovered upstream: probe
+            // succeeds and resets backoff to the initial cooldown.
+            clock.addAndGet(400L)
+            assertEquals(0, gate.activeCount())
+            val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
+            assertEquals(setOf("ok"), good)
+            assertEquals(2L, gate.halfOpenProbes.get())
+            assertFalse(gate.isStuck())
+            assertEquals(0L, gate.halfOpenFailureCount())
+            assertEquals(200L, gate.halfOpenCooldownMs())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
 }
