@@ -43,6 +43,11 @@ enum class ChannelPreference {
 }
 
 // Gateway actually built for a preference after Auto resolution.
+// - NOOP is the fail-closed read-only fallback gateway (never a menu entry).
+// - LSPOSED_PLACEHOLDER is the explicit-LSPosed resolution: intentionally a
+//   NoOp as well (not a second gateway kind). Both build NoOpGateway today;
+//   they differ only in reason metadata (placeholder vs no-channel), so the
+//   ViewModel can refuse writes with the accurate copy. See buildGatewayForChannel.
 enum class ResolvedChannel {
     ROOT,
     SHIZUKU,
@@ -176,8 +181,10 @@ fun resolveAutoProbe(
 // placeholder, F4b-P2): the placeholder must never be mistaken for an
 // executable channel -- DualViewModel refuses writes under it with the reason
 // stated.
-// TODO(hook-channel): return the real LSPosed hook gateway for
-// LSPOSED_PLACEHOLDER once the hook execution channel is verified on-device.
+// Intentionally NoOp (no hook-channel TODO kept): returning a real LSPosed
+// hook gateway for LSPOSED_PLACEHOLDER requires on-device verification of the
+// execution channel (see docs/HOOK.md); until then this stays NoOp by design,
+// not by omission.
 fun buildGatewayForChannel(channel: ResolvedChannel, packageName: String): CmdGateway =
     when (channel) {
         ResolvedChannel.ROOT -> SuCmdGateway()
@@ -217,8 +224,8 @@ fun assembleChannel(
         ResolvedChannel.SHIZUKU -> shizukuGateway
         // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only); the
         // whitelist policy source is wired (end-to-end DEVICE-UNVERIFIED) but
-        // the LSPosed execution channel remains a NoOp placeholder. See TODO
-        // above.
+        // the LSPosed execution channel remains an intentionally-NoOp
+        // placeholder (see buildGatewayForChannel above).
         ResolvedChannel.NOOP,
         ResolvedChannel.LSPOSED_PLACEHOLDER,
         -> NoOpGateway()

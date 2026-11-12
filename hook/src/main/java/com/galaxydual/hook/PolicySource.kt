@@ -25,6 +25,11 @@ object PolicySource {
     val STATIC_SEED: Set<String> = emptySet()
 
     // Code gate for non-empty effective policy. Remains false until HOOK.md §1.4 hard gate is satisfied with device evidence (signatures/returns, hook-install counts, callback hits, user/profile/install-state, controlled empty vs non-empty). This is a code gate only, not device verification.
+    // Phase4 note: compile-time constant — flipping it requires a source change
+    // + recompile; there is NO runtime switch/flag/remote kill-switch that can
+    // open the gate on a shipped build. Single source of truth for TTL/budget
+    // numbers paired with this gate is docs/USAGE.md §政策 TTL 對照 (App 5min /
+    // hook cache 60s / failure-cooldown 5s).
     const val NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = false
 
     // Remote policy prefs group/key, single-sourced here and referenced by the
@@ -33,7 +38,7 @@ object PolicySource {
     const val POLICY_PREFS_NAME = "dual_policy"
     const val POLICY_KEY_EXTRA_PACKAGES = "extra_whitelist_packages"
 
-    // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 nullable).
+    // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 hardened).
     //
     // Default is empty (observe-only). DualHook wires a RemotePreferences-backed
     // reader that returns null on a failed read (NOT empty: null preserves the
@@ -43,10 +48,13 @@ object PolicySource {
     // The reader MAY return unsanitized tokens (remotePolicySnapshot()
     // sanitizes); it MUST be assumed fallible -- null or any Throwable
     // (including Error) fails closed to empty inside remotePolicySnapshot().
-    // Tests that mutate this must restore the previous value (see
-    // PolicySourceTest @Before/@After global restore plus per-test try/finally).
+    // Phase4 visibility: module-internal (VisibleForTesting discipline without
+    // a new annotation dependency in :hook). Production assigns this exactly
+    // once at hook init (DualHook wiring below); external modules (app) never
+    // touch it. Tests mutate ONLY via save/restore (see PolicySourceTest
+    // @Before/@After global restore plus per-test try/finally).
     @Volatile
-    var remotePolicyReader: () -> Set<String>? = { emptySet() }
+    internal var remotePolicyReader: () -> Set<String>? = { emptySet() }
 
     fun isValidPackage(pkg: String): Boolean =
         pkg.isNotEmpty() && PKG.matches(pkg)

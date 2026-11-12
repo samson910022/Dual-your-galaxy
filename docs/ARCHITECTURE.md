@@ -164,7 +164,6 @@ val privilege: Privilege = when {
    `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
 
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
-
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
 - Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例，寫入側版本序號＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活，後續全 `BUSY`，由 `refreshPolicyDraft` late-join 結清回 `IDLE`）；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
@@ -172,6 +171,18 @@ val privilege: Privilege = when {
 - Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。
 - 跨 VM（Stage G2）：`PolicyTxCoordinator` App-scoped（`GalaxyApp` 單例），`activeTx` 跨 VM 唯一真相；Tx 攜 pending，新 VM init 認領（繼承 fence＋`RECONCILING`＋Unknown＋reconciler join 同一 deferred）；`deferred.invokeOnCompletion` 單次 auto-recheck（有界獨立池，不耗 reconciler 預算，Unknown→unresolved 待手動 `refreshPolicyDraft` late-join）；終態 `tryClaimCoordinatorPublish` CAS 勝者發布；reconciler 總預算 15 秒，超限誠實 unresolved 滯留待 late-join。
 - 完整語義（pending 世代、TTL、fence、blind-clear 二次確認〈僅 Unavailable 瞬斷：TTL＋世代＋disarm，Corrupt 走修復流程〉）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒、reconciler 總預算 15 秒、auto-recheck 單次 vs hook 側快取 60 秒／失敗節流 5 秒）。
+
+### Poison 封裝（remote prefs 樂觀值隔離，`HookPolicyStore` 內部狀態）
+
+- 封裝：`remotePoison: AtomicReference<PoisonState(entries, gen, overflow)>`（copy-on-write，全域單例，弱鍵；`internal` 僅測試可見，VM 經 `loadResult/loadForRepair/repairCorrupt` 間接使用，不直觸狀態）。
+- 證據：`remoteCorruptEvidence: AtomicReference<Map<WeakPrefKey, CorruptEvidence>>`（per-instance CCE 診斷，first-wins；與 poison fence 並存，不替代）。
+- 狀態表（set/cleared 條件）：
+  | 狀態 | 寫入條件 | 清除條件 |
+  |---|---|---|
+  | poison fence（某 prefs 加毒） | `prePoison`（save/commit 前，先加毒 gen+1 再 commit）／CCE 讀命中 `ensurePoisoned` | 成功 save/clear 以 token 相等 `clearPoison`（防 lost-poison：併發新毒 token 更大即不清除）；Verified Known 讀（unpoisoned 成功讀） |
+  | corrupt evidence（某 instance 腐壞） | `loadResult` 捕獲 CCE → `recordCorruptEvidence`（first-wins） | Verified Known（unpoisoned 成功讀 `clearCorruptEvidence`）或成功修復；transient 失敗保留舊證據 |
+  | overflow 閂 | 任一表達 bound（`POISON_MAX_ENTRIES`／`EVIDENCE_MAX_ENTRIES`）採 drop-new＋閂鎖＋`poisonEvictCount/evidenceEvictCount` 可觀測 | 永不自動清除（重啟重置；見 `resetRemotePoisonForTests` 測試重置） |
+- TTL/真相單一來源：`docs/USAGE.md` §政策 TTL 對照為準（App 側 5 分鐘／IO 10 秒／reconciler 15 秒；hook 側快取 60 秒／失敗節流 5 秒；單調時鐘）。
 
 ## Non-Goals
 

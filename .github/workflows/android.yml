@@ -305,6 +305,11 @@ jobs:
           echo "merged manifest: $MERGED"
           # Exact attribute values, not a bare FQN substring: the merged manifest
           # must carry the guard provider at the debug-suffixed authority.
+          # NOTE (debug-only): this parity gate asserts the DEBUG variant
+          # authority (com.galaxydual.plus.debug.XposedService). The release
+          # authority differs by applicationId suffix; the invariant (exactly
+          # one GuardXposedProvider, zero libxposed XposedProvider) holds for
+          # every variant, only the literal below is debug-specific.
           grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
           grep -F 'android:authorities="com.galaxydual.plus.debug.XposedService"' "$MERGED"
           if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
