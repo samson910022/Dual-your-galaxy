@@ -93,6 +93,12 @@ class PolicyTxCoordinator {
     val commitMutex = Mutex()
     val committedRevision = AtomicLong(0L)
     val pendingPublish = AtomicReference<PolicySettled?>(null)
+    // Stage M3 (P2#5 orphan fence): staged-at wall clock for stale-placeholder
+    // finalizer. Set atomically with pendingPublish under commitMutex (same
+    // critical section); read under the same lock by pre-IO gates. 0 = never
+    // staged (legacy / cleared). System.currentTimeMillis matches the VM-side
+    // recovery clock (same source, no injectable skew).
+    val pendingPublishAtMs = AtomicLong(0L)
 
     // Stage L3 lossless 真相：永為最新終態（無逐出，晚訂閱收斂最新；gap 經 rev
     // 檢出）。僅終態（real）寫入，placeholder（claim fence）不寫入，免 Unknown
@@ -137,6 +143,8 @@ class PolicyTxCoordinator {
                         payload
                     }
                     pendingPublish.set(stamped)
+                    // Stage M3: stamp fence time with the payload (same lock).
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
                     ok = true
                 }
             } catch (_: Exception) {
@@ -145,6 +153,66 @@ class PolicyTxCoordinator {
         }
         return ok
     }
+
+    // Stage M3 (P2#5 orphan fence): coordinator-scoped finalizer. If pending
+    // belongs to a dead owner (activeTx is null or holds a different Tx) and its
+    // age exceeds staleThresholdMs, promote-or-clear atomically:
+    // - real terminal (known or non-empty msg) -> publish to _latest (monotonic)
+    //   then clear pending (lossless, followers converge via _latest);
+    // - placeholder fence (Unknown + empty msg, claim-only, never terminal) ->
+    //   drop without touching _latest (no truth lost, rev gap is counted).
+    // Returns the recovered payload, or null when nothing stale (in-flight fresh
+    // fence, owner still active, or no pending). Caller holds commitMutex
+    // (pre-IO gates call this inside withCommitLock); suspend wrapper below
+    // acquires the lock for out-of-gate callers/tests.
+    fun recoverStalePendingLocked(nowMs: Long, staleThresholdMs: Long): PolicySettled? {
+        try {
+            val cur = try { pendingPublish.get() } catch (_: Exception) { null } ?: return null
+            val active = try { activeTx.get() } catch (_: Exception) { null }
+            // Owner still active (pending belongs to the live Tx) -> in-flight, keep.
+            if (active != null && active.txId == cur.txId && active.key == cur.key) return null
+            val stagedAt = try { pendingPublishAtMs.get() } catch (_: Exception) { 0L }
+            if (stagedAt == 0L) return null
+            if (nowMs - stagedAt < staleThresholdMs) return null
+            val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
+            if (!isPlaceholder) {
+                try {
+                    val latestCur = try { _latest.value } catch (_: Exception) { null }
+                    if (latestCur == null || cur.rev == -1L || latestCur.rev == -1L ||
+                        cur.rev >= latestCur.rev
+                    ) {
+                        try { _latest.value = cur } catch (_: Exception) { }
+                    } else {
+                        emitSuperseded.incrementAndGet()
+                        logCoord(
+                            "recover superseded txId=${cur.txId} rev=${cur.rev} " +
+                                "behind latest rev=${latestCur.rev} txId=${latestCur.txId}",
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+                logCoord(
+                    "recover stale real pending txId=${cur.txId} rev=${cur.rev} " +
+                        "ageMs=${nowMs - stagedAt} (promoted to latest)",
+                )
+            } else {
+                logCoord(
+                    "recover stale placeholder txId=${cur.txId} rev=${cur.rev} " +
+                        "ageMs=${nowMs - stagedAt} (dropped, no truth)",
+                )
+            }
+            return if (try { pendingPublish.compareAndSet(cur, null) } catch (_: Exception) { false }) {
+                cur
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    suspend fun tryRecoverStalePending(nowMs: Long, staleThresholdMs: Long): PolicySettled? =
+        commitMutex.withLock { recoverStalePendingLocked(nowMs, staleThresholdMs) }
 
     // Stage L3: stage terminal payload (preserve claim rev, update _latest
     // monotonically). Call after commitMutex released? No — this takes the lock
@@ -165,6 +233,8 @@ class PolicyTxCoordinator {
                         payload
                     }
                     pendingPublish.set(stamped)
+                    // Stage M3: refresh fence time on overwrite (same lock).
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
                     val latestCur = try { _latest.value } catch (_: Exception) { null }
                     if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L ||
                         stamped.rev >= latestCur.rev
@@ -185,6 +255,7 @@ class PolicyTxCoordinator {
                     } catch (_: Exception) { -1L }
                     val stamped = try { payload.copy(rev = rev) } catch (_: Exception) { payload }
                     pendingPublish.set(stamped)
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
                     val latestCur = try { _latest.value } catch (_: Exception) { null }
                     if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L ||
                         stamped.rev >= latestCur.rev
@@ -513,6 +584,10 @@ class PolicyTxCoordinator {
         }
         try {
             pendingPublish.set(null)
+        } catch (_: Exception) {
+        }
+        try {
+            pendingPublishAtMs.set(0L)
         } catch (_: Exception) {
         }
         try {
