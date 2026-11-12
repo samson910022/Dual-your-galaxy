@@ -6905,6 +6905,7 @@ private class DualViewModelFactory(
                         PolicyTextKind.CORRUPT_REPAIR_FIRST -> res.getString(R.string.policy_corrupt_repair_first)
                         PolicyTextKind.CORRUPT_REPAIRED -> res.getString(R.string.policy_corrupt_repaired)
                         PolicyTextKind.CORRUPT_REPAIR_FAILED -> res.getString(R.string.policy_corrupt_repair_failed)
+                        PolicyTextKind.CORRUPT_REPAIR_TIMEOUT -> res.getString(R.string.policy_corrupt_repair_timeout)
                         PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
                         PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
                         PolicyTextKind.UNRESOLVED_REFRESH -> res.getString(R.string.policy_unresolved_refresh)

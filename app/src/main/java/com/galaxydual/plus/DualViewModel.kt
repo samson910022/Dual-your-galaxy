@@ -1910,7 +1910,7 @@ class DualViewModel(
                     else cur.copy(
                         policyWritePhase = PolicyWritePhase.RECONCILING,
                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                         msg = policyText(PolicyText(PolicyTextKind.UNRESOLVED_REFRESH)),
                         msgKind = MsgKind.CHANNEL,
                     )
@@ -2384,10 +2384,13 @@ class DualViewModel(
                         policyWritePhase = PolicyWritePhase.RECONCILING,
                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                         loading = false,
                         msg = policyText(
-                            PolicyText(if (tx.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT),
+                            PolicyText(
+                                if (tx.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
+                                else if (tx.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
+                            ),
                         ),
                         msgKind = MsgKind.CHANNEL,
                     )
@@ -5610,6 +5613,7 @@ class DualViewModel(
                                         }
                                     } else {
                                         disarmBlindClear()
+                                        if (tx.isRepair) disarmCorruptRepair()
                                         _state.update { cur ->
                                             cur.copy(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
@@ -5617,7 +5621,7 @@ class DualViewModel(
                                                 policyDraft = emptySet(),
                                                 policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
                                                 msgKind = MsgKind.INFO,
                                             )
                                         }
@@ -5652,8 +5656,8 @@ class DualViewModel(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                 policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                        policyDraftCorrupt = tx.isRepair,
+                                                msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)) else policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
                                                 msgKind = MsgKind.FAILED,
                                             )
                                         }
@@ -5733,8 +5737,8 @@ class DualViewModel(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                        policyDraftCorrupt = tx.isRepair,
+                                        msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)) else policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
                                         msgKind = MsgKind.FAILED,
                                     )
                                 }
@@ -5781,18 +5785,23 @@ class DualViewModel(
                                     when (settleDecision) {
                                         is PolicyTxSettle.Success -> {
                                             disarmBlindClear()
+                                            if (tx.isRepair) disarmCorruptRepair()
                                             cur.copy(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                 policyDraft = emptySet(),
                                                 policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
                                                 msgKind = MsgKind.INFO,
                                             )
                                         }
                                         is PolicyTxSettle.Mismatch -> {
                                             disarmBlindClear()
+                                            // Stage M2 P2#3: repair mismatch = backend
+                                            // readable non-empty (corruption gone);
+                                            // honest REFRESHED stands, disarm repair.
+                                            if (tx.isRepair) disarmCorruptRepair()
                                             cur.copy(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -5821,8 +5830,8 @@ class DualViewModel(
                                                     policyWritePhase = PolicyWritePhase.IDLE,
                                                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                     policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                                                    msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                                        policyDraftCorrupt = tx.isRepair,
+                                                    msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)) else policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
                                                     msgKind = MsgKind.FAILED,
                                                 )
                                             }
@@ -5832,7 +5841,7 @@ class DualViewModel(
                                             cur.copy(
                                                 policyWritePhase = PolicyWritePhase.RECONCILING,
                                                 policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                                                 msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                                                 msgKind = MsgKind.CHANNEL,
                                             )
@@ -5855,7 +5864,7 @@ class DualViewModel(
                                         cur.copy(
                                             policyWritePhase = PolicyWritePhase.RECONCILING,
                                             policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                                             msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                                             msgKind = MsgKind.CHANNEL,
                                         )
@@ -5865,7 +5874,7 @@ class DualViewModel(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                                         msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
@@ -5903,7 +5912,7 @@ class DualViewModel(
                             cur.copy(
                                 policyWritePhase = PolicyWritePhase.RECONCILING,
                                 policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        policyDraftCorrupt = tx.isRepair,
                                 msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                                 msgKind = MsgKind.CHANNEL,
                             )
@@ -8608,10 +8617,11 @@ class DualViewModel(
         }
         viewModelScope.launch {
             // Stage M1 P1: repair is a first-class destructive PolicyTx (same
-            // fencing as save/clear). handoverTx stays null (no RECONCILING
-            // handover: timeout maps to FAILED like the pre-M1 path, still fenced
-            // via claim/emit/settle); writeLocked tracks the app-scoped single
+            // fencing as save/clear). Stage M2 P2#3: timeout hands over like
+            // save/clear (RECONCILING + handoverTx + reconciler, never settle
+            // on unknown); writeLocked tracks the app-scoped single
             // writer; preClaimTx tracks the claimed Tx for rollback/emit/settle.
+            var handoverTx: PolicyTx? = null
             var writeLocked = false
             var preClaimTx: PolicyTx? = null
             try {
@@ -9103,40 +9113,48 @@ class DualViewModel(
                             false
                         }
                         if (ok == null) {
-                            // Timeout: result unknown. Pre-M1 mapped to FAILED;
-                            // keep FAILED (no new RECONCILING path for repair) but
-                            // fenced via claim/emit/settle like save/clear failure.
-                            val pcTimeout = preClaimTx
-                            if (pcTimeout != null && !claimForPublish(pcTimeout)) {
-                                markPolicyUnknownLocked()
-                                preClaimTx = null
-                                if (writeLocked) {
-                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                    writeLocked = false
-                                }
-                                return@withLock
-                            }
+                            // Stage M2 P2#3: indeterminate — same tracked
+                            // transaction/outcome protocol as save/clear (no
+                            // more IDLE+RepairFailed on timeout): mark +
+                            // RECONCILING + CORRUPT_REPAIR_TIMEOUT/CHANNEL,
+                            // retain the claimed Tx (fence + deferred handle)
+                            // via handover; release only the app-scoped
+                            // single-writer. Late delete still owns completion
+                            // (never settled here); reconciler/autoRecheck
+                            // verifies ground truth (Known(empty) → REPAIRED
+                            // else FAILED/REFRESH). Corrupt retained
+                            // (fail-closed: still damaged, unknown).
                             markPolicyUnknownLocked()
                             _state.update {
                                 it.copy(
                                     loading = false,
                                     policyDraftKnown = false,
                                     policyDraftCorrupt = true,
-                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyWritePhase = PolicyWritePhase.RECONCILING,
                                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                    msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
-                                    msgKind = MsgKind.FAILED,
+                                    msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_TIMEOUT)),
+                                    msgKind = MsgKind.CHANNEL,
                                 )
                             }
                             val pc = preClaimTx
                             if (pc != null) {
-                                emitTxSettledSnapshot(pc)
-                                settlePolicyTx(pc)
+                                handoverTx = pc
                                 preClaimTx = null
-                            }
-                            if (writeLocked) {
-                                try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                writeLocked = false
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                            } else {
+                                handoverTx = PolicyTx(
+                                    txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                                    key = key,
+                                    deferred = deferred,
+                                    sanitized = emptySet(),
+                                    store = store,
+                                    isClear = true,
+                                    pending = null,
+                                    isRepair = true,
+                                )
                             }
                             return@withLock
                         }
@@ -9227,12 +9245,21 @@ class DualViewModel(
                 _state.update { it.copy(loading = false) }
                 throw e
             } finally {
+                // Stage M2 P2#3: timeout hands over like save/clear — register
+                // the retained Tx (fence + deferred) so reconciler/autoRecheck
+                // verifies ground truth. Never settle on unknown here.
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                 }
-                // No handover for repair (timeout maps to FAILED above, fenced).
-                inFlightWrites.remove(key)
-                policyWriteSaving.remove(key)
+                val htx = handoverTx
+                if (htx != null) {
+                    inFlightWrites.remove(htx.key)
+                    policyWriteSaving.remove(htx.key)
+                    registerHandoverTx(htx, isClear = true)
+                } else {
+                    inFlightWrites.remove(key)
+                    policyWriteSaving.remove(key)
+                }
             }
         }
     }
@@ -11855,6 +11882,9 @@ enum class PolicyTextKind {
     CORRUPT_REPAIR_FIRST,
     CORRUPT_REPAIRED,
     CORRUPT_REPAIR_FAILED,
+    // Stage M2 P2#3: repair IO 逾時（結果未知，正在核對，請勿重試）。msgKind 複用
+    // CHANNEL（與 WRITE/CLEAR_TIMEOUT 同級：未知＋正在核對＋不可重試）。
+    CORRUPT_REPAIR_TIMEOUT,
     // Stage A：IO 逾時（結果未知，正在核對，請勿重試）。msgKind 複用 CHANNEL
     //（不新增 enum），文案口徑「逾時、結果未知、正在核對、請勿重試」。
     WRITE_TIMEOUT,
@@ -11904,6 +11934,7 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.CORRUPT_REPAIR_FIRST -> "檢測到損壞的政策條目，修復將備份後清除損壞內容（具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理"
     PolicyTextKind.CORRUPT_REPAIRED -> "已修復損壞的政策草稿（已備份並清除，現為空）"
     PolicyTextKind.CORRUPT_REPAIR_FAILED -> "修復損壞的政策草稿失敗，仍為損壞狀態；建議重試或檢查服務連線"
+    PolicyTextKind.CORRUPT_REPAIR_TIMEOUT -> "修復損壞政策逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.WRITE_TIMEOUT -> "寫入政策逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.CLEAR_TIMEOUT -> "清除草稿逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.UNRESOLVED_REFRESH -> "結果仍未知，請點「重新整理草稿」確認結果"
