@@ -8,6 +8,7 @@ package com.galaxydual.plus
 
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -169,7 +170,7 @@ class PolicyTxCoordinator {
         } else if (claimTombstones.size >= 512) {
             try {
                 tombstoneRejects.incrementAndGet()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
             logCoord(
                 "tombstone bound full (512): reject drop txId=$txId " +
@@ -180,7 +181,9 @@ class PolicyTxCoordinator {
             claimTombstones[k] = rev
             true
         }
-    } catch (_: Exception) {
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         false
     }
 
@@ -189,7 +192,9 @@ class PolicyTxCoordinator {
     // the new revision.
     internal fun bumpRevisionForTests(): Long = try {
         committedRevision.incrementAndGet()
-    } catch (_: Exception) {
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         -1L
     }
 
@@ -223,14 +228,18 @@ class PolicyTxCoordinator {
 
     internal fun isTombstoned(txId: Long, key: String): Boolean = try {
         claimTombstones.containsKey(tombstoneKey(txId, key))
-    } catch (_: Exception) {
-        false
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        true
     }
 
     fun currentRevision(): Long = try {
         committedRevision.get()
-    } catch (_: Exception) {
-        0L
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        -1L
     }
 
     suspend fun <T> withCommitLock(block: suspend () -> T): T = commitMutex.withLock { block() }
@@ -248,18 +257,20 @@ class PolicyTxCoordinator {
                     val rev = committedRevision.incrementAndGet()
                     val stamped = try {
                         payload.copy(rev = rev)
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                         payload
                     }
                     pendingPublish.set(stamped)
                     // Stage M3: stamp fence time with the payload (same lock).
-                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Throwable) { }
                     // Stage N3 P1#3: monotonic fence time + originating-claim owner.
-                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
-                    try { pendingOwner.set(tx) } catch (_: Exception) { }
+                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Throwable) { }
+                    try { pendingOwner.set(tx) } catch (_: Throwable) { }
                     ok = true
                 }
-            } catch (_: Exception) {
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
                 ok = false
             }
         }
@@ -288,16 +299,18 @@ class PolicyTxCoordinator {
                     val rev = committedRevision.incrementAndGet()
                     val stamped = try {
                         payload.copy(rev = rev)
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                         payload
                     }
                     pendingPublish.set(stamped)
-                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
-                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
-                    try { pendingOwner.set(tx) } catch (_: Exception) { }
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Throwable) { }
+                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Throwable) { }
+                    try { pendingOwner.set(tx) } catch (_: Throwable) { }
                     ok = true
                 }
-            } catch (_: Exception) {
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
                 ok = false
             }
         }
@@ -554,7 +567,17 @@ class PolicyTxCoordinator {
         commitMutex.withLock {
             try {
                 // Tombstone fast-reject: dropped identity never stages again.
-                if (isTombstoned(payload.txId, payload.key)) {
+                // Check failure (isTombstoned throwing) is fail-closed: reject,
+                // never pass (isTombstoned itself returns true on Throwable;
+                // this explicit guard covers CE/throwing paths).
+                val tombstoned: Boolean = try {
+                    isTombstoned(payload.txId, payload.key)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    true
+                }
+                if (tombstoned) {
                     emitSuperseded.incrementAndGet()
                     logCoord(
                         "stage rejected (tombstoned) txId=${payload.txId} key=${payload.key} " +
@@ -623,7 +646,9 @@ class PolicyTxCoordinator {
                     )
                     out = null
                 }
-            } catch (_: Exception) {
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
                 out = null
             }
         }
@@ -648,7 +673,9 @@ class PolicyTxCoordinator {
                     activeTx.set(tx)
                     res = ClaimWriteResult.CLAIMED
                 }
-            } catch (_: Exception) {
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
                 res = ClaimWriteResult.BUSY
             }
         }
@@ -665,7 +692,8 @@ class PolicyTxCoordinator {
     // equal-rev different-identity never overwrites latest (borrowed-rev guard).
     fun emitStaged(payload: PolicySettled) {
         // Tombstone pre-check: dropped placeholder identity must never resurrect
-        // via emit, even with a fresh synthetic rev.
+        // via emit, even with a fresh synthetic rev. Check failure is fail-closed
+        // (reject, never pass): an unverifiable tombstone read must not emit.
         try {
             if (isTombstoned(payload.txId, payload.key)) {
                 emitSuperseded.incrementAndGet()
@@ -675,7 +703,15 @@ class PolicyTxCoordinator {
                 )
                 return
             }
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            emitSuperseded.incrementAndGet()
+            logCoord(
+                "emit rejected (tombstone check failure) txId=${payload.txId} key=${payload.key} " +
+                    "rev=${payload.rev} (fail-closed, must re-claim)",
+            )
+            return
         }
         var toEmit = payload
         // Preserve claim rev when caller passed unstamped but pending holds it
@@ -885,7 +921,8 @@ class PolicyTxCoordinator {
     }
 
     fun tryEmitSettled(s: PolicySettled): Boolean {
-        // Stage N3: tombstoned identity never emits.
+        // Stage N3: tombstoned identity never emits. Check failure is fail-closed
+        // (reject, never pass): an unverifiable tombstone read must not emit.
         try {
             if (isTombstoned(s.txId, s.key)) {
                 emitSuperseded.incrementAndGet()
@@ -894,7 +931,14 @@ class PolicyTxCoordinator {
                 )
                 return false
             }
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            emitSuperseded.incrementAndGet()
+            logCoord(
+                "tryEmit rejected (tombstone check failure) txId=${s.txId} key=${s.key} rev=${s.rev}",
+            )
+            return false
         }
         var stamped = s
         try {
@@ -993,7 +1037,9 @@ class PolicyTxCoordinator {
     // settlePolicyTx 經此做 coordinator 側 claim（claim 先行，免先讀後 emit 窗口）。
     fun tryCompleteClaim(tx: DualViewModel.PolicyTx): Boolean = try {
         activeTx.compareAndSet(tx, null)
-    } catch (_: Exception) {
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         false
     }
 

@@ -974,16 +974,22 @@ class DualViewModel(
         if (sampler != null) {
             try {
                 sampler()
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (_: Throwable) {
                 -1L
             }
         } else {
             try {
                 policyTxCoordinator?.currentRevision() ?: -1L
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (_: Throwable) {
                 -1L
             }
         }
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (_: Throwable) {
         -1L
     }
@@ -1003,24 +1009,26 @@ class DualViewModel(
     internal fun markObservedKnownAt(rev: Long, dropGen: Long? = null) {
         try {
             if (rev != -1L) {
-                try { authoritativeObservedRev.set(rev) } catch (_: Exception) { }
+                try { authoritativeObservedRev.set(rev) } catch (_: Throwable) { }
             } else {
                 try {
                     val lastR = lastRevisionSeenRev.get()
                     if (lastR != -1L) authoritativeObservedRev.set(lastR)
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                 }
             }
             try {
                 val dg = dropGen ?: try {
                     policyTxCoordinator?.orphanDropGen?.get() ?: 0L
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     0L
                 }
                 lastSeenDropGen.set(dg)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
     }
 
@@ -1028,7 +1036,7 @@ class DualViewModel(
         val cur = sampledCurrentRevision()
         val dg = try {
             policyTxCoordinator?.orphanDropGen?.get() ?: 0L
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             0L
         }
         markObservedKnownAt(cur, dg)
@@ -2293,7 +2301,9 @@ class DualViewModel(
     // joinable regardless (no start risk; keeps legacy test doubles green).
     private fun canJoinTx(tx: PolicyTx): Boolean = try {
         tx.executionArmed.get() || tx.deferred.isCompleted
-    } catch (_: Exception) {
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         false
     }
 
@@ -2327,26 +2337,36 @@ class DualViewModel(
     private fun abortUnarmedTx(tx: PolicyTx) {
         try {
             tx.ownerAlive.set(false)
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
         try {
             tx.deferred.cancel()
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
         try {
             settlePolicyTx(tx)
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
         try {
             policyReconciling.remove(tx.key)
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
         try {
             markPolicyUnknownLocked()
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
         }
         _state.update { cur ->
-            val keepCorrupt = try { tx.isRepair } catch (_: Exception) { false }
+            val keepCorrupt = try { tx.isRepair } catch (_: Throwable) { false }
             if (cur.policyWritePhase != PolicyWritePhase.RECONCILING &&
                 cur.policyWritePhase != PolicyWritePhase.SAVING &&
                 cur.policyWritePhase != PolicyWritePhase.QUEUED
@@ -2373,7 +2393,7 @@ class DualViewModel(
             tx.deferred.await()
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
         // Stage J2: ok==false 不得純憑句柄結 FAILED，須以已取 ground-truth 校準——
@@ -3252,28 +3272,34 @@ class DualViewModel(
             // be discarded (stay Unknown, fail closed) — never marked observed.
             // Phase7: via sampledCurrentRevision() so barrier tests can fake
             // the revision source (count + latch).
-            val revBeforeInit = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
+            // Sampler/null distinction (fail-closed): sampler==null && coordinator==null
+            // is legacy (no authoritative rev, -1 skips); otherwise -1 is unverifiable
+            // and must discard Known below (never mark observed).
+            val revBeforeInit = try { sampledCurrentRevision() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { -1L }
+            val hasAuthInit = policyTxCoordinator != null || revisionSamplerForTests != null
+            val revUnverifiableInit = revBeforeInit == -1L && hasAuthInit
             // Stage J4 P1 (identity-aware rev-discard): sample the in-flight
             // Tx identities before IO. A rev move caused by our OWN commit
             // (winner bumped version triple above, so the version fence already
             // discards; this covers the split snapshot window where the version
             // was sampled after the bump but revBefore before it) must not wash
             // Known=false — _latest with the same identity is own-commit truth.
-            val initLocalSnap = try { activePolicyTx.get() } catch (_: Exception) { null }
-            val initCoordSnap = try { policyTxCoordinator?.activeTx?.get() } catch (_: Exception) { null }
+            val initLocalSnap = try { activePolicyTx.get() } catch (_: Throwable) { null }
+            val initCoordSnap = try { policyTxCoordinator?.activeTx?.get() } catch (_: Throwable) { null }
             val result = if (store == null) {
                 LoadResult.Unavailable
             } else try {
                 onIo { store.loadResult() }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 if (e is CancellationException) throw e
                 LoadResult.Unavailable
             }
             // P1-1: revision moved during the read => stale Known, discard.
             // Phase7: via sampledCurrentRevision() (barrier-test seam).
+            // Check failure is fail-closed (true => discard, never pass).
             val revMovedInit = try {
                 revBeforeInit != -1L && sampledCurrentRevision() != revBeforeInit
-            } catch (_: Throwable) { false }
+            } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { true }
             _state.update { cur ->
                 // Stage G2：認領 fence 優先——Tx 存活時 init load 一律丟棄（不覆寫
                 // RECONCILING＋Unknown＋pending；新 VM 認領已同步發布 fence）。
@@ -3294,7 +3320,8 @@ class DualViewModel(
                     // Known=false. The winner triple bump above already routes
                     // the common case via the version fence; this covers the
                     // split-snapshot window only.
-                    if (revMovedInit) {
+                    // Unverifiable rev (-1 with authoritative source) discards like moved.
+                    if (revUnverifiableInit || revMovedInit) {
                         val ownCommit: Boolean = try {
                             val latest = policyTxCoordinator?.latest?.value
                             latest != null && (
@@ -3305,7 +3332,7 @@ class DualViewModel(
                                         latest.txId == initCoordSnap.txId &&
                                         latest.key == initCoordSnap.key)
                                 )
-                        } catch (_: Exception) { false }
+                        } catch (_: Throwable) { false }
                         if (ownCommit) cur
                         else cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
                     } else {
@@ -7101,20 +7128,26 @@ class DualViewModel(
                 // P1-1: sample the authoritative revision BEFORE the trusted IO.
                 // Phase7: via sampledCurrentRevision() (barrier-test seam,
                 // refresh is the representative pinned path).
-                val revBeforeRefresh = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
+                // Sampler/null distinction (fail-closed): sampler==null && coordinator==null
+                // is legacy (no authoritative rev, -1 skips); otherwise -1 is unverifiable
+                // and must discard Known below.
+                val revBeforeRefresh = try { sampledCurrentRevision() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { -1L }
+                val hasAuthRefresh = policyTxCoordinator != null || revisionSamplerForTests != null
+                val revUnverifiableRefresh = revBeforeRefresh == -1L && hasAuthRefresh
                 val result = if (store == null) {
                     LoadResult.Unavailable
                 } else try {
                     onIo { store.loadResult() }
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     if (e is CancellationException) throw e
                     LoadResult.Unavailable
                 }
                 // P1-1: revision moved during the read => the Known below is stale.
                 // Phase7: via sampledCurrentRevision() (barrier-test seam).
+                // Check failure is fail-closed (true => discard, never pass).
                 val revMovedRefresh = try {
                     revBeforeRefresh != -1L && sampledCurrentRevision() != revBeforeRefresh
-                } catch (_: Throwable) { false }
+                } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { true }
                 // Tx 快照（IO 後取值：覆蓋讀期間出現的 Tx；reconciler 已退出時
                 // 仍可見滯留 Tx，late-join 可恢復）。
                 val txSnap = activePolicyTx.get()
@@ -7435,8 +7468,9 @@ class DualViewModel(
                         // abortUnarmedTx keepCorrupt (repair Tx aborts wash nothing).
                         if (hasActivePolicyTx()) {
                             cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
-                        } else if (revMovedRefresh) {
-                            // P1-1: stale read (rev advanced mid-IO) => discard: no
+                        } else if (revUnverifiableRefresh || revMovedRefresh) {
+                            // P1-1: stale read (rev advanced mid-IO) or unverifiable rev
+                            // (-1 with authoritative source) => discard: no
                             // disarm, no stale wash, no mark, stay Unknown (fail closed).
                             // Corrupt retained (repair-period discard must not wash).
                             cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
@@ -10550,7 +10584,9 @@ class DualViewModel(
                         // commits mid-IO, the success below must be discarded
                         // (stay Unknown, no mark/disarm/stale-wash — fail closed).
                         // Phase7: via sampledCurrentRevision() (barrier-test seam).
-                        val repairRevBefore = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
+                        // Unverifiable (-1 with coordinator) must abort fail-closed below
+                        // (never call completeWithRevisionChecked which would skip the gate).
+                        val repairRevBefore = try { sampledCurrentRevision() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { -1L }
                         val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadForRepair() }
                         val finalRead: LoadResult = try {
                             withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { finalJob.await() }
@@ -10708,6 +10744,31 @@ class DualViewModel(
                             if (pcFast != null) {
                                 val coordR = policyTxCoordinator
                                 val claimedRepair: Boolean = if (coordR != null) {
+                                    // Fail-closed: unverifiable rev (-1 with coordinator) must abort
+                                    // without calling completeWithRevisionChecked (which would skip
+                                    // the rev gate as legacy). Settle, unlock, stay Unknown+Corrupt.
+                                    if (repairRevBefore == -1L) {
+                                        try { settlePolicyTx(pcFast) } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
+                                        preClaimTx = null
+                                        if (writeLocked) {
+                                            try { policyTxCoordinator?.writeMutex?.unlock() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
+                                            writeLocked = false
+                                        }
+                                        try { h1RepairDeferred?.cancel() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
+                                        try { markPolicyUnknownLocked() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                policyDraftKnown = false,
+                                                policyDraftCorrupt = true,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                                msgKind = MsgKind.CHANNEL,
+                                            )
+                                        }
+                                        return@withLock
+                                    }
                                     try {
                                         val ph = PolicySettled(
                                             pcFast.txId, pcFast.key, pcFast.sanitized,
@@ -10715,10 +10776,12 @@ class DualViewModel(
                                         )
                                         val wasClaimed = coordR.completeWithRevisionChecked(pcFast, ph, repairRevBefore)
                                         if (wasClaimed) {
-                                            try { afterClaimBeforeEmit?.invoke() } catch (_: Exception) { }
+                                            try { afterClaimBeforeEmit?.invoke() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
                                         }
                                         wasClaimed
-                                    } catch (_: Exception) {
+                                    } catch (ce: CancellationException) {
+                                        throw ce
+                                    } catch (_: Throwable) {
                                         false
                                     }
                                 } else {
@@ -10732,7 +10795,7 @@ class DualViewModel(
                                     val revNow = try {
                                         val sampled = sampledCurrentRevision()
                                         if (sampled == -1L) repairRevBefore else sampled
-                                    } catch (_: Throwable) { repairRevBefore }
+                                    } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { repairRevBefore }
                                     val revRejected = repairRevBefore != -1L && revNow != repairRevBefore
                                     if (revRejected) {
                                         // Stale read (rev advanced mid-IO): discard, settle
