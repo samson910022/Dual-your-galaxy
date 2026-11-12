@@ -7254,4 +7254,152 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
     }
 
+    // Stage L4 fix(a) 清除鈕統一入口：Corrupt 下兩 tap 走修復（非盲清 abort）。
+    // 第一 tap→request arm（零 store 觸碰＋REPAIR_FIRST），第二 tap→confirm 執行
+    // （修復成功→Known empty＋Repaired）。證明清除鈕在 Corrupt 下導向修復流程。
+    @Test
+    fun l4_clearButtonTap_corruptRoutesRepair_twoTapsRepaired() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        var clearCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+
+        // 第一 tap：路由修復請求（arm，不碰 store）。
+        vm.onClearPolicyButtonTap()
+        assertTrue(vm.isCorruptRepairArmed())
+        assertTrue(vm.state.value.msg.contains("修復") || vm.state.value.msg.contains("備份"))
+        assertEquals(0, clearCalls)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+
+        // 第二 tap：路由修復確認（執行，經 TTL＋世代雙檢）。
+        vm.onClearPolicyButtonTap()
+        await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown }
+        assertEquals(1, clearCalls)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertFalse(vm.state.value.policyDraftCorrupt)
+        assertTrue(vm.state.value.policyDraft.isEmpty())
+        assertTrue(vm.state.value.msg.contains("已修復"))
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
+    // Stage L4 fix(a) 非 Corrupt 不變：Unavailable 下清除鈕仍走盲清雙確認
+    // （第一 tap arm＋BLIND_CLEAR_FIRST，零 store 觸碰；Corrupt 修復不介入）。
+    // 統一入口兩 tap：皆經 onClearPolicyButtonTap（與生產按鈕同一调用點），
+    // TTL/世代通過＋遠端恢復 Known 後第二 tap 執行盲清（clearCalls==1）。
+    @Test
+    fun l4_clearButtonTap_unavailableKeepsBlindClear() {
+        var now = 10_000L
+        var backing: Set<String>? = null
+        var clearCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = { backing },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null, nowMonoMs = { now })
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { !vm.state.value.policyDraftKnown }
+        assertFalse(vm.state.value.policyDraftCorrupt)
+
+        // 第一 tap（統一入口）：盲清 arm，零 store 觸碰。
+        vm.onClearPolicyButtonTap()
+        assertTrue(vm.state.value.msg.contains("再次清除"))
+        assertEquals(0, clearCalls)
+        assertFalse(vm.isCorruptRepairArmed())
+
+        // 遠端恢復為確認空（不經 refresh，不 bump 版本/世代，TTL＋世代雙檢可過）。
+        backing = emptySet()
+        now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
+        // 第二 tap（同一統一入口）：TTL＋世代通過＋pre-read Known→執行盲清。
+        vm.onClearPolicyButtonTap()
+        await(timeoutMs = 5_000L) { clearCalls == 1 && vm.state.value.msgKind == MsgKind.INFO }
+        assertEquals(1, clearCalls)
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertFalse(vm.state.value.policyDraftCorrupt)
+        assertTrue(vm.state.value.policyDraft.isEmpty())
+        assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
+        assertFalse(vm.isCorruptRepairArmed())
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
+    // Stage L4 fix(a) 路由一致性：pure(known,corrupt,armed) 窮舉＋VM 同一入口同謂詞。
+    // 僅 !known&&corrupt 走修復；Known+Corrupt 殘留亦 CLEAR（舊 corrupt-alone 會誤判 REPAIR）。
+    @Test
+    fun l4_clearButtonRoute_vmConsistentWithPure_allKnownCorruptArmed() {
+        // pure 窮舉 8 組合。
+        for (known in listOf(false, true)) {
+            for (corrupt in listOf(false, true)) {
+                for (armed in listOf(false, true)) {
+                    val expected = if (!(!known && corrupt)) ClearPolicyButtonRoute.CLEAR
+                    else if (armed) ClearPolicyButtonRoute.REPAIR_CONFIRM
+                    else ClearPolicyButtonRoute.REPAIR_REQUEST
+                    assertEquals(
+                        "known=$known corrupt=$corrupt armed=$armed",
+                        expected,
+                        clearPolicyButtonRoute(known = known, corrupt = corrupt, repairArmed = armed),
+                    )
+                }
+            }
+        }
+        // VM 同一入口一致性：Known+Corrupt 殘留必須走 CLEAR（非修復）。
+        // 後端 Known(seed)，狀態強制 Known+Corrupt，經 onClearPolicyButtonTap 應單步清除
+        // （clearCalls==1、修復未 arm），而非 REPAIR_REQUEST（arm＋0 calls）。
+        var backing: Set<String>? = setOf("com.seed")
+        var clearCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = { backing },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { vm.state.value.policyDraftKnown }
+        assertFalse(vm.state.value.policyDraftCorrupt)
+        // 強制 Known+Corrupt 殘留（生產穩態外，謂詞分汧檢測用）。
+        val stateField = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val stateFlow = stateField.get(vm) as MutableStateFlow<UiState>
+        stateFlow.value = stateFlow.value.copy(policyDraftKnown = true, policyDraftCorrupt = true)
+        assertFalse(vm.isCorruptRepairArmed())
+        vm.onClearPolicyButtonTap()
+        await(timeoutMs = 5_000L) { clearCalls == 1 && vm.state.value.msgKind == MsgKind.INFO }
+        assertEquals(1, clearCalls)
+        assertFalse(vm.isCorruptRepairArmed())
+        assertTrue(vm.state.value.policyDraftKnown)
+    }
+
 }

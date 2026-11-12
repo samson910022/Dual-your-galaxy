@@ -180,6 +180,36 @@ class StageJ5PolishTest {
         assertEquals(R.string.input_too_long to null, vmMessageRes("輸入過長（超過 256 字元），已拒絕"))
     }
 
+    // Stage L4 fix(a) 清除鈕路由 single source（純函數，統一謂詞 !(!known&&corrupt)）：
+    // 僅 !known&&corrupt 走修復（未 arm→REQUEST，已 arm→CONFIRM）；其餘一律 CLEAR
+    // （Known 單步／Unavailable 盲清；Known+Corrupt 殘留亦 CLEAR，與 VM
+    // onClearPolicyButtonTap 同一判定，防 corrupt-alone 與 !known&&corrupt 漂移）。
+    // 穷舉 known×corrupt×armed 八組合鎖定唯一謂詞。
+    @Test
+    fun clearPolicyButtonRoute_corruptTwoTaps() {
+        // Non-repair: Known 或 Unavailable 一律 CLEAR（armed 無關）。
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = true, corrupt = false, repairArmed = false))
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = true, corrupt = false, repairArmed = true))
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = false, corrupt = false, repairArmed = false))
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = false, corrupt = false, repairArmed = true))
+        // Known+Corrupt 殘留亦 CLEAR（與舊 corrupt-alone 謂詞之分汧點）。
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = true, corrupt = true, repairArmed = false))
+        assertEquals(ClearPolicyButtonRoute.CLEAR, clearPolicyButtonRoute(known = true, corrupt = true, repairArmed = true))
+        // 唯一修復：!known&&corrupt，以 armed 分流兩 tap。
+        assertEquals(ClearPolicyButtonRoute.REPAIR_REQUEST, clearPolicyButtonRoute(known = false, corrupt = true, repairArmed = false))
+        assertEquals(ClearPolicyButtonRoute.REPAIR_CONFIRM, clearPolicyButtonRoute(known = false, corrupt = true, repairArmed = true))
+    }
+
+    // Stage L4 fix(a) 修復模式標籤：Corrupt 下按鈕重貼 repair 文案＋CD，
+    // 非 Corrupt 回原清除文案。
+    @Test
+    fun clearPolicyButtonRes_corruptUsesRepair() {
+        assertEquals(R.string.action_repair_policy_draft, clearPolicyButtonTextRes(true))
+        assertEquals(R.string.repair_policy_draft_cd, clearPolicyButtonCdRes(true))
+        assertEquals(R.string.action_clear_policy_draft, clearPolicyButtonTextRes(false))
+        assertEquals(R.string.clear_policy_draft_cd, clearPolicyButtonCdRes(false))
+    }
+
     @Test
     fun vmMessageRes_prefixRemainderIsRawChineseByDesign() {
         // Known limitation (locale-mixed by design, see MainActivity.vmMessageRes

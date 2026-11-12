@@ -2073,7 +2073,10 @@ class DualViewModel(
     private val corruptRepairArmedVersion = AtomicLong(-1L)
     private val corruptRepairArmedFreshGen = AtomicLong(-1L)
 
-    private fun isCorruptRepairArmed(): Boolean = corruptRepairArmedAtMs.get() != -1L
+    // Stage L4 P2#3 corrupt-repair armed 狀態（UI 清除鈕路由用：未 arm 走
+    // request（第一次 tap），已 arm 走 confirm（第二次 tap，TTL＋世代雙檢）。
+    // 內部三元組仍以 -1 哨兵同步，生產 Main 串行、測試 Unconfined 可見。
+    fun isCorruptRepairArmed(): Boolean = corruptRepairArmedAtMs.get() != -1L
 
     private fun armCorruptRepairLocked() {
         corruptRepairArmedAtMs.set(nowMonoMs())
@@ -8637,6 +8640,25 @@ class DualViewModel(
         }
     }
 
+    // Stage L4 fix(a) 清除鈕統一入口（MainActivity 唯一調用點，thin wrapper →
+    // onClearPolicyButtonTap 為 single source）：路由謂詞與 TTL/世代雙檢皆在
+    // VM 內經 pure clearPolicyButtonRoute(known,corrupt,armed) 判定（僅
+    // !known&&corrupt 走修復；Known（含髒 Corrupt 殘留）／Unavailable 一律 CLEAR，
+    // 維持原盲清／正常清除語義），純函數僅作 VM 內部決策 helper／JVM 可測。
+    fun onClearPolicyButtonTap() {
+        when (
+            clearPolicyButtonRoute(
+                _state.value.policyDraftKnown,
+                _state.value.policyDraftCorrupt,
+                isCorruptRepairArmed(),
+            )
+        ) {
+            ClearPolicyButtonRoute.REPAIR_CONFIRM -> confirmRepairCorruptDraft()
+            ClearPolicyButtonRoute.REPAIR_REQUEST -> requestRepairCorruptDraft()
+            ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft()
+        }
+    }
+
     // 從 SelectionStore 恢復勾選 (供重啟/Activity 重建後呼叫):
     // - 僅在 selectedKeys 為空時恢復 (永不覆蓋使用者當前勾選)。
     // - 保存的是 AppKey 集合；只恢復仍在 catalog (availableKeys,預設為當前
@@ -11336,3 +11358,21 @@ fun UiState.hookEvidence(): HookEvidence = HookEvidence(
     markerTimeMs = hookMarkerTimeMs,
     viaGateway = hookViaGateway,
 )
+
+// Stage L4 fix(a) 清除鈕路由 single source（純函數，JVM 可測，不碰 VM/Activity）：
+// 僅 !known&&corrupt 走修復（未 arm→REPAIR_REQUEST arm＋警告，已 arm→
+// REPAIR_CONFIRM TTL＋世代雙檢後執行）；其餘一律 CLEAR（Known 單步清除／
+// Unavailable 盲清雙確認；Known+Corrupt 殘留亦 CLEAR走正常清除路徑）。
+// 直調 clearPolicyDraft 的 !known&&corrupt 仍由其內 CORRUPT_DETECTED 拒絕兜底
+// （零 store 觸碰），永不走盲清；VM onClearPolicyButtonTap 唯一經此分發，
+// Activity 僅 thin wrapper 直調，不重複 when。
+internal enum class ClearPolicyButtonRoute { CLEAR, REPAIR_REQUEST, REPAIR_CONFIRM }
+
+internal fun clearPolicyButtonRoute(
+    known: Boolean,
+    corrupt: Boolean,
+    repairArmed: Boolean,
+): ClearPolicyButtonRoute =
+    if (!(!known && corrupt)) ClearPolicyButtonRoute.CLEAR
+    else if (repairArmed) ClearPolicyButtonRoute.REPAIR_CONFIRM
+    else ClearPolicyButtonRoute.REPAIR_REQUEST
