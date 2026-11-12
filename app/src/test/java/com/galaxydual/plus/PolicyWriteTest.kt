@@ -6871,6 +6871,152 @@ class PolicyWriteTest {
         }
     }
 
+
+    // Stage L3 (P2#5 lossless): 20 rapid emit with no collector — late subscriber
+    // converges latest via _latest StateFlow, gap detected, never silent loss.
+    // SharedFlow replay bounded (8): old evicted; truth is _latest (no eviction,
+    // ordered by committedRevision seq). Timeout never means delivered (metric).
+    @Test
+    fun l3_overflow20_losslessLatest() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            for (i in 1..20) {
+                coord.emitStaged(
+                    PolicySettled(i.toLong(), "k$i", setOf("com.$i"), true, MsgKind.INFO, "m$i", false),
+                )
+            }
+            await(timeoutMs = 5_000L) { coord.latest.value?.txId == 20L }
+            assertEquals(20L, coord.latest.value?.txId)
+            assertEquals("k20", coord.latest.value?.key)
+            assertTrue(coord.settled.replayCache.size <= 8)
+            assertTrue(coord.settled.replayCache.none { it.txId == 1L })
+            val r20 = coord.awaitSettled(20L, "k20", 2_000L)
+            assertNotNull(r20)
+            assertEquals(setOf("com.20"), r20!!.draft)
+            val r1 = coord.awaitSettled(1L, "k1", 500L)
+            assertNull(r1)
+            // Lossless via _latest (no eviction, ordered by rev seq); SharedFlow
+            // replay bounded, old evicted (gap detected via null, never stale).
+            // Timeout/drop metric is exercised by overtake/recovery paths; here
+            // latest preservation alone proves no silent loss for latest.
+            assertEquals(20L, coord.latest.value?.txId)
+            assertTrue((coord.latest.value?.rev ?: -1L) > 0)
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Stage L3 overtake: stalled N late emit must never overwrite newer N+1.
+    // Publish order = claim order (committedRevision seq); stale rev < latest
+    // is explicitly superseded (metric+log), never silent.
+    @Test
+    fun l3_stalledOvertake_explicitSupersede() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val fake = FakePolicyStore()
+            val txN = DualViewModel.PolicyTx(
+                coord.nextTxId(), "kN",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.N"), fake.store, false,
+            )
+            coord.activeTx.set(txN)
+            assertTrue(
+                coord.completeWithRevision(
+                    txN, PolicySettled(txN.txId, txN.key, setOf("com.N"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val revN = coord.committedRevision.get()
+            val realN = PolicySettled(txN.txId, txN.key, setOf("com.N"), true, MsgKind.INFO, "mN", false)
+            val stagedN = coord.stageRealPayload(realN)
+            assertNotNull(stagedN)
+            assertEquals(revN, stagedN!!.rev)
+            assertEquals(txN.txId, coord.latest.value?.txId)
+            val txN1 = DualViewModel.PolicyTx(
+                coord.nextTxId(), "kN1",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.N1"), fake.store, false,
+            )
+            coord.activeTx.set(txN1)
+            assertTrue(
+                coord.completeWithRevision(
+                    txN1, PolicySettled(txN1.txId, txN1.key, setOf("com.N1"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val revN1 = coord.committedRevision.get()
+            assertTrue(revN1 > revN)
+            val realN1 = PolicySettled(txN1.txId, txN1.key, setOf("com.N1"), true, MsgKind.INFO, "mN1", false)
+            val stagedN1 = coord.stageRealPayload(realN1)
+            assertNotNull(stagedN1)
+            assertEquals(txN1.txId, coord.latest.value?.txId)
+            assertEquals(revN1, coord.latest.value?.rev)
+            val before = coord.emitSuperseded.get()
+            coord.emitStaged(realN.copy(rev = revN))
+            assertEquals(txN1.txId, coord.latest.value?.txId)
+            assertTrue(coord.emitSuperseded.get() > before)
+            val rN1 = coord.awaitSettled(txN1.txId, txN1.key, 2_000L)
+            assertNotNull(rN1)
+            assertEquals(setOf("com.N1"), rN1!!.draft)
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Stage L3 recovery: stalled emit (>2s fallback timeout, no SharedFlow
+    // collector) + late subscriber after burst both reach IDLE+Known/SUCCESS via
+    // settled (_latest) or resync; settled==null alone never leaves RECONCILING
+    // (callers must go via boundedReconcileRead).
+    @Test
+    fun l3_recovery_stalledAndLateConverge() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            for (i in 1..16) {
+                coord.tryEmitSettled(
+                    PolicySettled(1000L + i, "fill$i", setOf("com.fill$i"), true, MsgKind.INFO, "fill$i", false),
+                )
+            }
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 300, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            vm1.setSourceCatalog(listOf(SourceAppEntry("com.B", "B", 0, false)))
+            vm1.toggleSelection("0:com.B")
+            vm1.requestPolicyWrite()
+            val pendingB = vm1.state.value.pendingPolicyWrite
+            assertNotNull(pendingB)
+            vm1.confirmPolicyWrite(pendingB!!)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            Thread.sleep(2500)
+            saveRelease.set(true)
+            await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertEquals(setOf("com.B"), backend.get())
+            val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            await(timeoutMs = 15_000L) { vm2.state.value.policyDraftKnown && vm2.state.value.policyDraft == setOf("com.B") }
+            assertEquals(PolicyWritePhase.IDLE, vm2.state.value.policyWritePhase)
+            assertEquals(setOf("com.B"), coord.latest.value?.draft)
+            // Lossless: latest holds B even if SharedFlow notifier was stalled;
+            // drop/supersede surfaced when overtaken (overtake test locks metric).
+            // Here assert convergence + timeout-not-delivered contract.
+            val missing = runBlocking { coord.awaitSettled(999999L, "nope", 300L) }
+            assertNull(missing)
+        } finally {
+            try { saveRelease.set(true) } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
     // Stage L1 P1: coordinator CAS visible before revision event; old pending C
     // must never overwrite unseen B. VM1 request+confirm B save blocked → timeout
     // handover; gate B reconciler at afterClaimBeforeEmit (CAS done,
