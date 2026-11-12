@@ -1376,9 +1376,10 @@ class DualViewModel(
     // - 有界等待同一 txId 的勝者 settled（withTimeout(policyIoTimeoutMs)，replay=1
     //   使晚訂閱仍可見）：收到即應用本地 IDLE+draft/Known/msg（僅 phase 仍為
     //   RECONCILING 才應用，免覆寫已結新事實；Known 成功即 disarm）。
-    // - 逾時兜底：顯式可信重讀一次（boundedReconcileRead），Known 即 IDLE+Known+
-    //   REFRESHED（disarm），Unknown 即 IDLE+Unknown+REFRESH_FAILED（保留舊快照），
-    //   皆清 pending、不永久卡死。
+    // - 逾時兜底：settled==null 即走共用 fallback（boundedReconcileRead 單次＋
+    //   resolveObserverFallback/decide 唯一真相，見該 helper KDoc）：Adopt 才收斂
+    //   IDLE（Success/Mismatch/Failed），Retain 續留 RECONCILING（不盲 Known→IDLE），
+    //   免 claimed VM 永留 RECONCILING。
     // - CE 透傳（scope 取消不吞）。
     private fun launchLoserSync(tx: PolicyTx) {
         val coord = policyTxCoordinator ?: return
@@ -1450,10 +1451,7 @@ class DualViewModel(
                 }
                 return@launch
             }
-            // 兜底：可信重讀後顯式 reconcile 本地 phase，不永久卡死。
-            // Stage L3: settled==null 永不視為送達——此處顯式 boundedReconcileRead
-            // 兜底（Known 即 IDLE+Known+REFRESHED，Unknown 即 IDLE+Unknown+
-            // REFRESH_FAILED），不經 resync 永不離開 RECONCILING。
+            // Phase6 兜底：settled==null 走共用 fallback（唯一真相 decide）。
             // Stage I1：同上再檢——新 Tx 在途即丟棄（不發布、不碰新 fence），僅清自身 key。
             val curLocalFb = try { activePolicyTx.get() } catch (_: Exception) { null }
             val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
@@ -1464,59 +1462,29 @@ class DualViewModel(
                 }
                 return@launch
             }
-            val read: LoadResult = try {
-                val (r, _) = boundedReconcileRead(tx.store)
-                r
+            // canJoinTx false → abortUnarmedTx，不讀。
+            if (!canJoinTx(tx)) {
+                abortUnarmedTx(tx)
+                return@launch
+            }
+            val (fbRead, fbTimedOut) = try {
+                boundedReconcileRead(tx.store)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                LoadResult.Unavailable
+                LoadResult.Unavailable to false
             }
-            _state.update { cur ->
-                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
-                else if (read is LoadResult.Known) {
-                    disarmBlindClear()
-                    cur.copy(
-                        pendingPolicyWrite = null,
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraft = read.packages,
-                        policyDraftKnown = true,
-                                        policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                        msgKind = MsgKind.INFO,
-                    )
-                } else {
-                    cur.copy(
-                        pendingPolicyWrite = null,
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
-                        msgKind = MsgKind.CHANNEL,
-                    )
-                }
-            }
-            // Stage H2 P1 follow-then-clear: converge cleared the phase above;
-            // now release the (own) fence — CAS guards against a new Tx that
-            // may have started during the bounded read (foreign => no-op).
-            try {
-                activePolicyTx.compareAndSet(tx, null)
-            } catch (_: Exception) {
-            }
-            try {
-                policyReconciling.remove(tx.key)
-            } catch (_: Exception) {
-            }
+            resolveObserverFallback(tx, fbRead, fbTimedOut)
+            return@launch
         }
     }
 
     // Stage H2：init/認領後訂閱（同一 txId+key 即應用，replay=8 晚到仍可見）。
     // 認領即啟動，勝者終態一到即收斂本地（與 reconciler 敗者跟隨同 helper，冪等）。
     // Stage J4：settled==null（掉終態／超時）不再直接返回——走 loser 式有界重讀
-    // 兜底（boundedReconcileRead 單次，Known 即 IDLE＋Known＋REFRESHED，
-    // Unknown 即 IDLE＋Unknown＋REFRESH_FAILED），免 claimed VM 永留 RECONCILING。
+    // 兜底（boundedReconcileRead 單次＋resolveObserverFallback/decide 唯一真相，
+    // 見該 helper KDoc：Adopt 才收斂 IDLE，Retain 續留 RECONCILING，不盲 Known→IDLE），
+    // 免 claimed VM 永留 RECONCILING。
     // 與進行中 reconciler 冪等（同 Tx-settle CAS＋版本守衛，先到者勝）。
     // Stage I1：txId+key 精確比對（免重建後新 Tx 撞舊 id 致 stale 誤同步）＋
     // 應用前 activeTx===tx 再檢（新 Tx 在途即丟棄，僅清自身 key）。
@@ -1531,7 +1499,10 @@ class DualViewModel(
                 null
             }
             if (settled == null) {
-                // J4 兜底：顯式可信重讀後收斂，不永久卡死（同 launchLoserSync 兜底）。
+                // Phase6 兜底：同 launchLoserSync，對稱共用 fallback（唯一真相 decide）。
+                // canJoinTx false → abortUnarmedTx，不讀；保留 I1 丟棄；bounded 取
+                // (r,timedOut)，Unavailable 即 Unknown；CE 透傳。Adopt 清本地 fence
+                //（CAS+key，不碰 coordinator，不搶 reconciler 廣播權）；Retain 全保留。
                 val curLocalFb = try { activePolicyTx.get() } catch (_: Exception) { null }
                 val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
                 if ((curLocalFb != null && curLocalFb !== tx) || (curCoordFb != null && curCoordFb !== tx)) {
@@ -1541,48 +1512,18 @@ class DualViewModel(
                     }
                     return@launch
                 }
-                val read: LoadResult = try {
-                    val (r, _) = boundedReconcileRead(tx.store)
-                    r
+                if (!canJoinTx(tx)) {
+                    abortUnarmedTx(tx)
+                    return@launch
+                }
+                val (fbRead, fbTimedOut) = try {
+                    boundedReconcileRead(tx.store)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    LoadResult.Unavailable
+                    LoadResult.Unavailable to false
                 }
-                _state.update { cur ->
-                    if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
-                    else if (read is LoadResult.Known) {
-                        disarmBlindClear()
-                        cur.copy(
-                            pendingPolicyWrite = null,
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                            policyDraft = read.packages,
-                            policyDraftKnown = true,
-                                        policyDraftCorrupt = false,
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                            msgKind = MsgKind.INFO,
-                        )
-                    } else {
-                        cur.copy(
-                            pendingPolicyWrite = null,
-                            policyWritePhase = PolicyWritePhase.IDLE,
-                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                            policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                            msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
-                            msgKind = MsgKind.CHANNEL,
-                        )
-                    }
-                }
-                // Stage J4 (F2)：兜底僅收斂 phase，不碰本地 fence／reconciling：
-                // 本訂閱與 reconciler 同一 Tx 在途並行，終態發布權留給 reconciler
-                // 經 settlePolicyTx 恰一次結清＋廣播；此處若先清本地 fence
-                //（coordinator 側仍在），reconciler 續行發布
-                // 致終態雙寫（本地 IDLE＋reconciler 廣播各一）。init 認領保證兩者
-                // 同啟（見 init 認領段），fence 必由勝出者結清，不殘留。
-                // （launchLoserSync 兜底不同：敗者跟隨無 reconciler 爭發布權，
-                // 故收斂後清自身 fence；此處不通用。）
+                resolveObserverFallback(tx, fbRead, fbTimedOut)
                 return@launch
             }
             val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
@@ -2397,6 +2338,193 @@ class DualViewModel(
                 if (read.packages == tx.sanitized) PolicyTxSettle.Success(read.packages)
                 else PolicyTxSettle.Mismatch(read.packages)
             is LoadResult.Unknown -> PolicyTxSettle.Unresolved
+        }
+    }
+
+    // Phase6 (P1 observer 雙路徑 false-authority)：兩 observer 兜底共用。
+    // launchLoserSync 與 observeSettledFor 的 settled==null 兜底同調此 helper，
+    // 唯一調 decidePolicyTxSettle，免雙路徑漂移（false-authority 根因：舊兜底見
+    // Known 即 IDLE+Known+REFRESHED，不看 deferred 是否完成，late-failure 誤認
+    // ground B 為成功）。
+    // - canJoinTx false → abortUnarmedTx，不讀（呼叫端已先檢，此處防禦性再檢）。
+    // - timedOut → Retain（逾時 Unknown 不可採納，不調 decide，直接續留）。
+    // - Unresolved（含 !isCompleted 任何 Known、ok=true+Unknown）→ Retain：
+    //   至多 RECONCILING+Known false+REFRESH_FAILED/CHANNEL 提示，pending/fence/
+    //   reconciling 全保留，不 disarm，不 CAS 清，不廣播。
+    // - Success/Mismatch/Failed（deferred 完成+ack+readback）→ Adopt：先過 I1
+    //  （本地/coordinator 仍持同一 Tx，敗者僅清自身 key 不覆寫）+ TOCTOU
+    //   ownership/version（期間新事實即丟棄不覆寫），才收斂 IDLE（Success
+    //   SUCCESS+Known；Mismatch REFRESHED+ground B 永不 SUCCESS；Failed
+    //   WRITE_FAILED+Unknown+markPolicyUnknownLocked）。Adopt 清本地 fence
+    //  （CAS+reconciling 移除，不碰 coordinator：loser 不碰 winner，observe 不搶
+    //   reconciler 廣播權，單發布者仍為 reconciler/winner）。
+    // - Unavailable 即 Unknown（LoadResult.Unknown 子類，decide 已涵蓋）。
+    // - CE 透傳（scope 取消不吞）。
+    internal suspend fun resolveObserverFallback(
+        tx: PolicyTx,
+        read: LoadResult,
+        timedOut: Boolean,
+    ) {
+        if (!canJoinTx(tx)) {
+            abortUnarmedTx(tx)
+            return
+        }
+        val versionAtStart = policyDraftVersion.get()
+        val ownershipSnap = policyOwnershipGen.get()
+        if (timedOut) {
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                else cur.copy(
+                    policyWritePhase = PolicyWritePhase.RECONCILING,
+                    policyDraftKnown = false,
+                    msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        val decision: PolicyTxSettle = try {
+            decidePolicyTxSettle(tx, read)
+        } catch (e: CancellationException) {
+            throw e
+        }
+        if (decision is PolicyTxSettle.Unresolved) {
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                else cur.copy(
+                    policyWritePhase = PolicyWritePhase.RECONCILING,
+                    policyDraftKnown = false,
+                    msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        // Adopt：I1 + TOCTOU，敗者不覆寫新事實（僅清自身 key）。
+        val coord = policyTxCoordinator
+        val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
+        val curCoord = try { coord?.activeTx?.get() } catch (_: Exception) { null }
+        if ((curLocal != null && curLocal !== tx) || (curCoord != null && curCoord !== tx)) {
+            try {
+                policyReconciling.remove(tx.key)
+            } catch (_: Exception) {
+            }
+            return
+        }
+        if (policyDraftVersion.get() != versionAtStart ||
+            policyOwnershipGen.get() != ownershipSnap
+        ) {
+            try {
+                policyReconciling.remove(tx.key)
+            } catch (_: Exception) {
+            }
+            return
+        }
+        when (decision) {
+            is PolicyTxSettle.Success -> {
+                bumpPolicyGenerations()
+                try {
+                    disarmBlindClear()
+                } catch (_: Exception) {
+                }
+                if (tx.isRepair) {
+                    try {
+                        disarmCorruptRepair()
+                    } catch (_: Exception) {
+                    }
+                }
+                val successMsg = if (tx.isRepair) {
+                    policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED))
+                } else if (tx.isClear) {
+                    policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS))
+                } else {
+                    writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized)
+                }
+                val successDraft = if (tx.isClear) emptySet() else decision.packages
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                    else cur.copy(
+                        pendingPolicyWrite = if (tx.isClear) cur.pendingPolicyWrite else null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = successDraft,
+                        policyDraftKnown = true,
+                        policyDraftCorrupt = false,
+                        msg = successMsg,
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+            }
+            is PolicyTxSettle.Mismatch -> {
+                bumpPolicyGenerations()
+                try {
+                    disarmBlindClear()
+                } catch (_: Exception) {
+                }
+                if (tx.isRepair) {
+                    try {
+                        disarmCorruptRepair()
+                    } catch (_: Exception) {
+                    }
+                }
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                    else cur.copy(
+                        pendingPolicyWrite = if (tx.isClear) cur.pendingPolicyWrite else null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = decision.packages,
+                        policyDraftKnown = true,
+                        policyDraftCorrupt = false,
+                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                        msgKind = MsgKind.INFO,
+                    )
+                }
+            }
+            is PolicyTxSettle.Failed -> {
+                markPolicyUnknownLocked()
+                _state.update { cur ->
+                    if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                    else if (tx.isRepair) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        policyDraftCorrupt = true,
+                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
+                    else if (tx.isClear) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        policyDraftCorrupt = false,
+                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
+                    else cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                        policyDraftCorrupt = false,
+                        msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
+                }
+            }
+            is PolicyTxSettle.Unresolved -> {
+                // Unreachable（上已返回），防禦性保留。
+                return
+            }
+        }
+        // Adopt 清本地 fence（CAS+key 移除，不碰 coordinator）。
+        try {
+            activePolicyTx.compareAndSet(tx, null)
+        } catch (_: Exception) {
+        }
+        try {
+            policyReconciling.remove(tx.key)
+        } catch (_: Exception) {
         }
     }
     // F1 有界 join（F1-simple：withTimeout(policyIoTimeoutMs)；F2 再預算化）：
