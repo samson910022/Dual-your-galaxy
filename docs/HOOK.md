@@ -66,13 +66,18 @@
 - App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
   Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
-  （Unknown fence、兩步清除、手動重整、超時轉 RECONCILING 核對）；端到端仍
+  （Unknown fence、blind-clear 二次確認〈僅 Unavailable 瞬斷專用：第一次 tap 告警並 arm，
+  第二次 tap 先判 TTL〈逾 5 分鐘重 arm〉再判世代〈`policyDraftVersion`／`policyFreshnessGen`
+  失配重 arm〉，同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm；
+  Corrupt 永不盲清，走修復流程〉、手動重整、超時轉 RECONCILING 核對）；端到端仍
   DEVICE-UNVERIFIED。
-- 熱路徑 stall 預算（P1-2）：hook 白名單查詢執行緒上的有效政策重讀經
-  `PolicyRefreshBudget` 有界執行器＋50ms 超時（`DEFAULT_STALL_BUDGET_MS`）；
-  超時即回 seed／last-known-good（fail-closed observe-only），慢 binder 讀
-  在背景取消，永不 pin 住查詢執行緒。JVM 以 `PolicyRefreshBudgetTest`
-  鎖定超時回退（leader-timeout）。
+- 熱路徑 stall 預算（P1-2，K4 P2#6 硬化）：hook 白名單查詢執行緒上的有效政策重讀經
+  `PolicyRefreshGate`（at-most-one guard＋stuck-worker breaker）＋零隊列執行器
+  （`ThreadPoolExecutor(0,1,60s,SynchronousQueue)`，滿載／爭用即拒收）＋50ms 超時
+  （`DEFAULT_STALL_BUDGET_MS`）；超時／爭用／拒收／熔斷一律回 seed／last-known-good
+  （fail-closed observe-only），慢 binder 讀在背景取消（uninterruptible 讀亦僅滯留
+  單一 worker，隊列恆零、不增長），永不 pin 住查詢執行緒。JVM 以 `PolicyRefreshBudgetTest`
+  鎖定超時回退（leader-timeout）＋`PolicyRefreshGateTest` 鎖定有界＋熔斷＋invalidate 恢復。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。

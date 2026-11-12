@@ -59,7 +59,8 @@ import kotlinx.coroutines.CancellationException
 //   (成功併發的誤 Unknown 為 fail-closed 可接受)。
 // - 弱鍵:WeakPrefKey (identity hash + WeakReference),map 強引 WeakKey、弱引 prefs;
 //   GC 後條目 get()==null,永不命中活讀者 (活讀者必持強引),fresh resolve 重估。
-//   每次寫入 purge stale (filterKeys get()!=null),讀者忽略 stale;無強引用洩漏 (P3a)。
+//   每次寫入 purge stale (filterKeys get()!=null),讀者忽略 stale;stale 條目至多
+//   殘留至下次寫入 purge (P3a)，不長期持有 prefs 強引用。
 // - 讀失敗 (含 CCE/暫時 IPC) 即 ensure 加毒後 Unknown (relatch):同實例短路零觸碰,
 //   新身份探讀失敗續閂,皆 fail-closed。成功清除僅 token 相等才刪,避免蓋掉併發新毒。
 // - resolvePrefs 在圍欄外 (provider 缺席未觸 prefs 即無污染可能,不設旗)。
@@ -188,7 +189,8 @@ fun sanitizeHookPolicy(raw: Set<String?>): Set<String> = PolicySource.sanitize(r
 // - 生產:LSPosed remote preferences 單鍵 commit (見底部 remoteHookPolicyStore)。
 // - 測試:HashMap 後端。
 // saveRaw 回傳寫入是否成功；save/clear 自身捕捉例外並回傳 false，
-// load 捕捉例外並自清 (見各方法註解)，故本類對呼叫端永不拋出。
+// load 捕捉例外回 Unknown 不刪鍵 (Unavailable/Corrupt，見各方法註解；
+// Stage J3 永不 auto-delete，CCE 亦僅回 Corrupt 不自清)，故本類對呼叫端永不拋出。
 // 讀取結果:區分「已確認值」(含確認空) 與「未知/無法讀取」(service 缺席、
 // IPC 失敗) 與「損壞」(型別損壞 CCE)。UI/VM 不得把 Unknown/損壞當成確認空。
 // Stage L4 P2#3 split: Unknown(interface) -> Unavailable(null/IPC/timeout/

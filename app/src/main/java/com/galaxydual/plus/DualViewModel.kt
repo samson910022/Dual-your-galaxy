@@ -899,16 +899,20 @@ class DualViewModel(
     private val lastRevisionSeenTxId = AtomicLong(-1L)
     private val lastRevisionSeenKey = AtomicReference<String?>(null)
     // Stage L3: rev 水位（committedRevision 序號，publish order = claim order）。
-    // 去重＋overtake 守衛：incoming rev < last 即 stale 丟棄（不覆寫新事實）；
-    // gap（rev 跳號）經 metric/log 顯式標記，仍收斂最新（conflated 有序）。
+    // 去重＋overtake 守衛：rev 已知時由 rev 決定新舊（incoming rev < last 即
+    // stale 丟棄，不覆寫新事實）；rev 任一為 -1 時退回 txId 排序守衛。
+    // gap（rev 跳號 lastRev+1 < incoming rev）經 revisionGapCount/log 顯式標記，
+    // 仍收斂最新（conflated 有序，不靜默丟失）。
     private val lastRevisionSeenRev = AtomicLong(-1L)
+    // Stage L3 gap 可觀測計數（JVM 可讀；跳號僅標記不丟失）。
+    internal val revisionGapCount = AtomicLong(0L)
     private val policyRevisionStale = AtomicBoolean(false)
     // Stage J4 (J3#1 pre-IO TOCTOU)：修訂觀察與寫入路徑序列化的專用互斥。
     // - confirm pre-IO 門控（check base/stale＋lazy.start）在 opMutex 內再持此鎖；
     // - handleForeignSettled 的 stale 標記段同持此鎖（短臨界，無 IO、不長持）。
     // 與 opMutex 順序固定（opMutex→revision），collector 側僅持 revision，
     // 故無死鎖；tryLock 不用（臨界皆短，withLock 等待有界）。
-    // Stage L1 P1: order opMutex→policyRevisionMutex→commitMutex→writeMutex leaf;
+    // Stage L1 P1: order opMutex→writeMutex→policyRevisionMutex→commitMutex;
     // never emit while holding mutex (stage payload under lock, emit after release).
     private val policyRevisionMutex = Mutex()
     // Stage L1 P1: test hook afterClaimBeforeEmit (default no-op) inside tryClaim
@@ -1222,7 +1226,7 @@ class DualViewModel(
                     policyOwnershipGen.incrementAndGet()
                 }
                 // Stage I2：跟隨即記水位（不洗 stale：異 Tx 陳舊仍須顯式重讀）。
-                // Stage L3: 同步 rev 水位（overtake 守衛＋gap 檢出）。
+                // Stage L3: 同步 rev 水位（rev 已知由 rev 守衛，rev==-1 退回 txId；gap 經計數）。
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
                 try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
@@ -1423,8 +1427,8 @@ class DualViewModel(
     // Stage I2 (P2#3#4)：coordinator 級陳舊修訂同步——每 VM init 常駐收集 settled，
     // 不限認領單一 txId（以 lastSeenTxId 去重，replay=8 晚訂閱仍只應用一次）。
     // Stage L3: 改收斂 _latest StateFlow（conflated、有序、無逐出；晚訂閱收斂最新，
-    // gap 經 rev 檢出，永不靜默丟失）。_settled SharedFlow 僅為瞬態 notifier
-    // （相容保留，不再作為真相）。
+    // gap（lastRev+1 < incoming rev）經 revisionGapCount/log 標記，永不靜默丟失）。
+    // _settled SharedFlow 僅為瞬態 notifier（相容保留，不再作為真相）。
     private fun observeRevisionUpdates() {
         val coord = policyTxCoordinator ?: return
         viewModelScope.launch {
@@ -1493,20 +1497,45 @@ class DualViewModel(
             val authoritativeRev = committedRev
             @Suppress("UNUSED_VARIABLE")
             val authoritativePending = stagedPending
-            // Stage L3: rev 守衛 — 舊 rev（overtake 殘留）一律丟棄，免 stale 覆寫
-            // 新事實；gap（跳號）仍收斂最新（下行應用），不靜默丟失。
+            // Stage L3: rev 守衛 — rev 已知時由 rev 決定新舊（overtake 殘留
+            // rev < last 一律丟棄，免 stale 覆寫新事實）；任一 rev==-1 時退回
+            // txId 排序守衛。gap（跳號 lastRev+1 < incoming）經 revisionGapCount
+            // + stderr 顯式標記，仍收斂最新（下行應用），不靜默丟失。
             val lastRev = try { lastRevisionSeenRev.get() } catch (_: Exception) { -1L }
-            if (settled.rev != -1L && lastRev != -1L && settled.rev < lastRev) return
             val lastId = lastRevisionSeenTxId.get()
             val lastK = lastRevisionSeenKey.get()
-            if (settled.txId == lastId && settled.key == lastK) {
-                // Same identity: still advance rev watermark when newer (placeholder
-                // →real 同 rev 覆寫不需動；跨 rev 同 id 極罕，仍推進）。
-                try { if (settled.rev != -1L && settled.rev > lastRev) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
-                return
+            val revKnown = settled.rev != -1L && lastRev != -1L
+            if (revKnown) {
+                if (settled.rev < lastRev) return
+                if (settled.rev > lastRev + 1) {
+                    try {
+                        revisionGapCount.incrementAndGet()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        System.err.println(
+                            "[DualViewModel] revision gap lastRev=$lastRev incoming rev=${settled.rev} txId=${settled.txId}",
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
+                if (settled.txId == lastId && settled.key == lastK) {
+                    // Same identity: still advance rev watermark when newer.
+                    try { if (settled.rev > lastRev) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
+                    return
+                }
+                // rev 已知時不再以 txId 排序（rev 為準；txId 僅為 rev==-1 fallback）。
+            } else {
+                if (settled.txId == lastId && settled.key == lastK) {
+                    // Same identity: still advance rev watermark when newer (placeholder
+                    // →real 同 rev 覆寫不需動；跨 rev 同 id 極罕，仍推進）。
+                    try { if (settled.rev != -1L && settled.rev > lastRev) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
+                    return
+                }
+                // 全域單調 fallback（僅 rev 未知時）：舊修訂（txId 更小）一律丟棄，
+                // 免 stale 覆寫新事實。
+                if (settled.txId < lastId) return
             }
-            // 全域單調：舊修訂（txId 更小）一律丟棄，免 stale 覆寫新事實。
-            if (settled.txId < lastId) return
             val localTx = try { activePolicyTx.get() } catch (_: Exception) { null }
             // 自 Tx 終態經專屬跟隨處理，此處僅記水位不應用。
             if (localTx != null && settled.txId == localTx.txId && settled.key == localTx.key) {
@@ -2282,7 +2311,7 @@ class DualViewModel(
         // 丟棄（不覆寫 fence）；state 同步翻 RECONCILING＋Unknown＋pending。
         // Stage L1 P1: init-reclaim checks committedRevision/pendingPublish under
         // commitMutex (tryLock, non-suspend init; order
-        // opMutex→policyRevisionMutex→commitMutex→writeMutex leaf).
+        // opMutex→writeMutex→policyRevisionMutex→commitMutex).
         run {
             val coordInit = policyTxCoordinator ?: return@run
             var reclaimedTx: PolicyTx? = null
@@ -6726,7 +6755,8 @@ class DualViewModel(
                         // pendingPublish==null-or-self. Drain union replayCache +
                         // pendingPublish.get(). Fail → same abort (settle+unlock+cancel
                         // +UNKNOWN_REFRESH, no IO). Order
-                        // opMutex→policyRevisionMutex→commitMutex→writeMutex leaf.
+                        // opMutex→writeMutex→policyRevisionMutex→commitMutex
+                        // (writeMutex already held outer, revision+commit inner).
                         var preIoAbort = false
                         policyRevisionMutex.withLock {
                             try {
