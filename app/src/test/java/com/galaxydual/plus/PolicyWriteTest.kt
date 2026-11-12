@@ -76,6 +76,14 @@ class PolicyWriteTest {
     @After
     fun tearDown() {
         for (vm in vms) {
+            // dispose() first (disarm + revoke owned PREPARING + best-effort close
+            // of the per-VM reconcile dispatcher; a binder-blocked read thread may
+            // linger to process death — known residue), then cancel the scope.
+            try {
+                vm.dispose()
+            } catch (_: Exception) {
+                // Best effort: test process is discarded anyway.
+            }
             try {
                 vm.viewModelScope.cancel()
             } catch (_: Exception) {
@@ -136,11 +144,48 @@ class PolicyWriteTest {
     }
 
     private fun await(timeoutMs: Long = 5_000L, cond: () -> Boolean) {
+        val caller = try {
+            Thread.currentThread().stackTrace.firstOrNull {
+                it.fileName?.contains("PolicyWriteTest") == true && it.methodName != "await"
+            }?.let { "${it.fileName}:${it.lineNumber} ${it.methodName}" } ?: "unknown-caller"
+        } catch (_: Exception) {
+            "unknown-caller"
+        }
         val deadline = System.currentTimeMillis() + timeoutMs
         while (!cond()) {
             if (System.currentTimeMillis() > deadline) {
+                val vmsDump = try {
+                    vms.mapIndexed { i, vm ->
+                        val st = try { vm.state.value } catch (_: Exception) { null }
+                        val tx = try { activeTxOf(vm) } catch (_: Exception) { "?" }
+                        val stale = try { revisionStaleOf(vm) } catch (_: Exception) { "?" }
+                        "vm[$i] phase=${st?.policyWritePhase} Known=${st?.policyDraftKnown} " +
+                            "Stale=$stale draft=${st?.policyDraft} pending=${st?.pendingPolicyWrite != null} " +
+                            "activeTx=$tx msg=${st?.msg}"
+                    }.joinToString("\n")
+                } catch (_: Exception) {
+                    "vms-dump-failed"
+                }
+                val coordDump = try {
+                    vms.mapNotNull { vm ->
+                        try {
+                            val f = DualViewModel::class.java.getDeclaredField("policyTxCoordinator")
+                                .apply { isAccessible = true }
+                            (f.get(vm) as? PolicyTxCoordinator)?.let {
+                                "coordTx=${it.activeTx.get()} rev=${it.currentRevision()} " +
+                                    "pending=${it.pendingPublish.get()} gen=${it.orphanDropGen.get()} " +
+                                    "dropRev=${it.orphanDropRev.get()} retired=${it.retiredRealCount.get()} " +
+                                    "owner=${it.pendingOwner.get()}"
+                            }
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }.distinct().joinToString("; ").ifEmpty { "no-coord" }
+                } catch (_: Exception) {
+                    "coord-dump-failed"
+                }
                 throw AssertionError(
-                    "timeout waiting for condition: state=${vms.lastOrNull()?.state?.value}",
+                    "timeout at $caller after ${timeoutMs}ms\nvms:\n$vmsDump\ncoord: $coordDump",
                 )
             }
             Thread.sleep(20)
@@ -5913,9 +5958,11 @@ class PolicyWriteTest {
 
             // 顯式 refresh Known（讀 B）即洗白，後續 request 恢復 QUEUED。
             vm.refreshPolicyDraft()
-            await(timeoutMs = 10_000L) { !revisionStaleOf(vm) }
-            assertTrue(vm.state.value.policyDraftKnown)
-            assertEquals(setOf("com.B"), vm.state.value.policyDraft)
+            // Await the asserted state itself (Known && draft==B && !stale), then
+            // re-assert — never await(!stale) first (that passes while still
+            // Unknown and makes the Known assertions below vacuous).
+            await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown && vm.state.value.policyDraft == setOf("com.B") && !revisionStaleOf(vm) }
+            assertFalse(revisionStaleOf(vm))
             seedSelection(vm)
             vm.requestPolicyWrite()
             val pending2 = vm.state.value.pendingPolicyWrite
@@ -6447,10 +6494,10 @@ class PolicyWriteTest {
             assertEquals(pending, vm.state.value.pendingPolicyWrite)
 
             // 外來寫入已落盤，顯式重讀 Known(C) 洗白 stale（pending 保留）。
+            // Await the asserted state itself (Known && draft==C && !stale), then the wash.
             backend.set(setOf("com.C"))
             vm.refreshPolicyDraft()
-            await(timeoutMs = 5_000L) { vm.state.value.policyDraftKnown }
-            assertEquals(setOf("com.C"), vm.state.value.policyDraft)
+            await(timeoutMs = 5_000L) { vm.state.value.policyDraftKnown && vm.state.value.policyDraft == setOf("com.C") && !revisionStaleOf(vm) }
             assertFalse(revisionStaleOf(vm))
             assertEquals(pending, vm.state.value.pendingPolicyWrite)
 
@@ -6674,11 +6721,26 @@ class PolicyWriteTest {
         val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val initLoadEntered = java.util.concurrent.CountDownLatch(1)
+        val ackReadEntered = java.util.concurrent.CountDownLatch(1)
         val store = HookPolicyStore(
             loadRaw = {
-                if (calls.incrementAndGet() == 1) {
+                // initLoadEntered (vm1 cold-start init n==1) never blocks;
+                // ackRead (n==2) blocks on loadRelease. vm2 handover-init (n>=3)
+                // also blocks until release: with Unconfined, immediate vm2 init
+                // wins the coordinator null-window race (fast-path claim clears
+                // activeTx briefly) and accepts stale B as IDLE, missing the
+                // RECONCILING fence. Blocking preserves handover observability
+                // (deterministic RECONCILING) while still latch-based, no sleep.
+                // Cold-start init (n==1) vs ackRead (n==2) distinction satisfies
+                // "init never blocks vs ackRead blocks" for the rotation window
+                // (j4 vm2 inherit+init-load concurrency).
+                val n = calls.incrementAndGet()
+                if (n == 1) {
+                    initLoadEntered.countDown()
                     backend.get()
                 } else {
+                    if (n == 2) ackReadEntered.countDown()
                     while (!loadRelease.get()) {
                         try {
                             Thread.sleep(10)
@@ -6698,17 +6760,19 @@ class PolicyWriteTest {
             // ack bound min(5s,1s)=1s；load 阻塞待取消（CE 發生於 readback 期）。
             val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
             await { vm1.state.value.policyDraftKnown }
+            assertTrue(initLoadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
 
             vm1.confirmPolicyWrite(pendingB)
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
-            // 確保 ackRead 已在途（save 已證成功、load 阻塞中）。
-            Thread.sleep(300)
+            // ackRead 已在途（save 已證成功、load 阻塞中）：latch 取代 sleep(300)。
+            assertTrue(ackReadEntered.await(10, java.util.concurrent.TimeUnit.SECONDS))
             // 旋轉式取消：readback 期 CE。
             vm1.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
-            Thread.sleep(300)
-            // fence 保留（coordinator 仍持 Tx，不被 settle 清掉；舊碼此處為 null）。
+            // fence 保留（coordinator 仍持 Tx，不被 settle 清掉；舊碼此處為 null）：
+            // 第二 sleep(300) 改有界輪詢 retained。
+            await(timeoutMs = 10_000L) { coordinatorTxOf(coord) != null }
             val retained = coordinatorTxOf(coord)
             assertNotNull(retained)
 
@@ -6737,8 +6801,14 @@ class PolicyWriteTest {
             assertFalse(vm2.state.value.policyDraftKnown)
 
             // 放行：save 早已落盤 B（save 證成功），讀回 B 即 SUCCESS 結清。
+            // 合取 await（IDLE && Known && draft==B && !stale）再斷言，免 UI/協調器時序抖動。
             loadRelease.set(true)
-            await(timeoutMs = 20_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            await(timeoutMs = 20_000L) {
+                vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vm2.state.value.policyDraftKnown &&
+                    vm2.state.value.policyDraft == setOf("com.B") &&
+                    !revisionStaleOf(vm2)
+            }
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
             assertNull(vm2.state.value.pendingPolicyWrite)
@@ -7975,6 +8045,9 @@ class PolicyWriteTest {
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.C"), vm2.state.value.policyDraft)
             assertEquals(setOf("com.C"), backend.get())
+            // Coordinator fence cleared (bounded await distinguishes UI vs
+            // coordinator timing: pending null is UI, pendingPublish null is coord).
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
             assertNull(coord.pendingPublish.get())
             assertNull(coordinatorTxOf(coord))
             assertEquals(PolicyWritePhase.IDLE, vm2.state.value.policyWritePhase)
@@ -8580,6 +8653,89 @@ class PolicyWriteTest {
             assertTrue(gotC.known)
             assertNull(coord.activeTx.get())
             assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage O1 P1-2 (overrun discard primitive): budget-overrun catch discards a
+    // staged orphan placeholder atomically (same txId/key, still placeholder) —
+    // tombstone + orphanDropGen bump, no _latest touch; a same-txId/key real
+    // staged concurrently must NOT be cleared (left to retire/recover); a later
+    // write still succeeds. Direct coordinator primitive (ms-level); the full
+    // reconciler staleOutside→catch path (15s budget) is exercised by
+    // j4_cancelAfterCommit_handoverOrPublish (overrun never claims) — a dedicated
+    // 15s overrun integration test is deferred (TODO) to keep the suite fast.
+    @Test
+    fun o1_overrunPlaceholder_discardedAndTombstoned_realUntouched() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val fake = FakePolicyStore()
+            // Part A: orphan placeholder discard.
+            val deferredO = kotlinx.coroutines.CompletableDeferred<Boolean>()
+            val txO = DualViewModel.PolicyTx(
+                coord.nextTxId(), "policy-overrun",
+                deferredO, setOf("com.O"), fake.store, false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
+            )
+            coord.activeTx.set(txO)
+            assertTrue(
+                coord.completeWithRevision(
+                    txO,
+                    PolicySettled(txO.txId, txO.key, setOf("com.O"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val revO = coord.committedRevision.get()
+            assertNotNull(coord.pendingPublish.get())
+            assertEquals(0L, coord.orphanDropGen.get())
+            assertEquals(-1L, coord.orphanDropRev.get())
+
+            assertTrue(coord.discardOverrunPlaceholder(txO.txId, txO.key))
+            assertNull(coord.pendingPublish.get())
+            assertTrue(coord.isTombstoned(txO.txId, txO.key))
+            assertEquals(1L, coord.orphanDropGen.get())
+            assertEquals(revO, coord.orphanDropRev.get())
+            assertNull(coord.latest.value)
+
+            // Same-id late real must not stage (tombstoned, truth untouched).
+            val lateRealO = PolicySettled(txO.txId, txO.key, setOf("com.O"), true, MsgKind.INFO, "mO", false)
+            assertNull(coord.stageRealPayload(lateRealO))
+            assertNull(coord.pendingPublish.get())
+            assertNull(coord.latest.value)
+            assertEquals(1L, coord.orphanDropGen.get())
+
+            // Part B: staged REAL with same-shape identity must NOT be discarded.
+            val deferredR = kotlinx.coroutines.CompletableDeferred<Boolean>()
+            val txR = DualViewModel.PolicyTx(
+                coord.nextTxId(), "policy-overrun-real",
+                deferredR, setOf("com.R"), fake.store, false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
+            )
+            coord.activeTx.set(txR)
+            assertTrue(
+                coord.completeWithRevision(
+                    txR,
+                    PolicySettled(txR.txId, txR.key, setOf("com.R"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val realR = PolicySettled(txR.txId, txR.key, setOf("com.R"), true, MsgKind.INFO, "mR", false)
+            val stagedR = coord.stageRealPayload(realR)
+            assertNotNull(stagedR)
+            assertFalse(coord.discardOverrunPlaceholder(txR.txId, txR.key))
+            assertEquals(stagedR, coord.pendingPublish.get())
+            assertEquals(1L, coord.orphanDropGen.get())
+            assertFalse(coord.isTombstoned(txR.txId, txR.key))
+
+            // Subsequent write still succeeds (emit real, latest advances).
+            coord.emitStaged(stagedR!!)
+            assertEquals(setOf("com.R"), coord.latest.value?.draft)
+            assertTrue(coord.latest.value?.known == true)
+            assertEquals(stagedR.rev, coord.latest.value?.rev)
+            assertEquals(1L, coord.orphanDropGen.get())
+            assertEquals(0L, coord.retiredRealCount.get())
         } finally {
             try {
                 coord.close()
