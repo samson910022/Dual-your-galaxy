@@ -135,6 +135,7 @@
     <string name="policy_corrupt_repair_first">檢測到損壞的政策條目，修復將備份後清除損壞內容（具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理</string>
     <string name="policy_corrupt_repaired">已修復損壞的政策草稿（已備份並清除，現為空）</string>
     <string name="policy_corrupt_repair_failed">修復損壞的政策草稿失敗，仍為損壞狀態；建議重試或檢查服務連線</string>
+    <string name="policy_corrupt_repair_timeout">修復損壞政策逾時，結果未知，正在核對，請勿重試</string>
     <plurals name="batch_create">
         <item quantity="one">建立 %1$d 個分身</item>
         <item quantity="other">建立 %1$d 個分身</item>

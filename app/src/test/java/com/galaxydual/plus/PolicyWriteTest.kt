@@ -7653,4 +7653,222 @@ class PolicyWriteTest {
             }
         }
     }
+
+    // Stage M2 P2#3 (indeterminate): repair delete blocks past the injected IO
+    // deadline (interrupt-ignoring latch) → timeout must NOT settle IDLE+FAILED.
+    // Honest indeterminate: RECONCILING + CORRUPT_REPAIR_TIMEOUT/CHANNEL +
+    // Unknown + Corrupt retained, fence + deferred handle retained (handover).
+    // A second VM's save during the window must be refused with zero IO (no
+    // lost delete); the late delete then wins and ground truth converges to
+    // REPAIRED (Known empty), revision advanced, fences cleared.
+    @Test
+    fun m2_repairTimeout_indeterminateConverges() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val deleteEntered = java.util.concurrent.CountDownLatch(1)
+        val deleteRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    deleteEntered.countDown()
+                    while (!deleteRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    saveCalls.incrementAndGet()
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB.state.value.loading }
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftCorrupt }
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(deleteEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // Indeterminate: RECONCILING + TIMEOUT/CHANNEL + Unknown + Corrupt
+            // retained (not IDLE + RepairFailed), fence + deferred retained.
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIR_TIMEOUT).defaultText(),
+                vmA.state.value.msg,
+            )
+            assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+            assertFalse(vmA.state.value.policyDraftKnown)
+            assertTrue(vmA.state.value.policyDraftCorrupt)
+            assertFalse(vmA.state.value.loading)
+            assertNull(vmA.state.value.pendingPolicyWrite)
+            assertNotNull(activeTxOf(vmA))
+            assertNotNull(coordinatorTxOf(coord))
+
+            // Second VM save during repair RECONCILING: refused, zero IO.
+            seedPolicyDraftKnown(vmB, setOf("com.seed"))
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmB, pendingB)
+            vmB.confirmPolicyWrite(pendingB)
+            Thread.sleep(800)
+            assertEquals(0, saveCalls.get())
+            assertEquals(1, deleteCalls.get())
+            assertTrue(corrupt)
+            assertNull(backing)
+            assertEquals(pendingB, vmB.state.value.pendingPolicyWrite)
+            assertEquals(
+                PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(),
+                vmB.state.value.msg,
+            )
+
+            // Late delete finishes after the deadline; ground truth (post-read
+            // Known empty) converges to REPAIRED — not FAILED, no lost delete.
+            deleteRelease.set(true)
+            await(timeoutMs = 20_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertFalse(vmA.state.value.policyDraftCorrupt)
+            assertEquals(emptySet<String>(), vmA.state.value.policyDraft)
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
+                vmA.state.value.msg,
+            )
+            assertEquals(MsgKind.INFO, vmA.state.value.msgKind)
+            assertEquals(emptySet<String>(), backing)
+            assertEquals(0, saveCalls.get())
+            assertEquals(1, deleteCalls.get())
+            assertNull(activeTxOf(vmA))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(1L, coord.committedRevision.get())
+            assertEquals(emptySet<String>(), coord.latest.value?.draft)
+            assertTrue(coord.latest.value?.known == true)
+        } finally {
+            try {
+                deleteRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage M2 P2#4 (cross-VM stale): repair completion publishes a coordinator
+    // revision (committedRevision/latest/PolicySettled) so siblings invalidate.
+    // VM-A repairs Corrupt→empty; a sibling without pending converges to
+    // Known(empty) via broadcast alone, while a sibling holding a stale pending
+    // is invalidated (Unknown + stale) and must re-confirm only after refresh
+    // (confirm aborts with zero IO, then refresh→rewrite succeeds, rev +1).
+    @Test
+    fun m2_repairBroadcast_invalidatesSibling() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        var deleteCalls = 0
+        var saveCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls++
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    saveCalls++
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            // Sibling without pending: converges via broadcast alone.
+            val vmB2 = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB2.state.value.loading }
+            await(timeoutMs = 5_000L) { vmB2.state.value.policyDraftCorrupt }
+            // Sibling holding a stale pending built on the old revision.
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB.state.value.loading }
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftCorrupt }
+            seedPolicyDraftKnown(vmB, setOf("com.old"))
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmB, pendingB)
+
+            // VM-A repairs Corrupt→empty, published as a coordinator revision.
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            await(timeoutMs = 10_000L) { vmA.state.value.policyDraftKnown }
+            assertEquals(emptySet<String>(), vmA.state.value.policyDraft)
+            assertFalse(vmA.state.value.policyDraftCorrupt)
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
+                vmA.state.value.msg,
+            )
+            assertEquals(1, deleteCalls)
+            assertEquals(1L, coord.committedRevision.get())
+            assertEquals(emptySet<String>(), coord.latest.value?.draft)
+
+            // Sibling without pending converges via broadcast: Known(empty).
+            await(timeoutMs = 10_000L) {
+                vmB2.state.value.policyDraftKnown && vmB2.state.value.policyDraft.isEmpty()
+            }
+            assertFalse(vmB2.state.value.policyDraftCorrupt)
+            assertEquals(PolicyWritePhase.IDLE, vmB2.state.value.policyWritePhase)
+
+            // Sibling with stale pending is invalidated (Unknown, pending kept).
+            await(timeoutMs = 10_000L) { !vmB.state.value.policyDraftKnown }
+            assertEquals(pendingB, vmB.state.value.pendingPolicyWrite)
+
+            // Stale pending must not write: confirm aborts with zero IO.
+            val savesBefore = saveCalls
+            vmB.confirmPolicyWrite(pendingB)
+            await(timeoutMs = 5_000L) { vmB.state.value.pendingPolicyWrite == null }
+            assertEquals(savesBefore, saveCalls)
+            assertEquals(emptySet<String>(), backing)
+            assertEquals(MsgKind.CHANNEL, vmB.state.value.msgKind)
+
+            // Refresh re-establishes Known(empty); a fresh write then succeeds.
+            vmB.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftKnown }
+            assertEquals(emptySet<String>(), vmB.state.value.policyDraft)
+            seedSelection(vmB)
+            vmB.requestPolicyWrite()
+            val pendingC = vmB.state.value.pendingPolicyWrite
+            assertNotNull(pendingC)
+            vmB.confirmPolicyWrite(pendingC!!)
+            await(timeoutMs = 10_000L) { vmB.state.value.pendingPolicyWrite == null }
+            assertEquals(setOf("com.example.a"), vmB.state.value.policyDraft)
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(setOf("com.example.a"), backing)
+            assertEquals(2L, coord.committedRevision.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

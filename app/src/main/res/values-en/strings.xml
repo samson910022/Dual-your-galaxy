@@ -132,6 +132,7 @@
     <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will back up then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>
     <string name="policy_corrupt_repaired">Repaired the corrupt policy draft (backed up and cleared, now empty)</string>
     <string name="policy_corrupt_repair_failed">Failed to repair the corrupt policy draft; still corrupt. Retry or check the service connection.</string>
+    <string name="policy_corrupt_repair_timeout">Repair of the corrupt policy timed out with unknown result; reconciling, do not retry</string>
     <plurals name="batch_create">
         <item quantity="one">Create %1$d clone</item>
         <item quantity="other">Create %1$d clones</item>
