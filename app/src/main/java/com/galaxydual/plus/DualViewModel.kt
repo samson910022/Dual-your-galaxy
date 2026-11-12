@@ -6897,7 +6897,30 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                policyRevisionStale.set(true)
+                                                // Stage M3 (P2#5 orphan fence): foreign pending may be
+                                                // a dead owner's orphan (activeTx==null + no emit).
+                                                // Recover when stale (promote real to _latest, drop
+                                                // placeholder) instead of blocking forever; fresh
+                                                // in-flight fence (age < IoTimeout) still marks stale.
+                                                val recovered = try {
+                                                    h1Coord.recoverStalePendingLocked(
+                                                        System.currentTimeMillis(),
+                                                        policyIoTimeoutMs,
+                                                    )
+                                                } catch (_: Exception) { null }
+                                                if (recovered == null) {
+                                                    policyRevisionStale.set(true)
+                                                } else {
+                                                    val isReal = try {
+                                                        recovered.known || recovered.msg.isNotEmpty()
+                                                    } catch (_: Exception) { true }
+                                                    if (isReal) {
+                                                        lastRevisionSeenTxId.set(recovered.txId)
+                                                        lastRevisionSeenKey.set(recovered.key)
+                                                        try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
                                             }
                                         } catch (_: Exception) {
                                         }
@@ -7957,7 +7980,27 @@ class DualViewModel(
                                             if (stagedDrainClear != null &&
                                                 !(stagedDrainClear.txId == txClear.txId && stagedDrainClear.key == txClear.key)
                                             ) {
-                                                policyRevisionStale.set(true)
+                                                // Stage M3 (P2#5 orphan fence): recover stale foreign
+                                                // pending instead of blocking forever (see confirm gate).
+                                                val recovered = try {
+                                                    h1ClearCoord.recoverStalePendingLocked(
+                                                        System.currentTimeMillis(),
+                                                        policyIoTimeoutMs,
+                                                    )
+                                                } catch (_: Exception) { null }
+                                                if (recovered == null) {
+                                                    policyRevisionStale.set(true)
+                                                } else {
+                                                    val isReal = try {
+                                                        recovered.known || recovered.msg.isNotEmpty()
+                                                    } catch (_: Exception) { true }
+                                                    if (isReal) {
+                                                        lastRevisionSeenTxId.set(recovered.txId)
+                                                        lastRevisionSeenKey.set(recovered.key)
+                                                        try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
                                             }
                                         } catch (_: Exception) {
                                         }
@@ -8945,7 +8988,27 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                policyRevisionStale.set(true)
+                                                // Stage M3 (P2#5 orphan fence): recover stale foreign
+                                                // pending instead of blocking forever (see confirm gate).
+                                                val recovered = try {
+                                                    h1RepairCoord.recoverStalePendingLocked(
+                                                        System.currentTimeMillis(),
+                                                        policyIoTimeoutMs,
+                                                    )
+                                                } catch (_: Exception) { null }
+                                                if (recovered == null) {
+                                                    policyRevisionStale.set(true)
+                                                } else {
+                                                    val isReal = try {
+                                                        recovered.known || recovered.msg.isNotEmpty()
+                                                    } catch (_: Exception) { true }
+                                                    if (isReal) {
+                                                        lastRevisionSeenTxId.set(recovered.txId)
+                                                        lastRevisionSeenKey.set(recovered.key)
+                                                        try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
                                             }
                                         } catch (_: Exception) {
                                         }

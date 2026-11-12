@@ -7871,4 +7871,86 @@ class PolicyWriteTest {
             }
         }
     }
+
+    // Stage M3 (P2#5 orphan fence): cancel after CAS/placeholder before real
+    // stage strands activeTx=null + orphan placeholder (no owner/_latest). New
+    // VMs inherit only activeTx, so pre-IO gates see foreign pending and abort
+    // forever (writes disabled until restart). Coordinator finalizer + stale
+    // recovery in the pre-IO gate must clear the orphan (placeholder carries no
+    // truth) and let the next valid write succeed instead of sticking Unknown.
+    @Test
+    fun m3_cancelAfterClaimBeforeStage_recovers() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            // Simulate "cancel after CAS/placeholder before real stage": winner
+            // completes CAS+rev bump+placeholder stage (completeWithRevision)
+            // then dies before stageRealPayload/emit (activeTx=null + orphan
+            // placeholder, no owner/_latest). This is exactly what
+            // tryClaimStaged leaves behind when the VM-scope coroutine is
+            // cancelled between completeWithRevision (lock released) and
+            // stageRealPayload (needs decision payload).
+            val fakeTxStore = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { raw ->
+                    if (raw != null) backend.set(raw)
+                    true
+                },
+            )
+            // Seed backend B as if the winner's save had landed before death.
+            backend.set(setOf("com.B"))
+            val orphanTx = DualViewModel.PolicyTx(
+                coord.nextTxId(), "policy-test",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.B"), fakeTxStore, false,
+            )
+            coord.activeTx.set(orphanTx)
+            val orphanPlaceholder = PolicySettled(
+                orphanTx.txId, orphanTx.key, setOf("com.B"), false, MsgKind.CHANNEL, "", false,
+            )
+            runBlocking {
+                assertTrue(coord.completeWithRevision(orphanTx, orphanPlaceholder))
+            }
+            val orphan = coord.pendingPublish.get()
+            assertNotNull(orphan)
+            // Fast-path claim stages a placeholder (Unknown + empty msg, never _latest).
+            assertFalse(orphan!!.known)
+            assertTrue(orphan.msg.isEmpty())
+            assertNull(coord.latest.value)
+            assertNull(coordinatorTxOf(coord))
+            // Age the orphan past the next writer's stale threshold so the
+            // pre-IO gate treats it as dead (fresh in-flight fences still abort).
+            Thread.sleep(800)
+            // New VM-B inherits only activeTx (null) — without the finalizer it
+            // would see foreign pending and abort UNKNOWN_REFRESH forever.
+            val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 300)
+            await { vm2.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            vm2.setSourceCatalog(listOf(SourceAppEntry("com.C", "C", 0, false)))
+            vm2.toggleSelection("0:com.C")
+            vm2.requestPolicyWrite()
+            val pendingC = vm2.state.value.pendingPolicyWrite
+            assertNotNull(pendingC)
+            vm2.confirmPolicyWrite(pendingC!!)
+            await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
+            // System recovers: valid write succeeds, not stuck Unknown forever.
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(setOf("com.C"), vm2.state.value.policyDraft)
+            assertEquals(setOf("com.C"), backend.get())
+            assertNull(coord.pendingPublish.get())
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(PolicyWritePhase.IDLE, vm2.state.value.policyWritePhase)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }
