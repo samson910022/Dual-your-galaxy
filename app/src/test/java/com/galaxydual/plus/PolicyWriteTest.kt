@@ -7247,7 +7247,10 @@ class PolicyWriteTest {
 
         vm.requestRepairCorruptDraft()
         vm.confirmRepairCorruptDraft()
-        await(timeoutMs = 10_000L) { vm.state.value.msg.contains("失敗") }
+        await(timeoutMs = 10_000L) {
+            vm.state.value.msg == PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED).defaultText() &&
+                vm.state.value.msgKind == MsgKind.FAILED
+        }
         assertFalse(vm.state.value.policyDraftKnown)
         assertTrue(vm.state.value.policyDraftCorrupt)
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
