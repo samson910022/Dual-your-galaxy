@@ -25,8 +25,14 @@ import java.util.concurrent.atomic.AtomicLong
 // observe-only); the slow task is cancelled best-effort and never blocks the
 // query thread beyond the budget.
 //
-// Stall budget: [DEFAULT_STALL_BUDGET_MS] (50ms) keeps a whitelist query
-// (a local binder query normally sub-ms to a few ms) from stalling on IPC.
+// Stall budget: [DEFAULT_STALL_BUDGET_MS] (50ms) is the END-TO-END total for
+// one effectivePolicy() call (Phase7): capability probe + prefs read share
+// this single budget (remaining = total - elapsed; each segment uses
+// min(50, remaining), remaining <= 0 skips fail-closed to null), plus a
+// budget-aware follower grace (min(50, remaining), exhausted forces 0).
+// It keeps a whitelist query (a local binder query normally sub-ms to a few
+// ms) from stalling on IPC. Documented in docs/HOOK.md §1.1 (end-to-end
+// total); DualHook uses this for every effective-policy refresh.
 // Documented in docs/HOOK.md §1.1; DualHook uses this for every effective-
 // policy refresh. JVM-tested via injected ExecutorService (see
 // PolicyRefreshBudgetTest); production passes a shared daemon executor.
@@ -117,6 +123,41 @@ object PolicyRefreshBudget {
             { r -> Thread(r, threadName).apply { isDaemon = true } },
             ThreadPoolExecutor.AbortPolicy(),
         )
+}
+
+// Pure end-to-end deadline arithmetic for one effectivePolicy() call
+// (Phase7). Single source of truth for DualHook production path and
+// EffectivePolicyDeadlineTest: remaining = total - elapsed, grace =
+// remaining coerced to [0, maxGrace]. All Throwable -> fail-closed
+// (0/empty), never throws. Pure (t0/now injected, no clock read inside)
+// so JVM tests exercise the exact production function.
+object DeadlineBudget {
+    fun remainingMs(
+        t0Nanos: Long,
+        nowNanos: Long,
+        totalMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+    ): Long = try {
+        if (t0Nanos == 0L) totalMs else totalMs - (nowNanos - t0Nanos) / 1_000_000L
+    } catch (_: Throwable) {
+        0L
+    }
+
+    fun graceAtEntry(
+        t0Nanos: Long,
+        nowNanos: Long,
+        totalMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+        maxGraceMs: Long = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS,
+    ): Long = try {
+        remainingMs(t0Nanos, nowNanos, totalMs).coerceIn(0L, maxGraceMs)
+    } catch (_: Throwable) {
+        0L
+    }
+
+    fun nowNanos(): Long = try {
+        System.nanoTime()
+    } catch (_: Throwable) {
+        0L
+    }
 }
 
 // Bounded single-flight refresh gate (K4 P2#6).

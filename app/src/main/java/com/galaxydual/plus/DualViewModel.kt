@@ -958,11 +958,52 @@ class DualViewModel(
     // Request fails closed when coord.orphanDropGen != lastSeenDropGen (an unseen
     // placeholder was dropped without any _latest event).
     private val lastSeenDropGen = AtomicLong(0L)
-    private fun markObservedKnown() {
+    // Phase7 test seam: overrides the authoritative revision source for
+    // TOCTOU barrier tests (fake currentRevision with call counting + latch).
+    // Production stays null (coordinator.currentRevision()); tests set this
+    // to a counting lambda so revBefore/revMoved/mark reads are
+    // deterministically interleaved. Refresh is the representative pinned
+    // path (PolicyToctouBarrierTest); init shares the same
+    // sampledCurrentRevision()/markObservedKnownAt() helpers (same fail-closed
+    // discard), and repair is additionally guarded by the atomic
+    // completeWithRevisionChecked rev gate under commitMutex.
+    internal var revisionSamplerForTests: (() -> Long)? = null
+
+    private fun sampledCurrentRevision(): Long = try {
+        val sampler = revisionSamplerForTests
+        if (sampler != null) {
+            try {
+                sampler()
+            } catch (_: Throwable) {
+                -1L
+            }
+        } else {
+            try {
+                policyTxCoordinator?.currentRevision() ?: -1L
+            } catch (_: Throwable) {
+                -1L
+            }
+        }
+    } catch (_: Throwable) {
+        -1L
+    }
+
+    // Phase7 seam: explicit-rev variant of markObservedKnown for barrier
+    // tests. Production calls markObservedKnown() (samples via
+    // sampledCurrentRevision); tests call markObservedKnownAt(rev) directly
+    // or drive the full path with revisionSamplerForTests.
+    // Phase7 observability for tests: current authoritatively-observed rev.
+    // Fail-closed: any Throwable reading the atomic returns -1L (never throws).
+    internal fun observedRevForTests(): Long = try {
+        authoritativeObservedRev.get()
+    } catch (_: Throwable) {
+        -1L
+    }
+
+    internal fun markObservedKnownAt(rev: Long, dropGen: Long? = null) {
         try {
-            val cur = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
-            if (cur != -1L) {
-                try { authoritativeObservedRev.set(cur) } catch (_: Exception) { }
+            if (rev != -1L) {
+                try { authoritativeObservedRev.set(rev) } catch (_: Exception) { }
             } else {
                 try {
                     val lastR = lastRevisionSeenRev.get()
@@ -971,12 +1012,26 @@ class DualViewModel(
                 }
             }
             try {
-                val dg = try { policyTxCoordinator?.orphanDropGen?.get() ?: 0L } catch (_: Exception) { 0L }
+                val dg = dropGen ?: try {
+                    policyTxCoordinator?.orphanDropGen?.get() ?: 0L
+                } catch (_: Exception) {
+                    0L
+                }
                 lastSeenDropGen.set(dg)
             } catch (_: Exception) {
             }
         } catch (_: Exception) {
         }
+    }
+
+    private fun markObservedKnown() {
+        val cur = sampledCurrentRevision()
+        val dg = try {
+            policyTxCoordinator?.orphanDropGen?.get() ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+        markObservedKnownAt(cur, dg)
     }
     // P1-1 (TOCTOU) invariant: every trusted-read Known path (init load,
     // refreshLocked, repair success) samples revBefore BEFORE the IO and discards
@@ -3195,7 +3250,9 @@ class DualViewModel(
             // concurrent B commits (placeholder rev bump, no _latest event) while
             // this read is in flight, the Known payload below is stale (A) and must
             // be discarded (stay Unknown, fail closed) — never marked observed.
-            val revBeforeInit = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
+            // Phase7: via sampledCurrentRevision() so barrier tests can fake
+            // the revision source (count + latch).
+            val revBeforeInit = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
             // Stage J4 P1 (identity-aware rev-discard): sample the in-flight
             // Tx identities before IO. A rev move caused by our OWN commit
             // (winner bumped version triple above, so the version fence already
@@ -3213,9 +3270,10 @@ class DualViewModel(
                 LoadResult.Unavailable
             }
             // P1-1: revision moved during the read => stale Known, discard.
+            // Phase7: via sampledCurrentRevision() (barrier-test seam).
             val revMovedInit = try {
-                revBeforeInit != -1L && (policyTxCoordinator?.currentRevision() ?: revBeforeInit) != revBeforeInit
-            } catch (_: Exception) { false }
+                revBeforeInit != -1L && sampledCurrentRevision() != revBeforeInit
+            } catch (_: Throwable) { false }
             _state.update { cur ->
                 // Stage G2：認領 fence 優先——Tx 存活時 init load 一律丟棄（不覆寫
                 // RECONCILING＋Unknown＋pending；新 VM 認領已同步發布 fence）。
@@ -7041,7 +7099,9 @@ class DualViewModel(
                 val ownershipSnap = policyOwnershipGen.get()
                 val store = hookPolicyStore
                 // P1-1: sample the authoritative revision BEFORE the trusted IO.
-                val revBeforeRefresh = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
+                // Phase7: via sampledCurrentRevision() (barrier-test seam,
+                // refresh is the representative pinned path).
+                val revBeforeRefresh = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
                 val result = if (store == null) {
                     LoadResult.Unavailable
                 } else try {
@@ -7051,9 +7111,10 @@ class DualViewModel(
                     LoadResult.Unavailable
                 }
                 // P1-1: revision moved during the read => the Known below is stale.
+                // Phase7: via sampledCurrentRevision() (barrier-test seam).
                 val revMovedRefresh = try {
-                    revBeforeRefresh != -1L && (policyTxCoordinator?.currentRevision() ?: revBeforeRefresh) != revBeforeRefresh
-                } catch (_: Exception) { false }
+                    revBeforeRefresh != -1L && sampledCurrentRevision() != revBeforeRefresh
+                } catch (_: Throwable) { false }
                 // Tx 快照（IO 後取值：覆蓋讀期間出現的 Tx；reconciler 已退出時
                 // 仍可見滯留 Tx，late-join 可恢復）。
                 val txSnap = activePolicyTx.get()
@@ -10488,7 +10549,8 @@ class DualViewModel(
                         // revalidation IO + delete IO below. If a concurrent B
                         // commits mid-IO, the success below must be discarded
                         // (stay Unknown, no mark/disarm/stale-wash — fail closed).
-                        val repairRevBefore = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
+                        // Phase7: via sampledCurrentRevision() (barrier-test seam).
+                        val repairRevBefore = try { sampledCurrentRevision() } catch (_: Throwable) { -1L }
                         val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadForRepair() }
                         val finalRead: LoadResult = try {
                             withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { finalJob.await() }
@@ -10663,7 +10725,14 @@ class DualViewModel(
                                     claimForPublish(pcFast)
                                 }
                                 if (!claimedRepair) {
-                                    val revNow = try { coordR?.currentRevision() ?: repairRevBefore } catch (_: Exception) { repairRevBefore }
+                                    // Phase7: via sampledCurrentRevision() so the
+                                    // barrier seam observes the same source.
+                                    // Fail-closed: any Throwable falls back to
+                                    // repairRevBefore (fail-closed discard path).
+                                    val revNow = try {
+                                        val sampled = sampledCurrentRevision()
+                                        if (sampled == -1L) repairRevBefore else sampled
+                                    } catch (_: Throwable) { repairRevBefore }
                                     val revRejected = repairRevBefore != -1L && revNow != repairRevBefore
                                     if (revRejected) {
                                         // Stale read (rev advanced mid-IO): discard, settle

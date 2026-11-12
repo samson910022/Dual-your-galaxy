@@ -10,6 +10,12 @@ package com.galaxydual.hook
 // it is NOT cached. While a good value is cached it is returned (last known
 // good stays applied); after an invalidation a failed read falls back to the
 // seed alone (fail-closed observe-only), since the cached value may be stale.
+//
+// Phase7: follower grace is budget-aware + process-tunable via
+// [get]'s followerGraceMs param (default [DEFAULT_FOLLOWER_GRACE_MS] 50ms;
+// system_server may pass 0 to skip the grace sleep entirely).
+import java.util.concurrent.atomic.AtomicLong
+
 class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }) {
     private val lock = Any()
     private var cached: Set<String> = emptySet()
@@ -70,16 +76,27 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // stale leader never clears a successor) and by invalidate().
     private var inFlightGen: Long? = null
 
-    // Follower grace (Phase3 herd fix): a follower that arrives while a leader
-    // read is in flight sleeps briefly outside the lock, then re-checks for a
-    // committed value before falling back to seed-only. This collapses a herd
-    // onto the leader's result instead of returning permanent seed-only.
-    // Fail-closed in all cases (seed-only fallback, never stale).
-    private val followerGraceMs = 50L
+    // Follower grace (Phase3 herd fix, Phase7 budget-aware): a follower that
+    // arrives while a leader read is in flight sleeps briefly outside the
+    // lock, then re-checks for a committed value before falling back to
+    // seed-only. This collapses a herd onto the leader's result instead of
+    // returning permanent seed-only. Fail-closed in all cases (seed-only
+    // fallback, never stale). Phase7: grace is min(50, remaining end-to-end
+    // budget) passed by DualHook; 0 skips the sleep entirely (system_server
+    // tunable). Hits counted in [followerGraceHits] for observability.
+    companion object {
+        const val DEFAULT_FOLLOWER_GRACE_MS = 50L
+    }
+
+    // Phase7 observability: follower grace waits taken (grace > 0 path).
+    // Skipped (grace <= 0) fast-paths do not increment. Monotonic, never
+    // reset (process-lifetime; tests read only).
+    val followerGraceHits = AtomicLong(0L)
 
     fun get(
         seed: Set<String>,
         nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
+        followerGraceMs: Long = DEFAULT_FOLLOWER_GRACE_MS,
         reader: () -> Set<String>?,
     ): Set<String> {
         // Stage C: gate-closed short-circuit. Returns empty without touching
@@ -143,12 +160,25 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             // spurious wakeups by design — there is no wait to wake early
             // from). The leader's former notifyAll was dead (nobody waits)
             // and is removed; followers never block the leader.
-            try {
-                Thread.sleep(followerGraceMs)
-            } catch (t: Throwable) {
-                if (t is InterruptedException) try {
-                    Thread.currentThread().interrupt()
+            // Phase7: grace <= 0 skips the sleep (deadline exhausted /
+            // system_server tunable 0) for an immediate seed-only fast path.
+            val grace = try {
+                followerGraceMs.coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
+            } catch (_: Throwable) {
+                0L
+            }
+            if (grace > 0) {
+                try {
+                    followerGraceHits.incrementAndGet()
                 } catch (_: Throwable) {
+                }
+                try {
+                    Thread.sleep(grace)
+                } catch (t: Throwable) {
+                    if (t is InterruptedException) try {
+                        Thread.currentThread().interrupt()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
             synchronized(lock) {

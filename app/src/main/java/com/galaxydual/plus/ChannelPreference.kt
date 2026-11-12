@@ -83,14 +83,19 @@ fun channelPreferenceFromStored(raw: String?): ChannelPreference =
 // Reads the persisted choice (default AUTO). Thin wrapper over the pure
 // mapping above; never called on JVM tests (Android stub would throw).
 // Corrupt-data policy: a stored value of the wrong type (or any other read
-// failure) is treated as unrecoverable and falls back to AUTO (fail-closed),
-// rather than propagating ClassCastException to the caller. This keeps a
-// mistyped platform entry from crashing startup; the entry itself is left
-// untouched (no self-clear) because the type cannot be safely rewritten here.
+// failure, including Error) is treated as unrecoverable and falls back to
+// AUTO (fail-closed), rather than propagating ClassCastException to the
+// caller. This keeps a mistyped platform entry from crashing startup; the
+// entry itself is left untouched (no self-clear) because the type cannot be
+// safely rewritten here. Phase7: catches Throwable (hostile prefs impl may
+// throw Error); CancellationException is re-thrown (cancellation is never
+// swallowed as AUTO).
 fun loadChannelPreference(prefs: SharedPreferences): ChannelPreference =
     try {
         channelPreferenceFromStored(prefs.getString(CHANNEL_PREF_KEY, null))
-    } catch (_: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         ChannelPreference.AUTO
     }
 

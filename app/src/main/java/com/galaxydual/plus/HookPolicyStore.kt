@@ -106,6 +106,12 @@ internal data class PoisonState(
 )
 
 internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPreferences>(referent) {
+    // Note on identityHash collisions: two distinct prefs instances may share
+    // the same identityHashCode (32-bit hash, birthday collisions possible).
+    // Correctness never relies on the hash alone: equals() requires a === b
+    // (referential identity on live referents, GC'd entries never match), so
+    // a collision only costs a hash-bucket probe, never a false poison/evidence
+    // hit. hashCode is snapshotted at construction so a GC'd key stays stable.
     private val hash = System.identityHashCode(referent)
     override fun hashCode(): Int = hash
     override fun equals(other: Any?): Boolean {
@@ -164,7 +170,34 @@ internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
     } catch (_: Throwable) {
         0
     }
-    if (curHash == 0) return true
+    // Phase7: curHash == 0 fail-closed (was: return true). 0 arises from a
+    // throwing identityHashCode (hostile prefs) or a genuine 0 hash
+    // (1/2^32). Either way the identity is unverifiable, so the read must
+    // not be trusted when poison/evidence is present. Count + log like any
+    // other mismatch below.
+    if (curHash == 0) {
+        try {
+            identityMismatchCount.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        try {
+            logStore("provider identity unverifiable (hash 0, fail-closed)")
+        } catch (_: Throwable) {
+        }
+        val poisonedZero = try {
+            val s = remotePoison.get()
+            s.overflow || s.entries.isNotEmpty()
+        } catch (_: Throwable) {
+            false
+        }
+        val hasEvidenceZero = try {
+            remoteCorruptEvidence.get().isNotEmpty()
+        } catch (_: Throwable) {
+            false
+        }
+        if (!poisonedZero && !hasEvidenceZero) return true
+        return false
+    }
     val prev = try {
         lastPrefsHash.get()
     } catch (_: Throwable) {

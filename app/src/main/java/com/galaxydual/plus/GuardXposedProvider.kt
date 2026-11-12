@@ -67,6 +67,11 @@ class GuardXposedProvider(
     // 512 為防禦性上限，避免極端偽造/多用戶爆炸撐大 map）。超限時驅逐任意
     // 最舊首鍵（best-effort LRU-ish；丟失僅影響該被驅逐 uid 的窗口計數，
     // 下次重建，不影響信任門控）。
+    // Phase7 註記：滿表時選擇「驅逐最舊＋放行本次（return false）」而非
+    // 「滿即 return true」。理由：rateWindows 僅記窗口計數（per-uid 計數器），
+    // 信任判定另由 isTrustedXposedCaller 獨立執行，驅逐永不放寬信任門控；
+    // 滿即拒（return true）會把合法的新 uid（例如多用戶新 daemon）在表滿時
+    // 誤判為洪水而拒絕握手，可用性損失大於節流收益，故保留驅逐語義。
     private val rateLock = Any()
     private val rateWindows = mutableMapOf<Int, Pair<Long, Int>>()
     private val rejectionLogs = AtomicInteger(0)
