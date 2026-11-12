@@ -6871,4 +6871,120 @@ class PolicyWriteTest {
         }
     }
 
+    // Stage L1 P1: coordinator CAS visible before revision event; old pending C
+    // must never overwrite unseen B. VM1 request+confirm B save blocked → timeout
+    // handover; gate B reconciler at afterClaimBeforeEmit (CAS done,
+    // committedRevision bumped, replayCache no B); VM2 fresh request C baseRev →
+    // confirm C must never start IO (saveCalls[C]==0, backend B-value), aborts
+    // UNKNOWN_REFRESH; release B → late B emits; assert backend==B, both converge
+    // draft==B/Known, committedRevision==rev(B), C never persisted.
+    @Test
+    fun p1_casBeforeEvent_noOverwrite() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveCallsB = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCallsC = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStartedB = java.util.concurrent.CountDownLatch(1)
+        val saveReleaseB = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == setOf("com.B")) {
+                    saveCallsB.incrementAndGet()
+                    saveStartedB.countDown()
+                    while (!saveReleaseB.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    backend.set(raw)
+                    true
+                } else if (raw == setOf("com.C")) {
+                    saveCallsC.incrementAndGet()
+                    backend.set(raw)
+                    true
+                } else {
+                    if (raw != null) backend.set(raw)
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            // VM1: request B (baseCoordinatorRevision snapshots 0).
+            val vm1 = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vm1.state.value.policyDraftKnown }
+            vm1.setSourceCatalog(listOf(SourceAppEntry("com.B", "B", 0, false)))
+            vm1.toggleSelection("0:com.B")
+            vm1.requestPolicyWrite()
+            val pendingB = vm1.state.value.pendingPolicyWrite
+            assertNotNull(pendingB)
+            assertEquals(0L, pendingB!!.baseCoordinatorRevision)
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(saveStartedB.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            // Gate B publish at afterClaimBeforeEmit (CAS done, rev bumped, replay no B).
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val releaseGate = java.util.concurrent.CountDownLatch(1)
+            vm1.afterClaimBeforeEmit = {
+                entered.countDown()
+                releaseGate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                Unit
+            }
+            // Release save → backend=B, deferred completes, autoRecheck claims B.
+            saveReleaseB.set(true)
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            // CAS visible: committed bumped, pending staged, replayCache no B.
+            await(timeoutMs = 5_000L) { coord.committedRevision.get() == 1L }
+            assertEquals(1L, coord.currentRevision())
+            assertNotNull(coord.pendingPublish.get())
+            assertTrue(coord.settled.replayCache.none { it.draft == setOf("com.B") })
+            // VM2: fresh request C (baseRev snapshots 1, after B bump).
+            val vm2 = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm2.state.value.policyDraftKnown }
+            vm2.setSourceCatalog(listOf(SourceAppEntry("com.C", "C", 0, false)))
+            vm2.toggleSelection("0:com.C")
+            vm2.requestPolicyWrite()
+            val pendingC = vm2.state.value.pendingPolicyWrite
+            assertNotNull(pendingC)
+            assertEquals(1L, pendingC!!.baseCoordinatorRevision)
+            // Confirm C must never start IO (saveCalls[C]==0, backend B-value).
+            vm2.confirmPolicyWrite(pendingC)
+            Thread.sleep(800)
+            assertEquals(0, saveCallsC.get())
+            assertEquals(setOf("com.B"), backend.get())
+            assertEquals(PolicyWritePhase.IDLE, vm2.state.value.policyWritePhase)
+            assertFalse(vm2.state.value.policyDraftKnown)
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertEquals(
+                PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+                vm2.state.value.msg,
+            )
+            assertEquals(MsgKind.CHANNEL, vm2.state.value.msgKind)
+            // Release B → late B emits; both converge draft==B/Known.
+            releaseGate.countDown()
+            await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            await(timeoutMs = 20_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            await(timeoutMs = 10_000L) { vm1.state.value.policyDraftKnown && vm2.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), backend.get())
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(1L, coord.committedRevision.get())
+            assertEquals(1L, coord.currentRevision())
+            assertNull(coord.pendingPublish.get())
+            assertTrue(coord.settled.replayCache.any { it.draft == setOf("com.B") })
+            assertEquals(0, saveCallsC.get())
+            assertNull(activeTxOf(vm1))
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
 }
