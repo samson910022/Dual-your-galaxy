@@ -4186,8 +4186,9 @@ class MainActivity : ComponentActivity() {
         // (!saving || reconciling)；舊 savingOnly 中介與此等價（真值表一致），故省去。
         val cancelable = policyDialogShouldBeCancelable(policySaving, policyReconciling)
         if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
+            // Stage L4: positive 門控改可檢視上界（含 total<=200，display≡inspectability）。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(confirmSaving, policyAcknowledged)
+                policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, confirmSaving)
             // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
             // Stage J4：RECONCILING 點按為本地 dismiss（不清 VM fence）。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
@@ -4394,19 +4395,20 @@ class MainActivity : ComponentActivity() {
             // 下一次 render 的 early-return 同步，真正寫入門控在 Positive 點擊
             // 即時重讀＋VM confirmPolicyWrite 世代守衛雙層 fail-closed。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                policyDialogCanConfirm(confirmSaving, checked)
+                policyWriteCanConfirmInspectable(pending.packages.size, checked, confirmSaving)
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING/
             // RECONCILING 才禁用（QUEUED 可確認，避免 request 即 QUEUED 導致恆
             // 禁用死鎖；核對中請勿重試）；世代守衛在 VM。
+            // Stage L4: 點擊亦經可檢視上界（display≡inspectability，超限禁寫）。
             val curPolicySaving = try {
                 val ph = vm.state.value.policyWritePhase
                 ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
             } catch (_: Exception) {
                 confirmSaving
             }
-            if (policyDialogCanConfirm(curPolicySaving, policyAcknowledged)) vm.confirmPolicyWrite(pending)
+            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) vm.confirmPolicyWrite(pending)
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
         // 點按時即時重讀 phase；Stage J4：SAVING 即 toast「寫入中，無法取消」且不調 VM；
@@ -4456,7 +4458,7 @@ class MainActivity : ComponentActivity() {
             policyWriteDialog = null; shownPolicyWrite = null; shownPolicyWriteSaving = false
         }
         policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-            policyDialogCanConfirm(confirmSaving, policyAcknowledged)
+            policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, confirmSaving)
         // Phase 5：negative 保持可點（見上 toast/本地 dismiss），Back/觸外以 cancelable 門控。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
         policyWriteDialog?.setCancelable(cancelable)
@@ -4541,9 +4543,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun policyWriteListSummary(total: Int, shownSize: Int, expanded: Boolean): String {
-        // Direct size comparison (no derived rest): expanded or fully shown ->
-        // full-list CD, else truncated CD with the shown count.
-        return if (expanded || total <= shownSize) {
+        // Stage L4 display≡inspectability：超限展開仍視截斷（僅 200 可檢視，
+        // 不得謊稱完整）。expanded 僅 total<=200 才回完整，否則一律截斷 CD。
+        val useFull = (expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shownSize
+        return if (useFull) {
             try {
                 getString(R.string.policy_write_list_cd, total)
             } catch (_: Exception) {
@@ -4559,20 +4562,36 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun policyWriteToggleLabel(expanded: Boolean, total: Int, shownSize: Int): String {
+        // Stage L4: 超限收合按鈕改 capped（「顯示全部」失實，改前 200＋分批）。
+        val overCap = total > POLICY_DIALOG_DISPLAY_MAX
         return try {
             if (expanded) getString(R.string.policy_write_show_less, shownSize)
+            else if (overCap) getString(R.string.policy_write_show_all_capped, total, shownSize)
             else getString(R.string.policy_write_show_all, total)
         } catch (_: Exception) {
-            policyWriteToggleLabelFallback(expanded, total, shownSize)
+            if (!expanded && overCap) policyWriteShowAllCappedFallback(total, shownSize)
+            else policyWriteToggleLabelFallback(expanded, total, shownSize)
         }
     }
 
     private fun policyWriteToggleAnnounce(expanded: Boolean, total: Int, shownSize: Int): String {
+        // Stage L4: 超限展開播報改 capped（「完整清單」失實，改前 200＋分批）。
+        val overCap = total > POLICY_DIALOG_DISPLAY_MAX
         return try {
-            if (expanded) getString(R.string.policy_write_expanded_announce, total)
+            if (expanded && overCap) getString(R.string.policy_write_expanded_announce_capped, total, shownSize)
+            else if (expanded) getString(R.string.policy_write_expanded_announce, total)
             else getString(R.string.policy_write_collapsed_announce, shownSize)
         } catch (_: Exception) {
-            policyWriteToggleAnnounceFallback(expanded, total, shownSize)
+            if (expanded && overCap) policyWriteExpandedAnnounceCappedFallback(total, shownSize)
+            else policyWriteToggleAnnounceFallback(expanded, total, shownSize)
+        }
+    }
+
+    private fun policyWriteOverCapWarning(total: Int, shownSize: Int): String {
+        return try {
+            getString(R.string.policy_write_over_cap_warning, total, shownSize)
+        } catch (_: Exception) {
+            policyWriteOverCapWarningFallback(total, shownSize)
         }
     }
 
@@ -4617,6 +4636,11 @@ class MainActivity : ComponentActivity() {
                 "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
             }
             message += "\n$droppedSuffix"
+        }
+        // Stage L4: 超限警告（total>200 即附，display≡inspectability 指引分批）。
+        if (pending.packages.size > POLICY_DIALOG_DISPLAY_MAX) {
+            val shown = minOf(pending.packages.size, POLICY_DIALOG_DISPLAY_MAX)
+            message += "\n" + policyWriteOverCapWarning(pending.packages.size, shown)
         }
         val busySuffix = try {
             if (policySaving) getString(R.string.policy_write_busy_saving)
@@ -6549,8 +6573,22 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
 // - positive：僅寫入中（SAVING）禁用＋需 ack 勾選；排隊（QUEUED）可確認/可取消。
 // - negative/Back：僅 SAVING 禁用（queued 仍可取消，P1 #1 語義）。
 // - busy 後綴：SAVING 顯示寫入中，QUEUED（op 非 saving）顯示等待中，皆附換行。
+// Stage L4 P2#2 (b) 單次確認可檢視上界 200（display≡inspectability）：
+// positive 另須 total<=POLICY_DIALOG_DISPLAY_MAX；超限即禁用＋超限警告＋
+// 分批指引（寫入仍用完整 pending.packages，但須經門控分批確認）。
 internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean): Boolean =
     !policySaving && acknowledged
+
+// Stage L4 單確認可檢視門控 single source：!saving && ack && total<=200。
+// 二參舊版保留（既有測試／舊調用，不含 total 檢查）；三參／Inspectable 版為
+// 生產真相（syncPolicyWriteDialog 一律用此）。display≡inspectability。
+internal fun policyWriteCanConfirmInspectable(total: Int, acknowledged: Boolean, policySaving: Boolean): Boolean =
+    !policySaving && acknowledged && total <= POLICY_DIALOG_DISPLAY_MAX
+
+internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean, total: Int): Boolean =
+    policyWriteCanConfirmInspectable(total, acknowledged, policySaving)
+
+internal fun policyWriteIsOverCap(total: Int): Boolean = total > POLICY_DIALOG_DISPLAY_MAX
 
 // Stage J4 (dialog trap)：SAVING 不可取消 vs RECONCILING 可取消（僅 UI 層 dismiss，
 // 不清 VM fence）。雙參為真相；單參相容保留（舊測試／舊調用：reconciling=false）。
@@ -6602,7 +6640,9 @@ internal fun policyWriteExpandedShouldReset(storedGeneration: Long?, pendingGene
     storedGeneration != pendingGeneration
 
 internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean): String =
-    if (expanded || total <= shown) "政策包名列表，共 $total 項"
+    // Stage L4: 超限展開仍視截斷（display≡inspectability：expanded 僅 200，
+    // 不得謊稱完整）。expanded 僅 total<=200 才回完整，否則一律截斷。
+    if ((expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shown) "政策包名列表，共 $total 項"
     else "政策包名列表，共 $total 項，僅顯示前 $shown 項"
 
 internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String =
@@ -6610,6 +6650,19 @@ internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown
 
 internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String =
     if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
+
+// Stage L4 capped variants fallback（超限時 Toggle/播報複用收合語義）：
+// - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超出須分批）。
+// - expanded_announce_capped：展開播報超限文案（已展開前 200，共 N，超出須分批）。
+// - over_cap_warning：dialog 超限警告（共 N，僅示前 200，須分批）。
+internal fun policyWriteShowAllCappedFallback(total: Int, shown: Int): String =
+    "顯示前 $shown 項（共 $total 項，超出須分批）"
+
+internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): String =
+    "已展開前 $shown 項，共 $total 項，超出須分批"
+
+internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String =
+    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項），請分批勾選寫入（每批 ≤$shown 項）以確保逐項可檢視確認"
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
@@ -6806,6 +6859,10 @@ private class DualViewModelFactory(
                         PolicyTextKind.REFRESH_FAILED -> res.getString(R.string.policy_refresh_failed)
                         PolicyTextKind.BLIND_CLEAR_FIRST -> res.getString(R.string.policy_blind_clear_first)
                         PolicyTextKind.BLIND_CLEAR_EXPIRED -> res.getString(R.string.policy_blind_clear_expired)
+                        PolicyTextKind.CORRUPT_DETECTED -> res.getString(R.string.policy_corrupt_detected)
+                        PolicyTextKind.CORRUPT_REPAIR_FIRST -> res.getString(R.string.policy_corrupt_repair_first)
+                        PolicyTextKind.CORRUPT_REPAIRED -> res.getString(R.string.policy_corrupt_repaired)
+                        PolicyTextKind.CORRUPT_REPAIR_FAILED -> res.getString(R.string.policy_corrupt_repair_failed)
                         PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
                         PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
                         PolicyTextKind.UNRESOLVED_REFRESH -> res.getString(R.string.policy_unresolved_refresh)

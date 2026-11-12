@@ -54,6 +54,83 @@ class StageJ5PolishTest {
         assertEquals(512 - 50, collapsedRest)
     }
 
+    // Stage L4 P2#2 (b) 200/201 邊界：display≡inspectability。
+    // 200 可確認（門控 true＋完整 CD），201 超限禁用＋截斷 CD＋capped 文案。
+    @Test
+    fun inspectabilityBound_200_201_boundary() {
+        val sorted200 = (1..200).map { "com.example.%03d".format(it) }
+        val (shown200, rest200) = policyWriteVisibleList(sorted200, true)
+        assertEquals(200, shown200.size)
+        assertEquals(0, rest200)
+        // 200 可確認。
+        assertTrue(policyWriteCanConfirmInspectable(total = 200, acknowledged = true, policySaving = false))
+        assertTrue(policyDialogCanConfirm(policySaving = false, acknowledged = true, total = 200))
+        assertFalse(policyWriteIsOverCap(200))
+        // 完整 CD（expanded＋total<=200 即完整）。
+        assertEquals("政策包名列表，共 200 項", policyWriteListCdFallback(total = 200, shown = 200, expanded = true))
+
+        val sorted201 = (1..201).map { "com.example.%03d".format(it) }
+        val (shown201, rest201) = policyWriteVisibleList(sorted201, true)
+        assertEquals(200, shown201.size)
+        assertEquals(1, rest201)
+        // 201 超限禁用（即使 ack＋非 saving）。
+        assertFalse(policyWriteCanConfirmInspectable(total = 201, acknowledged = true, policySaving = false))
+        assertFalse(policyDialogCanConfirm(policySaving = false, acknowledged = true, total = 201))
+        assertTrue(policyWriteIsOverCap(201))
+        // 超限展開仍視截斷（display≡inspectability）。
+        val cd201 = policyWriteListCdFallback(total = 201, shown = 200, expanded = true)
+        assertTrue(cd201.contains("201"))
+        assertTrue(cd201.contains("200"))
+        assertTrue(cd201.contains("僅顯示前"))
+    }
+
+    // Stage L4 gate unit：total/ack/saving 三維。
+    @Test
+    fun inspectableGate_totalAckSaving() {
+        // 200 內：!saving && ack 才 true。
+        assertTrue(policyWriteCanConfirmInspectable(50, true, false))
+        assertFalse(policyWriteCanConfirmInspectable(50, false, false))
+        assertFalse(policyWriteCanConfirmInspectable(50, true, true))
+        assertFalse(policyWriteCanConfirmInspectable(50, false, true))
+        // 舊二參相容（不含 total 檢查，保既有測試綠）。
+        assertTrue(policyDialogCanConfirm(policySaving = false, acknowledged = true))
+        assertFalse(policyDialogCanConfirm(policySaving = true, acknowledged = true))
+        // 512 sanitizer 上界仍可寫（write-full 契約），但門控擋下（須分批）。
+        assertFalse(policyWriteCanConfirmInspectable(512, true, false))
+        assertTrue(policyWriteIsOverCap(512))
+        val (shown512, rest512) = policyWriteVisibleList((1..512).map { "com.example.%03d".format(it) }, true)
+        assertEquals(200, shown512.size)
+        assertEquals(312, rest512)
+    }
+
+    // Stage L4 201＋512 capped 文案：Toggle/播報超限變體含雙計數；write-full
+    // 契約保留（pending.packages 仍完整，僅顯示截斷＋門控禁用）。
+    @Test
+    fun cappedVariants_201_512_containCounts() {
+        for (total in listOf(201, 512)) {
+            val shown = 200
+            val toggleCapped = policyWriteShowAllCappedFallback(total, shown)
+            assertTrue(toggleCapped.contains(total.toString()))
+            assertTrue(toggleCapped.contains(shown.toString()))
+            assertTrue(toggleCapped.contains("分批"))
+            val announceCapped = policyWriteExpandedAnnounceCappedFallback(total, shown)
+            assertTrue(announceCapped.contains(total.toString()))
+            assertTrue(announceCapped.contains(shown.toString()))
+            assertTrue(announceCapped.contains("分批"))
+            val warning = policyWriteOverCapWarningFallback(total, shown)
+            assertTrue(warning.contains(total.toString()))
+            assertTrue(warning.contains(shown.toString()))
+            // 超限展開 CD 複用截斷語義（非完整）。
+            val cd = policyWriteListCdFallback(total, shown, expanded = true)
+            assertTrue(cd.contains("僅顯示前"))
+            // 門控禁用（positive disabled），即使 ack＋非 saving。
+            assertFalse(policyWriteCanConfirmInspectable(total, true, false))
+        }
+        // 200 內 capped 不觸發（完整文案無「分批」）。
+        val normalToggle = policyWriteToggleLabelFallback(expanded = false, total = 50, shown = 50)
+        assertFalse(normalToggle.contains("分批"))
+    }
+
     @Test
     fun vmMessageRes_exactLiterals() {
         assertEquals(R.string.invalid_package to null, vmMessageRes("invalid package"))
