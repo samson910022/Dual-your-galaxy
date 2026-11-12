@@ -10,8 +10,10 @@ package com.galaxydual.plus
 
 import android.os.Bundle
 import android.os.Process
+import android.net.TestFakeUri
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -365,8 +367,7 @@ class GuardXposedProviderTest {
 
     // 速率窗口表有界：512 上限下大量不同 uid 不無限增長（驅逐舊鍵）。
     @Test
-    fun rateWindowsAreBounded() {
-        var now = 0L
+    fun rateWindowsAreBounded() {        var now = 0L
         var callingUid = 10000
         val delegateCall = RecordingDelegateCall()
         val provider = GuardXposedProvider(
@@ -386,4 +387,123 @@ class GuardXposedProviderTest {
         val map = field.get(provider) as Map<Int, *>
         assertTrue("rateWindows must stay bounded, was ${map.size}", map.size <= GuardXposedProvider.RATE_WINDOWS_MAX)
     }
+
+    // ---- Phase4 CRUD:函式庫 provider 的 CRUD 本就 inert (null/0),Guard 直接
+    // 回 null/0,絕不委派 (delegateCall 零觸碰)。Uri/ContentValues 皆為 stub
+    // 安全構造 (建構子 no-op,實作不觸碰參數)。
+
+    private fun crudProvider(delegateCall: RecordingDelegateCall): GuardXposedProvider =
+        GuardXposedProvider(
+            callingUidProvider = { 0 },
+            myUidProvider = { myUid },
+            delegateCall = delegateCall,
+        )
+
+    @Test
+    fun queryNeverDelegatesReturnsNull() {
+        val delegateCall = RecordingDelegateCall()
+        assertNull(crudProvider(delegateCall).query(TestFakeUri(), null, null, null, null))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    @Test
+    fun getTypeNeverDelegatesReturnsNull() {
+        val delegateCall = RecordingDelegateCall()
+        assertNull(crudProvider(delegateCall).getType(TestFakeUri()))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    @Test
+    fun insertNeverDelegatesReturnsNull() {
+        val delegateCall = RecordingDelegateCall()
+        assertNull(crudProvider(delegateCall).insert(TestFakeUri(), null))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    @Test
+    fun deleteNeverDelegatesReturnsZero() {
+        val delegateCall = RecordingDelegateCall()
+        assertEquals(0, crudProvider(delegateCall).delete(TestFakeUri(), null, null))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    @Test
+    fun updateNeverDelegatesReturnsZero() {
+        val delegateCall = RecordingDelegateCall()
+        assertEquals(0, crudProvider(delegateCall).update(TestFakeUri(), null, null, null))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    // ---- Phase4 provider-throw fail-closed:四種注入 provider 拋出
+    // (Runtime/Exception 與 Error 兩系) 一律回 null,不越過 Guard 邊界。
+    // callingUidProvider 拋 -> null (fail-closed)。
+    @Test
+    fun callingUidProviderThrowingReturnsNullFailClosed() {
+        val throwingRuntime = GuardXposedProvider(
+            callingUidProvider = { throw RuntimeException("uid boom") },
+            myUidProvider = { myUid },
+            delegateCall = { _, _, _ -> Bundle() },
+        )
+        assertNull(throwingRuntime.call("SendBinder", null, Bundle()))
+        val throwingError = GuardXposedProvider(
+            callingUidProvider = { throw AssertionError("uid boom") },
+            myUidProvider = { myUid },
+            delegateCall = { _, _, _ -> Bundle() },
+        )
+        assertNull(throwingError.call("SendBinder", null, Bundle()))
+    }
+
+    // myUidProvider 拋 -> null (fail-closed)。
+    @Test
+    fun myUidProviderThrowingReturnsNullFailClosed() {
+        val throwingRuntime = GuardXposedProvider(
+            callingUidProvider = { 0 },
+            myUidProvider = { throw RuntimeException("myuid boom") },
+            delegateCall = { _, _, _ -> Bundle() },
+        )
+        assertNull(throwingRuntime.call("SendBinder", null, Bundle()))
+        val throwingError = GuardXposedProvider(
+            callingUidProvider = { 0 },
+            myUidProvider = { throw AssertionError("myuid boom") },
+            delegateCall = { _, _, _ -> Bundle() },
+        )
+        assertNull(throwingError.call("SendBinder", null, Bundle()))
+    }
+
+    // 時鐘拋 (nowMsProvider) -> 速率門控 fail-open (不誤殺 daemon),但信任門控
+    // 仍在:非受信回 null,受信仍委派。
+    @Test
+    fun clockThrowingKeepsTrustGate() {
+        val untrustedClockThrow = GuardXposedProvider(
+            callingUidProvider = { 10124 },
+            myUidProvider = { myUid },
+            delegateCall = { _, _, _ -> Bundle() },
+            nowMsProvider = { throw RuntimeException("clock boom") },
+        )
+        assertNull(untrustedClockThrow.call("SendBinder", null, Bundle()))
+        val trustedClockThrow = GuardXposedProvider(
+            callingUidProvider = { 0 },
+            myUidProvider = { myUid },
+            delegateCall = { _, _, _ -> Bundle() },
+            nowMsProvider = { throw AssertionError("clock boom") },
+        )
+        assertNotNull(trustedClockThrow.call("SendBinder", null, Bundle()))
+    }
+
+    // 拒絕診斷拋 (onRejectLog) -> 不得影響門控 (仍回 null,不委派,不拋)。
+    @Test
+    fun rejectLogThrowingDoesNotAffectGate() {
+        val delegateCall = RecordingDelegateCall()
+        val provider = GuardXposedProvider(
+            callingUidProvider = { 10124 },
+            myUidProvider = { myUid },
+            delegateCall = delegateCall,
+            onRejectLog = { throw AssertionError("log boom") },
+        )
+        assertNull(provider.call("SendBinder", "secret-arg", Bundle()))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    // JVM  stub 安全的 Uri (見 android.net.TestFakeUri:同包子類,建構子 no-op;
+    // CRUD 實作不觸碰參數,故方法體全回空)。
 }

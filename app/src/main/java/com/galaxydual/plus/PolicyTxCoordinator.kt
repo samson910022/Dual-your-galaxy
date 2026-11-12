@@ -138,7 +138,43 @@ class PolicyTxCoordinator {
     // - placeholder drops tombstone (recoverStalePendingLocked, overrun discard);
     // - real retires NEVER tombstone (retireStagedRealPresentInLatestLocked clears
     //   pending but preserves truth; the completed identity stays valid in _latest).
+    // Phase4 bound (hard cap, no eviction): when the table is full the new
+    // placeholder drop is REJECTED (pending kept, caller returns null/false so
+    // the pre-IO gate marks STALE and retries) instead of evicting an arbitrary
+    // entry. Evicting (Phase2 #5 legacy keys.firstOrNull()) could resurrect a
+    // live identity: the evicted tombstone's late resumer would pass the
+    // tombstone check and borrow current rev. A placeholder carries no truth
+    // (_latest untouched), so rejecting loses nothing.
     val claimTombstones = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // Phase4: bounded tombstone insert. True = recorded (drop may proceed);
+    // false = table full (drop must abort, pending kept, STALE retry).
+    // Re-recording an already-tombstoned identity only refreshes its rev.
+    internal fun tryInsertClaimTombstone(txId: Long, key: String, rev: Long): Boolean = try {
+        val k = tombstoneKey(txId, key)
+        if (claimTombstones.containsKey(k)) {
+            claimTombstones[k] = rev
+            true
+        } else if (claimTombstones.size >= 512) {
+            logCoord(
+                "tombstone bound full (512): reject drop txId=$txId " +
+                    "(keep fence, pre-IO gate retries STALE)",
+            )
+            false
+        } else {
+            claimTombstones[k] = rev
+            true
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    // Phase4 test lock: canonical PolicyTx acquisition order. commitMutex is
+    // the only coordinator-side lock; the full order (VM opMutex/writeMutex/
+    // policyRevisionMutex first) is documented here so tests pin it and any
+    // future coordinator lock joins this tail (never head).
+    internal fun policyTxLockOrder(): String =
+        "opMutex->writeMutex->policyRevisionMutex->commitMutex"
 
     // Stage L3 lossless 真相：永為最新終態（無逐出，晚訂閱收斂最新；gap 經 rev
     // 檢出）。僅終態（real）寫入，placeholder（claim fence）不寫入，免 Unknown
@@ -310,23 +346,9 @@ class PolicyTxCoordinator {
                     "ageMs=${ageMs} (dropped, no truth)",
             )
             // Persist tombstone before clearing so late resumer is rejected.
-            // Stage N3 bound: cap tombstones (practical DoS bound; evict one
-            // arbitrary + log when full; resurrected identity still faces
-            // cur==null reject + rev guard, tombstone is extra defense).
-            try {
-                if (claimTombstones.size >= 512) {
-                    try {
-                        val evict = claimTombstones.keys.firstOrNull()
-                        if (evict != null) {
-                            claimTombstones.remove(evict)
-                            logCoord("tombstone bound evict $evict (size cap 512)")
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-                claimTombstones[tombstoneKey(cur.txId, cur.key)] = cur.rev
-            } catch (_: Exception) {
-            }
+            // Phase4: bound-full rejects (no arbitrary eviction); pending is
+            // kept and null returned so the gate marks STALE and retries.
+            if (!tryInsertClaimTombstone(cur.txId, cur.key, cur.rev)) return null
             val cleared = try {
                 pendingPublish.compareAndSet(cur, null)
             } catch (_: Exception) {
@@ -454,6 +476,9 @@ class PolicyTxCoordinator {
     // borrow current rev), bump orphanDropGen (no _latest event, readers must
     // fail closed), return true. False when nothing discarded (caller keeps its
     // local settle=false/unresolved semantics; the fence stays for retire/recover).
+    // Phase4 bound: when the tombstone table is full the discard is REFUSED
+    // (pending+owner kept, false returned, no arbitrary eviction) — a
+    // tombstone-less drop would let the late resumer resurrect the identity.
     // Tombstone discipline: placeholder drops tombstone; real retires never
     // tombstone (real identity completed into truth).
     suspend fun discardOverrunPlaceholder(txId: Long, key: String): Boolean =
@@ -463,6 +488,9 @@ class PolicyTxCoordinator {
             if (cur.txId != txId || cur.key != key) return@withLock false
             val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
             if (!isPlaceholder) return@withLock false
+            // Capacity first (before the destructive CAS): bound-full keeps
+            // the fence so a later retire/recover can still observe it.
+            if (!tryInsertClaimTombstone(cur.txId, cur.key, cur.rev)) return@withLock false
             val cleared = try { pendingPublish.compareAndSet(cur, null) } catch (_: Exception) { false }
             if (!cleared) return@withLock false
             try {
@@ -470,20 +498,6 @@ class PolicyTxCoordinator {
                 if (own != null && own.txId == cur.txId && own.key == cur.key) {
                     pendingOwner.compareAndSet(own, null)
                 }
-            } catch (_: Exception) {
-            }
-            try {
-                if (claimTombstones.size >= 512) {
-                    try {
-                        val evict = claimTombstones.keys.firstOrNull()
-                        if (evict != null) {
-                            claimTombstones.remove(evict)
-                            logCoord("tombstone bound evict $evict (size cap 512)")
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-                claimTombstones[tombstoneKey(cur.txId, cur.key)] = cur.rev
             } catch (_: Exception) {
             }
             // Paired rev/gen ordering: rev FIRST then gen (volatile transitive:

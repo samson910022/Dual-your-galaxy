@@ -121,6 +121,8 @@ class StageJ5PolishTest {
             assertTrue(announceCapped.contains(shown.toString()))
             assertTrue(announceCapped.contains("取代"))
             assertFalse(announceCapped.contains("分批"))
+            assertTrue(policyWriteToggleLabelFallback(false, total, shown).let { it.contains(total.toString()) && it.contains(shown.toString()) && it.contains("取代") && !it.contains("分批") })
+            assertTrue(policyWriteToggleAnnounceFallback(true, total, shown).let { it.contains(total.toString()) && it.contains(shown.toString()) && it.contains("取代") && !it.contains("分批") })
             val warning = policyWriteOverCapWarningFallback(total, shown)
             assertTrue(warning.contains(total.toString()))
             assertTrue(warning.contains(shown.toString()))

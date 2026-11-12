@@ -6680,10 +6680,14 @@ internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean
     else "政策包名列表，共 $total 項，僅顯示前 $shown 項"
 
 internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String =
-    if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）"
+    // display≡inspectability：收合態超限不得謊稱「顯示全部」，複用 capped 語義。
+    if (!expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteShowAllCappedFallback(total, shown)
+    else if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）"
 
 internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String =
-    if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
+    // display≡inspectability：展開態超限不得謊稱「完整清單」，複用 capped 語義。
+    if (expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteExpandedAnnounceCappedFallback(total, shown)
+    else if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
 
 // Stage L4 capped variants fallback（超限時 Toggle/播報複用收合語義）：
 // - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超限須縮減；寫入整組取代）。
