@@ -592,15 +592,57 @@ class DualHook : XposedModule() {
     // leader holds the permit while the worker thread tries the inner probe on
     // the same gate, tryAcquire always fails, the first true can never latch
     // (permanent seed-only). Separate gates keep the probe latchable.
-    internal fun effectivePolicy(): Set<String> =
-        effectiveCache.get(EXTRA_WHITELIST_PACKAGES) {
-            val capable = isRemoteCapable() ?: return@get null
+    internal fun effectivePolicy(): Set<String> {
+        // Phase7 P2 end-to-end deadline: single 50ms total budget shared by
+        // capability probe + prefs read (plus budget-aware follower grace).
+        // t0 sampled at entry with true System.nanoTime (never mocked);
+        // arithmetic via pure DeadlineBudget (same function JVM tests use):
+        // remaining = total - elapsed; each segment uses min(50, remaining),
+        // remaining <= 0 skips fail-closed to null (deadlineExhaustedCount++,
+        // monotonic, never reset). The null skip is a failed read for the
+        // cache, so its 5s failureCooldown throttles the next retry.
+        // Follower grace = min(50, remaining at entry), exhausted forces 0.
+        val t0 = DeadlineBudget.nowNanos()
+        fun remainingMs(): Long = try {
+            DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        val graceAtEntry: Long = try {
+            DeadlineBudget.graceAtEntry(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        return effectiveCache.get(
+            EXTRA_WHITELIST_PACKAGES,
+            nonEmptyPolicyGateOpen = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
+            followerGraceMs = graceAtEntry,
+        ) {
+            var rem = remainingMs()
+            if (rem <= 0) {
+                try {
+                    deadlineExhaustedCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                return@get null
+            }
+            val capTimeout = minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)
+            val capable = isRemoteCapable(capTimeout) ?: return@get null
             if (!capable) return@get emptySet()
+            rem = remainingMs()
+            if (rem <= 0) {
+                try {
+                    deadlineExhaustedCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                return@get null
+            }
             policyRefreshGate.readBoundedOrThrow(
                 reader = { readRemotePrefs() },
-                timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+                timeoutMs = rem,
             )
         }
+    }
 
     // RemotePreferences-backed policy reader (Stage H2-P1 plumbing, hardened in
     // H2-P2), reached through EffectivePolicyCache via a bounded executor
@@ -675,20 +717,33 @@ class DualHook : XposedModule() {
     // on a dedicated single-thread executor), so a slow
     // getFrameworkProperties() can never pin the query thread and never
     // self-contends with the outer policy gate (independent Semaphore(1)).
-    private fun isRemoteCapable(): Boolean? {
+    // Phase7: timeoutMs is the remaining end-to-end budget
+    // (min(50, remaining) computed by effectivePolicy); default 50 preserves
+    // the standalone seam behavior (readRemotePolicy tests).
+    private fun isRemoteCapable(
+        timeoutMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+    ): Boolean? {
         // Fast path: latched true never re-probes (no clock, no gate).
         if (capabilityLatch.isLatchedTrue()) return true
         if (!capabilityLatch.shouldProbe()) return remoteCapableFalseCached
         // Gate-bounded probe: maps the Long property to a Set signal so the
         // existing Set-based gate can bound it (non-empty = capable).
+        // Phase7: uses the caller's remaining end-to-end budget (already
+        // min(50, remaining)); coerced to >= 0, 0 means immediate timeout
+        // path (fail-closed null) without submitting.
         val probe: Set<String>? = try {
+            val boundedTimeout = try {
+                timeoutMs.coerceAtLeast(0L)
+            } catch (_: Throwable) {
+                0L
+            }
             capabilityGate.readBoundedOrThrow(
                 reader = {
                     val v = getFrameworkProperties()
                     if ((v and XposedInterface.PROP_CAP_REMOTE) != 0L) setOf("capable")
                     else emptySet()
                 },
-                timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+                timeoutMs = boundedTimeout,
             )
         } catch (_: PolicyRefreshContentionException) {
             // Gate contention (guard busy / stuck short-circuit / rejection):
@@ -979,6 +1034,12 @@ class DualHook : XposedModule() {
         private val capabilityLatch = RemoteCapabilityLatch()
         @Volatile
         private var remoteCapableFalseCached: Boolean? = null
+
+        // Phase7 observability (optional): end-to-end deadline exhaustions
+        // (remaining <= 0 skip before capability or prefs segment). Never
+        // drives logic; counts fail-closed skips only. Monotonic, never
+        // reset (process-lifetime; tests read only).
+        internal val deadlineExhaustedCount = java.util.concurrent.atomic.AtomicLong(0L)
 
         // Rate-limits the capability-probe failure log: a persistently throwing
         // probe would otherwise spam the hot path on every query.

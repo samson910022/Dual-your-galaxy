@@ -567,20 +567,20 @@ class EffectivePolicyCacheTest {
         val cache = EffectivePolicyCache(nowMs = { time })
         val failing: () -> Set<String>? = { reads++; null }
 
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
         assertEquals(1, reads)
 
         time = 2_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
         assertEquals(1, reads)
 
         time = 7_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
         assertEquals(2, reads)
 
         // 舊窗口（自 1_000 起 5s）已過，新窗口（自 7_000 起 5s）內：必須節流。
         time = 8_000L
-        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, failing))
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
         assertEquals(2, reads)
     }
 

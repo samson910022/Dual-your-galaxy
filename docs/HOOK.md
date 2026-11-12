@@ -71,13 +71,16 @@
   失配重 arm〉，同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm；
   Corrupt 永不盲清，走修復流程〉、手動重整、超時轉 RECONCILING 核對）；端到端仍
   DEVICE-UNVERIFIED。
-- 熱路徑 stall 預算（P1-2，K4 P2#6 硬化）：hook 白名單查詢執行緒上的有效政策重讀經
+- 熱路徑 stall 預算（P1-2，K4 P2#6 硬化，Phase7 端到端 total）：hook 白名單查詢執行緒上的有效政策重讀經
   `PolicyRefreshGate`（at-most-one guard＋stuck-worker breaker）＋零隊列執行器
-  （`ThreadPoolExecutor(0,1,60s,SynchronousQueue)`，滿載／爭用即拒收）＋50ms 超時
-  （`DEFAULT_STALL_BUDGET_MS`）；超時／爭用／拒收／熔斷一律回 seed／last-known-good
+  （`ThreadPoolExecutor(0,1,60s,SynchronousQueue)`，滿載／爭用即拒收）＋50ms 端到端總預算
+  （`DEFAULT_STALL_BUDGET_MS`，Phase7 起為 capability＋prefs 兩段共享的單一 total：每段取
+  `min(50, remaining)`，`remaining<=0` 直接跳過 fail-closed 回 null；follower grace 取
+  `min(50, remaining)`，耗盡強制 0）；超時／爭用／拒收／熔斷／deadline 耗盡一律回 seed／last-known-good
   （fail-closed observe-only），慢 binder 讀在背景取消（uninterruptible 讀亦僅滯留
   單一 worker，隊列恆零、不增長），永不 pin 住查詢執行緒。JVM 以 `PolicyRefreshBudgetTest`
-  鎖定超時回退（leader-timeout）＋`PolicyRefreshGateTest` 鎖定有界＋熔斷＋invalidate 恢復。
+  鎖定超時回退（leader-timeout）＋`PolicyRefreshGateTest` 鎖定有界＋熔斷＋invalidate 恢復＋
+  `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速）。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。

@@ -145,7 +145,18 @@ class PolicyTxCoordinator {
     // live identity: the evicted tombstone's late resumer would pass the
     // tombstone check and borrow current rev. A placeholder carries no truth
     // (_latest untouched), so rejecting loses nothing.
+    // Phase7: GuardedBy(commitMutex) — all mutating readers/writers run under
+    // commitMutex.withLock (recover/discard paths) or are idempotent
+    // concurrent reads (stage/emit fast-reject). The map itself is a
+    // ConcurrentHashMap so the lock-free isTombstoned fast-reject stays safe;
+    // the guard documents the mutation ordering, not a hard lock requirement
+    // for reads. Rejections counted in [tombstoneRejects].
+    // @GuardedBy("commitMutex") for mutations (see above; reads lock-free safe).
     val claimTombstones = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // Phase7 observability: tombstone bound-full rejections (drop refused,
+    // fence kept). Monotonic, never reset except resetForTest.
+    val tombstoneRejects = AtomicLong(0L)
 
     // Phase4: bounded tombstone insert. True = recorded (drop may proceed);
     // false = table full (drop must abort, pending kept, STALE retry).
@@ -156,6 +167,10 @@ class PolicyTxCoordinator {
             claimTombstones[k] = rev
             true
         } else if (claimTombstones.size >= 512) {
+            try {
+                tombstoneRejects.incrementAndGet()
+            } catch (_: Exception) {
+            }
             logCoord(
                 "tombstone bound full (512): reject drop txId=$txId " +
                     "(keep fence, pre-IO gate retries STALE)",
@@ -167,6 +182,15 @@ class PolicyTxCoordinator {
         }
     } catch (_: Exception) {
         false
+    }
+
+    // Phase7 test seam: bump the authoritative revision without a full Tx
+    // (simulates a concurrent B commit for TOCTOU barrier tests). Returns
+    // the new revision.
+    internal fun bumpRevisionForTests(): Long = try {
+        committedRevision.incrementAndGet()
+    } catch (_: Exception) {
+        -1L
     }
 
     // Phase4 test lock: canonical PolicyTx acquisition order. commitMutex is
@@ -1010,6 +1034,10 @@ class PolicyTxCoordinator {
         }
         try {
             claimTombstones.clear()
+        } catch (_: Exception) {
+        }
+        try {
+            tombstoneRejects.set(0L)
         } catch (_: Exception) {
         }
         try {
