@@ -570,16 +570,19 @@ class DualHook : XposedModule() {
     // poll may return stale data until reboot (daemon restart rebuilds the
     // map). See docs/HOOK.md §1.1 + CrossProcessFreshnessContractTest.
     //
-    // Hot-path budget (P1-2): the reader below runs on a bounded executor with
-    // a 50ms stall budget (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on
-    // timeout the query falls back to seed/last-known-good and never blocks the
-    // hooked whitelist-query thread beyond the budget.
+    // Hot-path budget (P1-2, hardened K4 P2#6): the reader below runs through
+    // PolicyRefreshGate (at-most-one guard + stuck-worker breaker) on a
+    // zero-queue executor with a 50ms stall budget
+    // (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on timeout / contention /
+    // rejection / short-circuit the query falls back to seed/last-known-good
+    // and never blocks the hooked whitelist-query thread beyond the budget.
+    // Queue stays bounded (<=1, no growth) even when cancel(true) cannot stop
+    // an uninterruptible Binder read; breaker resets on invalidate.
     internal fun effectivePolicy(): Set<String> =
         effectiveCache.get(EXTRA_WHITELIST_PACKAGES) {
-            PolicyRefreshBudget.readBounded(
+            policyRefreshGate.readBounded(
                 reader = { readRemotePolicy() },
                 timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
-                executor = policyRefreshExecutor,
             )
         }
 
@@ -821,18 +824,38 @@ class DualHook : XposedModule() {
         // for JVM tests.
         private val effectiveCache = EffectivePolicyCache()
 
-        // Bounded refresh executor (P1-2): single daemon thread shared by all
-        // policy refreshes so a slow binder read never pins the hooked query
-        // thread beyond PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS. Daemon so
-        // it never blocks process exit; single thread bounds IPC fan-out under
-        // query herds (EffectivePolicyCache single-flight already collapses
-        // concurrent misses to one leader). Intentionally never shut down:
-        // process-lifetime executor for system_server/daagent (shutdown would
-        // strand future refreshes; daemon thread exits with the process).
-        private val policyRefreshExecutor: java.util.concurrent.ExecutorService =
-            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-                Thread(r, "GalaxyDual-policy-refresh").apply { isDaemon = true }
-            }
+        // Bounded refresh executor (P1-2, hardened K4 P2#6): zero-queue single
+        // daemon thread shared by all policy refreshes so a slow binder read
+        // never pins the hooked query thread beyond
+        // PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS. SynchronousQueue =
+        // zero queue: a submit while the worker is busy throws
+        // RejectedExecutionException instead of queueing (bounded to <=1
+        // outstanding, no growth even when cancel(true) cannot stop an
+        // uninterruptible Binder read). Daemon so it never blocks process
+        // exit; 60s keep-alive lets the idle thread exit. Single thread
+        // bounds IPC fan-out under query herds (EffectivePolicyCache
+        // single-flight already collapses concurrent misses to one leader;
+        // PolicyRefreshGate adds an at-most-one guard on top).
+        // Intentionally never shut down: process-lifetime executor for
+        // system_server/daagent (shutdown would strand future refreshes;
+        // daemon thread exits with the process).
+        private val policyRefreshExecutor: java.util.concurrent.ThreadPoolExecutor =
+            PolicyRefreshBudget.newPolicyRefreshExecutor()
+
+        // K4 P2#6 single-flight gate: at-most-one outstanding guard +
+        // stuck-worker circuit breaker in front of the executor. Contention /
+        // rejection / short-circuit all map to null (seed fallback) with
+        // droppedRefreshCount + throttled log; counters exposed for tests.
+        // Invalidate resets the breaker (recovery path) alongside the cache.
+        private val policyRefreshGate = PolicyRefreshGate(
+            executor = policyRefreshExecutor,
+            log = { msg ->
+                try {
+                    android.util.Log.i(TAG, msg)
+                } catch (_: Throwable) {
+                }
+            },
+        )
 
         // Remote-capability latch (P2-1): only true is latched forever; false
         // is cooldown-gated and re-probed (see RemoteCapabilityLatch). The
@@ -860,6 +883,10 @@ class DualHook : XposedModule() {
             SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
                 capabilityLatch.onInvalidate()
                 effectiveCache.invalidate()
+                try {
+                    policyRefreshGate.invalidate()
+                } catch (_: Throwable) {
+                }
             }
 
         // Scope constants are single-sourced in HookScopes (pure JVM, unit-

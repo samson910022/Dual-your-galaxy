@@ -6068,6 +6068,8 @@ internal fun policyDraftLiveRegion(changed: Boolean): Int =
 // 需鎖定字面），以 regex 解析數字重組多參模板屬脆弱（包名可含數字／符號，
 // 誤解析風險高於混合文案成本），故維持透傳並以 StageJ5PolishTest 鎖定混合
 // 為已知限制；未來 VM 改發結構化參數時再拆多參模板。
+// Stage L5 P3: VmMessage sealed typed-args 屬大重構，DEFER——本 shim 維持現狀，
+// 不在此階段實作（VM 無 Context＋JVM 鎖字面，見上）。
 internal fun vmMessageRes(msg: String): Pair<Int, String?>? {
     when (msg) {
         "invalid package" -> return R.string.invalid_package to null

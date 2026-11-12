@@ -85,7 +85,7 @@ class PolicyTxCoordinator {
     // - pendingPublish: staged but not yet emitted payload (set under commitMutex,
     //   cleared after emit leaves replayCache). Gate drains union
     //   replayCache + pendingPublish, so collector lag cannot hide B.
-    // - Lock order: opMutex->policyRevisionMutex->commitMutex->writeMutex leaf;
+    // - Lock order: opMutex->writeMutex->policyRevisionMutex->commitMutex;
     //   never emit while holding mutex (stage under lock, emit after release).
     // Stage L3: committedRevision 兼作 publish seq（不另設 divergent counter）。
     // _latest StateFlow 為唯一真相（同步、單調、無逐出，publish order = claim
