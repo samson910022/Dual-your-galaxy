@@ -1795,8 +1795,11 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
 
-        // 4) 新身份恢復（DEVICE-UNVERIFIED 實驗路徑：第 1 層穿透）：以乾淨 prefs
+        // 4) 新身份恢復（DEVICE-UNVERIFIED 實驗路徑）：以乾淨 prefs
         //    新建 VM，refresh 即 Known，後續 request+confirm 成功（真實 store→VM 鏈）。
+        //    Phase2 #2：新行程全域狀態隔離（reset 模擬行程重啟，否則舊毒+舊身份
+        //    會使首讀 fail-closed）。
+        resetRemotePoisonForTests()
         val cleanPrefs = MinimalPrefs(commitSucceeds = true)
         val cleanStore = remoteHookPolicyStore { cleanPrefs }
         val vm2 = makeVm(cleanStore, userId = 0, initialDraft = emptySet())

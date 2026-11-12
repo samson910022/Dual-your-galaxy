@@ -319,4 +319,29 @@ class HookPolicyStoreTest {
         val result = store.repairCorrupt()
         assertTrue(result is RepairResult.ServiceUnavailable)
     }
+
+    // Phase2 #1 備份鉤子拋出仍不擋修復（best-effort）。
+    @Test
+    fun repair_backupHookThrows_stillRepaired() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        store.setBackupHook { throw RuntimeException("backup boom") }
+        assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+    }
 }

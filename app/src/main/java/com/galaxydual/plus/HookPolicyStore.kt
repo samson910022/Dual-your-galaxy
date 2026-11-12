@@ -37,8 +37,40 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
 import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+
+// Phase2 hardening bounds (fail-closed, bounded memory).
+// - 備份單一固定鍵覆寫，不無界增長；value 截斷 ≤4KB；遷移批量刪上限
+//   BACKUP_MIGRATION_MAX_KEYS/次（殘留下次再清）。
+// - 毒/證據全域 cap：滿時不逐舊、只 bump gen + log + metric 並丟新（fail-closed；
+//   毒另置 overflow 閂使次讀強制 Unknown）；讀寫皆 purge stale。
+// - stale（GC 後）條目至多殘留至下次寫入 purge（P3a），接受殘留，不長期持有
+//   prefs 強引用（WeakPrefKey 弱引）。
+// - EVIDENCE_GEN_TTL：observedGen 過期即視為無證據並 best-effort 清除。
+internal const val BACKUP_KEY = "dual_policy.bak"
+internal const val BACKUP_LEGACY_PREFIX = "dual_policy.bak."
+internal const val BACKUP_MAX_CHARS = 4096
+internal const val BACKUP_MIGRATION_MAX_KEYS = 512
+internal const val POISON_MAX_ENTRIES = 128
+internal const val EVIDENCE_MAX_ENTRIES = 128
+internal const val EVIDENCE_GEN_TTL = 32L
+internal const val FALLBACK_CORRUPT_TYPE = "ClassCastException"
+
+internal val poisonEvictCount = AtomicLong(0L)
+internal val evidenceEvictCount = AtomicLong(0L)
+internal val identityMismatchCount = AtomicLong(0L)
+// 上次見到的 provider 實例身份 (identityHashCode)。0 = 無。
+// 用於 wrapper-churn 自檢：連續兩次 resolve 身份不同即視為不穩定。
+internal val lastPrefsHash = AtomicLong(0L)
+
+internal fun logStore(msg: String) {
+    try {
+        System.err.println("[HookPolicyStore] $msg")
+    } catch (_: Throwable) {
+    }
+}
 
 // Stage L2 atomic poison fence (P2 #4 + P3a):single global AtomicReference<PoisonState>
 // copy-on-write, weak keys, pre-poison seqlock.
@@ -65,7 +97,13 @@ import kotlinx.coroutines.CancellationException
 //   新身份探讀失敗續閂,皆 fail-closed。成功清除僅 token 相等才刪,避免蓋掉併發新毒。
 // - resolvePrefs 在圍欄外 (provider 缺席未觸 prefs 即無污染可能,不設旗)。
 // - CancellationException 透傳 (取消不得吞為 Unknown/false)。
-internal data class PoisonState(val entries: Map<WeakPrefKey, Long>, val gen: Long)
+internal data class PoisonState(
+    val entries: Map<WeakPrefKey, Long>,
+    val gen: Long,
+    // Fail-closed overflow latch: cap 滿丟新時置 true，此後一切讀強制 Unknown
+    //（含未來新 before 的讀），僅 reset 清除。生產單實例永不觸發（cap 128）。
+    val overflow: Boolean = false,
+)
 
 internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPreferences>(referent) {
     private val hash = System.identityHashCode(referent)
@@ -82,14 +120,111 @@ internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPr
 
 internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
 
-// Injectable publish hook (tests only,生產 null):在每次 CAS 前調用,可供 latch-pause
-// 模擬發佈間隙;生產路徑不依賴 (pre-poison 已關窗)。
-internal var poisonPublishHook: (() -> Unit)? = null
+// Phase2 #3: poisonPublishHook seam 已刪除（GapCommitPrefs 已可模擬
+// commit-vs-publish 窗；可注入全域 var 在 JVM 多執行緒下有 data race，
+// @Volatile 亦不如刪除乾淨）。如需重演發佈間隙，一律用 GapCommitPrefs
+// 阻塞 commit（見 HookPolicyRemoteStoreTest）。
 
 internal fun resetRemotePoisonForTests() {
     remotePoison.set(PoisonState(emptyMap(), 0))
     try {
         remoteCorruptEvidence.set(emptyMap())
+    } catch (_: Throwable) {
+    }
+    try {
+        lastPrefsHash.set(0L)
+    } catch (_: Throwable) {
+    }
+    try {
+        poisonEvictCount.set(0L)
+    } catch (_: Throwable) {
+    }
+    try {
+        evidenceEvictCount.set(0L)
+    } catch (_: Throwable) {
+    }
+    try {
+        identityMismatchCount.set(0L)
+    } catch (_: Throwable) {
+    }
+}
+
+// Phase2 #2 身份穩定自檢：provider() 連續兩次身份不同即視為不穩定
+// （libxposed 承諾同一 group 永久同一實例；每次 new wrapper 即違約）。
+// - 回傳 true = 穩定（或無毒可信），可繼續正常讀；false = 當次必須
+//   fail-closed（回 Unavailable + log + 指標），不靜默信任。
+// - 僅當毒/證據非空才 fail-closed（無毒時的合法 swap 如 service 初到
+//   不擋）；當次僅 fail-closed，不新增毒（免讀風暴無界），但更新 last
+//   使下一穩定讀可恢復（wrapper-churn 永不穩定故永 Unknown；合法 swap
+//   首讀 Unknown、次讀穩定即 Known）。
+// - 寫路徑不經此門（寫是重同步機會，必須放行以清毒），僅更新 last。
+internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
+    val curHash = try {
+        System.identityHashCode(prefs)
+    } catch (_: Throwable) {
+        0
+    }
+    if (curHash == 0) return true
+    val prev = try {
+        lastPrefsHash.get()
+    } catch (_: Throwable) {
+        0L
+    }
+    try {
+        lastPrefsHash.set(curHash.toLong())
+    } catch (_: Throwable) {
+    }
+    if (prev == 0L || prev == curHash.toLong()) return true
+    try {
+        identityMismatchCount.incrementAndGet()
+    } catch (_: Throwable) {
+    }
+    try {
+        logStore("provider identity changed prev=$prev cur=$curHash (unstable wrapper?)")
+    } catch (_: Throwable) {
+    }
+    val poisoned = try {
+        val s = remotePoison.get()
+        s.overflow || s.entries.isNotEmpty()
+    } catch (_: Throwable) {
+        false
+    }
+    val hasEvidence = try {
+        remoteCorruptEvidence.get().isNotEmpty()
+    } catch (_: Throwable) {
+        false
+    }
+    // 無毒無證據時的不穩定為合法演進（如 service 初到），放行。
+    if (!poisoned && !hasEvidence) return true
+    return false
+}
+
+internal fun notePrefsIdentity(prefs: SharedPreferences) {
+    try {
+        lastPrefsHash.set(System.identityHashCode(prefs).toLong())
+    } catch (_: Throwable) {
+    }
+}
+
+// 讀路徑 best-effort purge stale（同 gen，不 bump，不影響活讀者）。
+internal fun tryPurgeStalePoisonNoBump() {
+    try {
+        while (true) {
+            val cur = try {
+                remotePoison.get()
+            } catch (_: Throwable) {
+                return
+            }
+            if (cur.entries.isEmpty()) return
+            val purged: Map<WeakPrefKey, Long> = try {
+                cur.entries.filterKeys { it.get() != null }
+            } catch (_: Throwable) {
+                return
+            }
+            if (purged.size == cur.entries.size) return
+            val next = PoisonState(purged, cur.gen, cur.overflow)
+            if (remotePoison.compareAndSet(cur, next)) return
+        }
     } catch (_: Throwable) {
     }
 }
@@ -115,14 +250,15 @@ internal val remoteCorruptEvidence = AtomicReference<Map<WeakPrefKey, CorruptEvi
 
 private fun recordCorruptEvidence(prefs: SharedPreferences, cce: ClassCastException) {
     val keyName = try {
-        com.galaxydual.hook.PolicySource.POLICY_KEY_EXTRA_PACKAGES
+        PolicySource.POLICY_KEY_EXTRA_PACKAGES
     } catch (_: Throwable) {
+        // 硬編 fallback：PolicySource 類初始化失敗時再取常量亦拋，免重拋。
         "extra_whitelist_packages"
     }
     val typeName = try {
         cce.javaClass.name
     } catch (_: Throwable) {
-        "ClassCastException"
+        FALLBACK_CORRUPT_TYPE
     }
     while (true) {
         val cur = try {
@@ -150,17 +286,34 @@ private fun recordCorruptEvidence(prefs: SharedPreferences, cce: ClassCastExcept
             val next = purged
             if (remoteCorruptEvidence.compareAndSet(cur, next)) return
         } else {
-            val poisonGen = try {
-                remotePoison.get().gen
-            } catch (_: Throwable) {
-                0L
+            // 全域 cap：滿時不逐舊（fail-closed，保留舊診斷 first-wins）、丟新 +
+            // metric + log。stale 已在 purged 中處理；若仍滿則直接丟新（有 stale
+            // 才落盤 purge 結果），新實例本次無證據（值仍經毒圍欄 Unknown）。
+            val base = purged
+            if (base.size >= EVIDENCE_MAX_ENTRIES) {
+                try {
+                    evidenceEvictCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                try {
+                    logStore("evidence bound drop-new (size cap $EVIDENCE_MAX_ENTRIES)")
+                } catch (_: Throwable) {
+                }
+                if (purged.size == cur.size) return
+                if (remoteCorruptEvidence.compareAndSet(cur, purged)) return
+            } else {
+                val poisonGen = try {
+                    remotePoison.get().gen
+                } catch (_: Throwable) {
+                    0L
+                }
+                val next = try {
+                    base + (WeakPrefKey(prefs) to CorruptEvidence(keyName, typeName, poisonGen))
+                } catch (_: Throwable) {
+                    return
+                }
+                if (remoteCorruptEvidence.compareAndSet(cur, next)) return
             }
-            val next = try {
-                purged + (WeakPrefKey(prefs) to CorruptEvidence(keyName, typeName, poisonGen))
-            } catch (_: Throwable) {
-                return
-            }
-            if (remoteCorruptEvidence.compareAndSet(cur, next)) return
         }
     }
 }
@@ -191,10 +344,39 @@ private fun clearCorruptEvidence(prefs: SharedPreferences) {
     }
 }
 
-internal fun hasCorruptEvidence(prefs: SharedPreferences): Boolean = try {
-    remoteCorruptEvidence.get().containsKey(WeakPrefKey(prefs))
-} catch (_: Throwable) {
-    false
+internal fun hasCorruptEvidence(prefs: SharedPreferences): Boolean {
+    try {
+        val cur = remoteCorruptEvidence.get()
+        if (cur.isEmpty()) return false
+        val ev = cur[WeakPrefKey(prefs)] ?: return false
+        // Phase2 #7: observedGen 過期 — gen 推進 N 後失效（免陳舊證據永毒）。
+        // 過期視為無證據並 best-effort 清除。
+        val genNow = try {
+            remotePoison.get().gen
+        } catch (_: Throwable) {
+            ev.observedGen
+        }
+        if (genNow - ev.observedGen > EVIDENCE_GEN_TTL) {
+            try {
+                while (true) {
+                    val c2 = remoteCorruptEvidence.get()
+                    if (c2.isEmpty()) break
+                    val n2 = try {
+                        c2.filterKeys { val r = it.get(); r != null && r !== prefs }
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    if (n2.size == c2.size) break
+                    if (remoteCorruptEvidence.compareAndSet(c2, n2)) break
+                }
+            } catch (_: Throwable) {
+            }
+            return false
+        }
+        return true
+    } catch (_: Throwable) {
+        return false
+    }
 }
 
 private fun isPoisoned(state: PoisonState, prefs: SharedPreferences): Boolean = try {
@@ -205,6 +387,8 @@ private fun isPoisoned(state: PoisonState, prefs: SharedPreferences): Boolean = 
 
 // Pre-publish poison before commit (關 commit-vs-publish 窗)。永遠 bump gen 並以新 gen
 // 為 token 覆寫 (即使已毒,亦更新為最新,保证重疊讀見 gen 變化)。回傳 ownToken 供成功清除比對。
+// 全域 cap：滿時不逐舊（fail-closed，保留舊毒）、只 bump gen + log + metric 並丟新，
+// 另置 overflow 閂使次讀（含未來新 before 的讀）強制 Unknown。
 private fun prePoison(prefs: SharedPreferences): Long {
     while (true) {
         val cur = remotePoison.get()
@@ -226,24 +410,41 @@ private fun prePoison(prefs: SharedPreferences): Long {
                 purged
             }
         }
-        val newGen = cur.gen + 1
-        val next = try {
-            PoisonState(cleaned + (WeakPrefKey(prefs) to newGen), newGen)
-        } catch (_: Throwable) {
-            return cur.gen
+        // 全域 cap：滿時不逐舊、丟新 + overflow 閂（fail-closed，免逐出舊毒致舊
+        // 實例樂觀污染被誤信）。重疊讀見 gen 變化而 Unknown；未來讀見 overflow
+        // 亦 Unknown（零觸碰短路）。僅 reset 清閂（生產單實例永不滿）。
+        if (cleaned.size >= POISON_MAX_ENTRIES) {
+            try {
+                poisonEvictCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            try {
+                logStore("poison bound drop-new + overflow latch (size cap $POISON_MAX_ENTRIES)")
+            } catch (_: Throwable) {
+            }
+            val newGen = cur.gen + 1
+            val next = try {
+                PoisonState(cleaned, newGen, overflow = true)
+            } catch (_: Throwable) {
+                return cur.gen
+            }
+            if (remotePoison.compareAndSet(cur, next)) return newGen
+        } else {
+            val newGen = cur.gen + 1
+            val next = try {
+                PoisonState(cleaned + (WeakPrefKey(prefs) to newGen), newGen, cur.overflow)
+            } catch (_: Throwable) {
+                return cur.gen
+            }
+            if (remotePoison.compareAndSet(cur, next)) return newGen
         }
-        try {
-            poisonPublishHook?.invoke()
-        } catch (_: Throwable) {
-        }
-        if (remotePoison.compareAndSet(cur, next)) return newGen
     }
 }
 
 private fun ensurePoisoned(prefs: SharedPreferences): Long = prePoison(prefs)
 
 // 僅 token 相等才刪 (防 lost-poison:併發更新 token 更大即有更新毒,不清除)。
-// 已乾淨時若有 stale 即 purge (bump 發佈),否則 no-op 不 bump。
+// 已乾淨時若僅 stale 即 purge-only 不 bump（不影響活讀者）；僅真正增刪活條目才 bump。
 private fun clearPoison(prefs: SharedPreferences, ownToken: Long): Boolean {
     while (true) {
         val cur = remotePoison.get()
@@ -260,11 +461,8 @@ private fun clearPoison(prefs: SharedPreferences, ownToken: Long): Boolean {
                 return true
             }
             if (purged.size == cur.entries.size) return true
-            val next = PoisonState(purged, cur.gen + 1)
-            try {
-                poisonPublishHook?.invoke()
-            } catch (_: Throwable) {
-            }
+            // Phase2 #4: 僅 stale purge，不 bump gen（活讀者不受影響）；保留 overflow 閂。
+            val next = PoisonState(purged, cur.gen, cur.overflow)
             if (remotePoison.compareAndSet(cur, next)) return true
         } else {
             if (curToken != ownToken) return false
@@ -273,11 +471,7 @@ private fun clearPoison(prefs: SharedPreferences, ownToken: Long): Boolean {
             } catch (_: Throwable) {
                 return false
             }
-            val next = PoisonState(newMap, cur.gen + 1)
-            try {
-                poisonPublishHook?.invoke()
-            } catch (_: Throwable) {
-            }
+            val next = PoisonState(newMap, cur.gen + 1, cur.overflow)
             if (remotePoison.compareAndSet(cur, next)) return true
         }
     }
@@ -539,9 +733,19 @@ fun remoteHookPolicyStore(
             if (prefs == null) {
                 null
             } else {
+                // Phase2 #2: 身份穩定自檢 — wrapper-churn 當次 fail-closed。
+                try {
+                    if (!checkPrefsIdentityStable(prefs)) return@HookPolicyStore null
+                } catch (_: Throwable) {
+                }
+                // Phase2 #8: 讀路徑亦 purge stale（同 gen 不 bump）。
+                try {
+                    tryPurgeStalePoisonNoBump()
+                } catch (_: Throwable) {
+                }
                 val before = remotePoison.get()
-                if (isPoisoned(before, prefs)) {
-                    // 已毒短路 Unavailable,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
+                if (before.overflow || isPoisoned(before, prefs)) {
+                    // 已毒/溢出短路 Unavailable,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
                     // Stage N1 P1: value fail-closed，但 Corrupt evidence 保留供修復路徑。
                     null
                 } else {
@@ -552,7 +756,7 @@ fun remoteHookPolicyStore(
                         // 含 mid-getStringSet 突變 (拷貝期 CME 即 catch 轉 Unavailable)。
                         val snap = v.toSet()
                         val after = remotePoison.get()
-                        if (after.gen != before.gen || isPoisoned(after, prefs)) {
+                        if (after.gen != before.gen || after.overflow || isPoisoned(after, prefs)) {
                             null
                         } else {
                             // Verified Known:後端已證可信，洗白 Corrupt evidence。
@@ -603,6 +807,12 @@ fun remoteHookPolicyStore(
             if (prefs == null) {
                 false
             } else {
+                // 寫是重同步機會：僅更新身份（不 fail-closed），使合法新實例
+                // 的後續讀可穩定恢復。
+                try {
+                    notePrefsIdentity(prefs)
+                } catch (_: Throwable) {
+                }
                 // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
                 val ownToken = prePoison(prefs)
                 try {
@@ -661,6 +871,9 @@ fun remoteHookPolicyStore(
             // - 成功且無毒 → Known (verified，洗白 evidence)。
             // - 其他 Throwable → Unavailable (+relatch，保留既有 evidence)。
             // - null provider → Unavailable。CE 透傳。
+            // Phase2 #2: 身份不穩定當次亦 Unavailable（wrapper-churn 不信）。
+            // Phase2 #6: 空快照 + gen 推進但無毒時，以 prefs.all 二次確認
+            // （成功 clear 的反向間隙不應誤判污染；二次仍空且無毒才 Known）。
             val prefs = try {
                 provider()
             } catch (ce: CancellationException) {
@@ -671,52 +884,104 @@ fun remoteHookPolicyStore(
             if (prefs == null) {
                 LoadResult.Unavailable
             } else {
-                val before = try {
-                    remotePoison.get()
+                val identityOk = try {
+                    checkPrefsIdentityStable(prefs)
                 } catch (_: Throwable) {
-                    return@HookPolicyStore LoadResult.Unavailable
+                    true
                 }
-                try {
-                    val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
-                        ?: emptySet()
-                    val snap = v.toSet()
-                    val after = try {
+                if (!identityOk) {
+                    LoadResult.Unavailable
+                } else {
+                    val before = try {
                         remotePoison.get()
                     } catch (_: Throwable) {
                         return@HookPolicyStore LoadResult.Unavailable
                     }
-                    val poisonedNow = try {
-                        isPoisoned(before, prefs) || isPoisoned(after, prefs)
-                    } catch (_: Throwable) {
-                        true
-                    }
-                    if (after.gen != before.gen || poisonedNow) {
-                        LoadResult.Unavailable
-                    } else {
-                        try {
-                            clearCorruptEvidence(prefs)
+                    try {
+                        val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
+                            ?: emptySet()
+                        val snap = v.toSet()
+                        val after = try {
+                            remotePoison.get()
                         } catch (_: Throwable) {
+                            return@HookPolicyStore LoadResult.Unavailable
                         }
-                        LoadResult.Known(sanitizeHookPolicy(snap))
+                        val poisonedNow = try {
+                            before.overflow || after.overflow ||
+                                isPoisoned(before, prefs) || isPoisoned(after, prefs)
+                        } catch (_: Throwable) {
+                            true
+                        }
+                        if (after.gen != before.gen || after.overflow || poisonedNow) {
+                            // Phase2 #6: 空快照 + 無毒（含無溢出）+ 僅 gen 推進 → 可能是成功
+                            // clear 的反向間隙（pre→commit→clear 兩次 bump），以
+                            // prefs.all 二次確認；二次仍空且當下無毒才信為 Known，
+                            // 否則維持 Unavailable（fail-closed）。
+                            val genOnlyNoPoison = try {
+                                !poisonedNow && !after.overflow && snap.isEmpty()
+                            } catch (_: Throwable) {
+                                false
+                            }
+                            if (genOnlyNoPoison) {
+                                // String 型錯亂（cur 非 Set 非 null）不得確認為空；
+                                // 僅 null（鍵缺席）或空 Set 才確認。
+                                val confirmedEmpty: Boolean = try {
+                                    val all = prefs.all
+                                    val cur = all[PolicySource.POLICY_KEY_EXTRA_PACKAGES]
+                                    when {
+                                        cur == null -> true
+                                        cur is Set<*> -> cur.isEmpty()
+                                        else -> false
+                                    }
+                                } catch (_: Throwable) {
+                                    false
+                                }
+                                // prefs.all 與 stillClean 間的併發 prePoison 只 bump
+                                // gen（成功 clear 反向間隙外的真污染）亦須 Unknown。
+                                val stillClean: Boolean = try {
+                                    val now = remotePoison.get()
+                                    !now.overflow && now.gen == after.gen && !isPoisoned(now, prefs)
+                                } catch (_: Throwable) {
+                                    false
+                                }
+                                if (confirmedEmpty && stillClean) {
+                                    try {
+                                        clearCorruptEvidence(prefs)
+                                    } catch (_: Throwable) {
+                                    }
+                                    LoadResult.Known(sanitizeHookPolicy(snap))
+                                } else {
+                                    LoadResult.Unavailable
+                                }
+                            } else {
+                                LoadResult.Unavailable
+                            }
+                        } else {
+                            try {
+                                clearCorruptEvidence(prefs)
+                            } catch (_: Throwable) {
+                            }
+                            LoadResult.Known(sanitizeHookPolicy(snap))
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (cce: ClassCastException) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            recordCorruptEvidence(prefs, cce)
+                        } catch (_: Exception) {
+                        }
+                        LoadResult.Corrupt
+                    } catch (_: Throwable) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
+                        LoadResult.Unavailable
                     }
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (cce: ClassCastException) {
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
-                    }
-                    try {
-                        recordCorruptEvidence(prefs, cce)
-                    } catch (_: Exception) {
-                    }
-                    LoadResult.Corrupt
-                } catch (_: Throwable) {
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
-                    }
-                    LoadResult.Unavailable
                 }
             }
         },
@@ -731,34 +996,96 @@ fun remoteHookPolicyStore(
             } ?: return@setCorruptEvidenceProbe false
             hasCorruptEvidence(prefs)
         }
-        // Stage L4 best-effort 備份鉤子：writable 時嘗試將損壞值拷貝至
-        // dual_policy.bak.<ts>（僅 best-effort：prefs.all 或型別錯亂值可能拋出，
-        // 備份可能失敗、無法保證可恢復；失敗忽略仍刪除，不擋修復）。
-        store.setBackupHook { ts ->
+        // Stage L4 best-effort 備份鉤子（Phase2 #1：單一固定鍵覆寫，不無界增長）。
+        // - 固定鍵 dual_policy.bak 覆寫（不再 dual_policy.bak.<ts> 無界增長）；
+        //   每次修復先遷移清除舊 bak.* 鍵（至多殘留 1 個新鍵）。
+        // - value 截斷 ≤4KB：超限只存「類型名+長度」單條（免大 value 撐爆 prefs）。
+        // - 僅 best-effort：prefs.all 或型別錯亂值可能拋出，備份可能失敗、
+        //   無法保證可恢復；失敗忽略仍刪除，不擋修復。
+        store.setBackupHook { _ ->
             try {
                 val prefs = try { provider() } catch (_: Throwable) { null } ?: return@setBackupHook
+                // 單快照供遷移 + 備份共用（免兩次 prefs.all 全掃）；all 失敗即跳過
+                // 遷移/備份，不擋修復（best-effort）。
+                val snapshot: Map<String, *> = try {
+                    prefs.all
+                } catch (_: Throwable) {
+                    return@setBackupHook
+                }
+                // 遷移：舊 bak.* 鍵單 edit 批量刪，上限前 N/次（殘留下次再清）。
+                val legacy: List<String> = try {
+                    snapshot.keys.filter { it.startsWith(BACKUP_LEGACY_PREFIX) }
+                        .take(BACKUP_MIGRATION_MAX_KEYS)
+                } catch (_: Throwable) {
+                    emptyList()
+                }
                 val rawObj: Any? = try {
-                    prefs.all[PolicySource.POLICY_KEY_EXTRA_PACKAGES]
+                    snapshot[PolicySource.POLICY_KEY_EXTRA_PACKAGES]
                 } catch (_: Throwable) {
                     null
                 }
-                if (rawObj != null) {
-                    val bakKey = "dual_policy.bak.$ts"
+                val backupSet: Set<String>? = if (rawObj != null) {
                     try {
-                        val asSet: Set<String>? = try {
+                        try {
                             @Suppress("UNCHECKED_CAST")
-                            (rawObj as? Set<*>)?.mapNotNull { it?.toString() }?.toSet()
+                            val asSet: Set<String>? = try {
+                                (rawObj as? Set<*>)?.mapNotNull { it?.toString() }?.toSet()
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            if (asSet != null) {
+                                // 截斷：總字元超限只存類型+大小。
+                                var total = 0
+                                for (s in asSet) total += s.length
+                                if (total > BACKUP_MAX_CHARS) {
+                                    setOf("${rawObj.javaClass.name}:${asSet.size}")
+                                } else {
+                                    // 逐條亦截斷單條超長（防單包名異常大）。
+                                    asSet.map { if (it.length > BACKUP_MAX_CHARS) it.take(BACKUP_MAX_CHARS) else it }.toSet()
+                                }
+                            } else {
+                                // 非 Set（String 型錯亂等）：走 toString 分支。
+                                val s = try { rawObj.toString() } catch (_: Throwable) { null }
+                                if (s == null) {
+                                    setOf("${rawObj.javaClass.name}:unreadable")
+                                } else if (s.length > BACKUP_MAX_CHARS) {
+                                    setOf("${rawObj.javaClass.name}:${s.length}")
+                                } else {
+                                    setOf(s)
+                                }
+                            }
                         } catch (_: Throwable) {
                             null
-                        }
-                        if (asSet != null) {
-                            prefs.edit().putStringSet(bakKey, asSet).commit()
-                        } else {
-                            prefs.edit().putStringSet(bakKey, setOf(rawObj.toString())).commit()
-                        }
+                        } ?: setOf("${rawObj.javaClass.name}:unreadable")
                     } catch (_: Throwable) {
                         // Best effort: 備份失敗不擋修復。
+                        null
                     }
+                } else {
+                    null
+                }
+                if (legacy.isEmpty() && backupSet == null) return@setBackupHook
+                try {
+                    val ed = prefs.edit()
+                    for (k in legacy) {
+                        try {
+                            ed.remove(k)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    if (backupSet != null) {
+                        try {
+                            ed.putStringSet(BACKUP_KEY, backupSet)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    // 單次 commit 批量落盤（遷移 + 備份同一事務）。
+                    try {
+                        ed.commit()
+                    } catch (_: Throwable) {
+                    }
+                } catch (_: Throwable) {
+                    // Best effort: 備份失敗不擋修復。
                 }
             } catch (_: Throwable) {
                 // Best effort.
