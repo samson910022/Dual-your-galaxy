@@ -893,6 +893,15 @@ class DualViewModel(
         // isClear stays true for repair (destructive delete-to-empty) so generic
         // isClear gating (destructive vs write) remains correct.
         val isRepair: Boolean = false,
+        // Stage N2 P1: execution gate — LAZY deferred must NOT be started/joined
+        // until final validation + baseline verified. False = PREPARING (must
+        // not start: join paths return without awaiting; inheritance aborts).
+        // True = ARMED/STARTED (validated, may start/join). Set exactly once via
+        // armAndStartTxDeferred() immediately before start() (save/clear: pre-IO
+        // gate after checks; repair: final fresh revalidation after pre-IO gate).
+        // Fallback Tx with an already-running/completed eager deferred passes
+        // true (validation already done at creation). Atomic: read on IO/Main.
+        val executionArmed: AtomicBoolean = AtomicBoolean(false),
     )
     // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
@@ -1659,6 +1668,13 @@ class DualViewModel(
     // reconciler、不碰 winner）；coordinator CAS 失配即 loser 清本地（僅清自身
     // Tx，不碰 coordinator winner）後返回。
     private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean) {
+        // Stage N2 P1: never expose/transfer a PREPARING (unvalidated) Tx as
+        // executable. Handover is only for post-validation timeouts (armed);
+        // an unarmed handover request is aborted without store touch.
+        if (!canJoinTx(tx)) {
+            abortUnarmedTx(tx)
+            return
+        }
         val localCur = activePolicyTx.get()
         if (localCur !== tx) {
             if (!activePolicyTx.compareAndSet(null, tx)) {
@@ -1714,6 +1730,11 @@ class DualViewModel(
         // 擁有者再判（併發已結／被替換即丟棄，防雙發布）。
         if (activePolicyTx.get() !== tx) return
         if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
+        // Stage N2 P1: unvalidated Tx must never auto-execute; abort instead.
+        if (!canJoinTx(tx)) {
+            abortUnarmedTx(tx)
+            return
+        }
         // 終態發布權以 settle-CAS 先行仲裁（見 tryClaimCoordinatorPublish），此處
         // 僅做擁有者預檢；同一 Tx 被新 VM 認領時舊 handler 與新 handler 競爭發布權，
         // 首個 CAS 成功者勝出發布，敗者跳過（不覆寫勝者 fence）。
@@ -1934,7 +1955,76 @@ class DualViewModel(
         object Failed : PolicyTxSettle
         object Unresolved : PolicyTxSettle
     }
+    // Stage N2 P1: execution gate — joining/reconciliation is INCAPABLE of
+    // starting an unvalidated pending job. LAZY deferred starts on first await,
+    // so every join path must check armed BEFORE touching deferred. Unarmed +
+    // incomplete (PREPARING, validation never finished) => never await/start;
+    // caller must abort/unclaim instead. Completed deferreds (already ran) are
+    // joinable regardless (no start risk; keeps legacy test doubles green).
+    private fun canJoinTx(tx: PolicyTx): Boolean = try {
+        tx.executionArmed.get() || tx.deferred.isCompleted
+    } catch (_: Exception) {
+        false
+    }
+
+    // Stage N2 P1: validate-then-arm-then-start (single source). Sets armed
+    // BEFORE start() so any concurrent join observing armed==true sees a Tx
+    // whose validation already passed. Unarmed cancel prevents LAZY start.
+    private fun armAndStartTxDeferred(tx: PolicyTx) {
+        try {
+            tx.executionArmed.set(true)
+        } catch (_: Exception) {
+        }
+        try {
+            tx.deferred.start()
+        } catch (_: Exception) {
+        }
+    }
+
+    // Stage N2 P1: abort an unvalidated (PREPARING) Tx without any store touch.
+    // Cancels the LAZY (unstarted cancel prevents start), settles/unclaims
+    // local+coordinator, clears the reconciling key, and publishes
+    // IDLE+Unknown (fail-closed, requires fresh validation by the inheriting
+    // VM). Safe to call redundantly (settle CAS + best-effort cancel).
+    private fun abortUnarmedTx(tx: PolicyTx) {
+        try {
+            tx.deferred.cancel()
+        } catch (_: Exception) {
+        }
+        try {
+            settlePolicyTx(tx)
+        } catch (_: Exception) {
+        }
+        try {
+            policyReconciling.remove(tx.key)
+        } catch (_: Exception) {
+        }
+        try {
+            markPolicyUnknownLocked()
+        } catch (_: Exception) {
+        }
+        _state.update { cur ->
+            if (cur.policyWritePhase != PolicyWritePhase.RECONCILING &&
+                cur.policyWritePhase != PolicyWritePhase.SAVING &&
+                cur.policyWritePhase != PolicyWritePhase.QUEUED
+            ) {
+                cur.copy(policyDraftKnown = false, policyDraftCorrupt = false)
+            } else {
+                cur.copy(
+                    loading = false,
+                    policyWritePhase = PolicyWritePhase.IDLE,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    policyDraftKnown = false,
+                    policyDraftCorrupt = false,
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+        }
+    }
     private suspend fun decidePolicyTxSettle(tx: PolicyTx, read: LoadResult): PolicyTxSettle {
+        // Stage N2 P1: never start/await an unvalidated job (see canJoinTx).
+        if (!canJoinTx(tx)) return PolicyTxSettle.Unresolved
         if (!tx.deferred.isCompleted) return PolicyTxSettle.Unresolved
         val ok: Boolean = try {
             tx.deferred.await()
@@ -1967,14 +2057,18 @@ class DualViewModel(
     // （逾時未知，保留 fence 續讀）。CE 透傳（scope 取消，不吞為失敗）。
     // Stage F2：本 join 納入 reconciler 總預算（外層
     // withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS)），此處內界不變。
-    private suspend fun joinPolicyTxBounded(tx: PolicyTx): Boolean? = try {
-        withTimeout(policyIoTimeoutMs) { tx.deferred.await() }
-    } catch (te: TimeoutCancellationException) {
-        null
-    } catch (e: CancellationException) {
-        throw e
-    } catch (_: Exception) {
-        false
+    private suspend fun joinPolicyTxBounded(tx: PolicyTx): Boolean? {
+        // Stage N2 P1: never start an unvalidated LAZY (await would start it).
+        if (!canJoinTx(tx)) return null
+        return try {
+            withTimeout(policyIoTimeoutMs) { tx.deferred.await() }
+        } catch (te: TimeoutCancellationException) {
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
     }
     // Stage F2 有界讀（獨立池＋detach）：每次讀外包 withTimeout(policyIoTimeoutMs)，
     // 最多 POLICY_RECONCILE_RETRIES 次。Binder 不可中斷：loadRaw 若無視取消
@@ -2374,6 +2468,17 @@ class DualViewModel(
             }
             val tx = reclaimedTx ?: return@run
             if (activePolicyTx.get() == null) {
+                // Stage N2 P1: inherit only validated (ARMED/STARTED) Tx. A
+                // PREPARING (unvalidated, pre-start-cancelled) Tx must NOT be
+                // joined — its LAZY await would start the destructive delete
+                // without either VM completing final validation. Abort it here
+                // (cancel unstarted LAZY, unclaim, IDLE+Unknown) and require a
+                // fresh Corrupt+revision validation by this VM.
+                if (!canJoinTx(tx)) {
+                    activePolicyTx.set(tx)
+                    abortUnarmedTx(tx)
+                    return@run
+                }
                 activePolicyTx.set(tx)
                 policyReconciling.add(tx.key)
                 attachDeferredAutoRecheck(tx)
@@ -5113,6 +5218,14 @@ class DualViewModel(
         val store = tx.store
         val sanitized = tx.sanitized
         viewModelScope.launch {
+            // Stage N2 P1: unvalidated (PREPARING) Tx must never be joined —
+            // it was cancelled before final validation/arm. Abort without any
+            // store touch (cancel unstarted LAZY so it can never start) and
+            // require fresh validation; do NOT keep the fence.
+            if (!canJoinTx(tx)) {
+                abortUnarmedTx(tx)
+                return@launch
+            }
             val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
@@ -5259,9 +5372,10 @@ class DualViewModel(
                         val finalResult = result
                         // Stage F2 late-join：三讀皆 Unknown 且曾逾時時，句柄可能在讀
                         // 期間已結；已完成即補 join 一次（await 即時回值，不耗預算）：
-                        // 已證失敗（false/拋出）即 FAILED 結清，否則 unresolved。
+                        // 已證失敗（false/拋出）即 FAILED 結清，否則 unresolved.
+                        // Stage N2 P1: gated by canJoinTx (never start unvalidated).
                         val lateProvenFailed = if (finalResult is LoadResult.Unknown &&
-                            hadReadTimeout && tx.deferred.isCompleted
+                            hadReadTimeout && canJoinTx(tx) && tx.deferred.isCompleted
                         ) {
                             try {
                                 !tx.deferred.await()
@@ -5563,6 +5677,13 @@ class DualViewModel(
     private fun launchClearReconciler(tx: PolicyTx) {
         val store = tx.store
         viewModelScope.launch {
+            // Stage N2 P1: same unvalidated abort as confirm (covers repair:
+            // repair is isClear+isRepair and routes here; never start/join a
+            // PREPARING delete).
+            if (!canJoinTx(tx)) {
+                abortUnarmedTx(tx)
+                return@launch
+            }
             val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋phase 續留
@@ -5697,8 +5818,9 @@ class DualViewModel(
                         }
                         val finalResult = result
                         // Stage F2 late-join：同 confirm；已證失敗即 FAILED 結清。
+                        // Stage N2 P1: gated by canJoinTx (never start unvalidated).
                         val lateProvenFailed = if (finalResult is LoadResult.Unknown &&
-                            hadReadTimeout && tx.deferred.isCompleted
+                            hadReadTimeout && canJoinTx(tx) && tx.deferred.isCompleted
                         ) {
                             try {
                                 !tx.deferred.await()
@@ -5999,8 +6121,9 @@ class DualViewModel(
                 // 非此條件一律 null（走 yielding/正常路徑，不搶結）。
                 // Stage G1：經 settle helper（deferred 未完成＋Known 即 yielding，
                 // 不 settle）。
+                // Stage N2 P1: gated by canJoinTx (never start unvalidated LAZY).
                 val lateJoinOk: Boolean? = if (txSnap != null && result is LoadResult.Known &&
-                    txSnap.deferred.isCompleted
+                    canJoinTx(txSnap) && txSnap.deferred.isCompleted
                 ) {
                     try {
                         txSnap.deferred.await()
@@ -6939,10 +7062,10 @@ class DualViewModel(
                                     if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get()) {
                                         preIoAbort = true
                                     } else {
-                                        try {
-                                            lazy.start()
-                                        } catch (_: Exception) {
-                                        }
+                                        // Stage N2 P1: validate-then-arm-then-start (single
+                                        // source; armed BEFORE start so concurrent joiners
+                                        // never observe an executable unvalidated Tx).
+                                        armAndStartTxDeferred(tx)
                                     }
                                 }
                             } catch (_: Exception) {
@@ -6952,10 +7075,8 @@ class DualViewModel(
                                 if (baseMismatchPreIo || policyRevisionStale.get()) {
                                     preIoAbort = true
                                 } else {
-                                    try {
-                                        lazy.start()
-                                    } catch (_: Exception) {
-                                    }
+                                    // Stage N2 P1: same arm-then-start (see above).
+                                    armAndStartTxDeferred(tx)
                                 }
                             }
                         }
@@ -7196,6 +7317,7 @@ class DualViewModel(
                                     store = store,
                                     isClear = false,
                                     pending = pendingAtCall,
+                                    executionArmed = AtomicBoolean(true),
                                 )
                             }
                             return@withLock
@@ -7355,6 +7477,7 @@ class DualViewModel(
                                             store = store,
                                             isClear = false,
                                             pending = pendingAtCall,
+                                            executionArmed = AtomicBoolean(true),
                                         )
                                     }
                                     return@withLock
@@ -7396,6 +7519,7 @@ class DualViewModel(
                                         store = store,
                                         isClear = false,
                                         pending = pendingAtCall,
+                                        executionArmed = AtomicBoolean(true),
                                     )
                                 }
                                 return@withLock
@@ -7532,10 +7656,34 @@ class DualViewModel(
                 // 此處僅安全解鎖 writeMutex（best effort，單寫者必須釋放）＋
                 // 交接/清理 inFlight/saving；CE 已認領 deferred 不 cancel（上行
                 // 已跳過），供新 VM join 同一句柄）。
+                // Stage N2 P1: pre-start cancellation (PREPARING, never armed)
+                // must atomically abort/unclaim/cancel — an unstarted LAZY must
+                // never transfer to a new VM as executable. Armed Tx keeps the
+                // existing inherit path (validated handover via register below
+                // or retained activeTx for pre-timeout destroy).
                 if (writeLocked) {
                     try {
                         policyTxCoordinator?.writeMutex?.unlock()
                     } catch (_: Exception) {
+                    }
+                }
+                val pcOuterSave = preClaimTx
+                if (pcOuterSave != null && !canJoinTx(pcOuterSave)) {
+                    try { pcOuterSave.deferred.cancel() } catch (_: Exception) { }
+                    try { settlePolicyTx(pcOuterSave) } catch (_: Exception) { }
+                    try { policyReconciling.remove(pcOuterSave.key) } catch (_: Exception) { }
+                    preClaimTx = null
+                    try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                    _state.update { cur ->
+                        cur.copy(
+                            loading = false,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
+                            policyDraftCorrupt = false,
+                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
                     }
                 }
                 val htx = handoverTx
@@ -8014,20 +8162,16 @@ class DualViewModel(
                                     if (!coordActiveOkClear || !pendingOkClear || policyRevisionStale.get()) {
                                         preIoAbortClear = true
                                     } else {
-                                        try {
-                                            lazyClear.start()
-                                        } catch (_: Exception) {
-                                        }
+                                        // Stage N2 P1: arm-then-start (see save path).
+                                        armAndStartTxDeferred(txClear)
                                     }
                                 }
                             } catch (_: Exception) {
                                 if (policyRevisionStale.get()) {
                                     preIoAbortClear = true
                                 } else {
-                                    try {
-                                        lazyClear.start()
-                                    } catch (_: Exception) {
-                                    }
+                                    // Stage N2 P1: same arm-then-start (see above).
+                                    armAndStartTxDeferred(txClear)
                                 }
                             }
                         }
@@ -8148,6 +8292,7 @@ class DualViewModel(
                                 store = store,
                                 isClear = true,
                                 pending = null,
+                                executionArmed = AtomicBoolean(true),
                             )
                         }
                         return@withLock
@@ -8305,6 +8450,7 @@ class DualViewModel(
                                         store = store,
                                         isClear = true,
                                         pending = null,
+                                        executionArmed = AtomicBoolean(true),
                                     )
                                 }
                                 return@withLock
@@ -8346,6 +8492,7 @@ class DualViewModel(
                                     store = store,
                                     isClear = true,
                                     pending = null,
+                                    executionArmed = AtomicBoolean(true),
                                 )
                             }
                             return@withLock
@@ -8452,10 +8599,30 @@ class DualViewModel(
             } finally {
                 // Stage H1：finally 不碰 coordinator.activeTx（僅 settle 清）；
                 // 僅安全解鎖 writeMutex（best effort）＋交接/清理。
+                // Stage N2 P1: pre-start (PREPARING) abort — see save path.
                 if (writeLocked) {
                     try {
                         policyTxCoordinator?.writeMutex?.unlock()
                     } catch (_: Exception) {
+                    }
+                }
+                val pcOuterClear = preClaimTx
+                if (pcOuterClear != null && !canJoinTx(pcOuterClear)) {
+                    try { pcOuterClear.deferred.cancel() } catch (_: Exception) { }
+                    try { settlePolicyTx(pcOuterClear) } catch (_: Exception) { }
+                    try { policyReconciling.remove(pcOuterClear.key) } catch (_: Exception) { }
+                    preClaimTx = null
+                    try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                    _state.update { cur ->
+                        cur.copy(
+                            loading = false,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
+                            policyDraftCorrupt = false,
+                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
                     }
                 }
                 val htx = handoverTx
@@ -9142,18 +9309,21 @@ class DualViewModel(
                         // revalidation above; null-coordinator path runs eager).
                         // Bounded await; timeout/throw → FAILED (no
                         // silent path; failure keeps Corrupt + FAILED).
-                        try {
-                            h1RepairDeferred?.let {
-                                try {
-                                    it.start()
-                                } catch (_: Exception) {
-                                }
+                        // Stage N2 P1: validate-then-arm-then-start — armed ONLY
+                        // here, after the final fresh Corrupt revalidation above
+                        // (pre-start cancellation leaves PREPARING => abort).
+                        run {
+                            val toArm = h1RepairDeferred
+                            if (toArm != null && preClaimTx != null) {
+                                armAndStartTxDeferred(preClaimTx!!)
+                            } else if (toArm != null) {
+                                try { toArm.start() } catch (_: Exception) { }
                             }
-                        } catch (_: Exception) {
                         }
-                        // (LAZY already started in the gate; null-coordinator path
-                        // runs eager). Bounded await; timeout/throw → FAILED (no
-                        // silent path; failure keeps Corrupt + FAILED).
+                        // (LAZY armed+started above after final revalidation;
+                        // null-coordinator path runs eager). Bounded await;
+                        // timeout/throw → FAILED (no silent path; failure keeps
+                        // Corrupt + FAILED).
                         val deferred: Deferred<Boolean> = h1RepairDeferred ?: viewModelScope.async(Dispatchers.IO) {
                             try {
                                 store.repairCorrupt() is RepairResult.Repaired
@@ -9225,6 +9395,7 @@ class DualViewModel(
                                     isClear = true,
                                     pending = null,
                                     isRepair = true,
+                                    executionArmed = AtomicBoolean(true),
                                 )
                             }
                             return@withLock
@@ -9319,8 +9490,34 @@ class DualViewModel(
                 // Stage M2 P2#3: timeout hands over like save/clear — register
                 // the retained Tx (fence + deferred) so reconciler/autoRecheck
                 // verifies ground truth. Never settle on unknown here.
+                // Stage N2 P1: pre-start (PREPARING, final validation never
+                // finished) cancellation must abort/unclaim/cancel instead of
+                // transferring an executable unvalidated LAZY. Covers CE while
+                // waiting the final bounded pre-delete read (9088-9096 path):
+                // outer finally unlocks writer but must also cancel/rollback
+                // preClaimTx (unstarted LAZY cancel prevents start) and settle/
+                // unclaim coordinator. Armed Tx keeps the inherit path.
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                }
+                val pcOuterRepair = preClaimTx
+                if (pcOuterRepair != null && !canJoinTx(pcOuterRepair)) {
+                    try { pcOuterRepair.deferred.cancel() } catch (_: Exception) { }
+                    try { settlePolicyTx(pcOuterRepair) } catch (_: Exception) { }
+                    try { policyReconciling.remove(pcOuterRepair.key) } catch (_: Exception) { }
+                    preClaimTx = null
+                    try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                    _state.update { cur ->
+                        cur.copy(
+                            loading = false,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
+                            policyDraftCorrupt = false,
+                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                            msgKind = MsgKind.CHANNEL,
+                        )
+                    }
                 }
                 val htx = handoverTx
                 if (htx != null) {

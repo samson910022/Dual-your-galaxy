@@ -4887,6 +4887,9 @@ class PolicyWriteTest {
             // reconciler／auto-recheck 恆走 Unresolved（不結清、不清本地），註冊態斷言
             // 不依賴「測試執行緒跑贏核對協程」的時序（已完成 deferred＋Known 讀會立刻
             // Mismatch 結清並清空本地，負載高時必現 flake）。
+            // Stage N2 P1: winner simulates a post-validation handover (armed;
+            // incomplete deferred stays Unresolved without settling). Unarmed
+            // (PREPARING) Tx must never register as executable.
             val winner = DualViewModel.PolicyTx(
                 txId = -1L,
                 key = "policy-test",
@@ -4894,6 +4897,7 @@ class PolicyWriteTest {
                 sanitized = setOf("com.WINNER"),
                 store = fake.store,
                 isClear = false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
             )
             val loser = DualViewModel.PolicyTx(
                 txId = -2L,
@@ -8141,6 +8145,316 @@ class PolicyWriteTest {
                 for ((k, v) in pending) data[k] = v
                 pending.clear()
                 removed.clear()
+            }
+        }
+    }
+
+    // Stage N2 P1: unarmed repair inherit — VM-A stages repair, blocks in the
+    // final bounded pre-delete read (loadForRepair, interrupt-ignoring latch),
+    // preClaimTx still PREPARING (unarmed, LAZY unstarted) → destroy VM-A
+    // (scope cancel) → outer-finally aborts (cancel unstarted LAZY, unclaim,
+    // IDLE+Unknown) → VM-B (same coord+store) init finds no executable Tx →
+    // zero repairCorrupt/delete calls, activeTx==null, IDLE, Known==false /
+    // Corrupt==false, reconciling empty; VM-B re-validates Corrupt from scratch.
+    // Without the N2 guard the retained preClaimTx would transfer as executable
+    // and the inheritor's reconciler await would start the destructive delete.
+    @Test
+    fun n2_twoVm_unarmedRepairInherit_corruptUnchanged_zeroDeletes() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val loadCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val finalEntered = java.util.concurrent.CountDownLatch(1)
+        val finalRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val initBEntered = java.util.concurrent.CountDownLatch(1)
+        val initBRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when (loadCalls.incrementAndGet()) {
+                    1 -> throw ClassCastException("corrupt")
+                    2 -> throw ClassCastException("corrupt")
+                    3 -> {
+                        finalEntered.countDown()
+                        while (!finalRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        throw ClassCastException("corrupt")
+                    }
+                    4 -> {
+                        initBEntered.countDown()
+                        while (!initBRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        if (corrupt) throw ClassCastException("corrupt") else backing
+                    }
+                    else -> {
+                        if (corrupt) throw ClassCastException("corrupt") else backing
+                    }
+                }
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    saveCalls.incrementAndGet()
+                    backing = raw
+                    corrupt = false
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            assertFalse(vmA.state.value.policyDraftKnown)
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(finalEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vmA) as DualViewModel.PolicyTx
+            assertNotNull(tx1)
+            // Prove the unarmed path: validation never finished, LAZY unstarted.
+            assertFalse(tx1.executionArmed.get())
+            assertFalse(tx1.deferred.isCompleted)
+            assertSame(tx1, coordinatorTxOf(coord))
+
+            // Pre-timeout destroy: cancel while blocked in the final bounded read.
+            vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(500)
+            // N2 outer-finally aborts the PREPARING Tx (no handover, no delete).
+            await(timeoutMs = 5_000L) { coordinatorTxOf(coord) == null && activeTxOf(vmA) == null }
+            assertNull(coordinatorTxOf(coord))
+            assertNull(activeTxOf(vmA))
+            assertTrue(tx1.deferred.isCancelled)
+            assertEquals(0, deleteCalls.get())
+            assertEquals(0, saveCalls.get())
+            assertTrue(corrupt)
+
+            // VM-B with the same coordinator+store: nothing executable to inherit.
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            assertTrue(initBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            Thread.sleep(200)
+            assertNull(activeTxOf(vmB))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertFalse(vmB.state.value.policyDraftKnown)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            assertTrue(reconcilingKeysOf(vmB).isEmpty())
+            assertEquals(0, deleteCalls.get())
+            assertEquals(0, saveCalls.get())
+
+            // Release both latches; VM-B re-validates Corrupt from scratch.
+            finalRelease.set(true)
+            initBRelease.set(true)
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftCorrupt }
+            assertFalse(vmB.state.value.policyDraftKnown)
+            assertTrue(vmB.state.value.policyDraftCorrupt)
+            assertNull(activeTxOf(vmB))
+            assertEquals(0, deleteCalls.get())
+            // Fresh validation works again (re-arm proves no stuck Unknown).
+            vmB.requestRepairCorruptDraft()
+            assertTrue(vmB.isCorruptRepairArmed())
+        } finally {
+            try {
+                finalRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                initBRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage N2 P1: same unarmed inherit but the key was externally fixed to
+    // Known(B) before VM-B inherits → still zero deletes, B persists, VM-B
+    // refresh observes Known(B), and no CLEAR_SUCCESS / repair publication
+    // ever emits from the stale (aborted) Tx.
+    @Test
+    fun n2_twoVm_unarmedRepairInherit_knownB_refusesZeroDeletes() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val loadCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val finalEntered = java.util.concurrent.CountDownLatch(1)
+        val finalRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val initBEntered = java.util.concurrent.CountDownLatch(1)
+        val initBRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when (loadCalls.incrementAndGet()) {
+                    1 -> throw ClassCastException("corrupt")
+                    2 -> throw ClassCastException("corrupt")
+                    3 -> {
+                        finalEntered.countDown()
+                        while (!finalRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        if (corrupt) throw ClassCastException("corrupt") else backing
+                    }
+                    4 -> {
+                        initBEntered.countDown()
+                        while (!initBRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        if (corrupt) throw ClassCastException("corrupt") else backing
+                    }
+                    else -> {
+                        if (corrupt) throw ClassCastException("corrupt") else backing
+                    }
+                }
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    corrupt = false
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(finalEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vmA) as DualViewModel.PolicyTx
+            assertFalse(tx1.executionArmed.get())
+            assertFalse(tx1.deferred.isCompleted)
+
+            vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
+            Thread.sleep(500)
+            await(timeoutMs = 5_000L) { coordinatorTxOf(coord) == null && activeTxOf(vmA) == null }
+            assertTrue(tx1.deferred.isCancelled)
+            assertEquals(0, deleteCalls.get())
+
+            // External fix to Known(B) before VM-B inherits (no coordinator rev
+            // change, only the fresh pre-read could catch it — but the Tx is
+            // already aborted, so there is nothing to catch it with).
+            corrupt = false
+            backing = setOf("com.B")
+
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            assertTrue(initBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            Thread.sleep(200)
+            assertNull(activeTxOf(vmB))
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertFalse(vmB.state.value.policyDraftKnown)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            assertTrue(reconcilingKeysOf(vmB).isEmpty())
+            assertEquals(0, deleteCalls.get())
+            assertEquals(setOf("com.B"), backing)
+
+            finalRelease.set(true)
+            initBRelease.set(true)
+            // VM-B init re-validates the fixed key from scratch.
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vmB.state.value.policyDraft)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertNull(activeTxOf(vmB))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(reconcilingKeysOf(vmB).isEmpty())
+            assertEquals(0, deleteCalls.get())
+            assertEquals(setOf("com.B"), backing)
+
+            // Explicit refresh stays Known(B); stale Tx never published.
+            vmB.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftKnown && vmB.state.value.policyDraft == setOf("com.B") }
+            assertEquals(setOf("com.B"), vmB.state.value.policyDraft)
+            assertEquals(0, deleteCalls.get())
+            assertFalse(vmB.state.value.msg.contains("已修復"))
+            assertFalse(vmB.state.value.msg.contains("已清除政策草稿"))
+            assertNull(coord.latest.value)
+            assertNull(activeTxOf(vmB))
+        } finally {
+            try {
+                finalRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                initBRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage N2 P1: unarmed + incomplete Tx must never register as executable.
+    // registerHandoverTx aborts without store touch: local/coordinator
+    // untouched, reconciling empty, IDLE+Unknown, LAZY deferred cancelled.
+    @Test
+    fun n2_registerHandover_unarmedIncomplete_aborts() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val tx = DualViewModel.PolicyTx(
+                txId = -1L,
+                key = "policy-test-unarmed",
+                deferred = kotlinx.coroutines.CompletableDeferred(),
+                sanitized = setOf("com.X"),
+                store = fake.store,
+                isClear = false,
+            )
+            // Prove the unarmed path: never armed, never completed.
+            assertFalse(tx.executionArmed.get())
+            assertFalse(tx.deferred.isCompleted)
+
+            callRegisterHandover(vm, tx, false)
+
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertFalse(vm.state.value.policyDraftCorrupt)
+            assertTrue(tx.deferred.isCancelled)
+            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.clearCalls)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
             }
         }
     }
