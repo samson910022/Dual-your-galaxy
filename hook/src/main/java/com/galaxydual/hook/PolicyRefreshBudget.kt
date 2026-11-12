@@ -72,7 +72,11 @@ object PolicyRefreshBudget {
         // escape onto the hooked query thread.
         val future: Future<Set<String>?> = try {
             executor.submit(Callable<Set<String>?> { reader() })
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
             return null
         }
         return try {
@@ -83,9 +87,13 @@ object PolicyRefreshBudget {
             } catch (_: Throwable) {
             }
             null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             try {
                 future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
             } catch (_: Throwable) {
             }
             null
@@ -144,8 +152,19 @@ object PolicyRefreshBudget {
 // Thread-safety: all counters are AtomicLong; the semaphore serializes
 // submits; breaker state is volatile + atomic counters only (no lock on the
 // hot path beyond the semaphore).
+// Distinguishes gate contention (at-most-one guard busy, stuck-breaker
+// short-circuit, zero-queue rejection) from a genuine IO failure
+// (timeout / reader exception). EffectivePolicyCache catches this and returns
+// seed-only WITHOUT refreshing its failureCooldown, so a herd contending on
+// the single worker does not renew the 5s cooldown forever (herd permanent
+// seed-only fix). All paths stay fail-closed (seed / last-known-good).
+class PolicyRefreshContentionException(message: String? = null) : RuntimeException(message)
+
+private fun tripleSaturated(v: Long): Long =
+    if (v > Long.MAX_VALUE / 3L) Long.MAX_VALUE else v * 3L
+
 class PolicyRefreshGate(
-    private val executor: ExecutorService,
+    @Volatile private var executor: ExecutorService,
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
     private val maxConsecutiveTimeouts: Int = PolicyRefreshBudget.MAX_CONSECUTIVE_TIMEOUTS,
     private val stuckOpenMs: Long = PolicyRefreshBudget.STUCK_OPEN_MS,
@@ -153,7 +172,14 @@ class PolicyRefreshGate(
     private val halfOpenMaxMs: Long = PolicyRefreshBudget.HALF_OPEN_MAX_MS,
     private val log: (String) -> Unit = {},
 ) {
+    companion object {
+        // Leak bound: at most one forced executor rebuild per gate lifetime.
+        // See tryRebuildStuckWorker for the stuck-thread residency note.
+        const val MAX_WORKER_REBUILDS = 1L
+    }
+
     private val outstanding = Semaphore(1)
+    private val rebuildLock = Any()
 
     val droppedRefreshCount = AtomicLong(0L)
     val stuckShortCircuits = AtomicLong(0L)
@@ -162,6 +188,12 @@ class PolicyRefreshGate(
     // stuck-open (cooldown elapsed + drained). Cooldown itself via
     // halfOpenCooldownMs() (exponential, reset on success/invalidate).
     val halfOpenProbes = AtomicLong(0L)
+    // Phase3: stuck-busy worker rebuild metrics. workerRebuilds counts forced
+    // executor replacements after a busy worker outlived k*cooldown or
+    // HALF_OPEN_MAX_MS; busyStuckDrops counts busy short-circuits below the
+    // rebuild threshold.
+    val workerRebuilds = AtomicLong(0L)
+    val busyStuckDrops = AtomicLong(0L)
     private val halfOpenFailures = AtomicLong(0L)
     private val lastStuckOpenMs = AtomicLong(Long.MIN_VALUE)
 
@@ -180,13 +212,15 @@ class PolicyRefreshGate(
     // bounded (<=1) for any executor. Returns -1 when the executor does not
     // expose a queue (custom ExecutorService).
     fun queueDepth(): Int = try {
-        if (executor is ThreadPoolExecutor) executor.queue.size else -1
+        val e = executor
+        if (e is ThreadPoolExecutor) e.queue.size else -1
     } catch (_: Throwable) {
         -1
     }
 
     fun activeCount(): Int = try {
-        if (executor is ThreadPoolExecutor) executor.activeCount else -1
+        val e = executor
+        if (e is ThreadPoolExecutor) e.activeCount else -1
     } catch (_: Throwable) {
         -1
     }
@@ -213,16 +247,83 @@ class PolicyRefreshGate(
 
     fun lastStuckOpenMs(): Long = lastStuckOpenMs.get()
 
+    // Test seam: current executor identity (rebuild swaps this reference).
+    fun currentExecutorForTest(): ExecutorService = executor
+
     // Previous stuck work drained? Only a ThreadPoolExecutor exposes liveness;
     // custom executors are treated as idle (probe allowed — guard + zero queue
     // still bound it to at most one worker). A busy worker means the prior
     // uninterruptible Binder read is still occupying the single thread, so a
-    // probe would only hit RejectedExecutionException — keep short-circuiting.
+    // probe would only hit RejectedExecutionException — keep short-circuiting
+    // unless the busy age exceeds the rebuild threshold (see below).
+    // Custom ExecutorService (non-ThreadPoolExecutor): queueDepth/activeCount
+    // return -1 and busy is always false (fail-closed probe allowed).
     private fun isExecutorBusy(): Boolean = try {
         val e = executor as? ThreadPoolExecutor ?: return false
         e.activeCount > 0
     } catch (_: Throwable) {
         false
+    }
+
+    fun workerRebuildCount(): Long = workerRebuilds.get()
+
+    fun busyStuckDropCount(): Long = busyStuckDrops.get()
+
+    // Bounded busy threshold (shared by readBounded/readBoundedOrThrow stuck
+    // paths — keep both call sites in sync): 3*cooldown capped at
+    // HALF_OPEN_MAX_MS. The old minOf(rebuildAfter, HALF_OPEN_MAX_MS) was
+    // redundant (rebuildAfter is already capped), simplified here.
+    private fun rebuildThresholdMs(cooldown: Long): Long =
+        tripleSaturated(cooldown).coerceAtMost(halfOpenMaxMs).coerceAtLeast(0L)
+
+    // Forced worker rebuild (Phase3 breaker self-lock fix, bounded leak):
+    // a single-thread executor stuck on an uninterruptible Binder read never
+    // drains, so a stuck-open breaker with a permanently busy worker would
+    // short-circuit forever (observe-only lock-in). When the busy age exceeds
+    // rebuildThresholdMs(cooldown) (3*cooldown capped at HALF_OPEN_MAX_MS),
+    // shutdown the stuck worker best-effort and atomically replace the gate's
+    // executor reference with a fresh zero-queue single-thread executor.
+    // Custom executors cannot be rebuilt (unknown factory) — counted/logged
+    // only. Caller must hold the outstanding guard.
+    //
+    // Leak bound: at most MAX_WORKER_REBUILDS rebuilds per gate lifetime; the
+    // old interrupt-ignoring worker thread is a daemon that never exits, so it
+    // stays resident permanently — at most MAX_WORKER_REBUILDS such stuck
+    // threads per gate (1 policy + 1 capability = at most 2 per process).
+    // Past the cap the gate only short-circuits + counts (no new threads).
+    // Fresh thread names carry the rebuild count suffix for lspd forensics.
+    private fun tryRebuildStuckWorker(): Boolean {
+        synchronized(rebuildLock) {
+            // Re-check under rebuild lock: a peer may have rebuilt or the
+            // worker may have drained while we acquired the guard.
+            try {
+                if (workerRebuilds.get() >= MAX_WORKER_REBUILDS) return false
+                val cur = executor as? ThreadPoolExecutor ?: return false
+                if (cur.activeCount <= 0) return true
+                try {
+                    cur.shutdownNow()
+                } catch (_: Throwable) {
+                }
+                val n = workerRebuilds.get() + 1L
+                val fresh = try {
+                    PolicyRefreshBudget.newPolicyRefreshExecutor(
+                        "GalaxyDual-policy-refresh-rebuilt-$n",
+                    )
+                } catch (_: Throwable) {
+                    return false
+                }
+                executor = fresh
+                workerRebuilds.incrementAndGet()
+                throttledLog(
+                    "policy refresh worker rebuilt after stuck busy " +
+                        "(rebuild $n/$MAX_WORKER_REBUILDS, fail-closed probe continues)",
+                    force = true,
+                )
+                return true
+            } catch (_: Throwable) {
+                return false
+            }
+        }
     }
 
     private fun shortCircuitNull(): Set<String>? {
@@ -240,6 +341,7 @@ class PolicyRefreshGate(
         // cooldown (M4 P2#6 fix): no cross-process push exists on API 102.0.0,
         // so invalidate() may never arrive; without a timed probe the breaker
         // could stick open forever (success is impossible while blocking).
+        // nowMs() throwing short-circuits fail-closed (no clock, no probe).
         if (stuckOpen) {
             val now = try {
                 nowMs()
@@ -252,11 +354,51 @@ class PolicyRefreshGate(
                 return shortCircuitNull()
             }
             // Cooldown elapsed: probe only when drained (or reinit-safe via
-            // invalidate, which clears stuckOpen before we get here). A busy
-            // single worker would only reject the submit — keep
-            // short-circuiting until it drains.
+            // invalidate, which clears stuckOpen before we get here).
+            // Phase3 self-lock fix: a permanently busy single worker (an
+            // uninterruptible Binder read that ignores cancel(true)) would
+            // otherwise short-circuit forever. When the busy age exceeds
+            // k*cooldown (k=3) or HALF_OPEN_MAX_MS, force a worker rebuild
+            // (shutdownNow + fresh zero-queue executor, atomically swapped)
+            // and probe on the fresh worker. Below the threshold keep
+            // short-circuiting (counted) until it drains.
             if (isExecutorBusy()) {
-                return shortCircuitNull()
+                val age = now - last
+                // Shared stuck-busy decision (see rebuildThresholdMs): force a
+                // rebuild only past 3*cooldown capped at HALF_OPEN_MAX_MS.
+                val forceAt = rebuildThresholdMs(cooldown)
+                if (age < forceAt) {
+                    busyStuckDrops.incrementAndGet()
+                    return shortCircuitNull()
+                }
+                // Above threshold: single-flight the rebuild+probe so only one
+                // thread rebuilds.
+                if (!outstanding.tryAcquire()) {
+                    return shortCircuitNull()
+                }
+                try {
+                    if (!stuckOpen) {
+                        return doSubmit(reader, timeoutMs, isProbe = false)
+                    }
+                    // Peer may have drained/rebuilt while acquiring the guard.
+                    if (!isExecutorBusy()) {
+                        halfOpenProbes.incrementAndGet()
+                        return doProbeSubmit(reader, timeoutMs, now)
+                    }
+                    val rebuilt = tryRebuildStuckWorker()
+                    if (!rebuilt) {
+                        busyStuckDrops.incrementAndGet()
+                        throttledLog("policy refresh stuck busy, rebuild skipped (custom executor)")
+                        return shortCircuitNull()
+                    }
+                    halfOpenProbes.incrementAndGet()
+                    return doProbeSubmit(reader, timeoutMs, now)
+                } finally {
+                    try {
+                        outstanding.release()
+                    } catch (_: Throwable) {
+                    }
+                }
             }
             // Single-flight still guards the probe (at-most-one); zero queue
             // is kept because the production executor is SynchronousQueue.
@@ -302,6 +444,120 @@ class PolicyRefreshGate(
         }
     }
 
+    // Contention-signalling variant (Phase3 herd fix): identical stall/breaker
+    // semantics to readBounded, but gate contention (guard busy,
+    // stuck short-circuit, zero-queue rejection) throws
+    // PolicyRefreshContentionException instead of returning null, so
+    // EffectivePolicyCache can return seed-only WITHOUT refreshing its
+    // failureCooldown. Genuine IO failures (timeout / reader Error/Exception /
+    // interrupt) still return null (failed read → cache cooldown applies).
+    // Fail-closed in all cases (null or Contention both map to seed fallback
+    // in the cache layer).
+    // Sync note: the stuck-open preamble above (clock/cooldown/busy/rebuild/
+    // guard) mirrors readBounded; stuck-busy decision shared via
+    // rebuildThresholdMs — keep both paths in sync when retuning.
+    fun readBoundedOrThrow(
+        reader: () -> Set<String>?,
+        timeoutMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+    ): Set<String>? {
+        if (stuckOpen) {
+            val now = try {
+                nowMs()
+            } catch (_: Throwable) {
+                stuckShortCircuits.incrementAndGet()
+                droppedRefreshCount.incrementAndGet()
+                throw PolicyRefreshContentionException("clock")
+            }
+            val last = lastStuckOpenMs.get()
+            val cooldown = halfOpenCooldownMs()
+            if (last == Long.MIN_VALUE || now - last < cooldown) {
+                stuckShortCircuits.incrementAndGet()
+                droppedRefreshCount.incrementAndGet()
+                throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
+                throw PolicyRefreshContentionException("stuck")
+            }
+            if (isExecutorBusy()) {
+                val age = now - last
+                // Shared stuck-busy decision with readBounded above (keep in
+                // sync): only past rebuildThresholdMs forces a rebuild.
+                val forceAt = rebuildThresholdMs(cooldown)
+                if (age < forceAt) {
+                    busyStuckDrops.incrementAndGet()
+                    stuckShortCircuits.incrementAndGet()
+                    droppedRefreshCount.incrementAndGet()
+                    throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
+                    throw PolicyRefreshContentionException("busy")
+                }
+                if (!outstanding.tryAcquire()) {
+                    stuckShortCircuits.incrementAndGet()
+                    droppedRefreshCount.incrementAndGet()
+                    throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
+                    throw PolicyRefreshContentionException("guard")
+                }
+                try {
+                    if (!stuckOpen) {
+                        return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+                    }
+                    if (!isExecutorBusy()) {
+                        halfOpenProbes.incrementAndGet()
+                        return doProbeSubmitOrThrow(reader, timeoutMs, now)
+                    }
+                    val rebuilt = tryRebuildStuckWorker()
+                    if (!rebuilt) {
+                        busyStuckDrops.incrementAndGet()
+                        stuckShortCircuits.incrementAndGet()
+                        droppedRefreshCount.incrementAndGet()
+                        throw PolicyRefreshContentionException("rebuild-skipped")
+                    }
+                    halfOpenProbes.incrementAndGet()
+                    return doProbeSubmitOrThrow(reader, timeoutMs, now)
+                } finally {
+                    try {
+                        outstanding.release()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            if (!outstanding.tryAcquire()) {
+                stuckShortCircuits.incrementAndGet()
+                droppedRefreshCount.incrementAndGet()
+                throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
+                throw PolicyRefreshContentionException("guard")
+            }
+            try {
+                if (!stuckOpen) {
+                    return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+                }
+                halfOpenProbes.incrementAndGet()
+                return doProbeSubmitOrThrow(reader, timeoutMs, now)
+            } finally {
+                try {
+                    outstanding.release()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        if (!outstanding.tryAcquire()) {
+            droppedRefreshCount.incrementAndGet()
+            throttledLog("policy refresh dropped: outstanding in flight")
+            throw PolicyRefreshContentionException("guard")
+        }
+        try {
+            if (stuckOpen) {
+                stuckShortCircuits.incrementAndGet()
+                droppedRefreshCount.incrementAndGet()
+                throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
+                throw PolicyRefreshContentionException("stuck")
+            }
+            return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+        } finally {
+            try {
+                outstanding.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     // Shared submit body for the normal (non-half-open) path. Caller holds the
     // at-most-one guard. isProbe is always false here; the half-open probe has
     // its own body (doProbeSubmit) so probe outcomes update backoff.
@@ -318,9 +574,13 @@ class PolicyRefreshGate(
             executor.submit(Callable<Set<String>?> { reader() })
         } catch (re: RejectedExecutionException) {
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh rejected: ${re.javaClass.simpleName}")
+            throttledLog("policy refresh rejected: ${HookLog.shortEx(re)}")
             return null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
             droppedRefreshCount.incrementAndGet()
             return null
         }
@@ -335,9 +595,13 @@ class PolicyRefreshGate(
             }
             onTimeout()
             null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             try {
                 future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
             } catch (_: Throwable) {
             }
             // Non-timeout failure (exception/interrupt): not a stuck
@@ -349,10 +613,12 @@ class PolicyRefreshGate(
         }
     }
 
-    // Half-open probe body: caller holds the guard and has verified cooldown
-    // elapsed + executor drained. Success closes the breaker + resets backoff;
-    // any failure (timeout / rejection / reader exception) re-opens + backs
-    // off. Fail-closed in all cases (null to seed/last-known-good).
+    // Contention-signalling submit bodies: rejection (zero-queue busy race)
+    // throws Contention so the cache layer does not treat it as an IO failure
+    // (no failureCooldown renewal). Timeout / reader Error/Exception /
+    // interrupt still return null (genuine failed read → cooldown applies).
+    // Covers the Error / Rejected / Interrupted branches with the same
+    // fail-closed null mapping as doSubmit/doProbeSubmit.
     private fun doProbeSubmit(
         reader: () -> Set<String>?,
         timeoutMs: Long,
@@ -365,10 +631,14 @@ class PolicyRefreshGate(
             // worker re-busy: stay open, throttle the next probe by refreshing
             // lastStuckOpenMs, back off once.
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh half-open probe rejected: ${re.javaClass.simpleName}")
+            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(re)}")
             onProbeFail(now)
             return null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
             droppedRefreshCount.incrementAndGet()
             onProbeFail(now)
             return null
@@ -384,13 +654,108 @@ class PolicyRefreshGate(
             }
             onProbeFail(now)
             null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             try {
                 future.cancel(true)
             } catch (_: Throwable) {
             }
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
             // Any quick failure still proves nothing about recovery: stay
             // open + back off (only a returned value, even null, closes).
+            onProbeFail(now)
+            null
+        }
+    }
+
+    private fun doSubmitOrThrow(
+        reader: () -> Set<String>?,
+        timeoutMs: Long,
+        isProbe: Boolean,
+    ): Set<String>? {
+        @Suppress("UNUSED_PARAMETER")
+        val _probe = isProbe
+        val future: Future<Set<String>?> = try {
+            executor.submit(Callable<Set<String>?> { reader() })
+        } catch (re: RejectedExecutionException) {
+            droppedRefreshCount.incrementAndGet()
+            throttledLog("policy refresh rejected: ${HookLog.shortEx(re)}")
+            throw PolicyRefreshContentionException("rejected")
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
+            droppedRefreshCount.incrementAndGet()
+            throw PolicyRefreshContentionException("submit-failed")
+        }
+        return try {
+            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            onSuccess()
+            v
+        } catch (_: TimeoutException) {
+            try {
+                future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            onTimeout()
+            null
+        } catch (t: Throwable) {
+            try {
+                future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
+            null
+        }
+    }
+
+    private fun doProbeSubmitOrThrow(
+        reader: () -> Set<String>?,
+        timeoutMs: Long,
+        now: Long,
+    ): Set<String>? {
+        val future: Future<Set<String>?> = try {
+            executor.submit(Callable<Set<String>?> { reader() })
+        } catch (re: RejectedExecutionException) {
+            droppedRefreshCount.incrementAndGet()
+            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(re)}")
+            onProbeFail(now)
+            throw PolicyRefreshContentionException("probe-rejected")
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
+            droppedRefreshCount.incrementAndGet()
+            onProbeFail(now)
+            throw PolicyRefreshContentionException("probe-submit-failed")
+        }
+        return try {
+            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            onProbeSuccess()
+            v
+        } catch (_: TimeoutException) {
+            try {
+                future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            onProbeFail(now)
+            null
+        } catch (t: Throwable) {
+            try {
+                future.cancel(true)
+            } catch (_: Throwable) {
+            }
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
             onProbeFail(now)
             null
         }

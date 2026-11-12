@@ -129,7 +129,7 @@ class DualHook : XposedModule() {
             try {
                 val overloads = target.declaredMethods.filter { it.name == methodName }
                 if (overloads.isEmpty()) {
-                    logi("method not found: ${target.name}#$methodName (no overloads)")
+                    logi("method not found: ${shortClass(target)}#${methodName.take(200)} (no overloads)")
                     continue
                 }
                 overloads.forEach { method ->
@@ -138,7 +138,7 @@ class DualHook : XposedModule() {
                     } catch (t: Throwable) {
                         guardSkipped++
                         try {
-                            logi("skip hook ${target.name}#${method.name}: eligibility evaluation failed (${t.message})")
+                            logi("skip hook ${shortClass(target)}#${method.name.take(200)}: eligibility evaluation failed (${shortEx(t)}: ${shortMsg(t)})")
                         } catch (_: Throwable) {
                         }
                         return@forEach
@@ -146,13 +146,13 @@ class DualHook : XposedModule() {
                     if (decision is WhitelistHookEligibility.Skip) {
                         guardSkipped++
                         try {
-                            logi("skip hook ${target.name}#${method.name}: ${decision.reason}")
+                            logi("skip hook ${shortClass(target)}#${method.name.take(200)}: ${decision.reason.take(200)}")
                         } catch (_: Throwable) {
                         }
                         return@forEach
                     }
                     try {
-                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name)) {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name.take(200))) {
                             installed++
                         } else {
                             installFailures++
@@ -160,14 +160,14 @@ class DualHook : XposedModule() {
                     } catch (t: Throwable) {
                         installFailures++
                         try {
-                            logi("hook install failed: ${target.name}#${method.name}: ${t.message}")
+                            logi("hook install failed: ${shortClass(target)}#${method.name.take(200)}: ${shortEx(t)}: ${shortMsg(t)}")
                         } catch (_: Throwable) {
                         }
                     }
                 }
             } catch (t: Throwable) {
                 try {
-                    logi("hook lookup failed: ${target.name}#$methodName: ${t.message}")
+                    logi("hook lookup failed: ${shortClass(target)}#${methodName.take(200)}: ${shortEx(t)}: ${shortMsg(t)}")
                 } catch (_: Throwable) {
                 }
             }
@@ -175,7 +175,7 @@ class DualHook : XposedModule() {
         if (installed == 0 && (guardSkipped > 0 || installFailures > 0)) {
             logi(
                 "system_server whitelist hooks: installed=0, guardSkipped=$guardSkipped, " +
-                    "installFailures=$installFailures on ${target.name} (observe-only)",
+                    "installFailures=$installFailures on ${shortClass(target)} (observe-only)",
             )
         }
         return installed
@@ -209,7 +209,7 @@ class DualHook : XposedModule() {
         // Attribution for on-device forensics: the winning candidate disambiguates
         // provider path vs legacy fallback in lspd logs (field-found lines alone
         // cannot, both candidates carry the same field names).
-        logi("using ${target.name} for daagent hooks")
+        logi("using ${shortClass(target)} for daagent hooks")
         // Best-effort diagnostics: report every candidate field's presence
         // (both standard and _FOR_CHINA names are patch targets below, so the
         // log shows which ones this ROM actually carries).
@@ -222,18 +222,18 @@ class DualHook : XposedModule() {
             }
         }
         if (presentFields.isEmpty()) {
-            logi("field $WHITELIST_FIELD_NAME not found on ${target.name}")
+            logi("field $WHITELIST_FIELD_NAME not found on ${shortClass(target)}")
         } else {
             for (diagnosticField in presentFields) {
                 try {
                     val field = target.getDeclaredField(diagnosticField)
                     logi(
-                        "found $diagnosticField : ${field.type.name} " +
+                        "found ${diagnosticField.take(200)} : ${shortClass(field.type)} " +
                             "static=${Modifier.isStatic(field.modifiers)} " +
                             "final=${Modifier.isFinal(field.modifiers)}",
                     )
                 } catch (_: Throwable) {
-                    logi("field $diagnosticField not found on ${target.name}")
+                    logi("field ${diagnosticField.take(200)} not found on ${shortClass(target)}")
                 }
             }
         }
@@ -251,9 +251,9 @@ class DualHook : XposedModule() {
             installed++
             // Install evidence only (see patchWhitelistField below for effect);
             // deferred/observe-only reasoning lives in comments, not in the log.
-            logi("hooked ${target.name}#<clinit> (install evidence only)")
+            logi("hooked ${shortClass(target)}#<clinit> (install evidence only)")
         } catch (t: Throwable) {
-            logi("hook <clinit> failed: ${t.message}")
+            logi("hook <clinit> failed: ${shortEx(t)}: ${shortMsg(t)}")
         }
         // Stage 1 diagnose-only *hitelist* sweep (no hook installs): mutation/
         // read-only ambiguity on ROM variants makes fuzzy install unsafe (e.g.
@@ -270,8 +270,8 @@ class DualHook : XposedModule() {
                     } catch (t: Throwable) {
                         try {
                             logi(
-                                "diagnose-only sweep ${target.name}#${method.name}: " +
-                                    "eligibility evaluation failed (${t.message}); " +
+                                "diagnose-only sweep ${shortClass(target)}#${method.name.take(200)}: " +
+                                    "eligibility evaluation failed (${shortEx(t)}: ${shortMsg(t)}); " +
                                     "no hook installed (Stage 1 fail-closed)",
                             )
                         } catch (_: Throwable) {
@@ -290,8 +290,8 @@ class DualHook : XposedModule() {
                             is WhitelistHookEligibility.Skip -> decision.reason
                         }
                         logi(
-                            "diagnose-only sweep ${target.name}#${method.name}: " +
-                                "safety=$safety, eligibility=${reason}; " +
+                            "diagnose-only sweep ${shortClass(target)}#${method.name.take(200)}: " +
+                                "safety=$safety, eligibility=${reason.take(200)}; " +
                                 "no hook installed (Stage 1 fail-closed, diagnose-only)",
                         )
                     } catch (_: Throwable) {
@@ -299,7 +299,7 @@ class DualHook : XposedModule() {
                 }
         } catch (t: Throwable) {
             try {
-                logi("diagnose-only *hitelist* sweep failed on ${target.name}: ${t.message}")
+                logi("diagnose-only *hitelist* sweep failed on ${shortClass(target)}: ${shortEx(t)}: ${shortMsg(t)}")
             } catch (_: Throwable) {
             }
         }
@@ -360,7 +360,7 @@ class DualHook : XposedModule() {
                         // Fail-closed at call site (privileged hook path).
                         guardSkipped++
                         try {
-                            logi("skip hook ${target.name}#${method.name}: eligibility evaluation failed (${t.message})")
+                            logi("skip hook ${shortClass(target)}#${method.name.take(200)}: eligibility evaluation failed (${shortEx(t)}: ${shortMsg(t)})")
                         } catch (_: Throwable) {
                         }
                         return@forEach
@@ -368,13 +368,13 @@ class DualHook : XposedModule() {
                     if (decision is WhitelistHookEligibility.Skip) {
                         guardSkipped++
                         try {
-                            logi("skip hook ${target.name}#${method.name}: ${decision.reason}")
+                            logi("skip hook ${shortClass(target)}#${method.name.take(200)}: ${decision.reason.take(200)}")
                         } catch (_: Throwable) {
                         }
                         return@forEach
                     }
                     try {
-                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name)) {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name.take(200))) {
                             classInstalled++
                         } else {
                             installFailures++
@@ -382,14 +382,14 @@ class DualHook : XposedModule() {
                     } catch (t: Throwable) {
                         installFailures++
                         try {
-                            logi("hook install failed: ${target.name}#${method.name}: ${t.message}")
+                            logi("hook install failed: ${shortClass(target)}#${method.name.take(200)}: ${shortEx(t)}: ${shortMsg(t)}")
                         } catch (_: Throwable) {
                         }
                     }
                 }
             }
             if (classInstalled > 0) {
-                logi("using ${target.name} for daagent query hooks (+$classInstalled)")
+                logi("using ${shortClass(target)} for daagent query hooks (+$classInstalled)")
                 hooksInstalled += classInstalled
             }
         }
@@ -539,7 +539,7 @@ class DualHook : XposedModule() {
             try {
                 logi(
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $desc: policy apply failed " +
-                        "(${t.javaClass.name}); returning original",
+                        "(${shortEx(t)}: ${shortMsg(t)}); returning original",
                 )
             } catch (_: Throwable) {
                 // Logging must never break the hook path.
@@ -570,20 +570,34 @@ class DualHook : XposedModule() {
     // poll may return stale data until reboot (daemon restart rebuilds the
     // map). See docs/HOOK.md §1.1 + CrossProcessFreshnessContractTest.
     //
-    // Hot-path budget (P1-2, hardened K4 P2#6, half-open M4 P2#6): the reader
-    // below runs through PolicyRefreshGate (at-most-one guard + stuck-worker
-    // breaker with timed half-open probe) on a zero-queue executor with a 50ms
-    // stall budget (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on timeout /
-    // contention / rejection / short-circuit the query falls back to
-    // seed/last-known-good and never blocks the hooked whitelist-query thread
-    // beyond the budget. Queue stays bounded (<=1, no growth) even when
-    // cancel(true) cannot stop an uninterruptible Binder read; breaker resets
-    // on invalidate or on a half-open probe success (30s initial, x2 to 5min
-    // cap) so silent upstream recovery still reopens without a push signal.
+    // Hot-path budget (P1-2, hardened K4 P2#6, half-open M4 P2#6, Phase3 herd):
+    // the reader below runs through PolicyRefreshGate (at-most-one guard +
+    // stuck-worker breaker with timed half-open probe + stuck-busy rebuild) on
+    // a zero-queue executor with a 50ms stall budget
+    // (PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS); on timeout / reader
+    // failure the query falls back to seed/last-known-good (cache
+    // failureCooldown applies); on contention (guard busy / stuck
+    // short-circuit / zero-queue rejection) the gate throws
+    // PolicyRefreshContentionException so the cache returns seed-only WITHOUT
+    // renewing its failureCooldown (herd collapse without permanent seed-only).
+    // Queue stays bounded (<=1, no growth) even when cancel(true) cannot stop
+    // an uninterruptible Binder read; breaker resets on invalidate or on a
+    // half-open probe success (30s initial, x2 to 5min cap) so silent upstream
+    // recovery still reopens without a push signal.
+    // Critical nesting fix: the capability probe runs on its own gate+executor
+    // (capabilityGate) OUTSIDE the policy gate. The policy gate's reader wraps
+    // only the prefs getStringSet (readRemotePrefs); the probe is sequenced
+    // before it and never nests inside the outer guard. Sharing one
+    // non-reentrant Semaphore(1) gate for both would self-contend: the outer
+    // leader holds the permit while the worker thread tries the inner probe on
+    // the same gate, tryAcquire always fails, the first true can never latch
+    // (permanent seed-only). Separate gates keep the probe latchable.
     internal fun effectivePolicy(): Set<String> =
         effectiveCache.get(EXTRA_WHITELIST_PACKAGES) {
-            policyRefreshGate.readBounded(
-                reader = { readRemotePolicy() },
+            val capable = isRemoteCapable() ?: return@get null
+            if (!capable) return@get emptySet()
+            policyRefreshGate.readBoundedOrThrow(
+                reader = { readRemotePrefs() },
                 timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
             )
         }
@@ -610,16 +624,24 @@ class DualHook : XposedModule() {
     // the writer + reboot semantics are documented in docs/HOOK.md §1.1.
     // DEVICE-UNVERIFIED: end-to-end read-after-write still needs on-device proof.
     private fun readRemotePolicy(): Set<String>? {
-        // PROP_CAP_REMOTE probe via RemoteCapabilityLatch (P2-1): only a
-        // definitive true is latched; a probe that throws is NOT latched and
-        // returns null, so the cache does not cache the failure and the next
-        // query retries. A definitive false reports through the latch and
-        // returns emptySet() (successful empty read, cached 60s): the latch 5s
-        // is an INNER gate reached only on a cache miss (TTL expiry or
-        // explicit invalidate), so effective false retry = max(60s TTL, 5s
-        // latch); invalidate clears both for an immediate retry.
+        // Seam for PolicySource.remotePolicyReader (JVM tests): probe +
+        // prefs, never throws. Production effectivePolicy() sequences the same
+        // steps but keeps the probe OUTSIDE the policy gate (see above); this
+        // helper shares the pieces so the seam stays behavior-identical.
         val capable = isRemoteCapable() ?: return null
         if (!capable) return emptySet()
+        return readRemotePrefs()
+    }
+
+    // Prefs-only read (outer-gate reader): no capability probe inside, so the
+    // outer policy gate never nests a probe on the same guard. Never throws:
+    // the not-capable path is handled by the caller (emptySet, cached), while
+    // a failed read (framework not attached / group missing / IPC failure)
+    // returns null and is logged best-effort only on the good->failed
+    // transition. Null is NOT cached: the last known good value stays applied,
+    // or the seed alone when none is cached (fail-closed observe-only). A
+    // successful read (even empty) returns a set and IS cached.
+    private fun readRemotePrefs(): Set<String>? {
         return try {
             val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
             registerPolicyChangeListener(prefs)
@@ -629,7 +651,7 @@ class DualHook : XposedModule() {
             // service would otherwise spam the hot path. Null is not cached
             // (see cache).
             if (effectiveCache.shouldLogFailure()) {
-                logi("remote policy read failed: ${t.javaClass.simpleName}: ${t.message}")
+                logi("remote policy read failed: ${shortEx(t)}: ${shortMsg(t)}")
             }
             null
         }
@@ -641,18 +663,73 @@ class DualHook : XposedModule() {
     // empty read, cached 60s by EffectivePolicyCache), so the latch 5s
     // cooldown is an INNER gate reached only on a cache miss (TTL expiry or
     // explicit invalidate). Effective false retry = max(60s TTL, 5s latch).
-    // A probe that throws is NOT latched false: it is logged best-effort
-    // and retried on the next call (returns null, not cached, so the cache
+    // A probe that throws / times out / contends is NOT latched false: it is
+    // throttled via reportFalseAt (fixed cooldown, no window sliding) and
+    // retried on the next call (returns null, not cached, so the cache
     // 5s failure cooldown -- not the TTL -- governs throw retries). Only a
     // definitive true is latched forever. Latch state is cleared for false
     // on invalidate() so a policy-change signal re-probes immediately
     // (cache.invalidate + latch.onInvalidate together).
+    // Phase3: the Binder probe itself runs inside its OWN gate budget
+    // (capabilityGate, 50ms stall budget + at-most-one guard + stuck breaker
+    // on a dedicated single-thread executor), so a slow
+    // getFrameworkProperties() can never pin the query thread and never
+    // self-contends with the outer policy gate (independent Semaphore(1)).
     private fun isRemoteCapable(): Boolean? {
-        // Fast path: latched true never re-probes.
+        // Fast path: latched true never re-probes (no clock, no gate).
         if (capabilityLatch.isLatchedTrue()) return true
         if (!capabilityLatch.shouldProbe()) return remoteCapableFalseCached
+        // Gate-bounded probe: maps the Long property to a Set signal so the
+        // existing Set-based gate can bound it (non-empty = capable).
+        val probe: Set<String>? = try {
+            capabilityGate.readBoundedOrThrow(
+                reader = {
+                    val v = getFrameworkProperties()
+                    if ((v and XposedInterface.PROP_CAP_REMOTE) != 0L) setOf("capable")
+                    else emptySet()
+                },
+                timeoutMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+            )
+        } catch (_: PolicyRefreshContentionException) {
+            // Gate contention (guard busy / stuck short-circuit / rejection):
+            // throttle the next probe via the latch (fixed window, no slide)
+            // and fail closed to null. Null IS a failed read for the outer
+            // EffectivePolicyCache, so its 5s failureCooldown DOES apply on top
+            // of the latch 5s (bounded dual 5s throttle, never a forever pin:
+            // the next cooldown expiry retries the probe). Mapping to null is
+            // intentional: isRemoteCapable's Boolean?/null contract keeps the
+            // cache's single failure path instead of propagating Contention
+            // through the loader.
+            try {
+                capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
+            } catch (_: Throwable) {
+            }
+            return null
+        } catch (_: Throwable) {
+            // Submit failure outside the gate state machine: same dual
+            // throttle (latch 5s fixed window + outer cache 5s via the null
+            // below, both bounded).
+            try {
+                capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
+            } catch (_: Throwable) {
+            }
+            return null
+        }
+        if (probe == null) {
+            // Timeout / reader Error (including AssertionError) / interrupt:
+            // throttle the throw storm via the latch, log once, fail to null.
+            try {
+                capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
+            } catch (_: Throwable) {
+            }
+            if (!remoteCapabilityProbeFailureLogged) {
+                remoteCapabilityProbeFailureLogged = true
+                logi("remote capability probe failed: TimeoutOrError")
+            }
+            return null
+        }
         return try {
-            val capable = (getFrameworkProperties() and XposedInterface.PROP_CAP_REMOTE) != 0L
+            val capable = probe.isNotEmpty()
             if (capable) {
                 capabilityLatch.reportTrue()
                 remoteCapableFalseCached = null
@@ -662,9 +739,14 @@ class DualHook : XposedModule() {
             }
             capable
         } catch (t: Throwable) {
+            // Latch bookkeeping itself threw (hostile clock): throttle + null.
+            try {
+                capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
+            } catch (_: Throwable) {
+            }
             if (!remoteCapabilityProbeFailureLogged) {
                 remoteCapabilityProbeFailureLogged = true
-                logi("remote capability probe failed: ${t.javaClass.simpleName}: ${t.message}")
+                logi("remote capability probe failed: ${shortEx(t)}: ${shortMsg(t)}")
             }
             null
         }
@@ -677,29 +759,30 @@ class DualHook : XposedModule() {
     // but freshness never depends on it; the TTL poll is the mechanism.
     //
     // Phase 4: synchronized + compareAndSet with unregister of the old
-    // instance. A stale listener on a replaced prefs instance would both leak
-    // and invalidate on irrelevant changes; unregister best-effort (never
-    // throws out) then register the new one. Assignment only after a
+    // instance. Phase3 order: register the NEW instance first; only on success
+    // unregister the OLD (never lose the listener on a failed register, and
+    // never leak a stale instance on success). Assignment only after a
     // successful registration so a failed registration is retried with the
     // next prefs instance instead of being skipped.
     private fun registerPolicyChangeListener(prefs: SharedPreferences) {
         synchronized(listenerLock) {
             if (registeredPrefs === prefs) return
             val old = registeredPrefs
+            try {
+                prefs.registerOnSharedPreferenceChangeListener(remotePolicyListener)
+            } catch (_: Throwable) {
+                // Failed registration: keep the old listener (if any) so the
+                // next query retries with the next prefs instance; never clear
+                // to null and never touch the old registration on failure.
+                return
+            }
+            // New registration succeeded: best-effort drop the old instance.
             if (old != null && old !== prefs) {
                 try {
                     old.unregisterOnSharedPreferenceChangeListener(remotePolicyListener)
                 } catch (_: Throwable) {
                     // Best effort: a hostile prefs impl must not break the hook.
                 }
-            }
-            try {
-                prefs.registerOnSharedPreferenceChangeListener(remotePolicyListener)
-            } catch (_: Throwable) {
-                // Failed registration: keep old (already unregistered above) as
-                // null so the next query retries with the next prefs instance.
-                registeredPrefs = null
-                return
             }
             registeredPrefs = prefs
         }
@@ -739,8 +822,8 @@ class DualHook : XposedModule() {
             )
         } catch (t: Throwable) {
             logi(
-                "caller plan failed [$hookId] ${HookInstaller.executableSignature(method)}: " +
-                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                "caller plan failed [$hookId] ${shortClass(method.declaringClass)}#${method.name.take(200)}: " +
+                    "${shortEx(t)}: ${shortMsg(t)}; " +
                     "falling back to callee-only hook, effect unverified",
             )
             hookWithDeoptimize(method, hookId)
@@ -772,7 +855,7 @@ class DualHook : XposedModule() {
         val extra = effectivePolicy()
         if (extra.isEmpty()) {
             logi(
-                "skip patch on ${target.name}: empty policy " +
+                "skip patch on ${shortClass(target)}: empty policy " +
                     "(${WhitelistPatch.OBSERVE_ONLY_MARKER})",
             )
             return
@@ -781,16 +864,16 @@ class DualHook : XposedModule() {
         for ((fieldName, outcome) in results) {
             when (outcome) {
                 is WhitelistPatch.Outcome.PatchedInPlace ->
-                    logi("patched $fieldName on ${target.name} (MutableList): +${outcome.added} entries")
+                    logi("patched ${fieldName.take(200)} on ${shortClass(target)} (MutableList): +${outcome.added} entries")
                 is WhitelistPatch.Outcome.Replaced -> {
                     if (outcome.added == 0) {
-                        logi("patch $fieldName on ${target.name} already complete, no write")
+                        logi("patch ${fieldName.take(200)} on ${shortClass(target)} already complete, no write")
                     } else {
-                        logi("patched $fieldName on ${target.name} (String[]): +${outcome.added} entries")
+                        logi("patched ${fieldName.take(200)} on ${shortClass(target)} (String[]): +${outcome.added} entries")
                     }
                 }
-                is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason)
-                is WhitelistPatch.Outcome.ObserveOnly -> logi(outcome.reason)
+                is WhitelistPatch.Outcome.Skipped -> logi(outcome.reason.take(200))
+                is WhitelistPatch.Outcome.ObserveOnly -> logi(outcome.reason.take(200))
             }
         }
     }
@@ -805,6 +888,15 @@ class DualHook : XposedModule() {
         }
         return null
     }
+
+    // Log hygiene (shared HookLog): short simple names + truncated messages only;
+    // package-qualified names never enter the log. Delegates so all hook logs
+    // share one desensitized helper (see HookLog).
+    private fun shortEx(t: Throwable): String = HookLog.shortEx(t)
+
+    private fun shortMsg(t: Throwable): String = HookLog.shortMsg(t)
+
+    private fun shortClass(c: Class<*>): String = HookLog.shortClass(c)
 
     private fun logi(msg: String) {
         try {
@@ -861,6 +953,26 @@ class DualHook : XposedModule() {
             },
         )
 
+        // Dedicated capability-probe executor+gate (Critical nesting fix):
+        // independent Semaphore(1) + independent single-thread executor, never
+        // shared with the policy refresh path. The probe (getFrameworkProperties)
+        // is sequenced OUTSIDE the outer policy gate (see effectivePolicy), so
+        // even the thread-nesting is gone; sharing would self-contend on the
+        // non-reentrant guard and pin the first true forever (seed-only lock-in).
+        // Intentionally never shut down (process-lifetime, like the policy executor).
+        private val capabilityRefreshExecutor: java.util.concurrent.ThreadPoolExecutor =
+            PolicyRefreshBudget.newPolicyRefreshExecutor("GalaxyDual-capability-probe")
+
+        private val capabilityGate = PolicyRefreshGate(
+            executor = capabilityRefreshExecutor,
+            log = { msg ->
+                try {
+                    android.util.Log.i(TAG, msg)
+                } catch (_: Throwable) {
+                }
+            },
+        )
+
         // Remote-capability latch (P2-1): only true is latched forever; false
         // is cooldown-gated and re-probed (see RemoteCapabilityLatch). The
         // last-observed false is cached here for the cooldown fast path.
@@ -889,6 +1001,10 @@ class DualHook : XposedModule() {
                 effectiveCache.invalidate()
                 try {
                     policyRefreshGate.invalidate()
+                } catch (_: Throwable) {
+                }
+                try {
+                    capabilityGate.invalidate()
                 } catch (_: Throwable) {
                 }
             }

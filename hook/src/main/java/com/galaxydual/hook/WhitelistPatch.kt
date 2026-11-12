@@ -84,10 +84,11 @@ object WhitelistPatch {
         extra: Set<String>,
     ): Map<String, Outcome> {
         val results = LinkedHashMap<String, Outcome>()
+        val targetShort = HookLog.shortClass(target)
         if (extra.isEmpty()) {
             for (name in fieldNames) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: empty policy set ($OBSERVE_ONLY_MARKER)",
+                    "skip patch $name on $targetShort: empty policy set ($OBSERVE_ONLY_MARKER)",
                 )
             }
             return results
@@ -97,14 +98,14 @@ object WhitelistPatch {
                 target.getDeclaredField(name)
             } catch (_: Throwable) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: field not found",
+                    "skip patch $name on $targetShort: field not found",
                 )
                 continue
             }
             val isStatic = Modifier.isStatic(field.modifiers)
             if (!isStatic) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: field is not static",
+                    "skip patch $name on $targetShort: field is not static",
                 )
                 continue
             }
@@ -129,7 +130,7 @@ object WhitelistPatch {
                 }
                 if (!accessible) {
                     results[name] = Outcome.Skipped(
-                        "skip patch $name on ${target.name}: cannot access non-final field " +
+                        "skip patch $name on $targetShort: cannot access non-final field " +
                             "(setAccessible failed, fail-closed)",
                     )
                     continue
@@ -146,7 +147,7 @@ object WhitelistPatch {
                 field.get(null)
             } catch (t: Throwable) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: read failed (${t.javaClass.simpleName})",
+                    "skip patch $name on $targetShort: read failed (${HookLog.shortEx(t)})",
                 )
                 continue
             }
@@ -162,7 +163,7 @@ object WhitelistPatch {
                         results[name] = outcome
                     } catch (t: Throwable) {
                         results[name] = Outcome.Skipped(
-                            "skip patch $name on ${target.name}: write failed (${t.javaClass.simpleName})",
+                            "skip patch $name on $targetShort: write failed (${HookLog.shortEx(t)})",
                         )
                     }
                 }
@@ -180,25 +181,28 @@ object WhitelistPatch {
         className: String,
         isFinal: Boolean = false,
     ): Outcome {
+        // Desensitized owner: callers pass Class.name (package-qualified);
+        // logs keep only the short simple name.
+        val owner = HookLog.shortName(className)
         if (extra.isEmpty()) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: empty policy set ($OBSERVE_ONLY_MARKER)",
+                "skip patch $fieldName on $owner: empty policy set ($OBSERVE_ONLY_MARKER)",
             )
         }
         if (!isStatic) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: field is not static",
+                "skip patch $fieldName on $owner: field is not static",
             )
         }
         if (isFinal) {
             return Outcome.ObserveOnly(
-                "$OBSERVE_ONLY_MARKER $fieldName on $className: static final field, " +
+                "$OBSERVE_ONLY_MARKER $fieldName on $owner: static final field, " +
                     "not reassigned via Field.set (no force-write; ART unverified)",
             )
         }
         if (current == null) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: field value is null",
+                "skip patch $fieldName on $owner: field value is null",
             )
         }
         if (current is MutableList<*>) {
@@ -209,7 +213,7 @@ object WhitelistPatch {
             // with Strings (would ClassCastException the reader).
             if (current.any { it !is String }) {
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: MutableList holds non-String elements",
+                    "skip patch $fieldName on $owner: MutableList holds non-String elements",
                 )
             }
             @Suppress("UNCHECKED_CAST")
@@ -225,7 +229,7 @@ object WhitelistPatch {
                 ArrayList(snapshot).apply { addAll(add) }
             } catch (t: Throwable) {
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: failed to compute union (${t.javaClass.simpleName})",
+                    "skip patch $fieldName on $owner: failed to compute union (${HookLog.shortEx(t)})",
                 )
             }
             if (add.isEmpty()) return Outcome.PatchedInPlace(added = 0)
@@ -242,7 +246,7 @@ object WhitelistPatch {
                     // Swallowed: narrowed promise applies (see header).
                 }
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: list is not modifiable (${t.javaClass.simpleName})",
+                    "skip patch $fieldName on $owner: list is not modifiable (${HookLog.shortEx(t)})",
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
@@ -255,7 +259,7 @@ object WhitelistPatch {
             return Outcome.Replaced((arr.toList() + add).toTypedArray(), added = add.size)
         }
         return Outcome.Skipped(
-            "skip patch $fieldName on $className: unsupported type ${current.javaClass.name}",
+            "skip patch $fieldName on $owner: unsupported type ${HookLog.shortClass(current.javaClass)}",
         )
     }
 }

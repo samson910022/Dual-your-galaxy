@@ -25,6 +25,8 @@ object WhitelistPolicy {
     // hook targets); best-effort LRU-ish eviction (reinsert on hit, drop an
     // arbitrary eldest on overflow). Holds at most 128 Class refs in this
     // process (system_server/daagent classloaders are permanent, no leak).
+    // Best-effort diagnostic only: a miss recomputes, a lost touch or an
+    // evicted entry only affects log-string cost, never policy correctness.
     private const val DESCRIBE_CACHE_MAX = 128
     private val describeCache = ConcurrentHashMap<Executable, String>()
 
@@ -63,8 +65,9 @@ object WhitelistPolicy {
         unexpectedArgsLogs.set(0)
     }
 
-    // Human-readable hook target for logs, e.g.
-    // "com.foo.Bar#isWhitelisted(java.lang.String)".
+    // Human-readable hook target for logs, e.g. "Bar#isWhitelisted(String)".
+    // Short simple names only (no package qualification) + take(200): avoids
+    // leaking ROM package structure into logs and bounds hostile length.
     fun describe(executable: Executable): String {
         describeCache[executable]?.let { hit ->
             // Touch for LRU-ish recency (remove + reinsert is atomic enough
@@ -73,8 +76,17 @@ object WhitelistPolicy {
             describeCache[executable] = hit
             return hit
         }
-        val params = executable.parameterTypes.joinToString(",") { it.name }
-        val computed = "${executable.declaringClass.name}#${executable.name}($params)"
+        val params = try {
+            executable.parameterTypes.joinToString(",") { HookLog.shortClass(it) }
+        } catch (_: Throwable) {
+            ""
+        }
+        val owner = try {
+            HookLog.shortClass(executable.declaringClass)
+        } catch (_: Throwable) {
+            "Class"
+        }
+        val computed = "$owner#${executable.name}($params)".take(200)
         if (describeCache.size >= DESCRIBE_CACHE_MAX) {
             describeCache.keys.firstOrNull()?.let { describeCache.remove(it) }
         }
@@ -140,9 +152,9 @@ object WhitelistPolicy {
         }
         if (result is Boolean) {
             if (declaredReturnType != null && !isBooleanLikeDeclaredReturn(declaredReturnType)) {
-                logBounded(onLog, 
+                logBounded(onLog,
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
-                        "result with non-Boolean declared return ${declaredReturnType.name}; " +
+                        "result with non-Boolean declared return ${HookLog.shortClass(declaredReturnType)}; " +
                         "returning original",
                 )
                 return result
@@ -207,9 +219,9 @@ object WhitelistPolicy {
         }
         if (result is Set<*>) {
             if (result is SortedSet<*> || result is NavigableSet<*>) {
-                logBounded(onLog, 
+                logBounded(onLog,
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                        "sorted/navigable set ${result.javaClass.name}; returning original",
+                        "sorted/navigable set ${HookLog.shortClass(result.javaClass)}; returning original",
                 )
                 return result
             }
@@ -256,9 +268,9 @@ object WhitelistPolicy {
         if (result is Collection<*>) {
             // Other Collection kinds (Queue, etc.) have unknown contracts;
             // observe-only rather than reshaping them into a List.
-            logBounded(onLog, 
+            logBounded(onLog,
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                    "unsupported collection ${result.javaClass.name}; " +
+                    "unsupported collection ${HookLog.shortClass(result.javaClass)}; " +
                     "returning original",
             )
             return result
@@ -278,9 +290,9 @@ object WhitelistPolicy {
                 result
             }
         }
-        logBounded(onLog, 
+        logBounded(onLog,
             "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                "unrecognized result ${result?.javaClass?.name ?: "null"}; " +
+                "unrecognized result ${result?.let { HookLog.shortClass(it.javaClass) } ?: "null"}; " +
                 "returning original",
         )
         return result
@@ -294,31 +306,35 @@ object WhitelistPolicy {
             declaredReturnType == java.lang.Boolean::class.java
 
     // A2: when merge would add String extras to a List/Set, require evidence that
-    // the container's element type is String. Non-empty containers that have
-    // already passed runtime "all elements are String" checks are treated as
-    // runtime-verified (safe). Empty containers have no runtime element evidence,
-    // so require a verified String generic; raw/unparameterized/null/unverifiable
-    // generics are fail-closed when adding.
+    // the container's element type is String. When [genericReturnType] is a
+    // parseable ParameterizedType (e.g. List<String> vs List<Int>) it is ALWAYS
+    // checked first — even for non-empty all-String runtime containers — so a
+    // declared List<Int>/Set<Int> can never be poisoned by String extras.
+    // Only raw/unknown/null generics keep the legacy non-empty all-String
+    // compat branch (runtime-verified); empty containers with unverified
+    // generics stay fail-closed when adding.
     private fun isVerifiedStringCollectionGeneric(
         genericReturnType: Type?,
         runtimeResult: Collection<*>,
     ): Boolean {
-        if (runtimeResult.isNotEmpty()) return true
-        if (genericReturnType == null) return false
-        if (genericReturnType is Class<*>) {
-            // Raw class (not parameterized) - cannot verify element type.
-            return false
-        }
         if (genericReturnType is ParameterizedType) {
             val args = genericReturnType.actualTypeArguments
             if (args.isEmpty()) return false
             val elementArg = args[0]
             return elementArg is Class<*> && elementArg == String::class.java
         }
-        // TypeVariable, WildcardType, GenericArrayType, etc. - not verified.
-        if (genericReturnType is TypeVariable<*> || genericReturnType is WildcardType) {
+        if (runtimeResult.isNotEmpty()) return true
+        if (genericReturnType == null) return false
+        if (genericReturnType is Class<*>) {
+            // Raw List/Set without <String> (e.g. List.class): the element type
+            // is unknown from the signature, so a merge that would add entries
+            // stays observe-only (fail-closed). Only a parseable
+            // ParameterizedType with a String element (checked above) or a
+            // non-empty all-String runtime container (compat, checked above)
+            // may merge.
             return false
         }
+        // TypeVariable, WildcardType, GenericArrayType, etc. - not verified.
         return false
     }
 
@@ -345,10 +361,10 @@ object WhitelistPolicy {
         onLog: (String) -> Unit,
     ): Any {
         if (declaredReturnType != null && !declaredReturnType.isInstance(merged)) {
-            logBounded(onLog, 
+            logBounded(onLog,
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
-                    "merged type ${merged.javaClass.name} incompatible with " +
-                    "declared ${declaredReturnType.name}; returning original",
+                    "merged type ${HookLog.shortClass(merged.javaClass)} incompatible with " +
+                    "declared ${HookLog.shortClass(declaredReturnType)}; returning original",
             )
             return original
         }
