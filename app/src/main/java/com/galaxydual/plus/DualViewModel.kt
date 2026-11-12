@@ -8770,7 +8770,12 @@ class DualViewModel(
                     // key to Known(B) since our last load. Delete ONLY if still
                     // Corrupt; Known → abort UNKNOWN_REFRESH (CORRUPT obsolete, no
                     // delete, require refresh); Unavailable → abort REFRESH_FAILED.
-                    val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                    // Stage N1 P1: repair-aware read — same-instance poison makes
+                    // plain loadResult() return Unavailable after the first CCE
+                    // (value fail-closed), so consult loadForRepair()'s
+                    // authoritative probe (live CCE → Corrupt, poisoned Set →
+                    // Unavailable). Normal refresh/save/clear still use loadResult().
+                    val preJob = viewModelScope.async(Dispatchers.IO) { store.loadForRepair() }
                     val preRead: LoadResult = try {
                         withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
                     } catch (te: TimeoutCancellationException) {
@@ -9085,7 +9090,10 @@ class DualViewModel(
                         // the repair below; a Known here means B landed before we
                         // claimed (gate missed a test-only synthetic emit) and we
                         // must abort without deleting.
-                        val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                        // Stage N1 P1: same as pre-read — use loadForRepair(), not
+                        // plain loadResult() (poisoned same-instance would read
+                        // Unavailable and abort a still-Corrupt repair).
+                        val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadForRepair() }
                         val finalRead: LoadResult = try {
                             withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { finalJob.await() }
                         } catch (te: TimeoutCancellationException) {

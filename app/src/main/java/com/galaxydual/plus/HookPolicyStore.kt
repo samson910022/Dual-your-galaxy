@@ -88,6 +88,113 @@ internal var poisonPublishHook: (() -> Unit)? = null
 
 internal fun resetRemotePoisonForTests() {
     remotePoison.set(PoisonState(emptyMap(), 0))
+    try {
+        remoteCorruptEvidence.set(emptyMap())
+    } catch (_: Throwable) {
+    }
+}
+
+// Stage N1 P1: per-instance corruption evidence (trusted CCE diagnosis) stored
+// alongside (not instead of) the optimistic-value poison fence.
+//
+// - poison fence (remotePoison) quarantines the optimistic mMap value: once set,
+//   normal reads short-circuit to Unavailable without touching prefs (fail-closed,
+//   zero-touch). It does NOT distinguish CCE (Corrupt) from transient IPC
+//   (Unavailable) — both set the same fence.
+// - evidence (remoteCorruptEvidence) records that THIS prefs instance's fence was
+//   caused by a trusted ClassCastException (first CCE key/type observed). Normal
+//   reads still return Unavailable for value purposes, but the repair path can
+//   consult evidence via loadForRepair()'s authoritative probe (live getStringSet
+//   that re-throws CCE as Corrupt, never re-trusting a poisoned Set value).
+// - cleared only on verified Known (unpoisoned successful read) or successful
+//   save/clear resync (clearPoison token match). Transient failures retain prior
+//   evidence; CCE re-records (first-wins per instance).
+internal data class CorruptEvidence(val key: String, val typeName: String, val observedGen: Long)
+
+internal val remoteCorruptEvidence = AtomicReference<Map<WeakPrefKey, CorruptEvidence>>(emptyMap())
+
+private fun recordCorruptEvidence(prefs: SharedPreferences, cce: ClassCastException) {
+    val keyName = try {
+        com.galaxydual.hook.PolicySource.POLICY_KEY_EXTRA_PACKAGES
+    } catch (_: Throwable) {
+        "extra_whitelist_packages"
+    }
+    val typeName = try {
+        cce.javaClass.name
+    } catch (_: Throwable) {
+        "ClassCastException"
+    }
+    while (true) {
+        val cur = try {
+            remoteCorruptEvidence.get()
+        } catch (_: Throwable) {
+            return
+        }
+        val purged: Map<WeakPrefKey, CorruptEvidence> = if (cur.isEmpty()) {
+            cur
+        } else {
+            try {
+                cur.filterKeys { it.get() != null }
+            } catch (_: Throwable) {
+                cur
+            }
+        }
+        val probeKey = try {
+            WeakPrefKey(prefs)
+        } catch (_: Throwable) {
+            return
+        }
+        // First-wins: retain the original diagnosis for this instance.
+        if (purged.containsKey(probeKey)) {
+            if (purged.size == cur.size) return
+            val next = purged
+            if (remoteCorruptEvidence.compareAndSet(cur, next)) return
+        } else {
+            val poisonGen = try {
+                remotePoison.get().gen
+            } catch (_: Throwable) {
+                0L
+            }
+            val next = try {
+                purged + (WeakPrefKey(prefs) to CorruptEvidence(keyName, typeName, poisonGen))
+            } catch (_: Throwable) {
+                return
+            }
+            if (remoteCorruptEvidence.compareAndSet(cur, next)) return
+        }
+    }
+}
+
+private fun clearCorruptEvidence(prefs: SharedPreferences) {
+    while (true) {
+        val cur = try {
+            remoteCorruptEvidence.get()
+        } catch (_: Throwable) {
+            return
+        }
+        if (cur.isEmpty()) return
+        val probeKey = try {
+            WeakPrefKey(prefs)
+        } catch (_: Throwable) {
+            return
+        }
+        val next: Map<WeakPrefKey, CorruptEvidence> = try {
+            cur.filterKeys { val r = it.get(); r != null && r !== prefs }
+        } catch (_: Throwable) {
+            return
+        }
+        if (next.size == cur.size) {
+            // No entry for this instance, but purge stale if any.
+            return
+        }
+        if (remoteCorruptEvidence.compareAndSet(cur, next)) return
+    }
+}
+
+internal fun hasCorruptEvidence(prefs: SharedPreferences): Boolean = try {
+    remoteCorruptEvidence.get().containsKey(WeakPrefKey(prefs))
+} catch (_: Throwable) {
+    false
 }
 
 private fun isPoisoned(state: PoisonState, prefs: SharedPreferences): Boolean = try {
@@ -216,7 +323,53 @@ class HookPolicyStore(
     // Stage L4: service 可用性探針（remote 傳入 provider!=null；測試預設 true）。
     // repairCorrupt 藉此區分 ServiceUnavailable vs RepairFailed。
     private val isServiceAvailable: () -> Boolean = { true },
+    // Stage N1 P1: repair-specific authoritative probe (remote 傳入繞毒直探；
+    // 直接注入後端預設 null → loadForRepair() 即 loadResult())。VM 修復 pre/final
+    // 讀一律經 loadForRepair()，正常 refresh/save/clear 仍經 loadResult()。
+    private val repairProbe: (() -> LoadResult)? = null,
 ) {
+    // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
+    // fail-closed. Direct backends (repairProbe null) delegate to loadResult()
+    // (no poison → already authoritative). Remote probe bypasses the poison
+    // short-circuit with a live getStringSet: CCE → Corrupt (trusted), poisoned
+    // Set success → Unavailable (never re-trust optimistic mMap), verified
+    // Known → Known (+clears evidence). CE 透傳，其餘轉 Unavailable。
+    fun loadForRepair(): LoadResult {
+        val probe = repairProbe ?: return loadResult()
+        try {
+            return probe()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            return LoadResult.Unavailable
+        }
+    }
+
+    // Test/VM hook: whether THIS store's remote backend currently holds trusted
+    // Corrupt evidence (poisoned by CCE). Direct backends (no probe) report
+    // whether the latest load was Corrupt via a fresh loadResult() check? No —
+    // to avoid extra IO, direct stores return false; callers use loadForRepair()
+    // (== loadResult()) for the authoritative answer. Remote overrides via probe.
+    fun hasCorruptEvidence(): Boolean {
+        val probeHas: (() -> Boolean)? = corruptEvidenceProbe
+        if (probeHas != null) {
+            try {
+                return probeHas()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                return false
+            }
+        }
+        return false
+    }
+
+    @Volatile
+    private var corruptEvidenceProbe: (() -> Boolean)? = null
+
+    internal fun setCorruptEvidenceProbe(probe: () -> Boolean) {
+        corruptEvidenceProbe = probe
+    }
     // 讀草稿結果:損壞 (拋出，如條目型別錯亂的 ClassCastException) -> Corrupt，
     // 永不 auto-delete（Stage J3 P1：CCE 自清會在 untrusted type
     // confusion 下刪除有效草稿，fail-closed 要求保留舊快照、僅標 Corrupt；
@@ -355,6 +508,14 @@ class HookPolicyStore(
 // 任何 gen 變化期間的讀 (含 mid-getStringSet 突變與 clear 反向間隙,皆 fail-closed)。
 // 有意用 commit() 而非 apply():需要同步落盤語意 (寫入/清除後立即一致);
 // 集合僅數十包名,且 DualViewModel 經 onIo (Dispatchers.IO) 呼叫,不阻塞主執行緒。
+//
+// provider() 身分快取要求 (identity-caching requirement):毒圍欄與損壞證據皆以
+// SharedPreferences 實例身分為鍵 (WeakPrefKey = identity hash + ===)。provider()
+// 必須對同一 group 永遠回傳同一實例 —— 生產經 GalaxyApp.remotePreferences 直通
+// libxposed XposedService.getRemotePreferences,而該 API 為 computeIfAbsent 永久
+// 快取,同一行程內同一 group 保證同一實例,故身分鍵有效。若 libxposed 未來改為每次
+// 回傳新的 wrapper 實例,身分鍵將永遠 miss (毒圍欄漏毒、證據錯位),此時必須改以
+// group 字串為鍵,而非實例身分。
 @SuppressLint("ApplySharedPref")
 fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
@@ -380,6 +541,7 @@ fun remoteHookPolicyStore(
                 val before = remotePoison.get()
                 if (isPoisoned(before, prefs)) {
                     // 已毒短路 Unavailable,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
+                    // Stage N1 P1: value fail-closed，但 Corrupt evidence 保留供修復路徑。
                     null
                 } else {
                     try {
@@ -389,15 +551,31 @@ fun remoteHookPolicyStore(
                         // 含 mid-getStringSet 突變 (拷貝期 CME 即 catch 轉 Unavailable)。
                         val snap = v.toSet()
                         val after = remotePoison.get()
-                        if (after.gen != before.gen || isPoisoned(after, prefs)) null else snap
+                        if (after.gen != before.gen || isPoisoned(after, prefs)) {
+                            null
+                        } else {
+                            // Verified Known:後端已證可信，洗白 Corrupt evidence。
+                            // (Stage N1 P1: evidence cleared only on verified Known.)
+                            try {
+                                clearCorruptEvidence(prefs)
+                            } catch (_: Throwable) {
+                            }
+                            snap
+                        }
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (cce: ClassCastException) {
                         // Stage L4: CCE 型別損壞即 Corrupt（非 Unavailable），加毒
                         // relatch 後重拋，由外層 loadResult 映射為 Corrupt；永不
                         // 吞為 Unavailable（免損壞走盲清），永不自清。
+                        // Stage N1 P1: 同時記錄 trusted corruption evidence (first-wins)，
+                        // 供修復路徑在毒短路下仍能辨識 Corrupt vs transient。
                         try {
                             ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            recordCorruptEvidence(prefs, cce)
                         } catch (_: Exception) {
                         }
                         throw cce
@@ -405,6 +583,8 @@ fun remoteHookPolicyStore(
                         // 暫時 IPC 失敗即加毒 relatch 後 Unavailable,
                         // 永不拋出觸自清 (J3 已無自清,此處統一吞為 Unavailable 並沾毒,
                         // 保證同實例短路、跨實例共毒 fail-closed)。
+                        // Stage N1 P1: transient 不記錄/不清除 Corrupt evidence
+                        // (保留先前 CCE 診斷；若本無 evidence 則仍無)。
                         try {
                             ensurePoisoned(prefs)
                         } catch (_: Exception) {
@@ -432,7 +612,15 @@ fun remoteHookPolicyStore(
                             .commit()
                     }
                     if (ok) {
-                        clearPoison(prefs, ownToken)
+                        val cleared = clearPoison(prefs, ownToken)
+                        if (cleared) {
+                            // Stage N1 P1:成功重同步即洗白 evidence (verified resync)。
+                            // Token 失配 (併發新毒) 則保留，不蓋掉併發診斷。
+                            try {
+                                clearCorruptEvidence(prefs)
+                            } catch (_: Exception) {
+                            }
+                        }
                     } else {
                         try {
                             ensurePoisoned(prefs)
@@ -465,7 +653,83 @@ fun remoteHookPolicyStore(
                 false
             }
         },
+        repairProbe = {
+            // Stage N1 P1 authoritative repair probe:繞過毒短路，直探後端型別。
+            // - CCE → Corrupt (trusted，不回 Unavailable；record+relatch)。
+            // - 成功但毒 (before/after 任一毒或 gen 變) → Unavailable (絕不重信毒 mMap)。
+            // - 成功且無毒 → Known (verified，洗白 evidence)。
+            // - 其他 Throwable → Unavailable (+relatch，保留既有 evidence)。
+            // - null provider → Unavailable。CE 透傳。
+            val prefs = try {
+                provider()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                null
+            }
+            if (prefs == null) {
+                LoadResult.Unavailable
+            } else {
+                val before = try {
+                    remotePoison.get()
+                } catch (_: Throwable) {
+                    return@HookPolicyStore LoadResult.Unavailable
+                }
+                try {
+                    val v = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet())
+                        ?: emptySet()
+                    val snap = v.toSet()
+                    val after = try {
+                        remotePoison.get()
+                    } catch (_: Throwable) {
+                        return@HookPolicyStore LoadResult.Unavailable
+                    }
+                    val poisonedNow = try {
+                        isPoisoned(before, prefs) || isPoisoned(after, prefs)
+                    } catch (_: Throwable) {
+                        true
+                    }
+                    if (after.gen != before.gen || poisonedNow) {
+                        LoadResult.Unavailable
+                    } else {
+                        try {
+                            clearCorruptEvidence(prefs)
+                        } catch (_: Throwable) {
+                        }
+                        LoadResult.Known(sanitizeHookPolicy(snap))
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (cce: ClassCastException) {
+                    try {
+                        ensurePoisoned(prefs)
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        recordCorruptEvidence(prefs, cce)
+                    } catch (_: Exception) {
+                    }
+                    LoadResult.Corrupt
+                } catch (_: Throwable) {
+                    try {
+                        ensurePoisoned(prefs)
+                    } catch (_: Exception) {
+                    }
+                    LoadResult.Unavailable
+                }
+            }
+        },
     ).also { store ->
+        // Stage N1 P1: evidence probe for hasCorruptEvidence() (zero-touch,
+        // 僅查 evidence map，不碰 prefs getStringSet)。
+        store.setCorruptEvidenceProbe {
+            val prefs = try {
+                provider()
+            } catch (_: Throwable) {
+                null
+            } ?: return@setCorruptEvidenceProbe false
+            hasCorruptEvidence(prefs)
+        }
         // Stage L4 best-effort 備份鉤子：writable 時嘗試將損壞值拷貝至
         // dual_policy.bak.<ts>（僅 best-effort：prefs.all 或型別錯亂值可能拋出，
         // 備份可能失敗、無法保證可恢復；失敗忽略仍刪除，不擋修復）。

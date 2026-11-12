@@ -67,6 +67,10 @@ class PolicyWriteTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(Dispatchers.Unconfined)
+        // N1 全域毒圍欄/證據 map 跨測試殘留會污染後續用例 (remoteHookPolicyStore
+        // 皆用同一全域);每測前重置,各 N1 用例內仍保留 try/finally 雙保險。
+        // reset 僅為 AtomicReference.set(空),無副作用,安全。
+        resetRemotePoisonForTests()
     }
 
     @After
@@ -80,6 +84,7 @@ class PolicyWriteTest {
         }
         vms.clear()
         Dispatchers.resetMain()
+        resetRemotePoisonForTests()
     }
 
     private fun makeVm(
@@ -7953,6 +7958,189 @@ class PolicyWriteTest {
             try {
                 coord.close()
             } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage N1 P1: same-instance poison must not make two-tap repair inoperable.
+    // remoteHookPolicyStore { sameRecordingPrefs } with realistic wrong-type entry
+    // (getStringSet(KEY) throws CCE, remove+commit works). First read → Corrupt
+    // (poison+evidence); 2nd/3rd normal reads → Unavailable for value (fail-closed,
+    // zero-touch) while Corrupt evidence retained for repair; two taps via the
+    // unified clear button (onClearPolicyButtonTap) → backend remove once +
+    // Known(empty). Evidence cleared only on successful repair/verified Known.
+    @Test
+    fun n1_sameInstancePoison_repairStaysOperable_twoTaps() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = SameInstanceCorruptPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            val coord = PolicyTxCoordinator()
+            try {
+                val vm = makeVm(store, userId = 0, initialDraft = null, policyTxCoordinator = coord)
+                await { !vm.state.value.loading }
+                // Observe Corrupt (first read CCE → Corrupt + poison + evidence).
+                await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+                assertFalse(vm.state.value.policyDraftKnown)
+                assertTrue(vm.state.value.policyDraftCorrupt)
+                assertEquals(1, prefs.getStringSetCalls)
+
+                // 2nd/3rd normal reads stay fail-closed for value (Unavailable),
+                // zero-touch (no new getStringSet), while Corrupt evidence retained.
+                val second = store.loadResult()
+                assertTrue(second is LoadResult.Unavailable)
+                val third = store.loadResult()
+                assertTrue(third is LoadResult.Unavailable)
+                assertEquals(1, prefs.getStringSetCalls)
+                assertTrue(store.hasCorruptEvidence())
+                // Repair probe is authoritative: still Corrupt (touches once more).
+                val probe = store.loadForRepair()
+                assertTrue(probe is LoadResult.Corrupt)
+                assertEquals(2, prefs.getStringSetCalls)
+                assertTrue(store.hasCorruptEvidence())
+
+                // First tap: routes to repair request (arm, zero backend remove).
+                vm.onClearPolicyButtonTap()
+                assertTrue(vm.isCorruptRepairArmed())
+                assertTrue(vm.state.value.policyDraftCorrupt)
+                assertEquals(0, prefs.removeCalls)
+
+                // Second tap: routes to repair confirm (executes, bounded IO).
+                vm.onClearPolicyButtonTap()
+                await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown }
+                assertEquals(1, prefs.removeCalls)
+                assertTrue(vm.state.value.policyDraftKnown)
+                assertFalse(vm.state.value.policyDraftCorrupt)
+                assertTrue(vm.state.value.policyDraft.isEmpty())
+                assertTrue(vm.state.value.msg.contains("已修復"))
+                assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+                assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+
+                // Evidence cleared only on successful repair/verified Known.
+                assertFalse(store.hasCorruptEvidence())
+                val after = store.loadResult()
+                assertTrue(after is LoadResult.Known)
+                assertTrue((after as LoadResult.Known).packages.isEmpty())
+                val afterProbe = store.loadForRepair()
+                assertTrue(afterProbe is LoadResult.Known)
+                assertTrue((afterProbe as LoadResult.Known).packages.isEmpty())
+            } finally {
+                try {
+                    coord.close()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N1 P1 test double: realistic wrong-type corruption (String value under the
+    // policy key). getStringSet(KEY) throws CCE like real RemotePreferences type
+    // confusion; remove(KEY).commit() clears it so repair can verify Known(empty).
+    private class SameInstanceCorruptPrefs : SharedPreferences {
+        private val data = linkedMapOf<String, Any?>(
+            PolicySource.POLICY_KEY_EXTRA_PACKAGES to "corrupt-string-value",
+        )
+        var getStringSetCalls = 0
+            private set
+        var removeCalls = 0
+            private set
+        var commitCalls = 0
+            private set
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(data)
+        override fun getString(key: String?, defValue: String?): String? =
+            if (data[key] is String) data[key] as? String else defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+            getStringSetCalls++
+            if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) {
+                val v = data[key]
+                if (v == null) return defValues
+                if (v is String) {
+                    throw ClassCastException("java.lang.String cannot be cast to java.util.Set")
+                }
+            }
+            @Suppress("UNCHECKED_CAST")
+            val stored = data[key] as? MutableSet<String>
+            return stored?.toMutableSet() ?: defValues
+        }
+        override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            (data[key] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = data.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = CorruptEditor()
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+
+        private inner class CorruptEditor : SharedPreferences.Editor {
+            private val pending = linkedMapOf<String, Any?>()
+            private val removed = mutableSetOf<String>()
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+                if (value == null) {
+                    removed.add(key!!)
+                    pending.remove(key)
+                } else {
+                    pending[key!!] = value
+                    removed.remove(key)
+                }
+                return this
+            }
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
+                pending[key!!] = values?.toMutableSet()
+                removed.remove(key)
+                return this
+            }
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
+            override fun remove(key: String?): SharedPreferences.Editor {
+                if (key == PolicySource.POLICY_KEY_EXTRA_PACKAGES) removeCalls++
+                removed.add(key!!)
+                pending.remove(key)
+                return this
+            }
+            override fun clear(): SharedPreferences.Editor {
+                removed.addAll(data.keys)
+                pending.clear()
+                return this
+            }
+            override fun commit(): Boolean {
+                for (k in removed) data.remove(k)
+                for ((k, v) in pending) data[k] = v
+                pending.clear()
+                removed.clear()
+                commitCalls++
+                return true
+            }
+            override fun apply() {
+                for (k in removed) data.remove(k)
+                for ((k, v) in pending) data[k] = v
+                pending.clear()
+                removed.clear()
             }
         }
     }
