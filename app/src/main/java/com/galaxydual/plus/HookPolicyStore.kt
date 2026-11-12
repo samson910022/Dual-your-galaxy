@@ -187,13 +187,17 @@ internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
         val poisonedZero = try {
             val s = remotePoison.get()
             s.overflow || s.entries.isNotEmpty()
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Throwable) {
-            false
+            true
         }
         val hasEvidenceZero = try {
             remoteCorruptEvidence.get().isNotEmpty()
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Throwable) {
-            false
+            true
         }
         if (!poisonedZero && !hasEvidenceZero) return true
         return false
@@ -219,13 +223,17 @@ internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
     val poisoned = try {
         val s = remotePoison.get()
         s.overflow || s.entries.isNotEmpty()
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (_: Throwable) {
-        false
+        true
     }
     val hasEvidence = try {
         remoteCorruptEvidence.get().isNotEmpty()
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (_: Throwable) {
-        false
+        true
     }
     // 無毒無證據時的不穩定為合法演進（如 service 初到），放行。
     if (!poisoned && !hasEvidence) return true
