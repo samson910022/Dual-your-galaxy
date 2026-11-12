@@ -108,10 +108,36 @@ class PolicyTxCoordinator {
     // pending is emitted/cleared/dropped. Lets recover distinguish in-flight
     // save (deferred running) from dead/suspended owner (deferred done).
     val pendingOwner = AtomicReference<DualViewModel.PolicyTx?>(null)
+    // Stage O1 P1#1 (orphan-drop invalidation): monotonic drop generation.
+    // Incremented on every successful placeholder drop (recoverStalePendingLocked).
+    // VMs compare at request time (authoritativeObservedRev vs currentRevision covers
+    // rev advance; this gen covers the no-event drop itself so an already-open stale
+    // VM cannot reuse a pre-drop base even when rev comparison is bypassed by legacy
+    // -1). Observability only; never drives truth (truth stays in _latest).
+    val orphanDropGen = AtomicLong(0L)
+    // P3: drop revision paired with orphanDropGen. The gen alone over-fail-closes:
+    // ANY drop since lastSeen (even a placeholder older than our observed rev)
+    // would block request. The paired rev lets request block ONLY when the drop
+    // is actually newer than what this VM authoritatively read
+    // (dropRev > observedRev); older drops just advance lastSeenDropGen silently.
+    // Max-drop rev (monotonic max, never regress): two placeholders may be
+    // staged/dropped out of order across threads; keeping the max preserves
+    // the newest invalidation (last-write-wins would let an older dropRev
+    // mask a newer drop and reopen a stale-read window). The rev gate
+    // (currentRevision != observed) independently covers rev advances.
+    val orphanDropRev = AtomicLong(-1L)
+    // Stage O1 P2#3 (stranded-real availability): retired-real counter.
+    // Incremented when a stale real staged payload already present in _latest is
+    // retired (pending cleared, truth preserved). Monotonic, observability only.
+    val retiredRealCount = AtomicLong(0L)
     // Stage N3 P1#3: identity/revision tombstone for dropped placeholders.
     // Key "$txId:$key" -> rev. Persisted after placeholder drop so a late
     // resumer with the same identity is rejected in stage/emit even when
     // pending is null (never borrow current rev). Cleared only by resetForTest.
+    // P3 tombstone discipline (locked invariant):
+    // - placeholder drops tombstone (recoverStalePendingLocked, overrun discard);
+    // - real retires NEVER tombstone (retireStagedRealPresentInLatestLocked clears
+    //   pending but preserves truth; the completed identity stays valid in _latest).
     val claimTombstones = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Stage L3 lossless 真相：永為最新終態（無逐出，晚訂閱收斂最新；gap 經 rev
@@ -169,6 +195,44 @@ class PolicyTxCoordinator {
                     // Stage M3: stamp fence time with the payload (same lock).
                     try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
                     // Stage N3 P1#3: monotonic fence time + originating-claim owner.
+                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
+                    try { pendingOwner.set(tx) } catch (_: Exception) { }
+                    ok = true
+                }
+            } catch (_: Exception) {
+                ok = false
+            }
+        }
+        return ok
+    }
+
+    // P1-1 repair atomic claim: rev re-check merged into the SAME commitMutex
+    // critical section as the CAS+bump+stage (no withCommitLock suspension
+    // window between a lock-free revMoved read and claimForPublish). Rejects
+    // when committedRevision != revBefore (concurrent B committed mid-IO),
+    // so the repair success below can never publish a stale Known(empty) over
+    // unseen B. revBefore==-1L (legacy/no-coordinator) skips the rev gate.
+    suspend fun completeWithRevisionChecked(
+        tx: DualViewModel.PolicyTx,
+        payload: PolicySettled,
+        revBefore: Long,
+    ): Boolean {
+        var ok = false
+        commitMutex.withLock {
+            try {
+                if (revBefore != -1L && committedRevision.get() != revBefore) {
+                    ok = false
+                    return@withLock
+                }
+                if (activeTx.compareAndSet(tx, null)) {
+                    val rev = committedRevision.incrementAndGet()
+                    val stamped = try {
+                        payload.copy(rev = rev)
+                    } catch (_: Exception) {
+                        payload
+                    }
+                    pendingPublish.set(stamped)
+                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
                     try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
                     try { pendingOwner.set(tx) } catch (_: Exception) { }
                     ok = true
@@ -276,6 +340,11 @@ class PolicyTxCoordinator {
                     }
                 } catch (_: Exception) {
                 }
+    // P3: paired rev/gen ordering — rev FIRST then gen. Volatile transitively
+                // guarantees any reader seeing the new gen必见 new rev (gen read after
+                // rev read still sees rev because rev write precedes gen write).
+                try { orphanDropRev.updateAndGet { prev -> if (cur.rev > prev) cur.rev else prev } } catch (_: Exception) { }
+                try { orphanDropGen.incrementAndGet() } catch (_: Exception) { }
                 return cur
             } else {
                 // Lost race: another thread staged/cleared; roll back tombstone?
@@ -290,6 +359,145 @@ class PolicyTxCoordinator {
 
     suspend fun tryRecoverStalePending(nowNanos: Long, staleThresholdMs: Long): PolicySettled? =
         commitMutex.withLock { recoverStalePendingLocked(nowNanos, staleThresholdMs) }
+
+    // Stage O1 P2#3 (availability): retire a stale REAL staged payload already
+    // present in _latest. Caller holds commitMutex (pre-IO gates call inside
+    // withCommitLock); suspend wrapper acquires the lock for out-of-gate callers.
+    // Conditions (ALL required):
+    // - pending is real (known || msg non-empty; placeholders handled by recover);
+    // - _latest holds the EXACT same identity+rev (stageRealPayload wrote truth
+    //   synchronously under the same lock, so a staged real is always present;
+    //   this check prevents resurrecting an old event over a newer latest);
+    // - stale proof: monotonic age >= threshold OR recorded owner done
+    //   (deferred completed/cancelled). A still-running owner may still emit
+    //   imminently; retire is idempotent (emitStaged re-applies latest) but we
+    //   still require death/age proof to avoid racing a live publisher.
+    // On retire: clear pending+owner (no tombstone — real identity completed and
+    // is now truth; future re-claims use new txIds), bump retiredRealCount, return
+    // the retired payload for watermark advance. Returns null when nothing retired.
+    // NOTE: nowNanos is monotonic System.nanoTime(), never wall.
+    fun retireStagedRealPresentInLatestLocked(nowNanos: Long, staleThresholdMs: Long): PolicySettled? {
+        try {
+            val cur = try { pendingPublish.get() } catch (_: Exception) { null } ?: return null
+            val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
+            if (isPlaceholder) return null
+            val latestCur = try { _latest.value } catch (_: Exception) { null } ?: return null
+            if (latestCur.txId != cur.txId || latestCur.key != cur.key || latestCur.rev != cur.rev) return null
+            val stagedAt = try { pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+            if (stagedAt == 0L) return null
+            if (nowNanos < stagedAt) return null
+            val ageMs = try { (nowNanos - stagedAt) / 1_000_000L } catch (_: Exception) { 0L }
+            var ownerDone = false
+            try {
+                val own = pendingOwner.get()
+                if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                    ownerDone = try { own.deferred.isCompleted || own.deferred.isCancelled } catch (_: Exception) { false }
+                } else if (own == null) {
+                    // P2-2: unknown owner must NOT bypass age. Legacy (no owner
+                    // record) still retires once monotonic age proves staleness;
+                    // age gate below enforces this (ownerDone stays false).
+                    try {
+                        logCoord(
+                            "retire staged real without owner record txId=${cur.txId} " +
+                                "rev=${cur.rev} ageMs=${ageMs} (requires age proof)",
+                        )
+                    } catch (_: Exception) {
+                    }
+                    ownerDone = false
+                }
+            } catch (_: Exception) {
+            }
+            if (ageMs < staleThresholdMs && !ownerDone) return null
+            val cleared = try { pendingPublish.compareAndSet(cur, null) } catch (_: Exception) { false }
+            if (!cleared) return null
+            try {
+                val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                    pendingOwner.compareAndSet(own, null)
+                }
+            } catch (_: Exception) {
+            }
+            try { retiredRealCount.incrementAndGet() } catch (_: Exception) { }
+            try {
+                logCoord(
+                    "retire staged real present-in-latest txId=${cur.txId} rev=${cur.rev} ageMs=${ageMs}",
+                )
+            } catch (_: Exception) {
+            }
+            return cur
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    suspend fun tryRetireStagedReal(nowNanos: Long, staleThresholdMs: Long): PolicySettled? =
+        commitMutex.withLock { retireStagedRealPresentInLatestLocked(nowNanos, staleThresholdMs) }
+
+    // Stage O1 P2#2 (lifecycle): owner-liveness is decided inline under
+    // commitMutex at each call site (single-snapshot activeTx+ownerAlive+
+    // deferred+pending/age, see DualViewModel init/async-reclaim/busy-waiter).
+    // The former isLiveOwner/isLiveOwnerAtomic/isAbandonedClaim helpers were
+    // zero-call dead code (torn lock-free reads / decorative tryLock) and are
+    // removed; the init inline snapshot is retained as the single source.
+
+    // Stage O1 P1-2 (overrun discard): locked placeholder-only discard for the
+    // reconciler budget-overrun path. Runs under commitMutex as ONE atomic
+    // observation (get + isPlaceholder + identity + CAS clear): a concurrent
+    // stageRealPayload overwriting the placeholder between a lock-free get and
+    // clear must NOT be cleared (same txId/key/rev real would be destroyed by
+    // the old placeholder object). Conditions (ALL required, checked under lock):
+    // - pending holds EXACTLY txId+key and is still a placeholder
+    //   (!known && msg empty); staged reals are NEVER touched here (left to
+    //   retireStagedRealPresentInLatestLocked/recoverStalePendingLocked).
+    // On discard: clear pending+owner, persist the placeholder identity tombstone
+    // (same as recover: late resumers with this identity must re-claim, never
+    // borrow current rev), bump orphanDropGen (no _latest event, readers must
+    // fail closed), return true. False when nothing discarded (caller keeps its
+    // local settle=false/unresolved semantics; the fence stays for retire/recover).
+    // Tombstone discipline: placeholder drops tombstone; real retires never
+    // tombstone (real identity completed into truth).
+    suspend fun discardOverrunPlaceholder(txId: Long, key: String): Boolean =
+        commitMutex.withLock {
+            val cur = try { pendingPublish.get() } catch (_: Exception) { null }
+                ?: return@withLock false
+            if (cur.txId != txId || cur.key != key) return@withLock false
+            val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
+            if (!isPlaceholder) return@withLock false
+            val cleared = try { pendingPublish.compareAndSet(cur, null) } catch (_: Exception) { false }
+            if (!cleared) return@withLock false
+            try {
+                val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                    pendingOwner.compareAndSet(own, null)
+                }
+            } catch (_: Exception) {
+            }
+            try {
+                if (claimTombstones.size >= 512) {
+                    try {
+                        val evict = claimTombstones.keys.firstOrNull()
+                        if (evict != null) {
+                            claimTombstones.remove(evict)
+                            logCoord("tombstone bound evict $evict (size cap 512)")
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                claimTombstones[tombstoneKey(cur.txId, cur.key)] = cur.rev
+            } catch (_: Exception) {
+            }
+            // Paired rev/gen ordering: rev FIRST then gen (volatile transitive:
+            // seeing new gen必见 new rev).
+            try { orphanDropRev.updateAndGet { prev -> if (cur.rev > prev) cur.rev else prev } } catch (_: Exception) { }
+            try { orphanDropGen.incrementAndGet() } catch (_: Exception) { }
+            try {
+                logCoord(
+                    "discard overrun placeholder txId=${cur.txId} rev=${cur.rev} (budget overrun, no real)",
+                )
+            } catch (_: Exception) {
+            }
+            true
+        }
 
     // Stage L3 + N3 P1#3: stage terminal payload with EXACT originating-claim
     // identity. Succeeds ONLY when pendingPublish holds the matching claim
@@ -582,18 +790,29 @@ class PolicyTxCoordinator {
         }
     }
 
+    // Zero-call legacy: no production/test caller (overrun path uses
+    // discardOverrunPlaceholder; normal paths settle via CAS). Kept for API
+    // compatibility; do not use in new code.
+    @Deprecated("Zero-call legacy; use discardOverrunPlaceholder/retire/recover instead.")
     fun clearPendingPublish(payload: PolicySettled) {
-        try {
-            pendingPublish.compareAndSet(payload, null)
-        } catch (_: Exception) {
-        }
+        // NOTE: no direct compareAndSet(payload, null) here — pendingPublish
+        // holds the STAMPED copy (same txId/key/rev, different object identity
+        // after completeWithRevision/stageRealPayload), so a reference-equality
+        // CAS against the caller's unstamped payload would always fail. Clear
+        // by identity below instead.
         // Rev-aware clear: pending may hold stamped (same txId/key/rev, different
-        // draft/known). Clear when identity matches to avoid fence leak.
+        // draft/known). Clear when identity matches AND the current holder is
+        // still a placeholder. P1-2: never clear a staged REAL by identity —
+        // stageRealPayload overwrites the placeholder with a new object carrying
+        // the SAME txId/key/rev; an overrun discard racing that overwrite must
+        // abandon (leave to retire/recover), not destroy the real.
         try {
             val cur = try { pendingPublish.get() } catch (_: Exception) { null }
             if (cur != null && cur.txId == payload.txId && cur.key == payload.key &&
                 (cur.rev == payload.rev || payload.rev == -1L)
             ) {
+                val curIsPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
+                if (!curIsPlaceholder) return
                 if (pendingPublish.compareAndSet(cur, null)) {
                     try {
                         val own = try { pendingOwner.get() } catch (_: Exception) { null }
@@ -780,6 +999,18 @@ class PolicyTxCoordinator {
         } catch (_: Exception) {
         }
         try {
+            orphanDropGen.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            orphanDropRev.set(-1L)
+        } catch (_: Exception) {
+        }
+        try {
+            retiredRealCount.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
             _latest.value = null
         } catch (_: Exception) {
         }
@@ -796,16 +1027,18 @@ class PolicyTxCoordinator {
         } catch (_: Exception) {
             // Best effort.
         }
+        // P3: best-effort single release, never a while-unlock loop (a loop can
+        // release locks held by a concurrent writer and corrupt the count).
         try {
-            while (writeMutex.isLocked) {
-                writeMutex.unlock()
+            if (writeMutex.isLocked) {
+                try { writeMutex.unlock() } catch (_: Exception) { }
             }
         } catch (_: Exception) {
             // Best effort.
         }
         try {
-            while (commitMutex.isLocked) {
-                commitMutex.unlock()
+            if (commitMutex.isLocked) {
+                try { commitMutex.unlock() } catch (_: Exception) { }
             }
         } catch (_: Exception) {
             // Best effort.

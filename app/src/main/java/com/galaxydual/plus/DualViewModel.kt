@@ -814,6 +814,16 @@ class DualViewModel(
     // Main-confined (see class doc).
     private var selectJob: Job? = null
 
+    // P2-4 Busy waiter handle (bounded 4 rounds + _latest collector backstop).
+    // attachBusyWaiter stores the Job here (replacing any prior waiter);
+    // dispose()/onCleared() cancel it explicitly. viewModelScope cancellation
+    // alone is NOT relied upon (dispose() does not cancel the scope in tests;
+    // production scope cancel happens only in onCleared), so an explicit
+    // handle is required to avoid a 300s leak. The _latest collector
+    // (observeRevisionUpdates) is the convergence backstop after the bounded
+    // rounds expire.
+    private var busyWaiterJob: Job? = null
+
     // In-flight write dedup keys ("clone:<pkg>" / "request-remove:<pkg>" /
     // "remove:<pkg>@<id>#<serial>#<ts>", PR-3 stage 1, issue #24 + PR-4 P23
     // stage 2, PR-33 R2 adds the serial to the generation).
@@ -902,6 +912,15 @@ class DualViewModel(
         // Fallback Tx with an already-running/completed eager deferred passes
         // true (validation already done at creation). Atomic: read on IO/Main.
         val executionArmed: AtomicBoolean = AtomicBoolean(false),
+        // Stage O1 P2#2 (lifecycle): owner-liveness for shared LAZY ownership.
+        // True until the owning VM explicitly revokes pre-start (dispose/onCleared
+        // or its own pre-start abort). A newly attached VM decides liveness via
+        // an inline single-snapshot under commitMutex (activeTx+ownerAlive+
+        // deferred+pending/age, see init/async-reclaim/busy-waiter): live
+        // PREPARING owner => must NOT cancel (mark self Unverified/Busy, wait
+        // for owner); abandoned (false) => may abort/unclaim. Armed Txs ignore
+        // this (inherit regardless).
+        val ownerAlive: AtomicBoolean = AtomicBoolean(true),
     )
     // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
@@ -924,6 +943,52 @@ class DualViewModel(
     // Stage L3 gap 可觀測計數（JVM 可讀；跳號僅標記不丟失）。
     internal val revisionGapCount = AtomicLong(0L)
     private val policyRevisionStale = AtomicBoolean(false)
+    // Stage O1 P1#1 (consent): authoritatively observed policy revision.
+    // The coordinator committedRevision sampled at the moment this VM's current
+    // Known draft was authoritatively read (fresh trusted load / terminal event /
+    // reconciler ground-truth). requestPolicyWrite binds pending.baseCoordinatorRevision
+    // to THIS (not currentRevision()), so a confirmation displaying stale A cannot
+    // borrow the already-advanced B revision. Updated only on fresh Known transitions
+    // via markObservedKnown(); never on stale-retained Known. -1L = never observed
+    // (legacy/Unknown; request falls back to fail-closed Unknown path, confirm gates
+    // use -1L skip only for legacy injected pendings).
+    private val authoritativeObservedRev = AtomicLong(-1L)
+    // Stage O1 P1#1: last orphan-drop generation observed by this VM. Advanced
+    // whenever this VM observes a drop (pre-IO recover) or a fresh Known read.
+    // Request fails closed when coord.orphanDropGen != lastSeenDropGen (an unseen
+    // placeholder was dropped without any _latest event).
+    private val lastSeenDropGen = AtomicLong(0L)
+    private fun markObservedKnown() {
+        try {
+            val cur = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
+            if (cur != -1L) {
+                try { authoritativeObservedRev.set(cur) } catch (_: Exception) { }
+            } else {
+                try {
+                    val lastR = lastRevisionSeenRev.get()
+                    if (lastR != -1L) authoritativeObservedRev.set(lastR)
+                } catch (_: Exception) {
+                }
+            }
+            try {
+                val dg = try { policyTxCoordinator?.orphanDropGen?.get() ?: 0L } catch (_: Exception) { 0L }
+                lastSeenDropGen.set(dg)
+            } catch (_: Exception) {
+            }
+        } catch (_: Exception) {
+        }
+    }
+    // P1-1 (TOCTOU) invariant: every trusted-read Known path (init load,
+    // refreshLocked, repair success) samples revBefore BEFORE the IO and discards
+    // the Known (no disarm, no stale wash, no mark — stay Unknown, fail closed)
+    // when currentRevision moved mid-IO. See the revBefore/revMoved pairs below.
+    // Residual window (documented, not closed here): the revMoved re-check vs
+    // markObservedKnown/disarm/stale-wash is a lock-free read-then-act pair,
+    // so a concurrent commit landing between the check and the mark could still
+    // wash. The pre-IO double door (opMutex→policyRevisionMutex→withCommitLock
+    // union drain of replayCache+pendingPublish+committedRevision+dropGen, plus
+    // the atomic rev-gated claim for repair) is the second defense: any unseen
+    // B still blocks the next request/confirm even if this window is hit.
     // Stage J4 (J3#1 pre-IO TOCTOU)：修訂觀察與寫入路徑序列化的專用互斥。
     // - confirm pre-IO 門控（check base/stale＋lazy.start）在 opMutex 內再持此鎖；
     // - handleForeignSettled 的 stale 標記段同持此鎖（短臨界，無 IO、不長持）。
@@ -965,6 +1030,10 @@ class DualViewModel(
     // 本地；刪除舊集中式「先讀 _state 後 emit」（讀-發窗口可被併發終態污染，敗者
     // 誤發射）；發射改由各終態發布點顯式 emitTxSettledSnapshot（claim 持有下呼叫，
     // 見下），settle 本體只做 CAS＋清理。
+    // P2-3: lock-free CAS (no tryLock decoration). activeTx clear is a single
+    // atomic CAS — holding commitMutex around it adds no atomicity (the CAS is
+    // the fence). Multi-field snapshots that need atomicity use withCommitLock
+    // at their own call sites (pre-IO gates); settle itself never takes the lock.
     private fun settlePolicyTx(tx: PolicyTx): Boolean {
         val coord = policyTxCoordinator
         if (coord != null) {
@@ -1013,6 +1082,11 @@ class DualViewModel(
                         lastRevisionSeenTxId.set(emitForMark.txId)
                         lastRevisionSeenKey.set(emitForMark.key)
                         if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                        // Stage O1 P1#1: own terminal truth => observed.
+                        if (stamped != null) {
+                            try { authoritativeObservedRev.set(stamped.rev) } catch (_: Exception) { }
+                            try { lastSeenDropGen.set(coord.orphanDropGen.get()) } catch (_: Exception) { }
+                        }
                     } catch (_: Exception) {
                     }
                 } catch (_: Exception) {
@@ -1042,6 +1116,10 @@ class DualViewModel(
                     lastRevisionSeenTxId.set(emitForMark.txId)
                     lastRevisionSeenKey.set(emitForMark.key)
                     if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                    if (stamped != null) {
+                        try { authoritativeObservedRev.set(stamped.rev) } catch (_: Exception) { }
+                        try { lastSeenDropGen.set(coord.orphanDropGen.get()) } catch (_: Exception) { }
+                    }
                 } catch (_: Exception) {
                 }
             } catch (_: Exception) {
@@ -1188,6 +1266,10 @@ class DualViewModel(
                         lastRevisionSeenTxId.set(emitForMark.txId)
                         lastRevisionSeenKey.set(emitForMark.key)
                         if (emitForMark.rev != -1L) lastRevisionSeenRev.set(emitForMark.rev)
+                        if (stamped != null) {
+                            try { authoritativeObservedRev.set(stamped.rev) } catch (_: Exception) { }
+                            try { lastSeenDropGen.set(coord.orphanDropGen.get()) } catch (_: Exception) { }
+                        }
                     } catch (_: Exception) {
                     }
                 } catch (_: Exception) {
@@ -1244,9 +1326,18 @@ class DualViewModel(
                 }
                 // Stage I2：跟隨即記水位（不洗 stale：異 Tx 陳舊仍須顯式重讀）。
                 // Stage L3: 同步 rev 水位（rev 已知由 rev 守衛，rev==-1 退回 txId；gap 經計數）。
+                // Stage O1 P1#1: follower observes authoritative truth => observed.
                 lastRevisionSeenTxId.set(settled.txId)
                 lastRevisionSeenKey.set(settled.key)
                 try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
+                if (settled.known) {
+                    try {
+                        val orv = if (settled.rev != -1L) settled.rev else (policyTxCoordinator?.currentRevision() ?: -1L)
+                        if (orv != -1L) authoritativeObservedRev.set(orv)
+                    } catch (_: Exception) {
+                    }
+                    try { lastSeenDropGen.set(policyTxCoordinator?.orphanDropGen?.get() ?: 0L) } catch (_: Exception) { }
+                }
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                     else {
@@ -1411,9 +1502,18 @@ class DualViewModel(
             }
             // Stage I2：跟隨即記水位，免常駐收集重入（不洗 stale：仍須顯式重讀）。
             // Stage L3: 同步 rev 水位。
+            // Stage O1 P1#1: follower observes authoritative truth => observed.
             lastRevisionSeenTxId.set(settled.txId)
             lastRevisionSeenKey.set(settled.key)
             try { if (settled.rev != -1L) lastRevisionSeenRev.set(settled.rev) } catch (_: Exception) { }
+            if (settled.known) {
+                try {
+                    val orv = if (settled.rev != -1L) settled.rev else (policyTxCoordinator?.currentRevision() ?: -1L)
+                    if (orv != -1L) authoritativeObservedRev.set(orv)
+                } catch (_: Exception) {
+                }
+                try { lastSeenDropGen.set(policyTxCoordinator?.orphanDropGen?.get() ?: 0L) } catch (_: Exception) { }
+            }
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
                 else {
@@ -1496,6 +1596,8 @@ class DualViewModel(
         try {
             // Stage L1 P1: observe coordinator committedRevision + pendingPublish
             // atomically with watermark (same commitMutex observation).
+            // P2-4: orphanDropGen is sampled in the SAME observation (rev/pending/
+            // dropGen one snapshot, no split window).
             val committedRev: Long = try {
                 coord?.committedRevision?.get() ?: -1L
             } catch (_: Exception) {
@@ -1505,6 +1607,12 @@ class DualViewModel(
                 coord?.pendingPublish?.get()
             } catch (_: Exception) {
                 null
+            }
+            @Suppress("UNUSED_VARIABLE")
+            val observedDropGen: Long = try {
+                coord?.orphanDropGen?.get() ?: 0L
+            } catch (_: Exception) {
+                0L
             }
             // Authoritative: staged (CAS done, not yet emitted) counts as seen
             // revision — mark stale even before its event lands (closes P1 gap).
@@ -1638,6 +1746,9 @@ class DualViewModel(
             policyFreshnessGen.incrementAndGet()
             policyOwnershipGen.incrementAndGet()
             policyRevisionStale.set(false)
+            // Stage O1 P1#1: terminal event is authoritative truth => observed.
+            try { authoritativeObservedRev.set(if (settled.rev != -1L) settled.rev else (policyTxCoordinator?.currentRevision() ?: -1L)) } catch (_: Exception) { }
+            try { lastSeenDropGen.set(policyTxCoordinator?.orphanDropGen?.get() ?: 0L) } catch (_: Exception) { }
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
                     cur.policyWritePhase != PolicyWritePhase.QUEUED
@@ -1667,23 +1778,41 @@ class DualViewModel(
     // 本地 CAS 失配（另有 winner）即 loser 直接返回（不加 reconciling、不啟動
     // reconciler、不碰 winner）；coordinator CAS 失配即 loser 清本地（僅清自身
     // Tx，不碰 coordinator winner）後返回。
+    // P2-3: lock-free dual CAS (no tryLock decoration). Both CAS are single
+    // atomic structures; a mutex around them cannot make the pair atomic
+    // (non-suspend finally path cannot hold commitMutex across the pair anyway).
+    // Rollback-safe: local CAS failure => return (coord untouched when coordCur
+    // was already tx, else coord CAS attempted first below); coord CAS failure =>
+    // roll back local and return without touching the winner.
     private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean) {
         // Stage N2 P1: never expose/transfer a PREPARING (unvalidated) Tx as
         // executable. Handover is only for post-validation timeouts (armed);
         // an unarmed handover request is aborted without store touch.
+        // Stage O1 P2#2: owner-liveness already checked by caller (init) or by
+        // canJoinTx gate here; abandoned claims abort, live owners never reach here
+        // via init (init returns Busy early).
         if (!canJoinTx(tx)) {
             abortUnarmedTx(tx)
             return
         }
-        val localCur = activePolicyTx.get()
+        // Single-structure snapshot: read local+coord once.
+        val localCur = try { activePolicyTx.get() } catch (_: Exception) { null }
+        val coordCur: PolicyTx? = try { policyTxCoordinator?.activeTx?.get() } catch (_: Exception) { null }
         if (localCur !== tx) {
             if (!activePolicyTx.compareAndSet(null, tx)) {
                 return
             }
         }
         val coord = policyTxCoordinator
-        if (coord != null && coord.activeTx.get() !== tx) {
-            if (!coord.activeTx.compareAndSet(null, tx)) {
+        if (coord != null && coordCur !== tx) {
+            val claimed: Boolean = try {
+                if (coord.activeTx.get() !== tx) {
+                    coord.activeTx.compareAndSet(null, tx)
+                } else {
+                    true
+                }
+            } catch (_: Exception) { false }
+            if (!claimed) {
                 activePolicyTx.compareAndSet(tx, null)
                 policyReconciling.remove(tx.key)
                 return
@@ -1692,6 +1821,108 @@ class DualViewModel(
         policyReconciling.add(tx.key)
         attachDeferredAutoRecheck(tx)
         if (isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+    }
+
+    // P2-4: Busy waiter — a VM that marked itself BUSY (live PREPARING owner
+    // elsewhere) must not strand forever when that owner disposes immediately
+    // after the snapshot (no re-estimate, no timeout, no adopt, no subscribe).
+    // Best-effort periodic recheck under commitMutex (single snapshot):
+    // - claim abandoned (activeTx holds tx but ownerAlive==false, or deferred
+    //   done + staged fence stale/missing) => abort (pre-start cancel path);
+    // - claim joinable (armed/started) => reclaim like the normal inherit path;
+    // - claim gone (settled, activeTx==null/different) => return (the _latest
+    //   collector converges this VM, no local action needed).
+    // Capped iterations (bounded 4 rounds; explicitly cancelled in
+    // dispose()/onCleared() via busyWaiterJob, NOT via viewModelScope alone —
+    // dispose() does not cancel the scope in tests) so a truly live
+    // owner never spins forever; the _latest collector (observeRevisionUpdates)
+    // remains the convergence backstop after the bounded rounds expire.
+    private fun attachBusyWaiter(tx: PolicyTx) {
+        try {
+            try { busyWaiterJob?.cancel() } catch (_: Exception) { }
+            busyWaiterJob = viewModelScope.launch {
+                try {
+                    val coord = policyTxCoordinator ?: return@launch
+                    var rounds = 0
+                    while (rounds < 4) {
+                        rounds += 1
+                        try { kotlinx.coroutines.delay(policyIoTimeoutMs) } catch (e: CancellationException) { throw e } catch (_: Exception) { return@launch }
+                        if (activePolicyTx.get() != null) return@launch
+                        var action = 0 // 0=keep waiting, 1=abort, 2=reclaim
+                        try {
+                            coord.withCommitLock {
+                                val cur = try { coord.activeTx.get() } catch (_: Exception) { null }
+                                if (cur !== tx) return@withCommitLock
+                                val alive = try { tx.ownerAlive.get() } catch (_: Exception) { false }
+                                if (!alive) {
+                                    action = 1
+                                    return@withCommitLock
+                                }
+                                if (canJoinTx(tx)) {
+                                    action = 2
+                                    return@withCommitLock
+                                }
+                                val done = try { tx.deferred.isCompleted || tx.deferred.isCancelled } catch (_: Exception) { false }
+                                if (done) {
+                                    val pend = try { coord.pendingPublish.get() } catch (_: Exception) { null }
+                                    if (pend == null || pend.txId != tx.txId || pend.key != tx.key) {
+                                        action = 1
+                                        return@withCommitLock
+                                    }
+                                    val stagedAt = try { coord.pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+                                    val now = try { System.nanoTime() } catch (_: Exception) { 0L }
+                                    if (stagedAt == 0L || (now >= stagedAt &&
+                                        (now - stagedAt) / 1_000_000L >= policyIoTimeoutMs)
+                                    ) {
+                                        action = 1
+                                        return@withCommitLock
+                                    }
+                                }
+                            }
+                        } catch (e: CancellationException) { throw e } catch (_: Exception) { return@launch }
+                        if (action == 1) {
+                            // Only abort a Tx we actually hold: CAS null->tx first;
+                            // failure means another VM claimed/settled concurrently —
+                            // never abort someone else's fence.
+                            val held = try { activePolicyTx.compareAndSet(null, tx) } catch (_: Exception) { false }
+                            if (!held) return@launch
+                            try { abortUnarmedTx(tx) } catch (_: Exception) { }
+                            return@launch
+                        } else if (action == 2) {
+                            try {
+                                if (activePolicyTx.compareAndSet(null, tx)) {
+                                    try { policyReconciling.add(tx.key) } catch (_: Exception) { }
+                                    try { attachDeferredAutoRecheck(tx) } catch (_: Exception) { }
+                                    try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                    _state.update { cur ->
+                                        cur.copy(
+                                            pendingPolicyWrite = tx.pending ?: cur.pendingPolicyWrite,
+                                            policyWritePhase = PolicyWritePhase.RECONCILING,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraftKnown = false,
+                                            policyDraftCorrupt = tx.isRepair,
+                                            loading = false,
+                                            msg = policyText(
+                                                PolicyText(
+                                                    if (tx.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
+                                                    else if (tx.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
+                                                ),
+                                            ),
+                                            msgKind = MsgKind.CHANNEL,
+                                        )
+                                    }
+                                    if (tx.isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+                                    observeSettledFor(tx)
+                                }
+                            } catch (_: Exception) {
+                            }
+                            return@launch
+                        }
+                    }
+                } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     // Stage G2 (P2#4#5)：deferred 完成自動重查。
@@ -1986,7 +2217,19 @@ class DualViewModel(
     // local+coordinator, clears the reconciling key, and publishes
     // IDLE+Unknown (fail-closed, requires fresh validation by the inheriting
     // VM). Safe to call redundantly (settle CAS + best-effort cancel).
+    // Stage O1 P2#2: only the owner itself (pre-start cancel) or an abandoned
+    // claim (ownerAlive==false, owner destroyed) may revoke. A live owner's Tx
+    // is never aborted by a newly attached VM (init decides liveness via the
+    // inline single-snapshot under commitMutex first).
+    // Revocation explicitly clears ownerAlive so late attachers see abandoned.
+    // P2-1: repair Tx keeps Corrupt=true (still damaged, fail-closed); only
+    // non-repair aborts wash Corrupt=false. Matches the liveOwner Busy path
+    // (policyDraftCorrupt = tx.isRepair).
     private fun abortUnarmedTx(tx: PolicyTx) {
+        try {
+            tx.ownerAlive.set(false)
+        } catch (_: Exception) {
+        }
         try {
             tx.deferred.cancel()
         } catch (_: Exception) {
@@ -2004,18 +2247,19 @@ class DualViewModel(
         } catch (_: Exception) {
         }
         _state.update { cur ->
+            val keepCorrupt = try { tx.isRepair } catch (_: Exception) { false }
             if (cur.policyWritePhase != PolicyWritePhase.RECONCILING &&
                 cur.policyWritePhase != PolicyWritePhase.SAVING &&
                 cur.policyWritePhase != PolicyWritePhase.QUEUED
             ) {
-                cur.copy(policyDraftKnown = false, policyDraftCorrupt = false)
+                cur.copy(policyDraftKnown = false, policyDraftCorrupt = keepCorrupt)
             } else {
                 cur.copy(
                     loading = false,
                     policyWritePhase = PolicyWritePhase.IDLE,
                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                     policyDraftKnown = false,
-                    policyDraftCorrupt = false,
+                    policyDraftCorrupt = keepCorrupt,
                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                     msgKind = MsgKind.CHANNEL,
                 )
@@ -2389,7 +2633,21 @@ class DualViewModel(
     // Stage D：同步 disarm blind-clear（VM 丟棄後不得殘留確認態）。
     // Stage L4: 同步 disarm corrupt-repair（同上）。
     // Stage F2：盡力關閉獨立讀池（阻塞中執行緒仍滯留至行程結束）。
+    // Stage O1 P2#2: owner-liveness revoke — dispose marks any owned PREPARING
+    // (unvalidated) Tx as abandoned (ownerAlive=false) so a later VM may abort
+    // it; live VMs never touch another owner's flag. Armed/in-flight Txs keep
+    // their fence for inheritance (activeTx retained, ownerAlive stays true until
+    // explicit pre-start revoke or settle).
     fun dispose() {
+        try { busyWaiterJob?.cancel() } catch (_: Exception) { }
+        try { busyWaiterJob = null } catch (_: Exception) { }
+        try {
+            val owned = try { activePolicyTx.get() } catch (_: Exception) { null }
+            if (owned != null && !canJoinTx(owned)) {
+                try { owned.ownerAlive.set(false) } catch (_: Exception) { }
+            }
+        } catch (_: Exception) {
+        }
         disarmBlindClear()
         disarmCorruptRepair()
         teardownShizukuBindings()
@@ -2397,6 +2655,15 @@ class DualViewModel(
     }
 
     override fun onCleared() {
+        try { busyWaiterJob?.cancel() } catch (_: Exception) { }
+        try { busyWaiterJob = null } catch (_: Exception) { }
+        try {
+            val owned = try { activePolicyTx.get() } catch (_: Exception) { null }
+            if (owned != null && !canJoinTx(owned)) {
+                try { owned.ownerAlive.set(false) } catch (_: Exception) { }
+            }
+        } catch (_: Exception) {
+        }
         disarmBlindClear()
         disarmCorruptRepair()
         teardownShizukuBindings()
@@ -2449,22 +2716,151 @@ class DualViewModel(
         run {
             val coordInit = policyTxCoordinator ?: return@run
             var reclaimedTx: PolicyTx? = null
+            // P2-4: liveness decided under the SAME tryLock snapshot below (no
+            // torn read between activeTx/ownerAlive/deferred/pending/dropGen).
+            var reclaimedLive = false
             // Self-reference: DualViewModel.PolicyTx == PolicyTx in this scope.
             var lockedInit = false
             try {
                 lockedInit = try { coordInit.commitMutex.tryLock() } catch (_: Exception) { false }
-                try {
-                    @Suppress("UNUSED_VARIABLE")
-                    val revInit = try { coordInit.committedRevision.get() } catch (_: Exception) { -1L }
-                    @Suppress("UNUSED_VARIABLE")
-                    val stagedInit = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
-                    reclaimedTx = try { coordInit.activeTx.get() } catch (_: Exception) { null }
-                } catch (_: Exception) {
+                // Stage O1 extra (init tryLock drop): only trust the snapshot when the
+                // lock was actually held (single-structure snapshot under commitMutex).
+                // tryLock failure => stale read, defer to async withCommitLock below
+                // (never activeTx value but no VM claim).
+                if (lockedInit) {
+                    try {
+                        @Suppress("UNUSED_VARIABLE")
+                        val revInit = try { coordInit.committedRevision.get() } catch (_: Exception) { -1L }
+                        @Suppress("UNUSED_VARIABLE")
+                        val stagedInit = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
+                        reclaimedTx = try { coordInit.activeTx.get() } catch (_: Exception) { null }
+                        // P2-4: dropGen sampled in the SAME lock observation as
+                        // rev/pending/active (no split-window staleness).
+                        try {
+                            lastSeenDropGen.set(try { coordInit.orphanDropGen.get() } catch (_: Exception) { 0L })
+                        } catch (_: Exception) {
+                        }
+                        // P2-4: single-snapshot liveness (flag + deferred/age backstop).
+                        reclaimedLive = run {
+                            val t = reclaimedTx ?: return@run false
+                            if (!canJoinTx(t)) {
+                                val alive = try { t.ownerAlive.get() } catch (_: Exception) { false }
+                                if (!alive) return@run false
+                                val done = try { t.deferred.isCompleted || t.deferred.isCancelled } catch (_: Exception) { false }
+                                if (!done) return@run true
+                                val pend = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
+                                if (pend == null || pend.txId != t.txId || pend.key != t.key) return@run false
+                                val stagedAt = try { coordInit.pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+                                if (stagedAt == 0L) return@run false
+                                val now = try { System.nanoTime() } catch (_: Exception) { 0L }
+                                if (now < stagedAt) return@run true
+                                val ageMs = try { (now - stagedAt) / 1_000_000L } catch (_: Exception) { 0L }
+                                ageMs < policyIoTimeoutMs
+                            } else {
+                                true
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
                 }
             } finally {
                 if (lockedInit) {
                     try { coordInit.commitMutex.unlock() } catch (_: Exception) { }
                 }
+            }
+            // Stage O1 extra: tryLock missed => async locked reclaim (delayed retry).
+            // Guarantees every activeTx value is eventually claimed by some live VM.
+            if (!lockedInit) {
+                try {
+                    viewModelScope.launch {
+                        try {
+                            coordInit.withCommitLock {
+                                val txAsync = try { coordInit.activeTx.get() } catch (_: Exception) { null }
+                                    ?: return@withCommitLock
+                                if (activePolicyTx.get() != null) return@withCommitLock
+                                if (!canJoinTx(txAsync)) {
+                                    // Stage O1 P2#2: live owner => never cancel.
+                                    // P2-4: single-snapshot liveness — this block already
+                                    // holds commitMutex, so read active/owner/deferred/
+                                    // pending/age inline (the former torn-read helpers
+                                    // are deleted; inline is the single source).
+                                    val liveAsync = run {
+                                        val curA = try { coordInit.activeTx.get() } catch (_: Exception) { null }
+                                        if (curA !== txAsync) return@run false
+                                        val aliveA = try { txAsync.ownerAlive.get() } catch (_: Exception) { false }
+                                        if (!aliveA) return@run false
+                                        val doneA = try { txAsync.deferred.isCompleted || txAsync.deferred.isCancelled } catch (_: Exception) { false }
+                                        if (!doneA) return@run true
+                                        val pendA = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
+                                        if (pendA == null || pendA.txId != txAsync.txId || pendA.key != txAsync.key) return@run false
+                                        val stagedAtA = try { coordInit.pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+                                        if (stagedAtA == 0L) return@run false
+                                        val nowA = try { System.nanoTime() } catch (_: Exception) { 0L }
+                                        if (nowA < stagedAtA) return@run true
+                                        val ageA = try { (nowA - stagedAtA) / 1_000_000L } catch (_: Exception) { 0L }
+                                        ageA < policyIoTimeoutMs
+                                    }
+                                    if (liveAsync) {
+                                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                        _state.update { cur ->
+                                            cur.copy(
+                                                policyDraftKnown = false,
+                                                policyDraftCorrupt = txAsync.isRepair,
+                                                msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                                msgKind = MsgKind.INFO,
+                                            )
+                                        }
+                                        // P2-4: Busy must not strand forever if the owner
+                                        // dies right after this snapshot (no re-estimate, no
+                                        // timeout, no adopt). Attach a light waiter that
+                                        // rechecks under commitMutex and aborts/reclaims
+                                        // once the claim is abandoned.
+                                        try { attachBusyWaiter(txAsync) } catch (_: Exception) { }
+                                        return@withCommitLock
+                                    }
+                                    // P2-4 fix: only abort a Tx we actually hold locally.
+                                    // CAS null->txAsync first; failure means another
+                                    // VM/op claimed locally concurrently — return
+                                    // without aborting someone else's fence.
+                                    val heldAbandoned = try { activePolicyTx.compareAndSet(null, txAsync) } catch (_: Exception) { false }
+                                    if (!heldAbandoned) return@withCommitLock
+                                    try { abortUnarmedTx(txAsync) } catch (_: Exception) { }
+                                    return@withCommitLock
+                                }
+                                // P2-4 fix: joinable reclaim must also CAS (never blind
+                                // set). Failure => local race lost; re-read and let
+                                // the _latest collector converge (never overwrite).
+                                val heldJoin = try { activePolicyTx.compareAndSet(null, txAsync) } catch (_: Exception) { false }
+                                if (!heldJoin) return@withCommitLock
+                                try { policyReconciling.add(txAsync.key) } catch (_: Exception) { }
+                                try { attachDeferredAutoRecheck(txAsync) } catch (_: Exception) { }
+                                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                _state.update { cur ->
+                                    cur.copy(
+                                        pendingPolicyWrite = txAsync.pending ?: cur.pendingPolicyWrite,
+                                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = txAsync.isRepair,
+                                        loading = false,
+                                        msg = policyText(
+                                            PolicyText(
+                                                if (txAsync.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
+                                                else if (txAsync.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
+                                            ),
+                                        ),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                                if (txAsync.isClear) launchClearReconciler(txAsync) else launchConfirmReconciler(txAsync)
+                                observeSettledFor(txAsync)
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+                return@run
             }
             val tx = reclaimedTx ?: return@run
             if (activePolicyTx.get() == null) {
@@ -2474,12 +2870,50 @@ class DualViewModel(
                 // without either VM completing final validation. Abort it here
                 // (cancel unstarted LAZY, unclaim, IDLE+Unknown) and require a
                 // fresh Corrupt+revision validation by this VM.
+                // Stage O1 P2#2: distinguish live PREPARING owner from abandoned.
+                // Live owner (coordinator still holds Tx AND ownerAlive) => new VM
+                // must NOT cancel the shared LAZY; mark self Unverified/Busy and
+                // wait for the owner to finish (converge via _latest collector).
                 if (!canJoinTx(tx)) {
-                    activePolicyTx.set(tx)
+                    // P2-4: use the single-snapshot verdict taken under the init
+                    // tryLock above (never a torn lock-free re-read here). false on
+                    // tryLock miss is handled by the async locked reclaim path;
+                    // reaching here means lockedInit held, so the flag is fresh.
+                    val liveOwner = reclaimedLive
+                    if (liveOwner) {
+                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                        _state.update { cur ->
+                            cur.copy(
+                                policyDraftKnown = false,
+                                policyDraftCorrupt = tx.isRepair,
+                                msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                msgKind = MsgKind.INFO,
+                            )
+                        }
+                        // P2-4: Busy waiter (see async path): recheck under
+                        // commitMutex; abort/reclaim once abandoned, never strand.
+                        try { attachBusyWaiter(tx) } catch (_: Exception) { }
+                        return@run
+                    }
+                    // Sync init blind sets become CAS: failure => local race lost,
+                    // re-read and let _latest converge (never overwrite).
+                    // Hold-check: already holding same Tx => proceed to abort.
+                    val curLocalAb = try { activePolicyTx.get() } catch (_:Exception) { null }
+                    if (curLocalAb !== tx) {
+                        if (!try { activePolicyTx.compareAndSet(null, tx) } catch (_: Exception) { false }) return@run
+                    }
                     abortUnarmedTx(tx)
                     return@run
                 }
-                activePolicyTx.set(tx)
+                // P2-4 fix: joinable reclaim must also CAS (never blind set).
+                // Failure => local race lost; re-read and let _latest converge.
+                // Hold-check first: if we already hold this exact Tx (e.g. async
+                // reclaim won before sync), proceed (CAS null->tx would fail
+                // spuriously on same-identity).
+                val curLocalJoin = try { activePolicyTx.get() } catch (_: Exception) { null }
+                if (curLocalJoin !== tx) {
+                    if (!try { activePolicyTx.compareAndSet(null, tx) } catch (_: Exception) { false }) return@run
+                }
                 policyReconciling.add(tx.key)
                 attachDeferredAutoRecheck(tx)
                 markPolicyUnknownLocked()
@@ -2526,6 +2960,11 @@ class DualViewModel(
             val generation = policyFreshnessGen.incrementAndGet()
             val versionAtStart = policyDraftVersion.get()
             val store = hookPolicyStore
+            // P1-1: sample the authoritative revision BEFORE the trusted IO. If a
+            // concurrent B commits (placeholder rev bump, no _latest event) while
+            // this read is in flight, the Known payload below is stale (A) and must
+            // be discarded (stay Unknown, fail closed) — never marked observed.
+            val revBeforeInit = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
             val result = if (store == null) {
                 LoadResult.Unavailable
             } else try {
@@ -2534,6 +2973,10 @@ class DualViewModel(
                 if (e is CancellationException) throw e
                 LoadResult.Unavailable
             }
+            // P1-1: revision moved during the read => stale Known, discard.
+            val revMovedInit = try {
+                revBeforeInit != -1L && (policyTxCoordinator?.currentRevision() ?: revBeforeInit) != revBeforeInit
+            } catch (_: Exception) { false }
             _state.update { cur ->
                 // Stage G2：認領 fence 優先——Tx 存活時 init load 一律丟棄（不覆寫
                 // RECONCILING＋Unknown＋pending；新 VM 認領已同步發布 fence）。
@@ -2543,12 +2986,24 @@ class DualViewModel(
                 ) {
                     cur
                 } else if (result is LoadResult.Known) {
-                    // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏：arm→Known→
-                    // Unknown→單次 clear 必須仍告警，不可因舊 arm 直接執行）。
-                    // Stage L4: Known 同時洗白 Corrupt（雙 disarm）。
-                    disarmBlindClear()
-                    disarmCorruptRepair()
-                    cur.copy(policyDraft = result.packages, policyDraftKnown = true, policyDraftCorrupt = false)
+                    // P1-1: stale read (rev advanced mid-IO) => discard: no disarm,
+                    // no stale wash, no mark, stay Unknown (fail closed).
+                    // Keep cur Corrupt (repair-period discard must not wash, same
+                    // as refresh 6913/6918 + abortUnarmedTx keepCorrupt; repair-abort
+                    // Unknown+Corrupt must not downgrade to Unavailable).
+                    if (revMovedInit) {
+                        cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
+                    } else {
+                        // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏：arm→Known→
+                        // Unknown→單次 clear 必須仍告警，不可因舊 arm 直接執行）。
+                        // Stage L4: Known 同時洗白 Corrupt（雙 disarm）。
+                        // Stage O1 P1#1: fresh trusted read => advance authoritatively
+                        // observed revision (request binds to this, not current).
+                        disarmBlindClear()
+                        disarmCorruptRepair()
+                        markObservedKnown()
+                        cur.copy(policyDraft = result.packages, policyDraftKnown = true, policyDraftCorrupt = false)
+                    }
                 } else {
                     // Unavailable/Corrupt: preserve the last known draft but mark it unknown.
                     // Phase 1：此為 load 結果本身的 Unknown，刻意不 bump（見
@@ -5597,13 +6052,44 @@ class DualViewModel(
                     // 免覆寫新事實（同 hadReadTimeout 內判）。
                     // Stage G1：refresh 期中 yielding 只推 freshness，不致此丟棄。
                     // P2-1：丟棄終態先搶發布權（勝者才發布），unresolved 不搶。
+                    // Stage O1 extra (budget-overrun orphan placeholder): claim (placeholder
+                    // stage) and stageReal share the same reconciler budget; they must not
+                    // separate across the timeout boundary. On overrun, never stage a NEW
+                    // placeholder (old code claimed here when staleOutside, stranding a
+                    // 10s blackhole with no real to follow). Discard to IDLE without claim.
+                    // P3: unconditional discard is correct (proven): overrun means the
+                    // reconciler budget (15s) already exceeded; any placeholder staged
+                    // before timeout is orphan (no real to follow, claim and stageReal
+                    // separated). Claiming here would strand a 10s blackhole fence with
+                    // no real (j4 vm2 inherit window is covered by the sync inherit fence,
+                    // not by overrun claim; overrun discard only clears own placeholder,
+                    // same-txId/key/rev real left to retire/recover). Nailed by
+                    // j4_cancelAfterCommit_handoverOrPublish (overrun never claims).
                     var keepFenceBudget = true
                     run {
                         val staleOutside = policyDraftVersion.get() != versionAtStart ||
                             policyOwnershipGen.get() != ownership
-                        if (staleOutside && !claimForPublish(tx)) {
+                        if (staleOutside) {
+                            // Overrun discard: clean any placeholder this Tx may have staged
+                            // before the timeout (claim and stageReal separated) so future
+                            // VMs are not fenced by an orphan with no real to follow.
+                            // P1-2: the whole discard runs under commitMutex inside
+                            // discardOverrunPlaceholder (get + isPlaceholder + identity
+                            // + CAS + tombstone + orphanDropGen bump, one atomic
+                            // observation). A concurrent stageRealPayload overwriting
+                            // the placeholder is NOT cleared (same txId/key/rev real
+                            // left to retire/recover). Settle stays false here (no
+                            // claim, no emit); the local IDLE+REFRESHED update below
+                            // carries the explicit settle semantics.
+                            try {
+                                val coordO = policyTxCoordinator
+                                if (coordO != null) {
+                                    try { coordO.discardOverrunPlaceholder(tx.txId, tx.key) } catch (_: Exception) { }
+                                }
+                            } catch (_: Exception) {
+                            }
                             settle = false
-                            return@launch
+                            // Fall through to IDLE+REFRESHED update below (no claim, no emit).
                         }
                     }
                     _state.update { cur ->
@@ -6010,13 +6496,22 @@ class DualViewModel(
                     // ownership 推進即丟棄回 IDLE＋REFRESHED，同 confirm）。
                     // Stage G1：refresh yielding 不致此丟棄。
                     // P2-1：丟棄終態先搶發布權（勝者才發布），同 confirm。
+                    // Stage O1 extra: same unconditional discard as confirm (see above;
+                    // proven correct, nailed by j4).
                     var keepFenceBudget = true
                     run {
                         val staleOutside = policyDraftVersion.get() != versionAtStart ||
                             policyOwnershipGen.get() != ownership
-                        if (staleOutside && !claimForPublish(tx)) {
+                        if (staleOutside) {
+                            // P1-2: locked placeholder-only discard (see confirm path).
+                            try {
+                                val coordO = policyTxCoordinator
+                                if (coordO != null) {
+                                    try { coordO.discardOverrunPlaceholder(tx.txId, tx.key) } catch (_: Exception) { }
+                                }
+                            } catch (_: Exception) {
+                            }
                             settle = false
-                            return@launch
                         }
                     }
                     _state.update { cur ->
@@ -6105,6 +6600,8 @@ class DualViewModel(
                 val versionAtStart = policyDraftVersion.get()
                 val ownershipSnap = policyOwnershipGen.get()
                 val store = hookPolicyStore
+                // P1-1: sample the authoritative revision BEFORE the trusted IO.
+                val revBeforeRefresh = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
                 val result = if (store == null) {
                     LoadResult.Unavailable
                 } else try {
@@ -6113,6 +6610,10 @@ class DualViewModel(
                     if (e is CancellationException) throw e
                     LoadResult.Unavailable
                 }
+                // P1-1: revision moved during the read => the Known below is stale.
+                val revMovedRefresh = try {
+                    revBeforeRefresh != -1L && (policyTxCoordinator?.currentRevision() ?: revBeforeRefresh) != revBeforeRefresh
+                } catch (_: Exception) { false }
                 // Tx 快照（IO 後取值：覆蓋讀期間出現的 Tx；reconciler 已退出時
                 // 仍可見滯留 Tx，late-join 可恢復）。
                 val txSnap = activePolicyTx.get()
@@ -6374,8 +6875,16 @@ class DualViewModel(
                         // Stage J2: 刷新期中有任一 app-scoped Tx（本地或 coordinator
                         // 他 VM 在途）即視為 Unverified：僅翻 Known=false、保留舊快照，
                         // 不 disarm、不洗 stale、不發布 Known（免把樂觀中間值當確認）。
+                        // P2-1 keepCorrupt: repair-period refresh discard must retain
+                        // cur.policyDraftCorrupt (still damaged, fail-closed), matching
+                        // abortUnarmedTx keepCorrupt (repair Tx aborts wash nothing).
                         if (hasActivePolicyTx()) {
-                            cur.copy(policyDraftKnown = false, policyDraftCorrupt = false)
+                            cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
+                        } else if (revMovedRefresh) {
+                            // P1-1: stale read (rev advanced mid-IO) => discard: no
+                            // disarm, no stale wash, no mark, stay Unknown (fail closed).
+                            // Corrupt retained (repair-period discard must not wash).
+                            cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
                         } else {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏）。
                         // Stage L4: 雙 disarm（盲清＋修復）＋洗白 Corrupt。
@@ -6384,7 +6893,9 @@ class DualViewModel(
                         // Stage I2：顯式重讀 Known 即洗白陳舊修訂 stale（後續
                         // request/confirm 恢復；late-join 結清不經此，保留 stale
                         // 直至顯式重讀）。
+                        // Stage O1 P1#1: fresh trusted read => observed.
                         policyRevisionStale.set(false)
+                        markObservedKnown()
                         if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                             cur.copy(
                                 policyDraft = result.packages,
@@ -6487,6 +6998,62 @@ class DualViewModel(
             }
             return
         }
+        // Stage O1 P1#1 (consent): authoritatively observed revision gate.
+        // The displayed draft was read at authoritativeObservedRev; if the
+        // coordinator committedRevision has since advanced (unseen B CAS without
+        // any _latest event, e.g. orphan placeholder dropped), the dialog content
+        // is stale even though local Known is still true. Fail closed: force
+        // Unknown + fresh trusted read before any full-set replacement.
+        // Also fail closed when an orphan placeholder was dropped since our last
+        // observation (dropGen moved) — no event was published, so staleness is
+        // invisible without this generation check.
+        // P3: the gen gate is paired with the drop rev (orphanDropRev): block
+        // ONLY when the drop is newer than what this VM authoritatively read
+        // (dropRev > observed). An older drop (dropRev <= observed, e.g. a stale
+        // placeholder predating our fresh read) just advances lastSeenDropGen
+        // silently — the rev gate above already covers real advances.
+        run {
+            val coordO = policyTxCoordinator
+            if (coordO != null && hookPolicyStore != null) {
+                val observed = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                if (observed != -1L) {
+                    val curRev = try { coordO.currentRevision() } catch (_: Exception) { observed }
+                    if (curRev != observed) {
+                        try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                        _state.update {
+                            it.copy(
+                                policyDraftKnown = false,
+                                policyDraftCorrupt = it.policyDraftCorrupt,
+                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                msgKind = MsgKind.CHANNEL,
+                            )
+                        }
+                        return
+                    }
+                    val curDrop = try { coordO.orphanDropGen.get() } catch (_: Exception) { 0L }
+                    val seenDrop = try { lastSeenDropGen.get() } catch (_: Exception) { curDrop }
+                    if (curDrop != seenDrop) {
+                        val dropRev = try { coordO.orphanDropRev.get() } catch (_: Exception) { -1L }
+                        if (dropRev == -1L || dropRev > observed) {
+                            try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                            try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                            _state.update {
+                                it.copy(
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = it.policyDraftCorrupt,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return
+                        }
+                        // Stale drop (older than observed): catch up silently.
+                        try { lastSeenDropGen.set(curDrop) } catch (_: Exception) { }
+                    }
+                }
+            }
+        }
         // P2 #3:先前遠端政策未知時拒絕建 pending (fail closed,避免整包覆寫
         // 未曾示出的內容)。store 為 null 時走既有 null-store 路徑,不在此攔截。
         // clear 刻意不設 unknown 門控：明確刪除≠覆寫未見內容。
@@ -6545,6 +7112,11 @@ class DualViewModel(
         // dropped 警語在上一次 emission，第二次 copy 保留其 msg 不覆寫）。
         // Stage J3：綁定當下修訂版本（外來修訂即 stale，confirm 比對失配拒寫）。
         // Stage L1 P1: 同綁 coordinator committedRevision (authoritative)。
+        // Stage O1 P1#1: bind the AUTHORITATIVELY OBSERVED revision (the rev at which
+        // this VM actually read the displayed draft), NOT currentRevision(). Sampling
+        // current here would borrow the already-advanced B revision for a dialog still
+        // showing stale A, letting confirm overwrite unseen B. Observed==-1 (never
+        // authoritatively read, e.g. null-store) falls back to current for compat.
         _state.update {
             it.copy(
                 pendingPolicyWrite = PendingPolicyWrite(
@@ -6552,7 +7124,11 @@ class DualViewModel(
                     requestedAtMs = nowMonoMs(),
                     droppedCount = dropped,
                     baseDraftVersion = policyDraftVersion.get(),
-                    baseCoordinatorRevision = policyTxCoordinator?.currentRevision() ?: -1L,
+                    baseCoordinatorRevision = run {
+                        val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                        if (obs != -1L) obs
+                        else policyTxCoordinator?.currentRevision() ?: -1L
+                    },
                 ),
                 policyWritePhase = PolicyWritePhase.QUEUED,
                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -6722,7 +7298,27 @@ class DualViewModel(
                         }
                         return@withLock
                     }
-                    val cur = _state.value.pendingPolicyWrite ?: return@withLock
+                    val cur = _state.value.pendingPolicyWrite
+                    if (cur == null) {
+                        // P3 ownerless (O1 QUEUED+pending==null): pending vanished
+                        // while this confirm queued behind opMutex (cancel landed in
+                        // the window, or a test cleared it by reflection). No owner
+                        // will ever settle the lingering QUEUED fence => IDLE.
+                        // Invariant: no markUnknown/bump here (cancel is not a failed
+                        // read — displayed Known stays; staleness still enforced by
+                        // the stale/unknown gates of the next request/confirm).
+                        _state.update { s ->
+                            if (s.pendingPolicyWrite == null &&
+                                s.policyWritePhase == PolicyWritePhase.QUEUED
+                            ) {
+                                s.copy(
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                )
+                            } else s
+                        }
+                        return@withLock
+                    }
                     if (cur != pendingAtCall) return@withLock
                     if (nowMonoMs() - cur.requestedAtMs > POLICY_CONFIRM_TTL_MS) {
                         // Phase 3：TTL 只清 pending＋msg，不碰 loading（本 op 尚未
@@ -7020,12 +7616,31 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: foreign pending may be
-                                                // a dead owner's orphan (activeTx==null + no emit).
-                                                // Recover when stale placeholder with stronger-than-age
-                                                // owner-gone proof (deferred done + monotonic age, see
-                                                // coordinator); fresh in-flight fence or real payload
-                                                // still marks stale. Monotonic System.nanoTime, never wall.
+                                                // Stage O1 P2#3 (availability): retire a stale REAL staged
+                                                // payload already present in _latest (publisher died after
+                                                // stageRealPayload before emitStaged). Retired fence clears
+                                                // pending without losing truth; watermark advances, no stale
+                                                // (truth already in latest; revOk/pendingOk decide).
+                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3 + O1 P1#1: foreign
+                                                // pending may be a dead owner's orphan (activeTx==null + no
+                                                // emit). Recover stale placeholder with stronger-than-age
+                                                // owner-gone proof; ANY dropped placeholder (even non-real,
+                                                // no _latest event) invalidates all VMs => stale. Fresh
+                                                // in-flight fence still marks stale. Monotonic nanoTime.
+                                                try {
+                                                    val retired = try {
+                                                        h1Coord.retireStagedRealPresentInLatestLocked(
+                                                            System.nanoTime(),
+                                                            policyIoTimeoutMs,
+                                                        )
+                                                    } catch (_: Exception) { null }
+                                                    if (retired != null) {
+                                                        lastRevisionSeenTxId.set(retired.txId)
+                                                        lastRevisionSeenKey.set(retired.key)
+                                                        try { if (retired.rev != -1L) lastRevisionSeenRev.set(retired.rev) } catch (_: Exception) { }
+                                                    }
+                                                } catch (_: Exception) {
+                                                }
                                                 val recovered = try {
                                                     h1Coord.recoverStalePendingLocked(
                                                         System.nanoTime(),
@@ -7033,8 +7648,22 @@ class DualViewModel(
                                                     )
                                                 } catch (_: Exception) { null }
                                                 if (recovered == null) {
-                                                    policyRevisionStale.set(true)
+                                                    // No drop: foreign pending still in-flight => stale.
+                                                    // (Retired-real path above already advanced watermark
+                                                    // when truth was in latest; stale still forced below
+                                                    // via pendingOk/revOk/base checks when appropriate.)
+                                                    val stillStaged = try { h1Coord.pendingPublish.get() } catch (_: Exception) { null }
+                                                    if (stillStaged != null &&
+                                                        !(stillStaged.txId == tx.txId && stillStaged.key == tx.key)
+                                                    ) {
+                                                        policyRevisionStale.set(true)
+                                                    }
                                                 } else {
+                                                    // Stage O1 P1#1: orphan drop invalidates ONLY when it
+                                                    // advances beyond what this VM authoritatively observed.
+                                                    // Real drop advances watermark; non-real keeps rev watermark.
+                                                    // m3 (fresh B observed==drop rev) => no stale, write proceeds;
+                                                    // #1 (stale A observed<drop rev) => stale, fail-closed.
                                                     val isReal = try {
                                                         recovered.known || recovered.msg.isNotEmpty()
                                                     } catch (_: Exception) { true }
@@ -7042,6 +7671,13 @@ class DualViewModel(
                                                         lastRevisionSeenTxId.set(recovered.txId)
                                                         lastRevisionSeenKey.set(recovered.key)
                                                         try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                    }
+                                                    val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                                                    if (obs != -1L && recovered.rev != -1L && recovered.rev > obs) {
+                                                        policyRevisionStale.set(true)
+                                                    } else if (obs == -1L) {
+                                                        // Legacy (never observed): preserve pre-O1 fail-closed
+                                                        // (any foreign drop forces re-read).
                                                         policyRevisionStale.set(true)
                                                     }
                                                 }
@@ -7156,6 +7792,16 @@ class DualViewModel(
                     // (no suspension between, cheap).
                     // Stage H1：前置已認領時 abort 須回滾認領（settle 清本地＋
                     // coordinator）＋解鎖，免殘留 fence 卡死後續；未認領走原路。
+                    // Stage O1 extra (QUEUED+pending==null ownerless): a cancel/clear that
+                    // landed between the post-acquire re-check and the save-commit point
+                    // clears pending; remaining QUEUED with null pending is ownerless and
+                    // must return IDLE (not QUEUED), otherwise the phase fence lingers
+                    // with no owner to settle it.
+                    // P3 invariant (locked): ownerless QUEUED->IDLE intentionally does
+                    // NOT markUnknown/bump (cancel is not a failed read — Known stays
+                    // as displayed; staleness is still enforced by the stale/unknown
+                    // gates at the next request/confirm). Non-null pending (replaced by
+                    // a newer request) keeps QUEUED for the new owner to settle.
                     if (_state.value.pendingPolicyWrite != pendingAtCall) {
                         val pc = preClaimTx
                         if (pc != null) {
@@ -7173,11 +7819,20 @@ class DualViewModel(
                             } catch (_: Exception) {
                             }
                         }
+                        val nowPendingNull = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
                         _state.update {
-                            it.copy(
-                                loading = false,
-                                policyWritePhase = PolicyWritePhase.QUEUED,
-                            )
+                            if (nowPendingNull) {
+                                it.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                )
+                            } else {
+                                it.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.QUEUED,
+                                )
+                            }
                         }
                         return@withLock
                     }
@@ -7246,6 +7901,9 @@ class DualViewModel(
                         // 未認領走原路；已認領不 cancel deferred（只取消 await，
                         // 沿用上行 CE 語義，免誤殺供認領句柄——此處為非 CE abort，
                         // deferred 若仍在途則 best effort cancel 僅限未認領）。
+                        // Stage O1 extra (QUEUED+pending==null ownerless): see save-commit point.
+                        // P3 invariant: same as above — IDLE on null pending without
+                        // markUnknown (Known preserved); QUEUED when replaced.
                         if (_state.value.pendingPolicyWrite != pendingAtCall) {
                             val pc = preClaimTx
                             if (pc != null) {
@@ -7265,11 +7923,20 @@ class DualViewModel(
                                     // Best effort.
                                 }
                             }
+                            val nowPendingNull2 = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
                             _state.update {
-                                it.copy(
-                                    loading = false,
-                                    policyWritePhase = PolicyWritePhase.QUEUED,
-                                )
+                                if (nowPendingNull2) {
+                                    it.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    )
+                                } else {
+                                    it.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.QUEUED,
+                                    )
+                                }
                             }
                             return@withLock
                         }
@@ -7670,6 +8337,7 @@ class DualViewModel(
                 }
                 val pcOuterSave = preClaimTx
                 if (pcOuterSave != null && !canJoinTx(pcOuterSave)) {
+                    try { pcOuterSave.ownerAlive.set(false) } catch (_: Exception) { }
                     try { pcOuterSave.deferred.cancel() } catch (_: Exception) { }
                     try { settlePolicyTx(pcOuterSave) } catch (_: Exception) { }
                     try { policyReconciling.remove(pcOuterSave.key) } catch (_: Exception) { }
@@ -7991,6 +8659,14 @@ class DualViewModel(
                         )
                         // Stage L1 P1: atomic pre-IO claim under commitMutex (clear 無 base,
                         // 以 -1L 跳過 revision 檢查，stale 由 pre-IO gate 擋).
+                        // Asymmetry note (save vs clear): save binds a base revision and
+                        // uses the rev-checked claim (completeWithRevisionChecked rejects
+                        // when committedRevision moved mid-IO); clear carries no base so
+                        // it cannot rev-gate here. Safety instead rests on the activeTx-held
+                        // invariant: writeMutex is held AND activeTx==txClear from this
+                        // claim until settle/abort, plus the pre-IO drain below (replayCache
+                        // + pendingPublish + stale) aborts on any foreign revision — a
+                        // concurrent B still forces UNKNOWN_REFRESH, never a blind delete.
                         val clearClaimRes = h1ClearCoord.tryClaimWrite(txClear, -1L)
                         if (clearClaimRes != PolicyTxCoordinator.ClaimWriteResult.CLAIMED) {
                             try {
@@ -8129,9 +8805,22 @@ class DualViewModel(
                                             if (stagedDrainClear != null &&
                                                 !(stagedDrainClear.txId == txClear.txId && stagedDrainClear.key == txClear.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: recover stale foreign
-                                                // placeholder with stronger-than-age proof (see confirm gate).
-                                                // Monotonic System.nanoTime, never wall.
+                                                // Stage O1 P2#3: retire stale real present-in-latest first.
+                                                try {
+                                                    val retired = try {
+                                                        h1ClearCoord.retireStagedRealPresentInLatestLocked(
+                                                            System.nanoTime(),
+                                                            policyIoTimeoutMs,
+                                                        )
+                                                    } catch (_: Exception) { null }
+                                                    if (retired != null) {
+                                                        lastRevisionSeenTxId.set(retired.txId)
+                                                        lastRevisionSeenKey.set(retired.key)
+                                                        try { if (retired.rev != -1L) lastRevisionSeenRev.set(retired.rev) } catch (_: Exception) { }
+                                                    }
+                                                } catch (_: Exception) {
+                                                }
+                                                // Stage M3+N3+O1 P1#1: ANY orphan drop invalidates.
                                                 val recovered = try {
                                                     h1ClearCoord.recoverStalePendingLocked(
                                                         System.nanoTime(),
@@ -8139,7 +8828,12 @@ class DualViewModel(
                                                     )
                                                 } catch (_: Exception) { null }
                                                 if (recovered == null) {
-                                                    policyRevisionStale.set(true)
+                                                    val stillStaged = try { h1ClearCoord.pendingPublish.get() } catch (_: Exception) { null }
+                                                    if (stillStaged != null &&
+                                                        !(stillStaged.txId == txClear.txId && stillStaged.key == txClear.key)
+                                                    ) {
+                                                        policyRevisionStale.set(true)
+                                                    }
                                                 } else {
                                                     val isReal = try {
                                                         recovered.known || recovered.msg.isNotEmpty()
@@ -8148,6 +8842,11 @@ class DualViewModel(
                                                         lastRevisionSeenTxId.set(recovered.txId)
                                                         lastRevisionSeenKey.set(recovered.key)
                                                         try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                    }
+                                                    val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                                                    if (obs != -1L && recovered.rev != -1L && recovered.rev > obs) {
+                                                        policyRevisionStale.set(true)
+                                                    } else if (obs == -1L) {
                                                         policyRevisionStale.set(true)
                                                     }
                                                 }
@@ -8610,6 +9309,7 @@ class DualViewModel(
                 }
                 val pcOuterClear = preClaimTx
                 if (pcOuterClear != null && !canJoinTx(pcOuterClear)) {
+                    try { pcOuterClear.ownerAlive.set(false) } catch (_: Exception) { }
                     try { pcOuterClear.deferred.cancel() } catch (_: Exception) { }
                     try { settlePolicyTx(pcOuterClear) } catch (_: Exception) { }
                     try { policyReconciling.remove(pcOuterClear.key) } catch (_: Exception) { }
@@ -9162,9 +9862,22 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: recover stale foreign
-                                                // placeholder with stronger-than-age proof (see confirm gate).
-                                                // Monotonic System.nanoTime, never wall.
+                                                // Stage O1 P2#3: retire stale real present-in-latest first.
+                                                try {
+                                                    val retired = try {
+                                                        h1RepairCoord.retireStagedRealPresentInLatestLocked(
+                                                            System.nanoTime(),
+                                                            policyIoTimeoutMs,
+                                                        )
+                                                    } catch (_: Exception) { null }
+                                                    if (retired != null) {
+                                                        lastRevisionSeenTxId.set(retired.txId)
+                                                        lastRevisionSeenKey.set(retired.key)
+                                                        try { if (retired.rev != -1L) lastRevisionSeenRev.set(retired.rev) } catch (_: Exception) { }
+                                                    }
+                                                } catch (_: Exception) {
+                                                }
+                                                // Stage M3+N3+O1 P1#1: ANY orphan drop invalidates.
                                                 val recovered = try {
                                                     h1RepairCoord.recoverStalePendingLocked(
                                                         System.nanoTime(),
@@ -9172,7 +9885,12 @@ class DualViewModel(
                                                     )
                                                 } catch (_: Exception) { null }
                                                 if (recovered == null) {
-                                                    policyRevisionStale.set(true)
+                                                    val stillStaged = try { h1RepairCoord.pendingPublish.get() } catch (_: Exception) { null }
+                                                    if (stillStaged != null &&
+                                                        !(stillStaged.txId == tx.txId && stillStaged.key == tx.key)
+                                                    ) {
+                                                        policyRevisionStale.set(true)
+                                                    }
                                                 } else {
                                                     val isReal = try {
                                                         recovered.known || recovered.msg.isNotEmpty()
@@ -9181,6 +9899,11 @@ class DualViewModel(
                                                         lastRevisionSeenTxId.set(recovered.txId)
                                                         lastRevisionSeenKey.set(recovered.key)
                                                         try { if (recovered.rev != -1L) lastRevisionSeenRev.set(recovered.rev) } catch (_: Exception) { }
+                                                    }
+                                                    val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                                                    if (obs != -1L && recovered.rev != -1L && recovered.rev > obs) {
+                                                        policyRevisionStale.set(true)
+                                                    } else if (obs == -1L) {
                                                         policyRevisionStale.set(true)
                                                     }
                                                 }
@@ -9263,6 +9986,11 @@ class DualViewModel(
                         // Stage N1 P1: same as pre-read — use loadForRepair(), not
                         // plain loadResult() (poisoned same-instance would read
                         // Unavailable and abort a still-Corrupt repair).
+                        // P1-1: sample the authoritative revision BEFORE the final
+                        // revalidation IO + delete IO below. If a concurrent B
+                        // commits mid-IO, the success below must be discarded
+                        // (stay Unknown, no mark/disarm/stale-wash — fail closed).
+                        val repairRevBefore = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
                         val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadForRepair() }
                         val finalRead: LoadResult = try {
                             withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { finalJob.await() }
@@ -9404,19 +10132,78 @@ class DualViewModel(
                             return@withLock
                         }
                         if (ok) {
+                            // P1-1 atomic: rev re-check merged into the SAME commitMutex
+                            // critical section as the placeholder claim (no lock-free
+                            // revMoved window). completeWithRevisionChecked rejects
+                            // when committedRevision != repairRevBefore (concurrent B
+                            // landed mid-IO), so a stale Known(empty) can never be
+                            // published over unseen B. Post-claim rev re-read below
+                            // is only for branching the failure path (stale discard
+                            // vs CAS-loser), not for correctness.
                             // Success: repairCorrupt verified Known(empty) via its
                             // authoritative post-read. Fenced publish (placeholder
                             // claim → bump → REPAIRED → emit → settle), same order
                             // as save/clear fast-path.
                             val pcFast = preClaimTx
-                            if (pcFast != null && !claimForPublish(pcFast)) {
-                                try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
-                                preClaimTx = null
-                                if (writeLocked) {
-                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                    writeLocked = false
+                            if (pcFast != null) {
+                                val coordR = policyTxCoordinator
+                                val claimedRepair: Boolean = if (coordR != null) {
+                                    try {
+                                        val ph = PolicySettled(
+                                            pcFast.txId, pcFast.key, pcFast.sanitized,
+                                            false, MsgKind.CHANNEL, "", pcFast.isClear,
+                                        )
+                                        val wasClaimed = coordR.completeWithRevisionChecked(pcFast, ph, repairRevBefore)
+                                        if (wasClaimed) {
+                                            try { afterClaimBeforeEmit?.invoke() } catch (_: Exception) { }
+                                        }
+                                        wasClaimed
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                } else {
+                                    claimForPublish(pcFast)
                                 }
-                                return@withLock
+                                if (!claimedRepair) {
+                                    val revNow = try { coordR?.currentRevision() ?: repairRevBefore } catch (_: Exception) { repairRevBefore }
+                                    val revRejected = repairRevBefore != -1L && revNow != repairRevBefore
+                                    if (revRejected) {
+                                        // Stale read (rev advanced mid-IO): discard, settle
+                                        // the claim (no fence leak), unlock, stay Unknown
+                                        // with Corrupt retained, no disarm/mark/stale-wash,
+                                        // no emit (fail closed, never display borrowed base).
+                                        val pcStale = preClaimTx
+                                        if (pcStale != null) {
+                                            try { settlePolicyTx(pcStale) } catch (_: Exception) { }
+                                            preClaimTx = null
+                                        }
+                                        if (writeLocked) {
+                                            try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                            writeLocked = false
+                                        }
+                                        try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                        _state.update {
+                                            it.copy(
+                                                loading = false,
+                                                policyDraftKnown = false,
+                                                policyDraftCorrupt = true,
+                                                policyWritePhase = PolicyWritePhase.IDLE,
+                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                                msgKind = MsgKind.CHANNEL,
+                                            )
+                                        }
+                                        return@withLock
+                                    }
+                                    try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                        writeLocked = false
+                                    }
+                                    return@withLock
+                                }
                             }
                             policyDraftVersion.incrementAndGet()
                             policyFreshnessGen.incrementAndGet()
@@ -9424,6 +10211,8 @@ class DualViewModel(
                             disarmBlindClear()
                             disarmCorruptRepair()
                             policyRevisionStale.set(false)
+                            // Stage O1 P1#1: authoritative success => observed.
+                            markObservedKnown()
                             _state.update {
                                 it.copy(
                                     loading = false,
@@ -9503,8 +10292,13 @@ class DualViewModel(
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                 }
+                // Stage O1 extra (repair cancel must not wash Corrupt): pre-start
+                // (PREPARING) abort of a repair Tx retains Corrupt=true (still
+                // damaged, fail-closed) instead of downgrading to Unavailable.
+                // Owner revokes its own unstarted LAZY; late attachers see abandoned.
                 val pcOuterRepair = preClaimTx
                 if (pcOuterRepair != null && !canJoinTx(pcOuterRepair)) {
+                    try { pcOuterRepair.ownerAlive.set(false) } catch (_: Exception) { }
                     try { pcOuterRepair.deferred.cancel() } catch (_: Exception) { }
                     try { settlePolicyTx(pcOuterRepair) } catch (_: Exception) { }
                     try { policyReconciling.remove(pcOuterRepair.key) } catch (_: Exception) { }
@@ -9516,7 +10310,7 @@ class DualViewModel(
                             policyWritePhase = PolicyWritePhase.IDLE,
                             policyEpoch = policyPhaseEpoch.incrementAndGet(),
                             policyDraftKnown = false,
-                            policyDraftCorrupt = false,
+                            policyDraftCorrupt = true,
                             msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                             msgKind = MsgKind.CHANNEL,
                         )
