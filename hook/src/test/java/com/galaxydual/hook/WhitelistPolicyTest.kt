@@ -170,7 +170,7 @@ class WhitelistPolicyTest {
     @Test
     fun describeFormatsSignature() {
         val m = String::class.java.getMethod("length")
-        assertEquals("java.lang.String#length()", WhitelistPolicy.describe(m))
+        assertEquals("String#length()", WhitelistPolicy.describe(m))
     }
 
     @Test
@@ -568,7 +568,7 @@ class WhitelistPolicyTest {
         val first = WhitelistPolicy.describe(m)
         val second = WhitelistPolicy.describe(m)
         assertEquals(first, second)
-        assertEquals("java.lang.String#length()", first)
+        assertEquals("String#length()", first)
     }
 
     // Phase 4:hostile extra（迭代即拋）不得越過邊界：第二段 addAll 與第一段

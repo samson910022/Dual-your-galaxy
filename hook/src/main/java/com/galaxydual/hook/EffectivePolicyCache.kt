@@ -70,6 +70,13 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // stale leader never clears a successor) and by invalidate().
     private var inFlightGen: Long? = null
 
+    // Follower grace (Phase3 herd fix): a follower that arrives while a leader
+    // read is in flight sleeps briefly outside the lock, then re-checks for a
+    // committed value before falling back to seed-only. This collapses a herd
+    // onto the leader's result instead of returning permanent seed-only.
+    // Fail-closed in all cases (seed-only fallback, never stale).
+    private val followerGraceMs = 50L
+
     fun get(
         seed: Set<String>,
         nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
@@ -82,8 +89,17 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         // Phase 4: lock only for state check + generation snapshot. The
         // reader() IPC/sanitize runs OUTSIDE the lock (hot-path fix: every
         // whitelist query previously held the lock across binder IPC).
-        val now0 = nowMs()
+        // nowMs() throwing fails closed to cached/seed (no clock, no retry).
+        val now0: Long = try {
+            nowMs()
+        } catch (_: Throwable) {
+            synchronized(lock) {
+                return if (valid) cached.toSet()
+                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+            }
+        }
         val gen0: Long
+        var isFollower = false
         synchronized(lock) {
             // TTL expiry: fail closed to the seed on the next read (invalidated
             // true), so a stale cached value is never resurrected after expiry.
@@ -102,21 +118,86 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
             // Stage C single-flight claim: a second concurrent miss becomes a
-            // follower and returns without calling reader (valid snapshot if
-            // a peer already committed, else seed-only). Only the leader
-            // proceeds to the IO below.
+            // follower. Phase3: followers do NOT return seed-only immediately;
+            // they take the grace path below (sleep outside the lock, then
+            // re-check valid) so a just-committed leader value is observed.
+            // Only the leader proceeds to the IO below.
             if (inFlightGen != null) {
-                return if (valid) cached.toSet()
-                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                // Re-check valid under the same guard before leaving (a peer
+                // may have committed between the valid check above and here).
+                if (valid) return cached.toSet()
+                isFollower = true
+                // Fall through to the grace wait outside the lock.
+                // gen0 unused for followers; assign a placeholder to satisfy
+                // definite assignment (never read on this path).
+                gen0 = -1L
+            } else {
+                inFlightGen = generation
+                gen0 = generation
             }
-            inFlightGen = generation
-            gen0 = generation
+        }
+        if (isFollower) {
+            // OUTSIDE lock: brief grace so the in-flight leader can commit.
+            // Never holds the lock across the sleep (the leader needs it).
+            // No wait/notify: followers sleep then re-check valid (handles
+            // spurious wakeups by design — there is no wait to wake early
+            // from). The leader's former notifyAll was dead (nobody waits)
+            // and is removed; followers never block the leader.
+            try {
+                Thread.sleep(followerGraceMs)
+            } catch (t: Throwable) {
+                if (t is InterruptedException) try {
+                    Thread.currentThread().interrupt()
+                } catch (_: Throwable) {
+                }
+            }
+            synchronized(lock) {
+                // Re-check after grace: leader may have committed a good value.
+                if (valid) return cached.toSet()
+                return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+            }
         }
         // OUTSIDE lock: fallible IO + merge (sanitize may traverse hostile input).
+        // Phase3: gate contention (PolicyRefreshContentionException) is NOT a
+        // failed read — it returns seed-only WITHOUT refreshing failureCooldown
+        // (no cooldown renewal, so the next query retries immediately instead
+        // of being throttled another 5s by a herd collision).
+        var wasContention = false
         val remote: Set<String>? = try {
             reader()
-        } catch (_: Throwable) {
+        } catch (e: PolicyRefreshContentionException) {
+            wasContention = true
             null
+        } catch (t: Throwable) {
+            // Reader Error (including AssertionError) / Exception / interrupt:
+            // failed read (not cached); cooldown applies below. Restore the
+            // interrupt bit so callers can observe cancellation.
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
+            null
+        }
+        // Contention short-circuits before merge: no failureCooldown update.
+        if (wasContention) {
+            synchronized(lock) {
+                try {
+                    // A peer may have committed while we were in IO; prefer it.
+                    if (valid) return cached.toSet()
+                    // Loser-drop still applies: an invalidate during IO means
+                    // seed-only (never resurrect stale).
+                    if (gen0 != generation) {
+                        return if (valid) cached.toSet()
+                        else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                    }
+                    return if (hadGoodValue && !invalidated) cached.toSet()
+                    else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                } finally {
+                    if (inFlightGen == gen0) {
+                        inFlightGen = null
+                    }
+                }
+            }
         }
         var merged: Set<String>? = null
         var mergeOk = false
@@ -129,7 +210,11 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 mergeOk = false
             }
         }
-        val now1 = nowMs()
+        val now1: Long = try {
+            nowMs()
+        } catch (_: Throwable) {
+            now0
+        }
         synchronized(lock) {
             try {
                 // Loser discards: invalidated while IO was in flight, or a peer
@@ -163,7 +248,10 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 // Stage C: release the single-flight claim, but only if it is
                 // still ours -- an invalidate() (which clears inFlightGen) or
                 // a successor leader must never be cleared by a stale leader.
-                if (inFlightGen == gen0) inFlightGen = null
+                // No notifyAll: followers use timed sleep + re-check, never wait().
+                if (inFlightGen == gen0) {
+                    inFlightGen = null
+                }
             }
         }
     }
@@ -180,6 +268,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         // Stage C: release any in-flight single-flight claim so the next miss
         // elects a fresh leader under the new generation (the stale leader
         // discards via the gen0 != generation loser-drop above).
+        // No notifyAll: followers never wait(), they sleep + re-check.
         inFlightGen = null
         generation++
     }

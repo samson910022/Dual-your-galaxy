@@ -50,7 +50,7 @@ class HookInstallerCallerTest {
         assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
         host.events.forEach { assertSame(callee, it.second) }
         assertEquals(
-            listOf("deoptimized java.lang.String#length()->int", "hooked java.lang.String#length()->int"),
+            listOf("deoptimized String#length()->int", "hooked String#length()->int"),
             host.logs,
         )
     }
@@ -72,8 +72,8 @@ class HookInstallerCallerTest {
             listOf(
                 "deoptimized caller [$id] ${sig(callerA)}",
                 "deoptimized caller [$id] ${sig(callerB)}",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
             ),
             host.logs,
         )
@@ -89,8 +89,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimize caller [$id] returned false ${sig(caller)} (hook proceeds, effect unverified)",
-                "deoptimize returned false java.lang.String#length()->int (hook proceeds, effect unverified)",
-                "hooked java.lang.String#length()->int",
+                "deoptimize returned false String#length()->int (hook proceeds, effect unverified)",
+                "hooked String#length()->int",
                 incompleteSummary(id, callee, 0, 1),
             ),
             host.logs,
@@ -108,9 +108,9 @@ class HookInstallerCallerTest {
         assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertEquals(
             listOf(
-                "deoptimize caller [$id] failed ${sig(caller)}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimize caller [$id] failed ${sig(caller)}: AssertionError: art unavailable; hook proceeds, effect unverified",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
                 incompleteSummary(id, callee, 0, 1),
             ),
             host.logs,
@@ -167,7 +167,7 @@ class HookInstallerCallerTest {
         assertSame(callee, host.events[2].second)
         assertEquals(listOf(id), host.ids)
         assertEquals(3, host.logs.size)
-        assertEquals("hook failed java.lang.String#length()->int: java.lang.Error: install error", host.logs.last())
+        assertEquals("hook failed String#length()->int: Error: install error", host.logs.last())
     }
 
     @Test
@@ -189,8 +189,8 @@ class HookInstallerCallerTest {
         assertEquals(listOf(id), host.ids)
         // Caller + callee deopt attempts logged (each "returned false"),
         // then hook-failure diagnostic from install(); no incomplete summary.
-        assertTrue(host.logs.any { it == "hook failed java.lang.String#length()->int: java.lang.Error: install error" })
-        assertEquals("hook failed java.lang.String#length()->int: java.lang.Error: install error", host.logs.last())
+        assertTrue(host.logs.any { it == "hook failed String#length()->int: Error: install error" })
+        assertEquals("hook failed String#length()->int: Error: install error", host.logs.last())
         assertFalse(host.logs.any { it.startsWith("caller deopt incomplete") })
         assertFalse(host.logs.any {
             it.contains("not needed", ignoreCase = true) ||
@@ -214,8 +214,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimized caller [$id] ${sig(caller)}",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
             ),
             host.logs,
         )
@@ -239,8 +239,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimize caller [$id] returned false ${sig(caller)} (hook proceeds, effect unverified)",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
                 incompleteSummary(id, callee, 0, 1),
             ),
             host.logs,
@@ -264,9 +264,9 @@ class HookInstallerCallerTest {
         assertEquals(listOf(id), host.ids)
         assertEquals(
             listOf(
-                "deoptimize caller [$id] failed ${sig(caller)}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimize caller [$id] failed ${sig(caller)}: AssertionError: art unavailable; hook proceeds, effect unverified",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
                 incompleteSummary(id, callee, 0, 1),
             ),
             host.logs,
@@ -320,10 +320,10 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimize caller [$id] returned false ${sig(first)} (hook proceeds, effect unverified)",
-                "deoptimize caller [$id] failed ${sig(second)}: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
+                "deoptimize caller [$id] failed ${sig(second)}: AssertionError: art unavailable; hook proceeds, effect unverified",
                 "deoptimized caller [$id] ${sig(third)}",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
                 incompleteSummary(id, callee, 1, 3),
             ),
             host.logs,
@@ -342,8 +342,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimized caller [$id] ${sig(caller)}",
-                "deoptimize returned false java.lang.String#length()->int (hook proceeds, effect unverified)",
-                "hooked java.lang.String#length()->int",
+                "deoptimize returned false String#length()->int (hook proceeds, effect unverified)",
+                "hooked String#length()->int",
             ),
             host.logs,
         )
@@ -361,8 +361,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimized caller [$id] ${sig(caller)}",
-                "deoptimize failed java.lang.String#length()->int: java.lang.AssertionError: art unavailable; hook proceeds, effect unverified",
-                "hooked java.lang.String#length()->int",
+                "deoptimize failed String#length()->int: AssertionError: art unavailable; hook proceeds, effect unverified",
+                "hooked String#length()->int",
             ),
             host.logs,
         )
@@ -424,7 +424,7 @@ class HookInstallerCallerTest {
         val host = Host(deopt = { target -> if (target == caller) throw RuntimeException() else true })
         assertTrue(host.installWithCallers(callee, listOf(caller), id))
         assertTrue(host.logs.any {
-            it == "deoptimize caller [$id] failed ${sig(caller)}: java.lang.RuntimeException; hook proceeds, effect unverified"
+            it == "deoptimize caller [$id] failed ${sig(caller)}: RuntimeException; hook proceeds, effect unverified"
         })
         assertFalse(host.logs.any { it.contains("null") && it.contains("failed") })
     }
@@ -444,8 +444,8 @@ class HookInstallerCallerTest {
         assertEquals(
             listOf(
                 "deoptimized caller [$id] ${sig(ctor)}",
-                "deoptimized java.lang.String#length()->int",
-                "hooked java.lang.String#length()->int",
+                "deoptimized String#length()->int",
+                "hooked String#length()->int",
             ),
             host.logs,
         )
@@ -472,11 +472,11 @@ class HookInstallerCallerTest {
         host.events.forEach { assertSame(callee, it.second) }
         assertEquals(listOf(id), host.ids)
         assertEquals(
-            "caller plan failed [$id] ${sig(callee)}: java.lang.RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
+            "caller plan failed [$id] ${sig(callee)}: RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
             host.logs.first(),
         )
-        assertEquals("deoptimized java.lang.String#length()->int", host.logs[1])
-        assertEquals("hooked java.lang.String#length()->int", host.logs[2])
+        assertEquals("deoptimized String#length()->int", host.logs[1])
+        assertEquals("hooked String#length()->int", host.logs[2])
         assertEquals(3, host.logs.size)
         assertFalse(host.logs.any {
             it.contains("not needed", ignoreCase = true) ||
@@ -494,7 +494,7 @@ class HookInstallerCallerTest {
         assertEquals(listOf("deoptimize", "hook"), host.events.map { it.first })
         assertEquals(listOf(id), host.ids)
         assertTrue(host.logs.any {
-            it == "caller plan failed [$id] ${sig(callee)}: java.lang.RuntimeException; falling back to callee-only hook, effect unverified"
+            it == "caller plan failed [$id] ${sig(callee)}: RuntimeException; falling back to callee-only hook, effect unverified"
         })
         assertTrue(host.logs.last().startsWith("hooked "))
         assertFalse(host.logs.any { it.contains("null") && it.contains("caller plan failed") })
@@ -510,10 +510,10 @@ class HookInstallerCallerTest {
         host.events.forEach { assertSame(callee, it.second) }
         assertEquals(listOf(id), host.ids)
         assertEquals(
-            "caller plan failed [$id] ${sig(callee)}: java.lang.RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
+            "caller plan failed [$id] ${sig(callee)}: RuntimeException: resolver boom; falling back to callee-only hook, effect unverified",
             host.logs[0],
         )
-        assertEquals("hook failed java.lang.String#length()->int: java.lang.Error: install error", host.logs.last())
+        assertEquals("hook failed String#length()->int: Error: install error", host.logs.last())
         assertFalse(host.logs.any { it.startsWith("caller deopt incomplete") })
         assertFalse(host.logs.any {
             it.contains("not needed", ignoreCase = true) ||
@@ -544,8 +544,8 @@ class HookInstallerCallerTest {
         val implSig = sig(impl)
         val bridgeSig = sig(bridge)
         assertFalse("bridge and impl signatures must differ", implSig == bridgeSig)
-        assertTrue("impl should include String return type: $implSig", implSig.endsWith("->java.lang.String"))
-        assertTrue("bridge should include Object return type: $bridgeSig", bridgeSig.endsWith("->java.lang.Object"))
+        assertTrue("impl should include String return type: $implSig", implSig.endsWith("->String"))
+        assertTrue("bridge should include Object return type: $bridgeSig", bridgeSig.endsWith("->Object"))
     }
 
     @Test

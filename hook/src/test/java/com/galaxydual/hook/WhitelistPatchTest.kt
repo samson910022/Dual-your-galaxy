@@ -137,7 +137,10 @@ class WhitelistPatchTest {
         val out = WhitelistPatch.apply(null, true, setOf("b"), "MY_FIELD", "com.foo.Bar")
         val reason = (out as WhitelistPatch.Outcome.Skipped).reason
         assertTrue(reason.contains("MY_FIELD"))
-        assertTrue(reason.contains("com.foo.Bar"))
+        // Desensitized: only the short simple name is logged, never the
+        // package-qualified name.
+        assertTrue(reason.contains("Bar"))
+        assertTrue(!reason.contains("com.foo.Bar"))
     }
 
     // Simulates a hostile custom list: lands the element, then throws on the

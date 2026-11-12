@@ -8,10 +8,35 @@ import java.lang.reflect.Method
 // Framework-free orchestration; the caller supplies the actual framework operations.
 internal object HookInstaller {
     internal fun executableSignature(e: Executable): String {
-        val name = if (e is Constructor<*>) "<init>" else e.name
-        val params = e.parameterTypes.joinToString(",") { it.typeName }
-        val base = "${e.declaringClass.name}#$name($params)"
-        return if (e is Method) "$base->${e.returnType.typeName}" else base
+        // Short names only (no package qualification) + fail-closed: diagnostics
+        // must never leak ROM package structure or throw on hostile reflection.
+        val name = try {
+            if (e is Constructor<*>) "<init>" else e.name
+        } catch (_: Throwable) {
+            "unknown"
+        }
+        val params = try {
+            e.parameterTypes.joinToString(",") { HookLog.shortName(it.typeName) }
+        } catch (_: Throwable) {
+            ""
+        }
+        val owner = try {
+            HookLog.shortClass(e.declaringClass)
+        } catch (_: Throwable) {
+            "Class"
+        }
+        val base = "$owner#$name($params)".take(200)
+        return try {
+            if (e is Method) "$base->${HookLog.shortName(e.returnType.typeName)}".take(200) else base
+        } catch (_: Throwable) {
+            base
+        }
+    }
+
+    private fun shortFailure(t: Throwable): String {
+        val ex = HookLog.shortEx(t)
+        val msg = HookLog.shortMsg(t)
+        return if (msg.isNotEmpty()) "$ex: $msg" else ex
     }
 
     private inline fun safeLog(log: (String) -> Unit, message: String) {
@@ -44,7 +69,7 @@ internal object HookInstaller {
                 safeLog(
                     log,
                     "deoptimize failed ${executableSignature(method)}: " +
-                        "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                        "${shortFailure(t)}; " +
                         "hook proceeds, effect unverified",
                 )
             }
@@ -55,7 +80,7 @@ internal object HookInstaller {
             safeLog(
                 log,
                 "hook failed ${executableSignature(method)}: " +
-                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}",
+                    shortFailure(t),
             )
             return false
         }
@@ -86,7 +111,7 @@ internal object HookInstaller {
             safeLog(
                 log,
                 "caller plan failed [$hookId] ${executableSignature(callee)}: " +
-                    "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                    "${shortFailure(t)}; " +
                     "falling back to callee-only hook, effect unverified",
             )
             return install(callee, hookId, deoptimize, hook, log)
@@ -110,7 +135,7 @@ internal object HookInstaller {
                 safeLog(
                     log,
                     "deoptimize caller [$hookId] failed $sig: " +
-                        "${t::class.java.name}${if (t.message != null) ": ${t.message}" else ""}; " +
+                        "${shortFailure(t)}; " +
                         "hook proceeds, effect unverified",
                 )
             }

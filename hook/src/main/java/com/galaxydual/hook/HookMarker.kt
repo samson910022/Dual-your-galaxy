@@ -143,7 +143,7 @@ object HookMarker {
             safeLog(onLog, "marker write failed: primary and fallback unwritable")
             return false
         } catch (t: Throwable) {
-            safeLog(onLog, "marker write failed: ${t.message}")
+            safeLog(onLog, "marker write failed: ${HookLog.shortEx(t)}: ${HookLog.shortMsg(t)}")
             return false
         }
     }
@@ -175,7 +175,7 @@ object HookMarker {
         return try {
             if (!file.isFile) null else file.readText()
         } catch (e: Exception) {
-            safeLog(onLog, "marker $which read failed, ignoring: ${e.message}")
+            safeLog(onLog, "marker $which read failed, ignoring: ${HookLog.shortEx(e)}: ${HookLog.shortMsg(e)}")
             null
         }
     }

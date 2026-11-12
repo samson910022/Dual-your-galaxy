@@ -38,16 +38,35 @@ class RemoteCapabilityLatch(
         lastFalseMs = null
     }
 
+    // Throttled: high-frequency false reports within the cooldown do NOT
+    // extend the window (fixed cooldown from the first false). Without this
+    // a hot-path false storm would keep pushing lastFalseMs forward and
+    // shouldProbe() would never go true again. Effective false retry stays
+    // max(60s TTL, 5s latch) — see class docs.
     fun reportFalse() {
         if (latchedTrue) return
-        lastFalseMs = nowMs()
+        try {
+            val now = nowMs()
+            val last = lastFalseMs
+            if (last != null && now - last < cooldownMs) return
+            lastFalseMs = now
+        } catch (_: Throwable) {
+            // Clock broken: fail-closed without touching latch state.
+        }
     }
 
     // Test seam: report false at an explicit timestamp (avoids clock injection
-    // ordering issues in tests).
+    // ordering issues in tests). Same throttling as reportFalse(): a report
+    // inside the cooldown window is ignored so throw-storm throttling via
+    // reportFalseAt(now) cannot slide the window forever.
     fun reportFalseAt(ms: Long) {
         if (latchedTrue) return
-        lastFalseMs = ms
+        try {
+            val last = lastFalseMs
+            if (last != null && ms - last < cooldownMs) return
+            lastFalseMs = ms
+        } catch (_: Throwable) {
+        }
     }
 
     fun onInvalidate() {
@@ -58,9 +77,16 @@ class RemoteCapabilityLatch(
     }
 
     fun shouldProbe(): Boolean {
+        // Fast path: latched true never re-probes (no clock call); no prior
+        // false also probes immediately (no clock call).
         if (latchedTrue) return false
         val last = lastFalseMs ?: return true
-        return nowMs() - last >= cooldownMs
+        return try {
+            nowMs() - last >= cooldownMs
+        } catch (_: Throwable) {
+            // Clock broken: fail-closed to no-probe (observe-only cached value).
+            false
+        }
     }
 
     companion object {

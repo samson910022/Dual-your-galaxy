@@ -170,6 +170,10 @@ object PolicySource {
         if (out.isNotEmpty() && !nonEmptyPolicyGateOpen) return emptySet()
         // Enforce a single global cap on the merged set (seed + remote), so a
         // hostile split between the two sides cannot double the bound.
+        // Truncation is seed-priority by intent: seed entries were added first
+        // so LinkedHashSet iteration keeps them ahead of remote entries; the
+        // first MAX_POLICY_ENTRIES survivors are therefore seed-first. This is
+        // fail-closed (never shrinks the seed to make room for remote).
         if (out.size > MAX_POLICY_ENTRIES) {
             val truncated = LinkedHashSet<String>(MAX_POLICY_ENTRIES)
             out.take(MAX_POLICY_ENTRIES).forEach { truncated.add(it) }
