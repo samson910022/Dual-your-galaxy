@@ -8458,4 +8458,113 @@ class PolicyWriteTest {
             }
         }
     }
+
+    // Stage N3 P1#3: stalled B aged-out, C settles, B resumes rejected.
+    // B placeholder staged rev1 (save-blocked, deferred running = in-flight,
+    // gate must NOT drop) -> owner completes (deferred done) + monotonic age
+    // -> C gate drops placeholder (tombstone, no _latest touch) -> C settles
+    // rev2 (latest=C, backend=C) -> B resumes stageRealPayload/emitStaged ->
+    // REJECTED (tombstoned, superseded++, no _latest touch, no B event).
+    @Test
+    fun n3_stalledB_ageOut_Csettles_Bresumes_rejected() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val fake = FakePolicyStore()
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+
+            // B: save-blocked placeholder staged rev1 (deferred running).
+            val deferredB = kotlinx.coroutines.CompletableDeferred<Boolean>()
+            val txB = DualViewModel.PolicyTx(
+                coord.nextTxId(), "policy-test-B",
+                deferredB, setOf("com.B"), fake.store, false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
+            )
+            coord.activeTx.set(txB)
+            assertTrue(
+                coord.completeWithRevision(
+                    txB,
+                    PolicySettled(txB.txId, txB.key, setOf("com.B"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val rev1 = coord.committedRevision.get()
+            assertEquals(1L, rev1)
+            assertNotNull(coord.pendingPublish.get())
+            assertFalse(deferredB.isCompleted)
+            assertNull(coord.latest.value)
+
+            // In-flight (owner running) must NOT drop even when aged.
+            Thread.sleep(100)
+            assertNull(coord.tryRecoverStalePending(System.nanoTime(), 50))
+            assertNotNull(coord.pendingPublish.get())
+            assertFalse(coord.isTombstoned(txB.txId, txB.key))
+
+            // Owner completes (save finished, should have staged real payload
+            // but died before it) + age -> C gate drops placeholder.
+            assertTrue(deferredB.complete(true))
+            val dropped = coord.tryRecoverStalePending(System.nanoTime(), 50)
+            assertNotNull(dropped)
+            assertEquals(txB.txId, dropped!!.txId)
+            assertEquals(txB.key, dropped.key)
+            assertNull(coord.pendingPublish.get())
+            assertTrue(coord.isTombstoned(txB.txId, txB.key))
+            assertNull(coord.latest.value)
+            assertNull(coord.activeTx.get())
+
+            // C settles rev2: claim + stage real + emit (latest=C, backend=C).
+            val txC = DualViewModel.PolicyTx(
+                coord.nextTxId(), "policy-test-C",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.C"), fake.store, false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
+            )
+            coord.activeTx.set(txC)
+            assertTrue(
+                coord.completeWithRevision(
+                    txC,
+                    PolicySettled(txC.txId, txC.key, setOf("com.C"), false, MsgKind.CHANNEL, "", false),
+                ),
+            )
+            val rev2 = coord.committedRevision.get()
+            assertEquals(2L, rev2)
+            val realC = PolicySettled(txC.txId, txC.key, setOf("com.C"), true, MsgKind.INFO, "mC", false)
+            val stagedC = coord.stageRealPayload(realC)
+            assertNotNull(stagedC)
+            assertEquals(rev2, stagedC!!.rev)
+            coord.emitStaged(stagedC)
+            backend.set(setOf("com.C"))
+            assertEquals(setOf("com.C"), coord.latest.value?.draft)
+            assertTrue(coord.latest.value?.known == true)
+            assertEquals(rev2, coord.latest.value?.rev)
+            val latestBeforeB = coord.latest.value
+            val supersededBeforeB = coord.emitSuperseded.get()
+
+            // B resumes late: stage + emit must be REJECTED (tombstoned).
+            val realB = PolicySettled(txB.txId, txB.key, setOf("com.B"), true, MsgKind.INFO, "mB", false)
+            assertNull(coord.stageRealPayload(realB))
+            coord.emitStaged(realB.copy(rev = rev1))
+            coord.emitStaged(realB)
+
+            // No _latest touch, superseded bumped, latest still Known(C).
+            assertTrue(coord.emitSuperseded.get() > supersededBeforeB)
+            assertSame(latestBeforeB, coord.latest.value)
+            assertEquals(setOf("com.C"), coord.latest.value?.draft)
+            assertTrue(coord.latest.value?.known == true)
+            assertEquals(rev2, coord.latest.value?.rev)
+            assertEquals(setOf("com.C"), backend.get())
+            // No B event in replay/settled.
+            assertTrue(coord.settled.replayCache.none { it.txId == txB.txId && it.key == txB.key })
+            assertNull(coord.awaitSettled(txB.txId, txB.key, 300))
+            // C event present.
+            val gotC = coord.awaitSettled(txC.txId, txC.key, 2_000)
+            assertNotNull(gotC)
+            assertEquals(setOf("com.C"), gotC!!.draft)
+            assertTrue(gotC.known)
+            assertNull(coord.activeTx.get())
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

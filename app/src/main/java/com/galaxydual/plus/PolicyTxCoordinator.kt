@@ -98,7 +98,21 @@ class PolicyTxCoordinator {
     // critical section); read under the same lock by pre-IO gates. 0 = never
     // staged (legacy / cleared). System.currentTimeMillis matches the VM-side
     // recovery clock (same source, no injectable skew).
+    // Stage N3 P1#3: wall clock retained for compat/logging only; age decisions
+    // use monotonic pendingPublishAtNanos (System.nanoTime, immune to wall
+    // backwards jumps). Backwards nanos (now < staged) => not stale.
     val pendingPublishAtMs = AtomicLong(0L)
+    val pendingPublishAtNanos = AtomicLong(0L)
+    // Stage N3 P1#3: originating-claim owner for stronger-than-age death proof.
+    // Set atomically with pendingPublish in completeWithRevision; cleared when
+    // pending is emitted/cleared/dropped. Lets recover distinguish in-flight
+    // save (deferred running) from dead/suspended owner (deferred done).
+    val pendingOwner = AtomicReference<DualViewModel.PolicyTx?>(null)
+    // Stage N3 P1#3: identity/revision tombstone for dropped placeholders.
+    // Key "$txId:$key" -> rev. Persisted after placeholder drop so a late
+    // resumer with the same identity is rejected in stage/emit even when
+    // pending is null (never borrow current rev). Cleared only by resetForTest.
+    val claimTombstones = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Stage L3 lossless 真相：永為最新終態（無逐出，晚訂閱收斂最新；gap 經 rev
     // 檢出）。僅終態（real）寫入，placeholder（claim fence）不寫入，免 Unknown
@@ -116,6 +130,15 @@ class PolicyTxCoordinator {
             System.err.println("[PolicyTxCoordinator] $msg")
         } catch (_: Exception) {
         }
+    }
+
+    // Stage N3 P1#3: tombstone key helper (exact originating-claim identity).
+    internal fun tombstoneKey(txId: Long, key: String): String = "${txId}:${key}"
+
+    internal fun isTombstoned(txId: Long, key: String): Boolean = try {
+        claimTombstones.containsKey(tombstoneKey(txId, key))
+    } catch (_: Exception) {
+        false
     }
 
     fun currentRevision(): Long = try {
@@ -145,6 +168,9 @@ class PolicyTxCoordinator {
                     pendingPublish.set(stamped)
                     // Stage M3: stamp fence time with the payload (same lock).
                     try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
+                    // Stage N3 P1#3: monotonic fence time + originating-claim owner.
+                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
+                    try { pendingOwner.set(tx) } catch (_: Exception) { }
                     ok = true
                 }
             } catch (_: Exception) {
@@ -154,77 +180,155 @@ class PolicyTxCoordinator {
         return ok
     }
 
-    // Stage M3 (P2#5 orphan fence): coordinator-scoped finalizer. If pending
-    // belongs to a dead owner (activeTx is null or holds a different Tx) and its
-    // age exceeds staleThresholdMs, promote-or-clear atomically:
-    // - real terminal (known or non-empty msg) -> publish to _latest (monotonic)
-    //   then clear pending (lossless, followers converge via _latest);
-    // - placeholder fence (Unknown + empty msg, claim-only, never terminal) ->
-    //   drop without touching _latest (no truth lost, rev gap is counted).
-    // Returns the recovered payload, or null when nothing stale (in-flight fresh
-    // fence, owner still active, or no pending). Caller holds commitMutex
-    // (pre-IO gates call this inside withCommitLock); suspend wrapper below
-    // acquires the lock for out-of-gate callers/tests.
-    fun recoverStalePendingLocked(nowMs: Long, staleThresholdMs: Long): PolicySettled? {
+    // Stage M3 (P2#5 orphan fence) + N3 P1#3 hardening: coordinator-scoped
+    // finalizer for PLACEHOLDERS ONLY. Never infer death from age alone and
+    // never promote real payloads based on age.
+    // Drop requires ALL of (stronger-than-age owner-gone proof):
+    // - pending is a placeholder fence (Unknown + empty msg, never terminal);
+    //   real terminal payloads are NEVER touched here (return null, owner must
+    //   stage/emit via exact-identity stageRealPayload);
+    // - owner not active in coordinator (activeTx null or different identity);
+    // - monotonic age >= threshold (System.nanoTime; backwards now<staged => keep);
+    // - recorded owner deferred done (isCompleted || isCancelled) when owner is
+    //   known — proves the save IO finished and the owner should have proceeded
+    //   to stageRealPayload; a still-running save (deferred incomplete) is
+    //   in-flight, never orphan. Unknown owner (legacy) falls back to
+    //   age+placeholder+inactive (logged).
+    // On drop: persist identity/revision tombstone (txId:key->rev) so a late
+    // resumer with the same identity is rejected by stage/emit even when
+    // pending is null (never borrow current rev); clear pending+owner.
+    // Returns the dropped placeholder, or null when nothing stale (fresh fence,
+    // owner active/running, real payload, or no pending). Caller holds
+    // commitMutex (pre-IO gates call this inside withCommitLock); suspend
+    // wrapper below acquires the lock for out-of-gate callers/tests.
+    // NOTE: nowNanos is monotonic System.nanoTime(); callers must pass
+    // System.nanoTime(), never wall clock. staleThresholdMs in millis.
+    fun recoverStalePendingLocked(nowNanos: Long, staleThresholdMs: Long): PolicySettled? {
         try {
             val cur = try { pendingPublish.get() } catch (_: Exception) { null } ?: return null
             val active = try { activeTx.get() } catch (_: Exception) { null }
             // Owner still active (pending belongs to the live Tx) -> in-flight, keep.
             if (active != null && active.txId == cur.txId && active.key == cur.key) return null
-            val stagedAt = try { pendingPublishAtMs.get() } catch (_: Exception) { 0L }
-            if (stagedAt == 0L) return null
-            if (nowMs - stagedAt < staleThresholdMs) return null
             val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
             if (!isPlaceholder) {
+                // Stage N3 P1#3: real payloads are never aged-out here. Owner must
+                // stage/emit via exact identity; age-based promotion could resurrect
+                // stale truth over a newer latest. Keep pending, let gates abort.
+                return null
+            }
+            val stagedAt = try { pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+            if (stagedAt == 0L) return null
+            // Backwards jump (now < staged): monotonic should not go backwards;
+            // treat as not-stale (never infer death).
+            if (nowNanos < stagedAt) return null
+            val ageMs = try { (nowNanos - stagedAt) / 1_000_000L } catch (_: Exception) { 0L }
+            if (ageMs < staleThresholdMs) return null
+            // Stronger-than-age: recorded owner must be done (save finished).
+            val owner = try { pendingOwner.get() } catch (_: Exception) { null }
+            if (owner != null) {
+                if (owner.txId != cur.txId || owner.key != cur.key) return null
+                val done = try {
+                    owner.deferred.isCompleted || owner.deferred.isCancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (!done) return null
+            } else {
+                // Legacy: no owner recorded — allow age+placeholder+inactive drop
+                // (logged) to preserve M3 dead-owner recovery for old paths.
+                logCoord(
+                    "recover placeholder without owner record txId=${cur.txId} " +
+                        "rev=${cur.rev} ageMs=${ageMs} (legacy fallback)",
+                )
+            }
+            logCoord(
+                "recover stale placeholder txId=${cur.txId} rev=${cur.rev} " +
+                    "ageMs=${ageMs} (dropped, no truth)",
+            )
+            // Persist tombstone before clearing so late resumer is rejected.
+            // Stage N3 bound: cap tombstones (practical DoS bound; evict one
+            // arbitrary + log when full; resurrected identity still faces
+            // cur==null reject + rev guard, tombstone is extra defense).
+            try {
+                if (claimTombstones.size >= 512) {
+                    try {
+                        val evict = claimTombstones.keys.firstOrNull()
+                        if (evict != null) {
+                            claimTombstones.remove(evict)
+                            logCoord("tombstone bound evict $evict (size cap 512)")
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                claimTombstones[tombstoneKey(cur.txId, cur.key)] = cur.rev
+            } catch (_: Exception) {
+            }
+            val cleared = try {
+                pendingPublish.compareAndSet(cur, null)
+            } catch (_: Exception) {
+                false
+            }
+            if (cleared) {
                 try {
-                    val latestCur = try { _latest.value } catch (_: Exception) { null }
-                    if (latestCur == null || cur.rev == -1L || latestCur.rev == -1L ||
-                        cur.rev >= latestCur.rev
-                    ) {
-                        try { _latest.value = cur } catch (_: Exception) { }
-                    } else {
-                        emitSuperseded.incrementAndGet()
-                        logCoord(
-                            "recover superseded txId=${cur.txId} rev=${cur.rev} " +
-                                "behind latest rev=${latestCur.rev} txId=${latestCur.txId}",
-                        )
+                    val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                    if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                        pendingOwner.compareAndSet(own, null)
                     }
                 } catch (_: Exception) {
                 }
-                logCoord(
-                    "recover stale real pending txId=${cur.txId} rev=${cur.rev} " +
-                        "ageMs=${nowMs - stagedAt} (promoted to latest)",
-                )
+                return cur
             } else {
-                logCoord(
-                    "recover stale placeholder txId=${cur.txId} rev=${cur.rev} " +
-                        "ageMs=${nowMs - stagedAt} (dropped, no truth)",
-                )
-            }
-            return if (try { pendingPublish.compareAndSet(cur, null) } catch (_: Exception) { false }) {
-                cur
-            } else {
-                null
+                // Lost race: another thread staged/cleared; roll back tombstone?
+                // Keep tombstone (safe: exact identity now held by newer pending,
+                // late old identity still correctly rejected). Do not return.
+                return null
             }
         } catch (_: Exception) {
             return null
         }
     }
 
-    suspend fun tryRecoverStalePending(nowMs: Long, staleThresholdMs: Long): PolicySettled? =
-        commitMutex.withLock { recoverStalePendingLocked(nowMs, staleThresholdMs) }
+    suspend fun tryRecoverStalePending(nowNanos: Long, staleThresholdMs: Long): PolicySettled? =
+        commitMutex.withLock { recoverStalePendingLocked(nowNanos, staleThresholdMs) }
 
-    // Stage L3: stage terminal payload (preserve claim rev, update _latest
-    // monotonically). Call after commitMutex released? No — this takes the lock
-    // itself (stage under lock, emit after release by caller via emitStaged).
-    // Returns stamped to emit, or null if superseded (caller must skip SharedFlow
-    // emit; metric+log already surfaced, never silent).
+    // Stage L3 + N3 P1#3: stage terminal payload with EXACT originating-claim
+    // identity. Succeeds ONLY when pendingPublish holds the matching claim
+    // (same txId+key; when caller passes a stamped rev it must equal the claim
+    // rev). All other cases are explicitly superseded (metric+log, never silent):
+    // - cur==null (no pending: dropped/cleared/never claimed) -> reject, NEVER
+    //   borrow committedRevision/current rev for an unstamped payload. Owner must
+    //   re-claim (new txId/rev) instead of resurrecting a dead identity.
+    // - cur mismatch (foreign pending) -> reject, never overwrite newer fence.
+    // - payload stamped rev != claim rev -> reject (divergent seq).
+    // Tombstoned identities (previously dropped placeholder) are always rejected
+    // even when pending is null. _latest/pending are untouched on reject.
+    // Returns stamped to emit, or null if superseded (caller must skip emit).
     suspend fun stageRealPayload(payload: PolicySettled): PolicySettled? {
         var out: PolicySettled? = null
         commitMutex.withLock {
             try {
+                // Tombstone fast-reject: dropped identity never stages again.
+                if (isTombstoned(payload.txId, payload.key)) {
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "stage rejected (tombstoned) txId=${payload.txId} key=${payload.key} " +
+                            "rev=${payload.rev} (dropped placeholder identity, must re-claim)",
+                    )
+                    out = null
+                    return@withLock
+                }
                 val cur = try { pendingPublish.get() } catch (_: Exception) { null }
                 if (cur != null && cur.txId == payload.txId && cur.key == payload.key) {
+                    // Exact identity match; enforce rev equality when stamped.
+                    if (payload.rev != -1L && payload.rev != cur.rev) {
+                        emitSuperseded.incrementAndGet()
+                        logCoord(
+                            "stage rejected (rev mismatch) txId=${payload.txId} " +
+                                "payloadRev=${payload.rev} claimRev=${cur.rev}",
+                        )
+                        out = null
+                        return@withLock
+                    }
                     val rev = cur.rev
                     val stamped = try {
                         if (payload.rev == -1L || payload.rev != rev) payload.copy(rev = rev)
@@ -233,44 +337,38 @@ class PolicyTxCoordinator {
                         payload
                     }
                     pendingPublish.set(stamped)
-                    // Stage M3: refresh fence time on overwrite (same lock).
+                    // Stage M3/N3: refresh fence time on overwrite (same lock).
                     try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
+                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
                     val latestCur = try { _latest.value } catch (_: Exception) { null }
-                    if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L ||
-                        stamped.rev >= latestCur.rev
-                    ) {
+                    val canSetLatest = try {
+                        if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L) true
+                        else if (stamped.rev > latestCur.rev) true
+                        else stamped.rev == latestCur.rev &&
+                            stamped.txId == latestCur.txId && stamped.key == latestCur.key
+                    } catch (_: Exception) { false }
+                    if (canSetLatest) {
                         try { _latest.value = stamped } catch (_: Exception) { }
                         out = stamped
                     } else {
                         emitSuperseded.incrementAndGet()
                         logCoord(
                             "stage superseded txId=${payload.txId} rev=${stamped.rev} " +
-                                "behind latest rev=${latestCur.rev} txId=${latestCur.txId}",
+                                "behind latest rev=${latestCur?.rev} txId=${latestCur?.txId}",
                         )
                         out = null
                     }
                 } else if (cur == null) {
-                    val rev = if (payload.rev != -1L) payload.rev else try {
-                        committedRevision.get()
-                    } catch (_: Exception) { -1L }
-                    val stamped = try { payload.copy(rev = rev) } catch (_: Exception) { payload }
-                    pendingPublish.set(stamped)
-                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
-                    val latestCur = try { _latest.value } catch (_: Exception) { null }
-                    if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L ||
-                        stamped.rev >= latestCur.rev
-                    ) {
-                        try { _latest.value = stamped } catch (_: Exception) { }
-                        out = stamped
-                    } else {
-                        emitSuperseded.incrementAndGet()
-                        logCoord(
-                            "stage superseded (no placeholder) txId=${payload.txId} " +
-                                "rev=${stamped.rev} behind latest ${latestCur.rev}",
-                        )
-                        try { pendingPublish.compareAndSet(stamped, null) } catch (_: Exception) { }
-                        out = null
-                    }
+                    // Stage N3 P1#3: no matching pending claim -> reject. Never
+                    // borrow committedRevision for an unstamped payload; that
+                    // lets a stalled old Tx stamp OLD payload with NEWER revision
+                    // and overwrite latest on equal rev.
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "stage rejected (no pending claim) txId=${payload.txId} key=${payload.key} " +
+                            "rev=${payload.rev} (must re-claim, never borrow current rev)",
+                    )
+                    out = null
                 } else {
                     emitSuperseded.incrementAndGet()
                     logCoord(
@@ -317,7 +415,22 @@ class PolicyTxCoordinator {
     // （計數＋log，pending 仍按 fence 清除，收斂經 _latest/resync，不靜默丟失）。
     // tryEmit hit -> clear pending (replayCache now carries it, union still sees it);
     // buffer-full -> keep pending until async emit lands, then clear.
+    // Stage N3 P1#3: tombstoned identities never emit (even via synthetic bump);
+    // equal-rev different-identity never overwrites latest (borrowed-rev guard).
     fun emitStaged(payload: PolicySettled) {
+        // Tombstone pre-check: dropped placeholder identity must never resurrect
+        // via emit, even with a fresh synthetic rev.
+        try {
+            if (isTombstoned(payload.txId, payload.key)) {
+                emitSuperseded.incrementAndGet()
+                logCoord(
+                    "emit rejected (tombstoned) txId=${payload.txId} key=${payload.key} " +
+                        "rev=${payload.rev} (must re-claim)",
+                )
+                return
+            }
+        } catch (_: Exception) {
+        }
         var toEmit = payload
         // Preserve claim rev when caller passed unstamped but pending holds it
         // (avoid double-bump via fresh increment).
@@ -341,34 +454,42 @@ class PolicyTxCoordinator {
         val finalEmit = toEmit
         // Overtake guard: stale (rev < latest) never overwrites _latest nor
         // SharedFlow order — explicit supersede, never silent.
+        // Stage N3 P1#3: equal rev from a DIFFERENT identity is also stale
+        // (borrowed-rev resurrection); only same-identity equal rev may refresh.
         try {
             val curLatest = try { _latest.value } catch (_: Exception) { null }
-            if (curLatest != null && finalEmit.rev != -1L && curLatest.rev != -1L &&
-                finalEmit.rev < curLatest.rev
-            ) {
-                emitSuperseded.incrementAndGet()
-                logCoord(
-                    "emit superseded txId=${finalEmit.txId} rev=${finalEmit.rev} " +
-                        "behind latest rev=${curLatest.rev} txId=${curLatest.txId}",
-                )
-                try {
-                    val curP = try { pendingPublish.get() } catch (_: Exception) { null }
-                    if (curP != null && curP.txId == finalEmit.txId &&
-                        curP.key == finalEmit.key && curP.rev == finalEmit.rev
-                    ) {
-                        pendingPublish.compareAndSet(curP, null)
+            if (curLatest != null && finalEmit.rev != -1L && curLatest.rev != -1L) {
+                val sameIdentity = finalEmit.txId == curLatest.txId && finalEmit.key == curLatest.key
+                if (finalEmit.rev < curLatest.rev || (finalEmit.rev == curLatest.rev && !sameIdentity)) {
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "emit superseded txId=${finalEmit.txId} rev=${finalEmit.rev} " +
+                            "behind latest rev=${curLatest.rev} txId=${curLatest.txId}",
+                    )
+                    try {
+                        val curP = try { pendingPublish.get() } catch (_: Exception) { null }
+                        if (curP != null && curP.txId == finalEmit.txId &&
+                            curP.key == finalEmit.key && curP.rev == finalEmit.rev
+                        ) {
+                            pendingPublish.compareAndSet(curP, null)
+                        }
+                    } catch (_: Exception) {
                     }
-                } catch (_: Exception) {
+                    return
                 }
-                return
             }
             // Ensure _latest holds it (idempotent when stageReal already set;
             // synthetic path sets here).
+            // Stage N3: equal-rev different-identity never overwrites (borrowed rev).
             try {
                 val cur2 = try { _latest.value } catch (_: Exception) { null }
-                if (cur2 == null || finalEmit.rev == -1L || cur2.rev == -1L ||
-                    finalEmit.rev >= cur2.rev
-                ) {
+                val canSet = try {
+                    if (cur2 == null || finalEmit.rev == -1L || cur2.rev == -1L) true
+                    else if (finalEmit.rev > cur2.rev) true
+                    else finalEmit.rev == cur2.rev &&
+                        finalEmit.txId == cur2.txId && finalEmit.key == cur2.key
+                } catch (_: Exception) { false }
+                if (canSet) {
                     _latest.value = finalEmit
                 }
             } catch (_: Exception) {
@@ -387,7 +508,15 @@ class PolicyTxCoordinator {
                 if (curP != null && curP.txId == finalEmit.txId &&
                     curP.key == finalEmit.key && curP.rev == finalEmit.rev
                 ) {
-                    pendingPublish.compareAndSet(curP, null)
+                    if (pendingPublish.compareAndSet(curP, null)) {
+                        try {
+                            val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                            if (own != null && own.txId == curP.txId && own.key == curP.key) {
+                                pendingOwner.compareAndSet(own, null)
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
                 } else {
                     // Legacy fallback: direct compare (synthetic without pending → no-op).
                     try { pendingPublish.compareAndSet(payload, null) } catch (_: Exception) { }
@@ -433,7 +562,15 @@ class PolicyTxCoordinator {
                     if (curP2 != null && curP2.txId == finalEmit.txId &&
                         curP2.key == finalEmit.key && curP2.rev == finalEmit.rev
                     ) {
-                        pendingPublish.compareAndSet(curP2, null)
+                        if (pendingPublish.compareAndSet(curP2, null)) {
+                            try {
+                                val own2 = try { pendingOwner.get() } catch (_: Exception) { null }
+                                if (own2 != null && own2.txId == curP2.txId && own2.key == curP2.key) {
+                                    pendingOwner.compareAndSet(own2, null)
+                                }
+                            } catch (_: Exception) {
+                            }
+                        }
                     } else {
                         try { pendingPublish.compareAndSet(payload, null) } catch (_: Exception) { }
                         try { pendingPublish.compareAndSet(finalEmit, null) } catch (_: Exception) { }
@@ -457,7 +594,15 @@ class PolicyTxCoordinator {
             if (cur != null && cur.txId == payload.txId && cur.key == payload.key &&
                 (cur.rev == payload.rev || payload.rev == -1L)
             ) {
-                pendingPublish.compareAndSet(cur, null)
+                if (pendingPublish.compareAndSet(cur, null)) {
+                    try {
+                        val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                        if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                            pendingOwner.compareAndSet(own, null)
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
             }
         } catch (_: Exception) {
         }
@@ -483,16 +628,41 @@ class PolicyTxCoordinator {
     }
 
     fun tryEmitSettled(s: PolicySettled): Boolean {
+        // Stage N3: tombstoned identity never emits.
+        try {
+            if (isTombstoned(s.txId, s.key)) {
+                emitSuperseded.incrementAndGet()
+                logCoord(
+                    "tryEmit rejected (tombstoned) txId=${s.txId} key=${s.key} rev=${s.rev}",
+                )
+                return false
+            }
+        } catch (_: Exception) {
+        }
         var stamped = s
         try {
             if (stamped.rev == -1L) {
                 // Synthetic direct (no claim): assign fresh seq. Claim-path callers
                 // pass stamped (rev set) so no double-bump here.
                 // Preserve pending claim rev when matching (avoid divergent seq).
+                // Stage N3: mismatched pending or tombstoned -> do NOT borrow;
+                // synthetic without exact claim is superseded (must re-claim).
                 val cur = try { pendingPublish.get() } catch (_: Exception) { null }
                 if (cur != null && cur.txId == stamped.txId && cur.key == stamped.key && cur.rev != -1L) {
                     try { stamped = stamped.copy(rev = cur.rev) } catch (_: Exception) { }
+                } else if (cur != null) {
+                    // Foreign pending in-flight: stale synthetic, reject.
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "tryEmit rejected (foreign pending) txId=${stamped.txId} " +
+                            "by pending txId=${cur.txId} rev=${cur.rev}",
+                    )
+                    return false
                 } else {
+                    // No pending: only allow synthetic when not tombstoned (checked
+                    // above). This preserves l3_overflow lossless test (pure
+                    // synthetic, no claim). Claimed-path late resumers are already
+                    // tombstoned and rejected above.
                     val rev = try { committedRevision.incrementAndGet() } catch (_: Exception) { -1L }
                     try { stamped = stamped.copy(rev = rev) } catch (_: Exception) { }
                 }
@@ -501,19 +671,26 @@ class PolicyTxCoordinator {
         }
         try {
             val curLatest = try { _latest.value } catch (_: Exception) { null }
-            if (curLatest != null && stamped.rev != -1L && curLatest.rev != -1L &&
-                stamped.rev < curLatest.rev
-            ) {
-                emitSuperseded.incrementAndGet()
-                logCoord(
-                    "tryEmit superseded txId=${stamped.txId} rev=${stamped.rev} " +
-                        "behind latest rev=${curLatest.rev}",
-                )
-                return false
+            if (curLatest != null && stamped.rev != -1L && curLatest.rev != -1L) {
+                val sameId = stamped.txId == curLatest.txId && stamped.key == curLatest.key
+                if (stamped.rev < curLatest.rev || (stamped.rev == curLatest.rev && !sameId)) {
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "tryEmit superseded txId=${stamped.txId} rev=${stamped.rev} " +
+                            "behind latest rev=${curLatest.rev}",
+                    )
+                    return false
+                }
             }
             try {
                 val cur2 = try { _latest.value } catch (_: Exception) { null }
-                if (cur2 == null || stamped.rev == -1L || cur2.rev == -1L || stamped.rev >= cur2.rev) {
+                val canSet = try {
+                    if (cur2 == null || stamped.rev == -1L || cur2.rev == -1L) true
+                    else if (stamped.rev > cur2.rev) true
+                    else stamped.rev == cur2.rev &&
+                        stamped.txId == cur2.txId && stamped.key == cur2.key
+                } catch (_: Exception) { false }
+                if (canSet) {
                     _latest.value = stamped
                 }
             } catch (_: Exception) {
@@ -588,6 +765,18 @@ class PolicyTxCoordinator {
         }
         try {
             pendingPublishAtMs.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            pendingPublishAtNanos.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            pendingOwner.set(null)
+        } catch (_: Exception) {
+        }
+        try {
+            claimTombstones.clear()
         } catch (_: Exception) {
         }
         try {

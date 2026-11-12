@@ -7020,14 +7020,15 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence): foreign pending may be
+                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: foreign pending may be
                                                 // a dead owner's orphan (activeTx==null + no emit).
-                                                // Recover when stale (promote real to _latest, drop
-                                                // placeholder) instead of blocking forever; fresh
-                                                // in-flight fence (age < IoTimeout) still marks stale.
+                                                // Recover when stale placeholder with stronger-than-age
+                                                // owner-gone proof (deferred done + monotonic age, see
+                                                // coordinator); fresh in-flight fence or real payload
+                                                // still marks stale. Monotonic System.nanoTime, never wall.
                                                 val recovered = try {
                                                     h1Coord.recoverStalePendingLocked(
-                                                        System.currentTimeMillis(),
+                                                        System.nanoTime(),
                                                         policyIoTimeoutMs,
                                                     )
                                                 } catch (_: Exception) { null }
@@ -8128,11 +8129,12 @@ class DualViewModel(
                                             if (stagedDrainClear != null &&
                                                 !(stagedDrainClear.txId == txClear.txId && stagedDrainClear.key == txClear.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence): recover stale foreign
-                                                // pending instead of blocking forever (see confirm gate).
+                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: recover stale foreign
+                                                // placeholder with stronger-than-age proof (see confirm gate).
+                                                // Monotonic System.nanoTime, never wall.
                                                 val recovered = try {
                                                     h1ClearCoord.recoverStalePendingLocked(
-                                                        System.currentTimeMillis(),
+                                                        System.nanoTime(),
                                                         policyIoTimeoutMs,
                                                     )
                                                 } catch (_: Exception) { null }
@@ -9160,11 +9162,12 @@ class DualViewModel(
                                             if (stagedForDrain != null &&
                                                 !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
                                             ) {
-                                                // Stage M3 (P2#5 orphan fence): recover stale foreign
-                                                // pending instead of blocking forever (see confirm gate).
+                                                // Stage M3 (P2#5 orphan fence) + N3 P1#3: recover stale foreign
+                                                // placeholder with stronger-than-age proof (see confirm gate).
+                                                // Monotonic System.nanoTime, never wall.
                                                 val recovered = try {
                                                     h1RepairCoord.recoverStalePendingLocked(
-                                                        System.currentTimeMillis(),
+                                                        System.nanoTime(),
                                                         policyIoTimeoutMs,
                                                     )
                                                 } catch (_: Exception) { null }
