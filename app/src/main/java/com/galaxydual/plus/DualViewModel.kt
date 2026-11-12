@@ -1001,7 +1001,11 @@ class DualViewModel(
     // caller after CAS success before emit. Test p1_casBeforeEvent_noOverwrite gates
     // B reconciler here (CAS done, committedRevision bumped, replayCache no B)
     // while VM2 confirm C must abort via pendingPublish/revision gate.
-    var afterClaimBeforeEmit: (() -> Unit)? = null
+    // Suspend function (not blocking): the winner may run on the test thread
+    // itself under Dispatchers.Unconfined, so a blocking latch gate would pin
+    // the very thread the test waits on (deadlock until gate timeout). A
+    // suspending gate (e.g. Deferred.await) frees the thread instead.
+    var afterClaimBeforeEmit: (suspend () -> Unit)? = null
     // Stage F2 (P2#4)：reconciler 專用獨立讀池（per-VM 單執行緒，執行緒名
     // policyReconcile）。Binder 不可中斷：逾時讀的執行緒滯留此池（不佔共用 IO
     // 池），呼叫側計預算（withTimeout 照常到期）。per-VM 而非全域：無限阻塞測
@@ -1048,12 +1052,84 @@ class DualViewModel(
         return owned
     }
 
+    // Stage H2 P1: winner stranded-terminal replay (idempotent convergence).
+    // When the winner's _state.update was discarded by a concurrent loser
+    // clearing the local fence (activePolicyTx !== tx), the phase stays
+    // RECONCILING while both fences are already empty and _latest already
+    // holds this Tx's terminal. Re-apply the terminal once (IDLE + settled
+    // draft/Known/msg, pending cleared) so the VM does not strand.
+    // Conditions (ALL required, all lock-free single snapshots):
+    // - phase still RECONCILING (winner update lost, not yet converged);
+    // - dual fences empty (no new Tx in flight; foreign in-flight => skip,
+    //   new op owns convergence);
+    // - _latest identity is this Tx (own terminal, not foreign).
+    // No-op otherwise (already IDLE, new Tx, or foreign terminal).
+    // Note: the re-applied terminal is a simplified escape-convergence copy
+    // (IDLE + settled draft/Known/msg, pending cleared). It intentionally does
+    // not replicate every winner branch detail (repair/clear Corrupt flag
+    // handling); winners publish the full terminal via the normal
+    // claim->bump->update->emit->settle path, this replay only rescues a
+    // stranded RECONCILING fence pair. With the pre-bump ordering the IDLE wash
+    // window is closed, so the RECONCILING-only guard is sufficient.
+    private fun replayWinnerTerminalIfStranded(tx: PolicyTx) {
+        try {
+            if (_state.value.policyWritePhase != PolicyWritePhase.RECONCILING) return
+            try {
+                if (activePolicyTx.get() != null) return
+            } catch (_: Exception) {
+                return
+            }
+            val coord = policyTxCoordinator ?: return
+            try {
+                if (coord.activeTx.get() != null) return
+            } catch (_: Exception) {
+                return
+            }
+            val latest: PolicySettled = try {
+                coord.latest.value ?: return
+            } catch (_: Exception) {
+                return
+            }
+            if (latest.txId != tx.txId || latest.key != tx.key) return
+            var applied = false
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.RECONCILING) cur
+                else {
+                    if (latest.known) {
+                        try { disarmBlindClear() } catch (_: Exception) { }
+                    }
+                    applied = true
+                    cur.copy(
+                        pendingPolicyWrite = null,
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = if (latest.known) latest.draft else cur.policyDraft,
+                        policyDraftKnown = latest.known,
+                        msg = latest.msg,
+                        msgKind = latest.msgKind,
+                    )
+                }
+            }
+            if (applied) {
+                try {
+                    policyReconciling.remove(tx.key)
+                } catch (_: Exception) {
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Best effort: replay must never break the winner path.
+        }
+    }
+
     // Stage I1：終態快照顯式發射（原 settle 集中式先讀後 emit 的遷出）。
     // 呼叫方須在 claim 持有下、終態 _state.update 之後、settlePolicyTx 之前呼叫
     // （同舊集中式時序：發射→CAS；無併發發布者，讀到即本次終態）。
     // 語義同舊集中式：僅 phase==IDLE 發射（unresolved 續留不發射）；Known 成功
-    // 同步 bump 版本三元（同快徑），使晚到 stale 讀丟棄；Failed/Unknown 經 mark
-    // 已 bump，此處不重複。coordinator 為 null 即 no-op。
+    // 的版本三元由呼叫方在 update 前同步預 bump（claim->bump->update->emit 順序，
+    // 使晚到 stale 讀丟棄），此處刻意不 bump（舊 Known 條件 bump 已移除，免與
+    // 預 bump 形成 double）。Failed/Unknown 經 mark 已 bump，此處亦不重複。coordinator 為 null 即 no-op。
     // Stage L1 P1: stage payload under commitMutex, emit after release.
     // Payload pre-built from _state snapshot, staged (overwrite placeholder)
     // inside withCommitLock with watermark update in same observation,
@@ -1065,11 +1141,6 @@ class DualViewModel(
         try {
             val s = _state.value
             if (s.policyWritePhase == PolicyWritePhase.IDLE) {
-                if (s.policyDraftKnown) {
-                    policyDraftVersion.incrementAndGet()
-                    policyFreshnessGen.incrementAndGet()
-                    policyOwnershipGen.incrementAndGet()
-                }
                 val payload = PolicySettled(
                     tx.txId, tx.key, s.policyDraft, s.policyDraftKnown,
                     s.msgKind, s.msg, tx.isClear,
@@ -1140,6 +1211,13 @@ class DualViewModel(
     // - 無 coordinator（本地單 VM 既有測試路徑）一律回 true，維持既有
     //   publish-then-settle 語義（單發布者，行為不變；併發仲裁仍經本地 settle CAS）。
     // 回 true=勝者（可發布），false=敗者（跳過發布）。
+    // Stage H2 P1 note: the loser path below (sync clear + SAVING->RECONCILING
+    // + launchLoserSync) is dead when a coordinator is attached — all coord
+    // paths claim via tryClaimStaged/tryClaimPlaceholder (follow-then-clear,
+    // never sync-clear). It is retained only for the null-coordinator legacy
+    // single-VM path (which returns true above and never reaches the loser
+    // branch). Kept aligned in spirit (loser never overwrites the winner) and
+    // not deleted to preserve the legacy contract.
     private fun tryClaimCoordinatorPublish(tx: PolicyTx): Boolean {
         val coord = policyTxCoordinator ?: return true
         if (!coord.activeTx.compareAndSet(tx, null)) {
@@ -1183,21 +1261,21 @@ class DualViewModel(
         val coord = policyTxCoordinator ?: return true
         val claimed: Boolean = try {
             coord.completeWithRevision(tx, payload)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             false
         }
         if (!claimed) {
-            try {
-                activePolicyTx.compareAndSet(tx, null)
-            } catch (_: Exception) {
-            }
-            try {
-                policyReconciling.remove(tx.key)
-            } catch (_: Exception) {
-            }
+            // Stage H2 P1: loser follow-then-clear (same as above): never clear
+            // the local fence synchronously; the winner's
+            // claim->stage->emit->update window must not observe a cleared
+            // fence. Keep the fence, flip SAVING->RECONCILING when no foreign
+            // Tx is in flight, then converge via launchLoserSync (clears after).
             val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
             val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
-            if (curLocal == null && curCoord == null) {
+            val noForeignTx = (curLocal == null || curLocal === tx) && curCoord == null
+            if (noForeignTx) {
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
                     else cur.copy(
@@ -1212,7 +1290,13 @@ class DualViewModel(
         }
         try {
             afterClaimBeforeEmit?.invoke()
-        } catch (_: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            try {
+                System.err.println("[DualViewModel] afterClaimBeforeEmit failed: ${e.message}")
+            } catch (_: Exception) {
+            }
         }
         return true
     }
@@ -1286,7 +1370,9 @@ class DualViewModel(
         }
     }
 
-    // Stage H2：敗者跟隨＋init 認領訂閱共用。
+    // Stage H2：敗者跟隨＋init 認領訂閱共用（冪等：同一 txId 多次 refresh 觸發的
+    // 跟隨皆等待同一 settled，首個應用者翻相位，後到者經 phase!=RECONCILING 丟棄；
+    // 不去重亦安全，此處註明不另加去重）。
     // - 有界等待同一 txId 的勝者 settled（withTimeout(policyIoTimeoutMs)，replay=1
     //   使晚訂閱仍可見）：收到即應用本地 IDLE+draft/Known/msg（僅 phase 仍為
     //   RECONCILING 才應用，免覆寫已結新事實；Known 成功即 disarm）。
@@ -1412,6 +1498,17 @@ class DualViewModel(
                     )
                 }
             }
+            // Stage H2 P1 follow-then-clear: converge cleared the phase above;
+            // now release the (own) fence — CAS guards against a new Tx that
+            // may have started during the bounded read (foreign => no-op).
+            try {
+                activePolicyTx.compareAndSet(tx, null)
+            } catch (_: Exception) {
+            }
+            try {
+                policyReconciling.remove(tx.key)
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -1478,12 +1575,14 @@ class DualViewModel(
                         )
                     }
                 }
-                // Stage J4 (F2)：兜底僅收斂 phase，不碰本地 fence／reconciling（同
-                // launchLoserSync 兜底）：本訂閱與 reconciler 同一 Tx 在途並行，
-                // 終態發布權留給 reconciler 經 settlePolicyTx 恰一次結清＋廣播；
-                // 此處若先清本地 fence（coordinator 側仍在），reconciler 續行發布
+                // Stage J4 (F2)：兜底僅收斂 phase，不碰本地 fence／reconciling：
+                // 本訂閱與 reconciler 同一 Tx 在途並行，終態發布權留給 reconciler
+                // 經 settlePolicyTx 恰一次結清＋廣播；此處若先清本地 fence
+                //（coordinator 側仍在），reconciler 續行發布
                 // 致終態雙寫（本地 IDLE＋reconciler 廣播各一）。init 認領保證兩者
                 // 同啟（見 init 認領段），fence 必由勝出者結清，不殘留。
+                // （launchLoserSync 兜底不同：敗者跟隨無 reconciler 爭發布權，
+                // 故收斂後清自身 fence；此處不通用。）
                 return@launch
             }
             val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
@@ -2025,43 +2124,46 @@ class DualViewModel(
                 } else {
                     if (!tryClaimCoordinatorPublish(tx)) return
                 }
-                // Stage H2/I1：勝者在 settle 前 tryEmit 終態（敗者跟隨用；此處顯式
-                // 發射為唯一發射點，settle 本體不再發射，見 emitTxSettledSnapshot）。
-                emitTxSettled(successPayload)
-                disarmBlindClear()
-                if (tx.isRepair) disarmCorruptRepair()
-                _state.update { cur ->
-                    if (activePolicyTx.get() !== tx) cur
-                    else if (tx.isRepair) cur.copy(
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraft = emptySet(),
-                        policyDraftKnown = true,
+                // Stage J4 P1 + H2 P1: claim->bump->update->emit->settle->replay
+                // via winnerPublish (single order source). The pre-bump closes
+                // the update-then-bump wash window for in-flight init/refresh
+                // loads; the post-update emit is the non-bumping path so the
+                // pre-bump is never doubled.
+                winnerPublish(tx, successPayload, bump = true) {
+                    disarmBlindClear()
+                    if (tx.isRepair) disarmCorruptRepair()
+                    _state.update { cur ->
+                        if (activePolicyTx.get() !== tx) cur
+                        else if (tx.isRepair) cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraft = emptySet(),
+                            policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
-                        msgKind = MsgKind.INFO,
-                    )
-                    else if (tx.isClear) cur.copy(
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraft = emptySet(),
-                        policyDraftKnown = true,
+                            msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
+                            msgKind = MsgKind.INFO,
+                        )
+                        else if (tx.isClear) cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraft = emptySet(),
+                            policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                        msgKind = MsgKind.INFO,
-                    )
-                    else cur.copy(
-                        pendingPolicyWrite = null,
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraft = decision.packages,
-                        policyDraftKnown = true,
+                            msg = policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                            msgKind = MsgKind.INFO,
+                        )
+                        else cur.copy(
+                            pendingPolicyWrite = null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraft = decision.packages,
+                            policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                        msg = writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized),
-                        msgKind = MsgKind.INFO,
-                    )
+                            msg = writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized),
+                            msgKind = MsgKind.INFO,
+                        )
+                    }
                 }
-                settlePolicyTx(tx)
             }
             is PolicyTxSettle.Mismatch -> {
                 if (activePolicyTx.get() !== tx) return
@@ -2077,24 +2179,25 @@ class DualViewModel(
                 } else {
                     if (!tryClaimCoordinatorPublish(tx)) return
                 }
-                // Stage H2：勝者在 settle 前 tryEmit 終態。
-                emitTxSettled(mismatchPayload)
-                disarmBlindClear()
-                if (tx.isRepair) disarmCorruptRepair()
-                _state.update { cur ->
-                    if (activePolicyTx.get() !== tx) cur
-                    else cur.copy(
-                        pendingPolicyWrite = if (tx.isClear) cur.pendingPolicyWrite else null,
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraft = decision.packages,
-                        policyDraftKnown = true,
+                // Stage H2 P1: claim->bump->update->emit->settle->replay via
+                // winnerPublish (same order as Success).
+                winnerPublish(tx, mismatchPayload, bump = true) {
+                    disarmBlindClear()
+                    if (tx.isRepair) disarmCorruptRepair()
+                    _state.update { cur ->
+                        if (activePolicyTx.get() !== tx) cur
+                        else cur.copy(
+                            pendingPolicyWrite = if (tx.isClear) cur.pendingPolicyWrite else null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraft = decision.packages,
+                            policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                        msgKind = MsgKind.INFO,
-                    )
+                            msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                            msgKind = MsgKind.INFO,
+                        )
+                    }
                 }
-                settlePolicyTx(tx)
             }
             is PolicyTxSettle.Failed -> {
                 if (activePolicyTx.get() !== tx) return
@@ -2116,43 +2219,43 @@ class DualViewModel(
                 } else {
                     if (!tryClaimCoordinatorPublish(tx)) return
                 }
-                // Stage H2：勝者在 settle 前 tryEmit 終態（Failed 保留舊快照，draft
-                // 取當下值供敗者收斂；敗者 Known=false 不覆寫為 Known，見跟隨）。
-                emitTxSettled(failedPayload)
-                markPolicyUnknownLocked()
-                val expV = policyDraftVersion.get()
-                val expO = policyOwnershipGen.get()
-                _state.update { cur ->
-                    if (activePolicyTx.get() !== tx) cur
-                    else if (tx.isRepair) cur.copy(
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraftKnown = false,
+                // Stage H2 P1: claim->mark(bump)->update->emit->settle->replay
+                // via winnerPublish (bump=false: the mark inside applyTerminal is
+                // the single pre-update bump; emitting after the update closes
+                // the update-then-bump wash window. Failed keeps the old draft
+                // snapshot for loser convergence; follower Known=false never
+                // overwrites to Known).
+                winnerPublish(tx, failedPayload, bump = false) {
+                    markPolicyUnknownLocked()
+                    _state.update { cur ->
+                        if (activePolicyTx.get() !== tx) cur
+                        else if (tx.isRepair) cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
                                         policyDraftCorrupt = true,
-                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
-                        msgKind = MsgKind.FAILED,
-                    )
-                    else if (tx.isClear) cur.copy(
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraftKnown = false,
+                            msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                            msgKind = MsgKind.FAILED,
+                        )
+                        else if (tx.isClear) cur.copy(
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
                                         policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
-                        msgKind = MsgKind.FAILED,
-                    )
-                    else cur.copy(
-                        pendingPolicyWrite = null,
-                        policyWritePhase = PolicyWritePhase.IDLE,
-                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                        policyDraftKnown = false,
+                            msg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED)),
+                            msgKind = MsgKind.FAILED,
+                        )
+                        else cur.copy(
+                            pendingPolicyWrite = null,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                            policyDraftKnown = false,
                                         policyDraftCorrupt = false,
-                        msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
-                        msgKind = MsgKind.FAILED,
-                    )
+                            msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
+                            msgKind = MsgKind.FAILED,
+                        )
+                    }
                 }
-                // Failed 的 mark 已在上行同步 bump（背靠背）；此處直接結清。
-                // （expV/expO 僅診斷保留，不另判。）
-                settlePolicyTx(tx)
             }
             is PolicyTxSettle.Unresolved -> {
                 if (activePolicyTx.get() !== tx) return
@@ -2965,6 +3068,14 @@ class DualViewModel(
             // this read is in flight, the Known payload below is stale (A) and must
             // be discarded (stay Unknown, fail closed) — never marked observed.
             val revBeforeInit = try { policyTxCoordinator?.currentRevision() ?: -1L } catch (_: Exception) { -1L }
+            // Stage J4 P1 (identity-aware rev-discard): sample the in-flight
+            // Tx identities before IO. A rev move caused by our OWN commit
+            // (winner bumped version triple above, so the version fence already
+            // discards; this covers the split snapshot window where the version
+            // was sampled after the bump but revBefore before it) must not wash
+            // Known=false — _latest with the same identity is own-commit truth.
+            val initLocalSnap = try { activePolicyTx.get() } catch (_: Exception) { null }
+            val initCoordSnap = try { policyTxCoordinator?.activeTx?.get() } catch (_: Exception) { null }
             val result = if (store == null) {
                 LoadResult.Unavailable
             } else try {
@@ -2989,10 +3100,28 @@ class DualViewModel(
                     // P1-1: stale read (rev advanced mid-IO) => discard: no disarm,
                     // no stale wash, no mark, stay Unknown (fail closed).
                     // Keep cur Corrupt (repair-period discard must not wash, same
-                    // as refresh 6913/6918 + abortUnarmedTx keepCorrupt; repair-abort
+                    // as refreshPolicyDraft yielding + abortUnarmedTx keepCorrupt; repair-abort
                     // Unknown+Corrupt must not downgrade to Unavailable).
+                    // Stage J4 P1 identity-aware: own-commit rev move (sampled
+                    // Tx identity == _latest terminal identity) is not stale —
+                    // discard (preserve winner terminal) instead of washing
+                    // Known=false. The winner triple bump above already routes
+                    // the common case via the version fence; this covers the
+                    // split-snapshot window only.
                     if (revMovedInit) {
-                        cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
+                        val ownCommit: Boolean = try {
+                            val latest = policyTxCoordinator?.latest?.value
+                            latest != null && (
+                                (initLocalSnap != null &&
+                                    latest.txId == initLocalSnap.txId &&
+                                    latest.key == initLocalSnap.key) ||
+                                    (initCoordSnap != null &&
+                                        latest.txId == initCoordSnap.txId &&
+                                        latest.key == initCoordSnap.key)
+                                )
+                        } catch (_: Exception) { false }
+                        if (ownCommit) cur
+                        else cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
                     } else {
                         // 成功翻 Known 即同步 disarm（修 stale-arm 洩漏：arm→Known→
                         // Unknown→單次 clear 必須仍告警，不可因舊 arm 直接執行）。
@@ -5610,9 +5739,73 @@ class DualViewModel(
     // - null-store bump 刻意保留以求統一、終態不變（null-store 下 load 恆為
     //   Unknown，本就無 Known 可 fence；bump 只為統一寫入路徑語意）。
     private fun markPolicyUnknownLocked() {
+        bumpPolicyGenerations()
+    }
+
+    // Stage H2 P1: winner triple bump (order contract for claim->bump->update->emit
+    // ordering, not a single helper). Every winner terminal (Success/Mismatch Known,
+    // Failed Unknown via mark) advances version+freshness+ownership synchronously
+    // after the claim win and BEFORE the terminal _state.update, so an in-flight
+    // init/refresh load sampling before the bump observes a generation mismatch
+    // and discards instead of washing Known=false (which stranded IDLE+Unknown
+    // with a SUCCESS msg). Callers must bump BEFORE update and emit via the
+    // non-bumping path (emitTxSettled / snapshot without bump); the old snapshot
+    // Known-conditional bump is removed to avoid double-bump.
+    // Exemptions (same order, inline, not via winnerPublish): reconciler and
+    // refresh late-join inline pre-bumps (see their bumpPolicyGenerations sites).
+    private fun bumpPolicyGenerations() {
         policyDraftVersion.incrementAndGet()
         policyFreshnessGen.incrementAndGet()
         policyOwnershipGen.incrementAndGet()
+    }
+
+    // Stage H2 P1: winner publish helper enforcing claim->bump->update->emit->
+    // settle->replay (order-contract helper for the terminal order; fast-path
+    // autoRecheck winners only). bump=true advances the version triple BEFORE
+    // applyTerminal (Known terminals); bump=false skips the helper bump because
+    // applyTerminal already bumps via markPolicyUnknownLocked (Failed Unknown
+    // terminals). applyTerminal must contain the terminal _state.update
+    // (+disarms); emit uses the non-bumping path so the pre-bump is never
+    // doubled. Reconciler/late-join inline paths follow the same order without
+    // this helper (see their inline pre-bump + non-bumping emit sites).
+    private suspend fun winnerPublish(
+        tx: PolicyTx,
+        payload: PolicySettled,
+        bump: Boolean,
+        applyTerminal: () -> Unit,
+    ) {
+        if (bump) bumpPolicyGenerations()
+        try {
+            applyTerminal()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+        try {
+            emitTxSettled(payload)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+        try {
+            settlePolicyTx(tx)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+        try {
+            replayWinnerTerminalIfStranded(tx)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun policyDraftVersionForTests(): Long = try {
+        policyDraftVersion.get()
+    } catch (_: Exception) {
+        -1L
     }
 
     // Stage A：核對中守衛（phase OR 集合雙層，防 state/集合瞬時窗口漂移）。
@@ -5723,6 +5916,10 @@ class DualViewModel(
                                 if (groundDecision is PolicyTxSettle.Success) {
                                     // F1 自觸修正 v2 語義：外判有新事實即丟棄，否則發布成功。
                                     // Stage G1：只比 ownership。
+                                    // Stage H2 P1: claim->bump->update->emit (pre-bump before
+                                    // update; the finally emit is the non-bumping path, so
+                                    // no double). The inner exp guard distinguishes our own
+                                    // bump (expV/expO) from a concurrent new fact.
                                     if (policyDraftVersion.get() != versionAtStart ||
                                         policyOwnershipGen.get() != ownership
                                     ) {
@@ -5736,18 +5933,33 @@ class DualViewModel(
                                             )
                                         }
                                     } else {
+                                        bumpPolicyGenerations()
+                                        val expV = versionAtStart + 1
+                                        val expO = ownership + 1
                                         disarmBlindClear()
                                         _state.update { cur ->
-                                            cur.copy(
-                                                pendingPolicyWrite = null,
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = groundDecision.packages,
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = groundDecision.packages,
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = writeSuccessMsg(groundDecision.packages.size, tx.pending, tx.sanitized),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = writeSuccessMsg(groundDecision.packages.size, tx.pending, tx.sanitized),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                     }
                                 } else if (policyDraftVersion.get() != versionAtStart ||
@@ -5793,8 +6005,13 @@ class DualViewModel(
                             } finally {
                                 // Stage I1：結清前顯式發射終態快照（reconciler 終態
                                 // 已證失敗分支；claim 持有下，settle 本體不再發射）。
+                                // Stage H2 P1: same stranded-terminal replay as
+                                // winnerPublish (update may have been discarded
+                                // by a concurrent loser fence clear in this VM;
+                                // no-op when already IDLE).
                                 emitTxSettledSnapshot(tx)
                                 settlePolicyTx(tx)
+                                replayWinnerTerminalIfStranded(tx)
                             }
                             // 已自行結清，外層 finally 跳過（冪等兜底亦可，但明示跳過）。
                             settle = false
@@ -5930,34 +6147,71 @@ class DualViewModel(
                                 } else if (finalResult is LoadResult.Known) {
                                     when (settleDecision) {
                                         is PolicyTxSettle.Success -> {
+                                            // Stage H2 P1: pre-bump before the terminal copy
+                                            // (inside the update arm, after the entry stale
+                                            // check above; the finally emit is non-bumping).
+                                            // exp guard tells our own bump apart from a
+                                            // concurrent new fact.
+                                            bumpPolicyGenerations()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
                                             disarmBlindClear()
-                                            cur.copy(
-                                                pendingPolicyWrite = null,
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = finalResult.packages,
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = finalResult.packages,
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = writeSuccessMsg(finalResult.packages.size, tx.pending, tx.sanitized),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = writeSuccessMsg(finalResult.packages.size, tx.pending, tx.sanitized),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                         is PolicyTxSettle.Mismatch -> {
+                                            // Stage H2 P1: pre-bump before the terminal copy
+                                            // (same order as Success; non-bumping emit).
+                                            bumpPolicyGenerations()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
                                             disarmBlindClear()
                                             // Mismatch 誠實：不謊稱寫入成功，以核對到的 ground
                                             // truth 為準 + REFRESHED 明示（INFO）。
                                             // Stage G1：僅 deferred 完成才至此；
                                             // 未完成（stale A）已在上行 Unresolved 續留。
-                                            cur.copy(
-                                                pendingPolicyWrite = null,
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = finalResult.packages,
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    pendingPolicyWrite = null,
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = finalResult.packages,
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                         is PolicyTxSettle.Failed -> {
                                             // 已證失敗：FAILED＋Unknown（樂觀讀 B
@@ -6125,9 +6379,13 @@ class DualViewModel(
             } finally {
                 // Stage I1：結清前顯式發射終態快照（reconciler 終態；settle=false 的
                 // 誠實 unresolved 不經此處故不發射）。
+                // Stage H2 P1: same stranded-terminal replay as winnerPublish
+                // (no-op when already IDLE or when fences still held for
+                // unresolved keepFence paths, which skip this block via settle).
                 if (settle) {
                     emitTxSettledSnapshot(tx)
                     settlePolicyTx(tx)
+                    replayWinnerTerminalIfStranded(tx)
                 }
             }
         }
@@ -6207,6 +6465,8 @@ class DualViewModel(
                                     throw e
                                 }
                                 if (groundDecision is PolicyTxSettle.Success) {
+                                    // Stage H2 P1: claim->bump->update->emit (pre-bump before
+                                    // update; finally emit is non-bumping, no double).
                                     if (policyDraftVersion.get() != versionAtStart ||
                                         policyOwnershipGen.get() != ownership
                                     ) {
@@ -6219,18 +6479,32 @@ class DualViewModel(
                                             )
                                         }
                                     } else {
+                                        bumpPolicyGenerations()
+                                        val expV = versionAtStart + 1
+                                        val expO = ownership + 1
                                         disarmBlindClear()
                                         if (tx.isRepair) disarmCorruptRepair()
                                         _state.update { cur ->
-                                            cur.copy(
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = emptySet(),
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = emptySet(),
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                     }
                                 } else if (policyDraftVersion.get() != versionAtStart ||
@@ -6273,8 +6547,11 @@ class DualViewModel(
                             } finally {
                                 // Stage I1：結清前顯式發射終態快照（reconciler 終態
                                 // 已證失敗分支；claim 持有下，settle 本體不再發射）。
+                                // Stage H2 P1: same stranded-terminal replay as
+                                // winnerPublish (no-op when already IDLE).
                                 emitTxSettledSnapshot(tx)
                                 settlePolicyTx(tx)
+                                replayWinnerTerminalIfStranded(tx)
                             }
                             // 已自行結清，外層 finally 跳過。
                             settle = false
@@ -6392,33 +6669,64 @@ class DualViewModel(
                                 } else if (finalResult is LoadResult.Known) {
                                     when (settleDecision) {
                                         is PolicyTxSettle.Success -> {
+                                            // Stage H2 P1: pre-bump before the terminal copy
+                                            // (inside arm, after entry stale check; non-bump emit).
+                                            bumpPolicyGenerations()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
                                             disarmBlindClear()
                                             if (tx.isRepair) disarmCorruptRepair()
-                                            cur.copy(
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = emptySet(),
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = emptySet(),
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) else policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                         is PolicyTxSettle.Mismatch -> {
+                                            // Stage H2 P1: pre-bump before the terminal copy.
+                                            bumpPolicyGenerations()
+                                            val expV = versionAtStart + 1
+                                            val expO = ownership + 1
                                             disarmBlindClear()
                                             // Stage M2 P2#3: repair mismatch = backend
                                             // readable non-empty (corruption gone);
                                             // honest REFRESHED stands, disarm repair.
                                             if (tx.isRepair) disarmCorruptRepair()
-                                            cur.copy(
-                                                policyWritePhase = PolicyWritePhase.IDLE,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraft = finalResult.packages,
-                                                policyDraftKnown = true,
+                                            if (policyDraftVersion.get() != expV ||
+                                                policyOwnershipGen.get() != expO
+                                            ) {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            } else {
+                                                cur.copy(
+                                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                                    policyDraft = finalResult.packages,
+                                                    policyDraftKnown = true,
                                         policyDraftCorrupt = false,
-                                                msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
-                                                msgKind = MsgKind.INFO,
-                                            )
+                                                    msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                                    msgKind = MsgKind.INFO,
+                                                )
+                                            }
                                         }
                                         is PolicyTxSettle.Failed -> {
                                             markPolicyUnknownLocked()
@@ -6546,9 +6854,13 @@ class DualViewModel(
             } finally {
                 // Stage I1：結清前顯式發射終態快照（reconciler 終態；settle=false 的
                 // 誠實 unresolved 不經此處故不發射）。
+                // Stage H2 P1: same stranded-terminal replay as winnerPublish
+                // (no-op when already IDLE or when fences still held for
+                // unresolved keepFence paths, which skip this block via settle).
                 if (settle) {
                     emitTxSettledSnapshot(tx)
                     settlePolicyTx(tx)
+                    replayWinnerTerminalIfStranded(tx)
                 }
             }
         }
@@ -6662,19 +6974,23 @@ class DualViewModel(
                         lateJoinPreClaimLost = true
                     }
                 }
-                // P2-1 敗者本地清理：coordinator 已非同一 Tx 時清本地＋reconciling，
-                // 後續 update 經 Tx 同一性丟棄（不覆寫勝者終態）。勝者剛 claim（coordinator
-                // 空係自己清的、本地仍持 Tx 待發布）不得清——以 lost 旗區分；非 late-join
-                // 嘗試（yielding/Unknown）而 coordinator 已空即他結，逕清。
+                // Stage H2 P1: loser follow-then-clear — never clear the local
+                // fence synchronously here. A sync CAS would race the winner's
+                // claim->stage->emit->update suspend window and discard the
+                // winner terminal via its identity gate. Keep the fence, let the
+                // version/ownership guards discard this refresh below, and
+                // converge via launchLoserSync (clears after applying).
+                // 勝者剛 claim（coordinator 空係自己清的、本地仍持 Tx 待發布）
+                // 不得跟隨——以 lost 旗區分；非 late-join 嘗試（yielding/Unknown）
+                // 而 coordinator 已空即他結，跟隨收斂（他結終態經 _latest 可見，
+                // 無終態則兜底重讀，不永久卡死）。
                 if (txSnap != null && policyTxCoordinator != null &&
                     policyTxCoordinator.activeTx.get() !== txSnap
                 ) {
                     if (lateJoinPreClaimLost) {
-                        activePolicyTx.compareAndSet(txSnap, null)
-                        policyReconciling.remove(txSnap.key)
+                        launchLoserSync(txSnap)
                     } else if (!(result is LoadResult.Known && lateJoinOk != null)) {
-                        activePolicyTx.compareAndSet(txSnap, null)
-                        policyReconciling.remove(txSnap.key)
+                        launchLoserSync(txSnap)
                     }
                 }
                 val lateFailMarked: Boolean
@@ -6711,6 +7027,12 @@ class DualViewModel(
                         // （refresh yielding 只推 freshness，永不致 Tx 丟棄）。
                         cur
                     } else if (!lateFailMarked && txSnap == null && staleForDisplay) {
+                        cur
+                    } else if (lateJoinPreClaimLost) {
+                        // Stage H2 P1: loser must not settle locally (lost the
+                        // publish race to the concurrent winner in this VM).
+                        // Discard so the winner terminal is never overwritten;
+                        // convergence arrives via the launched follow above.
                         cur
                     } else if (txSnap != null) {
                         // Tx 期中：先判 late-join（Known＋已完成），否則 yielding。
@@ -6768,10 +7090,26 @@ class DualViewModel(
                                     )
                                 }
                             } else if (txSnap.isRepair) {
+                                // Stage H2 P1: late-join winner pre-bump before the
+                                // terminal copy (claim->bump->update->emit; the post
+                                // emit below is the non-bumping path, no double).
+                                bumpPolicyGenerations()
+                                val lateKnownExpV = versionAtStart + 1
+                                val lateKnownExpO = ownershipSnap + 1
                                 lateSettled = true
                                 disarmBlindClear()
                                 disarmCorruptRepair()
-                                if (result.packages.isEmpty()) {
+                                if (policyDraftVersion.get() != lateKnownExpV ||
+                                    policyOwnershipGen.get() != lateKnownExpO
+                                ) {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (result.packages.isEmpty()) {
                                     cur.copy(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -6793,10 +7131,24 @@ class DualViewModel(
                                     )
                                 }
                             } else if (txSnap.isClear) {
+                                // Stage H2 P1: late-join winner pre-bump (same order).
+                                bumpPolicyGenerations()
+                                val lateKnownExpV = versionAtStart + 1
+                                val lateKnownExpO = ownershipSnap + 1
                                 lateSettled = true
                                 disarmBlindClear()
                                 disarmCorruptRepair()
-                                if (result.packages.isEmpty()) {
+                                if (policyDraftVersion.get() != lateKnownExpV ||
+                                    policyOwnershipGen.get() != lateKnownExpO
+                                ) {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (result.packages.isEmpty()) {
                                     cur.copy(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -6818,10 +7170,24 @@ class DualViewModel(
                                     )
                                 }
                             } else {
+                                // Stage H2 P1: late-join winner pre-bump (same order).
+                                bumpPolicyGenerations()
+                                val lateKnownExpV = versionAtStart + 1
+                                val lateKnownExpO = ownershipSnap + 1
                                 lateSettled = true
                                 disarmBlindClear()
                                 disarmCorruptRepair()
-                                if (result.packages == txSnap.sanitized) {
+                                if (policyDraftVersion.get() != lateKnownExpV ||
+                                    policyOwnershipGen.get() != lateKnownExpO
+                                ) {
+                                    cur.copy(
+                                        pendingPolicyWrite = null,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else if (result.packages == txSnap.sanitized) {
                                     cur.copy(
                                         pendingPolicyWrite = null,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -6946,6 +7312,10 @@ class DualViewModel(
                 if (lateSettled && txSnap != null) {
                     emitTxSettledSnapshot(txSnap)
                     settlePolicyTx(txSnap)
+                    // Stage H2 P1: stranded-terminal replay (same as autoRecheck
+                    // winners; late-join winner update may have been discarded
+                    // by a concurrent loser fence clear in this VM).
+                    replayWinnerTerminalIfStranded(txSnap)
                 }
             } finally {
                 if (policyRefreshInFlight.decrementAndGet() <= 0) {
