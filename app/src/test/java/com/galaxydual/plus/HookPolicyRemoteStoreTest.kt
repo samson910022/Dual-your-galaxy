@@ -15,9 +15,16 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class HookPolicyRemoteStoreTest {
+
+    @Before
+    fun setUp() {
+        // Phase2 #2 身份自檢 + 全域毒為全域狀態，跨測必須隔離。
+        resetRemotePoisonForTests()
+    }
 
     // Minimal in-memory SharedPreferences with an Editor that records explicit
     // commit()/apply() calls so the binding's synchronous-commit contract is
@@ -51,9 +58,10 @@ class HookPolicyRemoteStoreTest {
             if (data[key] is String) data[key] as? String else defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
             getStringSetCalls++
-            if (corruptType) {
+            if (corruptType && data.containsKey(key)) {
                 // 模擬條目型別錯亂 (如被誤寫成 String):真實 RemotePreferences
-                // 會在內部轉型時擲出 ClassCastException。
+                // 會在內部轉型時擲出 ClassCastException。僅當鍵存在時拋出，
+                // 使 repair 清除後 post-read 可回 Known(empty)（鍵缺席不拋）。
                 throw ClassCastException("java.lang.String cannot be cast to java.util.Set")
             }
             @Suppress("UNCHECKED_CAST")
@@ -479,9 +487,9 @@ class HookPolicyRemoteStoreTest {
 
     @Test
     fun swappedCleanInstanceRecoversKnownWithoutSave() {
-        // 舊名 stickyFlagSurvivesProviderSwapUntilSuccessfulSave 已反轉語意，
-        // 改名以誠實反映現行：第 1 層新身份穿透（DEVICE-UNVERIFIED 實驗路徑）——
-        // 換到不同身份的新 prefs 即穿透讀 Known，無需成功 save。
+        // Phase2 #2 身份自檢：換身份首讀 fail-closed（Unknown，不靜默信任），
+        // 次讀穩定即穿透 Known（確認空）。DEVICE-UNVERIFIED 實驗路徑保留，
+        // 但首讀不再靜默穿透。
         val polluted = RecordingPrefs()
         polluted.commitSucceeds = false
         val clean = RecordingPrefs()
@@ -491,8 +499,10 @@ class HookPolicyRemoteStoreTest {
         assertFalse(store.save(setOf("com.example.a")))
         assertTrue(store.loadResult() is LoadResult.Unknown)
 
-        // Phase 2：第 1 層身份穿透——新實例直接可讀 Known（確認空）。
+        // Phase2 #2：新身份首讀 fail-closed（身份不穩定 + 有毒）。
         current.set(clean)
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        // 次讀身份已穩定，穿透讀 Known（確認空）。
         val result = store.loadResult()
         assertTrue(result is LoadResult.Known)
         assertTrue((result as LoadResult.Known).packages.isEmpty())
@@ -500,8 +510,9 @@ class HookPolicyRemoteStoreTest {
 
     @Test
     fun newPrefsInstanceRecoversWithoutClearThenSaveSucceeds() {
-        // Phase 2：transient commit-false → 換新 prefs 實例（含舊值）→ load 即
-        // Known（免 clear）→ 可直接 save 新值免 clear。
+        // Phase2 #2：transient commit-false → 換新 prefs 實例（含舊值）→ 首讀
+        // fail-closed Unknown（身份不穩定），次讀穩定即 Known（舊值）→ 可直接
+        // save 新值免 clear。
         val polluted = RecordingPrefs()
         polluted.commitSucceeds = false
         val current = AtomicReference<SharedPreferences?>(polluted)
@@ -520,7 +531,8 @@ class HookPolicyRemoteStoreTest {
         )
         current.set(recovered)
 
-        // 免 clear 即恢復 Known（舊值），且可直接 save 新值。
+        // 首讀 fail-closed（身份不穩定），次讀穩定即 Known（舊值），且可直接 save 新值。
+        assertTrue(store.loadResult() is LoadResult.Unknown)
         val probed = store.loadResult()
         assertTrue(probed is LoadResult.Known)
         assertEquals(setOf("com.example.keep"), (probed as LoadResult.Known).packages)
@@ -565,8 +577,9 @@ class HookPolicyRemoteStoreTest {
 
     @Test
     fun flaggedNewIdentityProbeFailureRelatchesWithoutSelfClear() {
-        // 第 1 層新身份穿透失敗：永不觸 CCE 自清，且續閂到當今實例；
-        // 續閂後同實例短路不再碰 prefs（第二次同實例讀 getStringSetCalls 未增）。
+        // Phase2 #2 身份自檢：新身份首讀 fail-closed 不觸碰 prefs（零 getStringSet，
+        // 不靜默信任）；次讀穩定才探讀（CCE 失敗 → Unknown + 續閂到新實例）；
+        // 續閂後同實例短路不再碰 prefs。
         val polluted = RecordingPrefs()
         polluted.commitSucceeds = false
         val current = AtomicReference<SharedPreferences?>(polluted)
@@ -576,7 +589,7 @@ class HookPolicyRemoteStoreTest {
         assertTrue(store.loadResult() is LoadResult.Unknown)
         assertEquals(0, polluted.getStringSetCalls)
 
-        // 新實例帶型別損壞：穿透探讀失敗 → Unknown，不自清，續閂到新實例。
+        // 新實例帶型別損壞：首讀身份不穩定 → Unknown 且零觸碰（不探讀、不自清）。
         val bad = RecordingPrefs()
         assertTrue(
             bad.edit().putStringSet(
@@ -589,10 +602,14 @@ class HookPolicyRemoteStoreTest {
 
         val callsBefore = bad.getStringSetCalls
         assertTrue(store.loadResult() is LoadResult.Unknown)
-        assertEquals(callsBefore + 1, bad.getStringSetCalls)
+        assertEquals(callsBefore, bad.getStringSetCalls)
         assertTrue(bad.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
 
-        // 續閂：同實例第二次讀短路，不再碰 prefs。
+        // 次讀身份已穩定，探讀失敗（CCE）→ Unknown，觸碰 +1，續閂到新實例。
+        assertTrue(store.loadResult() is LoadResult.Unknown)
+        assertEquals(callsBefore + 1, bad.getStringSetCalls)
+
+        // 續閂：同實例第三次讀短路，不再碰 prefs。
         assertTrue(store.loadResult() is LoadResult.Unknown)
         assertEquals(callsBefore + 1, bad.getStringSetCalls)
 
@@ -881,7 +898,6 @@ class HookPolicyRemoteStoreTest {
             assertEquals(setOf("com.example.B"), (rb as LoadResult.Known).packages)
         } finally {
             resetRemotePoisonForTests()
-            poisonPublishHook = null
         }
     }
 
@@ -919,7 +935,6 @@ class HookPolicyRemoteStoreTest {
             assertTrue((rb as LoadResult.Known).packages.isEmpty())
         } finally {
             resetRemotePoisonForTests()
-            poisonPublishHook = null
         }
     }
 
@@ -1005,7 +1020,252 @@ class HookPolicyRemoteStoreTest {
             assertEquals(setOf("com.example.B"), (ra as LoadResult.Known).packages)
         } finally {
             resetRemotePoisonForTests()
-            poisonPublishHook = null
+        }
+    }
+
+    // Phase2 #1 備份：單一固定鍵覆寫，連續 3 次 repair 只剩 ≤1 bak 鍵（含遷移清舊鍵）。
+    @Test
+    fun backup_singleFixedKey_threeRepairsAtMostOneBakKey() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            // 種下舊無界鍵（遷移前殘留），修復時必須清除。
+            assertTrue(
+                prefs.edit().putStringSet("dual_policy.bak.111", mutableSetOf("stale1")).commit(),
+            )
+            assertTrue(
+                prefs.edit().putStringSet("dual_policy.bak.222", mutableSetOf("stale2")).commit(),
+            )
+            // 種下損壞值（Set 型，讀即 CCE）。
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.a"),
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+
+            repeat(3) {
+                val r = store.repairCorrupt()
+                assertTrue(r is RepairResult.Repaired)
+            }
+            val keys = prefs.all.keys.filter { it == BACKUP_KEY || it.startsWith(BACKUP_LEGACY_PREFIX) }
+            assertEquals(1, keys.size)
+            assertEquals(BACKUP_KEY, keys.single())
+            assertTrue(prefs.all.keys.none { it.startsWith(BACKUP_LEGACY_PREFIX) })
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #1 備份成功寫入斷言（Set 型損壞值備份內容一致）。
+    @Test
+    fun backup_successWritesSetValue() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.a", "com.example.b"),
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+            @Suppress("UNCHECKED_CAST")
+            val bak = prefs.all[BACKUP_KEY] as? Set<String>
+            assertTrue(bak != null)
+            assertEquals(setOf("com.example.a", "com.example.b"), bak!!.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #1 String 型錯亂走 toString 分支。
+    @Test
+    fun backup_stringConfusionUsesToStringBranch() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit().putString(PolicySource.POLICY_KEY_EXTRA_PACKAGES, "oops-string").commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+            @Suppress("UNCHECKED_CAST")
+            val bak = prefs.all[BACKUP_KEY] as? Set<String>
+            assertEquals(setOf("oops-string"), bak?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #1 value 截斷：超 4KB 只存類型+長度。
+    @Test
+    fun backup_truncatesOversizeValue() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val big = (1..200).map { "com.example." + "x".repeat(100) + it }.toSet()
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                big.toMutableSet(),
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+            @Suppress("UNCHECKED_CAST")
+            val bak = prefs.all[BACKUP_KEY] as? Set<String>
+            assertTrue(bak != null)
+            assertEquals(1, bak!!.size)
+            assertTrue(bak.single().contains("200"))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #2 身份脆弱：provider 每次回 new wrapper（同底層 map），
+    // save-false 後 load 仍須 Unknown（身分自檢 fail-closed）。
+    @Test
+    fun wrapperChurn_sameBackingNewWrapperStaysUnknownAfterSaveFalse() {
+        resetRemotePoisonForTests()
+        try {
+            val backing = linkedMapOf<String, Any?>()
+            var commitSucceeds = false
+            fun newWrapper(): SharedPreferences = object : SharedPreferences {
+                override fun getAll(): MutableMap<String, *> = LinkedHashMap(backing)
+                override fun getString(k: String?, d: String?): String? = d
+                override fun getStringSet(k: String?, d: MutableSet<String>?): MutableSet<String>? {
+                    @Suppress("UNCHECKED_CAST")
+                    return (backing[k] as? MutableSet<String>) ?: d
+                }
+                override fun getInt(k: String?, d: Int): Int = d
+                override fun getLong(k: String?, d: Long): Long = d
+                override fun getFloat(k: String?, d: Float): Float = d
+                override fun getBoolean(k: String?, d: Boolean): Boolean = d
+                override fun contains(k: String?): Boolean = backing.containsKey(k)
+                override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+                    private val pending = linkedMapOf<String, Any?>()
+                    private val removed = mutableSetOf<String>()
+                    override fun putString(k: String?, v: String?): SharedPreferences.Editor = this
+                    override fun putStringSet(k: String?, v: MutableSet<String>?): SharedPreferences.Editor {
+                        pending[k!!] = v?.toMutableSet(); removed.remove(k); return this
+                    }
+                    override fun putInt(k: String?, v: Int): SharedPreferences.Editor = this
+                    override fun putLong(k: String?, v: Long): SharedPreferences.Editor = this
+                    override fun putFloat(k: String?, v: Float): SharedPreferences.Editor = this
+                    override fun putBoolean(k: String?, v: Boolean): SharedPreferences.Editor = this
+                    override fun remove(k: String?): SharedPreferences.Editor {
+                        removed.add(k!!); pending.remove(k); return this
+                    }
+                    override fun clear(): SharedPreferences.Editor = this
+                    override fun commit(): Boolean {
+                        for (k in removed) backing.remove(k)
+                        for ((k, v) in pending) backing[k] = v
+                        pending.clear(); removed.clear()
+                        return commitSucceeds
+                    }
+                    override fun apply(): Unit = Unit
+                }
+                override fun registerOnSharedPreferenceChangeListener(
+                    l: SharedPreferences.OnSharedPreferenceChangeListener?,
+                ) = Unit
+                override fun unregisterOnSharedPreferenceChangeListener(
+                    l: SharedPreferences.OnSharedPreferenceChangeListener?,
+                ) = Unit
+            }
+            val store = remoteHookPolicyStore { newWrapper() }
+            assertFalse(store.save(setOf("com.example.a")))
+            // 每次新 wrapper（同底層樂觀污染 map）仍須 Unknown，不可誤讀樂觀值為 Known。
+            assertTrue(store.loadResult() is LoadResult.Unknown)
+            assertEquals(
+                setOf("com.example.a"),
+                backing[PolicySource.POLICY_KEY_EXTRA_PACKAGES]?.let {
+                    @Suppress("UNCHECKED_CAST")
+                    (it as? Set<String>)?.toSet()
+                },
+            )
+            // 第二次新 wrapper 亦 Unknown（永不穩定）。
+            assertTrue(store.loadResult() is LoadResult.Unknown)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #7 first-wins：第二次 CCE 不覆寫首次 observedGen。
+    @Test
+    fun evidence_firstWinsRetainsObservedGen() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.a"),
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            val first = remoteCorruptEvidence.get().entries.firstOrNull { it.key.get() === prefs }?.value
+            assertTrue(first != null)
+            val gen1 = first!!.observedGen
+            // 推進 gen（失敗寫入 bump），再經 repairProbe 觸發第二次 CCE
+            //（loadResult 已毒短路不再探讀，故用 loadForRepair 直探）。
+            prefs.corruptType = false
+            prefs.commitSucceeds = false
+            assertFalse(store.save(setOf("com.example.b")))
+            prefs.corruptType = true
+            prefs.commitSucceeds = true
+            assertTrue(store.loadForRepair() is LoadResult.Corrupt)
+            val second = remoteCorruptEvidence.get().entries.firstOrNull { it.key.get() === prefs }?.value
+            assertTrue(second != null)
+            assertEquals(gen1, second!!.observedGen)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #7 transient 不清除已有 evidence。
+    @Test
+    fun evidence_transientFailureRetainsPriorEvidence() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.a"),
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            assertTrue(hasCorruptEvidence(prefs))
+            // transient 寫失敗（commit false）不得清除 CCE 證據。
+            prefs.corruptType = false
+            prefs.commitSucceeds = false
+            assertFalse(store.save(setOf("com.example.b")))
+            assertTrue(hasCorruptEvidence(prefs))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase2 #8 全域 cap：相異實例風暴有界。
+    @Test
+    fun poison_capBoundedUnderDistinctInstanceStorm() {
+        resetRemotePoisonForTests()
+        try {
+            // 持有強引用免 GC（否則 stale purge 即有界，測不到 cap 逐出）。
+            val holders = mutableListOf<RecordingPrefs>()
+            val evictBase = poisonEvictCount.get()
+            repeat(150) { i ->
+                val p = RecordingPrefs()
+                holders.add(p)
+                p.commitSucceeds = false
+                val s = remoteHookPolicyStore { p }
+                assertFalse(s.save(setOf("com.example.$i")))
+            }
+            assertTrue(remotePoison.get().entries.size <= POISON_MAX_ENTRIES)
+            assertTrue(poisonEvictCount.get() - evictBase >= 150 - POISON_MAX_ENTRIES)
+        } finally {
+            resetRemotePoisonForTests()
         }
     }
 
