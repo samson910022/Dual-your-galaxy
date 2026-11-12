@@ -4592,7 +4592,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun policyWriteToggleLabel(expanded: Boolean, total: Int, shownSize: Int): String {
-        // Stage L4: 超限收合按鈕改 capped（「顯示全部」失實，改前 200＋分批）。
+        // Stage L4: 超限收合按鈕改 capped（「顯示全部」失實，改前 200＋縮減指引；寫入整組取代）。
         val overCap = total > POLICY_DIALOG_DISPLAY_MAX
         return try {
             if (expanded) getString(R.string.policy_write_show_less, shownSize)
@@ -4605,7 +4605,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun policyWriteToggleAnnounce(expanded: Boolean, total: Int, shownSize: Int): String {
-        // Stage L4: 超限展開播報改 capped（「完整清單」失實，改前 200＋分批）。
+        // Stage L4: 超限展開播報改 capped（「完整清單」失實，改前 200＋縮減指引；寫入整組取代）。
         val overCap = total > POLICY_DIALOG_DISPLAY_MAX
         return try {
             if (expanded && overCap) getString(R.string.policy_write_expanded_announce_capped, total, shownSize)
@@ -4667,7 +4667,8 @@ class MainActivity : ComponentActivity() {
             }
             message += "\n$droppedSuffix"
         }
-        // Stage L4: 超限警告（total>200 即附，display≡inspectability 指引分批）。
+        // Stage L4: 超限警告（total>200 即附，display≡inspectability 指引縮減；
+        // N4：寫入整組取代、不合併，故指引為單次 ≤200 而非分批累加）。
         if (pending.packages.size > POLICY_DIALOG_DISPLAY_MAX) {
             val shown = minOf(pending.packages.size, POLICY_DIALOG_DISPLAY_MAX)
             message += "\n" + policyWriteOverCapWarning(pending.packages.size, shown)
@@ -6607,7 +6608,8 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
 // - busy 後綴：SAVING 顯示寫入中，QUEUED（op 非 saving）顯示等待中，皆附換行。
 // Stage L4 P2#2 (b) 單次確認可檢視上界 200（display≡inspectability）：
 // positive 另須 total<=POLICY_DIALOG_DISPLAY_MAX；超限即禁用＋超限警告＋
-// 分批指引（寫入仍用完整 pending.packages，但須經門控分批確認）。
+// 縮減指引（N4：寫入整組取代、不合併，故指引為單次 ≤200 而非分批累加；
+// 寫入仍用完整 pending.packages，但須經門控縮減確認）。
 internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean): Boolean =
     !policySaving && acknowledged
 
@@ -6684,17 +6686,17 @@ internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, sh
     if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
 
 // Stage L4 capped variants fallback（超限時 Toggle/播報複用收合語義）：
-// - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超出須分批）。
-// - expanded_announce_capped：展開播報超限文案（已展開前 200，共 N，超出須分批）。
-// - over_cap_warning：dialog 超限警告（共 N，僅示前 200，須分批）。
+// - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超限須縮減；寫入整組取代）。
+// - expanded_announce_capped：展開播報超限文案（已展開前 200，共 N，超限須縮減；寫入整組取代）。
+// - over_cap_warning：dialog 超限警告（共 N，僅示前 200，單次 ≤200；寫入整組取代、不合併）。
 internal fun policyWriteShowAllCappedFallback(total: Int, shown: Int): String =
-    "顯示前 $shown 項（共 $total 項，超出須分批）"
+    "顯示前 $shown 項（共 $total 項，超限須縮減；寫入整組取代）"
 
 internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): String =
-    "已展開前 $shown 項，共 $total 項，超出須分批"
+    "已展開前 $shown 項，共 $total 項，超限須縮減；寫入整組取代"
 
 internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String =
-    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項），請分批勾選寫入（每批 ≤$shown 項）以確保逐項可檢視確認"
+    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤$shown 項，以確保逐項可檢視確認"
 
 // Stage L4 fix(a) 修復模式標籤：Corrupt 下按鈕重貼 repair 文案＋CD。
 // 路由 single source 已移至 DualViewModel.kt
