@@ -7402,4 +7402,255 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.policyDraftKnown)
     }
 
+    // Stage M1 P1 barrier (repair-first): VM-A repair staged (blocked in delete,
+    // holding shared writeMutex + coordinator claim) while VM-B attempts a valid
+    // write B → B must never start IO (fail-fast, zero saves); release repair →
+    // repair deletes Corrupt→empty, B never wrote so nothing erased.
+    @Test
+    fun m1_repairFirst_blocksConcurrentWrite() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val repairEntered = java.util.concurrent.CountDownLatch(1)
+        val repairRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCallsB = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    repairEntered.countDown()
+                    while (!repairRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    if (raw == setOf("com.B")) saveCallsB.incrementAndGet()
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB.state.value.loading }
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(repairEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertNotNull(activeTxOf(vmA))
+            assertNotNull(coordinatorTxOf(coord))
+            assertTrue(coord.writeMutex.isLocked)
+
+            // VM-B seeded Known + legacy pending attempts B while repair holds the
+            // shared writer → must fail fast with zero IO.
+            seedPolicyDraftKnown(vmB, setOf("com.seed"))
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmB, pendingB)
+            vmB.confirmPolicyWrite(pendingB)
+            Thread.sleep(800)
+            assertEquals(0, saveCallsB.get())
+            assertEquals(1, deleteCalls.get())
+            assertTrue(corrupt)
+            assertEquals(
+                PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(),
+                vmB.state.value.msg,
+            )
+
+            repairRelease.set(true)
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vmA.state.value.policyDraft)
+            assertEquals(emptySet<String>(), backing)
+            assertEquals(0, saveCallsB.get())
+            assertNull(activeTxOf(vmA))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                repairRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage M1 P1 barrier (write-first): VM-B valid write B staged (blocked in
+    // save, holding shared writeMutex + claim) while VM-A attempts repair →
+    // repair must fail fast with zero deletes; release B → B persists, old
+    // repair refused (state now Known, no delete).
+    @Test
+    fun m1_writeFirst_blocksRepair() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val saveBEntered = java.util.concurrent.CountDownLatch(1)
+        val saveBRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCallsB = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    if (raw == setOf("com.B")) {
+                        saveCallsB.incrementAndGet()
+                        saveBEntered.countDown()
+                        while (!saveBRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                    }
+                    corrupt = false
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB.state.value.loading }
+
+            // VM-A arms repair first (base rev 0).
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+
+            // VM-B stages B (seeded Known + legacy pending, blocked in save).
+            seedPolicyDraftKnown(vmB, setOf("com.seed"))
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmB, pendingB)
+            vmB.confirmPolicyWrite(pendingB)
+            assertTrue(saveBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertNotNull(coordinatorTxOf(coord))
+            assertTrue(coord.writeMutex.isLocked)
+
+            // VM-A confirms old repair while B holds the writer → fail fast, zero deletes.
+            vmA.confirmRepairCorruptDraft()
+            Thread.sleep(800)
+            assertEquals(0, deleteCalls.get())
+            assertEquals(
+                PolicyText(PolicyTextKind.BUSY).defaultText(),
+                vmA.state.value.msg,
+            )
+
+            // Release B → B persists; old repair (still armed) re-confirmed →
+            // state now Known(B) so refused without delete.
+            saveBRelease.set(true)
+            await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vmB.state.value.policyDraft)
+            assertEquals(setOf("com.B"), backing)
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+
+            vmA.confirmRepairCorruptDraft()
+            Thread.sleep(500)
+            assertEquals(0, deleteCalls.get())
+            assertEquals(setOf("com.B"), backing)
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+            assertTrue(vmA.state.value.policyDraftKnown)
+        } finally {
+            try {
+                saveBRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage M1 P1 stale repair: VM-A observes Corrupt and arms; the key is fixed
+    // externally to Known(B) (no coordinator rev change, so only the fresh
+    // trusted pre-read can catch it) → VM-A confirms old repair → abort without
+    // delete, B persists.
+    @Test
+    fun m1_staleRepairAfterForeignFix_preservesB() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        var deleteCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls++
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vmB.state.value.loading }
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+
+            // External fix to Known(B) (simulates VM-B's repair/write via another
+            // channel; deliberately no coordinator rev bump and no VM refresh, so
+            // versions stay put and only the fresh pre-read can catch it).
+            corrupt = false
+            backing = setOf("com.B")
+
+            // VM-A confirms the old (Corrupt-era) repair → fresh pre-read sees
+            // Known(B) → abort UNKNOWN_REFRESH, zero deletes, B persists.
+            vmA.confirmRepairCorruptDraft()
+            await(timeoutMs = 5_000L) {
+                vmA.state.value.msg == PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText()
+            }
+            assertEquals(0, deleteCalls)
+            assertEquals(setOf("com.B"), backing)
+            assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+            assertEquals(PolicyWritePhase.IDLE, vmA.state.value.policyWritePhase)
+
+            // VM-B refreshes afterwards and observes the persisted B.
+            vmB.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { vmB.state.value.policyDraftKnown }
+            assertEquals(setOf("com.B"), vmB.state.value.policyDraft)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }
