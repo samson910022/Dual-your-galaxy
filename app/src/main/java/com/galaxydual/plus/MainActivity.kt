@@ -1025,7 +1025,11 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             minimumHeight = dp(48)
             contentDescription = getString(R.string.clear_policy_draft_cd)
-            setOnClickListener { vm.clearPolicyDraft() }
+            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper，直調 VM
+            // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
+            // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
+            // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
+            setOnClickListener { vm.onClearPolicyButtonTap() }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -3459,6 +3463,26 @@ class MainActivity : ComponentActivity() {
             }
             if (::clearPolicyBtn.isInitialized) {
                 clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                // Stage L4 fix(a) 修復模式標籤：Corrupt 下重貼 repair 文案＋CD，
+                // 使 TalkBack 可感知「修復（兩步確認）」而非「清除」；msg 播報仍走
+                // VM 的 CORRUPT_DETECTED / REPAIR_FIRST 資源文案。非 Corrupt 回原
+                // 清除文案（Unavailable 盲清維持清除語義）。
+                try {
+                    val wantText = getString(clearPolicyButtonTextRes(s.policyDraftCorrupt))
+                    if (clearPolicyBtn.text.toString() != wantText) {
+                        clearPolicyBtn.text = wantText
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    val wantCd = getString(clearPolicyButtonCdRes(s.policyDraftCorrupt))
+                    if (clearPolicyBtn.contentDescription?.toString() != wantCd) {
+                        clearPolicyBtn.contentDescription = wantCd
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
             }
         } catch (_: Exception) {
             // Best effort: render may run before buildUi in tests.
@@ -4478,9 +4502,11 @@ class MainActivity : ComponentActivity() {
         }
         // P3 expanded dialog a11y window：初建即播報清單摘要（總數/顯示數），
         // 使 TalkBack 用戶不需逐項滑讀即知範圍；ScrollView CD 承載同文。
+        // shown 數由 PolicyListViews.shownSize 直攜（不經 text.lines() 反推，
+        // 溢出行不計入可見列，避免 off-by-one）。
         if (!confirmSaving) {
             try {
-                val summary = policyWriteListSummary(sorted.size, listViews.packagesText.text.toString().lines().size, effectiveExpanded)
+                val summary = policyWriteListSummary(sorted.size, listViews.shownSize, effectiveExpanded)
                 policyWriteDialog?.window?.decorView?.announceForAccessibility(summary)
             } catch (_: Exception) {
                 // Best effort.
@@ -4496,6 +4522,10 @@ class MainActivity : ComponentActivity() {
     private data class PolicyListViews(
         val scrollView: ScrollView,
         val packagesText: TextView,
+        // a11y off-by-one 修復：播報摘要的 shown 數直接攜帶可見列數，不再經
+        // packagesText.lines().size 反推（後者把溢出行「…等共 N 項」亦計為一列，
+        // 溢出時恆多 1）。buildPolicyListView 同步賦值，呼叫端以此為準。
+        val shownSize: Int,
     )
 
     private fun buildPolicyListView(sorted: List<String>, expanded: Boolean): PolicyListViews {
@@ -4519,7 +4549,7 @@ class MainActivity : ComponentActivity() {
                 ),
             )
         }
-        return PolicyListViews(scrollView, packagesText)
+        return PolicyListViews(scrollView, packagesText, shown.size)
     }
 
     private fun buildPolicyListText(sorted: List<String>, shown: List<String>): String {
@@ -6665,6 +6695,16 @@ internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): 
 
 internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String =
     "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項），請分批勾選寫入（每批 ≤$shown 項）以確保逐項可檢視確認"
+
+// Stage L4 fix(a) 修復模式標籤：Corrupt 下按鈕重貼 repair 文案＋CD。
+// 路由 single source 已移至 DualViewModel.kt
+// clearPolicyButtonRoute(known,corrupt,armed)（VM onClearPolicyButtonTap 唯一經此分發）：
+// 僅 !known&&corrupt 走修復，其餘一律 CLEAR。
+internal fun clearPolicyButtonTextRes(corrupt: Boolean): Int =
+    if (corrupt) R.string.action_repair_policy_draft else R.string.action_clear_policy_draft
+
+internal fun clearPolicyButtonCdRes(corrupt: Boolean): Int =
+    if (corrupt) R.string.repair_policy_draft_cd else R.string.clear_policy_draft_cd
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)

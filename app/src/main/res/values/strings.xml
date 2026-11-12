@@ -53,6 +53,9 @@
     <string name="write_policy_cd">將目前勾選寫入白名單政策草稿（只寫草稿，不安裝分身）</string>
     <string name="action_clear_policy_draft">清除草稿</string>
     <string name="clear_policy_draft_cd">清除已保存的政策草稿（不影響已安裝分身與目前勾選）</string>
+    <!-- Stage L4 fix(a)：Corrupt 修復模式按鈕（兩步確認：第一 tap 備份警告＋arm，第二 tap 執行）。 -->
+    <string name="action_repair_policy_draft">修復損壞草稿</string>
+    <string name="repair_policy_draft_cd">修復損壞的政策草稿（備份後清除，需按兩次確認；不影響已安裝分身與目前勾選）</string>
     <!-- Phase 2：手動重新整理草稿（唯讀，不觸發寫入）。 -->
     <string name="action_refresh_policy_draft">重新整理草稿</string>
     <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>

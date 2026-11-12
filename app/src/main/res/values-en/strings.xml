@@ -50,6 +50,9 @@
     <string name="write_policy_cd">Write current checks into the whitelist policy draft (draft only, never installs clones)</string>
     <string name="action_clear_policy_draft">Clear policy draft</string>
     <string name="clear_policy_draft_cd">Drop the saved policy draft (never touches installed clones or current checks)</string>
+    <!-- Stage L4 fix(a): corrupt-repair mode button (two-tap confirm: first tap arms with backup warning, second executes). -->
+    <string name="action_repair_policy_draft">Repair corrupt draft</string>
+    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (backup then clear, needs two taps to confirm; never touches installed clones or current checks)</string>
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
