@@ -223,6 +223,26 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("1 項"))
     }
 
+    // Stage N4 P2#4：save 為全量取代（REPLACEMENT，非合併累加）：先寫 200
+    // 再寫不相交 112，最終僅剩後者 112（而非 312）。鎖定 store.save →
+    // putStringSet commit 整組覆寫語義，防「分批寫入可累加」誤讀。
+    @Test
+    fun sequentialSaves_replaceNotAccumulate_200then112() {
+        val fake = FakePolicyStore(initialDraft = emptySet())
+        val first = (1..200).map { "com.example.app%03d".format(it) }.toSet()
+        val second = (201..312).map { "com.example.app%03d".format(it) }.toSet()
+        assertEquals(0, first.intersect(second).size)
+
+        assertTrue(fake.store.save(first))
+        assertEquals(first, fake.saved)
+        assertEquals(200, fake.saved!!.size)
+
+        assertTrue(fake.store.save(second))
+        assertEquals(2, fake.saveCalls)
+        assertEquals(second, fake.saved)
+        assertEquals(112, fake.saved!!.size)
+    }
+
     // owner-user 門控 (defense-in-depth):confirm/clear 對非 owner 不寫 store。
     @Test
     fun confirmAndClear_nonOwnerRefuseWithoutStoreWrite() {

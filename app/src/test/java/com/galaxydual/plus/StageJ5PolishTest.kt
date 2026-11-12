@@ -95,7 +95,7 @@ class StageJ5PolishTest {
         // 舊二參相容（不含 total 檢查，保既有測試綠）。
         assertTrue(policyDialogCanConfirm(policySaving = false, acknowledged = true))
         assertFalse(policyDialogCanConfirm(policySaving = true, acknowledged = true))
-        // 512 sanitizer 上界仍可寫（write-full 契約），但門控擋下（須分批）。
+        // 512 sanitizer 上界仍可寫（write-full 契約），但門控擋下（須縮減至單次 ≤200；寫入整組取代）。
         assertFalse(policyWriteCanConfirmInspectable(512, true, false))
         assertTrue(policyWriteIsOverCap(512))
         val (shown512, rest512) = policyWriteVisibleList((1..512).map { "com.example.%03d".format(it) }, true)
@@ -105,6 +105,8 @@ class StageJ5PolishTest {
 
     // Stage L4 201＋512 capped 文案：Toggle/播報超限變體含雙計數；write-full
     // 契約保留（pending.packages 仍完整，僅顯示截斷＋門控禁用）。
+    // Stage N4 P2#4：寫入整組取代（REPLACEMENT，不合併），故文案鎖定縮減／取代
+    // 語義（禁「分批／每批」分批累加指引；先寫 200 再寫 112 最終僅剩 112）。
     @Test
     fun cappedVariants_201_512_containCounts() {
         for (total in listOf(201, 512)) {
@@ -112,22 +114,28 @@ class StageJ5PolishTest {
             val toggleCapped = policyWriteShowAllCappedFallback(total, shown)
             assertTrue(toggleCapped.contains(total.toString()))
             assertTrue(toggleCapped.contains(shown.toString()))
-            assertTrue(toggleCapped.contains("分批"))
+            assertTrue(toggleCapped.contains("取代"))
+            assertFalse(toggleCapped.contains("分批"))
             val announceCapped = policyWriteExpandedAnnounceCappedFallback(total, shown)
             assertTrue(announceCapped.contains(total.toString()))
             assertTrue(announceCapped.contains(shown.toString()))
-            assertTrue(announceCapped.contains("分批"))
+            assertTrue(announceCapped.contains("取代"))
+            assertFalse(announceCapped.contains("分批"))
             val warning = policyWriteOverCapWarningFallback(total, shown)
             assertTrue(warning.contains(total.toString()))
             assertTrue(warning.contains(shown.toString()))
+            assertTrue(warning.contains("取代"))
+            assertFalse(warning.contains("分批"))
+            assertFalse(warning.contains("每批"))
             // 超限展開 CD 複用截斷語義（非完整）。
             val cd = policyWriteListCdFallback(total, shown, expanded = true)
             assertTrue(cd.contains("僅顯示前"))
             // 門控禁用（positive disabled），即使 ack＋非 saving。
             assertFalse(policyWriteCanConfirmInspectable(total, true, false))
         }
-        // 200 內 capped 不觸發（完整文案無「分批」）。
+        // 200 內 capped 不觸發（完整文案無取代／分批）。
         val normalToggle = policyWriteToggleLabelFallback(expanded = false, total = 50, shown = 50)
+        assertFalse(normalToggle.contains("取代"))
         assertFalse(normalToggle.contains("分批"))
     }
 

@@ -407,7 +407,8 @@ class HookPolicyStore(
         is LoadResult.Unknown -> emptySet()
     }
 
-    // 保存 (原子單鍵 commit)。空集合亦寫出 (明確寫入空草稿)；非法 token
+    // 保存 (原子單鍵 commit，全量取代 REPLACEMENT：putStringSet 整組覆寫，
+    // 非合併累加；先寫 200 再寫 112 最終僅剩 112)。空集合亦寫出 (明確寫入空草稿)；非法 token
     // 在此過濾 (VM 層已按 catalog 映射，生產第二道，見 DualViewModel)。
     fun save(packages: Set<String>): Boolean = try {
         saveRaw(sanitizeHookPolicy(packages))

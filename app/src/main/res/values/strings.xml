@@ -126,10 +126,11 @@
     <string name="policy_write_expanded_announce">已展開完整清單，共 %1$d 項</string>
     <string name="policy_write_collapsed_announce">已收合，僅顯示前 %1$d 項</string>
     <!-- Stage L4 P2#2 (b) 單次確認可檢視上界 200：超限警告＋capped Toggle/播報
-         （超限即禁用確認，須分批；%1$d=總數，%2$d=可檢視數 200）。 -->
-    <string name="policy_write_over_cap_warning">超出單次可檢視上限（共 %1$d 項，僅顯示前 %2$d 項），請分批勾選寫入（每批 ≤%2$d 項）以確保逐項可檢視確認</string>
-    <string name="policy_write_show_all_capped">顯示前 %2$d 項（共 %1$d 項，超出須分批）</string>
-    <string name="policy_write_expanded_announce_capped">已展開前 %2$d 項，共 %1$d 項，超出須分批</string>
+         （超限即禁用確認，須縮減至單次 ≤200；寫入整組取代、不合併；
+          %1$d=總數，%2$d=可檢視數 200）。N4 取代分批指引。 -->
+    <string name="policy_write_over_cap_warning">超出單次可檢視上限（共 %1$d 項，僅顯示前 %2$d 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤%2$d 項，以確保逐項可檢視確認</string>
+    <string name="policy_write_show_all_capped">顯示前 %2$d 項（共 %1$d 項，超限須縮減；寫入整組取代）</string>
+    <string name="policy_write_expanded_announce_capped">已展開前 %2$d 項，共 %1$d 項，超限須縮減；寫入整組取代</string>
     <!-- Stage L4 P2#3 corrupt 修復（CCE 損壞專用，與盲清 Unavailable 分離）。 -->
     <string name="policy_corrupt_detected">遠端政策已損壞（類型錯亂），已保留舊快照；清除需經修復確認，盲清已拒絕；若可連線建議先重新整理</string>
     <string name="policy_corrupt_repair_first">檢測到損壞的政策條目，修復將嘗試備份後清除損壞內容（備份僅 best-effort、可能失敗、無法保證可恢復；具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理</string>
