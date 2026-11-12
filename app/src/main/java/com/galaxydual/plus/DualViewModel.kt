@@ -885,6 +885,14 @@ class DualViewModel(
         val store: HookPolicyStore,
         val isClear: Boolean,
         val pending: PendingPolicyWrite? = null,
+        // Stage M1 P1: repair is a first-class destructive Tx (delete Corrupt→
+        // Known empty). isRepair distinguishes its terminal kind (REPAIRED /
+        // REPAIR_FAILED + corrupt retention) from plain clear (CLEAR_SUCCESS /
+        // CLEAR_FAILED + corrupt wash). Fencing/claim/emit paths are shared;
+        // only terminal messages + corrupt-bit handling branch on this flag.
+        // isClear stays true for repair (destructive delete-to-empty) so generic
+        // isClear gating (destructive vs write) remains correct.
+        val isRepair: Boolean = false,
     )
     // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
@@ -1755,7 +1763,8 @@ class DualViewModel(
                     tx.txId, tx.key,
                     if (tx.isClear) emptySet() else decision.packages,
                     true, MsgKind.INFO,
-                    if (tx.isClear) policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS))
+                    if (tx.isRepair) policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED))
+                    else if (tx.isClear) policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS))
                     else writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized),
                     tx.isClear,
                 )
@@ -1768,8 +1777,18 @@ class DualViewModel(
                 // 發射為唯一發射點，settle 本體不再發射，見 emitTxSettledSnapshot）。
                 emitTxSettled(successPayload)
                 disarmBlindClear()
+                if (tx.isRepair) disarmCorruptRepair()
                 _state.update { cur ->
                     if (activePolicyTx.get() !== tx) cur
+                    else if (tx.isRepair) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraft = emptySet(),
+                        policyDraftKnown = true,
+                                        policyDraftCorrupt = false,
+                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
+                        msgKind = MsgKind.INFO,
+                    )
                     else if (tx.isClear) cur.copy(
                         policyWritePhase = PolicyWritePhase.IDLE,
                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -1809,6 +1828,7 @@ class DualViewModel(
                 // Stage H2：勝者在 settle 前 tryEmit 終態。
                 emitTxSettled(mismatchPayload)
                 disarmBlindClear()
+                if (tx.isRepair) disarmCorruptRepair()
                 _state.update { cur ->
                     if (activePolicyTx.get() !== tx) cur
                     else cur.copy(
@@ -1833,7 +1853,8 @@ class DualViewModel(
                     tx.txId, tx.key, _state.value.policyDraft, false, MsgKind.FAILED,
                     policyText(
                         PolicyText(
-                            if (tx.isClear) PolicyTextKind.CLEAR_FAILED else PolicyTextKind.WRITE_FAILED,
+                            if (tx.isRepair) PolicyTextKind.CORRUPT_REPAIR_FAILED
+                            else if (tx.isClear) PolicyTextKind.CLEAR_FAILED else PolicyTextKind.WRITE_FAILED,
                         ),
                     ),
                     tx.isClear,
@@ -1851,6 +1872,14 @@ class DualViewModel(
                 val expO = policyOwnershipGen.get()
                 _state.update { cur ->
                     if (activePolicyTx.get() !== tx) cur
+                    else if (tx.isRepair) cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        policyDraftKnown = false,
+                                        policyDraftCorrupt = true,
+                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                        msgKind = MsgKind.FAILED,
+                    )
                     else if (tx.isClear) cur.copy(
                         policyWritePhase = PolicyWritePhase.IDLE,
                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
@@ -2072,6 +2101,12 @@ class DualViewModel(
     private val corruptRepairArmedAtMs = AtomicLong(-1L)
     private val corruptRepairArmedVersion = AtomicLong(-1L)
     private val corruptRepairArmedFreshGen = AtomicLong(-1L)
+    // Stage M1 P1: corrupt-repair arm carries the coordinator committedRevision
+    // snapshot at request time (authoritative cross-VM base, parallel to
+    // PendingPolicyWrite.baseCoordinatorRevision). confirm's pre-IO gate compares
+    // it under policyRevisionMutex→commitMutex (union drain); mismatch (unseen B)
+    // aborts without IO. -1L = legacy/no-coordinator (skip revision check).
+    private val corruptRepairArmedBaseRev = AtomicLong(-1L)
 
     // Stage L4 P2#3 corrupt-repair armed 狀態（UI 清除鈕路由用：未 arm 走
     // request（第一次 tap），已 arm 走 confirm（第二次 tap，TTL＋世代雙檢）。
@@ -2082,12 +2117,14 @@ class DualViewModel(
         corruptRepairArmedAtMs.set(nowMonoMs())
         corruptRepairArmedVersion.set(policyDraftVersion.get())
         corruptRepairArmedFreshGen.set(policyFreshnessGen.get())
+        corruptRepairArmedBaseRev.set(policyTxCoordinator?.currentRevision() ?: -1L)
     }
 
     private fun disarmCorruptRepair() {
         corruptRepairArmedAtMs.set(-1L)
         corruptRepairArmedVersion.set(-1L)
         corruptRepairArmedFreshGen.set(-1L)
+        corruptRepairArmedBaseRev.set(-1L)
     }
     // Phase 2 手動重新整理在途計數：policyRefreshing = count > 0（最後完成者清位，
     // 世代/版本丟棄的 stale 結果不提前清位，save bump 亦不洩漏）。
@@ -6065,6 +6102,16 @@ class DualViewModel(
                                         msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
                                         msgKind = MsgKind.INFO,
                                     )
+                                } else if (txSnap.isRepair) {
+                                    lateSettled = true
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                                        msgKind = MsgKind.FAILED,
+                                    )
                                 } else if (txSnap.isClear) {
                                     lateSettled = true
                                     cur.copy(
@@ -6085,6 +6132,31 @@ class DualViewModel(
                                         policyDraftCorrupt = false,
                                         msg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED)),
                                         msgKind = MsgKind.FAILED,
+                                    )
+                                }
+                            } else if (txSnap.isRepair) {
+                                lateSettled = true
+                                disarmBlindClear()
+                                disarmCorruptRepair()
+                                if (result.packages.isEmpty()) {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = emptySet(),
+                                        policyDraftKnown = true,
+                                        policyDraftCorrupt = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraft = result.packages,
+                                        policyDraftKnown = true,
+                                        policyDraftCorrupt = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESHED)),
+                                        msgKind = MsgKind.INFO,
                                     )
                                 }
                             } else if (txSnap.isClear) {
@@ -8400,6 +8472,17 @@ class DualViewModel(
             }
             return
         }
+        // Stage M1 P1: stale revision (unseen foreign settled) forces explicit
+        // re-read before a new repair arm (same fail-closed as requestPolicyWrite).
+        if (policyRevisionStale.get()) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
         // 第一次：僅告警並 arm，不碰 store。
         armCorruptRepairLocked()
         _state.update {
@@ -8430,6 +8513,21 @@ class DualViewModel(
         if (isPolicyReconcilingLocked()) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // Stage M1 P1: stale revision short-circuits before any arm/TTL work
+        // (old repair base is obsolete; require explicit refresh first).
+        if (policyRevisionStale.get()) {
+            disarmCorruptRepair()
+            markPolicyUnknownLocked()
+            _state.update {
+                it.copy(
+                    policyDraftKnown = false,
+                    policyDraftCorrupt = false,
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
             }
             return
         }
@@ -8489,8 +8587,10 @@ class DualViewModel(
         }
         // Stage L4: snapshot the armed generation for post-lock re-validation
         // (disarm below wipes the arm; the queue window may have changed state).
+        // Stage M1 P1: also snapshot the armed coordinator base revision.
         val armedRepairVersion = corruptRepairArmedVersion.get()
         val armedRepairFreshGen = corruptRepairArmedFreshGen.get()
+        val armedRepairBaseRev = corruptRepairArmedBaseRev.get()
         disarmCorruptRepair()
         val key = "policy-repair:${clearGeneration.incrementAndGet()}"
         if (!inFlightWrites.add(key)) {
@@ -8507,6 +8607,13 @@ class DualViewModel(
             )
         }
         viewModelScope.launch {
+            // Stage M1 P1: repair is a first-class destructive PolicyTx (same
+            // fencing as save/clear). handoverTx stays null (no RECONCILING
+            // handover: timeout maps to FAILED like the pre-M1 path, still fenced
+            // via claim/emit/settle); writeLocked tracks the app-scoped single
+            // writer; preClaimTx tracks the claimed Tx for rollback/emit/settle.
+            var writeLocked = false
+            var preClaimTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     if (isPolicyReconcilingLocked()) {
@@ -8578,6 +8685,316 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // Stage M1 P1: stale revision (foreign settled drained by the
+                    // collector during the queue window) → abort without IO.
+                    if (policyRevisionStale.get()) {
+                        markPolicyUnknownLocked()
+                        _state.update { cur ->
+                            if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            } else {
+                                cur.copy(
+                                    loading = false,
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                        }
+                        return@withLock
+                    }
+                    // Stage M1 P1: fresh trusted pre-read (bounded, detach). Local
+                    // Corrupt boolean is not proof: another VM may have fixed the
+                    // key to Known(B) since our last load. Delete ONLY if still
+                    // Corrupt; Known → abort UNKNOWN_REFRESH (CORRUPT obsolete, no
+                    // delete, require refresh); Unavailable → abort REFRESH_FAILED.
+                    val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                    val preRead: LoadResult = try {
+                        withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
+                    } catch (te: TimeoutCancellationException) {
+                        try { preJob.cancel() } catch (_: Exception) { }
+                        LoadResult.Unavailable
+                    } catch (e: CancellationException) {
+                        try { preJob.cancel() } catch (_: Exception) { }
+                        throw e
+                    } catch (_: Exception) {
+                        try { preJob.cancel() } catch (_: Exception) { }
+                        LoadResult.Unavailable
+                    }
+                    if (preRead !is LoadResult.Corrupt) {
+                        markPolicyUnknownLocked()
+                        _state.update { cur ->
+                            val preMsg = policyText(
+                                if (preRead is LoadResult.Known) PolicyText(PolicyTextKind.UNKNOWN_REFRESH)
+                                else PolicyText(PolicyTextKind.REFRESH_FAILED),
+                            )
+                            if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = preMsg,
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            } else {
+                                cur.copy(
+                                    loading = false,
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = preMsg,
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                        }
+                        return@withLock
+                    }
+                    // Stage M1 P1: H1 single-writer + coordinator claim (same as
+                    // save/clear). tryLock fail-fast: in-flight IO → BUSY + IDLE
+                    // (arm already consumed; next tap re-arms). tryClaimWrite with
+                    // the armed base revision: BUSY (foreign Tx) → BUSY + IDLE;
+                    // STALE (unseen B, rev moved) → UNKNOWN_REFRESH + IDLE.
+                    var h1RepairDeferred: Deferred<Boolean>? = null
+                    val h1RepairCoord = policyTxCoordinator
+                    if (h1RepairCoord != null) {
+                        if (!h1RepairCoord.writeMutex.tryLock()) {
+                            _state.update { cur ->
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            }
+                            return@withLock
+                        }
+                        writeLocked = true
+                        val lazy = h1RepairCoord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                            try {
+                                store.repairCorrupt() is RepairResult.Repaired
+                            } catch (ce: CancellationException) {
+                                throw ce
+                            } catch (_: Throwable) {
+                                false
+                            }
+                        }
+                        val tx = PolicyTx(
+                            txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
+                            key = key,
+                            deferred = lazy,
+                            sanitized = emptySet(),
+                            store = store,
+                            isClear = true,
+                            pending = null,
+                            isRepair = true,
+                        )
+                        val h1ClaimRes = h1RepairCoord.tryClaimWrite(tx, armedRepairBaseRev)
+                        if (h1ClaimRes == PolicyTxCoordinator.ClaimWriteResult.BUSY) {
+                            try { lazy.cancel() } catch (_: Exception) { }
+                            try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
+                            writeLocked = false
+                            _state.update { cur ->
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            }
+                            return@withLock
+                        }
+                        if (h1ClaimRes == PolicyTxCoordinator.ClaimWriteResult.STALE) {
+                            try { lazy.cancel() } catch (_: Exception) { }
+                            try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
+                            writeLocked = false
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
+                        }
+                        if (!activePolicyTx.compareAndSet(null, tx)) {
+                            try {
+                                h1RepairCoord.withCommitLock {
+                                    try {
+                                        if (h1RepairCoord.activeTx.get() === tx) h1RepairCoord.activeTx.set(null)
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                try { h1RepairCoord.activeTx.compareAndSet(tx, null) } catch (_: Exception) { }
+                            }
+                            try { lazy.cancel() } catch (_: Exception) { }
+                            try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
+                            writeLocked = false
+                            _state.update { cur ->
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            }
+                            return@withLock
+                        }
+                        h1RepairDeferred = lazy
+                        preClaimTx = tx
+                        // Stage M1 P1: pre-IO revision gate (same union drain as
+                        // save/clear) under policyRevisionMutex→commitMutex.
+                        // Checks: activeTx==self, committedRevision==armed base,
+                        // pendingPublish==null-or-self, armed version/freshGen,
+                        // stale. Fail → rollback claim (settle+unlock+cancel),
+                        // mark + UNKNOWN_REFRESH + IDLE, zero store delete.
+                        var preIoAbortRepair = false
+                        policyRevisionMutex.withLock {
+                            try {
+                                h1RepairCoord.withCommitLock {
+                                    try {
+                                        try {
+                                            val replay = try { h1RepairCoord.settled.replayCache } catch (_: Exception) { emptyList<PolicySettled>() }
+                                            for (s in replay) {
+                                                if (s.txId == tx.txId && s.key == tx.key) continue
+                                                if (s.txId < lastRevisionSeenTxId.get()) continue
+                                                val lastK = try { lastRevisionSeenKey.get() } catch (_: Exception) { null }
+                                                if (s.txId == lastRevisionSeenTxId.get() && s.key == lastK) continue
+                                                lastRevisionSeenTxId.set(s.txId)
+                                                lastRevisionSeenKey.set(s.key)
+                                                try { if (s.rev != -1L) lastRevisionSeenRev.set(s.rev) } catch (_: Exception) { }
+                                                policyRevisionStale.set(true)
+                                            }
+                                            try {
+                                                val latestOne = try { h1RepairCoord.latest.value } catch (_: Exception) { null }
+                                                if (latestOne != null &&
+                                                    !(latestOne.txId == tx.txId && latestOne.key == tx.key)
+                                                ) {
+                                                    val lastR = try { lastRevisionSeenRev.get() } catch (_: Exception) { -1L }
+                                                    val isNewer = if (latestOne.rev != -1L && lastR != -1L) {
+                                                        latestOne.rev > lastR
+                                                    } else {
+                                                        latestOne.txId != lastRevisionSeenTxId.get() ||
+                                                            latestOne.key != try { lastRevisionSeenKey.get() } catch (_: Exception) { null }
+                                                    }
+                                                    if (isNewer) {
+                                                        lastRevisionSeenTxId.set(latestOne.txId)
+                                                        lastRevisionSeenKey.set(latestOne.key)
+                                                        try { if (latestOne.rev != -1L) lastRevisionSeenRev.set(latestOne.rev) } catch (_: Exception) { }
+                                                        policyRevisionStale.set(true)
+                                                    }
+                                                }
+                                            } catch (_: Exception) {
+                                            }
+                                        } catch (_: Exception) {
+                                        }
+                                        try {
+                                            val stagedForDrain = try { h1RepairCoord.pendingPublish.get() } catch (_: Exception) { null }
+                                            if (stagedForDrain != null &&
+                                                !(stagedForDrain.txId == tx.txId && stagedForDrain.key == tx.key)
+                                            ) {
+                                                policyRevisionStale.set(true)
+                                            }
+                                        } catch (_: Exception) {
+                                        }
+                                    } catch (_: Exception) {
+                                    }
+                                    val baseMismatchPreIo = armedRepairVersion != -1L &&
+                                        (armedRepairVersion != policyDraftVersion.get() ||
+                                            armedRepairFreshGen != policyFreshnessGen.get())
+                                    val coordActive = try { h1RepairCoord.activeTx.get() } catch (_: Exception) { null }
+                                    val coordActiveOk = (coordActive == null || coordActive === tx)
+                                    val revOk = (armedRepairBaseRev == -1L ||
+                                        h1RepairCoord.committedRevision.get() == armedRepairBaseRev)
+                                    val staged = try { h1RepairCoord.pendingPublish.get() } catch (_: Exception) { null }
+                                    val pendingOk = (staged == null || (staged.txId == tx.txId && staged.key == tx.key))
+                                    if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get()) {
+                                        preIoAbortRepair = true
+                                    } else {
+                                        // Stage M1 P1: do NOT start the delete here —
+                                        // the final fresh revalidation below runs first
+                                        // (immediately before the delete); the claim
+                                        // (activeTx) + writeMutex already fence
+                                        // concurrent writers in between.
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                val baseMismatchPreIo = armedRepairVersion != -1L &&
+                                    (armedRepairVersion != policyDraftVersion.get() ||
+                                        armedRepairFreshGen != policyFreshnessGen.get())
+                                if (baseMismatchPreIo || policyRevisionStale.get()) {
+                                    preIoAbortRepair = true
+                                } else {
+                                    // Stage M1 P1: same — start deferred to after the
+                                    // final fresh revalidation below.
+                                }
+                            }
+                        }
+                        if (preIoAbortRepair) {
+                            settlePolicyTx(tx)
+                            preClaimTx = null
+                            if (writeLocked) {
+                                try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
+                                writeLocked = false
+                            }
+                            try { lazy.cancel() } catch (_: Exception) { }
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
+                        }
+                    }
                     _state.update {
                         it.copy(
                             loading = true,
@@ -8586,56 +9003,236 @@ class DualViewModel(
                             policyWritePhase = PolicyWritePhase.SAVING,
                         )
                     }
-                    val result: RepairResult = try {
-                        withTimeout(policyIoTimeoutMs) {
-                            onIo { store.repairCorrupt() }
+                    policyWriteSaving.add(key)
+                    try {
+                        // Stage M1 P1: final fresh revalidation immediately before
+                        // the destructive delete (closes gate-to-delete TOCTOU).
+                        // Backend writes hold writeMutex, which we hold, so no
+                        // concurrent delete/write can land between this read and
+                        // the repair below; a Known here means B landed before we
+                        // claimed (gate missed a test-only synthetic emit) and we
+                        // must abort without deleting.
+                        val finalJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                        val finalRead: LoadResult = try {
+                            withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { finalJob.await() }
+                        } catch (te: TimeoutCancellationException) {
+                            try { finalJob.cancel() } catch (_: Exception) { }
+                            LoadResult.Unavailable
+                        } catch (e: CancellationException) {
+                            try { finalJob.cancel() } catch (_: Exception) { }
+                            throw e
+                        } catch (_: Exception) {
+                            try { finalJob.cancel() } catch (_: Exception) { }
+                            LoadResult.Unavailable
                         }
-                    } catch (te: TimeoutCancellationException) {
-                        RepairResult.RepairFailed
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        RepairResult.RepairFailed
-                    }
-                    if (result is RepairResult.Repaired) {
-                        policyDraftVersion.incrementAndGet()
-                        policyFreshnessGen.incrementAndGet()
-                        policyOwnershipGen.incrementAndGet()
-                        disarmBlindClear()
-                        disarmCorruptRepair()
-                        policyRevisionStale.set(false)
-                        _state.update {
-                            it.copy(
-                                loading = false,
-                                policyDraft = emptySet(),
-                                policyDraftKnown = true,
-                                policyDraftCorrupt = false,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
-                                msgKind = MsgKind.INFO,
-                            )
+                        if (finalRead !is LoadResult.Corrupt) {
+                            val pcAbort = preClaimTx
+                            if (pcAbort != null) {
+                                settlePolicyTx(pcAbort)
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                            } else {
+                                try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                            }
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                val abortMsg = policyText(
+                                    if (finalRead is LoadResult.Known) PolicyText(PolicyTextKind.UNKNOWN_REFRESH)
+                                    else PolicyText(PolicyTextKind.REFRESH_FAILED),
+                                )
+                                cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = abortMsg,
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                            return@withLock
                         }
-                    } else {
-                        markPolicyUnknownLocked()
-                        _state.update {
-                            it.copy(
-                                loading = false,
-                                policyDraftKnown = false,
-                                policyDraftCorrupt = true,
-                                policyWritePhase = PolicyWritePhase.IDLE,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
-                                msgKind = MsgKind.FAILED,
-                            )
+                        // Stage M1 P1: run the destructive delete under the claim
+                        // (LAZY started here, immediately after the final fresh
+                        // revalidation above; null-coordinator path runs eager).
+                        // Bounded await; timeout/throw → FAILED (no
+                        // silent path; failure keeps Corrupt + FAILED).
+                        try {
+                            h1RepairDeferred?.let {
+                                try {
+                                    it.start()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        } catch (_: Exception) {
                         }
+                        // (LAZY already started in the gate; null-coordinator path
+                        // runs eager). Bounded await; timeout/throw → FAILED (no
+                        // silent path; failure keeps Corrupt + FAILED).
+                        val deferred: Deferred<Boolean> = h1RepairDeferred ?: viewModelScope.async(Dispatchers.IO) {
+                            try {
+                                store.repairCorrupt() is RepairResult.Repaired
+                            } catch (ce: CancellationException) {
+                                throw ce
+                            } catch (_: Throwable) {
+                                false
+                            }
+                        }
+                        val ok: Boolean? = try {
+                            withTimeout(policyIoTimeoutMs) { deferred.await() }
+                        } catch (te: TimeoutCancellationException) {
+                            null
+                        } catch (e: Exception) {
+                            if (e is CancellationException) {
+                                if (preClaimTx == null) {
+                                    try { deferred.cancel() } catch (_: Exception) { }
+                                }
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                throw e
+                            }
+                            if (preClaimTx == null) {
+                                try { deferred.cancel() } catch (_: Exception) { }
+                            }
+                            false
+                        }
+                        if (ok == null) {
+                            // Timeout: result unknown. Pre-M1 mapped to FAILED;
+                            // keep FAILED (no new RECONCILING path for repair) but
+                            // fenced via claim/emit/settle like save/clear failure.
+                            val pcTimeout = preClaimTx
+                            if (pcTimeout != null && !claimForPublish(pcTimeout)) {
+                                markPolicyUnknownLocked()
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                return@withLock
+                            }
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = true,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                                    msgKind = MsgKind.FAILED,
+                                )
+                            }
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                emitTxSettledSnapshot(pc)
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                            }
+                            if (writeLocked) {
+                                try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                writeLocked = false
+                            }
+                            return@withLock
+                        }
+                        if (ok) {
+                            // Success: repairCorrupt verified Known(empty) via its
+                            // authoritative post-read. Fenced publish (placeholder
+                            // claim → bump → REPAIRED → emit → settle), same order
+                            // as save/clear fast-path.
+                            val pcFast = preClaimTx
+                            if (pcFast != null && !claimForPublish(pcFast)) {
+                                try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                return@withLock
+                            }
+                            policyDraftVersion.incrementAndGet()
+                            policyFreshnessGen.incrementAndGet()
+                            policyOwnershipGen.incrementAndGet()
+                            disarmBlindClear()
+                            disarmCorruptRepair()
+                            policyRevisionStale.set(false)
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraft = emptySet(),
+                                    policyDraftKnown = true,
+                                    policyDraftCorrupt = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)),
+                                    msgKind = MsgKind.INFO,
+                                )
+                            }
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                emitTxSettledSnapshot(pc)
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                            }
+                            if (writeLocked) {
+                                try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                writeLocked = false
+                            }
+                        } else {
+                            // Proven failure (returned false / threw): FAILED +
+                            // Unknown, retain Corrupt (still damaged), fenced emit.
+                            val pcFailFast = preClaimTx
+                            if (pcFailFast != null && !claimForPublish(pcFailFast)) {
+                                markPolicyUnknownLocked()
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                return@withLock
+                            }
+                            markPolicyUnknownLocked()
+                            _state.update {
+                                it.copy(
+                                    loading = false,
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = true,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    msg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                                    msgKind = MsgKind.FAILED,
+                                )
+                            }
+                            val pc = preClaimTx
+                            if (pc != null) {
+                                emitTxSettledSnapshot(pc)
+                                settlePolicyTx(pc)
+                                preClaimTx = null
+                            }
+                            if (writeLocked) {
+                                try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                writeLocked = false
+                            }
+                        }
+                    } finally {
+                        policyWriteSaving.remove(key)
                     }
                 }
             } catch (e: CancellationException) {
                 _state.update { it.copy(loading = false) }
                 throw e
             } finally {
+                if (writeLocked) {
+                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                }
+                // No handover for repair (timeout maps to FAILED above, fenced).
                 inFlightWrites.remove(key)
+                policyWriteSaving.remove(key)
             }
         }
     }
