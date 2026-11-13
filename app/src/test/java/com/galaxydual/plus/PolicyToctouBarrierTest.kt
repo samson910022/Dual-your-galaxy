@@ -100,11 +100,12 @@ class PolicyToctouBarrierTest {
         try {
             val backend = AtomicReference<Set<String>?>(setOf("com.seed"))
             val entered = CountDownLatch(1)
+            val releaseIo = CountDownLatch(1)
             val store = HookPolicyStore(
                 loadRaw = {
                     entered.countDown()
-                    // In-flight IO window: the test bumps the revision here.
-                    Thread.sleep(150)
+                    // In-flight IO window: block until test bumps revision mid-IO.
+                    try { releaseIo.await(5, TimeUnit.SECONDS) } catch (_: Throwable) { }
                     backend.get()
                 },
                 saveRaw = { raw ->
@@ -144,13 +145,19 @@ class PolicyToctouBarrierTest {
                 "bump must move rev beyond observed (bumped=$bumped observed=$observedBefore)",
                 if (observedBefore == -1L) bumped != -1L else bumped > observedBefore,
             )
-            // Let the refresh finish (IO 150ms + settle).
+            // Release blocked IO after mid-IO rev move (deterministic, no sleep).
+            try { releaseIo.countDown() } catch (_: Throwable) { }
+            // Let the refresh finish.
             await(timeoutMs = 10_000L) { !vm.state.value.policyRefreshing }
 
             // Stale Known discarded: stay Unknown, no disarm/mark wash.
             assertFalse(vm.state.value.policyDraftKnown)
             assertEquals(observedBefore, vm.observedRevForTests())
-            assertTrue("rev sampler must see revBefore + revMoved", calls.get() >= 2)
+            // Exactly revBefore + revMoved: the mark path (3rd read) must not run
+            // on discard (already pinned by !thirdHappened below, so ==2 is the
+            // stable equivalent of >=2 — no background path samples this VM's
+            // sampler between install and refresh settle).
+            assertEquals("rev sampler must see exactly revBefore + revMoved", 2, calls.get())
             assertFalse("mark path (3rd read) must not run on discard", thirdHappened.get())
             // Latch discipline: the 2nd read observed the bump (revMoved true);
             // the 3rd read gate stayed closed (no release needed, no hang).

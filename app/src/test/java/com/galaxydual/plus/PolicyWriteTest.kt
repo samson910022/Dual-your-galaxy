@@ -63,6 +63,7 @@ class PolicyWriteTest {
     }
 
     private val vms = mutableListOf<DualViewModel>()
+    private val coords = java.util.concurrent.CopyOnWriteArrayList<PolicyTxCoordinator>()
 
     @Before
     fun setUp() {
@@ -91,6 +92,10 @@ class PolicyWriteTest {
             }
         }
         vms.clear()
+        for (c in coords) {
+            try { c.close() } catch (_: Exception) { }
+        }
+        coords.clear()
         Dispatchers.resetMain()
         resetRemotePoisonForTests()
     }
@@ -127,6 +132,9 @@ class PolicyWriteTest {
             policyTxCoordinator = policyTxCoordinator,
         )
         vms.add(vm)
+        if (policyTxCoordinator != null && !coords.contains(policyTxCoordinator)) {
+            coords.add(policyTxCoordinator)
+        }
         // 等 init 的政策草稿載入完成,避免其 _state.update 與 confirm 競爭。
         // Phase 5：以 Known 為準（前身以 draft==initialDraft 判定，確認空 emptySet
         // 初值即等致 vacuous 起步）：Known 翻轉與 draft 同一 emission，await Known
@@ -9261,6 +9269,71 @@ class PolicyWriteTest {
             } finally {
                 try { coord.close() } catch (_: Exception) { }
             }
+        }
+    }
+
+    // Cancellation while suspended on policyRevisionMutex acquisition (confirm):
+    // hold policyRevisionMutex in test, launch confirm (claims writeMutex + activeTx,
+    // then parks on withLock), cancel opJob while parked. Must rethrow cleanly with
+    // zero backend writes, LAZY unarmed and cancelled, no stranded coord.activeTx /
+    // writeMutex / activePolicyTx, and revision mutex released for reuse.
+    @Test
+    fun cancelAtPolicyRevisionMutex_confirm_zeroWritesAndCleanRollback() {
+        fun policyRevisionMutexOf(vm: DualViewModel): kotlinx.coroutines.sync.Mutex {
+            val f = DualViewModel::class.java.getDeclaredField("policyRevisionMutex").apply { isAccessible = true }
+            return f.get(vm) as kotlinx.coroutines.sync.Mutex
+        }
+
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val store = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { _ -> saveCalls.incrementAndGet(); true },
+            )
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(
+                setOf("com.B"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vm, pending)
+            val revMutex = policyRevisionMutexOf(vm)
+            runBlocking { revMutex.lock() }
+            try {
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
+                val beforeChildren = scopeJob.children.toSet()
+                vm.confirmPolicyWrite(pending)
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(coord.writeMutex.isLocked)
+                val opJob = scopeJob.children.first { it !in beforeChildren }
+                // Ensure the op is parked on policyRevisionMutex.withLock (claim done,
+                // armed still false, writeMutex held), then cancel while suspended.
+                Thread.sleep(100)
+                assertFalse(claimedTx.executionArmed.get())
+                opJob.cancel()
+                await(timeoutMs = 5_000L) {
+                    !opJob.isActive &&
+                        vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked
+                }
+                assertEquals(0, saveCalls.get())
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(claimedTx.deferred.isCancelled)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+                assertFalse(coord.writeMutex.isLocked)
+            } finally {
+                try {
+                    if (revMutex.isLocked) revMutex.unlock()
+                } catch (_: Exception) { }
+            }
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
         }
     }
 
