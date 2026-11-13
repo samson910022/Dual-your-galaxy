@@ -139,6 +139,8 @@ internal fun resetRemotePoisonForTests() {
     }
     try {
         lastPrefsHash.set(0L)
+        globalLastPrefsIdentity.set(null)
+        testIdentityCheckHook = null
     } catch (_: Throwable) {
     }
     try {
@@ -155,6 +157,11 @@ internal fun resetRemotePoisonForTests() {
     }
 }
 
+@Volatile
+internal var testIdentityCheckHook: (() -> Unit)? = null
+
+internal val globalLastPrefsIdentity = AtomicReference<SharedPreferences?>(null)
+
 // Phase2 #2 身份穩定自檢：provider() 連續兩次身份不同即視為不穩定
 // （libxposed 承諾同一 group 永久同一實例；每次 new wrapper 即違約）。
 // - 回傳 true = 穩定（或無毒可信），可繼續正常讀；false = 當次必須
@@ -164,17 +171,33 @@ internal fun resetRemotePoisonForTests() {
 //   使下一穩定讀可恢復（wrapper-churn 永不穩定故永 Unknown；合法 swap
 //   首讀 Unknown、次讀穩定即 Known）。
 // - 寫路徑不經此門（寫是重同步機會，必須放行以清毒），僅更新 last。
-internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
+// - 使用強引用（prev === prefs）追蹤實體參照，消除 32-bit hash 碰撞風險與 GC 引發的 wrapper-churn 逃逸；
+//   支援 per-store 實例隔離，避免多 store 交互干擾。
+internal fun checkPrefsIdentityStable(
+    prefs: SharedPreferences,
+    lastRef: AtomicReference<SharedPreferences?> = globalLastPrefsIdentity,
+): Boolean {
+    testIdentityCheckHook?.invoke()
     val curHash = try {
         System.identityHashCode(prefs)
     } catch (_: Throwable) {
         0
     }
-    // Phase7: curHash == 0 fail-closed (was: return true). 0 arises from a
-    // throwing identityHashCode (hostile prefs) or a genuine 0 hash
-    // (1/2^32). Either way the identity is unverifiable, so the read must
-    // not be trusted when poison/evidence is present. Count + log like any
-    // other mismatch below.
+    try {
+        lastPrefsHash.set(curHash.toLong())
+    } catch (_: Throwable) {
+    }
+
+    val prev = try {
+        lastRef.get()
+    } catch (_: Throwable) {
+        null
+    }
+    try {
+        lastRef.set(prefs)
+    } catch (_: Throwable) {
+    }
+
     if (curHash == 0) {
         try {
             identityMismatchCount.incrementAndGet()
@@ -202,22 +225,16 @@ internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
         if (!poisonedZero && !hasEvidenceZero) return true
         return false
     }
-    val prev = try {
-        lastPrefsHash.get()
-    } catch (_: Throwable) {
-        0L
-    }
-    try {
-        lastPrefsHash.set(curHash.toLong())
-    } catch (_: Throwable) {
-    }
-    if (prev == 0L || prev == curHash.toLong()) return true
+
+    // 參照身分全等（或首讀無前值）即判定穩定
+    if (prev == null || prev === prefs) return true
+
     try {
         identityMismatchCount.incrementAndGet()
     } catch (_: Throwable) {
     }
     try {
-        logStore("provider identity changed prev=$prev cur=$curHash (unstable wrapper?)")
+        logStore("provider identity changed prev=$prev cur=$prefs (unstable wrapper?)")
     } catch (_: Throwable) {
     }
     val poisoned = try {
@@ -240,9 +257,16 @@ internal fun checkPrefsIdentityStable(prefs: SharedPreferences): Boolean {
     return false
 }
 
-internal fun notePrefsIdentity(prefs: SharedPreferences) {
+internal fun notePrefsIdentity(
+    prefs: SharedPreferences,
+    lastRef: AtomicReference<SharedPreferences?> = globalLastPrefsIdentity,
+) {
     try {
         lastPrefsHash.set(System.identityHashCode(prefs).toLong())
+    } catch (_: Throwable) {
+    }
+    try {
+        lastRef.set(prefs)
     } catch (_: Throwable) {
     }
 }
@@ -688,6 +712,8 @@ class HookPolicyStore(
         try {
             val ts = try { System.currentTimeMillis() } catch (_: Throwable) { 0L }
             backupCorruptBestEffort(ts)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Throwable) {
             // Best effort: 備份失敗不擋修復。
         }
@@ -756,6 +782,7 @@ class HookPolicyStore(
 fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
 ): HookPolicyStore {
+    val storeIdentityRef = AtomicReference<SharedPreferences?>(null)
     fun resolvePrefs(): SharedPreferences? = try {
         provider()
     } catch (ce: CancellationException) {
@@ -776,8 +803,11 @@ fun remoteHookPolicyStore(
             } else {
                 // Phase2 #2: 身份穩定自檢 — wrapper-churn 當次 fail-closed。
                 try {
-                    if (!checkPrefsIdentityStable(prefs)) return@HookPolicyStore null
+                    if (!checkPrefsIdentityStable(prefs, storeIdentityRef)) return@HookPolicyStore null
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Throwable) {
+                    return@HookPolicyStore null // Fail closed!
                 }
                 // Phase2 #8: 讀路徑亦 purge stale（同 gen 不 bump）。
                 try {
@@ -851,7 +881,7 @@ fun remoteHookPolicyStore(
                 // 寫是重同步機會：僅更新身份（不 fail-closed），使合法新實例
                 // 的後續讀可穩定恢復。
                 try {
-                    notePrefsIdentity(prefs)
+                    notePrefsIdentity(prefs, storeIdentityRef)
                 } catch (_: Throwable) {
                 }
                 // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
@@ -901,6 +931,8 @@ fun remoteHookPolicyStore(
         isServiceAvailable = {
             try {
                 provider() != null
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (_: Throwable) {
                 false
             }
@@ -926,9 +958,11 @@ fun remoteHookPolicyStore(
                 LoadResult.Unavailable
             } else {
                 val identityOk = try {
-                    checkPrefsIdentityStable(prefs)
+                    checkPrefsIdentityStable(prefs, storeIdentityRef)
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Throwable) {
-                    true
+                    false // Fail closed!
                 }
                 if (!identityOk) {
                     LoadResult.Unavailable
@@ -1032,6 +1066,8 @@ fun remoteHookPolicyStore(
         store.setCorruptEvidenceProbe {
             val prefs = try {
                 provider()
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (_: Throwable) {
                 null
             } ?: return@setCorruptEvidenceProbe false
@@ -1045,11 +1081,19 @@ fun remoteHookPolicyStore(
         //   無法保證可恢復；失敗忽略仍刪除，不擋修復。
         store.setBackupHook { _ ->
             try {
-                val prefs = try { provider() } catch (_: Throwable) { null } ?: return@setBackupHook
+                val prefs = try {
+                    provider()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                } ?: return@setBackupHook
                 // 單快照供遷移 + 備份共用（免兩次 prefs.all 全掃）；all 失敗即跳過
                 // 遷移/備份，不擋修復（best-effort）。
                 val snapshot: Map<String, *> = try {
                     prefs.all
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Throwable) {
                     return@setBackupHook
                 }
@@ -1095,9 +1139,13 @@ fun remoteHookPolicyStore(
                                     setOf(s)
                                 }
                             }
+                        } catch (ce: CancellationException) {
+                            throw ce
                         } catch (_: Throwable) {
                             null
                         } ?: setOf("${rawObj.javaClass.name}:unreadable")
+                    } catch (ce: CancellationException) {
+                        throw ce
                     } catch (_: Throwable) {
                         // Best effort: 備份失敗不擋修復。
                         null
@@ -1123,11 +1171,17 @@ fun remoteHookPolicyStore(
                     // 單次 commit 批量落盤（遷移 + 備份同一事務）。
                     try {
                         ed.commit()
+                    } catch (ce: CancellationException) {
+                        throw ce
                     } catch (_: Throwable) {
                     }
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Throwable) {
                     // Best effort: 備份失敗不擋修復。
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (_: Throwable) {
                 // Best effort.
             }

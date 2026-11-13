@@ -12,6 +12,7 @@ import android.content.SharedPreferences
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
@@ -26,15 +27,14 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     }
 
     override fun onServiceBind(service: XposedService) {
-        GalaxyApp.service = service
+        serviceRef.set(service)
         // 5.1.5:通知所有綁定監聽者 (例如刷新政策草稿)。
         notifyServiceListeners()
     }
 
     override fun onServiceDied(service: XposedService) {
-        // 只清同一 instance,避免新 binder 被舊的 death 回調清掉。
-        if (GalaxyApp.service === service) {
-            GalaxyApp.service = null
+        // 原子 CAS：只清同一 instance，避免新 binder 被舊的 death 回調清掉。
+        if (serviceRef.compareAndSet(service, null)) {
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
         }
@@ -51,8 +51,7 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     }
 
     companion object {
-        @Volatile
-        private var service: XposedService? = null
+        private val serviceRef = AtomicReference<XposedService?>(null)
 
         // 5.1.5:service 綁定監聽者 (CopyOnWriteArrayList 供併發安全)。
         // Phase 4:改 private + add/remove 封裝,避免外部直接 mutable 存取。
@@ -74,7 +73,7 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         // 不得被吞為缺席），其餘 Throwable（含 Error）才轉 null。
         fun remotePreferences(group: String): SharedPreferences? =
             try {
-                service?.getRemotePreferences(group)
+                serviceRef.get()?.getRemotePreferences(group)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
@@ -82,6 +81,6 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             }
 
         // 供呼叫端在訂閱後補發已綁定狀態 (避免 lost-event 競態)。
-        fun isServiceConnected(): Boolean = service != null
+        fun isServiceConnected(): Boolean = serviceRef.get() != null
     }
 }

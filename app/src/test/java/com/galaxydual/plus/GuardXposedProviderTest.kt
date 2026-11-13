@@ -32,6 +32,24 @@ class GuardXposedProviderTest {
         assertTrue(isTrustedXposedCaller(1000, myUid))
     }
 
+    @Test
+    fun secondaryUserSystemCallerAllowed() {
+        // Same secondary user (user 10, system 1000 -> 1001000, myUid -> 1010123)
+        val secondaryUserMyUid = 10 * 100_000 + 10123
+        val secondaryUserSystemUid = 10 * 100_000 + 1000
+        assertTrue(isTrustedXposedCaller(secondaryUserSystemUid, secondaryUserMyUid))
+
+        // Different secondary user (caller user 11 system 1000 -> 1101000, myUid in user 10)
+        val diffUserSystemUid = 11 * 100_000 + 1000
+        assertFalse(isTrustedXposedCaller(diffUserSystemUid, secondaryUserMyUid))
+
+        // Same secondary user, non-system appId (e.g. shell 2000 or app 10124)
+        val secondaryUserShellUid = 10 * 100_000 + 2000
+        val secondaryUserAppUid = 10 * 100_000 + 10124
+        assertFalse(isTrustedXposedCaller(secondaryUserShellUid, secondaryUserMyUid))
+        assertFalse(isTrustedXposedCaller(secondaryUserAppUid, secondaryUserMyUid))
+    }
+
     // Phase 4 收緊:shell (2000) 不再受信任 (僅 root 0/system 1000/self)。
     // 舊碼信任整個 < FIRST_APPLICATION_UID 範圍 (含 shell);現拒絕。
     // TODO(on-device):驗證 LSPosed daemon 實際 uid,若非 0/1000 需回調。
@@ -356,13 +374,23 @@ class GuardXposedProviderTest {
     }
 
     // 拒絕類別純函數：shell/privileged/negative/app 四類可辨，且不含任何內容。
+    // 多用戶（user 10 等）UID 經 % 100_000 正規化後亦能正確分類。
     @Test
     fun rejectionCategoryCoversUidClasses() {
+        assertEquals("privileged", uidRejectionCategory(0, myUid))
+        assertEquals("privileged", uidRejectionCategory(1000, myUid))
+        assertEquals("privileged", uidRejectionCategory(1000000, myUid))
+        assertEquals("privileged", uidRejectionCategory(1001000, myUid))
         assertEquals("shell", uidRejectionCategory(2000, myUid))
         assertEquals("privileged", uidRejectionCategory(9999, myUid))
         assertEquals("privileged", uidRejectionCategory(1001, myUid))
         assertEquals("negative", uidRejectionCategory(-1, myUid))
         assertEquals("app", uidRejectionCategory(10124, myUid))
+        // Secondary user (userId = 10, offset = 1_000_000)
+        assertEquals("shell", uidRejectionCategory(1002000, myUid))
+        assertEquals("privileged", uidRejectionCategory(1001001, myUid))
+        assertEquals("privileged", uidRejectionCategory(1009999, myUid))
+        assertEquals("app", uidRejectionCategory(1010124, myUid))
     }
 
     // 速率窗口表有界：512 上限下大量不同 uid 不無限增長（驅逐舊鍵）。
