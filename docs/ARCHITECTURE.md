@@ -24,9 +24,14 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
   (`tools:node="remove"`) and declares `GuardXposedProvider` at the same
   authority.
 - `GuardXposedProvider` delegates `call()` to the library provider instance but
-  gates it: only LSPosed daemon UIDs (`uid < FIRST_APPLICATION_UID`, including
-  shell 2000) or the app itself (`uid == Process.myUid()`) may deliver a binder;
-  everything else gets `null`. CRUD stays inert (`null`/`0`).
+  gates it: only root (`uid == 0`), system (`appId == 1000` — exact `1000`, or the
+  same-user system UID in multi-user, `uid % 100_000 == 1000` within the app's
+  user), or the app itself (`uid == Process.myUid()`) may deliver a binder;
+  **everything else is rejected — including shell (`2000`) and general app
+  UIDs** — and gets `null`. The trusted set is exactly that; the
+  `uid < FIRST_APPLICATION_UID` superset is **not** trusted. The UID checked is
+  the kernel-set `Binder.getCallingUid()`, never a caller-supplied value. CRUD
+  stays inert (`null`/`0`).
 - The pure decision function `isTrustedXposedCaller` / `guardedPolicyCall` is
   JVM-tested; the real SendBinder round-trip remains DEVICE-UNVERIFIED.
 
@@ -82,6 +87,17 @@ val privilege: Privilege = when {
 > against SDK 34 on the AGP 8.5.2 baseline. The app only uses APIs available in
 > 34; the API 29 instrumentation run is the runtime-compatibility guard. This
 > flag will be revisited on the next AGP/compileSdk upgrade.
+>
+> Build-note: `gradle/verification-metadata.xml` enforces dependency
+> verification in **sha256** mode with `verify-signatures=false`; regenerate via
+> `./gradlew --write-verification-metadata sha256 <tasks>` (never hand-edit hashes
+> except the aapt2 caveat below). It covers all currently-run classpaths
+> (incl. lint / debug / test); the residual is the emulator `connectedAndroidTest`
+> path, which is unverified, and `release.yml` remains unpinned (tracked as
+> follow-up). Caveat: the aapt2 **platform-classifier** artifacts
+> (`-windows.jar`/`-osx.jar`) are not resolvable on this Linux host, so those
+> entries were added manually with sha256 hashes verified locally from Google's
+> Maven (`dl.google.com`); the linux classifier stays Gradle-generated.
 >
 > Device + SDK 矩陣（release gate 實證口徑：JVM／emulator 綠燈不等於 S24 裝置驗收）：
 >
@@ -165,7 +181,7 @@ val privilege: Privilege = when {
 
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
-- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例，寫入側版本序號＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
+- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例；`extra_whitelist_version` 版本序號 **規劃中／未實作**，新鮮度目前僅靠 TTL＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活，後續全 `BUSY`，由 `refreshPolicyDraft` late-join 結清回 `IDLE`）；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
 - Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。

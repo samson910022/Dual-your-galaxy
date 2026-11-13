@@ -225,4 +225,27 @@ class PolicySourceTest {
 
         assertEquals(setOf("a"), PolicySource.sanitize(setOf("a", 42 as Any?)))
     }
+
+    // S7 (equality-only contract boundary, see the CONTRACT comment at
+    // PolicySource.isValidPackage): the token grammar is a deliberate superset
+    // of the Android package grammar and is safe ONLY because consumers use
+    // pure equality/set membership. Pin the documented boundary: '..', 'a-',
+    // 'com..x', '-' parse as valid-but-inert tokens — they survive sanitize()
+    // unchanged, can never equal a real PackageManager-shaped package name
+    // unless the exact literal was written into the policy, and any future
+    // tightening or new non-equality reuse must show up as a test change
+    // here (and re-validate against a real package grammar).
+    @Test
+    fun isValidPackageAdmitsSupersetGrammarAsValidButInertEqualityOnly() {
+        assertTrue(PolicySource.isValidPackage(".."))
+        assertTrue(PolicySource.isValidPackage("a-"))
+        assertTrue(PolicySource.isValidPackage("-"))
+        assertTrue(PolicySource.isValidPackage("com..x"))
+        // Surviving sanitize() unchanged = accepted-but-useless tokens.
+        assertEquals(setOf("..", "a-", "-", "com..x"),
+            PolicySource.sanitize(setOf("..", "a-", "-", "com..x")))
+        // Equality is exact: a useless token never equals a normal entry.
+        assertFalse(PolicySource.sanitize(setOf("a-")).contains("a"))
+        assertFalse(PolicySource.sanitize(setOf("com..x")).contains("com.x"))
+    }
 }

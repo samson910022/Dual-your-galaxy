@@ -61,7 +61,12 @@
 
         <!-- 守衛版 provider:同一 authority,但只信任 LSPosed daemon
              (僅 root(0)/system(1000)/self，shell 拒絕——其 callingUid 由
-              kernel 設定、一般 app 無法偽造),見 GuardXposedProvider。 -->
+              kernel 設定、一般 app 無法偽造),見 GuardXposedProvider。
+             Threat model: this exported provider accepts SendBinder only from
+              root (uid 0) / system (uid 1000, appId 1000) / the app itself;
+              every other caller — including shell (2000) — is rejected with
+              null. The checked UID is the kernel-set Binder.getCallingUid(),
+              never a caller-supplied value. -->
         <provider
             android:name=".GuardXposedProvider"
             android:authorities="${applicationId}.XposedService"
