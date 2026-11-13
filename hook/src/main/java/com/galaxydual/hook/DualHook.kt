@@ -606,18 +606,30 @@ class DualHook : XposedModule() {
         // monotonic, never reset). The null skip is a failed read for the
         // cache, so its 5s failureCooldown throttles the next retry.
         // Follower grace = min(50, remaining at entry), exhausted forces 0.
-        val t0 = DeadlineBudget.nowNanos()
-        fun remainingMs(): Long = try {
+        // H8 (sentinel discipline): sample via sampleClock() so a broken
+        // nanoTime is explicit (clockOk=false), never a fresh full budget.
+        // Budget segments and the follower grace degrade the SAME way:
+        // clockOk=false -> no budget spend (reader never runs) and grace 0.
+        val t0Sample = DeadlineBudget.sampleClock()
+        val t0 = t0Sample.nanos
+        val clockOk = t0Sample.clockOk
+        fun remainingMs(): Long = if (!clockOk) {
+            0L
+        } else try {
             DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
         } catch (_: Throwable) {
             0L
         }
-        val graceAtEntry: Long = try {
+        val graceAtEntry: Long = if (!clockOk) {
+            0L
+        } else try {
             DeadlineBudget.graceAtEntry(t0, DeadlineBudget.nowNanos())
         } catch (_: Throwable) {
             0L
         }
-        val deadlineMs: Long = try {
+        val deadlineMs: Long = if (!clockOk) {
+            -1L
+        } else try {
             (t0 / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
         } catch (_: Throwable) {
             -1L
@@ -989,7 +1001,19 @@ class DualHook : XposedModule() {
         // Production reads go through this cache via a bounded executor
         // (effectivePolicy); the PolicySource.remotePolicyReader seam remains
         // for JVM tests.
-        private val effectiveCache = EffectivePolicyCache()
+        // H9: wire the cache's seed-only fallback diagnostics. The cache is
+        // companion-static while log()/logi() are instance members, so this
+        // logger uses android.util.Log directly (same TAG) behind a
+        // never-throw guard.
+        private val effectiveCache = EffectivePolicyCache(
+            onLog = { msg ->
+                try {
+                    Log.i(TAG, msg)
+                } catch (_: Throwable) {
+                    // Diagnostics only.
+                }
+            },
+        )
 
         // Bounded refresh executor (P1-2, hardened K4 P2#6): zero-queue single
         // daemon thread shared by all policy refreshes so a slow binder read

@@ -218,15 +218,14 @@ object WhitelistPatch {
             }
             @Suppress("UNCHECKED_CAST")
             val list = current as MutableList<String>
-            // Copy-on-write: snapshot, then compute union + addAll on a plain
-            // ArrayList. The live list is never used for computation, so any
-            // throw before the single addAll below leaves it untouched.
+            // Copy-on-write: snapshot, then compute the union against the
+            // snapshot (snapshot list itself is never mutated in place — the
+            // union is applied once via the single live-list addAll below).
             val snapshot: ArrayList<String>
             val add: List<String>
             try {
                 snapshot = ArrayList(list)
                 add = extra.filter { !snapshot.contains(it) }
-                ArrayList(snapshot).apply { addAll(add) }
             } catch (t: Throwable) {
                 return Outcome.Skipped(
                     "skip patch $fieldName on $owner: failed to compute union (${HookLog.shortEx(t)})",

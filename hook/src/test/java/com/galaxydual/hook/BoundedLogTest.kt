@@ -5,15 +5,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// P2-4: dead log rate-limiter must be wired.
-//
-// Pins that WhitelistPolicy mismatch logs are bounded: the first N fire,
-// the rest stay silent. Before the fix MAX_UNEXPECTED_ARGS_LOGS /
-// unexpectedArgsLogs were declared but never read (every mismatch logged).
+// P2-4/H13: mismatch logs are bounded twice: per-method (first 8 per distinct
+// methodDesc fire) and process-global (64 max). Before the H13 fix a single
+// process-global 8 let the noisiest method drain every other method's budget.
 class BoundedLogTest {
 
     @Test
-    fun mismatchLogsAreBoundedToEight() {
+    fun mismatchLogsAreBoundedToEightPerMethod() {
         WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
@@ -32,6 +30,58 @@ class BoundedLogTest {
         }
         assertEquals(8, logs)
         assertEquals(20, WhitelistPolicy.unexpectedArgsLogCount())
+        assertEquals(
+            WhitelistPolicy.MAX_UNEXPECTED_ARGS_GLOBAL_LOGS - 8,
+            WhitelistPolicy.remainingUnexpectedArgsBudget(),
+        )
+    }
+
+    @Test
+    fun differentMethodsGetIndependentBudgets() {
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+        var logs = 0
+        val onLog: (String) -> Unit = { logs++ }
+        val extra = setOf("com.policy.app")
+        // Two distinct mismatched methods: each logs up to its own 8.
+        repeat(2) { method ->
+            repeat(10) {
+                WhitelistPolicy.apply(
+                    result = false,
+                    args = listOf("a", "b"),
+                    extra = extra,
+                    methodDesc = "method$method",
+                    onLog = onLog,
+                    packageArgIndex = null,
+                    strictSignature = true,
+                )
+            }
+        }
+        // 2 methods x 8 per-method logs = 16 (global cap 64 not reached).
+        assertEquals(16, logs)
+    }
+
+    @Test
+    fun globalCapBackstopsManyMethods() {
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+        var logs = 0
+        val onLog: (String) -> Unit = { logs++ }
+        val extra = setOf("com.policy.app")
+        // 9 distinct methods x 10 attempts: 72 would pass the per-method
+        // cap; the global cap must hold emission at MAX_UNEXPECTED_ARGS_GLOBAL_LOGS.
+        repeat(9) { method ->
+            repeat(10) {
+                WhitelistPolicy.apply(
+                    result = false,
+                    args = listOf("a", "b"),
+                    extra = extra,
+                    methodDesc = "global$method",
+                    onLog = onLog,
+                    packageArgIndex = null,
+                    strictSignature = true,
+                )
+            }
+        }
+        assertEquals(WhitelistPolicy.MAX_UNEXPECTED_ARGS_GLOBAL_LOGS, logs)
         assertEquals(0, WhitelistPolicy.remainingUnexpectedArgsBudget())
     }
 
@@ -40,12 +90,16 @@ class BoundedLogTest {
         WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
+        // Unkeyed callers share one bucket: first 8 fire, rest stay silent.
         repeat(8) {
             assertTrue(WhitelistPolicy.logBounded(onLog, "m$it"))
         }
         assertEquals(8, logs)
-        // 9th is suppressed.
+        // 9th is suppressed (same, unkeyed, bucket).
         assertEquals(false, WhitelistPolicy.logBounded(onLog, "m8"))
         assertEquals(8, logs)
+        // A distinct methodKey gets its own budget.
+        assertTrue(WhitelistPolicy.logBounded(onLog, "n0", methodKey = "other"))
+        assertEquals(9, logs)
     }
 }

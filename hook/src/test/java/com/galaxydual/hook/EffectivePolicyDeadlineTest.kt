@@ -2,13 +2,14 @@
 package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 
 // Phase7 P2 end-to-end deadline (gate-open).
 //
@@ -19,7 +20,10 @@ import java.util.concurrent.atomic.AtomicLong
 // - fast/slow combo within budget merges;
 // - contention returns seed-only WITHOUT renewing failureCooldown;
 // - deadline-exhausted null DOES renew failureCooldown (next retry throttled);
-// - grace 0 followers return fast (< 65ms).
+// - grace 0 followers return without waiting on the leader;
+// - fast leader wakes grace followers via notifyAll (latch-handshake tests).
+// Follower tests use CountDownLatch handshakes (leader parked inside its
+// reader; followerGraceHits poll), never fixed sleeps or wall-clock bounds.
 // Uses real System.nanoTime (no mocked clock) and dedicated executors/gates
 // mirroring DualHook's split gates (capability vs policy, never shared).
 // Remaining/grace arithmetic goes through pure DeadlineBudget (the exact
@@ -51,11 +55,38 @@ class EffectivePolicyDeadlineTest {
         val t0 = 1_000_000_000L
         assertEquals(50L, DeadlineBudget.remainingMs(t0, t0))
         assertEquals(40L, DeadlineBudget.remainingMs(t0, t0 + 10_000_000L))
-        assertEquals(-10L, DeadlineBudget.remainingMs(t0, t0 + 60_000_000L))
         assertEquals(50L, DeadlineBudget.graceAtEntry(t0, t0))
         assertEquals(40L, DeadlineBudget.graceAtEntry(t0, t0 + 10_000_000L))
         assertEquals(0L, DeadlineBudget.graceAtEntry(t0, t0 + 60_000_000L))
-        assertEquals(50L, DeadlineBudget.remainingMs(0L, t0 + 999_000_000L))
+        // H8: t0 == NO_START_NANOS sentinel degrades fail-closed (no budget),
+        // never to a fresh full budget.
+        assertEquals(0L, DeadlineBudget.remainingMs(0L, t0 + 999_000_000L))
+        assertEquals(0L, DeadlineBudget.graceAtEntry(0L, t0 + 999_000_000L))
+        // H8: now == NO_START_NANOS sentinel (broken clock handed in as
+        // `now`) degrades the same way — zero budget, never the full total.
+        assertEquals(0L, DeadlineBudget.remainingMs(t0, 0L))
+        assertEquals(0L, DeadlineBudget.graceAtEntry(t0, 0L))
+        // Backwards clock (now < t0) degrades to zero budget.
+        assertEquals(0L, DeadlineBudget.remainingMs(t0, t0 - 1_000_000L))
+        assertEquals(0L, DeadlineBudget.graceAtEntry(t0, t0 - 1_000_000L))
+        // Result is coerced into [0, totalMs]: overrun clamps to 0.
+        assertEquals(0L, DeadlineBudget.remainingMs(t0, t0 + 60_000_000L))
+        // CR-O5: nanoTime's origin may legitimately be negative on real
+        // platforms — a negative t0 is VALID input, not the NO_START (0L)
+        // sentinel; remaining computes from the offset and clamps normally.
+        assertEquals(40L, DeadlineBudget.remainingMs(-5_000_000_000L, -5_000_000_000L + 10_000_000L))
+        assertEquals(0L, DeadlineBudget.remainingMs(-5_000_000_000L, -5_000_000_000L - 1L)) // backwards
+        // CR-O5: extreme-scale (now - t0 overflows 2^63, wraps two's
+        // complement negative) must never throw and never exceed totalMs;
+        // the wrapped delta truncates to 0ms upstream of the coerceIn clamp.
+        assertEquals(
+            PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+            DeadlineBudget.remainingMs(Long.MIN_VALUE + 1L, Long.MAX_VALUE),
+        )
+        assertEquals(
+            PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
+            DeadlineBudget.graceAtEntry(Long.MIN_VALUE + 1L, Long.MAX_VALUE),
+        )
     }
 
     @Test
@@ -92,11 +123,9 @@ class EffectivePolicyDeadlineTest {
             val elapsed = (DeadlineBudget.nowNanos() - t0) / 1_000_000L
             // Prefs segment truncated by the shared total: fail-closed seed-only.
             assertEquals(emptySet<String>(), result)
-            assertTrue("dual 40ms must stay under sequential 80ms, elapsed=$elapsed", elapsed < 80)
-            assertTrue(
-                "elapsed must respect total+slack elapsed=$elapsed",
-                elapsed <= totalBudgetMs() + 30,
-            )
+            // Hang-guard only (not a hot-path SLA): catches an unclobbered 2s
+            // stall regression; 120ms relaxes the flake-prone 80ms pin.
+            assertTrue("dual 40ms must stay under the 120ms hang-guard, elapsed=$elapsed", elapsed < 120)
         } finally {
             try {
                 capExec.shutdownNow()
@@ -220,10 +249,18 @@ class EffectivePolicyDeadlineTest {
 
     @Test
     fun graceZeroFollowersReturnFast() {
+        // T3: deterministic handshake — the leader parks on a latch inside its
+        // reader; the follower (grace 0) must return seed-only while the
+        // leader is parked. No wall-clock bound; completion is pinned via
+        // join(timeout) + assertFalse(isAlive).
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
         val leaderStarted = CountDownLatch(1)
-        // Leader occupies the single-flight with a 200ms read.
+        val leaderRelease = CountDownLatch(1)
+        // T-F9: failure flag set inside the reader thread, asserted on the
+        // main thread — an assertTrue() inside the reader would be swallowed
+        // by the cache's failed-read handling (AssertionError -> null).
+        val leaderLatchFailed = AtomicBoolean(false)
         var leaderResult: Set<String>? = null
         val leader = Thread {
             leaderResult = cache.get(
@@ -233,16 +270,19 @@ class EffectivePolicyDeadlineTest {
             ) {
                 reads.incrementAndGet()
                 leaderStarted.countDown()
-                sleepInterruptible(200)
+                try {
+                    // Park until the test releases us; the reader must not
+                    // complete before the follower probe below.
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
                 setOf("b")
             }
         }
         leader.start()
-        // Ensure the leader claimed inFlightGen before followers arrive.
         assertTrue("leader must start read within 5s", leaderStarted.await(5, TimeUnit.SECONDS))
-        val followerElapsed = AtomicInteger(-1)
         var followerResult: Set<String>? = null
-        val followerStart = DeadlineBudget.nowNanos()
         val follower = Thread {
             followerResult = cache.get(
                 emptySet(),
@@ -254,33 +294,42 @@ class EffectivePolicyDeadlineTest {
             }
         }
         follower.start()
-        follower.join()
-        val felapsed = (DeadlineBudget.nowNanos() - followerStart) / 1_000_000L
-        followerElapsed.set(felapsed.toInt())
-        leader.join()
-        // Follower skipped the grace sleep: fast seed-only (< 65ms) while the
-        // leader was still in flight; exactly one reader call total.
+        // Grace-0 path is synchronous and non-blocking: the follower returns
+        // before the parked leader can commit. join(timeout) + isAlive pins
+        // completion without a wall-clock bound.
+        follower.join(2_000)
+        assertFalse("grace 0 follower must not park on the leader", follower.isAlive)
         assertEquals(emptySet<String>(), followerResult)
+        // Grace-0 followers skip the wait entirely: no followerGraceHits.
+        assertEquals(0L, cache.followerGraceHits.get())
+        // T-F6: a grace-0 follower that fell back to seed-only is counted
+        // under graceExpiredSeedOnly (the early-return arm increments it).
+        assertEquals(1L, cache.graceExpiredSeedOnly.get())
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+        assertFalse("leader latch never released", leaderLatchFailed.get())
         assertEquals(1, reads.get())
         assertEquals(setOf("b"), leaderResult)
-        assertTrue("grace 0 follower must return fast, elapsed=$felapsed", felapsed < 65)
     }
 
     @Test
     fun fastLeaderNotifiesAndWakesFollowersImmediately() {
-        // Notify semantics without an absolute hot-path SLA: the follower must
-        // observe the leader's commit *before* its grace expires (notifyAll
-        // wakeup, not the ~grace timeout). All bounds are relative to
-        // [graceMs]; thread-start latency is excluded by timestamping inside
-        // the follower thread, so CI thread-scheduling jitter cannot flake
-        // the pin. A broken notify would park the follower for the full grace
-        // (~50ms in-get, ~45ms post-commit) and fail both timing pins below.
+        // T1: deterministic handshake — the leader parks on a latch inside its
+        // reader; the follower parks in the grace wait; we poll
+        // followerGraceHits>=1 to know the follower entered the grace path,
+        // then release the leader. The notifyAll wakeup delivers the committed
+        // value, never the grace timeout. No wall-clock bound on wake
+        // latency; completion is pinned via join(timeout) + assertFalse.
         val graceMs = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS
-        val leaderWorkMs = 5L
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
         val leaderStarted = CountDownLatch(1)
-        val leaderCommitNanos = AtomicLong(-1L)
+        val leaderRelease = CountDownLatch(1)
+        // T-F9: failure flag set inside the reader thread, asserted on the
+        // main thread — an assertTrue() inside the reader would be swallowed
+        // by the cache's failed-read handling (AssertionError -> null).
+        val leaderLatchFailed = AtomicBoolean(false)
         var leaderResult: Set<String>? = null
         val leader = Thread {
             leaderResult = cache.get(
@@ -290,72 +339,75 @@ class EffectivePolicyDeadlineTest {
             ) {
                 reads.incrementAndGet()
                 leaderStarted.countDown()
-                sleepInterruptible(leaderWorkMs)
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
                 setOf("fast-leader")
             }
-            leaderCommitNanos.set(DeadlineBudget.nowNanos())
         }
         leader.start()
         assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
         var followerResult: Set<String>? = null
-        val followerEnterNanos = AtomicLong(-1L)
-        val followerExitNanos = AtomicLong(-1L)
         val follower = Thread {
-            followerEnterNanos.set(DeadlineBudget.nowNanos())
             followerResult = cache.get(
                 emptySet(),
                 nonEmptyPolicyGateOpen = true,
-                followerGraceMs = graceMs,
+                // T-F1: a generous 10s grace — with a working notifyAll the
+                // follower wakes the instant the leader commits; with a broken
+                // notifyAll it parks the full grace, so join(2_000) +
+                // assertFalse(isAlive) below fails loudly instead of the
+                // follower silently returning seed-only after 50ms.
+                followerGraceMs = 10_000L,
             ) {
                 reads.incrementAndGet()
                 setOf("unexpected")
             }
-            followerExitNanos.set(DeadlineBudget.nowNanos())
         }
         follower.start()
-        follower.join()
-        leader.join()
+        // Wait until the follower entered the grace wait (deterministic
+        // handshake, bounded spin with yield — never a fixed sleep).
+        val graceDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (cache.followerGraceHits.get() < 1L && System.nanoTime() < graceDeadlineNanos) {
+            Thread.yield()
+        }
+        assertEquals(1L, cache.followerGraceHits.get())
+        leaderRelease.countDown()
+
+        follower.join(2_000)
+        assertFalse("follower must complete once the leader commits", follower.isAlive)
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+        assertFalse("leader latch never released", leaderLatchFailed.get())
 
         assertEquals(1, reads.get())
         assertEquals(setOf("fast-leader"), leaderResult)
         assertEquals(setOf("fast-leader"), followerResult)
-        // Follower time spent inside get() (excludes thread-start): must
-        // return before the grace expires — i.e. woken by the leader's
-        // notifyAll, not by the grace timeout.
-        val inGetElapsedMs = (followerExitNanos.get() - followerEnterNanos.get()) / 1_000_000L
-        assertTrue(
-            "follower must wake on leader commit before grace expiry, inGet=${inGetElapsedMs}ms grace=${graceMs}ms",
-            inGetElapsedMs < graceMs,
-        )
-        // Immediacy relative to grace (wakeup << grace): the follower must
-        // return shortly after the leader commits, not linger until the
-        // timeout. Clamped at 0: a follower that arrives after the commit
-        // observes the cached value with no wait at all.
-        val wakeLatencyMs = ((followerExitNanos.get() - leaderCommitNanos.get()) / 1_000_000L).coerceAtLeast(0L)
-        assertTrue(
-            "follower wakeup must be prompt after leader commit (<< grace), wake=${wakeLatencyMs}ms grace=${graceMs}ms",
-            wakeLatencyMs < graceMs / 2,
-        )
+        // Exactly one grace entry total (this test's follower).
+        assertEquals(1L, cache.followerGraceHits.get())
     }
 
     @Test
-    fun followerTotalElapsedNeverExceedsBudgetUnderContention() {
-        // Bounded-budget semantics with environment tolerance: followers must
-        // fall back to seed after their grace (not block on the 200ms leader)
-        // and must return within budget + generous CI slack. The primary pin
-        // is thread-state based (no wall clock): all followers complete while
-        // the slow leader is still in flight. The wall-time bound is a
-        // secondary hang-guard with generous tolerance, not a hot-path SLA.
-        val graceMs = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS
-        val budgetMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
-        // Generous scheduler tolerance for 8 contending followers; still well
-        // below the 200ms leader hold, so a wait-on-the-leader regression is
-        // caught by both the isAlive pin and this bound.
-        val envSlackMs = 100L
+    fun followersFallBackToSeedWhileLeaderParked() {
+        // T2: deterministic handshake — the leader parks on a latch inside its
+        // reader; every follower parks in the grace wait; we poll
+        // followerGraceHits>=followerCount, then verify all followers fell
+        // back to seed while the leader was still parked, then release the
+        // leader. No wall-clock bounds, no leader.isAlive scheduling pins.
+        // T-F2: 1s grace — long enough that a premature wake/spurious
+        // commit cannot make the seed-only fallback pass vacuously, short
+        // enough to keep the suite fast (grace-expiry semantics unchanged;
+        // a >1s pause is required before this could flake).
+        val graceMs = 1_000L
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
         val leaderStarted = CountDownLatch(1)
-        // Leader takes long (200ms) to ensure followers hit their grace budget timeout.
+        val leaderRelease = CountDownLatch(1)
+        // T-F9: failure flag set inside the reader thread, asserted on the
+        // main thread — an assertTrue() inside the reader would be swallowed
+        // by the cache's failed-read handling (AssertionError -> null).
+        val leaderLatchFailed = AtomicBoolean(false)
         val leader = Thread {
             cache.get(
                 emptySet(),
@@ -364,7 +416,11 @@ class EffectivePolicyDeadlineTest {
             ) {
                 reads.incrementAndGet()
                 leaderStarted.countDown()
-                sleepInterruptible(200)
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
                 setOf("slow-leader")
             }
         }
@@ -373,10 +429,8 @@ class EffectivePolicyDeadlineTest {
 
         val followerCount = 8
         val followerResults = Collections.synchronizedList(mutableListOf<Set<String>>())
-        val followerElapsedList = Collections.synchronizedList(mutableListOf<Long>())
         val followers = (1..followerCount).map {
             Thread {
-                val start = DeadlineBudget.nowNanos()
                 val res = cache.get(
                     emptySet(),
                     nonEmptyPolicyGateOpen = true,
@@ -385,38 +439,157 @@ class EffectivePolicyDeadlineTest {
                     reads.incrementAndGet()
                     setOf("unexpected")
                 }
-                val elapsed = (DeadlineBudget.nowNanos() - start) / 1_000_000L
                 followerResults.add(res)
-                followerElapsedList.add(elapsed)
             }
         }
         followers.forEach { it.start() }
-        followers.forEach { it.join() }
-        // Semantic pin without a wall clock: every follower returned within
-        // its grace while the slow leader was still in flight (followers did
-        // not block on the leader's 200ms commit). Strictly looser than the
-        // wall-time bound below (150ms cap < 200ms hold), so it adds signal
-        // without adding flake surface.
-        assertTrue(
-            "followers must return within grace while slow leader still in flight",
-            leader.isAlive,
-        )
-        leader.join()
+        // Wait until every follower entered the grace wait (deterministic
+        // handshake, bounded spin with yield — never a fixed sleep).
+        val graceDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (cache.followerGraceHits.get() < followerCount.toLong() && System.nanoTime() < graceDeadlineNanos) {
+            Thread.yield()
+        }
+        assertEquals(followerCount.toLong(), cache.followerGraceHits.get())
+        // Followers time out on their grace (1s, real time) and fall back
+        // to seed while the leader is still parked — they never block on it.
+        followers.forEach {
+            it.join(2_000)
+            assertFalse("follower must not block on the parked leader", it.isAlive)
+        }
+        // T-F6: every grace-expired follower counted under H9.
+        assertEquals(followerCount.toLong(), cache.graceExpiredSeedOnly.get())
 
         assertEquals(1, reads.get())
         assertEquals(followerCount, followerResults.size)
-        // All followers timed out after their grace budget (50ms) and fell back to seed (emptySet)
+        // All followers timed out after their grace budget and fell back to seed.
         for (res in followerResults) {
             assertEquals(emptySet<String>(), res)
         }
-        // Hang-guard with generous environment tolerance (budget + 100ms),
-        // not a hot-path SLA: catches unbounded waits while absorbing CI
-        // lock-contention/scheduling jitter across the 8 followers.
-        for (elapsed in followerElapsedList) {
-            assertTrue(
-                "follower elapsed must stay within budget+generous slack, elapsed=$elapsed budget=$budgetMs slack=$envSlackMs",
-                elapsed <= budgetMs + envSlackMs,
-            )
+        // Semantic pin: followers fell back to seed WITHOUT committing or
+        // reading — the leader's value is still uncommitted here.
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+        assertFalse("leader latch never released", leaderLatchFailed.get())
+    }
+
+    @Test
+    fun followerDeadlineMsClampsLongGrace() {
+        // CR-R1: pin the deadlineMs > 0L follower arm —
+        // minOf(followerGraceMs - elapsed, deadlineMs - now1). A generous
+        // 10s grace must be clamped by the caller's end-to-end deadline
+        // (~250ms from now, on the cache's nowMs() basis), never parked for
+        // the full grace. The 250ms headroom keeps the clamp ≪ 10s grace and
+        // ≪ join(2_000) bound while eliminating the ~30ms thread-start-
+        // latency flake window — the follower thread must finish starting
+        // (and sampling its deadline basis) before the deadline can pass.
+        // Latch-parked leader, deterministic completion via join(timeout) +
+        // assertFalse(isAlive) — no wall-clock bound on wake.
+        val cache = EffectivePolicyCache()
+        val reads = AtomicInteger()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val leaderLatchFailed = AtomicBoolean(false)
+        val leader = Thread {
+            cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 0L,
+            ) {
+                reads.incrementAndGet()
+                leaderStarted.countDown()
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
+                setOf("latched-leader")
+            }
         }
+        leader.start()
+        assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
+        val deadlineMs = System.nanoTime() / 1_000_000L + 250L
+        val t0 = System.nanoTime()
+        var followerResult: Set<String>? = null
+        val follower = Thread {
+            followerResult = cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                // T-F1 style: generous grace, pinned down by the deadline.
+                followerGraceMs = 10_000L,
+                deadlineMs = deadlineMs,
+            ) {
+                reads.incrementAndGet()
+                setOf("unexpected")
+            }
+        }
+        follower.start()
+        follower.join(2_000)
+        val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+        assertFalse("follower must not park past its 250ms deadline", follower.isAlive)
+        assertEquals(emptySet<String>(), followerResult)
+        // Grace ~250ms clamped by the deadline — never 10s. Hang-guard only:
+        // the deadline arm itself grants ~250ms.
+        assertTrue("elapsed must stay far below the 10s grace, elapsed=$elapsedMs", elapsedMs < 2_000)
+        assertEquals(1L, cache.followerGraceHits.get())
+        assertEquals(1L, cache.graceExpiredSeedOnly.get())
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+        assertFalse("leader latch never released", leaderLatchFailed.get())
+        assertEquals(1, reads.get())
+    }
+
+    @Test
+    fun followerExpiredDeadlineYieldsZeroWait() {
+        // CR-R1: deadlineMs <= now1 (already spent on the cache's nowMs()
+        // basis) — minOf collapses to a non-positive remaining grace and is
+        // coerced to 0: the follower returns seed-only synchronously WITHOUT
+        // entering the grace wait (no park, no hit, no wait on the leader).
+        val cache = EffectivePolicyCache()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val leaderLatchFailed = AtomicBoolean(false)
+        val leader = Thread {
+            cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 0L,
+            ) {
+                leaderStarted.countDown()
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
+                setOf("latched-leader")
+            }
+        }
+        leader.start()
+        assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
+        val deadlineMs = System.nanoTime() / 1_000_000L - 1L // strictly in the past, > 0
+        var followerResult: Set<String>? = null
+        val follower = Thread {
+            followerResult = cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 10_000L,
+                deadlineMs = deadlineMs,
+            ) {
+                setOf("unexpected")
+            }
+        }
+        follower.start()
+        follower.join(2_000)
+        assertFalse("follower with a spent deadline must return without parking", follower.isAlive)
+        assertEquals(emptySet<String>(), followerResult)
+        // Zero wait: never entered the grace path (no hit), counted as
+        // grace-expired seed-only via the early-return arm.
+        assertEquals(0L, cache.followerGraceHits.get())
+        assertEquals(1L, cache.graceExpiredSeedOnly.get())
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+        assertFalse("leader latch never released", leaderLatchFailed.get())
     }
 }

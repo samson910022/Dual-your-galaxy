@@ -3,6 +3,8 @@ package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
@@ -22,6 +24,52 @@ class EffectivePolicyCacheTest {
         }
         assertEquals(setOf("com.seed.app", "com.remote.app"), first)
         assertEquals(1, reads)
+    }
+
+    // T-F5: the committed snapshot is handed out by reference everywhere —
+    // no per-call copies — and the cached view is unmodifiable.
+    @Test
+    fun cachedSnapshotIsReusedAndUnmodifiable() {
+        val cache = EffectivePolicyCache()
+        val first = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
+        val second = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("b") }
+        assertSame(first, second)
+        assertThrows(UnsupportedOperationException::class.java) {
+            @Suppress("UNCHECKED_CAST")
+            (first as java.util.Set<String>).add("x")
+        }
+    }
+
+    // T-F6: contention fallback counter (H9).
+    @Test
+    fun contentionFallbackCountsSeedOnlyFallback() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                throw PolicyRefreshContentionException("guard")
+            },
+        )
+        assertEquals(1L, cache.contentionFallbackSeedOnly.get())
+        assertEquals(0L, cache.cooldownFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
+        assertEquals(0L, cache.invalidatedDiscardSeedOnly.get())
+    }
+
+    // T-F6: invalidate-during-IO discard counter (H9). The reader invalidates
+    // the cache from inside IO; the in-flight leader must discard and return
+    // seed-only (loser-drop), never resurrect a merged value.
+    @Test
+    fun invalidateDuringIoDiscardCountsSeedOnlyFallback() {
+        val cache = EffectivePolicyCache()
+        val result = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+            cache.invalidate()
+            setOf("b")
+        }
+        assertEquals(emptySet<String>(), result)
+        assertEquals(1L, cache.invalidatedDiscardSeedOnly.get())
+        assertEquals(0L, cache.contentionFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
     }
 
     @Test
@@ -191,6 +239,59 @@ class EffectivePolicyCacheTest {
             setOf("com.ok.app"),
             cache.get(setOf("com.ok.app", "bad pkg"), nonEmptyPolicyGateOpen = true) { null },
         )
+    }
+
+    // CR-O4: a failed read with NO prior good value falls back to the seed
+    // alone and is counted under failedReadSeedOnly (the merge-failed
+    // no-good-value arm), never resurrecting stale state; the sibling
+    // seed-only counters stay at zero for this shape.
+    @Test
+    fun failedReadSeedOnlyCountsFailedReadArm() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
+        )
+        assertEquals(1L, cache.failedReadSeedOnly.get())
+        assertEquals(0L, cache.cooldownFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
+    }
+
+    // CR-O4: a failed read AFTER invalidation (nothing to resurrect,
+    // last-known-good suppressed) also counts under failedReadSeedOnly —
+    // the H9 line keeps every failed-read seed-only shape visible.
+    @Test
+    fun failedReadAfterInvalidateCountsFailedReadArm() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.good.app"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("com.good.app") },
+        )
+        cache.invalidate()
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
+        )
+        // Post-invalidate failed read falls to seed and is counted.
+        assertEquals(1L, cache.failedReadSeedOnly.get())
+    }
+
+    // CR-O4 (negative pin): a FAILED read while hadGoodValue==true and
+    // !invalidated returns the last-known-good snapshot and must NOT count
+    // failedReadSeedOnly (the last-known-good return arm). The arm is not
+    // reachable through the public API today (valid==false implies
+    // invalidated==true in the current code), so the test synthesizes it by
+    // flipping the cache's `valid` flag via reflection; hadGoodValue and
+    // invalidated keep their production values.
+    @Test
+    fun failedReadWithLastKnownGoodLeavesFailedReadArmZero() {
+        val cache = EffectivePolicyCache()
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("com.good.app") }
+        val f = EffectivePolicyCache::class.java.getDeclaredField("valid")
+        f.isAccessible = true
+        f.setBoolean(cache, false)
+        assertEquals(setOf("com.good.app"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { null })
+        assertEquals(0L, cache.failedReadSeedOnly.get())
     }
 
     @Test
@@ -582,6 +683,9 @@ class EffectivePolicyCacheTest {
         time = 8_000L
         assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
         assertEquals(2, reads)
+        // O3: the two cooldown-throttled seed-only returns (at t=2_000 and
+        // t=8_000) are counted, so H9 sees the cooldown fallback shape.
+        assertEquals(2L, cache.cooldownFallbackSeedOnly.get())
     }
 
     @Test
