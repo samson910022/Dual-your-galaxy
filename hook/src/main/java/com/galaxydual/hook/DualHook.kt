@@ -248,7 +248,7 @@ class DualHook : XposedModule() {
                     try {
                         patchWhitelistField(target)
                     } catch (t: Throwable) {
-                        logi("patch field error: $t")
+                        logi("patch field error: ${shortEx(t)}: ${shortMsg(t)}")
                     }
                     null
                 }

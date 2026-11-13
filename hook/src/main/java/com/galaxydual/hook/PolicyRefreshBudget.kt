@@ -69,6 +69,9 @@ object PolicyRefreshBudget {
         timeoutMs: Long = DEFAULT_STALL_BUDGET_MS,
         executor: ExecutorService,
     ): Set<String>? {
+        // Zero/negative budget never submits: fail-closed null without
+        // touching the executor (parity with PolicyRefreshGate 0ms guard).
+        if (timeoutMs <= 0L) return null
         // Broad Throwable is intentional: the reader runs hostile/framework
         // code that may throw Error (not just Exception), and submit/get may
         // throw RejectedExecutionException/InterruptedException on shutdown

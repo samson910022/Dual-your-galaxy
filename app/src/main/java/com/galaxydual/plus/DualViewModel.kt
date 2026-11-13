@@ -9335,7 +9335,8 @@ class DualViewModel(
             _state.update {
                 it.copy(
                     policyDraftKnown = false,
-                    policyDraftCorrupt = false,
+                    // preserve on stale abort, never wash nor fabricate.
+                    policyDraftCorrupt = it.policyDraftCorrupt,
                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                     msgKind = MsgKind.CHANNEL,
                 )
@@ -9689,7 +9690,10 @@ class DualViewModel(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        // Repair is only reachable when corrupt==true (gated above +
+                                        // authoritative loadForRepair proved Corrupt; unseen B
+                                        // does not prove healed): preserve corrupt, never wash to false.
+                                        policyDraftCorrupt = true,
                                         msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
