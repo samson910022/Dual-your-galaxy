@@ -178,6 +178,44 @@ class PolicyRefreshGateNestedTest {
     }
 
     @Test
+    fun serialReuseNeverSpuriouslyRejects() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-serial-reuse")
+        try {
+            val gate = PolicyRefreshGate(executor = executor)
+            // Regression pin for the serial-reuse handoff race: with
+            // ThreadPoolExecutor(0, 1, SynchronousQueue, AbortPolicy) the
+            // Future signals completion BEFORE the worker re-parks on the
+            // handoff, so a tight back-to-back submit spuriously rejects
+            // (~1% of gate submits pre-fix, ~28% of raw executor submits).
+            // The gate retries the handoff strictly within the call's own
+            // budget (zero queue kept, no extra thread), so serial reuse on
+            // an idle worker must ALWAYS deliver the truth with zero drops.
+            // Generous deadline (2s) so only a real defect — never scheduling
+            // jitter — can fail this; no fixed sleeps.
+            repeat(300) { i ->
+                val r = try {
+                    gate.readBoundedOrThrow(
+                        reader = { setOf("com.example.app") },
+                        timeoutMs = 2_000,
+                    )
+                } catch (_: PolicyRefreshContentionException) {
+                    null
+                }
+                assertEquals("serial reuse iteration $i must deliver truth", setOf("com.example.app"), r)
+            }
+            assertEquals(0L, gate.droppedRefreshCount.get())
+            assertEquals(0, gate.queueDepth())
+            assertTrue("active<=1 active=${gate.activeCount()}", gate.activeCount() <= 1)
+            assertEquals(1, gate.outstandingPermitsAvailable())
+        } finally {
+            try {
+                executor.shutdownNow()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @Test
     fun secondRebuildBeyondCapOnlyShortCircuits() {
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-rebuild-cap")
         var currentToClose: java.util.concurrent.ExecutorService? = null

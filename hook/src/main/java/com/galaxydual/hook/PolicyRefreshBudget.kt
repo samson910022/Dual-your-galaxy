@@ -11,6 +11,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 
 // Pure (framework-free) bounded-refresh helper for the hook hot path (P1-2).
 //
@@ -172,7 +173,12 @@ object DeadlineBudget {
 //    throttled log) without touching the executor.
 // 2. Zero-queue executor: production executor is SynchronousQueue-based (see
 //    newPolicyRefreshExecutor), so even a guard race that reaches submit gets
-//    RejectedExecutionException -> null (droppedRefreshCount++).
+//    RejectedExecutionException -> null (droppedRefreshCount++). A spurious
+//    rejection from the serial-reuse handoff race (Future signalled before
+//    the worker re-parks) is retried strictly within the call's own timeoutMs
+//    (handoff + get <= timeoutMs; see submitHandoffRetry) so back-to-back
+//    reads observe the truth without queueing, extra threads, or extra delay
+//    beyond the budget they already had.
 // 3. Stuck-worker circuit breaker: consecutive TimeoutExceptions trip the
 //    breaker (≥3 consecutive timeouts, or 1 timeout when last success ≥30s
 //    ago (requires a prior success)). While open, submit is short-circuited to null
@@ -606,6 +612,116 @@ class PolicyRefreshGate(
     // Shared submit body for the normal (non-half-open) path. Caller holds the
     // at-most-one guard. isProbe is always false here; the half-open probe has
     // its own body (doProbeSubmit) so probe outcomes update backoff.
+    // Handoff result for the deadline-bounded SynchronousQueue retry below:
+    // success carries the future + the time left for get(); failure carries
+    // the cause for the caller's drop/contention accounting (never a timeout:
+    // a consumed handoff budget is contention, not a stuck-reader signal).
+    private data class HandoffResult(
+        val future: Future<Set<String>?>?,
+        val failure: Throwable?,
+        val remainingMs: Long,
+    )
+
+    // Deadline-bounded non-queueing handoff retry (serial-reuse race fix).
+    //
+    // Root cause: ThreadPoolExecutor(core=0, max=1, SynchronousQueue,
+    // AbortPolicy) signals Future completion (FutureTask.set wakes the
+    // getter) BEFORE the worker parks back on the SynchronousQueue handoff.
+    // An immediate second submit — e.g. the post-invalidate reload right
+    // after a successful loadOnce — can therefore hit
+    // RejectedExecutionException even though no work is running (~1% of
+    // tight back-to-back gate submits; ~28% of raw executor submits). The
+    // gate mapped that spurious rejection to contention/drop, so the second
+    // loadOnce returned seed-only [] instead of the truth.
+    //
+    // Fix: retry the HANDOFF (submit only, never queueing — the queue stays
+    // SynchronousQueue, zero storage) strictly within the call's own
+    // timeoutMs: handoff + get <= timeoutMs, so the end-to-end deadline is
+    // preserved and a genuinely stuck worker still fails inside the budget
+    // (same as a normal read timeout). No blind loops (every iteration
+    // re-checks a real-time nanoTime deadline), no fixed sleeps (only a 20us
+    // cooperative park between attempts; total wait never exceeds
+    // timeoutMs), no extra threads (the at-most-one guard is still held, one
+    // worker max). Only RejectedExecutionException retries; any other submit
+    // failure fails fast. Uses raw System.nanoTime — never the injectable
+    // nowMs breaker clock (frozen test clocks must not govern a real-time
+    // handoff race, or the loop could never terminate).
+    private fun submitHandoffRetry(
+        reader: () -> Set<String>?,
+        timeoutMs: Long,
+    ): HandoffResult {
+        if (timeoutMs <= 0L) return HandoffResult(null, null, 0L)
+        val startNanos: Long = try {
+            System.nanoTime()
+        } catch (_: Throwable) {
+            // Clock broken: single attempt, no retry (fail-closed).
+            return try {
+                HandoffResult(executor.submit(Callable<Set<String>?> { reader() }), null, timeoutMs)
+            } catch (t: Throwable) {
+                if (t is InterruptedException) try {
+                    Thread.currentThread().interrupt()
+                } catch (_: Throwable) {
+                }
+                HandoffResult(null, t, 0L)
+            }
+        }
+        val cappedMs = timeoutMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1_000_000L - 1L) // keep start+add strictly < Long.MAX_VALUE
+        val deadlineNanos: Long = try {
+            val add = cappedMs * 1_000_000L
+            if (startNanos > Long.MAX_VALUE - add) Long.MAX_VALUE else startNanos + add
+        } catch (_: Throwable) {
+            Long.MAX_VALUE
+        }
+        while (true) {
+            // Fail fast on interrupt: parkNanos returns immediately on interrupt
+            // without throwing, so check explicitly to avoid spinning to deadline.
+            if (try { Thread.currentThread().isInterrupted } catch (_: Throwable) { false }) {
+                try { Thread.currentThread().interrupt() } catch (_: Throwable) { }
+                return HandoffResult(null, InterruptedException("handoff-interrupted"), 0L)
+            }
+            try {
+                val f = executor.submit(Callable<Set<String>?> { reader() })
+                val remainingMs: Long = try {
+                    (deadlineNanos - System.nanoTime()) / 1_000_000L
+                } catch (_: Throwable) {
+                    timeoutMs
+                }
+                if (remainingMs <= 0L) {
+                    // Handoff consumed the whole budget: no time left for get.
+                    // Contention (not a reader timeout): cancel best-effort.
+                    try {
+                        f.cancel(true)
+                    } catch (_: Throwable) {
+                    }
+                    return HandoffResult(
+                        null,
+                        RejectedExecutionException("handoff-budget-exhausted"),
+                        0L,
+                    )
+                }
+                return HandoffResult(f, null, remainingMs)
+            } catch (re: RejectedExecutionException) {
+                val now: Long = try {
+                    System.nanoTime()
+                } catch (_: Throwable) {
+                    return HandoffResult(null, re, 0L)
+                }
+                if (now >= deadlineNanos) return HandoffResult(null, re, 0L)
+                try {
+                    LockSupport.parkNanos(20_000L)
+                } catch (_: Throwable) {
+                }
+                continue
+            } catch (t: Throwable) {
+                if (t is InterruptedException) try {
+                    Thread.currentThread().interrupt()
+                } catch (_: Throwable) {
+                }
+                return HandoffResult(null, t, 0L)
+            }
+        }
+    }
+
     private fun doSubmit(
         reader: () -> Set<String>?,
         timeoutMs: Long,
@@ -616,22 +732,20 @@ class PolicyRefreshGate(
         // submit semantics (guard + zero queue already bound the work).
         @Suppress("UNUSED_PARAMETER")
         val _probe = isProbe
-        val future: Future<Set<String>?> = try {
-            executor.submit(Callable<Set<String>?> { reader() })
-        } catch (re: RejectedExecutionException) {
+        val handoff = submitHandoffRetry(reader, timeoutMs)
+        val future = handoff.future
+        if (future == null) {
+            val cause = handoff.failure
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh rejected: ${HookLog.shortEx(re)}")
-            return null
-        } catch (t: Throwable) {
-            if (t is InterruptedException) try {
-                Thread.currentThread().interrupt()
-            } catch (_: Throwable) {
+            // Parity with the pre-retry mapping: only a SynchronousQueue
+            // rejection logs; other submit failures just count the drop.
+            if (cause is RejectedExecutionException) {
+                throttledLog("policy refresh rejected: ${HookLog.shortEx(cause)}")
             }
-            droppedRefreshCount.incrementAndGet()
             return null
         }
         return try {
-            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val v = future.get(handoff.remainingMs, TimeUnit.MILLISECONDS)
             onSuccess()
             v
         } catch (_: TimeoutException) {
@@ -671,27 +785,21 @@ class PolicyRefreshGate(
         now: Long,
     ): Set<String>? {
         if (timeoutMs <= 0L) return null
-        val future: Future<Set<String>?> = try {
-            executor.submit(Callable<Set<String>?> { reader() })
-        } catch (re: RejectedExecutionException) {
-            // Raced with another submit (guard race via custom executor) or
-            // worker re-busy: stay open, throttle the next probe by refreshing
-            // lastStuckOpenMs, back off once.
+        val handoff = submitHandoffRetry(reader, timeoutMs)
+        val future = handoff.future
+        if (future == null) {
+            // Raced with another submit (guard race via custom executor),
+            // worker re-busy, or the handoff consumed the whole budget: stay
+            // open, throttle the next probe by refreshing lastStuckOpenMs,
+            // back off once.
+            val cause = handoff.failure
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(re)}")
-            onProbeFail(now)
-            return null
-        } catch (t: Throwable) {
-            if (t is InterruptedException) try {
-                Thread.currentThread().interrupt()
-            } catch (_: Throwable) {
-            }
-            droppedRefreshCount.incrementAndGet()
+            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(cause ?: RejectedExecutionException("rejected"))}")
             onProbeFail(now)
             return null
         }
         return try {
-            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val v = future.get(handoff.remainingMs, TimeUnit.MILLISECONDS)
             onProbeSuccess()
             v
         } catch (_: TimeoutException) {
@@ -725,22 +833,25 @@ class PolicyRefreshGate(
         if (timeoutMs <= 0L) return null
         @Suppress("UNUSED_PARAMETER")
         val _probe = isProbe
-        val future: Future<Set<String>?> = try {
-            executor.submit(Callable<Set<String>?> { reader() })
-        } catch (re: RejectedExecutionException) {
+        val handoff = submitHandoffRetry(reader, timeoutMs)
+        val future = handoff.future
+        if (future == null) {
+            val cause = handoff.failure
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh rejected: ${HookLog.shortEx(re)}")
-            throw PolicyRefreshContentionException("rejected")
-        } catch (t: Throwable) {
-            if (t is InterruptedException) try {
+            // Parity with the pre-retry mapping: only a SynchronousQueue
+            // rejection logs; other submit failures just count the drop.
+            if (cause is RejectedExecutionException) {
+                throttledLog("policy refresh rejected: ${HookLog.shortEx(cause)}")
+                throw PolicyRefreshContentionException("rejected")
+            }
+            if (cause is InterruptedException) try {
                 Thread.currentThread().interrupt()
             } catch (_: Throwable) {
             }
-            droppedRefreshCount.incrementAndGet()
             throw PolicyRefreshContentionException("submit-failed")
         }
         return try {
-            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val v = future.get(handoff.remainingMs, TimeUnit.MILLISECONDS)
             onSuccess()
             v
         } catch (_: TimeoutException) {
@@ -769,24 +880,24 @@ class PolicyRefreshGate(
         now: Long,
     ): Set<String>? {
         if (timeoutMs <= 0L) return null
-        val future: Future<Set<String>?> = try {
-            executor.submit(Callable<Set<String>?> { reader() })
-        } catch (re: RejectedExecutionException) {
+        val handoff = submitHandoffRetry(reader, timeoutMs)
+        val future = handoff.future
+        if (future == null) {
+            val cause = handoff.failure
             droppedRefreshCount.incrementAndGet()
-            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(re)}")
+            throttledLog("policy refresh half-open probe rejected: ${HookLog.shortEx(cause ?: RejectedExecutionException("rejected"))}")
             onProbeFail(now)
-            throw PolicyRefreshContentionException("probe-rejected")
-        } catch (t: Throwable) {
-            if (t is InterruptedException) try {
+            if (cause is RejectedExecutionException) {
+                throw PolicyRefreshContentionException("probe-rejected")
+            }
+            if (cause is InterruptedException) try {
                 Thread.currentThread().interrupt()
             } catch (_: Throwable) {
             }
-            droppedRefreshCount.incrementAndGet()
-            onProbeFail(now)
             throw PolicyRefreshContentionException("probe-submit-failed")
         }
         return try {
-            val v = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val v = future.get(handoff.remainingMs, TimeUnit.MILLISECONDS)
             onProbeSuccess()
             v
         } catch (_: TimeoutException) {
