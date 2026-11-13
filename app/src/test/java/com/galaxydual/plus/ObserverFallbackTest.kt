@@ -45,6 +45,7 @@ import org.junit.Test
 )
 class ObserverFallbackTest {
     private val vms = mutableListOf<DualViewModel>()
+    private val coords = java.util.concurrent.CopyOnWriteArrayList<PolicyTxCoordinator>()
 
     @Before
     fun setUp() {
@@ -59,6 +60,10 @@ class ObserverFallbackTest {
             try { vm.viewModelScope.cancel() } catch (_: Exception) { }
         }
         vms.clear()
+        for (c in coords) {
+            try { c.close() } catch (_: Exception) { }
+        }
+        coords.clear()
         Dispatchers.resetMain()
         resetRemotePoisonForTests()
     }
@@ -98,6 +103,7 @@ class ObserverFallbackTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm)
+        coords.add(coord)
         await { !vm.state.value.loading }
         if (awaitKnown) {
             await { vm.state.value.policyDraftKnown }

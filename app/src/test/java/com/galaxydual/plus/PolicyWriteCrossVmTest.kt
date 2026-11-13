@@ -288,7 +288,8 @@ class PolicyWriteCrossVmTest {
             // pending base=1 directly — the pre-IO drain must drop the orphan and
             // refuse (UNKNOWN_REFRESH, zero C writes), proving even a borrowed base
             // cannot overwrite unseen B without a fresh read.
-            Thread.sleep(800)
+            // Deterministic aging (no real 800ms sleep): backdate staged nanos.
+            try { coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L) } catch (_: Throwable) { Thread.sleep(800) }
             setStale(vmC, false)
             seedKnown(vmC, setOf("com.A"))
             val borrowed = PendingPolicyWrite(
@@ -484,7 +485,8 @@ class PolicyWriteCrossVmTest {
             assertEquals(setOf("com.B"), coord.latest.value?.draft)
             assertNotNull(coord.pendingPublish.get())
             // Omit emitStaged (publisher died here). Age past threshold.
-            Thread.sleep(800)
+            // Deterministic aging (no real 800ms sleep): backdate staged nanos.
+            try { coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L) } catch (_: Throwable) { Thread.sleep(800) }
 
             // VM-C freshly verifies B, then writes C. Must succeed (retire stranded real).
             val vmC = makeVm2Direct(store, coord, policyIoTimeoutMs = 300)

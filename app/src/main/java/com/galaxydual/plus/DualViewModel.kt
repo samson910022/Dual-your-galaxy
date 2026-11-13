@@ -959,12 +959,13 @@ class DualViewModel(
     // via markObservedKnown(); never on stale-retained Known. -1L = never observed
     // (legacy/Unknown; request falls back to fail-closed Unknown path, confirm gates
     // use -1L skip only for legacy injected pendings).
-    private val authoritativeObservedRev = AtomicLong(-1L)
+    internal data class ObservedPolicySnapshot(val rev: Long, val dropGen: Long)
+    private val observedSnapshot = AtomicReference(ObservedPolicySnapshot(-1L, 0L))
+
     // Stage O1 P1#1: last orphan-drop generation observed by this VM. Advanced
     // whenever this VM observes a drop (pre-IO recover) or a fresh Known read.
     // Request fails closed when coord.orphanDropGen != lastSeenDropGen (an unseen
     // placeholder was dropped without any _latest event).
-    private val lastSeenDropGen = AtomicLong(0L)
     // Phase7 test seam: overrides the authoritative revision source for
     // TOCTOU barrier tests (fake currentRevision with call counting + latch).
     // Production stays null (coordinator.currentRevision()); tests set this
@@ -1008,31 +1009,25 @@ class DualViewModel(
     // Phase7 observability for tests: current authoritatively-observed rev.
     // Fail-closed: any Throwable reading the atomic returns -1L (never throws).
     internal fun observedRevForTests(): Long = try {
-        authoritativeObservedRev.get()
+        observedSnapshot.get().rev
     } catch (_: Throwable) {
         -1L
     }
 
     internal fun markObservedKnownAt(rev: Long, dropGen: Long? = null) {
         try {
-            if (rev != -1L) {
-                try { authoritativeObservedRev.set(rev) } catch (_: Throwable) { }
+            val targetRev = if (rev != -1L) {
+                rev
             } else {
-                try {
-                    val lastR = lastRevisionSeenRev.get()
-                    if (lastR != -1L) authoritativeObservedRev.set(lastR)
-                } catch (_: Throwable) {
-                }
+                val lastR = try { lastRevisionSeenRev.get() } catch (_: Throwable) { -1L }
+                if (lastR != -1L) lastR else observedSnapshot.get().rev
             }
-            try {
-                val dg = dropGen ?: try {
-                    policyTxCoordinator?.orphanDropGen?.get() ?: 0L
-                } catch (_: Throwable) {
-                    0L
-                }
-                lastSeenDropGen.set(dg)
+            val dg = dropGen ?: try {
+                policyTxCoordinator?.orphanDropGen?.get() ?: 0L
             } catch (_: Throwable) {
+                0L
             }
+            observedSnapshot.set(ObservedPolicySnapshot(targetRev, dg))
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
@@ -1047,6 +1042,69 @@ class DualViewModel(
             0L
         }
         markObservedKnownAt(cur, dg)
+    }
+
+    // 統一 orphanDropGen 與修訂陳舊門控：於 request / confirm pre-IO 統一校驗。
+    private fun checkOrphanDropAndRevisionStaleLocked(): Boolean {
+        val coordO = policyTxCoordinator ?: return !policyRevisionStale.get()
+        if (hookPolicyStore == null) return !policyRevisionStale.get()
+        val snap = observedSnapshot.get()
+        val observed = snap.rev
+        if (observed != -1L) {
+            val curRev = try { coordO.currentRevision() } catch (_: Exception) { -1L }
+            if (curRev == -1L || curRev != observed) {
+                try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                return false
+            }
+            val curDrop = try { coordO.orphanDropGen.get() } catch (_: Exception) { 0L }
+            val seenDrop = snap.dropGen
+            if (curDrop != seenDrop) {
+                val dropRev = try { coordO.orphanDropRev.get() } catch (_: Exception) { -1L }
+                if (dropRev == -1L || dropRev >= observed) {
+                    try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                    try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                    return false
+                }
+                // Stale drop (older than observed): catch up silently via CAS loop.
+                var updated = false
+                var guard = 0
+                while (!updated && guard++ < 8) {
+                    val cur = try { observedSnapshot.get() } catch (_: Exception) { snap }
+                    if (cur.dropGen == curDrop) break
+                    // Preserve newer rev if concurrently advanced; only advance dropGen.
+                    val merged = if (cur.rev != snap.rev) cur.copy(dropGen = curDrop) else snap.copy(dropGen = curDrop)
+                    try {
+                        updated = observedSnapshot.compareAndSet(cur, merged)
+                    } catch (_: Exception) {
+                        break
+                    }
+                    if (!updated && try { observedSnapshot.get().dropGen } catch (_: Exception) { curDrop } == curDrop) break
+                }
+            }
+        }
+        if (policyRevisionStale.get()) {
+            try { markPolicyUnknownLocked() } catch (_: Exception) { }
+            return false
+        }
+        return true
+    }
+
+    // Verified mark: only stamps revBefore when coordinator still at revBefore.
+    // Returns false + fail-closed stale when a concurrent commit landed between
+    // the IO second-sample and this mark (prevents stale-read absorbing newer rev).
+    private fun markObservedKnownVerified(revBefore: Long, dropGen: Long? = null): Boolean {
+        if (revBefore == -1L) {
+            try { markObservedKnownAt(revBefore, dropGen) } catch (_: Exception) { }
+            return true
+        }
+        val cur = try { sampledCurrentRevision() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { -1L }
+        if (cur == -1L || cur != revBefore) {
+            try { policyRevisionStale.set(true) } catch (_: Exception) { }
+            return false
+        }
+        try { markObservedKnownAt(revBefore, dropGen) } catch (_: Exception) { }
+        return true
     }
     // P1-1 (TOCTOU) invariant: every trusted-read Known path (init load,
     // refreshLocked, repair success) samples revBefore BEFORE the IO and discards
@@ -1309,8 +1367,9 @@ class DualViewModel(
                     lastRevisionSeenTxId.set(stamped.txId)
                     lastRevisionSeenKey.set(stamped.key)
                     advanceLastRevisionSeenRev(stamped.rev)
-                    try { authoritativeObservedRev.set(stamped.rev) } catch (_: Exception) { }
-                    try { lastSeenDropGen.set(coord.orphanDropGen.get()) } catch (_: Exception) { }
+                    try {
+                        observedSnapshot.set(ObservedPolicySnapshot(stamped.rev, coord.orphanDropGen.get()))
+                    } catch (_: Exception) { }
                 } catch (_: Exception) {
                 }
             }
@@ -1535,10 +1594,12 @@ class DualViewModel(
                 try { disarmBlindClear() } catch (_: Exception) { }
                 try { disarmCorruptRepair() } catch (_: Exception) { }
                 try {
+                    val curSnap = observedSnapshot.get()
                     val orv = if (settled.rev != -1L) settled.rev else (coord?.currentRevision() ?: -1L)
-                    if (orv != -1L) authoritativeObservedRev.set(orv)
+                    val newRev = if (orv != -1L) orv else curSnap.rev
+                    val newDg = try { coord?.orphanDropGen?.get() ?: 0L } catch (_: Exception) { 0L }
+                    observedSnapshot.set(ObservedPolicySnapshot(newRev, newDg))
                 } catch (_: Exception) { }
-                try { lastSeenDropGen.set(coord?.orphanDropGen?.get() ?: 0L) } catch (_: Exception) { }
             } else {
                 markPolicyUnknownLocked()
             }
@@ -1959,8 +2020,11 @@ class DualViewModel(
                 policyOwnershipGen.incrementAndGet()
                 policyRevisionStale.set(false)
                 // Stage O1 P1#1: terminal event is authoritative truth => observed.
-                try { authoritativeObservedRev.set(if (settled.rev != -1L) settled.rev else (policyTxCoordinator?.currentRevision() ?: -1L)) } catch (_: Exception) { }
-                try { lastSeenDropGen.set(policyTxCoordinator?.orphanDropGen?.get() ?: 0L) } catch (_: Exception) { }
+                try {
+                    val newRev = if (settled.rev != -1L) settled.rev else (policyTxCoordinator?.currentRevision() ?: -1L)
+                    val newDg = try { policyTxCoordinator?.orphanDropGen?.get() ?: 0L } catch (_: Exception) { 0L }
+                    observedSnapshot.set(ObservedPolicySnapshot(newRev, newDg))
+                } catch (_: Exception) { }
                 val canApplyForeign = _state.value.policyWritePhase == PolicyWritePhase.IDLE ||
                     _state.value.policyWritePhase == PolicyWritePhase.QUEUED
                 if (canApplyForeign) {
@@ -3189,7 +3253,9 @@ class DualViewModel(
                         // P2-4: dropGen sampled in the SAME lock observation as
                         // rev/pending/active (no split-window staleness).
                         try {
-                            lastSeenDropGen.set(try { coordInit.orphanDropGen.get() } catch (_: Exception) { 0L })
+                            val cur = observedSnapshot.get()
+                            val dg = try { coordInit.orphanDropGen.get() } catch (_: Exception) { 0L }
+                            observedSnapshot.set(cur.copy(dropGen = dg))
                         } catch (_: Exception) {
                         }
                         // P2-4: single-snapshot liveness (flag + deferred/age backstop).
@@ -3490,11 +3556,22 @@ class DualViewModel(
                             }
                         }
                     } else {
-                        disarmBlindClear()
-                        disarmCorruptRepair()
-                        markObservedKnown()
-                        _state.update { cur ->
-                            cur.copy(policyDraft = result.packages, policyDraftKnown = true, policyDraftCorrupt = false)
+                        // Verified mark: third-sample guard closes revAfter->mark window.
+                        // On concurrent commit, fail closed to Unknown (no disarm, no mark).
+                        val verified = try {
+                            markObservedKnownVerified(revBeforeInit)
+                        } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { false }
+                        if (!verified) {
+                            try { policyRevisionStale.set(true) } catch (_: Throwable) { }
+                            _state.update { cur ->
+                                cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
+                            }
+                        } else {
+                            disarmBlindClear()
+                            disarmCorruptRepair()
+                            _state.update { cur ->
+                                cur.copy(policyDraft = result.packages, policyDraftKnown = true, policyDraftCorrupt = false)
+                            }
                         }
                     }
                 } else {
@@ -7126,7 +7203,18 @@ class DualViewModel(
                 val result = if (store == null) {
                     LoadResult.Unavailable
                 } else try {
-                    onIo { store.loadResult() }
+                    onIo {
+                        if (_state.value.policyDraftCorrupt || store.hasCorruptEvidence()) {
+                            store.loadForRepair()
+                        } else {
+                            val r = store.loadResult()
+                            if (r is LoadResult.Unavailable && store.hasCorruptEvidence()) {
+                                store.loadForRepair()
+                            } else {
+                                r
+                            }
+                        }
+                    }
                 } catch (e: Throwable) {
                     if (e is CancellationException) throw e
                     LoadResult.Unavailable
@@ -7302,7 +7390,7 @@ class DualViewModel(
                         _state.update { cur ->
                             cur.copy(
                                 policyDraftKnown = false,
-                                policyDraftCorrupt = result is LoadResult.Corrupt,
+                                policyDraftCorrupt = result is LoadResult.Corrupt || (cur.policyDraftCorrupt && result !is LoadResult.Known),
                             )
                         }
                     } else {
@@ -7321,10 +7409,19 @@ class DualViewModel(
                                     cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
                                 }
                             } else {
+                                val verified = try {
+                                    markObservedKnownVerified(revBeforeRefresh)
+                                } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { false }
+                                if (!verified) {
+                                    try { policyRevisionStale.set(true) } catch (_: Throwable) { }
+                                    _state.update { cur ->
+                                        cur.copy(policyDraftKnown = false, policyDraftCorrupt = cur.policyDraftCorrupt)
+                                    }
+                                    return@synchronized
+                                }
                                 disarmBlindClear()
                                 disarmCorruptRepair()
                                 policyRevisionStale.set(false)
-                                markObservedKnown()
                                 _state.update { cur ->
                                     if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                                         cur.copy(
@@ -7340,7 +7437,9 @@ class DualViewModel(
                                 }
                             }
                         } else {
-                            val isCorrupt = result is LoadResult.Corrupt
+                            val isCorrupt = result is LoadResult.Corrupt ||
+                                (store?.hasCorruptEvidence() == true) ||
+                                (_state.value.policyDraftCorrupt && result !is LoadResult.Known)
                             if (isCorrupt) disarmBlindClear()
                             _state.update { cur ->
                                 if (store == null) {
@@ -7409,72 +7508,18 @@ class DualViewModel(
             }
             return
         }
-        // Stage I2：陳舊修訂 stale 即強制重讀（fail closed：異 Tx 終態已丟棄，
-        // 本地 draft 看似 Known 實則落後，不得整包覆寫未見新修訂）。
-        if (policyRevisionStale.get()) {
+        // Stage I2 / O1: 陳舊修訂與 orphanDropGen 門控（fail-closed：未見新修訂
+        // 或 orphan placeholder 被丟棄時，強制重讀刷新，不得覆寫未見修訂）。
+        if (!checkOrphanDropAndRevisionStaleLocked()) {
             _state.update {
                 it.copy(
+                    policyDraftKnown = false,
+                    policyDraftCorrupt = it.policyDraftCorrupt,
                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                     msgKind = MsgKind.CHANNEL,
                 )
             }
             return
-        }
-        // Stage O1 P1#1 (consent): authoritatively observed revision gate.
-        // The displayed draft was read at authoritativeObservedRev; if the
-        // coordinator committedRevision has since advanced (unseen B CAS without
-        // any _latest event, e.g. orphan placeholder dropped), the dialog content
-        // is stale even though local Known is still true. Fail closed: force
-        // Unknown + fresh trusted read before any full-set replacement.
-        // Also fail closed when an orphan placeholder was dropped since our last
-        // observation (dropGen moved) — no event was published, so staleness is
-        // invisible without this generation check.
-        // P3: the gen gate is paired with the drop rev (orphanDropRev): block
-        // ONLY when the drop is newer than what this VM authoritatively read
-        // (dropRev > observed). An older drop (dropRev <= observed, e.g. a stale
-        // placeholder predating our fresh read) just advances lastSeenDropGen
-        // silently — the rev gate above already covers real advances.
-        run {
-            val coordO = policyTxCoordinator
-            if (coordO != null && hookPolicyStore != null) {
-                val observed = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
-                if (observed != -1L) {
-                    val curRev = try { coordO.currentRevision() } catch (_: Exception) { observed }
-                    if (curRev != observed) {
-                        try { policyRevisionStale.set(true) } catch (_: Exception) { }
-                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
-                        _state.update {
-                            it.copy(
-                                policyDraftKnown = false,
-                                policyDraftCorrupt = it.policyDraftCorrupt,
-                                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                                msgKind = MsgKind.CHANNEL,
-                            )
-                        }
-                        return
-                    }
-                    val curDrop = try { coordO.orphanDropGen.get() } catch (_: Exception) { 0L }
-                    val seenDrop = try { lastSeenDropGen.get() } catch (_: Exception) { curDrop }
-                    if (curDrop != seenDrop) {
-                        val dropRev = try { coordO.orphanDropRev.get() } catch (_: Exception) { -1L }
-                        if (dropRev == -1L || dropRev > observed) {
-                            try { policyRevisionStale.set(true) } catch (_: Exception) { }
-                            try { markPolicyUnknownLocked() } catch (_: Exception) { }
-                            _state.update {
-                                it.copy(
-                                    policyDraftKnown = false,
-                                    policyDraftCorrupt = it.policyDraftCorrupt,
-                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                                    msgKind = MsgKind.CHANNEL,
-                                )
-                            }
-                            return
-                        }
-                        // Stale drop (older than observed): catch up silently.
-                        try { lastSeenDropGen.set(curDrop) } catch (_: Exception) { }
-                    }
-                }
-            }
         }
         // P2 #3:先前遠端政策未知時拒絕建 pending (fail closed,避免整包覆寫
         // 未曾示出的內容)。store 為 null 時走既有 null-store 路徑,不在此攔截。
@@ -7547,7 +7592,7 @@ class DualViewModel(
                     droppedCount = dropped,
                     baseDraftVersion = policyDraftVersion.get(),
                     baseCoordinatorRevision = run {
-                        val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                        val obs = try { observedSnapshot.get().rev } catch (_: Exception) { -1L }
                         if (obs != -1L) obs
                         else policyTxCoordinator?.currentRevision() ?: -1L
                     },
@@ -7679,7 +7724,7 @@ class DualViewModel(
                         lastRevisionSeenKey.set(recovered.key)
                         advanceLastRevisionSeenRev(recovered.rev)
                     }
-                    val obs = try { authoritativeObservedRev.get() } catch (_: Exception) { -1L }
+                    val obs = try { observedSnapshot.get().rev } catch (_: Exception) { -1L }
                     if (obs != -1L && (recovered.rev == -1L || recovered.rev > obs)) {
                         policyRevisionStale.set(true)
                     } else if (obs == -1L) {
@@ -7741,7 +7786,7 @@ class DualViewModel(
                     policyWritePhase = PolicyWritePhase.IDLE,
                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                     policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                    policyDraftCorrupt = cur.policyDraftCorrupt,
                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                     msgKind = MsgKind.CHANNEL,
                 )
@@ -7889,13 +7934,14 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             markPolicyUnknownLocked()
-                            _state.update {
-                                it.copy(
+                            _state.update { curWrite ->
+                                if (curWrite.pendingPolicyWrite != pendingAtCall) return@update curWrite
+                                curWrite.copy(
                                     pendingPolicyWrite = null,
                                     policyWritePhase = PolicyWritePhase.IDLE,
                                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                     policyDraftKnown = false,
-                                    policyDraftCorrupt = false,
+                                    policyDraftCorrupt = curWrite.policyDraftCorrupt,
                                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                                     msgKind = MsgKind.CHANNEL,
                                 )
@@ -8035,7 +8081,30 @@ class DualViewModel(
                                         h1Coord.committedRevision.get() == pendingAtCall.baseCoordinatorRevision)
                                     val staged = try { h1Coord.pendingPublish.get() } catch (_: Exception) { null }
                                     val pendingOk = (staged == null || (staged.txId == tx.txId && staged.key == tx.key))
-                                    if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get()) {
+                                    val snap = observedSnapshot.get()
+                                    val curDrop = try { h1Coord.orphanDropGen.get() } catch (_: Exception) { 0L }
+                                    val dropStale = if (curDrop != snap.dropGen) {
+                                        val dropRev = try { h1Coord.orphanDropRev.get() } catch (_: Exception) { -1L }
+                                        if (dropRev == -1L || dropRev >= snap.rev) {
+                                            try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                                            true
+                                        } else {
+                                            // dropGen is only mutated under commitMutex (recover/discard
+                                            // paths); this loop runs inside withCommitLock, so curDrop is
+                                            // stable and the CAS converges or breaks immediately.
+                                            var done = false
+                                            var guard = 0
+                                            while (!done && guard++ < 8) {
+                                                val curSnap = try { observedSnapshot.get() } catch (_: Exception) { snap }
+                                                if (curSnap.dropGen == curDrop) break
+                                                val merged = if (curSnap.rev != snap.rev) curSnap.copy(dropGen = curDrop) else snap.copy(dropGen = curDrop)
+                                                try { done = observedSnapshot.compareAndSet(curSnap, merged) } catch (_: Exception) { break }
+                                                if (!done && try { observedSnapshot.get().dropGen } catch (_: Exception) { curDrop } == curDrop) break
+                                            }
+                                            false
+                                        }
+                                    } else false
+                                    if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get() || dropStale) {
                                         preIoAbort = true
                                     } else {
                                         armAndStartTxDeferred(tx)
@@ -8819,7 +8888,32 @@ class DualViewModel(
                                     val coordActiveOkClear = (coordActiveClear == null || coordActiveClear === txClear)
                                     val stagedClear = try { h1ClearCoord.pendingPublish.get() } catch (_: Exception) { null }
                                     val pendingOkClear = (stagedClear == null || (stagedClear.txId == txClear.txId && stagedClear.key == txClear.key))
-                                    if (!coordActiveOkClear || !pendingOkClear || policyRevisionStale.get()) {
+                                    val snapClear = try { observedSnapshot.get() } catch (_: Exception) { null }
+                                    var dropStaleClear = false
+                                    if (snapClear != null && snapClear.rev != -1L) {
+                                        val curDropClear = try { h1ClearCoord.orphanDropGen.get() } catch (_: Exception) { snapClear.dropGen }
+                                        if (curDropClear != snapClear.dropGen) {
+                                            val dropRevClear = try { h1ClearCoord.orphanDropRev.get() } catch (_: Exception) { -1L }
+                                            if (dropRevClear == -1L || dropRevClear >= snapClear.rev) {
+                                                try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                                                dropStaleClear = true
+                                            } else {
+                                                // dropGen is only mutated under commitMutex (recover/discard
+                                                // paths); this loop runs inside withCommitLock, so curDropClear
+                                                // is stable and the CAS converges or breaks immediately.
+                                                var doneC = false
+                                                var guardC = 0
+                                                while (!doneC && guardC++ < 8) {
+                                                    val curS = try { observedSnapshot.get() } catch (_: Exception) { snapClear }
+                                                    if (curS.dropGen == curDropClear) break
+                                                    val mergedC = if (curS.rev != snapClear.rev) curS.copy(dropGen = curDropClear) else snapClear.copy(dropGen = curDropClear)
+                                                    try { doneC = observedSnapshot.compareAndSet(curS, mergedC) } catch (_: Exception) { break }
+                                                    if (!doneC && try { observedSnapshot.get().dropGen } catch (_: Exception) { curDropClear } == curDropClear) break
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!coordActiveOkClear || !pendingOkClear || policyRevisionStale.get() || dropStaleClear) {
                                         preIoAbortClear = true
                                     } else {
                                         armAndStartTxDeferred(txClear)
@@ -9433,7 +9527,9 @@ class DualViewModel(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        // Repair is only reachable when corrupt==true (gated above):
+                                        // preserve corrupt on stale abort, never wash to false.
+                                        policyDraftCorrupt = true,
                                         msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
@@ -9441,7 +9537,9 @@ class DualViewModel(
                                     cur.copy(
                                         loading = false,
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        // Repair is only reachable when corrupt==true (gated above):
+                                        // preserve corrupt on stale abort, never wash to false.
+                                        policyDraftCorrupt = true,
                                         msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
@@ -9665,7 +9763,32 @@ class DualViewModel(
                                         h1RepairCoord.committedRevision.get() == armedRepairBaseRev)
                                     val staged = try { h1RepairCoord.pendingPublish.get() } catch (_: Exception) { null }
                                     val pendingOk = (staged == null || (staged.txId == tx.txId && staged.key == tx.key))
-                                    if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get()) {
+                                    val snapRep = try { observedSnapshot.get() } catch (_: Exception) { null }
+                                    var dropStaleRep = false
+                                    if (snapRep != null && snapRep.rev != -1L) {
+                                        val curDropRep = try { h1RepairCoord.orphanDropGen.get() } catch (_: Exception) { snapRep.dropGen }
+                                        if (curDropRep != snapRep.dropGen) {
+                                            val dropRevRep = try { h1RepairCoord.orphanDropRev.get() } catch (_: Exception) { -1L }
+                                            if (dropRevRep == -1L || dropRevRep >= snapRep.rev) {
+                                                try { policyRevisionStale.set(true) } catch (_: Exception) { }
+                                                dropStaleRep = true
+                                            } else {
+                                                // dropGen is only mutated under commitMutex (recover/discard
+                                                // paths); this loop runs inside withCommitLock, so curDropRep
+                                                // is stable and the CAS converges or breaks immediately.
+                                                var doneR = false
+                                                var guardR = 0
+                                                while (!doneR && guardR++ < 8) {
+                                                    val curS = try { observedSnapshot.get() } catch (_: Exception) { snapRep }
+                                                    if (curS.dropGen == curDropRep) break
+                                                    val mergedR = if (curS.rev != snapRep.rev) curS.copy(dropGen = curDropRep) else snapRep.copy(dropGen = curDropRep)
+                                                    try { doneR = observedSnapshot.compareAndSet(curS, mergedR) } catch (_: Exception) { break }
+                                                    if (!doneR && try { observedSnapshot.get().dropGen } catch (_: Exception) { curDropRep } == curDropRep) break
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!coordActiveOk || !revOk || !pendingOk || baseMismatchPreIo || policyRevisionStale.get() || dropStaleRep) {
                                         preIoAbortRepair = true
                                     }
                                 }
@@ -9696,7 +9819,9 @@ class DualViewModel(
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
+                                        // Repair is only reachable when corrupt==true (gated above):
+                                        // preserve corrupt on pre-IO abort, never wash to false.
+                                        policyDraftCorrupt = true,
                                         msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
