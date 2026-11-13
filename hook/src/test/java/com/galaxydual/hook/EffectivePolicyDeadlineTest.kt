@@ -4,6 +4,9 @@ package com.galaxydual.hook
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 // Phase7 P2 end-to-end deadline (gate-open).
@@ -218,6 +221,7 @@ class EffectivePolicyDeadlineTest {
     fun graceZeroFollowersReturnFast() {
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
+        val leaderStarted = CountDownLatch(1)
         // Leader occupies the single-flight with a 200ms read.
         var leaderResult: Set<String>? = null
         val leader = Thread {
@@ -227,13 +231,14 @@ class EffectivePolicyDeadlineTest {
                 followerGraceMs = 0L,
             ) {
                 reads.incrementAndGet()
+                leaderStarted.countDown()
                 sleepInterruptible(200)
                 setOf("b")
             }
         }
         leader.start()
         // Ensure the leader claimed inFlightGen before followers arrive.
-        sleepInterruptible(20)
+        assertTrue("leader must start read within 5s", leaderStarted.await(5, TimeUnit.SECONDS))
         val followerElapsed = AtomicInteger(-1)
         var followerResult: Set<String>? = null
         val followerStart = DeadlineBudget.nowNanos()
@@ -258,5 +263,112 @@ class EffectivePolicyDeadlineTest {
         assertEquals(1, reads.get())
         assertEquals(setOf("b"), leaderResult)
         assertTrue("grace 0 follower must return fast, elapsed=$felapsed", felapsed < 65)
+    }
+
+    @Test
+    fun fastLeaderNotifiesAndWakesFollowersImmediately() {
+        val cache = EffectivePolicyCache()
+        val reads = AtomicInteger()
+        val leaderStarted = CountDownLatch(1)
+        var leaderResult: Set<String>? = null
+        val leader = Thread {
+            leaderResult = cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 50L,
+            ) {
+                reads.incrementAndGet()
+                leaderStarted.countDown()
+                sleepInterruptible(5)
+                setOf("fast-leader")
+            }
+        }
+        leader.start()
+        assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
+        var followerResult: Set<String>? = null
+        val followerStart = DeadlineBudget.nowNanos()
+        val follower = Thread {
+            followerResult = cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 50L,
+            ) {
+                reads.incrementAndGet()
+                setOf("unexpected")
+            }
+        }
+        follower.start()
+        follower.join()
+        val followerElapsed = (DeadlineBudget.nowNanos() - followerStart) / 1_000_000L
+        leader.join()
+
+        assertEquals(1, reads.get())
+        assertEquals(setOf("fast-leader"), leaderResult)
+        assertEquals(setOf("fast-leader"), followerResult)
+        // With notifyAll, follower wakes up when leader finishes (~5ms) instead of waiting full 50ms grace timeout.
+        assertTrue(
+            "follower must wake up immediately on leader commit (< 40ms), elapsed=$followerElapsed",
+            followerElapsed < 40,
+        )
+    }
+
+    @Test
+    fun followerTotalElapsedNeverExceedsBudgetUnderContention() {
+        val cache = EffectivePolicyCache()
+        val reads = AtomicInteger()
+        val leaderStarted = CountDownLatch(1)
+        // Leader takes long (200ms) to ensure followers hit their grace budget timeout.
+        val leader = Thread {
+            cache.get(
+                emptySet(),
+                nonEmptyPolicyGateOpen = true,
+                followerGraceMs = 50L,
+            ) {
+                reads.incrementAndGet()
+                leaderStarted.countDown()
+                sleepInterruptible(200)
+                setOf("slow-leader")
+            }
+        }
+        leader.start()
+        assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
+
+        val followerCount = 8
+        val followerResults = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val followerElapsedList = Collections.synchronizedList(mutableListOf<Long>())
+        val followers = (1..followerCount).map {
+            Thread {
+                val start = DeadlineBudget.nowNanos()
+                val res = cache.get(
+                    emptySet(),
+                    nonEmptyPolicyGateOpen = true,
+                    followerGraceMs = 50L,
+                ) {
+                    reads.incrementAndGet()
+                    setOf("unexpected")
+                }
+                val elapsed = (DeadlineBudget.nowNanos() - start) / 1_000_000L
+                followerResults.add(res)
+                followerElapsedList.add(elapsed)
+            }
+        }
+        followers.forEach { it.start() }
+        followers.forEach { it.join() }
+        leader.join()
+
+        assertEquals(1, reads.get())
+        assertEquals(followerCount, followerResults.size)
+        // All followers timed out after their grace budget (50ms) and fell back to seed (emptySet)
+        for (res in followerResults) {
+            assertEquals(emptySet<String>(), res)
+        }
+        // Even with lock contention among multiple followers waking up simultaneously,
+        // each follower's total elapsed time must not exceed the budget + reasonable OS scheduler slack (50ms + 35ms = 85ms).
+        for (elapsed in followerElapsedList) {
+            assertTrue(
+                "follower elapsed must not exceed budget+slack, elapsed=$elapsed",
+                elapsed <= PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS + 35,
+            )
+        }
     }
 }

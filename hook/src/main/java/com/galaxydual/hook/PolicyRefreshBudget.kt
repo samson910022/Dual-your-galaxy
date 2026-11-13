@@ -33,9 +33,8 @@ import java.util.concurrent.atomic.AtomicLong
 // It keeps a whitelist query (a local binder query normally sub-ms to a few
 // ms) from stalling on IPC. Documented in docs/HOOK.md §1.1 (end-to-end
 // total); DualHook uses this for every effective-policy refresh.
-// Documented in docs/HOOK.md §1.1; DualHook uses this for every effective-
-// policy refresh. JVM-tested via injected ExecutorService (see
-// PolicyRefreshBudgetTest); production passes a shared daemon executor.
+// JVM-tested via injected ExecutorService (see PolicyRefreshBudgetTest);
+// production passes a shared daemon executor.
 // Note: tests pin the FALLBACK (timeout/exception/null -> null, caller falls
 // back to seed/last-known-good), not the exact 50ms value; the constant may
 // be retuned without breaking the contract as long as the fallback holds.
@@ -378,6 +377,7 @@ class PolicyRefreshGate(
         reader: () -> Set<String>?,
         timeoutMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         // Stuck-worker short-circuit, with a bounded half-open probe after
         // cooldown (M4 P2#6 fix): no cross-process push exists on API 102.0.0,
         // so invalidate() may never arrive; without a timed probe the breaker
@@ -501,6 +501,7 @@ class PolicyRefreshGate(
         reader: () -> Set<String>?,
         timeoutMs: Long = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         if (stuckOpen) {
             val now = try {
                 nowMs()
@@ -607,6 +608,7 @@ class PolicyRefreshGate(
         timeoutMs: Long,
         isProbe: Boolean,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         // isProbe is reserved for future divergence; today both paths share
         // submit semantics (guard + zero queue already bound the work).
         @Suppress("UNUSED_PARAMETER")
@@ -665,6 +667,7 @@ class PolicyRefreshGate(
         timeoutMs: Long,
         now: Long,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         val future: Future<Set<String>?> = try {
             executor.submit(Callable<Set<String>?> { reader() })
         } catch (re: RejectedExecutionException) {
@@ -716,6 +719,7 @@ class PolicyRefreshGate(
         timeoutMs: Long,
         isProbe: Boolean,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         @Suppress("UNUSED_PARAMETER")
         val _probe = isProbe
         val future: Future<Set<String>?> = try {
@@ -761,6 +765,7 @@ class PolicyRefreshGate(
         timeoutMs: Long,
         now: Long,
     ): Set<String>? {
+        if (timeoutMs <= 0L) return null
         val future: Future<Set<String>?> = try {
             executor.submit(Callable<Set<String>?> { reader() })
         } catch (re: RejectedExecutionException) {

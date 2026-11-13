@@ -77,13 +77,14 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     private var inFlightGen: Long? = null
 
     // Follower grace (Phase3 herd fix, Phase7 budget-aware): a follower that
-    // arrives while a leader read is in flight sleeps briefly outside the
-    // lock, then re-checks for a committed value before falling back to
-    // seed-only. This collapses a herd onto the leader's result instead of
-    // returning permanent seed-only. Fail-closed in all cases (seed-only
-    // fallback, never stale). Phase7: grace is min(50, remaining end-to-end
-    // budget) passed by DualHook; 0 skips the sleep entirely (system_server
-    // tunable). Hits counted in [followerGraceHits] for observability.
+    // arrives while a leader read is in flight waits briefly on [lock], then
+    // re-checks for a committed value before falling back to seed-only.
+    // When the leader finishes (commits or aborts), it wakes all followers
+    // immediately via notifyAll (~2-3ms instead of waiting full grace).
+    // Fail-closed in all cases (seed-only fallback, never stale). Phase7: grace
+    // is min(50, remaining end-to-end budget) passed by DualHook; 0 skips the
+    // wait entirely (system_server tunable). Hits counted in [followerGraceHits]
+    // for observability.
     companion object {
         const val DEFAULT_FOLLOWER_GRACE_MS = 50L
     }
@@ -93,10 +94,22 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     // reset (process-lifetime; tests read only).
     val followerGraceHits = AtomicLong(0L)
 
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+    private fun waitGrace(timeoutMs: Long) {
+        if (timeoutMs <= 0L) return
+        (lock as java.lang.Object).wait(timeoutMs)
+    }
+
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+    private fun notifyFollowers() {
+        (lock as java.lang.Object).notifyAll()
+    }
+
     fun get(
         seed: Set<String>,
         nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
         followerGraceMs: Long = DEFAULT_FOLLOWER_GRACE_MS,
+        deadlineMs: Long = -1L,
         reader: () -> Set<String>?,
     ): Set<String> {
         // Stage C: gate-closed short-circuit. Returns empty without touching
@@ -154,35 +167,55 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             }
         }
         if (isFollower) {
-            // OUTSIDE lock: brief grace so the in-flight leader can commit.
-            // Never holds the lock across the sleep (the leader needs it).
-            // No wait/notify: followers sleep then re-check valid (handles
-            // spurious wakeups by design — there is no wait to wake early
-            // from). The leader's former notifyAll was dead (nobody waits)
-            // and is removed; followers never block the leader.
-            // Phase7: grace <= 0 skips the sleep (deadline exhausted /
-            // system_server tunable 0) for an immediate seed-only fast path.
-            val grace = try {
-                followerGraceMs.coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
+            // OUTSIDE lock: wait on [lock] with remaining grace budget so
+            // in-flight leader can wake followers immediately via notifyAll().
+            // If remainingGrace <= 0L, do not wait; fall back to cached/seed immediately.
+            val now1 = try {
+                nowMs()
+            } catch (_: Throwable) {
+                now0
+            }
+            val elapsed = try {
+                (now1 - now0).coerceAtLeast(0L)
             } catch (_: Throwable) {
                 0L
             }
-            if (grace > 0) {
+            val remainingGrace = if (deadlineMs > 0L) {
                 try {
-                    followerGraceHits.incrementAndGet()
+                    minOf(followerGraceMs - elapsed, deadlineMs - now1).coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
                 } catch (_: Throwable) {
+                    0L
                 }
+            } else {
                 try {
-                    Thread.sleep(grace)
-                } catch (t: Throwable) {
-                    if (t is InterruptedException) try {
-                        Thread.currentThread().interrupt()
-                    } catch (_: Throwable) {
-                    }
+                    (followerGraceMs - elapsed).coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
+                } catch (_: Throwable) {
+                    0L
                 }
             }
+            if (remainingGrace <= 0L) {
+                synchronized(lock) {
+                    if (valid) return cached.toSet()
+                    return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                }
+            }
+            try {
+                followerGraceHits.incrementAndGet()
+            } catch (_: Throwable) {
+            }
             synchronized(lock) {
-                // Re-check after grace: leader may have committed a good value.
+                if (!valid && inFlightGen != null) {
+                    try {
+                        waitGrace(remainingGrace)
+                    } catch (t: Throwable) {
+                        if (t is InterruptedException) {
+                            try {
+                                Thread.currentThread().interrupt()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
                 if (valid) return cached.toSet()
                 return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
@@ -217,14 +250,14 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                     // Loser-drop still applies: an invalidate during IO means
                     // seed-only (never resurrect stale).
                     if (gen0 != generation) {
-                        return if (valid) cached.toSet()
-                        else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                        return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                     }
                     return if (hadGoodValue && !invalidated) cached.toSet()
                     else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 } finally {
                     if (inFlightGen == gen0) {
                         inFlightGen = null
+                        notifyFollowers()
                     }
                 }
             }
@@ -278,9 +311,10 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 // Stage C: release the single-flight claim, but only if it is
                 // still ours -- an invalidate() (which clears inFlightGen) or
                 // a successor leader must never be cleared by a stale leader.
-                // No notifyAll: followers use timed sleep + re-check, never wait().
+                // Wake all waiting followers immediately via notifyAll().
                 if (inFlightGen == gen0) {
                     inFlightGen = null
+                    notifyFollowers()
                 }
             }
         }
@@ -298,9 +332,10 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         // Stage C: release any in-flight single-flight claim so the next miss
         // elects a fresh leader under the new generation (the stale leader
         // discards via the gen0 != generation loser-drop above).
-        // No notifyAll: followers never wait(), they sleep + re-check.
+        // Wake all waiting followers immediately via notifyAll().
         inFlightGen = null
         generation++
+        notifyFollowers()
     }
 
     // True only while a good value is cached; used by the reader to rate-limit

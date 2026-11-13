@@ -245,7 +245,11 @@ class DualHook : XposedModule() {
                 .setId(HOOK_ID_WHITELIST_CLINIT)
                 .intercept { chain ->
                     chain.proceed()
-                    patchWhitelistField(target)
+                    try {
+                        patchWhitelistField(target)
+                    } catch (t: Throwable) {
+                        logi("patch field error: $t")
+                    }
                     null
                 }
             installed++
@@ -613,10 +617,16 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             0L
         }
+        val deadlineMs: Long = try {
+            (t0 / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+        } catch (_: Throwable) {
+            -1L
+        }
         return effectiveCache.get(
             EXTRA_WHITELIST_PACKAGES,
             nonEmptyPolicyGateOpen = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
             followerGraceMs = graceAtEntry,
+            deadlineMs = deadlineMs,
         ) {
             var rem = remainingMs()
             if (rem <= 0) {
@@ -731,12 +741,15 @@ class DualHook : XposedModule() {
         // Phase7: uses the caller's remaining end-to-end budget (already
         // min(50, remaining)); coerced to >= 0, 0 means immediate timeout
         // path (fail-closed null) without submitting.
+        val boundedTimeout = try {
+            timeoutMs.coerceAtLeast(0L)
+        } catch (_: Throwable) {
+            0L
+        }
+        if (boundedTimeout <= 0L) {
+            return null
+        }
         val probe: Set<String>? = try {
-            val boundedTimeout = try {
-                timeoutMs.coerceAtLeast(0L)
-            } catch (_: Throwable) {
-                0L
-            }
             capabilityGate.readBoundedOrThrow(
                 reader = {
                     val v = getFrameworkProperties()
@@ -759,6 +772,7 @@ class DualHook : XposedModule() {
                 capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
             } catch (_: Throwable) {
             }
+            remoteCapableFalseCached = null
             return null
         } catch (_: Throwable) {
             // Submit failure outside the gate state machine: same dual
@@ -768,6 +782,7 @@ class DualHook : XposedModule() {
                 capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
             } catch (_: Throwable) {
             }
+            remoteCapableFalseCached = null
             return null
         }
         if (probe == null) {
@@ -777,6 +792,7 @@ class DualHook : XposedModule() {
                 capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
             } catch (_: Throwable) {
             }
+            remoteCapableFalseCached = null
             if (!remoteCapabilityProbeFailureLogged) {
                 remoteCapabilityProbeFailureLogged = true
                 logi("remote capability probe failed: TimeoutOrError")
@@ -792,6 +808,7 @@ class DualHook : XposedModule() {
                 capabilityLatch.reportFalse()
                 remoteCapableFalseCached = false
             }
+            remoteCapabilityProbeFailureLogged = false
             capable
         } catch (t: Throwable) {
             // Latch bookkeeping itself threw (hostile clock): throttle + null.
@@ -799,6 +816,7 @@ class DualHook : XposedModule() {
                 capabilityLatch.reportFalseAt(System.nanoTime() / 1_000_000L)
             } catch (_: Throwable) {
             }
+            remoteCapableFalseCached = null
             if (!remoteCapabilityProbeFailureLogged) {
                 remoteCapabilityProbeFailureLogged = true
                 logi("remote capability probe failed: ${shortEx(t)}: ${shortMsg(t)}")
@@ -1059,6 +1077,8 @@ class DualHook : XposedModule() {
         private val remotePolicyListener =
             SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
                 capabilityLatch.onInvalidate()
+                remoteCapableFalseCached = null
+                remoteCapabilityProbeFailureLogged = false
                 effectiveCache.invalidate()
                 try {
                     policyRefreshGate.invalidate()
