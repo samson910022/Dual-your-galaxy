@@ -6,7 +6,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 // Phase3: follower grace re-check, loser-drop under invalidate, contention
@@ -20,15 +22,19 @@ class EffectivePolicyCachePhase3Test {
         cache.invalidate()
         // Leader blocks 200ms; second invalidate fires mid-flight; the stale
         // leader must discard (gen mismatch) and return seed-only.
+        // Deterministic handshake: the invalidate only lands once the reader
+        // is actually in flight (entered latch), never on a wall-clock guess.
+        val readerEntered = CountDownLatch(1)
         var leaderResult: Set<String>? = null
         val leader = Thread {
             leaderResult = cache.get(emptySet(), true) {
+                readerEntered.countDown()
                 Thread.sleep(200)
                 setOf("b")
             }
         }
         leader.start()
-        Thread.sleep(50)
+        assertTrue("reader must enter before invalidate", readerEntered.await(5, TimeUnit.SECONDS))
         cache.invalidate()
         leader.join()
         assertEquals(emptySet<String>(), leaderResult)

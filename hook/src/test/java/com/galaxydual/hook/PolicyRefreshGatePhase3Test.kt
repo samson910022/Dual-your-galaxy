@@ -105,10 +105,13 @@ class PolicyRefreshGatePhase3Test {
             assertEquals(-1, gate.queueDepth())
             assertEquals(-1, gate.activeCount())
             // Trip, then advance beyond threshold: custom busy is always false,
-            // so the probe proceeds without a rebuild.
-            assertNull(gate.readBounded(ignoringReader(300), timeoutMs = 50))
+            // so the probe proceeds without a rebuild. Deterministic handshake:
+            // wait for the interrupt-ignoring reader to actually drain (not a
+            // wall-clock guess) before probing the custom executor.
+            val readerDone = CountDownLatch(1)
+            assertNull(gate.readBounded({ val v = ignoringReader(300)(); readerDone.countDown(); v }, timeoutMs = 50))
             assertTrue(gate.isStuck())
-            Thread.sleep(400)
+            assertTrue("stuck reader must drain", readerDone.await(5, TimeUnit.SECONDS))
             clock.addAndGet(500L)
             val r = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
             assertEquals(setOf("ok"), r)
@@ -129,8 +132,9 @@ class PolicyRefreshGatePhase3Test {
                 maxConsecutiveTimeouts = 1,
             )
             // First timeout trips via the count arm (clock failure is caught).
-            assertNull(gate.readBounded(ignoringReader(300), timeoutMs = 50))
-            Thread.sleep(400)
+            val readerDone = CountDownLatch(1)
+            assertNull(gate.readBounded({ val v = ignoringReader(300)(); readerDone.countDown(); v }, timeoutMs = 50))
+            assertTrue("stuck reader must drain", readerDone.await(5, TimeUnit.SECONDS))
             assertTrue(gate.isStuck())
             val stuckBefore = gate.stuckShortCircuits.get()
             // Stuck-open path calls nowMs() which throws -> short-circuit null.
@@ -259,12 +263,18 @@ class PolicyRefreshGatePhase3Test {
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-orthrow")
         try {
             val gate = PolicyRefreshGate(executor = executor)
-            // Guard contention throws.
+            // Guard contention throws. Deterministic handshake: the contended
+            // call only lands after the leader's reader is actually in
+            // flight (entered latch), never on a wall-clock guess.
+            val readerEntered = CountDownLatch(1)
             val leader = Thread {
-                gate.readBoundedOrThrow(ignoringReader(500), timeoutMs = 50)
+                gate.readBoundedOrThrow(
+                    { readerEntered.countDown(); ignoringReader(500)() },
+                    timeoutMs = 50,
+                )
             }
             leader.start()
-            Thread.sleep(50)
+            assertTrue("leader must enter its reader", readerEntered.await(5, TimeUnit.SECONDS))
             try {
                 gate.readBoundedOrThrow({ setOf("x") }, timeoutMs = 50)
                 assertTrue("expected contention", false)
@@ -272,7 +282,13 @@ class PolicyRefreshGatePhase3Test {
                 // Expected.
             }
             leader.join()
-            Thread.sleep(600)
+            // Worker drains (ignoring reader runs 500ms) before invalidate —
+            // bounded poll, not a wall-clock sleep.
+            val drainDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (gate.activeCount() != 0 && System.nanoTime() < drainDeadline) {
+                Thread.yield()
+            }
+            assertEquals(0, gate.activeCount())
             gate.invalidate()
             // IO failure (throwing reader) returns null, not contention.
             assertNull(gate.readBoundedOrThrow({ throw IllegalStateException("io") }, timeoutMs = 500))
