@@ -234,7 +234,9 @@ internal fun checkPrefsIdentityStable(
     } catch (_: Throwable) {
     }
     try {
-        logStore("provider identity changed prev=$prev cur=$prefs (unstable wrapper?)")
+        val prevH = try { System.identityHashCode(prev) } catch (_: Throwable) { 0 }
+        val curH = try { System.identityHashCode(prefs) } catch (_: Throwable) { 0 }
+        logStore("provider identity changed prevHash=$prevH curHash=$curH (unstable wrapper?)")
     } catch (_: Throwable) {
     }
     val poisoned = try {

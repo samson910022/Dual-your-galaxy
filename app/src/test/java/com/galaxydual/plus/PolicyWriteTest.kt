@@ -8131,6 +8131,23 @@ class PolicyWriteTest {
             assertNotNull(pendingC)
             vm2.confirmPolicyWrite(pendingC!!)
             await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
+            // Same-rev orphan drop (dropRev==observed) fails closed on first
+            // confirm (fail-closed >= boundary); refresh catches up dropGen,
+            // then retry must succeed — proves recovery, not stuck forever.
+            if (!vm2.state.value.policyDraftKnown) {
+                vm2.refreshPolicyDraft()
+                await(timeoutMs = 10_000L) { vm2.state.value.policyDraftKnown }
+                // Re-select C if selection was cleared by Unknown path.
+                if (!vm2.state.value.selectedKeys.contains("0:com.C")) {
+                    vm2.setSourceCatalog(listOf(SourceAppEntry("com.C", "C", 0, false)))
+                    vm2.toggleSelection("0:com.C")
+                }
+                vm2.requestPolicyWrite()
+                val pendingC2 = vm2.state.value.pendingPolicyWrite
+                assertNotNull(pendingC2)
+                vm2.confirmPolicyWrite(pendingC2!!)
+                await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
+            }
             // System recovers: valid write succeeds, not stuck Unknown forever.
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.C"), vm2.state.value.policyDraft)
@@ -10312,5 +10329,95 @@ class PolicyWriteTest {
             try { ackGate.countDown() } catch (_: Exception) { }
             try { coord2.close() } catch (_: Exception) { }
         }
+    }
+
+    private fun setRevisionStaleForRepairTest(vm: DualViewModel, stale: Boolean) {
+        val f = DualViewModel::class.java.getDeclaredField("policyRevisionStale").apply { isAccessible = true }
+        (f.get(vm) as java.util.concurrent.atomic.AtomicBoolean).set(stale)
+    }
+
+    // Early stale-abort must preserve corrupt==true (never wash to false).
+    @Test
+    fun repairCorrupt_earlyStaleAbort_preservesCorruptTrue() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> false },
+        )
+        val vm = makeVm(store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+
+        setRevisionStaleForRepairTest(vm, true)
+        assertTrue(revisionStaleOf(vm))
+
+        vm.confirmRepairCorruptDraft()
+
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+    }
+
+    // Early stale-abort must preserve corrupt==false (never fabricate true).
+    // Covers Known clean and Unknown clean (Unknown+corrupt=false).
+    @Test
+    fun repairCorrupt_earlyStaleAbort_preservesCleanFalse() {
+        // Known clean.
+        val fake = FakePolicyStore()
+        val vmKnown = makeVm(fake.store, userId = 0)
+        await { vmKnown.state.value.policyDraftKnown }
+        assertTrue(vmKnown.state.value.policyDraftKnown)
+        assertFalse(vmKnown.state.value.policyDraftCorrupt)
+
+        setRevisionStaleForRepairTest(vmKnown, true)
+        assertTrue(revisionStaleOf(vmKnown))
+
+        vmKnown.confirmRepairCorruptDraft()
+
+        assertFalse(
+            "stale abort must not fabricate corrupt on Known clean",
+            vmKnown.state.value.policyDraftCorrupt,
+        )
+        assertFalse(vmKnown.state.value.policyDraftKnown)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vmKnown.state.value.msg,
+        )
+        assertEquals(MsgKind.CHANNEL, vmKnown.state.value.msgKind)
+
+        // Unknown clean (Unavailable backend: null => Known=false, corrupt=false).
+        var backing: Set<String>? = null
+        val unknownStore = HookPolicyStore(
+            loadRaw = { backing },
+            saveRaw = { raw ->
+                if (raw != null) backing = raw
+                true
+            },
+        )
+        val vmUnknown = makeVm(unknownStore, userId = 0, initialDraft = null)
+        await { !vmUnknown.state.value.loading }
+        assertFalse(vmUnknown.state.value.policyDraftKnown)
+        assertFalse(vmUnknown.state.value.policyDraftCorrupt)
+
+        setRevisionStaleForRepairTest(vmUnknown, true)
+        assertTrue(revisionStaleOf(vmUnknown))
+
+        vmUnknown.confirmRepairCorruptDraft()
+
+        assertFalse(
+            "stale abort must not fabricate corrupt on Unknown clean",
+            vmUnknown.state.value.policyDraftCorrupt,
+        )
+        assertFalse(vmUnknown.state.value.policyDraftKnown)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vmUnknown.state.value.msg,
+        )
+        assertEquals(MsgKind.CHANNEL, vmUnknown.state.value.msgKind)
     }
 }

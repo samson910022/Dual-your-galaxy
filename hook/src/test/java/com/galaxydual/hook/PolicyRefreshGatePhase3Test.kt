@@ -217,6 +217,42 @@ class PolicyRefreshGatePhase3Test {
     }
 
     @Test
+    fun zeroTimeoutNeverSubmits() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-zero-timeout")
+        try {
+            val gate = PolicyRefreshGate(executor = executor)
+            var calls = 0
+            assertNull(gate.readBounded(reader = { calls++; setOf("x") }, timeoutMs = 0))
+            assertEquals(0, calls)
+            assertNull(gate.readBounded(reader = { calls++; setOf("x") }, timeoutMs = -1))
+            assertEquals(0, calls)
+            assertNull(gate.readBoundedOrThrow(reader = { calls++; setOf("x") }, timeoutMs = 0))
+            assertEquals(0, calls)
+            assertNull(gate.readBoundedOrThrow(reader = { calls++; setOf("x") }, timeoutMs = -1))
+            assertEquals(0, calls)
+            // Object-helper parity: zero/negative budget never submits either.
+            assertNull(
+                PolicyRefreshBudget.readBounded(
+                    reader = { calls++; setOf("x") },
+                    timeoutMs = 0,
+                    executor = executor,
+                ),
+            )
+            assertEquals(0, calls)
+            assertNull(
+                PolicyRefreshBudget.readBounded(
+                    reader = { calls++; setOf("x") },
+                    timeoutMs = -1,
+                    executor = executor,
+                ),
+            )
+            assertEquals(0, calls)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun orThrowSignalsContentionButNullOnIoFailure() {
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-orthrow")
         try {
