@@ -218,9 +218,10 @@ object WhitelistPatch {
             }
             @Suppress("UNCHECKED_CAST")
             val list = current as MutableList<String>
-            // Copy-on-write: snapshot, then compute the union against the
-            // snapshot (snapshot list itself is never mutated in place — the
-            // union is applied once via the single live-list addAll below).
+            // Copy-on-write: the union is materialized first as a NEW list
+            // (`add`, via `extra.filter { it !in snapshot }`); the live list
+            // is not touched until the final addAll applies exactly that
+            // precomputed delta.
             val snapshot: ArrayList<String>
             val add: List<String>
             try {

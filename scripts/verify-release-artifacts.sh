@@ -46,6 +46,43 @@ for apk in "$@"; do
     fail "ShizukuProvider not found in packaged manifest of $apk"
   fi
 
+  # 1b. Packaged manifest provisions exactly one GuardXposedProvider and ZERO
+  #     references to the libxposed service XposedProvider. aapt2 dump text is
+  #     grepped name-wise (a provider's android:name appears exactly once per
+  #     provider node). Loud hard-fail, never a skip: CI has the SDK, and a
+  #     silent pass here would mask a manifest-merge regression shipping the
+  #     unguarded (exported, no-permission) provider. Variant handling: PR CI
+  #     invokes this on the debug APK (debug applicationIdSuffix=.debug), so the
+  #     expected authority is derived from the APK path — the .debug authority
+  #     is only accepted for *-debug*.apk / */debug/* paths; anything else
+  #     expects the release authority (com.galaxydual.plus.XposedService, no
+  #     .debug). A release-expected APK carrying the .debug authority fails.
+  if ! MANIFEST_DUMP="$("$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml 2>/dev/null)"; then
+    fail "aapt2 dump of AndroidManifest.xml failed for $apk"
+  fi
+  if [ -z "$MANIFEST_DUMP" ]; then
+    fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
+  fi
+  guard_nodes="$(printf '%s\n' "$MANIFEST_DUMP" | grep -o 'GuardXposedProvider' | wc -l | tr -d ' ' || true)"
+  if [ "${guard_nodes:-0}" -ne 1 ]; then
+    fail "expected exactly one GuardXposedProvider node in packaged manifest of $apk, found ${guard_nodes:-0}"
+  fi
+  if printf '%s\n' "$MANIFEST_DUMP" | grep -qF 'io.github.libxposed.service.XposedProvider'; then
+    fail "packaged manifest of $apk references io.github.libxposed.service.XposedProvider (unguarded provider must not ship)"
+  fi
+  case "$apk" in
+    *-debug*.apk|*/debug/*) EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService" ;;
+    *)                      EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService" ;;
+  esac
+  if ! printf '%s\n' "$MANIFEST_DUMP" | grep -qF "$EXPECTED_AUTHORITY"; then
+    fail "GuardXposedProvider authority '$EXPECTED_AUTHORITY' not found in packaged manifest of $apk"
+  fi
+  if [ "$EXPECTED_AUTHORITY" = "com.galaxydual.plus.XposedService" ] \
+    && printf '%s\n' "$MANIFEST_DUMP" | grep -qF 'com.galaxydual.plus.debug.XposedService'; then
+    fail "release-expected APK carries the debug authority (com.galaxydual.plus.debug.XposedService): $apk"
+  fi
+  echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
+
   # 2. ShizukuProvider survives into the released DEX (exact descriptor).
   FOUND=0
   DEX_COUNT=0

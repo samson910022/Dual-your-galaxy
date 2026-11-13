@@ -92,12 +92,20 @@ val privilege: Privilege = when {
 > verification in **sha256** mode with `verify-signatures=false`; regenerate via
 > `./gradlew --write-verification-metadata sha256 <tasks>` (never hand-edit hashes
 > except the aapt2 caveat below). It covers all currently-run classpaths
-> (incl. lint / debug / test); the residual is the emulator `connectedAndroidTest`
-> path, which is unverified, and `release.yml` remains unpinned (tracked as
-> follow-up). Caveat: the aapt2 **platform-classifier** artifacts
+> (incl. lint / debug / test); the residual is the emulator/device RUNTIME
+> path (artifacts are pinned; the on-device execution is unverified), and
+> `release.yml` remains unpinned (tracked as follow-up). Caveat: the aapt2
+> **platform-classifier** artifacts
 > (`-windows.jar`/`-osx.jar`) are not resolvable on this Linux host, so those
 > entries were added manually with sha256 hashes verified locally from Google's
 > Maven (`dl.google.com`); the linux classifier stays Gradle-generated.
+> Wrapper provenance: the committed `gradle/wrapper/gradle-wrapper.jar`
+> (81a82aaea5abcc8ff68b3dfcb58b3c3c429378efd98e7433460610fecd7ae45f) matches
+> Gradle 8.13's published wrapper jar — the 8.7 distribution download itself is
+> independently pinned via `distributionSha256Sum` (official 8.7-bin checksum),
+> so the skew affects only wrapper bootstrap, not the 8.7 toolchain. Follow-up
+> (not done): swap the committed jar for the official Gradle 8.7 wrapper jar to
+> remove the version skew.
 >
 > Device + SDK 矩陣（release gate 實證口徑：JVM／emulator 綠燈不等於 S24 裝置驗收）：
 >

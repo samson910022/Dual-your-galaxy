@@ -313,6 +313,13 @@ jobs:
           # step below.
           grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
           grep -F 'android:authorities="com.galaxydual.plus.debug.XposedService"' "$MERGED"
+          # Mirror the release gate's node-count invariant (D4 below): exactly
+          # one GuardXposedProvider node in the debug merged manifest.
+          PROVIDER_NODES=$(grep -c -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED")
+          if [ "$PROVIDER_NODES" != "1" ]; then
+            echo "FAIL: expected exactly 1 GuardXposedProvider node in debug merged manifest, found $PROVIDER_NODES"
+            exit 1
+          fi
           if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
             echo "FAIL: merged manifest still declares the libxposed XposedProvider"
             exit 1

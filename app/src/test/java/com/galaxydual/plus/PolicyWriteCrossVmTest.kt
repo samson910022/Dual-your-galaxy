@@ -1,7 +1,9 @@
 // O1 cross-VM regressions (Phase 1 blocking + lifecycle/availability).
-// Deterministic: no Thread.sleep to prove "nothing happened" (use await/latch/hook);
-// 300ms negative assertions are direction-safe (documented: failure would be a write,
-// i.e. fail-closed violation, not flakiness).
+// Negative assertions ("nothing happened") cannot use await/latch (absence has no
+// event), so this file documents its convention: the few Thread.sleep(...) negative
+// windows (~300ms, direction-safe) are intentional — a failure would surface as an
+// actual store write (a fail-closed violation), never as flakiness; positive waits
+// use await/latch/hook as usual.
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope

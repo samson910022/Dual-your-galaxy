@@ -32,6 +32,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
+// Class-level testing convention: this file contains ~40 direction-safe
+// negative-window Thread.sleep(...) calls of ≥200ms (see the grep of
+// `Thread.sleep(` below; the ≈10/20/50ms ones are mostly latch polls inside
+// store fakes, not assertion windows). They are NOT converted to await(...) —
+// await is impossible for an absence proof ("nothing happened within the
+// window" has no signal to wait for). Each window is direction-safe: if the
+// system under test regresses, the forbidden effect (a store write / a fence
+// clear / a publish) would land inside the window and the assertion fails —
+// never a flaky pass. Positive waits still use await(timeoutMs = ...) /
+// latches. Auditors: grep `sleep(` to find every negative window; do not
+// blanket-convert them.
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PolicyWriteTest {
     // 假政策 store:記錄 save/clear 呼叫,並保有可重讀的記憶體後端。
@@ -8067,6 +8078,96 @@ class PolicyWriteTest {
         }
     }
 
+    // Stage M2 P2#3 + A3-1 (indeterminate + failed backup): the repair delete
+    // blocks past the injected IO deadline (interrupt-ignoring latch) while the
+    // best-effort backup hook reports Failed. After the late delete lands, the
+    // reconciler/late-join terminal must NOT publish CORRUPT_REPAIRED — the
+    // ground-truth Known(empty) converge must surface REPAIRED_NO_BACKUP with
+    // CHANNEL kind (deletion happened; evidence NOT preserved), and the
+    // backupFailureCount observable must increase. This pins the repair-outcome
+    // plumbing through the timeout/reconciler path (repairOutcomes map).
+    @Test
+    fun m2_repairTimeout_backupFailure_convergesToRepairedNoBackupChannel() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val deleteEntered = java.util.concurrent.CountDownLatch(1)
+        val deleteRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    deleteEntered.countDown()
+                    while (!deleteRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        // 備份必失敗（如讀回不一致）：刪除仍發生，backupFailureCount 須遞增。
+        store.setBackupHook { BackupOutcome.Failed }
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val backupFailuresBefore = backupFailureCount.get()
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(deleteEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIR_TIMEOUT).defaultText(),
+                vmA.state.value.msg,
+            )
+
+            // Late delete finishes after the deadline; ground truth converges.
+            deleteRelease.set(true)
+            await(timeoutMs = 20_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertFalse(vmA.state.value.policyDraftCorrupt)
+            // 誠實揭露：REPAIRED_NO_BACKUP（CHANNEL），不得是 CORRUPT_REPAIRED。
+            assertEquals(
+                PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP).defaultText(),
+                vmA.state.value.msg,
+            )
+            assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+            assertFalse(
+                vmA.state.value.msg == PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
+            )
+            assertTrue(
+                "backupFailureCount must increase when the backup hook reports Failed",
+                backupFailureCount.get() >= backupFailuresBefore + 1L,
+            )
+            assertEquals(1, deleteCalls.get())
+            assertNull(activeTxOf(vmA))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                deleteRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Stage M2 P2#4 (cross-VM stale): repair completion publishes a coordinator
     // revision (committedRevision/latest/PolicySettled) so siblings invalidate.
     // VM-A repairs Corrupt→empty; a sibling without pending converges to
@@ -8191,7 +8292,7 @@ class PolicyWriteTest {
             // completes CAS+rev bump+placeholder stage (completeWithRevision)
             // then dies before stageRealPayload/emit (activeTx=null + orphan
             // placeholder, no owner/_latest). This is exactly what
-            // tryClaimStaged leaves behind when the VM-scope coroutine is
+            // tryClaimStagedVerdict leaves behind when the VM-scope coroutine is
             // cancelled between completeWithRevision (lock released) and
             // stageRealPayload (needs decision payload).
             val fakeTxStore = HookPolicyStore(
@@ -8222,8 +8323,11 @@ class PolicyWriteTest {
             assertNull(coord.latest.value)
             assertNull(coordinatorTxOf(coord))
             // Age the orphan past the next writer's stale threshold so the
-            // pre-IO gate treats it as dead (fresh in-flight fences still abort).
-            Thread.sleep(800)
+            // pre-IO gate treats it as dead (fresh in-flight fences still
+            // abort). Backdate via the same pendingPublishAtNanos seam the
+            // other suites use (5s aged; stale threshold == policyIoTimeoutMs
+            // == 300ms here) — no wall-clock sleep needed.
+            coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L)
             // New VM-B inherits only activeTx (null) — without the finalizer it
             // would see foreign pending and abort UNKNOWN_REFRESH forever.
             val vm2 = makeVm2Direct(store, coord, policyIoTimeoutMs = 300)
@@ -9037,10 +9141,11 @@ class PolicyWriteTest {
             // the last externally observable point of the spanning load. Everything
             // after that sample (version-fence discard here) runs synchronously
             // and non-suspending on the IO thread, so once the counter fires the
-            // load can no longer alter Known/draft. The reconciler/follower/probe
-            // paths never sample revisions (exhaustive check of every
-            // sampledCurrentRevision call site), so count >= 1 is the spanning
-            // load itself, not an unrelated reader.
+            // load can no longer alter Known/draft. No other revision-sampling
+            // path is in flight for VM2 in this test (it holds no Tx, runs no
+            // refresh/observer-fallback, and settlePolicyTx never fires
+            // pre-release), so count >= 1 attributes the sample to the
+            // spanning load, not to an unrelated reader.
             val spanningLoadSamples = java.util.concurrent.atomic.AtomicInteger(0)
             vm2.revisionSamplerForTests = {
                 spanningLoadSamples.incrementAndGet()
@@ -9141,13 +9246,16 @@ class PolicyWriteTest {
             // BEFORE releasing the blocked init load. revBeforeInit is sampled
             // synchronously inside the VM constructor (before this install), so
             // the first post-install count is the post-IO revMovedInit sample —
-            // the last externally observable point of the spanning load. Everything
-            // after that sample (revMoved wash to Unknown here) runs synchronously
-            // and non-suspending on the IO thread, so once the counter fires the
-            // load can no longer apply the read as Known. The reconciler/follower/
-            // probe paths never sample revisions (exhaustive check of every
-            // sampledCurrentRevision call site), so count >= 1 is the spanning
-            // load itself, not an unrelated reader.
+            // the last externally observable point of the spanning load. In the
+            // CORRECT wash arm everything after that sample (the Unknown wash)
+            // runs synchronously and non-suspending on the IO thread; the wash
+            // itself emits nothing observable (equal-copy StateFlow conflation),
+            // so see the HONEST ORDERING NOTE below for what this can and cannot
+            // pin. No other revision-sampling path is in flight for VM2 in
+            // this test (it holds no Tx, runs no refresh/observer-fallback,
+            // and settlePolicyTx never fires pre-release), so count >= 1
+            // attributes the sample to the spanning load, not to an
+            // unrelated reader.
             val spanningLoadSamples = java.util.concurrent.atomic.AtomicInteger(0)
             vm2.revisionSamplerForTests = {
                 spanningLoadSamples.incrementAndGet()
@@ -9178,12 +9286,31 @@ class PolicyWriteTest {
             // gated (no _latest, version fence passes, revMoved with foreign
             // identity): must wash Unknown, never apply as Known.
             // Await the spanning load's post-IO revMovedInit sample (see the
-            // spanningLoadSamples install above) — deterministic completion
-            // seam; the wash after that sample is synchronous, so the
-            // assertFalse below can never race the load's discard decision.
+            // spanningLoadSamples install above). HONEST ORDERING NOTE: this gate
+            // orders against the revMovedInit SAMPLE only — NOT against the wash
+            // itself. The wash's `_state.update` copies policyDraftKnown=false over
+            // an already-equal value, so StateFlow data-class equals conflates and
+            // emits nothing observable; NO await can order after the wash decision.
+            // The !loading await below gates on the init PROBE's completion, which
+            // is a separate launch with no happens-before edge to the spanning
+            // load — treat it as a loose post-release settle, not as a barrier.
+            // Consequence (documented, accepted): on a broken apply-Known
+            // regression this test usually fails loudly by poll-window luck
+            // (μs-scale apply vs 20ms poll granularity), but it is NOT a
+            // deterministic pin — a true pin needs a test-seam inside the wash
+            // block (revisionSamplerForTests-style hook), deliberately out of
+            // scope for this round.
             loadRelease.set(true)
             await(timeoutMs = 10_000L) { spanningLoadSamples.get() >= 1 }
-            assertFalse(vm2.state.value.policyDraftKnown)
+            // HONEST ORDERING NOTE (cont.): the following two awaits do NOT order
+            // after the wash decision — !loading is the probe's completion flag
+            // (a separate launch, no happens-before edge to the spanning load)
+            // and !policyDraftKnown is false for a fresh VM from birth. They are
+            // kept only as a loose bounded settle before the poll-granularity
+            // known-gate below; do not read them as proof. See the HONEST note
+            // above for why this test is not a deterministic pin on the wash.
+            await(timeoutMs = 10_000L) { !vm2.state.value.loading }
+            await(timeoutMs = 10_000L) { !vm2.state.value.policyDraftKnown }
 
             // Release the winner: both VMs converge IDLE+Known(B).
             releaseGate.complete(Unit)
@@ -9253,6 +9380,11 @@ class PolicyWriteTest {
             // publish race and must follow (not clear). While the winner is
             // still gated, the local fence must survive.
             vm1.refreshPolicyDraft()
+            // Heuristic: no park latch exists for the loser's awaitSettled
+            // suspension, so this is timing-based, not handshake-based — it
+            // only needs the loser to have run its late-join and forfeited
+            // (never to have settled); the fence assertion below does not
+            // depend on park precision.
             Thread.sleep(800)
             assertNotNull(activeTxOf(vm1))
 
@@ -9627,7 +9759,7 @@ class PolicyWriteTest {
 
     // PR #60 (Phase 2 / R1(a)): A3-3 gate rejection settles — a foreign
     // committedRevision bump mid-flight makes the FAILED terminal rev-gated claim
-    // (claimForPublishChecked) reject; the rejection must settle exactly like a
+    // (claimForPublishCheckedVerdict) reject; the rejection must settle exactly like a
     // stage-rejected terminal: no VM-local fence, no coordinator claim, keys
     // cleared, UNKNOWN_REFRESH + stale, and a later confirm succeeds after refresh.
     @Test
@@ -9968,7 +10100,9 @@ class PolicyWriteTest {
     // own preRead flips _state.policyDraftKnown=false as a side effect
     // (models a concurrent refresh observing not-Known landing mid-flight);
     // every subsequent re-check must then abort the delete. Pinned here:
-    // store.clear() is NEVER called; the clear settles FAILED/Unknown.
+    // store.clear() is NEVER called; the clear settles the stage-rejected /
+    // BLIND_CLEAR_REFRESH_FIRST (CHANNEL) shape used at the outer fence
+    // sites — never a FAILED/CLEAR_FAILED terminal (P2-1).
     // Note: the added lastKnown-only arm disjunct cannot produce a behavioral
     // delta at this gate today — with lastKnown!=null && !Known the S4
     // refresh-first gate returns before the fence capture, so the fence is
@@ -10016,7 +10150,20 @@ class PolicyWriteTest {
         vm.clearPolicyDraft() // Known 單步清除：fence arm → preRead 翻轉 → 末端 re-check 中止
         await(timeoutMs = 5_000L) { !vm.state.value.loading }
         assertEquals("fence must abort the clear before store.clear()", 0, clearCalls)
-        assertFalse(vm.state.value.policyDraftKnown)
+        // P2-1: the in-IO-arm fence abort must NOT surface a FAILED/CLEAR_FAILED
+        // terminal — it settles the stage-rejected BLIND_CLEAR_REFRESH_FIRST
+        // (CHANNEL) shape (used at the outer fence sites) and then kicks a
+        // refresh, which re-adopts the still-readable backend as Known. The
+        // intermediate CHANNEL settle is intentionally racy to observe (the
+        // refresh may complete before this thread reads state), so accept
+        // either the settle or the post-refresh outcome — but never CLEAR_FAILED.
+        assertTrue(
+            "must never surface CLEAR_FAILED: msg=${vm.state.value.msg}",
+            vm.state.value.msg != PolicyText(PolicyTextKind.CLEAR_FAILED).defaultText(),
+        )
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftKnown }
+        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals("store.clear() must never have run", 0, clearCalls)
     }
 
     // PR #60 (Phase 2 / R1(d)): lastKnown==null 維持經典雙擊語義——pre-read 把關：
