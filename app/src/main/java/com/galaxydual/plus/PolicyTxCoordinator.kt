@@ -6,6 +6,7 @@
 // 同一 deferred）。
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
@@ -48,6 +49,10 @@ data class PolicySettled(
     val isClear: Boolean,
     val rev: Long = -1L,
 )
+
+// A2-1: tombstone 表硬上限（claimTombstones 滿時逐出最舊-rev tombstone，見
+// tryInsertClaimTombstone）。top-level internal：coordinator 與測試共用單一常數。
+internal const val CLAIM_TOMBSTONE_MAX = 512
 
 class PolicyTxCoordinator {
     // 跨 VM 唯一真相：仍在途的逾時交易（null=無在途交易）。
@@ -139,52 +144,140 @@ class PolicyTxCoordinator {
     // - placeholder drops tombstone (recoverStalePendingLocked, overrun discard);
     // - real retires NEVER tombstone (retireStagedRealPresentInLatestLocked clears
     //   pending but preserves truth; the completed identity stays valid in _latest).
-    // Phase4 bound (hard cap, no eviction): when the table is full the new
-    // placeholder drop is REJECTED (pending kept, caller returns null/false so
-    // the pre-IO gate marks STALE and retries) instead of evicting an arbitrary
-    // entry. Evicting (Phase2 #5 legacy keys.firstOrNull()) could resurrect a
-    // live identity: the evicted tombstone's late resumer would pass the
-    // tombstone check and borrow current rev. A placeholder carries no truth
-    // (_latest untouched), so rejecting loses nothing.
-    // Phase7: GuardedBy(commitMutex) — all mutating readers/writers run under
-    // commitMutex.withLock (recover/discard paths) or are idempotent
-    // concurrent reads (stage/emit fast-reject). The map itself is a
-    // ConcurrentHashMap so the lock-free isTombstoned fast-reject stays safe;
-    // the guard documents the mutation ordering, not a hard lock requirement
-    // for reads. Rejections counted in [tombstoneRejects].
-    // @GuardedBy("commitMutex") for mutations (see above; reads lock-free safe).
+    // Phase4 bound (hard cap): when the table is full, eviction of the
+    // strictly-oldest-rev tombstone is preferred over a permanent write wedge
+    // (A2-1). Rejections are reserved for the pathological case where no tombstone
+    // older than the incoming rev exists (fence kept). Evicting an OLD entry can
+    // never publish its stale identity: stageRealPayload rejects any claim whose
+    // identity is not pendingPublish (tombstones only guard the synthetic-emit
+    // path), and the surviving newest fences keep the recent drops protected.
+    // Rev-gate: only a strictly older rev is evicted. Evictions counted in
+    // [tombstoneEvictions]; un-evictable overflow rejections counted in
+    // [tombstoneRejects]. Mutations happen EITHER under commitMutex (the
+    // recoverStalePendingLocked / discardOverrunPlaceholder call sites run
+    // with commitMutex held) OR via the lock-free drop path
+    // dropStagedPlaceholderIfMatch (single pendingPublish CAS + the insert;
+    // the oldest-rev eviction inside the insert uses a value-matched remove
+    // so a lost eviction race is detected and refused — the table stays
+    // consistent without the mutex). The map itself is a ConcurrentHashMap so
+    // the lock-free isTombstoned fast-reject stays safe.
+    // NOT @GuardedBy("commitMutex") exclusively: the lock-free drop path is
+    // deliberately unlocked (see dropStagedPlaceholderIfMatch KDoc); reads
+    // are lock-free everywhere.
     val claimTombstones = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Phase7 observability: tombstone bound-full rejections (drop refused,
     // fence kept). Monotonic, never reset except resetForTest.
     val tombstoneRejects = AtomicLong(0L)
 
+    // A2-1 observability: tombstone evictions (oldest-rev evicted to make room).
+    // Monotonic, never reset except resetForTest. See [tryInsertClaimTombstone].
+    // Intended for metrics export (diagnostics surface) — see KDoc there.
+    val tombstoneEvictions = AtomicLong(0L)
+
+    // O1 (synthetic-emit fence): a monotonic count of UNSTAMPED (rev == -1)
+    // synthetic revision bumps — emitStaged/tryEmitSettled taking their
+    // synthetic-direct branch, or tryUpdateLatestMonotonic seeing a rev == -1
+    // payload. No production caller may emit with rev == -1 (claimed payloads
+    // only); this counter exists to detect contract violations and feed metrics
+    // export. Log-once per process (stderr, tag only); stamped paths are
+    // untouched.
+    val syntheticUnstampedBumps = AtomicLong(0L)
+    private val syntheticUnstampedBumpLogged = AtomicBoolean(false)
+
+    private fun noteSyntheticUnstampedBump(where: String) {
+        try {
+            syntheticUnstampedBumps.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        try {
+            if (syntheticUnstampedBumpLogged.compareAndSet(false, true)) {
+                logCoord(
+                    "synthetic-unstamped-bump observed ($where): rev=-1 emit path taken — " +
+                        "no production caller may emit/stage with rev == -1; claimed payloads only",
+                )
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     // Phase4: bounded tombstone insert. True = recorded (drop may proceed);
-    // false = table full (drop must abort, pending kept, STALE retry).
-    // Re-recording an already-tombstoned identity only refreshes its rev.
-    internal fun tryInsertClaimTombstone(txId: Long, key: String, rev: Long): Boolean = try {
-        val k = tombstoneKey(txId, key)
-        if (claimTombstones.containsKey(k)) {
-            claimTombstones[k] = rev
-            true
-        } else if (claimTombstones.size >= 512) {
+    // false = table full AND no strictly-older tombstone to evict (caller keeps
+    // fence / retries STALE). Re-recording an already-tombstoned identity only
+    // refreshes its rev.
+    // INVARIANT (no production caller may call emitStaged/tryEmitSettled with
+    // rev == -1; claimed payloads only): the synthetic unstamped bump exists
+    // solely so that out-of-band/test emitters and legacy paths stay ordered;
+    // a rev == -1 payload reaching the emit path is off-contract and is counted
+    // in [syntheticUnstampedBumps] (metrics-export intent, once-per-process log,
+    // fail-safe ordering preserved). Tombstone eviction exists to bound the
+    // drop fence set; tombstoneEvictions is INTENDED for metrics export (same
+    // family: tombstoneRejects/emitSuperseded/syntheticUnstampedBumps) — export
+    // it alongside poisonEvictCount/identityMismatchCount/backupFailureCount in
+    // any diagnostics surface; it must never be wired into correctness.
+    internal fun tryInsertClaimTombstone(txId: Long, key: String, rev: Long): Boolean {
+        fun rejectWithCount(): Boolean {
             try {
                 tombstoneRejects.incrementAndGet()
             } catch (_: Throwable) {
             }
-            logCoord(
-                "tombstone bound full (512): reject drop txId=$txId " +
-                    "(keep fence, pre-IO gate retries STALE)",
-            )
-            false
-        } else {
-            claimTombstones[k] = rev
-            true
+            try {
+                logCoord(
+                    "tombstone bound full ($CLAIM_TOMBSTONE_MAX): no evictable (older) tombstone; " +
+                        "reject drop txId=$txId (keep fence, pre-IO gate retries STALE)",
+                )
+            } catch (_: Throwable) {
+            }
+            return false
         }
-    } catch (ce: CancellationException) {
-        throw ce
-    } catch (_: Throwable) {
-        false
+        return try {
+            val k = tombstoneKey(txId, key)
+            if (claimTombstones.containsKey(k)) {
+                claimTombstones[k] = rev
+                true
+            } else if (claimTombstones.size >= CLAIM_TOMBSTONE_MAX) {
+                val oldest = try {
+                    claimTombstones.entries.minByOrNull { it.value }
+                } catch (_: Throwable) {
+                    null
+                }
+                if (oldest == null || oldest.value >= rev) {
+                    // No strictly-older tombstone: keep the fence, reject.
+                    rejectWithCount()
+                } else {
+                    val removed = try {
+                        claimTombstones.remove(oldest.key, oldest.value)
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (!removed) {
+                        // Lost a concurrent eviction race: fall back to reject (keep fence).
+                        rejectWithCount()
+                    } else {
+                        try {
+                            tombstoneEvictions.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            logCoord(
+                                "tombstone bound full ($CLAIM_TOMBSTONE_MAX): evicted oldest " +
+                                    "${oldest.key} rev=${oldest.value} for txId=$txId rev=$rev",
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        claimTombstones[k] = rev
+                        true
+                    }
+                }
+            } else {
+                claimTombstones[k] = rev
+                true
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     // Phase7 test seam: bump the authoritative revision without a full Tx
@@ -263,12 +356,30 @@ class PolicyTxCoordinator {
             incoming.key == cur.key
     }
 
+    // Stage L3: monotonic _latest CAS; bounded retries (A3-12) — after 8
+    // unsuccessful attempts (persistent concurrent CAS contention) the incoming
+    // terminal is abandoned to the existing supersede/lossless-convergence path
+    // (callers count emitSuperseded + log) instead of spinning forever.
     private fun tryUpdateLatestMonotonic(incoming: PolicySettled): Boolean {
-        while (true) {
+        // O1 (synthetic-emit fence): an unstamped (rev == -1) payload reaching the
+        // monotonic _latest CAS means a synthetic bump happened without a stamp
+        // (or stamping failed) — count + log-once; stamped paths are untouched.
+        if (incoming.rev == -1L) {
+            noteSyntheticUnstampedBump("tryUpdateLatestMonotonic")
+        }
+        var guard = 0
+        while (guard++ < 8) {
             val cur = _latest.value
             if (!canAdvanceLatest(cur, incoming)) return false
             if (_latest.compareAndSet(cur, incoming)) return true
         }
+        try {
+            logCoord(
+                "tryUpdateLatestMonotonic abandoned after 8 CAS attempts txId=${incoming.txId} rev=${incoming.rev} (converge via latest/resync, never force-write)",
+            )
+        } catch (_: Exception) {
+        }
+        return false
     }
 
     private fun clearPendingOwnerIfMatch(txId: Long, key: String) {
@@ -353,25 +464,35 @@ class PolicyTxCoordinator {
         return ok
     }
 
+    // Stage L1 P1: verdict of the rev-gated atomic claim. CLAIMED = staged
+    // under commitMutex (CAS won + revision bumped); REV_GATE_REJECTED = a
+    // foreign B committed mid-IO (committedRevision != revBefore, observed
+    // inside the same commitMutex critical section) so NO claim was consumed —
+    // the terminal must settle as stage-rejected (fence/keys cleared, local
+    // unknown), never publish; CAS_LOSS = the CAS to activeTx failed with the
+    // rev gate satisfied — a live winner consumed the claim (loser handling
+    // already applied inside the caller); the rev gate carries no information.
+    enum class ClaimStagedVerdict { CLAIMED, REV_GATE_REJECTED, CAS_LOSS }
+
     // P1-1 repair atomic claim: rev re-check merged into the SAME commitMutex
     // critical section as the CAS+bump+stage (no withCommitLock suspension
     // window between a lock-free revMoved read and claimForPublish). Rejects
     // when committedRevision != revBefore (concurrent B committed mid-IO),
     // so the repair success below can never publish a stale Known(empty) over
     // unseen B. revBefore==-1L (legacy/no-coordinator) skips the rev gate.
-    suspend fun completeWithRevisionChecked(
+    suspend fun completeWithRevisionCheckedVerdict(
         tx: DualViewModel.PolicyTx,
         payload: PolicySettled,
         revBefore: Long,
-    ): Boolean {
+    ): ClaimStagedVerdict {
         require(!payload.known && payload.msg.isEmpty()) {
             "completeWithRevisionChecked only accepts placeholder payloads (!known && msg.isEmpty())"
         }
-        var ok = false
+        var verdict = ClaimStagedVerdict.CAS_LOSS
         commitMutex.withLock {
             try {
                 if (revBefore != -1L && committedRevision.get() != revBefore) {
-                    ok = false
+                    verdict = ClaimStagedVerdict.REV_GATE_REJECTED
                     return@withLock
                 }
                 if (activeTx.compareAndSet(tx, null)) {
@@ -385,16 +506,29 @@ class PolicyTxCoordinator {
                     try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Throwable) { }
                     try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Throwable) { }
                     try { pendingOwner.set(tx) } catch (_: Throwable) { }
-                    ok = true
+                    verdict = ClaimStagedVerdict.CLAIMED
+                } else {
+                    verdict = ClaimStagedVerdict.CAS_LOSS
                 }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
-                ok = false
+                verdict = ClaimStagedVerdict.CAS_LOSS
             }
         }
-        return ok
+        return verdict
     }
+
+    // Boolean wrapper kept for existing call sites; new FAILED-terminal claim
+    // paths use completeWithRevisionCheckedVerdict (the verdict carries the
+    // reject reason from inside the lock — no post-hoc committedRevision
+    // re-read is needed to distinguish rev-gate rejection from CAS loss).
+    suspend fun completeWithRevisionChecked(
+        tx: DualViewModel.PolicyTx,
+        payload: PolicySettled,
+        revBefore: Long,
+    ): Boolean =
+        completeWithRevisionCheckedVerdict(tx, payload, revBefore) == ClaimStagedVerdict.CLAIMED
 
     // Stage M3 (P2#5 orphan fence) + N3 P1#3 hardening: coordinator-scoped
     // finalizer for PLACEHOLDERS ONLY. Never infer death from age alone and
@@ -462,8 +596,9 @@ class PolicyTxCoordinator {
                     "ageMs=${ageMs} (dropped, no truth)",
             )
             // Persist tombstone before clearing so late resumer is rejected.
-            // Phase4: bound-full rejects (no arbitrary eviction); pending is
-            // kept and null returned so the gate marks STALE and retries.
+            // Phase4/A2-1: bound-full evicts the strictly-oldest-rev tombstone
+            // (see tryInsertClaimTombstone); only when nothing older exists does
+            // the caller keep the pending (null → gate marks STALE and retries).
             if (!tryInsertClaimTombstone(cur.txId, cur.key, cur.rev)) return null
             val cleared = try {
                 pendingPublish.compareAndSet(cur, null)
@@ -592,9 +727,10 @@ class PolicyTxCoordinator {
     // borrow current rev), bump orphanDropGen (no _latest event, readers must
     // fail closed), return true. False when nothing discarded (caller keeps its
     // local settle=false/unresolved semantics; the fence stays for retire/recover).
-    // Phase4 bound: when the tombstone table is full the discard is REFUSED
-    // (pending+owner kept, false returned, no arbitrary eviction) — a
-    // tombstone-less drop would let the late resumer resurrect the identity.
+    // Phase4/A2-1 bound: when the tombstone table is full the discard evicts the
+    // strictly-oldest-rev tombstone (see tryInsertClaimTombstone) — strictly better
+    // than a permanent fence; if nothing older exists the discard is REFUSED
+    // (pending+owner kept, false returned).
     // Tombstone discipline: placeholder drops tombstone; real retires never
     // tombstone (real identity completed into truth).
     suspend fun discardOverrunPlaceholder(txId: Long, key: String): Boolean =
@@ -771,6 +907,10 @@ class PolicyTxCoordinator {
     // buffer-full -> keep pending until async emit lands, then clear.
     // Stage N3 P1#3: tombstoned identities never emit (even via synthetic bump);
     // equal-rev different-identity never overwrites latest (borrowed-rev guard).
+    // Error propagates intentionally (fail-loud): a JVM Error escaping this path
+    // means an invariant broke and must crash the caller rather than be
+    // silently absorbed (all Exception paths are already handled inside);
+    // CancellationException is rethrown as before, never swallowed.
     fun emitStaged(payload: PolicySettled) {
         // Tombstone pre-check: dropped placeholder identity must never resurrect
         // via emit, even with a fresh synthetic rev. Check failure is fail-closed
@@ -816,6 +956,7 @@ class PolicyTxCoordinator {
         // Synthetic direct (no claim, rev==-1): assign fresh seq via bump.
         try {
             if (toEmit.rev == -1L) {
+                noteSyntheticUnstampedBump("emitStaged")
                 val rev = try { committedRevision.incrementAndGet() } catch (_: Exception) { -1L }
                 try { toEmit = toEmit.copy(rev = rev) } catch (_: Exception) { }
             }
@@ -898,8 +1039,78 @@ class PolicyTxCoordinator {
                     fallbackB = finalEmit,
                 )
             }
-        } catch (_: Exception) {
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            // A2-6: a failed async-launch must not be silent — count it as a drop
+            // and log (lossless via _latest/resync either way; pending cleared by
+            // the synchronous fast-path above when SharedFlow delivered, else the
+            // identity stays fenced for recover/retire).
+            try {
+                emitTimeoutDrops.incrementAndGet()
+            } catch (_: Exception) {
+            }
+            try {
+                logCoord(
+                    "emit launch failed txId=${finalEmit.txId} rev=${finalEmit.rev}: ${e.javaClass.name} " +
+                        "(notifier dropped; converge via latest/resync)",
+                )
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    // A2-3: lock-free exact-identity placeholder drop for the VM's stage-rejected
+    // terminal path (applyStageRejectedUnderLock), which runs under the VM's leaf
+    // policySettleLock and may not suspend. Single-shot discipline, mirroring
+    // discardOverrunPlaceholder exactly-once semantics without holding commitMutex:
+    // - pendingPublish must hold EXACTLY (txId, key) and still be a placeholder
+    //   (!known && msg empty) — foreign/real/cleared pending → false, untouched;
+    // - tombstone is inserted first (capacity-gated, keeps the fence when full);
+    // - the drop itself is a single pendingPublish CAS — a concurrent stageRealPayload
+    //   /recover/retire winning the race invalidates our snapshot → false (its
+    //   outcome stands; never two winners);
+    // - on a won CAS: owner cleared, orphanDropRev/Gen bumped (paired order,
+    //   rev before gen) — identical to the locked drop paths.
+    // Placeholders carry no truth (_latest untouched), so a won lock-free drop
+    // can never publish or destroy a real payload.
+    internal fun dropStagedPlaceholderIfMatch(txId: Long, key: String): Boolean = try {
+        val cur = try { pendingPublish.get() } catch (_: Exception) { null }
+        if (cur == null || cur.txId != txId || cur.key != key) {
+            false
+        } else {
+            val isPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
+            if (!isPlaceholder) {
+                false
+            } else if (!tryInsertClaimTombstone(cur.txId, cur.key, cur.rev)) {
+                // Capacity: keep the fence (STALE retry) — same as the locked path.
+                false
+            } else if (!pendingPublish.compareAndSet(cur, null)) {
+                // Lost the race: another mutator won; keep tombstone, report not dropped.
+                false
+            } else {
+                try {
+                    val own = try { pendingOwner.get() } catch (_: Exception) { null }
+                    if (own != null && own.txId == cur.txId && own.key == cur.key) {
+                        pendingOwner.compareAndSet(own, null)
+                    }
+                } catch (_: Exception) {
+                }
+                try { orphanDropRev.updateAndGet { prev -> if (cur.rev > prev) cur.rev else prev } } catch (_: Exception) {
+                }
+                try { orphanDropGen.incrementAndGet() } catch (_: Exception) {
+                }
+                try {
+                    logCoord(
+                        "drop staged placeholder txId=${cur.txId} rev=${cur.rev} (stage rejected, no real payload)",
+                    )
+                } catch (_: Exception) {
+                }
+                true
+            }
+        }
+    } catch (_: Exception) {
+        false
     }
 
     // Zero-call legacy: no production/test caller (overrun path uses
@@ -1002,6 +1213,7 @@ class PolicyTxCoordinator {
                     // above). This preserves l3_overflow lossless test (pure
                     // synthetic, no claim). Claimed-path late resumers are already
                     // tombstoned and rejected above.
+                    noteSyntheticUnstampedBump("tryEmitSettled")
                     val rev = try { committedRevision.incrementAndGet() } catch (_: Exception) { -1L }
                     try { stamped = stamped.copy(rev = rev) } catch (_: Exception) { }
                 }
@@ -1110,6 +1322,18 @@ class PolicyTxCoordinator {
         }
         try {
             tombstoneRejects.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            tombstoneEvictions.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            syntheticUnstampedBumps.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            syntheticUnstampedBumpLogged.set(false)
         } catch (_: Exception) {
         }
         try {

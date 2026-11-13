@@ -206,7 +206,7 @@ class PolicyPhase2Test {
         assertTrue(coord.orphanDropGen.get() > 0L)
 
         // Now user confirms the pending write: must fail closed via checkOrphanDropAndRevisionStaleLocked()
-        vm.confirmPolicyWrite(pending!!)
+        vm.confirmPolicyWrite(pending!!, pending!!.generation)
 
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)

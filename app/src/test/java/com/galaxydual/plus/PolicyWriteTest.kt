@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.resetMain
@@ -268,7 +269,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite()
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(setOf("com.ok.app"), vm.state.value.policyDraft)
@@ -307,7 +308,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite()
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(0, fake.saveCalls)
 
@@ -350,7 +351,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite()
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
@@ -427,15 +428,16 @@ class PolicyWriteTest {
         vm.cancelPolicyWrite(pending)
         assertNull(vm.state.value.pendingPolicyWrite)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
 
         assertEquals(0, fake.saveCalls)
         assertNull(vm.state.value.pendingPolicyWrite)
     }
 
-    // clear 後再 confirm 舊 pending：不得寫 store，pending 保持 null。
+    // A3-5: clear 在 pending 確認排隊中不得靜默 supersede 已 arm 的 confirm ——
+    // 拒絕（BUSY）、不碰 store、pending 保留；之後 confirm 仍正常執行。
     @Test
-    fun clearThenConfirm_noWrite() {
+    fun clearWhilePendingArmed_refusesBusy_thenConfirmWrites() {
         val fake = FakePolicyStore()
         val vm = makeVm(fake.store, userId = 0)
         val pending = PendingPolicyWrite(
@@ -444,16 +446,18 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
+        // A3-5: pending 排隊中 clear → BUSY、零 store 觸碰、pending 保留。
         vm.clearPolicyDraft()
-        await { vm.state.value.policyDraft.isEmpty() }
+        assertEquals(0, fake.clearCalls)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("進行中"))
 
-        assertNull(vm.state.value.pendingPolicyWrite)
-
-        val savesBeforeConfirm = fake.saveCalls
-        vm.confirmPolicyWrite(pending)
-
-        assertEquals(savesBeforeConfirm, fake.saveCalls)
-        assertNull(vm.state.value.pendingPolicyWrite)
+        // pending 未被丟棄：confirm 仍然正常執行。
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(1, fake.saveCalls)
+        assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
     }
 
     // 晚到的 init 載入不得覆寫較新的 save 所寫入的 policyDraft。
@@ -505,7 +509,7 @@ class PolicyWriteTest {
             System.currentTimeMillis(),
         )
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(setOf("com.B"), vm.state.value.policyDraft)
@@ -573,7 +577,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         assertTrue(vm.policyWriteCommitInProgress)
 
@@ -634,7 +638,7 @@ class PolicyWriteTest {
         // 較新 save:com.B。
         val pending = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(setOf("com.B"), vm.state.value.policyDraft)
 
@@ -647,7 +651,7 @@ class PolicyWriteTest {
         // 在 refresh 被阻塞時再 save com.C (version 再 +1)。
         val pending2 = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending2)
-        vm.confirmPolicyWrite(pending2)
+        vm.confirmPolicyWrite(pending2, pending2.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(setOf("com.C"), vm.state.value.policyDraft)
 
@@ -762,7 +766,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertTrue(vm.state.value.msg.contains("確認已逾時"))
@@ -781,10 +785,67 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingA)
+        vm.confirmPolicyWrite(pendingA, pendingA.generation)
 
         assertEquals(0, fake.saveCalls)
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+    }
+
+    // S1（consent fence）：confirm 未取得對話框 acknowledgement（acknowledged=false）
+    // 時，VM 層第二道門必須拒絕：不寫 store、保留 pending、POLICY_NOT_ACKNOWLEDGED
+    // + INVALID；取得 acknowledgement 後才寫入。
+    @Test
+    fun confirmPolicyWrite_withoutAcknowledgement_refusesEntirely() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        val pending = PendingPolicyWrite(
+            setOf("com.example.a"),
+            System.currentTimeMillis(),
+        )
+        setPendingPolicyWrite(vm, pending)
+
+        // 未勾選確認框：VM 不得寫入，pending 保留。
+        vm.confirmPolicyWrite(pending, null)
+        await(timeoutMs = 5_000L) {
+            vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
+        }
+        assertEquals(0, fake.saveCalls)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+
+        // 勾選後重試（帶出勾選時綁定的世代：ack 綁定到本 pending）：正常寫入。
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(1, fake.saveCalls)
+        assertEquals(setOf("com.example.a"), fake.saved)
+    }
+
+    // SL1（世代綁定）：已勾選但帶出的是「別的世代」的 ack —— 不足以授權寫入。
+    // （世代綁定是 confirmPolicyWrite 的第二道門；UI 第一道門不足。）
+    @Test
+    fun confirmPolicyWrite_mismatchedGeneration_refusesEntirely() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        val pending = PendingPolicyWrite(
+            setOf("com.example.a"),
+            System.currentTimeMillis(),
+        )
+        setPendingPolicyWrite(vm, pending)
+
+        // 世代不符：不寫 store、不清 pending、POLICY_NOT_ACKNOWLEDGED。
+        vm.confirmPolicyWrite(pending, pending.generation + 1L)
+        await(timeoutMs = 5_000L) {
+            vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
+        }
+        assertEquals(0, fake.saveCalls)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+
+        // 正確世代：正常寫入。
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(1, fake.saveCalls)
+        assertEquals(setOf("com.example.a"), fake.saved)
     }
 
     // 4.1 #3 無 pending：INVALID。
@@ -793,7 +854,8 @@ class PolicyWriteTest {
         val fake = FakePolicyStore()
         val vm = makeVm(fake.store, userId = 0)
 
-        vm.confirmPolicyWrite()
+        val dummy = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        vm.confirmPolicyWrite(dummy, dummy.generation)
 
         assertEquals("沒有待確認的政策寫入", vm.state.value.msg)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
@@ -806,7 +868,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals("無政策 store，無法寫入政策", vm.state.value.msg)
@@ -825,7 +887,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
@@ -885,7 +947,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -1023,7 +1085,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertTrue(loadStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
@@ -1047,7 +1109,7 @@ class PolicyWriteTest {
         )
 
         // 重複維：核對中重複 confirm 不耗第二次 save。
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         Thread.sleep(100)
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         // IN_PROGRESS 覆寫 TIMEOUT 後，pending/相位仍保留（僅 msg 變化）。
@@ -1162,7 +1224,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
@@ -1214,7 +1276,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -1266,11 +1328,11 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
 
         // 第二個 confirm 在 in-flight 期間到達，應被去重。
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         assertEquals(1, fake.saveCalls)
 
@@ -1367,7 +1429,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
 
         // 寫入進行中呼叫 requestPolicyWrite 應被拒絕。
@@ -1425,7 +1487,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite()
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertFalse(vm.state.value.policyDraftKnown)
@@ -1481,7 +1543,7 @@ class PolicyWriteTest {
         assertTrue(blockerEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
 
         // 政策 confirm 在 mutex 後排隊 (key 已進 inFlightWrites，但 save 未開始)。
-        vm.confirmPolicyWrite(pending!!)
+        vm.confirmPolicyWrite(pending!!, pending!!.generation)
         await { vm.policyOperationInProgress }
         assertFalse(vm.policyWriteCommitInProgress)
 
@@ -1515,7 +1577,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(0, fake.saveCalls)
@@ -1574,7 +1636,7 @@ class PolicyWriteTest {
             System.currentTimeMillis(),
         )
         setPendingPolicyWrite(vm, pending1)
-        vm.confirmPolicyWrite(pending1)
+        vm.confirmPolicyWrite(pending1, pending1.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(0, saveCalls)
@@ -1592,7 +1654,7 @@ class PolicyWriteTest {
         vm.requestPolicyWrite()
         val pending2 = vm.state.value.pendingPolicyWrite
         assertNotNull(pending2)
-        vm.confirmPolicyWrite(pending2!!)
+        vm.confirmPolicyWrite(pending2!!, pending2!!.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(1, saveCalls)
@@ -1613,18 +1675,31 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        // 第一次：僅告警，不執行。
+        // A3-5：pending 排隊中 clear → BUSY、不 arm、不碰 store、pending 保留。
         vm.clearPolicyDraft()
-        // 同步 _state.update 警語（不經 IO），直接可斷言；pending 必須保留。
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("進行中"))
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(0, fake.clearCalls)
 
-        // 第二次：重讀仍 Unknown→abort，不執行、不耗 clear；clear 起始即清 pending
-        // （P2 #6，作廢確認），故 pending 為 null（J3）。
+        // 取消 pending 後回到盲清雙確認流程。本 VM 從未觀察到 Known 草稿
+        // （lastKnown==null），故 S4（強制重讀優先）不觸發，維持雙確認語義。
+        vm.cancelPolicyWrite(pending)
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(0, fake.clearCalls)
+
+        // 第一次：僅告警，不執行。
+        vm.clearPolicyDraft()
+        // 同步 _state.update 警語（不經 IO），直接可斷言；pending 保持 null。
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(0, fake.clearCalls)
+
+        // 第二次：重讀仍 Unknown→abort，不執行、不耗 clear。
         vm.clearPolicyDraft()
         Thread.sleep(300)
         assertEquals(0, fake.clearCalls)
@@ -1678,7 +1753,7 @@ class PolicyWriteTest {
         // 在途中有成功 save (draft=saved)。
         val pending = PendingPolicyWrite(setOf("com.SAVED"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(setOf("com.SAVED"), vm.state.value.policyDraft)
         assertTrue(vm.state.value.policyDraftKnown)
@@ -1770,7 +1845,7 @@ class PolicyWriteTest {
         val pending1 = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending1)
         val commitsBefore = prefs.commitCalls
-        vm.confirmPolicyWrite(pending1)
+        vm.confirmPolicyWrite(pending1, pending1.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
         assertFalse(vm.state.value.policyDraftKnown)
@@ -1780,7 +1855,7 @@ class PolicyWriteTest {
         val pending2 = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending2)
         val commitsBeforeSecond = prefs.commitCalls
-        vm.confirmPolicyWrite(pending2)
+        vm.confirmPolicyWrite(pending2, pending2.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertTrue(vm.state.value.msg.contains("未知"))
         assertEquals(commitsBeforeSecond, prefs.commitCalls)
@@ -1820,7 +1895,7 @@ class PolicyWriteTest {
         vm2.requestPolicyWrite()
         val pending3 = vm2.state.value.pendingPolicyWrite
         assertNotNull(pending3)
-        vm2.confirmPolicyWrite(pending3!!)
+        vm2.confirmPolicyWrite(pending3!!, pending3!!.generation)
         await { vm2.state.value.pendingPolicyWrite == null }
         assertEquals(setOf("com.example.a"), vm2.state.value.policyDraft)
         assertTrue(vm2.state.value.policyDraftKnown)
@@ -1876,7 +1951,7 @@ class PolicyWriteTest {
         // 在途中有寫入失敗：FAILED + Unknown（保留失敗前快照）。
         val pending = PendingPolicyWrite(setOf("com.NEW"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
         assertFalse(vm.state.value.policyDraftKnown)
@@ -2009,7 +2084,7 @@ class PolicyWriteTest {
         // confirm 觸 unknown-gate：CHANNEL + Unknown，不碰 store。
         val pending = PendingPolicyWrite(setOf("com.NEW"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertFalse(vm.state.value.policyDraftKnown)
@@ -2080,7 +2155,7 @@ class PolicyWriteTest {
         // 在途中有寫入成功：Known NEW。
         val pending = PendingPolicyWrite(setOf("com.NEW"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertTrue(vm.state.value.policyDraftKnown)
         assertEquals(setOf("com.NEW"), vm.state.value.policyDraft)
@@ -2127,7 +2202,7 @@ class PolicyWriteTest {
         vm.requestPolicyWrite()
         val pending = vm.state.value.pendingPolicyWrite
         assertNotNull(pending)
-        vm.confirmPolicyWrite(pending!!)
+        vm.confirmPolicyWrite(pending!!, pending!!.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
@@ -2155,7 +2230,8 @@ class PolicyWriteTest {
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         assertEquals(1, fake.clearCalls)
 
-        // 重試：第一次僅告警（不耗 store），第二次執行成功。
+        // 重試：第二次 arm 後的第二次點擊（S4）會先強制權威重讀而不刪除；
+        // 重讀恢復 Known 後的清除才是 Known 一般單步清除。
         fake.clearSucceeds = true
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
@@ -2163,8 +2239,16 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(1, fake.clearCalls)
 
+        // S4：本 VM 曾見過 Known 草稿，armed 後點擊先強制 refreshPolicyDraft()，
+        // 本點擊不碰 store（refresh 異步執行）。
         vm.clearPolicyDraft()
         await { vm.state.value.policyDraftKnown }
+        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+        assertEquals(1, fake.clearCalls)
+
+        // 重讀已恢復 Known → 下一次清除是一般 Known 單步清除。
+        vm.clearPolicyDraft()
+        await { vm.state.value.policyDraft.isEmpty() && vm.state.value.msgKind == MsgKind.INFO }
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
@@ -2292,7 +2376,7 @@ class PolicyWriteTest {
         fake.saveSucceeds = false
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
         assertFalse(vm.state.value.policyDraftKnown)
@@ -2508,7 +2592,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
         assertTrue(vm.state.value.loading)
@@ -2552,7 +2636,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         val live = vm.state.value.pendingPolicyWrite
         assertNotNull(live)
@@ -2616,7 +2700,7 @@ class PolicyWriteTest {
         // 模擬 sibling（refresh）持有 busy。
         setLoading(vm, true)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertNull(vm.state.value.pendingPolicyWrite)
@@ -2837,7 +2921,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -2945,7 +3029,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -3025,7 +3109,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -3045,7 +3129,7 @@ class PolicyWriteTest {
         // 試 confirm C（異世代→靜默保留，不耗 save，pending 續為 B，Tx 同一）。
         val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
         val msgBeforeC = vm.state.value.msg
-        vm.confirmPolicyWrite(pendingC)
+        vm.confirmPolicyWrite(pendingC, pendingC.generation)
         Thread.sleep(200)
         assertEquals(msgBeforeC, vm.state.value.msg)
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -3136,7 +3220,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertNotNull(activeTxOf(vm))
@@ -3218,7 +3302,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertNotNull(activeTxOf(vm))
@@ -3420,7 +3504,7 @@ class PolicyWriteTest {
         // unknown-gate confirm：不碰 store 但 bump 版本＋世代。
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(0, fake.saveCalls)
 
@@ -3509,7 +3593,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
         val loadsBeforeCancel = calls.get()
@@ -3581,7 +3665,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -3599,7 +3683,7 @@ class PolicyWriteTest {
         // 世代失配即靜默保留 TIMEOUT（不覆寫核對提示，見 confirm 入口守衛）。
         val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
         val timeoutMsgBefore = vm.state.value.msg
-        vm.confirmPolicyWrite(pendingC)
+        vm.confirmPolicyWrite(pendingC, pendingC.generation)
         Thread.sleep(200)
         assertEquals(timeoutMsgBefore, vm.state.value.msg)
         assertTrue(vm.state.value.msg.contains("逾時"))
@@ -3609,7 +3693,7 @@ class PolicyWriteTest {
         assertSame(txBefore, activeTxOf(vm))
 
         // 同世代重試即 IN_PROGRESS 明示（沿用既有 latch 語義）。
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         Thread.sleep(200)
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -3658,7 +3742,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -3708,7 +3792,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         saveRelease.set(true)
@@ -3741,7 +3825,7 @@ class PolicyWriteTest {
 
         val pending = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
@@ -3791,7 +3875,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertNotNull(activeTxOf(vm))
@@ -3843,7 +3927,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         val timeoutMsg = vm.state.value.msg
@@ -3887,7 +3971,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertTrue(vm.state.value.policyDraftKnown)
@@ -3953,7 +4037,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             val t0 = System.currentTimeMillis()
@@ -4045,7 +4129,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         // 等誠實 unresolved（TIMEOUT→REFRESH_FAILED，仍 RECONCILING，Tx 滯留）。
@@ -4138,7 +4222,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             await(timeoutMs = 15_000L) {
@@ -4216,7 +4300,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
             // save 6s 逾時→RECONCILING（TIMEOUT）。
             await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
@@ -4293,7 +4377,7 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         val timeoutMsg = vm.state.value.msg
@@ -4420,7 +4504,7 @@ class PolicyWriteTest {
             (field.get(vm1) as MutableStateFlow<UiState>).value =
                 (field.get(vm1) as MutableStateFlow<UiState>).value.copy(pendingPolicyWrite = pendingB)
 
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertEquals(pendingB, vm1.state.value.pendingPolicyWrite)
@@ -4612,7 +4696,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
 
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             // 前置已認領：coordinator＋本地同為同一 Tx，writeMutex 在途持有。
@@ -4760,7 +4844,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
 
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             val tx1 = activeTxOf(vm1)
@@ -4831,7 +4915,7 @@ class PolicyWriteTest {
 
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             assertTrue(coord.writeMutex.isLocked)
@@ -4839,7 +4923,7 @@ class PolicyWriteTest {
             // VM2 試 C：fail-fast，不啟第二 IO。
             val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
             setPendingPolicyWrite(vm2, pendingC)
-            vm2.confirmPolicyWrite(pendingC)
+            vm2.confirmPolicyWrite(pendingC, pendingC.generation)
             Thread.sleep(300)
             assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm2.state.value.msg)
             assertEquals(MsgKind.INFO, vm2.state.value.msgKind)
@@ -4902,7 +4986,7 @@ class PolicyWriteTest {
 
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
 
@@ -4962,13 +5046,13 @@ class PolicyWriteTest {
 
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
 
             val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
             setPendingPolicyWrite(vm2, pendingC)
-            vm2.confirmPolicyWrite(pendingC)
+            vm2.confirmPolicyWrite(pendingC, pendingC.generation)
             Thread.sleep(300)
             assertEquals(1, saveCalls.get())
 
@@ -4985,7 +5069,7 @@ class PolicyWriteTest {
             assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
 
             // 後試者重試即成功（終態 C）。
-            vm2.confirmPolicyWrite(pendingC)
+            vm2.confirmPolicyWrite(pendingC, pendingC.generation)
             await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
             assertEquals(setOf("com.C"), vm2.state.value.policyDraft)
             assertTrue(vm2.state.value.policyDraftKnown)
@@ -5084,7 +5168,7 @@ class PolicyWriteTest {
             val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pending)
 
-            vm.confirmPolicyWrite(pending)
+            vm.confirmPolicyWrite(pending, pending.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             // 在途持有：第二寫 tryLock 即失敗（不啟 IO 由 H1-4 鎖定，此處鎖定持有本身）。
@@ -5143,7 +5227,7 @@ class PolicyWriteTest {
             await { vm1.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             val tx1 = activeTxOf(vm1)
@@ -5230,7 +5314,7 @@ class PolicyWriteTest {
             await { vm1.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -5314,7 +5398,7 @@ class PolicyWriteTest {
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
-        vm.confirmPolicyWrite(pendingB)
+        vm.confirmPolicyWrite(pendingB, pendingB.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         val draftBefore = vm.state.value.policyDraft
@@ -5387,7 +5471,7 @@ class PolicyWriteTest {
             assertEquals(setOf("com.A"), vm.state.value.policyDraft)
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -5455,7 +5539,7 @@ class PolicyWriteTest {
             val vmA = makeVm(fakeA.store, userId = 0, policyTxCoordinator = coord)
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmA, pendingB)
-            vmA.confirmPolicyWrite(pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
             await { vmA.state.value.pendingPolicyWrite == null }
             assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
             assertTrue(vmA.state.value.policyDraftKnown)
@@ -5506,7 +5590,7 @@ class PolicyWriteTest {
             )
             val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
             setPendingPolicyWrite(vmB, pendingC)
-            vmB.confirmPolicyWrite(pendingC)
+            vmB.confirmPolicyWrite(pendingC, pendingC.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             val txB = activeTxOf(vmB) as DualViewModel.PolicyTx
@@ -5607,7 +5691,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             val tx = activeTxOf(vm) as DualViewModel.PolicyTx
@@ -5690,7 +5774,7 @@ class PolicyWriteTest {
 
             // ack 讀即將阻塞：先開旗再 confirm（init 已走完，save 前無讀）。
             blockAck.set(true)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(ackStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             val tx = activeTxOf(vm) as DualViewModel.PolicyTx
@@ -5789,7 +5873,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             val tx = activeTxOf(vm) as DualViewModel.PolicyTx
@@ -5863,6 +5947,13 @@ class PolicyWriteTest {
         return (f.get(vm) as java.util.concurrent.atomic.AtomicBoolean).get()
     }
 
+    private fun freshGenOf(vm: DualViewModel): Long {
+        // policyFreshnessGen 為 DualViewModel.kt 的 private top-level val（非 VM 成員）。
+        val f = Class.forName("com.galaxydual.plus.DualViewModelKt")
+            .getDeclaredField("policyFreshnessGen").apply { isAccessible = true }
+        return (f.get(null) as java.util.concurrent.atomic.AtomicLong).get()
+    }
+
     private fun lastRevisionSeenRevOf(vm: DualViewModel): Long {
         val f = DualViewModel::class.java.getDeclaredField("lastRevisionSeenRev").apply { isAccessible = true }
         return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
@@ -5931,7 +6022,7 @@ class PolicyWriteTest {
             // VM1 快寫 B 結清＋廣播。
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             await { vm1.state.value.pendingPolicyWrite == null }
             assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
             assertTrue(vm1.state.value.policyDraftKnown)
@@ -5992,7 +6083,7 @@ class PolicyWriteTest {
             await { vm.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertFalse(revisionStaleOf(vm))
@@ -6036,7 +6127,7 @@ class PolicyWriteTest {
             // 後續 confirm 同樣強制重讀（清 pending、不寫 store）。
             val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingC)
-            vm.confirmPolicyWrite(pendingC)
+            vm.confirmPolicyWrite(pendingC, pendingC.generation)
             await { vm.state.value.pendingPolicyWrite == null }
             assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
             assertTrue(vm.state.value.msg.contains("未知"))
@@ -6090,7 +6181,7 @@ class PolicyWriteTest {
                 val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
                 setPendingPolicyWrite(vm, pending)
                 val savesBefore = fake.saveCalls
-                vm.confirmPolicyWrite(pending)
+                vm.confirmPolicyWrite(pending, pending.generation)
                 await(timeoutMs = 5_000L) {
                     vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText()
                 }
@@ -6226,7 +6317,7 @@ class PolicyWriteTest {
             await { vm.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             val txBefore = activeTxOf(vm)
@@ -6333,7 +6424,7 @@ class PolicyWriteTest {
 
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { backend.get() == setOf("com.B") }
 
@@ -6465,7 +6556,7 @@ class PolicyWriteTest {
             // slow VM 慢 save 逾時進 RECONCILING（coordinator Tx 存活）。
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmSlow, pendingB)
-            vmSlow.confirmPolicyWrite(pendingB)
+            vmSlow.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vmSlow.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertNotNull(activeTxOf(vmSlow))
@@ -6525,7 +6616,7 @@ class PolicyWriteTest {
             assertEquals(pending, vm.state.value.pendingPolicyWrite)
 
             // confirm 須拒 UNKNOWN_REFRESH，store 零觸碰，pending 清除。
-            vm.confirmPolicyWrite(pending!!)
+            vm.confirmPolicyWrite(pending!!, pending!!.generation)
             await { vm.state.value.pendingPolicyWrite == null }
             assertEquals(0, saveCalls.get())
             assertEquals(setOf("com.A"), backend.get())
@@ -6588,7 +6679,7 @@ class PolicyWriteTest {
             assertEquals(pending, vm.state.value.pendingPolicyWrite)
 
             // 舊 pending confirm：stale 已洗白但 base(V0)!=當下(V1)，須版本門控 abort。
-            vm.confirmPolicyWrite(pending)
+            vm.confirmPolicyWrite(pending, pending.generation)
             await(timeoutMs = 5_000L) { vm.state.value.pendingPolicyWrite == null }
             assertEquals(0, saveCalls.get())
             assertEquals(setOf("com.C"), backend.get())
@@ -6665,7 +6756,7 @@ class PolicyWriteTest {
             // VM-A confirm 排隊（pending B，尚未啟 IO；H1 未 claim，writeMutex 空閒）。
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmA, pendingB)
-            vmA.confirmPolicyWrite(pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
             // 排隊中（opMutex 被 blocker 持有，尚未取鎖）。
             await(timeoutMs = 5_000L) { inFlightKeysOf(vmA).any { it.startsWith("policy-") } }
 
@@ -6719,7 +6810,7 @@ class PolicyWriteTest {
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         // ack 超 1s  bound→Unknown→RECONCILING（非 SUCCESS），pending 保留。
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         assertFalse(vm.state.value.policyDraftKnown)
@@ -6850,7 +6941,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
 
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             // ackRead 已在途（save 已證成功、load 阻塞中）：latch 取代 sleep(300)。
             assertTrue(ackReadEntered.await(10, java.util.concurrent.TimeUnit.SECONDS))
@@ -6954,7 +7045,7 @@ class PolicyWriteTest {
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
 
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             // 首延 500ms 空窗內放行 save：save 證成功落盤 B，deferred 完成；
@@ -7008,7 +7099,7 @@ class PolicyWriteTest {
         await { vm.state.value.policyDraftKnown }
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
-        vm.confirmPolicyWrite(pending)
+        vm.confirmPolicyWrite(pending, pending.generation)
         assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
         await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
         // RECONCILING 期 cancel 不得清 pending（UI 層應僅本地 dismiss，不調此者）。
@@ -7047,7 +7138,7 @@ class PolicyWriteTest {
                 PolicySettled(999L, "foreign", setOf("com.foreign"), true, MsgKind.INFO, "foreign", false),
             )
             Thread.sleep(500)
-            vm.confirmPolicyWrite(pending!!)
+            vm.confirmPolicyWrite(pending!!, pending!!.generation)
             Thread.sleep(800)
             // IO 永不 firing。
             assertEquals(0, saveCalls)
@@ -7189,7 +7280,7 @@ class PolicyWriteTest {
             vm1.requestPolicyWrite()
             val pendingB = vm1.state.value.pendingPolicyWrite
             assertNotNull(pendingB)
-            vm1.confirmPolicyWrite(pendingB!!)
+            vm1.confirmPolicyWrite(pendingB!!, pendingB!!.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             Thread.sleep(2500)
@@ -7262,7 +7353,7 @@ class PolicyWriteTest {
             val pendingB = vm1.state.value.pendingPolicyWrite
             assertNotNull(pendingB)
             assertEquals(0L, pendingB!!.baseCoordinatorRevision)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStartedB.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             // Gate B publish at afterClaimBeforeEmit (CAS done, rev bumped, replay no B).
@@ -7290,7 +7381,7 @@ class PolicyWriteTest {
             assertNotNull(pendingC)
             assertEquals(1L, pendingC!!.baseCoordinatorRevision)
             // Confirm C must never start IO (saveCalls[C]==0, backend B-value).
-            vm2.confirmPolicyWrite(pendingC)
+            vm2.confirmPolicyWrite(pendingC, pendingC.generation)
             Thread.sleep(800)
             assertEquals(0, saveCallsC.get())
             assertEquals(setOf("com.B"), backend.get())
@@ -7653,7 +7744,7 @@ class PolicyWriteTest {
             seedPolicyDraftKnown(vmB, setOf("com.seed"))
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmB, pendingB)
-            vmB.confirmPolicyWrite(pendingB)
+            vmB.confirmPolicyWrite(pendingB, pendingB.generation)
             Thread.sleep(800)
             assertEquals(0, saveCallsB.get())
             assertEquals(1, deleteCalls.get())
@@ -7738,7 +7829,7 @@ class PolicyWriteTest {
             seedPolicyDraftKnown(vmB, setOf("com.seed"))
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmB, pendingB)
-            vmB.confirmPolicyWrite(pendingB)
+            vmB.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             assertNotNull(coordinatorTxOf(coord))
@@ -7918,7 +8009,7 @@ class PolicyWriteTest {
             seedPolicyDraftKnown(vmB, setOf("com.seed"))
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmB, pendingB)
-            vmB.confirmPolicyWrite(pendingB)
+            vmB.confirmPolicyWrite(pendingB, pendingB.generation)
             Thread.sleep(800)
             assertEquals(0, saveCalls.get())
             assertEquals(1, deleteCalls.get())
@@ -8036,7 +8127,7 @@ class PolicyWriteTest {
 
             // Stale pending must not write: confirm aborts with zero IO.
             val savesBefore = saveCalls
-            vmB.confirmPolicyWrite(pendingB)
+            vmB.confirmPolicyWrite(pendingB, pendingB.generation)
             await(timeoutMs = 5_000L) { vmB.state.value.pendingPolicyWrite == null }
             assertEquals(savesBefore, saveCalls)
             assertEquals(emptySet<String>(), backing)
@@ -8050,7 +8141,7 @@ class PolicyWriteTest {
             vmB.requestPolicyWrite()
             val pendingC = vmB.state.value.pendingPolicyWrite
             assertNotNull(pendingC)
-            vmB.confirmPolicyWrite(pendingC!!)
+            vmB.confirmPolicyWrite(pendingC!!, pendingC!!.generation)
             await(timeoutMs = 10_000L) { vmB.state.value.pendingPolicyWrite == null }
             assertEquals(setOf("com.example.a"), vmB.state.value.policyDraft)
             assertTrue(vmB.state.value.policyDraftKnown)
@@ -8129,7 +8220,7 @@ class PolicyWriteTest {
             vm2.requestPolicyWrite()
             val pendingC = vm2.state.value.pendingPolicyWrite
             assertNotNull(pendingC)
-            vm2.confirmPolicyWrite(pendingC!!)
+            vm2.confirmPolicyWrite(pendingC!!, pendingC!!.generation)
             await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
             // Same-rev orphan drop (dropRev==observed) fails closed on first
             // confirm (fail-closed >= boundary); refresh catches up dropGen,
@@ -8145,7 +8236,7 @@ class PolicyWriteTest {
                 vm2.requestPolicyWrite()
                 val pendingC2 = vm2.state.value.pendingPolicyWrite
                 assertNotNull(pendingC2)
-                vm2.confirmPolicyWrite(pendingC2!!)
+                vm2.confirmPolicyWrite(pendingC2!!, pendingC2!!.generation)
                 await(timeoutMs = 10_000L) { vm2.state.value.pendingPolicyWrite == null }
             }
             // System recovers: valid write succeeds, not stuck Unknown forever.
@@ -8917,7 +9008,7 @@ class PolicyWriteTest {
             val revBefore = coord.currentRevision()
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             // Winner save blocked: Tx in flight, revision not yet bumped.
             await(timeoutMs = 10_000L) { coordinatorTxOf(coord) != null }
@@ -9032,7 +9123,7 @@ class PolicyWriteTest {
             // Seed the backend so the fast-path save completes synchronously;
             // the test gates on the claim hook, not on save IO.
             backend.set(setOf("com.B"))
-                        vm1.confirmPolicyWrite(pendingB)
+                        vm1.confirmPolicyWrite(pendingB, pendingB.generation)
                         assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
                         assertTrue(coord.currentRevision() != revBefore)
 
@@ -9093,7 +9184,7 @@ class PolicyWriteTest {
             val vBefore = vm1.policyDraftVersionForTests()
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm1, pendingB)
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -9166,7 +9257,7 @@ class PolicyWriteTest {
                 runBlocking { revMutex.lock() }
                 val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
                 val beforeChildren = scopeJob.children.toSet()
-                vm.confirmPolicyWrite(pending)
+                vm.confirmPolicyWrite(pending, pending.generation)
                 await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
                 val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
                 assertFalse(claimedTx.executionArmed.get())
@@ -9322,7 +9413,7 @@ class PolicyWriteTest {
             try {
                 val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
                 val beforeChildren = scopeJob.children.toSet()
-                vm.confirmPolicyWrite(pending)
+                vm.confirmPolicyWrite(pending, pending.generation)
                 await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
                 val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
                 assertFalse(claimedTx.executionArmed.get())
@@ -9383,7 +9474,7 @@ class PolicyWriteTest {
                 setPendingPolicyWrite(vm, pending)
                 val revMutex = policyRevisionMutexOf(vm)
                 runBlocking { revMutex.lock() }
-                vm.confirmPolicyWrite(pending)
+                vm.confirmPolicyWrite(pending, pending.generation)
                 await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
                 // Advance coordinator revision silently (stale foreign rev) & force lock failure.
                 coord.bumpRevisionForTests()
@@ -9483,6 +9574,429 @@ class PolicyWriteTest {
         }
     }
 
+    // PR #60 (Phase 2 / R1(a)): A3-3 gate rejection settles — a foreign
+    // committedRevision bump mid-flight makes the FAILED terminal rev-gated claim
+    // (claimForPublishChecked) reject; the rejection must settle exactly like a
+    // stage-rejected terminal: no VM-local fence, no coordinator claim, keys
+    // cleared, UNKNOWN_REFRESH + stale, and a later confirm succeeds after refresh.
+    @Test
+    fun a33_gateRejection_confirmFailed_settlesFencesAndKeys() {
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val saveStarted = java.util.concurrent.CountDownLatch(1)
+            val saveCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val store = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { raw ->
+                    val n = saveCount.incrementAndGet()
+                    if (raw == null) return@HookPolicyStore true
+                    if (n == 1) {
+                        saveStarted.countDown()
+                        while (!saveRelease.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        return@HookPolicyStore false // save 失敗 → FAILED 終態
+                    }
+                    backend.set(raw)
+                    true
+                },
+            )
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(
+                setOf("com.B"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vm, pending)
+            vm.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Foreign B commits mid-flight: bump committedRevision.
+            coord.bumpRevisionForTests()
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    !coord.writeMutex.isLocked
+            }
+            // VM-local fence released; coordinator claim completed — never wedged.
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue("policy-write keys must be cleared: " + inFlightKeysOf(vm), inFlightKeysOf(vm).none { it.startsWith("policy-write:") })
+            assertTrue(savingKeysOf(vm).none { it.startsWith("policy-write:") })
+            // UNKNOWN_REFRESH + markPolicyUnknownLocked effect (stale + draftUnknown), CHANNEL.
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm))
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            // Subsequent confirm succeeds after a fresh Known refresh.
+            backend.set(setOf("com.remote"))
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown && !revisionStaleOf(vm) }
+            val pending2 = PendingPolicyWrite(
+                setOf("com.example.a"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vm, pending2)
+            vm.confirmPolicyWrite(pending2, pending2.generation)
+            await(timeoutMs = 10_000L) { vm.state.value.pendingPolicyWrite == null }
+            assertEquals(2, saveCount.get())
+            assertTrue(vm.state.value.msg.contains("已寫入政策草稿"))
+        } finally {
+            saveRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 (Phase 2 / R1(a)): 同款 rev-gate 拒絕——clear FAILED 終態。
+    @Test
+    fun a33_gateRejection_clearFailed_settlesFencesAndKeys() {
+        val clearRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val clearStarted = java.util.concurrent.CountDownLatch(1)
+            val clearCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val store = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { raw ->
+                    if (raw == null) {
+                        clearCount.incrementAndGet()
+                        clearStarted.countDown()
+                        while (!clearRelease.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        return@HookPolicyStore false // clear 失敗 → FAILED 終態
+                    }
+                    true
+                },
+            )
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            vm.clearPolicyDraft()
+            assertTrue(clearStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Foreign B commits mid-flight: bump committedRevision.
+            coord.bumpRevisionForTests()
+            clearRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    !coord.writeMutex.isLocked
+            }
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-clear:") })
+            assertTrue(savingKeysOf(vm).none { it.startsWith("policy-clear:") })
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm))
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            // Delete failed → backend unchanged.
+            assertEquals(setOf("com.seed"), backend.get())
+        } finally {
+            clearRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 (Phase 2 / R1(a)): 同款 rev-gate 拒絕——repair FAILED 終態。
+    @Test
+    fun a33_gateRejection_repairFailed_settlesFencesAndKeys() {
+        val repairRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val repairStarted = java.util.concurrent.CountDownLatch(1)
+            val store = HookPolicyStore(
+                loadRaw = { throw ClassCastException("corrupt prefs") },
+                saveRaw = { raw ->
+                    if (raw == null) {
+                        repairStarted.countDown()
+                        while (!repairRelease.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        return@HookPolicyStore false // delete 失敗 → RepairFailed → FAILED 終態
+                    }
+                    true
+                },
+                repairProbe = { LoadResult.Corrupt },
+            )
+            val vm = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vm.state.value.loading && vm.state.value.policyDraftCorrupt }
+            vm.requestRepairCorruptDraft()
+            vm.confirmRepairCorruptDraft()
+            assertTrue(repairStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Foreign B commits mid-flight: bump committedRevision.
+            coord.bumpRevisionForTests()
+            repairRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    !coord.writeMutex.isLocked
+            }
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
+            assertTrue(savingKeysOf(vm).none { it.startsWith("policy-") })
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm))
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            // Repair 失敗保留 corrupt 證據（fail-closed）。
+            assertTrue(vm.state.value.policyDraftCorrupt)
+        } finally {
+            repairRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 (Phase 2 / R1(b)): dropStagedPlaceholderIfMatch — 僅 exact identity 的
+    // placeholder 可丟；外來 identity／已 stage 的 real payload 一律不動。
+    @Test
+    fun dropStagedPlaceholderIfMatch_dropsExactIdentity_leavesForeignAndRealUntouched() {
+        val coord = PolicyTxCoordinator()
+        try {
+            val storeA = HookPolicyStore(loadRaw = { setOf("com.p") }, saveRaw = { true })
+            val txA = DualViewModel.PolicyTx(
+                coord.nextTxId(), "r1b-drop-a",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.p"), storeA, false,
+            )
+            coord.activeTx.set(txA)
+            val placeholder = PolicySettled(txA.txId, txA.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false)
+            kotlinx.coroutines.runBlocking { assertTrue(coord.completeWithRevision(txA, placeholder)) }
+            val cur = coord.pendingPublish.get()!!
+            assertFalse(cur.known)
+
+            // (1) foreign txId → false；placeholder 不動
+            assertFalse(coord.dropStagedPlaceholderIfMatch(txA.txId + 999L, txA.key))
+            assertSame(cur, coord.pendingPublish.get())
+            // (2) foreign key → false；placeholder 不動
+            assertFalse(coord.dropStagedPlaceholderIfMatch(txA.txId, "r1b-drop-foreign"))
+            assertSame(cur, coord.pendingPublish.get())
+
+            // (3) same identity 但已 stage real payload → 不可作為 placeholder 丟棄
+            val staged = kotlinx.coroutines.runBlocking {
+                coord.stageRealPayload(PolicySettled(txA.txId, txA.key, setOf("com.real"), true, MsgKind.INFO, "done", false))
+            }
+            assertNotNull(staged)
+            val real = coord.pendingPublish.get()!!
+            assertTrue(real.known)
+            assertEquals(setOf("com.real"), real.draft)
+            assertFalse(coord.dropStagedPlaceholderIfMatch(txA.txId, txA.key))
+            assertSame(real, coord.pendingPublish.get())
+
+            // (4) 另一 placeholder 的 exact identity → dropped，pending 清空＋tombstone
+            val txB = DualViewModel.PolicyTx(
+                coord.nextTxId(), "r1b-drop-b",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.p"), storeA, false,
+            )
+            coord.activeTx.set(txB)
+            val placeholderB = PolicySettled(txB.txId, txB.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false)
+            kotlinx.coroutines.runBlocking { assertTrue(coord.completeWithRevision(txB, placeholderB)) }
+            assertTrue(coord.dropStagedPlaceholderIfMatch(txB.txId, txB.key))
+            assertNull(coord.pendingPublish.get())
+            assertTrue(coord.isTombstoned(txB.txId, txB.key))
+            // 重複呼叫 → false（已丟棄），tombstone 仍在
+            assertFalse(coord.dropStagedPlaceholderIfMatch(txB.txId, txB.key))
+        } finally {
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 (Phase 2 / R1(c)): A3-7 有界 join — 從未 arm（本行程不可能有）的
+    // deferred 立即返回；arm 後被 cancel 但仍阻塞的 deferred 逾時 → false ＋
+    // policyRevisionStale=true，且後續 confirm 被 stale 短路擋住（UNKNOWN_REFRESH）。
+    @Test
+    fun cancelAndJoinRepairDeferred_neverArmed_returnsPromptly() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        await { !vm.state.value.loading }
+        kotlinx.coroutines.runBlocking {
+            val never = kotlinx.coroutines.CompletableDeferred<Boolean>()
+            val t0 = System.currentTimeMillis()
+            assertTrue(vm.cancelAndJoinRepairDeferred(never))
+            assertTrue(System.currentTimeMillis() - t0 < 2_000L)
+            // 已完成的 deferred → 立即 true
+            assertTrue(vm.cancelAndJoinRepairDeferred(kotlinx.coroutines.CompletableDeferred(true)))
+            // null → true（無事可 join）
+            assertTrue(vm.cancelAndJoinRepairDeferred(null))
+            Unit
+        }
+    }
+
+    @Test
+    fun cancelAndJoinRepairDeferred_blockingArm_timeoutMarksStale() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 200)
+        await { !vm.state.value.loading }
+        // 阻塞工作且不響應 coroutine cancel：cancel() 只標記 flag；body 繼續
+        // 跑完才算完成（真實：blocking store.repairCorrupt() 跑在 app-scoped IO）。
+        // R1(c) latch pin: the blocking body must be RUNNING before cancel is
+        // issued — otherwise cancel() may land before the IO worker starts the
+        // body and the deferred completes as cancelled-before-start (join()
+        // returns immediately and the timeout assertion is racy). Count the
+        // body's first instruction down, await it, then cancel deterministically.
+        val bodyStarted = java.util.concurrent.CountDownLatch(1)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO)
+        val job = scope.async(kotlinx.coroutines.Dispatchers.IO) {
+            bodyStarted.countDown()
+            try { Thread.sleep(3_000) } catch (_: InterruptedException) { }
+            true
+        }
+        try {
+            assertTrue("blocking body must start before cancel", bodyStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            kotlinx.coroutines.runBlocking {
+                val t0 = System.currentTimeMillis()
+                val result = vm.cancelAndJoinRepairDeferred(job)
+                val elapsed = System.currentTimeMillis() - t0
+                assertFalse(result)
+                assertTrue("join 必須有界（~policyIoTimeoutMs），實測 ${elapsed}ms", elapsed < 3_000L)
+                Unit
+            }
+            assertTrue(revisionStaleOf(vm))
+            // stale 生效：後續 confirm 被強制重讀擋住（UNKNOWN_REFRESH、零寫入）。
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+            vm.confirmPolicyWrite(pending, pending.generation)
+            await { vm.state.value.pendingPolicyWrite == null }
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(0, fake.saveCalls)
+        } finally {
+            try { scope.cancel() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 (Phase 2 / R1(d) + SM): S4 盲清 — 本行程曾觀察到 Known；遠端轉未知後，
+    // 雙擊只強制重讀；重讀仍未知 → 不刪（BLIND_CLEAR_REFRESH_FIRST），第二次亦同。
+    @Test
+    fun s4_blindClear_lastKnownSet_refreshKeepsFailing_neverDeletes() {
+        val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        // 遠端轉為未知：強制重讀（state → Unknown；lastKnown 本行程保留）。
+        fake.saved = null
+        vm.refreshPolicyDraft()
+        await(timeoutMs = 5_000L) { !vm.state.value.policyDraftKnown }
+        assertNotNull(vm.lastKnownPolicyDraftForTests())
+
+        vm.clearPolicyDraft() // tap 1：arm＋BLIND_CLEAR_FIRST
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertEquals(0, fake.clearCalls)
+
+        val genBeforeTap2 = freshGenOf(vm)
+        vm.clearPolicyDraft() // tap 2：S4 refresh-first；重讀仍 Unknown → 不刪
+        await(timeoutMs = 5_000L) {
+            freshGenOf(vm) != genBeforeTap2 && !vm.state.value.policyRefreshing
+        }
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertTrue(
+            "tap2 後只能看到 refresh-first／refresh-failed（重讀仍未知）：" + vm.state.value.msg,
+            vm.state.value.msg == PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST).defaultText() ||
+                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
+        )
+
+        vm.clearPolicyDraft() // tap 3：重新 arm（上一 arm 已 consume；世代已穩定）
+        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        // tap3 的 arm 快照於世代推進之後 → 檢查通過 → S4（第二次 refresh-first）→ 仍不刪
+        val genBeforeTap4 = freshGenOf(vm)
+        vm.clearPolicyDraft() // tap 4：第二次 refresh-first（第二次失敗）→ 仍不刪
+        await(timeoutMs = 5_000L) {
+            freshGenOf(vm) != genBeforeTap4 && !vm.state.value.policyRefreshing
+        }
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+    }
+
+    // PR #60 (Phase 2 / SEC-M1): commit-time Known fence — the clear must
+    // refuse store.clear() if the session flips to not-Known between the
+    // fence capture (arm) and the last-moment re-check inside the IO arm.
+    // Simulated deterministically via the store's read hook: the clear's
+    // own preRead flips _state.policyDraftKnown=false as a side effect
+    // (models a concurrent refresh observing not-Known landing mid-flight);
+    // every subsequent re-check must then abort the delete. Pinned here:
+    // store.clear() is NEVER called; the clear settles FAILED/Unknown.
+    // Note: the added lastKnown-only arm disjunct cannot produce a behavioral
+    // delta at this gate today — with lastKnown!=null && !Known the S4
+    // refresh-first gate returns before the fence capture, so the fence is
+    // only ever armed here via Known (at capture time). The test pins the
+    // fence mechanism the hardening extends; it cannot distinguish old vs
+    // new arm expression (that delta is defense-in-depth, see knownCommitFence
+    // KDoc).
+    @Test
+    fun clear_midFlightFlipToUnknown_fenceAbortsBeforeStoreClear() {
+        var backend: Set<String>? = setOf("com.seed")
+        var clearCalls = 0
+        var flipArmed = false
+        val flipped = java.util.concurrent.atomic.AtomicBoolean(false)
+        lateinit var vm: DualViewModel
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (flipArmed && !flipped.get() &&
+                    flipped.compareAndSet(false, true)
+                ) {
+                    // Flip the VM-visible Known bit as a side effect of the
+                    // clear's own preRead (main-thread fence is still Known).
+                    val field = DualViewModel::class.java.getDeclaredField("_state")
+                        .apply { isAccessible = true }
+                    @Suppress("UNCHECKED_CAST")
+                    val flow = field.get(vm) as MutableStateFlow<UiState>
+                    flow.value = flow.value.copy(policyDraftKnown = false)
+                }
+                backend
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    backend = emptySet()
+                    true
+                } else {
+                    backend = raw
+                    true
+                }
+            },
+        )
+        vm = makeVm(store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        assertNotNull(vm.lastKnownPolicyDraftForTests())
+        flipArmed = true
+        vm.clearPolicyDraft() // Known 單步清除：fence arm → preRead 翻轉 → 末端 re-check 中止
+        await(timeoutMs = 5_000L) { !vm.state.value.loading }
+        assertEquals("fence must abort the clear before store.clear()", 0, clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+    }
+
+    // PR #60 (Phase 2 / R1(d)): lastKnown==null 維持經典雙擊語義——pre-read 把關：
+    // 重讀 Unknown → REFRESH_FAILED 中止（不刪）；遠端恢復（state 仍 Unknown、
+    // lastKnown==null）→ 經典路徑允許刪除（既有行為保留）。
+    @Test
+    fun s4_blindClear_lastKnownNull_classicDoubleTapSemantics() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = makeVm(fake.store, userId = 0, initialDraft = null)
+        await { !vm.state.value.loading }
+        assertNull(vm.lastKnownPolicyDraftForTests())
+
+        vm.clearPolicyDraft() // tap 1：arm
+        assertEquals(0, fake.clearCalls)
+        // 遠端仍 Unknown：tap 2 → pre-read Unknown → abort（不刪）
+        vm.clearPolicyDraft()
+        Thread.sleep(400)
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.msg.contains("重新整理"))
+
+        // 遠端恢復（saved 已有值；state 仍 Unknown、未重讀；lastKnown==null）：
+        // 下一次雙擊經典路徑允許刪除。
+        vm.clearPolicyDraft() // tap 3：重新 arm
+        fake.saved = emptySet()
+        vm.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
+        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
+        assertEquals(1, fake.clearCalls)
+    }
+
     // Item 2: autoRecheckTx must stage a placeholder (!known && msg.isEmpty()) on claimForPublish,
     // never writing real terminal payload into pendingPublish before _latest via stageRealPayload.
     @Test
@@ -9508,7 +10022,7 @@ class PolicyWriteTest {
             await { vm.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -9637,7 +10151,7 @@ class PolicyWriteTest {
             returnUnavailable.set(true)
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -9714,7 +10228,7 @@ class PolicyWriteTest {
             await { vm.state.value.policyDraftKnown }
             val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pendingB)
-            vm.confirmPolicyWrite(pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
@@ -9848,7 +10362,7 @@ class PolicyWriteTest {
             val obsRevBefore2 = vm2.observedRevForTests()
             val pendingB2 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm2, pendingB2)
-            vm2.confirmPolicyWrite(pendingB2)
+            vm2.confirmPolicyWrite(pendingB2, pendingB2.generation)
             assertTrue(saveStarted2.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
 
@@ -9982,7 +10496,7 @@ class PolicyWriteTest {
             }
             val pendingB4 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm4, pendingB4)
-            vm4.confirmPolicyWrite(pendingB4)
+            vm4.confirmPolicyWrite(pendingB4, pendingB4.generation)
             await(timeoutMs = 10_000L) {
                 vm4.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     !vm4.state.value.loading &&
@@ -10030,7 +10544,7 @@ class PolicyWriteTest {
             await { vmW.state.value.policyDraftKnown }
             val pendingW = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vmW, pendingW)
-            vmW.confirmPolicyWrite(pendingW)
+            vmW.confirmPolicyWrite(pendingW, pendingW.generation)
             assertTrue(saveStartedWrite.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 5_000L) { vmW.state.value.policyWritePhase == PolicyWritePhase.SAVING }
             val txW = activeTxOf(vmW) as DualViewModel.PolicyTx
@@ -10078,7 +10592,7 @@ class PolicyWriteTest {
                 await { vmWFb.state.value.policyDraftKnown }
                 val pendingWFb = PendingPolicyWrite(setOf("com.B2"), System.currentTimeMillis())
                 setPendingPolicyWrite(vmWFb, pendingWFb)
-                vmWFb.confirmPolicyWrite(pendingWFb)
+                vmWFb.confirmPolicyWrite(pendingWFb, pendingWFb.generation)
                 assertTrue(saveStartedWriteFb.await(5, java.util.concurrent.TimeUnit.SECONDS))
                 await(timeoutMs = 5_000L) { vmWFb.state.value.policyWritePhase == PolicyWritePhase.SAVING }
                 val txWFb = activeTxOf(vmWFb) as DualViewModel.PolicyTx
@@ -10248,7 +10762,7 @@ class PolicyWriteTest {
                 claimEntered.countDown()
                 claimRelease.await()
             }
-            vm1.confirmPolicyWrite(pendingB)
+            vm1.confirmPolicyWrite(pendingB, pendingB.generation)
             assertTrue(claimEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             assertEquals(PolicyWritePhase.SAVING, vm1.state.value.policyWritePhase)
             assertTrue(vm1.state.value.loading)
@@ -10301,7 +10815,7 @@ class PolicyWriteTest {
             val pendingB2 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
             setPendingPolicyWrite(vm2, pendingB2)
 
-            vm2.confirmPolicyWrite(pendingB2)
+            vm2.confirmPolicyWrite(pendingB2, pendingB2.generation)
             assertTrue(ackReadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             assertEquals(PolicyWritePhase.SAVING, vm2.state.value.policyWritePhase)
             assertTrue(vm2.state.value.loading)

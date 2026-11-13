@@ -64,16 +64,23 @@ class GuardXposedProvider(
     // 正常 LSPosed daemon 握手僅數次,惡意 app 洪水則被節流。Best-effort,
     // 狀態僅存記憶體 (重啟即清空)。
     // 有界化：上限 512  uid 條目（callingUid 為 kernel 提供，正常僅數十種；
-    // 512 為防禦性上限，避免極端偽造/多用戶爆炸撐大 map）。超限時驅逐任意
-    // 最舊首鍵（best-effort LRU-ish；丟失僅影響該被驅逐 uid 的窗口計數，
-    // 下次重建，不影響信任門控）。
-    // Phase7 註記：滿表時選擇「驅逐最舊＋放行本次（return false）」而非
-    // 「滿即 return true」。理由：rateWindows 僅記窗口計數（per-uid 計數器），
+    // 512 為防禦性上限，避免極端偽造/多用戶爆炸撐大 map）。超限時逐出
+    // 「最近最少使用」條目（真正 LRU：LinkedHashMap(accessOrder=true)，
+    // get/put 皆計為一次存取，故滿時逐出的是事件最久未動用的窗口，而非最
+    // 早插入者）。丟失僅影響被逐出 uid 的窗口計數，下次重建，不影響信任門控。
+    // Phase7 註記：滿表時選擇「逐出最舊（LRU）＋放行本次（return false）」
+    // 而非「滿即 return true」。理由：rateWindows 僅記窗口計數（per-uid 計數器），
     // 信任判定另由 isTrustedXposedCaller 獨立執行，驅逐永不放寬信任門控；
     // 滿即拒（return true）會把合法的新 uid（例如多用戶新 daemon）在表滿時
     // 誤判為洪水而拒絕握手，可用性損失大於節流收益，故保留驅逐語義。
+    // 時鐘失效 fail-open（見 isRateLimited）為有意取捨：可用性優先、且仍受 UID
+    // 門控保護；非本方法職責修正（Clock-failure telemetry 見 isRateLimited）。
     private val rateLock = Any()
-    private val rateWindows = mutableMapOf<Int, Pair<Long, Int>>()
+    // True LRU (access-ordered): get/put 皆刷新存取順序；eviction removes the
+    // least-recently-used window, 不是 FIFO insertion order。
+    private val rateWindows = LinkedHashMap<Int, Pair<Long, Int>>(16, 0.75f, true)
+    // Once-per-process telemetry for the fail-open clock fallback (diagnosability).
+    private val clockFallbackLogged = java.util.concurrent.atomic.AtomicBoolean(false)
     private val rejectionLogs = AtomicInteger(0)
 
     private fun isRateLimited(uid: Int): Boolean {
@@ -81,12 +88,20 @@ class GuardXposedProvider(
             nowMsProvider()
         } catch (_: Throwable) {
             // 時鐘失效時 fail-open (仍受 UID 門控保護):可用性優先,避免誤殺 daemon。
+            // 每行程 log 一次使此 fail-open 可診斷（不再靜默）；clock 可用時恢復計數。
+            if (clockFallbackLogged.compareAndSet(false, true)) {
+                try {
+                    onRejectLog("[GuardXposedProvider] rate-limit clock failed; failing open (UID gate still enforced)")
+                } catch (_: Throwable) {
+                }
+            }
             return false
         }
         synchronized(rateLock) {
             val cur = rateWindows[uid]
             if (cur == null || now - cur.first >= RATE_WINDOW_MS) {
                 if (cur == null && rateWindows.size >= RATE_WINDOWS_MAX) {
+                    // access-ordered: keys.first() is the least-recently-used window.
                     rateWindows.keys.firstOrNull()?.let { rateWindows.remove(it) }
                 }
                 rateWindows[uid] = now to 1

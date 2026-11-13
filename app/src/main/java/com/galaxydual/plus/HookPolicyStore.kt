@@ -37,6 +37,7 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
 import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
@@ -75,6 +76,13 @@ internal fun logStore(msg: String) {
 // Stage L2 atomic poison fence (P2 #4 + P3a):single global AtomicReference<PoisonState>
 // copy-on-write, weak keys, pre-poison seqlock.
 //
+// A3-8：overflow 閂（cap POISON_MAX_ENTRIES）為永久 fail-closed 狀態：此後一切讀
+// 強制 Unavailable（含未來新 before 的讀），且生產中無任何自動清除路徑 —— 復原
+// 僅靠「行程重啟」（remotePoison 為行程級 AtomicReference）。resetRemotePoisonForTests
+// 僅供單元測試（測試隔離），生產路徑絕不呼叫；故 overflow 發生時除既有
+// poisonEvictCount 指標外，另以 poisonOverflowOnceLogged 每行程 log 一行，
+// 使「永久 Unavailable」可經 logcat 診斷。
+//
 // - 舊碼雙原子 (per-store failedPrefs + 全域強引用 set) 有發佈間隙:markFailed 先設
 //   本地再加全域,兄弟 store 本地 null 可在間隙兩次 isGloballyPoisoned 皆命中前通過,
 //   誤讀樂觀 mMap 為 Known。單 store barrier 測不到 distinct-store 交錯 (Factory
@@ -101,7 +109,10 @@ internal data class PoisonState(
     val entries: Map<WeakPrefKey, Long>,
     val gen: Long,
     // Fail-closed overflow latch: cap 滿丟新時置 true，此後一切讀強制 Unknown
-    //（含未來新 before 的讀），僅 reset 清除。生產單實例永不觸發（cap 128）。
+    //（含未來新 before 的讀）。生產路徑無清除機制（remotePoison 為行程級
+    // AtomicReference）：復原僅靠行程重啟；resetRemotePoisonForTests 僅供單元
+    // 測試隔離，生產絕不呼叫。overflow 時讀路徑每行程 log 一行（見
+    // logPoisonOverflowOnce），poisonEvictCount 另計。
     val overflow: Boolean = false,
 )
 
@@ -126,6 +137,23 @@ internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPr
 
 internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
 
+// A3-8: overflow 閂每行程 log-once（永久 fail-closed 狀態必須可診斷；逐次讀
+// log 會污染 log buffer，故 once-per-process）。resetRemotePoisonForTests 重置。
+internal val poisonOverflowOnceLogged = AtomicBoolean(false)
+
+internal fun logPoisonOverflowOnce(where: String) {
+    try {
+        if (poisonOverflowOnceLogged.compareAndSet(false, true)) {
+            logStore(
+                "poison overflow latch engaged ($where): all remote policy reads " +
+                    "fail-closed permanently until process restart " +
+                    "(resetRemotePoisonForTests is test-only; no production recovery path)",
+            )
+        }
+    } catch (_: Throwable) {
+    }
+}
+
 // Phase2 #3: poisonPublishHook seam 已刪除（GapCommitPrefs 已可模擬
 // commit-vs-publish 窗；可注入全域 var 在 JVM 多執行緒下有 data race，
 // @Volatile 亦不如刪除乾淨）。如需重演發佈間隙，一律用 GapCommitPrefs
@@ -133,6 +161,18 @@ internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
 
 internal fun resetRemotePoisonForTests() {
     remotePoison.set(PoisonState(emptyMap(), 0))
+    try {
+        poisonOverflowOnceLogged.set(false)
+    } catch (_: Throwable) {
+    }
+    try {
+        backupFailureCount.set(0L)
+    } catch (_: Throwable) {
+    }
+    try {
+        backupFailureFirstLogAtMs.set(0L)
+    } catch (_: Throwable) {
+    }
     try {
         remoteCorruptEvidence.set(emptyMap())
     } catch (_: Throwable) {
@@ -572,11 +612,30 @@ sealed interface LoadResult {
 }
 
 // Stage L4 P2#3 repair primitive 結果（永不 auto-called，僅 VM 修復流程調用）。
+// RepairedNoBackup（A3-1）：刪除＋post-read 驗證皆成功，但 best-effort 備份
+// 失敗（commit false／拋出／讀回不一致）→ 舊損壞內容未被保留。修復本身已發生
+// （與 Repaired 相同的資料結果），差別僅在誠實揭露證據遺失；呼叫端不得以
+// 「已備份」語氣宣稱，亦不得因此回退為 FAILED（刪除確實發生）。
 sealed interface RepairResult {
     data object Repaired : RepairResult
+    data object RepairedNoBackup : RepairResult
     data object RepairFailed : RepairResult
     data object ServiceUnavailable : RepairResult
 }
+
+// A3-1: repair backup 嘗試結果（內部）。
+// - Written：備份 commit 成功且讀回 BACKUP_KEY 內容與寫入一致（已驗證）。
+// - Failed：備份拋出／commit 回 false／讀回缺席或數值不一致 → 證據未保留。
+//   （CancellationException 永不降級為 Failed，一律透傳。）
+// - Skipped：本 store 未設備份鉤子（預設 no-op；直接注入後端／單測情境）。
+//   備份語意不適用，不算失敗（生產 remote 綁定一律會設鉤子，見
+//   remoteHookPolicyStore setBackupHook）。
+internal enum class BackupOutcome { Written, Failed, Skipped }
+
+// A3-1: 備份失敗計數（identityMismatchCount 模式；單調）。單一計數點在
+// repairCorrupt（涵蓋內建鉤子與回報 Failed 的自訂鉤子）；log 經 logStore
+// 一行。resetRemotePoisonForTests 會歸零（測試隔離）。
+internal val backupFailureCount = AtomicLong(0L)
 
 class HookPolicyStore(
     private val loadRaw: () -> Set<String>?,
@@ -689,14 +748,18 @@ class HookPolicyStore(
     }
 
     // Stage L4 P2#3 顯式修復原語（永不 auto-called，僅 VM 修復流程調用；M4 P3）：
-    // best-effort 備份至 dual_policy.bak.<ts>（writable 時；prefs.all 或型別錯亂值
-    // 皆可能拋出，備份僅 best-effort、可能失敗、無法保證可恢復；備份失敗仍繼續
-    // 刪除，不擋修復），remove(KEY).commit()，post-read 驗證 Known(empty)。
+    // best-effort 備份至 dual_policy.bak（writable 時；prefs.all 或型別錯亂值
+    // 皆可能拋出，備份失敗不擋修復，但 A3-1：讀回 BACKUP_KEY 驗證，失敗即回
+    // RepairedNoBackup 並 log＋backupFailureCount++，絕不靜默宣稱證據保留），
+    // remove(KEY).commit()，post-read 驗證 Known(empty)。
     // - ServiceUnavailable：服務缺席（isServiceAvailable false 或 clear 回 false
     //   且當下不可寫）。
-    // - Repaired：clear 成功＋post-read 為 Known(empty)（備份不保證成功）。
+    // - Repaired：clear 成功＋post-read 為 Known(empty)＋備份 Written 或 Skipped
+    //   （直接後端無備份語意；生產 remote 一律有鉤子）。
+    // - RepairedNoBackup（A3-1）：clear 成功＋post-read 為 Known(empty)，但備份
+    //   Failed → 刪除發生、舊內容未保留；呼叫端須誠實揭露。
     // - RepairFailed：其餘（clear 回 false/拋出、post-read 非空或仍 Unknown/Corrupt）。
-    // CE 透傳（取消不得被吞為失敗）。
+    // CE 透傳（取消不得被吞為失敗；亦不得降級為 RepairedNoBackup）。
     fun repairCorrupt(): RepairResult {
         val available = try {
             isServiceAvailable()
@@ -708,16 +771,32 @@ class HookPolicyStore(
         if (!available) return RepairResult.ServiceUnavailable
         // Best-effort 備份（writable 時）：嘗試讀取原始物件字串化備份，prefs.all
         // 或型別錯亂值皆可能拋出；備份僅 best-effort、可能失敗、無法保證可恢復，
-        // 失敗仍繼續刪除（不擋修復）。故損壞修復為破壞性操作，備份不能視為保證。
+        // 失敗仍繼續刪除（不擋修復），但 A3-1：失敗須記數＋log＋RepairedNoBackup，
+        // 絕不靜默刪除後仍報 Repaired。故損壞修復為破壞性操作，備份不能視為保證。
         // 損壞值經 loadRaw 即拋 CCE，故此處僅能備份可讀值；損壞本體無法經型別
         // 安全通道備份，仍以清除＋驗證為主，備份失敗不擋修復。
-        try {
+        val backupOutcome: BackupOutcome = try {
             val ts = try { System.currentTimeMillis() } catch (_: Throwable) { 0L }
             backupCorruptBestEffort(ts)
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
-            // Best effort: 備份失敗不擋修復。
+            // 鉤子自身拋出（非 CE）→ 備份失敗，仍繼續（fail-honest，不 fail-silent）。
+            recordRepairBackupFailure("hook threw (non-CE)")
+        }
+        // A3-1: 單一計數點 — 任何 Failed 結局（內建鉤子擲出/回報，或自訂鉤子
+        // 直接回報 Failed）都算一次備份失敗，確保可觀測。計數永遠無條件遞增。
+        if (backupOutcome == BackupOutcome.Failed) {
+            try {
+                backupFailureCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            // SL5: throttle on EVERY backup failure; the 24h timestamp check is
+            // the rate limiter (one stderr line per 24h per process).
+            try {
+                maybeLogFirstBackupFailure()
+            } catch (_: Throwable) {
+            }
         }
         val cleared: Boolean = try {
             saveRaw(null)
@@ -744,19 +823,61 @@ class HookPolicyStore(
             return RepairResult.RepairFailed
         }
         return if (after is LoadResult.Known && after.packages.isEmpty()) {
-            RepairResult.Repaired
+            // A3-1: 刪除已發生（post-read Known(empty)）；唯備份失敗時不得報
+            // 「已備份」語氣 —— 回 RepairedNoBackup 由呼叫端誠實揭露。
+            if (backupOutcome == BackupOutcome.Failed) RepairResult.RepairedNoBackup else RepairResult.Repaired
         } else {
             RepairResult.RepairFailed
         }
     }
 
-    // Best-effort 備份鉤子（預設 no-op；remote 覆寫經 prefs.all 備份）。
-    // 失敗一律忽略，不擋修復。
-    private var backupCorruptBestEffort: (Long) -> Unit = { _ -> }
+    // Best-effort 備份鉤子（預設 no-op＝Skipped；remote 覆寫經 prefs.all 備份並
+    // 讀回驗證）。鉤子拋出非 CE 例外視為 Failed（見 repairCorrupt）；CE 透傳。
+    private var backupCorruptBestEffort: (Long) -> BackupOutcome = { BackupOutcome.Skipped }
 
-    internal fun setBackupHook(hook: (Long) -> Unit) {
+    internal fun setBackupHook(hook: (Long) -> BackupOutcome) {
         backupCorruptBestEffort = hook
     }
+}
+
+// SL5 (backupFailureCount surfacing): there is NO in-app diagnostics or
+// benchmark export surface for the store counters (verified — poisonEvictCount/
+// identityMismatchCount are only read by tests). Until one exists, surface
+// repair-backup failures with a throttled stderr line: at most ONE line per
+// 24h per process, rate-limited by the in-memory AtomicLong timestamp below
+// (process lifetime bounds it; nothing persisted, no package names). Called
+// on EVERY recordRepairBackupFailure() and on every repairCorrupt Failed
+// outcome — the timestamp check is the rate limiter, NOT the call site;
+// backupFailureCount itself is incremented unconditionally at the single
+// count point (repairCorrupt). tombstoneEvictions should join this same
+// surface once it exists.
+internal val backupFailureFirstLogAtMs = AtomicLong(0L)
+
+internal fun maybeLogFirstBackupFailure(nowMs: Long = System.currentTimeMillis()) {
+    try {
+        val last = backupFailureFirstLogAtMs.get()
+        if (last != 0L && nowMs - last < 86_400_000L) return
+        if (!backupFailureFirstLogAtMs.compareAndSet(last, nowMs)) return
+        logStore("repair backup failure observed; deleted draft evidence not preserved")
+    } catch (_: Throwable) {
+    }
+}
+
+// A3-1 (S3): repair backup 失敗記錄（log 一行 + return Failed），供
+// remoteHookPolicyStore 備份鉤子與 repairCorrupt 的 hook-threw 降級共用。
+// 絕不宣稱證據已保留。計數點在 repairCorrupt（單一 bookkeeping），
+// 涵蓋內建鉤子與回報 Failed 的自訂鉤子；此處無條件呼叫一次 SL5 24h
+// 節流（時間戳是限速器；每個 Failed 都踩一次，24h 內至多一行 stderr）。
+internal fun recordRepairBackupFailure(whereDesc: String): BackupOutcome {
+    try {
+        logStore("repair backup $whereDesc; evidence NOT preserved")
+    } catch (_: Throwable) {
+    }
+    try {
+        maybeLogFirstBackupFailure()
+    } catch (_: Throwable) {
+    }
+    return BackupOutcome.Failed
 }
 
 // 生產綁定:LSPosed remote preferences (由 GalaxyApp 提供 XposedService)。
@@ -820,6 +941,13 @@ fun remoteHookPolicyStore(
                 if (before.overflow || isPoisoned(before, prefs)) {
                     // 已毒/溢出短路 Unavailable,不讀毒 mMap,不觸碰 prefs (零 getStringSet)。
                     // Stage N1 P1: value fail-closed，但 Corrupt evidence 保留供修復路徑。
+                    // A3-8: overflow 閂＝永久 fail-closed；每行程 log 一次供診斷。
+                    if (before.overflow) {
+                        try {
+                            logPoisonOverflowOnce("load")
+                        } catch (_: Throwable) {
+                        }
+                    }
                     null
                 } else {
                     try {
@@ -989,6 +1117,12 @@ fun remoteHookPolicyStore(
                         } catch (_: Throwable) {
                             true
                         }
+                        if (before.overflow || after.overflow) {
+                            try {
+                                logPoisonOverflowOnce("repairProbe")
+                            } catch (_: Throwable) {
+                            }
+                        }
                         if (after.gen != before.gen || after.overflow || poisonedNow) {
                             // Phase2 #6: 空快照 + 無毒（含無溢出）+ 僅 gen 推進 → 可能是成功
                             // clear 的反向間隙（pre→commit→clear 兩次 bump），以
@@ -1075,29 +1209,34 @@ fun remoteHookPolicyStore(
             } ?: return@setCorruptEvidenceProbe false
             hasCorruptEvidence(prefs)
         }
-        // Stage L4 best-effort 備份鉤子（Phase2 #1：單一固定鍵覆寫，不無界增長）。
+        // Stage L4 best-effort 備份鉤子（Phase2 #1：單一固定鍵覆寫，不無界增長；
+        // A3-1：commit 後讀回 BACKUP_KEY 驗證，失敗誠實回報）。
         // - 固定鍵 dual_policy.bak 覆寫（不再 dual_policy.bak.<ts> 無界增長）；
         //   每次修復先遷移清除舊 bak.* 鍵（至多殘留 1 個新鍵）。
         // - value 截斷 ≤4KB：超限只存「類型名+長度」單條（免大 value 撐爆 prefs）。
-        // - 僅 best-effort：prefs.all 或型別錯亂值可能拋出，備份可能失敗、
-        //   無法保證可恢復；失敗忽略仍刪除，不擋修復。
+        // - A3-1（S3）：commit 回 false／拋出／讀回 BACKUP_KEY 缺席或內容不一致
+        //   → BackupOutcome.Failed（+backupFailureCount++＋logStore 一行），
+        //   repairCorrupt 據以回 RepairedNoBackup —— 修復（刪除）仍發生，但絕不
+        //   靜默宣稱證據保留；讀回成功才 Written。無可備份內容（policy 鍵本就
+        //   缺席、僅遷移）→ Skipped（視為 Written，無證據可驗證）。
+        // - prefs.all 失敗／provider 缺席 → Failed（record；CE 透傳）。
+        // - 讀回經 prefs.all 而非 getStringSet：直接對 raw map 字典序查找，不依賴
+        //   每鍵型別 parse（損壞後端上 getStringSet 必拋）；生產 RemotePreferences
+        //   同樣支援。
         store.setBackupHook { _ ->
-            try {
-                val prefs = try {
-                    provider()
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Throwable) {
-                    null
-                } ?: return@setBackupHook
-                // 單快照供遷移 + 備份共用（免兩次 prefs.all 全掃）；all 失敗即跳過
-                // 遷移/備份，不擋修復（best-effort）。
+            val prefs = try {
+                provider()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                null
+            } ?: return@setBackupHook recordRepairBackupFailure("provider unavailable")
                 val snapshot: Map<String, *> = try {
                     prefs.all
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (_: Throwable) {
-                    return@setBackupHook
+                    return@setBackupHook recordRepairBackupFailure("prefs.all threw")
                 }
                 // 遷移：舊 bak.* 鍵單 edit 批量刪，上限前 N/次（殘留下次再清）。
                 val legacy: List<String> = try {
@@ -1155,8 +1294,10 @@ fun remoteHookPolicyStore(
                 } else {
                     null
                 }
-                if (legacy.isEmpty() && backupSet == null) return@setBackupHook
-                try {
+                // 無可備份內容（policy 鍵本就缺席，僅有遷移）：無證據可保留/可驗證；
+                // commit 仍落遷移，備份層面視為 Skipped（不算 Failed）。
+                if (legacy.isEmpty() && backupSet == null) return@setBackupHook BackupOutcome.Skipped
+                val backupCommitted = try {
                     val ed = prefs.edit()
                     for (k in legacy) {
                         try {
@@ -1176,17 +1317,43 @@ fun remoteHookPolicyStore(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {
+                        false
                     }
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (_: Throwable) {
-                    // Best effort: 備份失敗不擋修復。
+                    false
                 }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Throwable) {
-                // Best effort.
+                if (!backupCommitted) {
+                    return@setBackupHook recordRepairBackupFailure("commit failed")
+                }
+                if (backupSet == null) {
+                    // 僅遷移無備份內容：commit 即結果，無證據可驗。
+                    return@setBackupHook BackupOutcome.Written
+                }
+                // A3-1: 讀回驗證（raw map，不依賴每鍵型別 parse）。
+                val readBack: Any? = try {
+                    prefs.all[BACKUP_KEY]
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    return@setBackupHook recordRepairBackupFailure("read-back threw")
+                }
+                val readSet: Set<String>? = try {
+                    @Suppress("UNCHECKED_CAST")
+                    (readBack as? Set<*>)?.mapNotNull { it?.toString() }?.toSet()
+                } catch (_: Throwable) {
+                    null
+                }
+                if (readSet == null) {
+                    return@setBackupHook recordRepairBackupFailure("read-back missing or unreadable")
+                }
+                if (readSet != backupSet.toSet()) {
+                    return@setBackupHook recordRepairBackupFailure(
+                        "read-back mismatch (wrote ${backupSet.size} entries, read ${readSet.size})",
+                    )
+                }
+                BackupOutcome.Written
             }
         }
-    }
 }

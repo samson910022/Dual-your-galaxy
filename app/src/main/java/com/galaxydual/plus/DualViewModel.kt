@@ -219,9 +219,14 @@ data class PendingPolicyWrite(
     // （僅走 stale/unknown 門控，保既有測試綠）。
     val baseDraftVersion: Long = -1L,
     // Stage L1 P1: coordinator commit revision snapshot (authoritative).
-    // request 時快照 coord.currentRevision()；confirm pre-IO 在
-    // policyRevisionMutex+commitMutex 下比對失配即 abort（UNKNOWN_REFRESH），
-    // 防 CAS-visible-before-event 窗口：舊 pending C 不得覆寫未見 B。
+    // Stage O1 P1#1: binds the AUTHORITATIVELY OBSERVED revision (the rev at which
+    // this VM actually read the displayed draft — see ObservedPolicySnapshot and
+    // markObservedKnownAt/markObservedKnown), NOT coord.currentRevision() sampled
+    // at request time. Sampling current here would borrow the already-advanced B
+    // revision for a dialog still showing stale A, letting confirm overwrite unseen
+    // B. confirm pre-IO 在 policyRevisionMutex+commitMutex 下比對失配即
+    // abort（UNKNOWN_REFRESH），防 CAS-visible-before-event 窗口：舊 pending C
+    // 不得覆寫未見 B。
     // -1L=legacy 注入（跳過 revision 檢查，僅走 stale/unknown 門控）。
     val baseCoordinatorRevision: Long = -1L,
 )
@@ -1327,26 +1332,125 @@ class DualViewModel(
         }
     }
 
-    private fun applyStageRejectedUnderLock(tx: PolicyTx, key: String? = null) {
-        try { activePolicyTx.compareAndSet(tx, null) } catch (_: Exception) { }
+    // Provider contract (SEC-L4/CODE-OPT #3): called under policySettleLock with
+    // the local claim held OR with fences held; settles ONLY non-converged phases
+    // (terminal _state.update is a no-op when policyWritePhase is outside
+    // {QUEUED, SAVING, RECONCILING} as observed in cur); idempotent per tx via
+    // the 64-entry set. fenceHeld carries the caller's knowledge of this VM's
+    // local-fence ownership (see inside); null = let the helper decide.
+    //
+    // A2-3: stage rejected (stamped==null at call sites) while our placeholder may
+    // still hold coordinator.pendingPublish — as "our" claim, new C observes busy/stale
+    // for ~policyIoTimeoutMs (age-gated recover) with no path to converge.
+    // Drop the EXACT-identity abandoned placeholder via the coordinator's
+    // lock-free dropStagedPlaceholderIfMatch (no commitMutex needed; single CAS,
+    // tombstoned on success) so the fence does not linger. Real/foreign/cleared
+    // pending values are untouched (helper re-checks identity + placeholder-only).
+    // Non-suspend by design: this runs under the VM's leaf policySettleLock.
+    //
+    // A3-3 (C1): this helper is the settle-like-a-terminal path for EVERY rejected
+    // claim, including the FAILED rev-gate rejections and the success-side
+    // claimForPublish(Checked) rejections, which can still hold the LOCAL fence
+    // (activePolicyTx) and, for a rev-gate rejection, the coordinator's activeTx
+    // claim. It therefore ALSO completes the coordinator claim
+    // (policyTxCoordinator?.tryCompleteClaim(tx); no-op when the claim was already
+    // consumed or is foreign). Idempotent: a bounded per-VM identity set of
+    // settled txs makes a double invocation (e.g. caller pre-CAS'd the fence) a
+    // no-op for the non-idempotent parts (epoch bump / generation bump /
+    // _state.update); the fence clears stay unconditionally applied (CAS/removes
+    // are naturally idempotent).
+    private val stageRejectedLock = Any()
+    private val stageRejectedTxs: MutableSet<PolicyTx> =
+        java.util.Collections.newSetFromMap(java.util.IdentityHashMap<PolicyTx, Boolean>())
+
+    private fun applyStageRejectedUnderLock(
+        tx: PolicyTx,
+        key: String? = null,
+        // Ownership of this VM's local fence, when the caller decided it in the
+        // same critical section: true = caller consumed/held the fence for this
+        // VM (winner arm); false = a foreign winner consumed it (skip the
+        // stale/unknown stamp — the winner owns ordering); null = caller didn't
+        // decide — the helper CASes and decides (the FAILED rev-gate-rejection
+        // arm: the claim is rejected BEFORE CAS so nobody consumed the fence,
+        // CAS succeeds → stamp applies).
+        fenceHeld: Boolean? = null,
+    ) {
+        val first = synchronized(stageRejectedLock) {
+            if (stageRejectedTxs.size >= 64) {
+                // Bounded: drop an arbitrary entry (insertion order via
+                // iterator; IdentityHashMap has no defined order but is bounded).
+                val it = stageRejectedTxs.iterator()
+                if (it.hasNext()) {
+                    it.next()
+                    it.remove()
+                }
+            }
+            stageRejectedTxs.add(tx)
+        }
+        // CODE-OPT #3: when the caller didn't decide, the CAS here is the
+        // ownership test. (It may fail in arms where the caller pre-consumed
+        // the fence — those arms pass fenceHeld explicitly.)
+        val wonLocal = fenceHeld
+            ?: try {
+                activePolicyTx.compareAndSet(tx, null)
+            } catch (_: Exception) {
+                false
+            }
         try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
+        // A3-3 (C1): complete the coordinator claim (best effort; CAS is idempotent
+        // and fail-safe when the claim is already consumed or foreign). CE rethrown.
+        try {
+            policyTxCoordinator?.tryCompleteClaim(tx)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+        }
+        // A2-3: best-effort exact-identity placeholder drop; failure keeps the fence
+        // (recover path handles it once age-gated).
+        try {
+            val dropped = policyTxCoordinator?.dropStagedPlaceholderIfMatch(tx.txId, tx.key) == true
+            if (dropped) {
+                try {
+                    System.err.println(
+                        "[DualViewModel] dropped abandoned staged placeholder txId=${tx.txId} key=${tx.key} (stage rejected)",
+                    )
+                } catch (_: Exception) {
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            // Best effort: the fence remains for the age-gated recover path.
+        }
         if (key != null) {
             try { inFlightWrites.remove(key) } catch (_: Exception) { }
             try { policyWriteSaving.remove(key) } catch (_: Exception) { }
         }
-        policyRevisionStale.set(true)
-        markPolicyUnknownLocked()
+        if (!first) return
+        if (wonLocal) {
+            policyRevisionStale.set(true)
+            markPolicyUnknownLocked()
+        }
         _state.update { cur ->
-            cur.copy(
-                loading = false,
-                pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
-                policyWritePhase = PolicyWritePhase.IDLE,
-                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                policyDraftKnown = false,
-                policyDraftCorrupt = tx.isRepair,
-                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                msgKind = MsgKind.CHANNEL,
-            )
+            // SEC-L4: a converged Known/IDLE (or foreign) session must not be
+            // stomped — settle the terminal only for non-converged phases.
+            if (cur.policyWritePhase != PolicyWritePhase.QUEUED &&
+                cur.policyWritePhase != PolicyWritePhase.SAVING &&
+                cur.policyWritePhase != PolicyWritePhase.RECONCILING
+            ) {
+                cur
+            } else {
+                cur.copy(
+                    loading = false,
+                    pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
+                    policyWritePhase = PolicyWritePhase.IDLE,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    policyDraftKnown = false,
+                    policyDraftCorrupt = tx.isRepair,
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
         }
     }
 
@@ -1461,18 +1565,45 @@ class DualViewModel(
 
     // Stage L1 P1: staged claim — atomic completeWithRevision (CAS+revision bump
     // +pendingPublish stage) under commitMutex, then afterClaimBeforeEmit hook,
-    // emit happens later via emitTxSettled*/emitStaged after unlock.
-    // Returns true=winner (staged), false=loser (loser handling done, skip publish).
-    private suspend fun tryClaimStaged(tx: PolicyTx, payload: PolicySettled): Boolean {
-        val coord = policyTxCoordinator ?: return true
-        val claimed: Boolean = try {
-            coord.completeWithRevision(tx, payload)
+    // emit happens later via emitStaged.
+    // A3-3: revBefore != null routes the claim through completeWithRevisionChecked
+    // (the SAME rev gate the repair success path uses under commitMutex): if a
+    // foreign B commits between the failed IO and this placeholder claim, the
+    // bumped committedRevision != revBefore → claim rejected → terminal is gated
+    // the same way as a success. revBefore == null keeps completeWithRevision
+    // (legacy/exempt — see claimForPublish KDoc).
+    // Verdict variant: REV_GATE_REJECTED (rev moved before CAS — no claim
+    // consumed; settle as stage-rejected) and CAS_LOSS (a live winner consumed
+    // the claim — loser handling applied here) are distinguished from
+    // inside the commitMutex lock, so callers never re-read committedRevision
+    // to guess why the claim failed. REV_GATE_REJECTED deliberately skips the
+    // loser-follow (no winner exists to follow).
+    private suspend fun tryClaimStagedVerdict(
+        tx: PolicyTx,
+        payload: PolicySettled,
+        revBefore: Long? = null,
+    ): PolicyTxCoordinator.ClaimStagedVerdict {
+        val coord = policyTxCoordinator
+            ?: return PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+        val verdict: PolicyTxCoordinator.ClaimStagedVerdict = try {
+            if (revBefore != null) coord.completeWithRevisionCheckedVerdict(tx, payload, revBefore)
+            else if (coord.completeWithRevision(tx, payload)) {
+                PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+            } else {
+                PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            false
+            PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
         }
-        if (!claimed) {
+        if (verdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+            // No claim consumed, no winner to follow — the caller settles the
+            // terminal as stage-rejected. Loser-follow (SAVING→RECONCILING +
+            // launchLoserSync) would wait on a winner that does not exist.
+            return verdict
+        }
+        if (verdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
             // Stage H2 P1: loser follow-then-clear (same as above): never clear
             // the local fence synchronously; the winner's
             // claim->stage->emit->update window must not observe a cleared
@@ -1501,7 +1632,7 @@ class DualViewModel(
             if (shouldLaunchLoserSync) {
                 launchLoserSync(tx)
             }
-            return false
+            return verdict
         }
         try {
             afterClaimBeforeEmit?.invoke()
@@ -1513,29 +1644,88 @@ class DualViewModel(
             } catch (_: Exception) {
             }
         }
-        return true
+        return PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
     }
+
+    // Boolean wrapper kept for existing call sites (claimForPublish et al.);
+    // FAILED-terminal paths use tryClaimStagedVerdict/claimForPublishCheckedVerdict
+    // so the reject reason is never re-derived from a post-hoc revision read.
+    private suspend fun tryClaimStaged(
+        tx: PolicyTx,
+        payload: PolicySettled,
+        revBefore: Long? = null,
+    ): Boolean =
+        tryClaimStagedVerdict(tx, payload, revBefore) == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
 
     // Stage L1 P1: placeholder claim for paths where real payload is built after
     // _state.update (reconciler finally via emitTxSettledSnapshot). Stages a
     // placeholder (same txId/key, sanitized draft) so CAS-visible window still
     // blocks fresh C via pendingPublish!=null; later emit overwrites with real.
-    private suspend fun tryClaimPlaceholder(tx: PolicyTx): Boolean {
-        val coord = policyTxCoordinator ?: return true
+    // A3-3: revBefore != null gates the claim on the pre-IO observed revision
+    // (see tryClaimStaged); null keeps the legacy unconditional claim.
+    private suspend fun tryClaimPlaceholderVerdict(
+        tx: PolicyTx,
+        revBefore: Long? = null,
+    ): PolicyTxCoordinator.ClaimStagedVerdict {
         val placeholder = PolicySettled(
             tx.txId, tx.key, tx.sanitized, false, MsgKind.CHANNEL, "", tx.isClear,
         )
-        return tryClaimStaged(tx, placeholder)
+        if (policyTxCoordinator == null) {
+            // Legacy single-VM path: no claim machinery at all — claimForPublishChecked
+            // routes null-coordinator through tryClaimCoordinatorPublish itself; mirror
+            // the old `?: return true` here for standalone callers.
+            return PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+        }
+        return tryClaimStagedVerdict(tx, placeholder, revBefore)
     }
+
+    private suspend fun tryClaimPlaceholder(tx: PolicyTx, revBefore: Long? = null): Boolean =
+        tryClaimPlaceholderVerdict(tx, revBefore) == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
 
     // Stage L1 P1: reconciler/fast-path uniform entry (placeholder staged when
     // coordinator present, legacy CAS when null). Call-sites use this so
     // CAS+revision bump+pendingPublish stage atomically under commitMutex,
     // emit happens later via emitTxSettledSnapshot/emitStaged after release.
+    // A3-3 (exemption note): this unconditional form is INTENTIONALLY kept for
+    // call sites that cannot name a base revision (reconciler/late-join terminals
+    // where no revision was observed at IO entry — e.g. adopted cross-VM Txs,
+    // pre-arm aborts). It is safe there because those payloads are non-Known
+    // terminals, or Known terminals backed by a fresh ground-truth read taken
+    // under/after the revision-move gates (revMovedRefresh/staleOutside/
+    // revUnverifiableRefresh) — never an unobserved/stale read — and peers
+    // converge fail-closed (they treat !known/empty payloads as "not truth" and
+    // re-read). Any call site that DID observe a base revision for its IO must
+    // pass it as revBefore via claimForPublishChecked so a foreign commit
+    // mid-IO bumps the rev and the terminal is gated exactly like a success.
     private suspend fun claimForPublish(tx: PolicyTx): Boolean {
         val coord = policyTxCoordinator
         return if (coord != null) tryClaimPlaceholder(tx) else tryClaimCoordinatorPublish(tx)
     }
+
+    // A3-3: rev-gated sibling of claimForPublish for FAILED terminals whose IO
+    // ran against a known revision (confirm: pending.baseCoordinatorRevision;
+    // clear: sampled at IO entry; repair: repairRevBefore). A foreign B committing
+    // between the failed IO and this claim bumps committedRevision → the claim is
+    // rejected and the terminal (non-Known) is never staged — peers stay converged
+    // on B either via _latest or via the UNKNOWN_REFRESH gate.
+    // Verdict variant for the FAILED-terminal claim path: REV_GATE_REJECTED →
+    // caller settles as stage-rejected; CAS_LOSS → a live winner consumed the
+    // claim (loser handling already applied inside tryClaimStagedVerdict) and
+    // the caller must do NOTHING further; CLAIMED → staged.
+    private suspend fun claimForPublishCheckedVerdict(
+        tx: PolicyTx,
+        revBefore: Long,
+    ): PolicyTxCoordinator.ClaimStagedVerdict {
+        val coord = policyTxCoordinator
+        return if (coord != null) tryClaimPlaceholderVerdict(tx, revBefore) else if (tryClaimCoordinatorPublish(tx)) {
+            PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+        } else {
+            PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
+        }
+    }
+
+    private suspend fun claimForPublishChecked(tx: PolicyTx, revBefore: Long): Boolean =
+        claimForPublishCheckedVerdict(tx, revBefore) == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
 
     // Atomic local application of an authoritative PolicySettled terminal
     // (shared by launchLoserSync, observeSettledFor, and resolveObserverFallback).
@@ -1590,6 +1780,7 @@ class DualViewModel(
             lastRevisionSeenKey.set(settled.key)
             advanceLastRevisionSeenRev(settled.rev)
             if (settled.known) {
+                try { noteLastKnownDraft(settled.draft) } catch (_: Exception) { }
                 bumpPolicyGenerations()
                 try { disarmBlindClear() } catch (_: Exception) { }
                 try { disarmCorruptRepair() } catch (_: Exception) { }
@@ -1825,8 +2016,30 @@ class DualViewModel(
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
-                // Best effort: 收集失敗不影響本地終態。
+            } catch (e: Exception) {
+                // A3-2: collector 靜默死亡＝整個 cross-VM 陳舊修訂防禦失效，但
+                // 呼叫端無從得知。非-CE 退出一律 fail-closed：記一行 stderr
+                // （僅 tag＋例外類別，無內容）、標 policyRevisionStale＋世代
+                // fence，使後續 request/confirm/repair 一律走 UNKNOWN_REFRESH
+                // 重讀門（與 observe 退出前語義一致，只是永久停用同步）。
+                // Collector 不重啟：本 VM 的同步自此失效（下一個兌現點為
+                // refresh/stall gate）；重啟需新的訂閱句柄，刻意不自動重訂
+                // 以免重複應用已觀察終態。
+                try {
+                    System.err.println(
+                        "[DualViewModel] observeRevisionUpdates exited: ${e.javaClass.name}; " +
+                            "cross-VM revision sync disabled, failing closed (stale + Unknown)",
+                    )
+                } catch (_: Throwable) {
+                }
+                try {
+                    policyRevisionStale.set(true)
+                } catch (_: Throwable) {
+                }
+                try {
+                    markPolicyUnknownLocked()
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -2031,6 +2244,7 @@ class DualViewModel(
                     disarmBlindClear()
                     disarmCorruptRepair()
                 }
+                try { noteLastKnownDraft(settled.draft) } catch (_: Exception) { }
                 _state.update { cur ->
                     if (cur.policyWritePhase != PolicyWritePhase.IDLE &&
                         cur.policyWritePhase != PolicyWritePhase.QUEUED
@@ -2324,6 +2538,7 @@ class DualViewModel(
                 winnerPublish(tx, successPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
+                    try { noteLastKnownDraft(if (tx.isRepair || tx.isClear) emptySet() else decision.packages) } catch (_: Exception) { }
                     _state.update { cur ->
                         if (tx.isRepair) cur.copy(
                             pendingPolicyWrite = null,
@@ -2368,6 +2583,7 @@ class DualViewModel(
                 winnerPublish(tx, mismatchPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
+                    try { noteLastKnownDraft(decision.packages) } catch (_: Exception) { }
                     _state.update { cur ->
                         cur.copy(
                             pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -2480,6 +2696,54 @@ class DualViewModel(
     // Stage N2 P1: validate-then-arm-then-start (single source). Sets armed
     // BEFORE start() so any concurrent join observing armed==true sees a Tx
     // whose validation already passed. Unarmed cancel prevents LAZY start.
+    // A3-7: cancel an (armed or new) repair deferred and WAIT — bounded by
+    // policyIoTimeoutMs — for it to actually stop before gates are released.
+    // Cancellation cannot interrupt a blocking store.repairCorrupt() (it runs on
+    // an app-scoped Dispatchers.IO job), so fire-and-forget cancel could report
+    // IDLE while the delete still lands later.
+    // - deferred never started (the only arm point is AFTER the final-read
+    //   gates) → join() returns immediately;
+    // - deferred already running → bounded wait; on timeout, mark stale
+    //   (refresh required) + log, and report false so the caller stays honest.
+    // CE 透傳（協程取消不得被吞）。
+    // @VisibleForTesting internal：單元測試直接以（未 arm 的 deferred／阻塞
+    // deferred）驅動此有界 join（R1(c)）；生產仍只經 confirmRepairCorruptDraft。
+    @androidx.annotation.VisibleForTesting
+    internal suspend fun cancelAndJoinRepairDeferred(def: Deferred<Boolean>?): Boolean {
+        if (def == null) return true
+        try {
+            def.cancel()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+        }
+        return try {
+            withTimeout(policyIoTimeoutMs) { def.join() }
+            true
+        } catch (te: TimeoutCancellationException) {
+            // Belt-and-braces: this blocking-arm timeout branch is currently
+            // UNREACHABLE — repair deferreds are never armed at the two call
+            // sites (armed only after the final-read gates) — keep it fail-closed.
+            try {
+                System.err.println(
+                    "[DualViewModel] repair deferred did not stop after cancel (blocking repairCorrupt); " +
+                        "marking policyRevisionStale — refresh required before next write",
+                )
+            } catch (_: Exception) {
+            }
+            try {
+                policyRevisionStale.set(true)
+            } catch (_: Exception) {
+            }
+            false
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            // join 本身不應失敗；保守視為已停止（刪除結果交由 post-read 驗證收斂）。
+            true
+        }
+    }
+
     private fun armAndStartTxDeferred(tx: PolicyTx) {
         try {
             tx.executionArmed.set(true)
@@ -2933,6 +3197,32 @@ class DualViewModel(
     private val blindClearArmedAtMs = AtomicLong(-1L)
     private val blindClearArmedVersion = AtomicLong(-1L)
     private val blindClearArmedFreshGen = AtomicLong(-1L)
+
+    // S4（blind-clear defense-in-depth）：本次行程最後一次「已驗證 Known」的
+    // 政策草稿快照（null＝從未觀察到）。所有 verified-Known 終態/刷新/載入的
+    // noteLastKnownDraft() 呼叫點更新此欄。僅作為盲清前置門：盲清 armed 且
+    // 本欄非 null 時，clearPolicyDraft 不再單純依賴兩次點擊，而是先強制一次
+    // 權威重讀（refreshPolicyDraft）；只有重讀恢復 Known 才允許本次清除，
+    // 重讀失敗（仍 Unknown/Unavailable）→ 中止並提示（UNKNOWN_REFRESH）。
+    // Known 本身即證據；本欄只是「曾經 Known」的會話歷史，永不被覆寫為 null。
+    private val lastKnownPolicyDraft = AtomicReference<Set<String>?>(null)
+
+    private fun noteLastKnownDraft(draft: Set<String>) {
+        try {
+            // 防禦性拷貝：呼叫端集合可能於後續被重用/變異（sanitize 已產新集合，
+            // 此處再防一次）。永不拋出。
+            lastKnownPolicyDraft.set(HashSet(draft))
+        } catch (_: Exception) {
+        }
+    }
+
+    // 測試可見性：最後 Known 快照（驗證 S4 門控的存在/刷新行為；production 未用）。
+    @androidx.annotation.VisibleForTesting
+    internal fun lastKnownPolicyDraftForTests(): Set<String>? = try {
+        lastKnownPolicyDraft.get()
+    } catch (_: Throwable) {
+        null
+    }
 
     private fun isBlindClearArmed(): Boolean = blindClearArmedAtMs.get() != -1L
 
@@ -3569,6 +3859,7 @@ class DualViewModel(
                         } else {
                             disarmBlindClear()
                             disarmCorruptRepair()
+                            try { noteLastKnownDraft(result.packages) } catch (_: Exception) { }
                             _state.update { cur ->
                                 cur.copy(policyDraft = result.packages, policyDraftKnown = true, policyDraftCorrupt = false)
                             }
@@ -6229,7 +6520,7 @@ class DualViewModel(
             }
             if (wonLocal) {
                 if (policyTxCoordinator != null && stamped == null) {
-                    applyStageRejectedUnderLock(tx)
+                    applyStageRejectedUnderLock(tx, fenceHeld = true)
                 } else {
                     if (bump) bumpPolicyGenerations()
                     try {
@@ -6306,7 +6597,7 @@ class DualViewModel(
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
             if (wonLocal) {
                 if (policyTxCoordinator != null && stamped == null) {
-                    applyStageRejectedUnderLock(tx)
+                    applyStageRejectedUnderLock(tx, fenceHeld = (curLocal === tx))
                 } else {
                     try {
                         applyUnderLock()
@@ -6416,6 +6707,7 @@ class DualViewModel(
                                 } else if (groundDecision is PolicyTxSettle.Success) {
                                     bumpPolicyGenerations()
                                     disarmBlindClear()
+                                    try { noteLastKnownDraft(groundDecision.packages) } catch (_: Exception) { }
                                     _state.update { cur ->
                                         cur.copy(
                                             pendingPolicyWrite = null,
@@ -6609,6 +6901,7 @@ class DualViewModel(
                                             is PolicyTxSettle.Success -> {
                                                 bumpPolicyGenerations()
                                                 disarmBlindClear()
+                                                try { noteLastKnownDraft(finalResult.packages) } catch (_: Exception) { }
                                                 _state.update { cur ->
                                                     cur.copy(
                                                         pendingPolicyWrite = null,
@@ -6625,6 +6918,7 @@ class DualViewModel(
                                             is PolicyTxSettle.Mismatch -> {
                                                 bumpPolicyGenerations()
                                                 disarmBlindClear()
+                                                try { noteLastKnownDraft(finalResult.packages) } catch (_: Exception) { }
                                                 _state.update { cur ->
                                                     cur.copy(
                                                         pendingPolicyWrite = null,
@@ -6839,6 +7133,7 @@ class DualViewModel(
                                     bumpPolicyGenerations()
                                     disarmBlindClear()
                                     if (tx.isRepair) disarmCorruptRepair()
+                                    try { noteLastKnownDraft(emptySet()) } catch (_: Exception) { }
                                     _state.update { cur ->
                                         cur.copy(
                                             pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -7039,6 +7334,7 @@ class DualViewModel(
                                                 bumpPolicyGenerations()
                                                 disarmBlindClear()
                                                 if (tx.isRepair) disarmCorruptRepair()
+                                                try { noteLastKnownDraft(emptySet()) } catch (_: Exception) { }
                                                 _state.update { cur ->
                                                     cur.copy(
                                                         pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -7056,6 +7352,7 @@ class DualViewModel(
                                                 bumpPolicyGenerations()
                                                 disarmBlindClear()
                                                 if (tx.isRepair) disarmCorruptRepair()
+                                                try { noteLastKnownDraft(finalResult.packages) } catch (_: Exception) { }
                                                 _state.update { cur ->
                                                     cur.copy(
                                                         pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -7308,7 +7605,7 @@ class DualViewModel(
                         try { policyReconciling.remove(txSnap.key) } catch (_: Exception) { }
                         if (wonLocal) {
                             if (policyTxCoordinator != null && stamped == null) {
-                                applyStageRejectedUnderLock(txSnap)
+                                applyStageRejectedUnderLock(txSnap, fenceHeld = true)
                             } else if (policyDraftVersion.get() != versionAtStart ||
                                 policyOwnershipGen.get() != ownershipSnap
                             ) {
@@ -7340,6 +7637,7 @@ class DualViewModel(
                                 bumpPolicyGenerations()
                                 disarmBlindClear()
                                 disarmCorruptRepair()
+                                try { noteLastKnownDraft(result.packages) } catch (_: Exception) { }
                                 _state.update { cur ->
                                     cur.copy(
                                         loading = false,
@@ -7422,6 +7720,7 @@ class DualViewModel(
                                 disarmBlindClear()
                                 disarmCorruptRepair()
                                 policyRevisionStale.set(false)
+                                try { noteLastKnownDraft(result.packages) } catch (_: Exception) { }
                                 _state.update { cur ->
                                     if (cur.msgKind == MsgKind.FAILED || cur.msgKind == MsgKind.CHANNEL) {
                                         cur.copy(
@@ -7575,6 +7874,27 @@ class DualViewModel(
                 )
             }
         }
+        // S8（A3-6）：coordinator 和 store 皆在時，絕不再以 currentRevision() 代借
+        // 未被權威觀察過的 rev —— 本 dialog 的基礎只有「本 VM 實際讀到的 rev」
+        // （observedSnapshot）；從未權威讀過（obs==-1）時直接拒絕建 pending
+        // （UNKNOWN_REFRESH，請使用者先重新整理），不再引入 TOCTOU 借用窗口。
+        // coordinator==null 的 legacy 路徑不受影響（confirm 跳過 rev 門控）。
+        if (hookPolicyStore != null && policyTxCoordinator != null) {
+            val obsRev = try {
+                observedSnapshot.get().rev
+            } catch (_: Exception) {
+                -1L
+            }
+            if (obsRev == -1L) {
+                _state.update {
+                    it.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                return
+            }
+        }
         // Phase 3：建 pending 即進 QUEUED（同一 _state.update 翻相位＋epoch+1；
         // dropped 警語在上一次 emission，第二次 copy 保留其 msg 不覆寫）。
         // Stage J3：綁定當下修訂版本（外來修訂即 stale，confirm 比對失配拒寫）。
@@ -7582,8 +7902,9 @@ class DualViewModel(
         // Stage O1 P1#1: bind the AUTHORITATIVELY OBSERVED revision (the rev at which
         // this VM actually read the displayed draft), NOT currentRevision(). Sampling
         // current here would borrow the already-advanced B revision for a dialog still
-        // showing stale A, letting confirm overwrite unseen B. Observed==-1 (never
-        // authoritatively read, e.g. null-store) falls back to current for compat.
+        // showing stale A, letting confirm overwrite unseen B. obs==-1 於上方 S8 門
+        // 已拒絕（coordinator+store 皆在時）；此處僅 legacy/null-coordinator 路徑
+        // 才會讀到 -1（confirm 跳過 rev 檢查）。
         _state.update {
             it.copy(
                 pendingPolicyWrite = PendingPolicyWrite(
@@ -7591,10 +7912,10 @@ class DualViewModel(
                     requestedAtMs = nowMonoMs(),
                     droppedCount = dropped,
                     baseDraftVersion = policyDraftVersion.get(),
-                    baseCoordinatorRevision = run {
-                        val obs = try { observedSnapshot.get().rev } catch (_: Exception) { -1L }
-                        if (obs != -1L) obs
-                        else policyTxCoordinator?.currentRevision() ?: -1L
+                    baseCoordinatorRevision = try {
+                        observedSnapshot.get().rev
+                    } catch (_: Exception) {
+                        -1L
                     },
                 ),
                 policyWritePhase = PolicyWritePhase.QUEUED,
@@ -7736,18 +8057,47 @@ class DualViewModel(
         }
     }
 
-    fun confirmPolicyWrite() {
-        val pending = _state.value.pendingPolicyWrite
-        if (pending != null) confirmPolicyWrite(pending) else {
+    // 兩階段寫入 phase 2：世代全等＋TTL 內＋S1 acknowledgement 才寫 store；
+    // 任何不符清 pending 拒絕。
+    // S1（consent fence，第二道門）：acknowledgedGeneration 必須非 null 且等於
+    // expected.generation（ack 綁定到本 pending 的世代），且 pending 必須
+    // 與 expected 相同；否則不寫 store、不清 pending（僅提示），msgKind INVALID。
+    // UI 第一道門（MainActivity positive 鈕以 policyAcknowledged 門控，勾選
+    // 綁世代）為主，本門為全 VM 防線 —— 程式化誤呼叫/腳本亦無法繞過。
+    // SL1 (ack generation binding): the write is authorized iff the caller
+    // proves it saw the acknowledgement for THIS pending — pass the pending's
+    // generation as [acknowledgedGeneration]; a mismatch (or null) refuses.
+    // MainActivity passes `if (policyAcknowledged) pending.generation else null`;
+    // no default argument, no blanket boolean. The previously-added
+    // POLICY_NOT_ACKNOWLEDGED message stays for the unauthorized case.
+    fun confirmPolicyWrite(expected: PendingPolicyWrite, acknowledgedGeneration: Long?) {
+        // N1: pending==null 必須優先報 NO_PENDING（INVALID），不得被 acknowledgement
+        // 訊息掩蓋（acknowledgement 檢查置於其後）。
+        if (_state.value.pendingPolicyWrite == null) {
+            // 保留舊 no-arg 語義：無 pending 時報 NO_PENDING（INVALID），不靜默。
             _state.update { cur ->
                 if (cur.pendingPolicyWrite != null) cur
                 else cur.copy(msg = policyText(PolicyText(PolicyTextKind.NO_PENDING)), msgKind = MsgKind.INVALID)
             }
+            return
         }
-    }
-
-    // 兩階段寫入 phase 2：世代全等＋TTL 內才寫 store；任何不符清 pending 拒絕。
-    fun confirmPolicyWrite(expected: PendingPolicyWrite) {
+        // S1: acknowledgement fence。pending 保留（使用者仍可在對話框勾選後
+        // 再按確認）；世代不符／未確認一律不寫 store（POLICY_NOT_ACKNOWLEDGED）；
+        // pending 已非 expected（別的 pending 在途）則靜默 no-op（同既有世代契約）。
+        if (acknowledgedGeneration == null || acknowledgedGeneration != expected.generation) {
+            _state.update { cur ->
+                if (cur.pendingPolicyWrite == expected) {
+                    cur.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED)),
+                        msgKind = MsgKind.INVALID,
+                    )
+                } else {
+                    cur
+                }
+            }
+            return
+        }
+        if (_state.value.pendingPolicyWrite != expected) return
         // Stage A：核對中拒絕新確認（IN_PROGRESS；pending 保留，請勿重試）。
         // 置於 owner 門控之前：核對中不得清 pending（owner 拒絕會清 pending，
         // 此處必須先擋）。
@@ -8407,6 +8757,11 @@ class DualViewModel(
                                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                     writeLocked = false
                                 }
+                                // 成功側 claimForPublish 的 revBefore=null 恆為 unconditional
+                                // CAS；reject 只可能是 CAS-loss＝有 live winner 消費了 claim
+                                // —— loser handling（SAVING→RECONCILING＋launchLoserSync）
+                                // 已在 tryClaimStaged 內完成，本 VM 跟隨 winner 收斂即可，
+                                // 不得在此 abort 至 UNKNOWN_REFRESH（會蓋掉 winner 終態）。
                                 return@withLock
                             }
                             val isRefresh = policyRevisionStale.get() ||
@@ -8441,10 +8796,11 @@ class DualViewModel(
                                 preClaimTx = null
                                 if (wonLocal) {
                                     if (pcFast != null && policyTxCoordinator != null && stamped == null) {
-                                        applyStageRejectedUnderLock(pcFast, key)
+                                        applyStageRejectedUnderLock(pcFast, key, fenceHeld = true)
                                     } else {
                                         bumpPolicyGenerations()
                                         disarmBlindClear()
+                                        try { noteLastKnownDraft(finalDraft) } catch (_: Exception) { }
                                         _state.update {
                                             it.copy(
                                                 loading = false,
@@ -8466,13 +8822,36 @@ class DualViewModel(
                             }
                         } else {
                             val pcFailFast = preClaimTx
-                            if (pcFailFast != null && !claimForPublish(pcFailFast)) {
-                                preClaimTx = null
-                                if (writeLocked) {
-                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                    writeLocked = false
+                            // A3-3: gate the FAILED placeholder claim on the same rev base
+                            // the IO-stage claim used; a foreign B committing between the
+                            // failed save and this claim bumps committedRevision and the
+                            // terminal is rejected, exactly like a success claim.
+                            if (pcFailFast != null) {
+                                val claimVerdict = claimForPublishCheckedVerdict(
+                                    pcFailFast,
+                                    pendingAtCall.baseCoordinatorRevision,
+                                )
+                                if (claimVerdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                        writeLocked = false
+                                    }
+                                    // A3-3 (C1): settle ONLY on rev-gate rejection — the
+                                    // foreign B committed mid-IO and bumped
+                                    // committedRevision before the CAS, so no claim was
+                                    // consumed and no winner exists: settle the terminal
+                                    // as stage-rejected (clears local fence + keys,
+                                    // IDLE + UNKNOWN_REFRESH). CAS_LOSS means a live
+                                    // winner consumed the claim — loser-follow already ran
+                                    // inside tryClaimStagedVerdict; do nothing further.
+                                    if (claimVerdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+                                        synchronized(policySettleLock) {
+                                            applyStageRejectedUnderLock(pcFailFast, key)
+                                        }
+                                    }
+                                    return@withLock
                                 }
-                                return@withLock
                             }
                             val failedMsg = policyText(PolicyText(PolicyTextKind.WRITE_FAILED))
                             val failedPayload = pcFailFast?.let {
@@ -8495,7 +8874,7 @@ class DualViewModel(
                                 preClaimTx = null
                                 if (wonLocal) {
                                     if (pcFailFast != null && policyTxCoordinator != null && stamped == null) {
-                                        applyStageRejectedUnderLock(pcFailFast, key)
+                                        applyStageRejectedUnderLock(pcFailFast, key, fenceHeld = true)
                                     } else {
                                         markPolicyUnknownLocked()
                                         _state.update {
@@ -8558,6 +8937,15 @@ class DualViewModel(
     // clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠覆寫未見內容，
     // 故第二步不受 unknown 門控阻擋）。Known（或 null-store，無遠端內容可刪）
     // 維持單步。保持 clearGeneration/inFlight 互斥。
+    // Foreign-Known exemption (PR #60 Phase 2 裁決，ADR: foreign-Known
+    // mid-clear delete semantics): a foreign-Known B committed mid-clear is
+    // deleted by design — this is an explicit user delete, not a blind write,
+    // and rev-gating the clear against the pre-IO base would wedge permanently
+    // under dual-app sync (the other app keeps advancing committedRevision).
+    // The rev gate exists only on the FAILED placeholder terminals
+    // (confirm/clear/repair) and the repair success claim; the clear/
+    // save success side is intentionally unrev-gated. See docs/ARCHITECTURE.md
+    // §政策寫入流程 and the A3-3 claim sites.
     // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／freshGen
     // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
     // EXPIRED 文案），再判世代（version／freshGen 失配→重 arm＋FIRST 文案），
@@ -8574,6 +8962,15 @@ class DualViewModel(
                     msg = policyText(PolicyText(PolicyTextKind.OWNER_OPERATE)),
                     msgKind = MsgKind.CHANNEL,
                 )
+            }
+            return
+        }
+        // A3-5: pending 的確認寫入排隊中時不得靜默 supersede 它 —— 明確拒絕
+        // （BUSY），與 request 的既有 pending/in-flight 門控對稱。狀態保持
+        // （pending 保留、arm 保留，待確認完成後再清除）。
+        if (_state.value.pendingPolicyWrite != null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
             return
         }
@@ -8644,18 +9041,79 @@ class DualViewModel(
                 }
                 return
             }
+            // Phase 2 S4：本次行程曾觀察到 Known 草稿（lastKnownPolicyDraft 非空）
+            // 但遠端目前未知 → 兩次點擊確認不再足夠：先強制一次權威重讀
+            // （refreshPolicyDraft），本次點擊不刪除任何內容；只有重讀恢復
+            // Known 後下一次清除才走一般 Known 單步路徑（新鮮重讀本身即為
+            // 證據）。重讀仍未知 → 中止，草稿維持未知，不盲刪（fail-closed）。
+            // SM (session permanence, intentional): 一旦本行程觀察過 Known，
+            // 「refresh-first」狀態即對本行程餘下時間永久生效——每次雙擊都
+            // 只觸發重讀而永不盲刪，直到重讀恢復 Known。這是刻意的會話級
+            // fail-closed 設計；重啟 App（新行程 lastKnown==null）即解除，
+            // 回復到經典雙擊盲清。不提供程式化的第三次確認（SM 約定：(a) 文案
+            // 提供可行的補救、(b) 單測釘住「重讀失敗兩次仍不刪」語義）。
+            if (lastKnownPolicyDraft.get() != null) {
+                // consume 本 arm（重新開始）；刷新成 Known 後下一次點擊走 Known 路徑。
+                disarmBlindClear()
+                try {
+                    refreshPolicyDraft()
+                } catch (_: Throwable) {
+                    // refreshPolicyDraft 為 best-effort；其自身失敗已在 state（msg/Known）揭露。
+                    // 本點擊本就不刪除任何內容，故此處不拋出（UI 呼叫路徑）。
+                }
+                _state.update { cur ->
+                    cur.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
+                return
+            }
             // 兩者皆過：consume 後落到正常清除路徑。
             disarmBlindClear()
         } else {
             disarmBlindClear()
         }
-        val key = "policy-clear:${clearGeneration.incrementAndGet()}"
-        if (!inFlightWrites.add(key)) {
-            _state.update {
-                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+        // Phase 2 O3 (S4): commit-time Known fence — a refresh landing between
+        // the gate read and the actual store.clear() flips Known→false; the
+        // arms below re-check this and abort like the Unknown path instead of
+        // deleting content we no longer know. One comment line per check site;
+        // the refresh-first abort helper is shared. Armed on Known OR on a
+        // session-observed Known (lastKnownPolicyDraft): the latter is
+        // defense-in-depth — today unreachable (the S4 refresh-first gate
+        // returns before this capture whenever lastKnown!=null && !known),
+        // keeping a fail-closed fence even if that gate ever moves.
+        val knownCommitFence = hookPolicyStore != null &&
+            (_state.value.policyDraftKnown || lastKnownPolicyDraft.get() != null)
+        fun abortBlindClearCommit(key: String) {
+            synchronized(policySettleLock) {
+                inFlightWrites.remove(key)
+                policyWriteSaving.remove(key)
+                disarmBlindClear()
+                _state.update { cur ->
+                    val base = if (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                        cur.policyWritePhase == PolicyWritePhase.SAVING
+                    ) {
+                        cur.copy(
+                            loading = false,
+                            policyWritePhase = PolicyWritePhase.IDLE,
+                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                        )
+                    } else {
+                        cur.copy(loading = false)
+                    }
+                    base.copy(
+                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST)),
+                        msgKind = MsgKind.CHANNEL,
+                    )
+                }
             }
-            return
+            try { refreshPolicyDraft() } catch (_: Throwable) { }
         }
+        val key = "policy-clear:${clearGeneration.incrementAndGet()}"
+        // A2-4: 鍵由 clearGeneration 單調遞增保證唯一，add 必成功；舊 BUSY
+        // 帶不可達死分支，改為單純簿記（其餘 policy-* 觀測者用）。
+        inFlightWrites.add(key)
         // Phase 3：clear 在途亦經 QUEUED→SAVING→IDLE（dialog 以 pending==null
         // 關閉，phase 供 positive/negative 門控與「進行中請稍候」守衛觀測）。
         _state.update { cur ->
@@ -8677,13 +9135,19 @@ class DualViewModel(
             var coordClaimedTx: PolicyTx? = null
             try {
                 opMutex.withLock {
+                    // Phase 2 O3 (S4): re-check the Known fence at the commit
+                    // point — abort like the Unknown path if a refresh flipped it.
+                    if (knownCommitFence && !_state.value.policyDraftKnown) {
+                        abortBlindClearCommit(key)
+                        return@withLock
+                    }
                     if (isPolicyReconcilingLocked()) {
                         synchronized(policySettleLock) {
-                            val clearIdle = _state.value.policyWritePhase == PolicyWritePhase.QUEUED &&
-                                activePolicyTx.get() == null
-                            if (clearIdle) {
-                                inFlightWrites.remove(key)
-                            }
+                            // A3-5 (SL2): unconditional cleanup of THIS clear's key — the
+                            // in-flight owner (not the clear) owns the lifecycle of any
+                            // foreign key; our key must never wedge the process.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             _state.update { cur ->
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
                                     cur.copy(
@@ -8704,8 +9168,37 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // A3-5 (defensive; entry gate above normally refuses first):
+                    // a pending armed mid-flight (only possible via direct test
+                    // injection — production request is blocked by our own
+                    // in-flight key) must never be silently superseded. Abort the
+                    // clear honestly instead of nulling the armed confirm.
                     if (_state.value.pendingPolicyWrite != null) {
-                        _state.update { it.copy(pendingPolicyWrite = null) }
+                        synchronized(policySettleLock) {
+                            // A3-5 (SL2): unconditional cleanup of THIS clear's key — the
+                            // pending owner, not the clear, owns the lifecycle in the
+                            // QUEUED case; this sliver must not wedge the process.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
+                            _state.update { cur ->
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                            }
+                        }
+                        return@withLock
                     }
                     val store = hookPolicyStore
                     if (store == null) {
@@ -8778,9 +9271,10 @@ class DualViewModel(
                     if (h1ClearCoord != null) {
                         if (!h1ClearCoord.writeMutex.tryLock()) {
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                }
+                                // A3-5 (SL2): unconditional cleanup of this op's own keys —
+                                // this abort ends our key lifecycle, never gate on phase.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -8802,8 +9296,19 @@ class DualViewModel(
                             return@withLock
                         }
                         writeLocked = true
+                        // Phase 2 O3 (S4): commit re-check before the clear arm —
+                        // abort like the Unknown path if a refresh flipped Known.
+                        if (knownCommitFence && !_state.value.policyDraftKnown) {
+                            try { h1ClearCoord.writeMutex.unlock() } catch (_: Exception) { }
+                            writeLocked = false
+                            abortBlindClearCommit(key)
+                            return@withLock
+                        }
                         val lazyClear = h1ClearCoord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                            store.clear()
+                            // Phase 2 O3 (S4): last-moment Known re-check inside the IO arm —
+                            // refuse the delete (fail-closed) if a refresh flipped Known
+                            // since the commit gate; never clear unobserved content.
+                            if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear()
                         }
                         val txClear = PolicyTx(
                             txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
@@ -8820,9 +9325,10 @@ class DualViewModel(
                             try { h1ClearCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                }
+                                // A3-5 (SL2): unconditional cleanup of this op's own keys —
+                                // this abort ends our key lifecycle, never gate on phase.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -8867,9 +9373,10 @@ class DualViewModel(
                             try { h1ClearCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                }
+                                // A3-5 (SL2): unconditional cleanup of this op's own keys —
+                                // this abort ends our key lifecycle, never gate on phase.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -8890,6 +9397,15 @@ class DualViewModel(
                             }
                             return@withLock
                         }
+                        // Stage N2 ordering pin (lazyClear fast path): preClaimTx is
+                        // assigned HERE, before the commitMutex section below can call
+                        // armAndStartTxDeferred(txClear). Every abort/cancel path that
+                        // can revoke a PREPARING Tx (finally-block canJoinTx check,
+                        // onCleared, foreign-attach abandonment) reads preClaimTx —
+                        // abort must precede arm. Never assign preClaimTx after
+                        // armAndStartTxDeferred; an armed Tx whose identity was not yet
+                        // reachable from preClaimTx would be untracked and the delete
+                        // could land after an "aborted" report.
                         h1ClearDeferred = lazyClear
                         preClaimTx = txClear
                         coordClaimedTx = null
@@ -8978,9 +9494,24 @@ class DualViewModel(
                                 policyWritePhase = PolicyWritePhase.SAVING,
                             )
                         }
+                        // A3-4: clear must hold its key in policyWriteSaving inside the
+                        // same settlement-lock block as the QUEUED→SAVING transition
+                        // (mirror confirm/repair). The existing finally removes it.
+                        policyWriteSaving.add(key)
+                    }
+                    // A3-3: base revision sampled before the clear IO; the FAILED
+                    // terminal claim is rev-gated on it (see claimForPublishChecked).
+                    val clearRevBefore = try {
+                        sampledCurrentRevision()
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Throwable) {
+                        -1L
                     }
                     val deferred: Deferred<Boolean> = h1ClearDeferred ?: viewModelScope.async(Dispatchers.IO) {
-                        store.clear()
+                        // Phase 2 O3 (S4): last-moment Known re-check inside the fallback
+                        // IO arm — refuse the delete if a refresh flipped Known (fail-closed).
+                        if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear()
                     }
                     val ok: Boolean? = try {
                         withTimeout(policyIoTimeoutMs) {
@@ -9112,6 +9643,10 @@ class DualViewModel(
                                 try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                 writeLocked = false
                             }
+                            // 成功側 claimForPublish 的 revBefore=null 恆為 unconditional
+                            // CAS；reject 只可能是 CAS-loss＝live winner 消費 claim
+                            // （loser handling 已在 tryClaimStaged 內完成）—— 跟隨
+                            // winner 收斂，不得 abort 至 UNKNOWN_REFRESH。
                             return@withLock
                         }
                         val finalDraft = if (ackRead is LoadResult.Known && ackRead.packages.isNotEmpty()) {
@@ -9143,10 +9678,11 @@ class DualViewModel(
                             preClaimTx = null
                             if (wonLocal) {
                                 if (pcClearFast != null && policyTxCoordinator != null && stamped == null) {
-                                    applyStageRejectedUnderLock(pcClearFast, key)
+                                    applyStageRejectedUnderLock(pcClearFast, key, fenceHeld = true)
                                 } else {
                                     bumpPolicyGenerations()
                                     disarmBlindClear()
+                                    try { noteLastKnownDraft(finalDraft) } catch (_: Exception) { }
                                     _state.update {
                                         it.copy(
                                             loading = false,
@@ -9167,13 +9703,29 @@ class DualViewModel(
                         }
                     } else {
                         val pcClearFailFast = preClaimTx
-                        if (pcClearFailFast != null && !claimForPublish(pcClearFailFast)) {
-                            preClaimTx = null
-                            if (writeLocked) {
-                                try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                writeLocked = false
+                        // A3-3: gate the FAILED placeholder claim on the revision
+                        // sampled before the clear IO — a foreign B committing
+                        // between the failed clear and this claim bumps
+                        // committedRevision and the terminal is rejected.
+                        if (pcClearFailFast != null) {
+                            val claimVerdict = claimForPublishCheckedVerdict(pcClearFailFast, clearRevBefore)
+                            if (claimVerdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
+                                preClaimTx = null
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                // A3-3 (C1): settle ONLY on rev-gate rejection (foreign B
+                                // committed mid-IO — no winner exists); CAS_LOSS means a
+                                // live winner consumed the claim and loser-follow already
+                                // ran inside claimForPublishCheckedVerdict.
+                                if (claimVerdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+                                    synchronized(policySettleLock) {
+                                        applyStageRejectedUnderLock(pcClearFailFast, key)
+                                    }
+                                }
+                                return@withLock
                             }
-                            return@withLock
                         }
                         val failedMsg = policyText(PolicyText(PolicyTextKind.CLEAR_FAILED))
                         val failedPayload = pcClearFailFast?.let {
@@ -9195,7 +9747,7 @@ class DualViewModel(
                             preClaimTx = null
                             if (wonLocal) {
                                 if (pcClearFailFast != null && policyTxCoordinator != null && stamped == null) {
-                                    applyStageRejectedUnderLock(pcClearFailFast, key)
+                                    applyStageRejectedUnderLock(pcClearFailFast, key, fenceHeld = true)
                                 } else {
                                     markPolicyUnknownLocked()
                                     _state.update {
@@ -9232,14 +9784,17 @@ class DualViewModel(
                 if (pcOuterClear != null && !canJoinTx(pcOuterClear)) {
                     preClaimTx = null
                     inFlightWrites.remove(key)
+                    policyWriteSaving.remove(key)
                     try { abortUnarmedTx(pcOuterClear) } catch (_: Exception) { }
                 }
                 val htx = handoverTx
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
+                    policyWriteSaving.remove(htx.key)
                     registerHandoverTx(htx, isClear = true)
                 } else {
                     inFlightWrites.remove(key)
+                    policyWriteSaving.remove(key)
                 }
             }
         }
@@ -9264,6 +9819,15 @@ class DualViewModel(
                     msg = policyText(PolicyText(PolicyTextKind.OWNER_OPERATE)),
                     msgKind = MsgKind.CHANNEL,
                 )
+            }
+            return
+        }
+        // A3-5 symmetry (O2): a queued confirm owns the policy writers — refuse
+        // repair with BUSY while one is pending (same gate as clear); the arm and
+        // the pending are both preserved.
+        if (_state.value.pendingPolicyWrite != null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
             return
         }
@@ -9327,6 +9891,15 @@ class DualViewModel(
                     msg = policyText(PolicyText(PolicyTextKind.OWNER_OPERATE)),
                     msgKind = MsgKind.CHANNEL,
                 )
+            }
+            return
+        }
+        // A3-5 symmetry (O2): a queued confirm owns the policy writers — refuse
+        // repair with BUSY while one is pending (same gate as clear); the arm and
+        // the pending are both preserved.
+        if (_state.value.pendingPolicyWrite != null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
             return
         }
@@ -9420,12 +9993,9 @@ class DualViewModel(
         val armedRepairBaseRev = corruptRepairArmedBaseRev.get()
         disarmCorruptRepair()
         val key = "policy-repair:${clearGeneration.incrementAndGet()}"
-        if (!inFlightWrites.add(key)) {
-            _state.update {
-                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
-            }
-            return
-        }
+        // A2-4: 鍵由 clearGeneration 單調遞增保證唯一，add 必成功；舊 BUSY
+        // 帶不可達死分支，改為單純簿記（其餘 policy-* 觀測者用）。
+        inFlightWrites.add(key)
         _state.update { cur ->
             if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
             cur.copy(
@@ -9447,12 +10017,11 @@ class DualViewModel(
                 opMutex.withLock {
                     if (isPolicyReconcilingLocked()) {
                         synchronized(policySettleLock) {
-                            val clearIdle = _state.value.policyWritePhase == PolicyWritePhase.QUEUED &&
-                                activePolicyTx.get() == null
-                            if (clearIdle) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): unconditional cleanup of THIS repair's key —
+                            // the in-flight owner (not the repair) owns the lifecycle
+                            // of any foreign key; our key must never wedge the process.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             _state.update { cur ->
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
                                     cur.copy(
@@ -9476,10 +10045,10 @@ class DualViewModel(
                     val repairCur = _state.value
                     if (repairCur.policyDraftKnown || !repairCur.policyDraftCorrupt) {
                         synchronized(policySettleLock) {
-                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                            // are owned by the pending/in-flight op, never touched here.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             _state.update { cur ->
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
@@ -9504,10 +10073,10 @@ class DualViewModel(
                         policyFreshnessGen.get() != armedRepairFreshGen
                     ) {
                         synchronized(policySettleLock) {
-                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                            // are owned by the pending/in-flight op, never touched here.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             armCorruptRepairLocked()
                             _state.update { cur ->
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
@@ -9531,10 +10100,10 @@ class DualViewModel(
                     }
                     if (policyRevisionStale.get()) {
                         synchronized(policySettleLock) {
-                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                            // are owned by the pending/in-flight op, never touched here.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             markPolicyUnknownLocked()
                             _state.update { cur ->
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
@@ -9583,10 +10152,10 @@ class DualViewModel(
                         // (requires explicit refresh to adopt the healed value);
                         // only Unavailable below must retain corrupt.
                         synchronized(policySettleLock) {
-                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                            // are owned by the pending/in-flight op, never touched here.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             markPolicyUnknownLocked()
                             _state.update { cur ->
                                 val knownMsg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH))
@@ -9618,10 +10187,10 @@ class DualViewModel(
                         // Preserve corrupt evidence + bump generations (fail-closed
                         // fence) so the next tap still routes to repair request.
                         synchronized(policySettleLock) {
-                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                inFlightWrites.remove(key)
-                                policyWriteSaving.remove(key)
-                            }
+                            // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                            // are owned by the pending/in-flight op, never touched here.
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
                             markPolicyUnknownLocked()
                             _state.update { cur ->
                                 val preMsg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED))
@@ -9649,14 +10218,18 @@ class DualViewModel(
                         return@withLock
                     }
                     var h1RepairDeferred: Deferred<Boolean>? = null
+                    // A3-1: fast-path 需要知道修復是「Repaired」還是「RepairedNoBackup」
+                    // 才能誠實揭露備份失敗 —— 結果寫入此 ref 供 success 分支取用
+                    // （PolicyTx.deferred 為 Deferred<Boolean>，不變更其型別）。
+                    val repairResultRef = AtomicReference<RepairResult?>(null)
                     val h1RepairCoord = policyTxCoordinator
                     if (h1RepairCoord != null) {
                         if (!h1RepairCoord.writeMutex.tryLock()) {
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                    policyWriteSaving.remove(key)
-                                }
+                                // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                                // are owned by the pending/in-flight op, never touched here.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -9679,13 +10252,18 @@ class DualViewModel(
                         }
                         writeLocked = true
                         val lazy = h1RepairCoord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                            try {
-                                store.repairCorrupt() is RepairResult.Repaired
+                            val r = try {
+                                store.repairCorrupt()
                             } catch (ce: CancellationException) {
                                 throw ce
                             } catch (_: Throwable) {
-                                false
+                                RepairResult.RepairFailed
                             }
+                            try {
+                                repairResultRef.set(r)
+                            } catch (_: Exception) {
+                            }
+                            r is RepairResult.Repaired || r is RepairResult.RepairedNoBackup
                         }
                         val tx = PolicyTx(
                             txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
@@ -9703,10 +10281,10 @@ class DualViewModel(
                             try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                    policyWriteSaving.remove(key)
-                                }
+                                // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                                // are owned by the pending/in-flight op, never touched here.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -9776,10 +10354,10 @@ class DualViewModel(
                             try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
                             synchronized(policySettleLock) {
-                                if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                    inFlightWrites.remove(key)
-                                    policyWriteSaving.remove(key)
-                                }
+                                // A3-5 (SL2): this op's own keys, abort path — foreign keys
+                                // are owned by the pending/in-flight op, never touched here.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
                                 _state.update { cur ->
                                     if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
@@ -9924,7 +10502,12 @@ class DualViewModel(
                                     writeLocked = false
                                 }
                             }
-                            try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                            val repairStopped = cancelAndJoinRepairDeferred(h1RepairDeferred)
+                            if (!repairStopped) {
+                                // A3-7: cannot confirm the blocking repair stopped;
+                                // stay fail-closed (stale → next write/confirm requires refresh).
+                                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                            }
                             synchronized(policySettleLock) {
                                 if (pcKnown != null) {
                                     activePolicyTx.compareAndSet(pcKnown, null)
@@ -9960,7 +10543,12 @@ class DualViewModel(
                                     writeLocked = false
                                 }
                             }
-                            try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                            val repairStoppedUnavailable = cancelAndJoinRepairDeferred(h1RepairDeferred)
+                            if (!repairStoppedUnavailable) {
+                                // A3-7: cannot confirm the blocking repair stopped;
+                                // stay fail-closed (stale → next write/confirm requires refresh).
+                                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                            }
                             synchronized(policySettleLock) {
                                 if (pcAbort != null) {
                                     activePolicyTx.compareAndSet(pcAbort, null)
@@ -9994,13 +10582,18 @@ class DualViewModel(
                             }
                         }
                         val deferred: Deferred<Boolean> = h1RepairDeferred ?: viewModelScope.async(Dispatchers.IO) {
-                            try {
-                                store.repairCorrupt() is RepairResult.Repaired
+                            val r = try {
+                                store.repairCorrupt()
                             } catch (ce: CancellationException) {
                                 throw ce
                             } catch (_: Throwable) {
-                                false
+                                RepairResult.RepairFailed
                             }
+                            try {
+                                repairResultRef.set(r)
+                            } catch (_: Exception) {
+                            }
+                            r is RepairResult.Repaired || r is RepairResult.RepairedNoBackup
                         }
                         val ok: Boolean? = try {
                             withTimeout(policyIoTimeoutMs) { deferred.await() }
@@ -10060,11 +10653,19 @@ class DualViewModel(
                             preClaimTx = null
                             return@withLock
                         }
+                        // A3-1: 修復確實發生（ok==true）時，備份結果可能是
+                        // Repaired 或 RepairedNoBackup —— 後者必須以誠實訊息揭露
+                        // （刪除發生但證據未保留），不得以 CORRUPT_REPAIRED 語氣宣稱。
+                        val repairNoBackup = try {
+                            repairResultRef.get() is RepairResult.RepairedNoBackup
+                        } catch (_: Exception) {
+                            false
+                        }
                         if (ok) {
                             val pcFast = preClaimTx
                             if (pcFast != null) {
                                 val coordR = policyTxCoordinator
-                                val claimedRepair: Boolean = if (coordR != null) {
+                                val claimedRepair: PolicyTxCoordinator.ClaimStagedVerdict = if (coordR != null) {
                                     if (repairRevBefore == -1L) {
                                         try { policyTxCoordinator?.tryCompleteClaim(pcFast) } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
                                         if (writeLocked) {
@@ -10085,7 +10686,10 @@ class DualViewModel(
                                                     policyDraftCorrupt = true,
                                                     policyWritePhase = PolicyWritePhase.IDLE,
                                                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                                    msg = policyText(
+                                                        if (repairNoBackup) PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP)
+                                                        else PolicyText(PolicyTextKind.UNKNOWN_REFRESH),
+                                                    ),
                                                     msgKind = MsgKind.CHANNEL,
                                                 )
                                             }
@@ -10097,52 +10701,44 @@ class DualViewModel(
                                             pcFast.txId, pcFast.key, pcFast.sanitized,
                                             false, MsgKind.CHANNEL, "", pcFast.isClear,
                                         )
-                                        val wasClaimed = coordR.completeWithRevisionChecked(pcFast, ph, repairRevBefore)
-                                        if (wasClaimed) {
+                                        val verdict = try {
+                                            coordR.completeWithRevisionCheckedVerdict(pcFast, ph, repairRevBefore)
+                                        } catch (ce: CancellationException) {
+                                            throw ce
+                                        } catch (_: Throwable) {
+                                            PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
+                                        }
+                                        if (verdict == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
                                             try { afterClaimBeforeEmit?.invoke() } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { }
                                         }
-                                        wasClaimed
+                                        verdict
                                     } catch (ce: CancellationException) {
                                         throw ce
                                     } catch (_: Throwable) {
-                                        false
+                                        PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
                                     }
                                 } else {
-                                    claimForPublish(pcFast)
-                                }
-                                if (!claimedRepair) {
-                                    val revNow = try {
-                                        sampledCurrentRevision()
-                                    } catch (ce: CancellationException) {
-                                        throw ce
-                                    } catch (_: Throwable) {
-                                        -1L
+                                    if (claimForPublish(pcFast)) {
+                                        PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+                                    } else {
+                                        PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
                                     }
-                                    val revRejected = repairRevBefore != -1L && revNow != repairRevBefore
-                                    if (revRejected) {
-                                        try { policyTxCoordinator?.tryCompleteClaim(pcFast) } catch (_: Exception) { }
+                                }
+                                if (claimedRepair != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
+                                    // A3-3 (C1): settle ONLY on rev-gate rejection — the
+                                    // coordinator's CAS was never consumed (claim rejected
+                                    // before CAS) and no winner exists, so apply the
+                                    // stage-rejected terminal (helper also completes the
+                                    // coordinator claim and clears keys). CAS_LOSS means a
+                                    // live winner consumed the claim — loser-follow below.
+                                    if (claimedRepair == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
                                         if (writeLocked) {
                                             try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                             writeLocked = false
                                         }
                                         synchronized(policySettleLock) {
-                                            activePolicyTx.compareAndSet(pcFast, null)
-                                            policyReconciling.remove(pcFast.key)
-                                            inFlightWrites.remove(key)
-                                            policyWriteSaving.remove(key)
+                                            applyStageRejectedUnderLock(pcFast, key)
                                             preClaimTx = null
-                                            try { markPolicyUnknownLocked() } catch (_: Exception) { }
-                                            _state.update {
-                                                it.copy(
-                                                    loading = false,
-                                                    policyDraftKnown = false,
-                                                    policyDraftCorrupt = true,
-                                                    policyWritePhase = PolicyWritePhase.IDLE,
-                                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                                                    msgKind = MsgKind.CHANNEL,
-                                                )
-                                            }
                                         }
                                         return@withLock
                                     }
@@ -10180,9 +10776,15 @@ class DualViewModel(
                                     return@withLock
                                 }
                             }
-                            val repairedMsg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED))
+                            // A3-1: 備份失敗 → 誠實揭露（刪除發生；證據未保留）。
+                            val repairedMsg = if (repairNoBackup) {
+                                policyText(PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP))
+                            } else {
+                                policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED))
+                            }
+                            val repairedKind = if (repairNoBackup) MsgKind.CHANNEL else MsgKind.INFO
                             val repairedPayload = pcFast?.let {
-                                PolicySettled(it.txId, it.key, emptySet(), true, MsgKind.INFO, repairedMsg, true)
+                                PolicySettled(it.txId, it.key, emptySet(), true, repairedKind, repairedMsg, true)
                             }
                             val stamped = if (pcFast != null && repairedPayload != null) {
                                 emitTxSettledStageOnly(pcFast, repairedPayload)
@@ -10201,7 +10803,7 @@ class DualViewModel(
                                 preClaimTx = null
                                 if (wonLocal) {
                                     if (pcFast != null && policyTxCoordinator != null && stamped == null) {
-                                        applyStageRejectedUnderLock(pcFast, key)
+                                        applyStageRejectedUnderLock(pcFast, key, fenceHeld = true)
                                     } else {
                                         bumpPolicyGenerations()
                                         disarmBlindClear()
@@ -10210,6 +10812,7 @@ class DualViewModel(
                                         if (pcFast == null) {
                                             markObservedKnown()
                                         }
+                                        try { noteLastKnownDraft(emptySet()) } catch (_: Exception) { }
                                         _state.update {
                                             it.copy(
                                                 loading = false,
@@ -10220,7 +10823,7 @@ class DualViewModel(
                                                 policyWritePhase = PolicyWritePhase.IDLE,
                                                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                                 msg = repairedMsg,
-                                                msgKind = MsgKind.INFO,
+                                                msgKind = repairedKind,
                                             )
                                         }
                                     }
@@ -10231,13 +10834,29 @@ class DualViewModel(
                             }
                         } else {
                             val pcFailFast = preClaimTx
-                            if (pcFailFast != null && !claimForPublish(pcFailFast)) {
-                                preClaimTx = null
-                                if (writeLocked) {
-                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                                    writeLocked = false
+                            // A3-3: gate the FAILED placeholder claim on the same rev base
+                            // the IO-stage claim used; a foreign B committing between the
+                            // failed repair and this claim bumps committedRevision and the
+                            // terminal is rejected, exactly like a success claim.
+                            if (pcFailFast != null) {
+                                val claimVerdict = claimForPublishCheckedVerdict(pcFailFast, repairRevBefore)
+                                if (claimVerdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
+                                    preClaimTx = null
+                                    if (writeLocked) {
+                                        try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                        writeLocked = false
+                                    }
+                                    // A3-3 (C1): settle ONLY on rev-gate rejection (foreign B
+                                    // committed mid-IO — no winner exists); CAS_LOSS means a
+                                    // live winner consumed the claim and loser-follow already
+                                    // ran inside claimForPublishCheckedVerdict.
+                                    if (claimVerdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+                                        synchronized(policySettleLock) {
+                                            applyStageRejectedUnderLock(pcFailFast, key)
+                                        }
+                                    }
+                                    return@withLock
                                 }
-                                return@withLock
                             }
                             val failedMsg = policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED))
                             val failedPayload = pcFailFast?.let {
@@ -10260,7 +10879,7 @@ class DualViewModel(
                                 preClaimTx = null
                                 if (wonLocal) {
                                     if (pcFailFast != null && policyTxCoordinator != null && stamped == null) {
-                                        applyStageRejectedUnderLock(pcFailFast, key)
+                                        applyStageRejectedUnderLock(pcFailFast, key, fenceHeld = true)
                                     } else {
                                         markPolicyUnknownLocked()
                                         _state.update {
@@ -12950,6 +13569,20 @@ enum class PolicyTextKind {
     // 「重新整理草稿」確認結果），與 REFRESH_FAILED（重試失敗）區分：本態為
     // 自動重查後仍未知、待手動刷新 late-join。
     UNRESOLVED_REFRESH,
+    // Phase 2 S1（consent fence）：confirm 在使用者未勾選確認框時被調用 ——
+    // VM 層第二道門（UI positive 鈕為第一道），不寫 store、不清 pending。
+    // msgKind INVALID。
+    POLICY_NOT_ACKNOWLEDGED,
+    // Phase 2 S4（blind-clear refresh-first）：盲清第二次點擊時發現本次行程
+    // 曾記住最後 Known 草稿快照，遂強制先重讀（refreshPolicyDraft）；本次
+    // 點擊不刪除任何內容。恢復 Known 後下一次清除即走一般 Known 單步路徑；
+    // 若重讀仍未知，草稿維持未知且不可盲刪（fail-closed）。msgKind CHANNEL。
+    BLIND_CLEAR_REFRESH_FIRST,
+    // Phase 2 A3-1（repair backup honesty）：修復（刪除損壞內容）已發生且
+    // post-read 驗證為 Known(empty)，但 best-effort 備份失敗 —— 舊損壞內容
+    // 未被保留。與 CORRUPT_REPAIRED 區分：本態絕不宣稱證據已保留。
+    // msgKind CHANNEL（提醒而非失敗）。
+    REPAIRED_NO_BACKUP,
 }
 
 data class PolicyText(
@@ -12994,6 +13627,9 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.WRITE_TIMEOUT -> "寫入政策逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.CLEAR_TIMEOUT -> "清除草稿逾時，結果未知，正在核對，請勿重試"
     PolicyTextKind.UNRESOLVED_REFRESH -> "結果仍未知，請點「重新整理草稿」確認結果"
+    PolicyTextKind.POLICY_NOT_ACKNOWLEDGED -> "尚未勾選確認框，未寫入任何內容"
+    PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST -> "先前曾確認草稿內容，但遠端目前未知；已先觸發重新整理。請檢查 Hook 連線或重新啟動 App 後再清除"
+    PolicyTextKind.REPAIRED_NO_BACKUP -> "已清除損壞的政策草稿，但備份失敗：舊的損壞內容未被保留"
 }
 
 sealed interface BlockReason {

@@ -60,10 +60,17 @@ class HookPolicyRemoteStoreTest {
         var commitThrows = false
         var corruptType = false
         var cancelOnAll = false
+        // A3-1: 備份 commit 成功後，getAll 回報的 BACKUP_KEY 與實際寫入不一致
+        // （模擬讀回被外部污染/後備讀不一致）→ backup 讀回驗證必須失敗。
+        var mismatchBackupOnRead = false
 
         override fun getAll(): MutableMap<String, *> {
             if (cancelOnAll) throw kotlinx.coroutines.CancellationException("backup cancelled")
-            return LinkedHashMap(data)
+            val out = LinkedHashMap<String, Any?>(data)
+            if (mismatchBackupOnRead && out.containsKey(BACKUP_KEY)) {
+                out[BACKUP_KEY] = setOf("read-back-liar")
+            }
+            return out
         }
         override fun getString(key: String?, defValue: String?): String? =
             if (data[key] is String) data[key] as? String else defValue
@@ -1086,6 +1093,38 @@ class HookPolicyRemoteStoreTest {
             val bak = prefs.all[BACKUP_KEY] as? Set<String>
             assertTrue(bak != null)
             assertEquals(setOf("com.example.a", "com.example.b"), bak!!.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // A3-1 (S3): 備份 commit 看似成功，但讀回 BACKUP_KEY 內容與寫入不一致 →
+    // repairCorrupt 必須回 RepairedNoBackup（刪除照常發生），絕不報 Repaired。
+    @Test
+    fun backup_readBackMismatch_reportsNoBackup() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit().putStringSet(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                mutableSetOf("com.example.a", "com.example.b"),
+            ).commit())
+            prefs.corruptType = true
+            prefs.mismatchBackupOnRead = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            assertEquals(
+                "delete must proceed but backup must be reported failed",
+                true,
+                store.repairCorrupt() is RepairResult.RepairedNoBackup,
+            )
+            // 修復確實發生（政策鍵已刪），備份鍵仍在但回報不可信。
+            @Suppress("UNCHECKED_CAST")
+            val bak = prefs.all[BACKUP_KEY] as? Set<String>
+            assertTrue(
+                "backup key written physically, but result reports NoBackup (read-back mismatch)",
+                bak != null,
+            )
         } finally {
             resetRemotePoisonForTests()
         }
