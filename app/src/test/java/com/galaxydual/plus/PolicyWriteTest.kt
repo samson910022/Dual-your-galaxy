@@ -3080,6 +3080,9 @@ class PolicyWriteTest {
         val saveStarted = java.util.concurrent.CountDownLatch(1)
         val saveFinished = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val recheckAfterSaveEntered = java.util.concurrent.CountDownLatch(1)
+        val lateJoinSettledLatch = java.util.concurrent.CountDownLatch(1)
+        val refreshCalled = java.util.concurrent.atomic.AtomicBoolean(false)
         val reads = java.util.Collections.synchronizedList(mutableListOf<Set<String>?>())
         val store = HookPolicyStore(
             // init 首讀回真值 A（Known）；之後未放行回樂觀 B（Known，
@@ -3094,6 +3097,13 @@ class PolicyWriteTest {
                 } else if (!saveRelease.get()) {
                     setOf("com.B")
                 } else {
+                    if (!refreshCalled.get()) {
+                        recheckAfterSaveEntered.countDown()
+                        try {
+                            lateJoinSettledLatch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
                     backend.get()
                 }
                 reads.add(v)
@@ -3111,46 +3121,53 @@ class PolicyWriteTest {
                 false
             },
         )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
-        await { vm.state.value.policyDraftKnown }
-        assertEquals(setOf("com.A"), vm.state.value.policyDraft)
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+            await { vm.state.value.policyDraftKnown }
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
-        assertNotNull(activeTxOf(vm))
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertNotNull(activeTxOf(vm))
 
-        // 三輪 B（首延 500ms＋間隔 1s×2，約 2.5s）仍 RECONCILING（不結至 IDLE＋
-        // SUCCESS），pending 保留，Tx 存活，Known=false。
-        // 等 unresolved（REFRESH_FAILED＋RECONCILING＋保留）即證明三輪未搶結。
-        await(timeoutMs = 15_000L) {
-            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            // 三輪 B（首延 500ms＋間隔 1s×2，約 2.5s）仍 RECONCILING（不結至 IDLE＋
+            // SUCCESS），pending 保留，Tx 存活，Known=false。
+            // 等 unresolved（REFRESH_FAILED＋RECONCILING＋保留）即證明三輪未搶結。
+            await(timeoutMs = 15_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertNotNull(activeTxOf(vm))
+            assertTrue(reconcilingKeysOf(vm).isNotEmpty())
+            // 三輪讀＋init 至少 4 次（reconciler 至少 3 讀，未提前結；只取下界，
+            // 避免輪詢抖動造成 flaky，不設上界）。
+            assertTrue("load calls=" + calls.get() + ", expected >=4", calls.get() >= 4)
+
+            // 放行 save（回 false，已證失敗；後端不變仍 A），確定性地暫停 autoRecheckTx
+            // 後再執行 refresh late-join（讀 A＋deferred false）即 FAILED＋Unknown＋IDLE＋pending 清空＋Tx 結清。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(recheckAfterSaveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(setOf("com.A"), backend.get())
+            refreshCalled.set(true)
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.A"), vm.state.value.policyDraft)
+            assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+            assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
+            assertNull(activeTxOf(vm))
+            await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
+        } finally {
+            saveRelease.set(true)
+            lateJoinSettledLatch.countDown()
         }
-        assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertNotNull(activeTxOf(vm))
-        assertTrue(reconcilingKeysOf(vm).isNotEmpty())
-        // 三輪讀＋init 至少 4 次（reconciler 至少 3 讀，未提前結；只取下界，
-        // 避免輪詢抖動造成 flaky，不設上界）。
-        assertTrue("load calls=" + calls.get() + ", expected >=4", calls.get() >= 4)
-
-        // 放行 save（回 false，已證失敗；後端不變仍 A），再 refresh late-join
-        // （讀 A＋deferred false）即 FAILED＋Unknown＋IDLE＋pending 清空＋Tx 結清。
-        saveRelease.set(true)
-        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        assertEquals(setOf("com.A"), backend.get())
-        vm.refreshPolicyDraft()
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
-        assertNull(vm.state.value.pendingPolicyWrite)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.A"), vm.state.value.policyDraft)
-        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
-        assertNull(activeTxOf(vm))
-        await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
     }
 
     // Stage G1 T4：stale-A reconciler 續留（deferred 未完成＋Known(A≠B)→不
@@ -3891,6 +3908,7 @@ class PolicyWriteTest {
         val saveStarted = java.util.concurrent.CountDownLatch(1)
         val saveFinished = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val testCleanup = java.util.concurrent.atomic.AtomicBoolean(false)
         val readThreads = java.util.concurrent.ConcurrentLinkedQueue<String>()
         val store = HookPolicyStore(
             loadRaw = {
@@ -3899,13 +3917,12 @@ class PolicyWriteTest {
                 } else {
                     // 無限阻塞：無視中斷續跑（模擬不可中斷 binder）。
                     readThreads.add(Thread.currentThread().name)
-                    while (true) {
+                    while (!testCleanup.get()) {
                         try {
                             Thread.sleep(10)
                         } catch (_: InterruptedException) {
                         }
                     }
-                    @Suppress("UNREACHABLE_CODE")
                     backend.get()
                 }
             },
@@ -3922,53 +3939,58 @@ class PolicyWriteTest {
                 true
             },
         )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
-        await { vm.state.value.policyDraftKnown }
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
-        val t0 = System.currentTimeMillis()
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            val t0 = System.currentTimeMillis()
 
-        // 共用池對照：核對讀阻塞獨立池期間，共用 IO 池任務必須即時完成。
-        val control = kotlinx.coroutines.runBlocking {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { 42 }
+            // 共用池對照：核對讀阻塞獨立池期間，共用 IO 池任務必須即時完成。
+            val control = kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { 42 }
+            }
+            assertEquals(42, control)
+
+            // 終態：由 TIMEOUT 翻為 REFRESH_FAILED（仍 RECONCILING，非 IDLE）。
+            await(timeoutMs = 15_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vm.state.value.policyDraftKnown &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val elapsed = System.currentTimeMillis() - t0
+            // 總耗時有界：join(200ms)＋首延(500ms)＋3 讀(3×200ms)＋2 退避(2×1s)
+            // 約 3.3s；10s 上限含 CI 抖動餘量（無界實作將永不到終態而超時失敗）。
+            assertTrue("reconcile total must be bounded, was ${elapsed}ms", elapsed < 10_000L)
+
+            // 誠實 unresolved：CHANNEL＋Known=false＋pending 保留＋RECONCILING。
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            // 3 次 Unknown 不解 fence（late-join）：Tx 存活＋reconciling key 存活。
+            assertNotNull(activeTxOf(vm))
+            assertTrue(reconcilingKeysOf(vm).isNotEmpty())
+            assertTrue(savingKeysOf(vm).isEmpty())
+
+            // Stage J4 (HoL)：核對讀改走 Dispatchers.IO 共享池（每輪獨立執行緒並行，
+            // 首輪 latch 無視取消滯留亦不阻塞次輪；舊單執行緒 policyReconcile 池已退役，
+            // 僅保留欄位相容 close）。此處斷言讀執行緒不再是 policyReconcile 池。
+            assertTrue(readThreads.isNotEmpty())
+            assertTrue(readThreads.all { !it.contains("policyReconcile") })
+
+            // 清理脫鉤慢 save。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        } finally {
+            testCleanup.set(true)
+            saveRelease.set(true)
         }
-        assertEquals(42, control)
-
-        // 終態：由 TIMEOUT 翻為 REFRESH_FAILED（仍 RECONCILING，非 IDLE）。
-        await(timeoutMs = 15_000L) {
-            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
-                !vm.state.value.policyDraftKnown &&
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
-        }
-        val elapsed = System.currentTimeMillis() - t0
-        // 總耗時有界：join(200ms)＋首延(500ms)＋3 讀(3×200ms)＋2 退避(2×1s)
-        // 約 3.3s；10s 上限含 CI 抖動餘量（無界實作將永不到終態而超時失敗）。
-        assertTrue("reconcile total must be bounded, was ${elapsed}ms", elapsed < 10_000L)
-
-        // 誠實 unresolved：CHANNEL＋Known=false＋pending 保留＋RECONCILING。
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
-        assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
-        assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
-        // 3 次 Unknown 不解 fence（late-join）：Tx 存活＋reconciling key 存活。
-        assertNotNull(activeTxOf(vm))
-        assertTrue(reconcilingKeysOf(vm).isNotEmpty())
-        assertTrue(savingKeysOf(vm).isEmpty())
-
-        // Stage J4 (HoL)：核對讀改走 Dispatchers.IO 共享池（每輪獨立執行緒並行，
-        // 首輪 latch 無視取消滯留亦不阻塞次輪；舊單執行緒 policyReconcile 池已退役，
-        // 僅保留欄位相容 close）。此處斷言讀執行緒不再是 policyReconcile 池。
-        assertTrue(readThreads.isNotEmpty())
-        assertTrue(readThreads.all { !it.contains("policyReconcile") })
-
-        // 清理脫鉤慢 save（讀執行緒無限滯留獨立池，隨行程結束回收）。
-        saveRelease.set(true)
-        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
     }
 
     // Stage F2 late-join 成功：unresolved（有界讀耗盡，Tx 滯留）→放行 save
@@ -4063,17 +4085,30 @@ class PolicyWriteTest {
         val saveFinished = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
         val loadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val testCleanup = java.util.concurrent.atomic.AtomicBoolean(false)
+        val recheckAfterSaveEntered = java.util.concurrent.CountDownLatch(1)
+        val lateJoinSettledLatch = java.util.concurrent.CountDownLatch(1)
+        val refreshCalled = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
             loadRaw = {
                 if (calls.incrementAndGet() == 1) {
                     backend.get()
-                } else {
-                    while (!loadRelease.get()) {
+                } else if (!saveRelease.get()) {
+                    while (!loadRelease.get() && !testCleanup.get()) {
                         try {
                             Thread.sleep(10)
                         } catch (_: InterruptedException) {
                         }
                     }
+                    backend.get()
+                } else if (!refreshCalled.get()) {
+                    recheckAfterSaveEntered.countDown()
+                    try {
+                        lateJoinSettledLatch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (_: InterruptedException) {
+                    }
+                    backend.get()
+                } else {
                     backend.get()
                 }
             },
@@ -4089,35 +4124,44 @@ class PolicyWriteTest {
                 false
             },
         )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
-        await { vm.state.value.policyDraftKnown }
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
-        await(timeoutMs = 15_000L) {
-            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            await(timeoutMs = 15_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            assertNotNull(activeTxOf(vm))
+
+            // 放行 save（回 false，已證失敗；後端不變仍為 seed），確定性暫停 autoRecheckTx 後再放行 refresh。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(recheckAfterSaveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(setOf("com.seed"), backend.get())
+            loadRelease.set(true)
+            refreshCalled.set(true)
+
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+            assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
+            assertNull(activeTxOf(vm))
+            await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
+        } finally {
+            testCleanup.set(true)
+            saveRelease.set(true)
+            loadRelease.set(true)
+            lateJoinSettledLatch.countDown()
         }
-        assertNotNull(activeTxOf(vm))
-
-        // 放行 save（回 false，已證失敗；後端不變仍為 seed），放行讀（回 seed Known）。
-        saveRelease.set(true)
-        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        assertEquals(setOf("com.seed"), backend.get())
-        loadRelease.set(true)
-
-        vm.refreshPolicyDraft()
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
-        assertNull(vm.state.value.pendingPolicyWrite)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
-        assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
-        assertNull(activeTxOf(vm))
-        await(timeoutMs = 5_000L) { reconcilingKeysOf(vm).isEmpty() }
     }
 
     // Stage F2 總預算截斷：policyIoTimeoutMs=6000 下 join＋讀皆 6s，合計超
@@ -4129,19 +4173,19 @@ class PolicyWriteTest {
         val saveStarted = java.util.concurrent.CountDownLatch(1)
         val saveFinished = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val testCleanup = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
             loadRaw = {
                 if (calls.incrementAndGet() == 1) {
                     backend.get()
                 } else {
-                    // 無限阻塞（無視中斷，模擬不可中斷 binder；逾時執行緒滯留獨立池）。
-                    while (true) {
+                    // 無限阻塞（無視中斷，模擬不可中斷 binder）。
+                    while (!testCleanup.get()) {
                         try {
                             Thread.sleep(10)
                         } catch (_: InterruptedException) {
                         }
                     }
-                    @Suppress("UNREACHABLE_CODE")
                     backend.get()
                 }
             },
@@ -4158,39 +4202,44 @@ class PolicyWriteTest {
                 true
             },
         )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 6_000)
-        await { vm.state.value.policyDraftKnown }
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 6_000)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
-        // save 6s 逾時→RECONCILING（TIMEOUT）。
-        await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
-        val t0 = System.currentTimeMillis()
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            // save 6s 逾時→RECONCILING（TIMEOUT）。
+            await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            val t0 = System.currentTimeMillis()
 
-        // 總預算 15s 截斷→REFRESH_FAILED（仍 RECONCILING，非 IDLE）。
-        await(timeoutMs = 40_000L) {
-            vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
-                !vm.state.value.policyDraftKnown &&
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            // 總預算 15s 截斷→REFRESH_FAILED（仍 RECONCILING，非 IDLE）。
+            await(timeoutMs = 40_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vm.state.value.policyDraftKnown &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val elapsed = System.currentTimeMillis() - t0
+            // 有界：預算 15s＋抖動餘量（無界實作將永不到終態而超時失敗）。
+            assertTrue("reconcile total budget must truncate, was ${elapsed}ms", elapsed < 25_000L)
+
+            // 滯留：CHANNEL＋Known=false＋pending 保留＋Tx 存活＋reconciling 存活。
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
+            assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            assertNotNull(activeTxOf(vm))
+            assertTrue(reconcilingKeysOf(vm).isNotEmpty())
+
+            // 清理脫鉤慢 save。
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        } finally {
+            testCleanup.set(true)
+            saveRelease.set(true)
         }
-        val elapsed = System.currentTimeMillis() - t0
-        // 有界：預算 15s＋抖動餘量（無界實作將永不到終態而超時失敗）。
-        assertTrue("reconcile total budget must truncate, was ${elapsed}ms", elapsed < 25_000L)
-
-        // 滯留：CHANNEL＋Known=false＋pending 保留＋Tx 存活＋reconciling 存活。
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
-        assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
-        assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
-        assertNotNull(activeTxOf(vm))
-        assertTrue(reconcilingKeysOf(vm).isNotEmpty())
-
-        // 清理脫鉤慢 save（讀執行緒無限滯留，隨行程結束回收）。
-        saveRelease.set(true)
-        assertTrue(saveFinished.await(10, java.util.concurrent.TimeUnit.SECONDS))
     }
 
     // Stage F2 通道/前景守衛：Tx 存活時 selectChannel／onForeground 跳過
@@ -5297,12 +5346,13 @@ class PolicyWriteTest {
         // 勝者的 FAILED（與 auto-recheck／reconciler 三方競速，負載高時必現 flake）。
         // 此處傳真實 coordinator 鎖定恰一次 FAILED 終態（意圖不變）。
         val coord = PolicyTxCoordinator()
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val claimRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
         try {
             val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
             val calls = java.util.concurrent.atomic.AtomicInteger(0)
             val saveStarted = java.util.concurrent.CountDownLatch(1)
             val saveFinished = java.util.concurrent.CountDownLatch(1)
-            val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
             val store = HookPolicyStore(
                 // call 1：init 回真值 A；放行前恆回樂觀 B（==sanitized，在途 inconclusive）；
                 // 放行後回權威 A（ground truth !=B，late-join 仍 FAILED）。J2 語義同上。
@@ -5343,23 +5393,38 @@ class PolicyWriteTest {
             assertNotNull(activeTxOf(vm))
 
             // 放行已證失敗＋late-join（讀權威 A != sanitized B＋deferred false）→FAILED，不翻案。
+            // 以 afterClaimBeforeEmit 確定性將 refreshPolicyDraft 排在勝者結算前作為
+            // 併發 late-join loser 執行，避免「勝者先結清 IDLE＋activeTx=null 後才呼叫
+            // refreshPolicyDraft」造成事後手動重整把 FAILED 刷成 REFRESHED。
+            val claimEntered = java.util.concurrent.CountDownLatch(1)
+            vm.afterClaimBeforeEmit = {
+                claimEntered.countDown()
+                claimRelease.await()
+            }
             saveRelease.set(true)
             assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(claimEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             vm.refreshPolicyDraft()
-            // 等完整終態（IDLE＋FAILED 同一原子更新；僅等 phase 會在負載下撞見
-            // 中間態，見上 coordinator 註記）。
+            await(timeoutMs = 5_000L) { !vm.state.value.policyRefreshing }
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            claimRelease.complete(Unit)
+            // 等完整終態（IDLE＋FAILED 同一原子更新；activeTx 與 IDLE 同步清空）。
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && vm.state.value.msgKind == MsgKind.FAILED }
             assertNull(vm.state.value.pendingPolicyWrite)
             assertFalse(vm.state.value.policyDraftKnown)
             assertEquals(setOf("com.A"), vm.state.value.policyDraft)
             assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
             assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
-            // 終態發布（IDLE＋FAILED）與本地 fence 釋放（settlePolicyTx）分兩步：
-            // 有 coordinator 時中間隔著終態快照發射（含可能的 suspending 補發），
-            // UI 已終態而本地 Tx 尚未清空屬合法中間態，此處等待收斂再斷言。
-            await(timeoutMs = 10_000L) { activeTxOf(vm) == null }
             assertNull(activeTxOf(vm))
         } finally {
+            try {
+                saveRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                claimRelease.complete(Unit)
+            } catch (_: Exception) {
+            }
             try {
                 coord.close()
             } catch (_: Exception) {
@@ -5788,6 +5853,16 @@ class PolicyWriteTest {
     private fun revisionStaleOf(vm: DualViewModel): Boolean {
         val f = DualViewModel::class.java.getDeclaredField("policyRevisionStale").apply { isAccessible = true }
         return (f.get(vm) as java.util.concurrent.atomic.AtomicBoolean).get()
+    }
+
+    private fun lastRevisionSeenRevOf(vm: DualViewModel): Long {
+        val f = DualViewModel::class.java.getDeclaredField("lastRevisionSeenRev").apply { isAccessible = true }
+        return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
+    }
+
+    private fun lastRevisionSeenTxIdOf(vm: DualViewModel): Long {
+        val f = DualViewModel::class.java.getDeclaredField("lastRevisionSeenTxId").apply { isAccessible = true }
+        return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
     }
 
     // Stage I2-1：雙VM陳舊修訂同步＋stale 覆寫鎖定。
@@ -6835,19 +6910,19 @@ class PolicyWriteTest {
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val saveStarted = java.util.concurrent.CountDownLatch(1)
         val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val testCleanup = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
             loadRaw = {
                 when (calls.incrementAndGet()) {
                     1 -> backend.get()
                     2 -> {
                         // 首輪滯留：無視中斷永阻塞（binder 語義）。
-                        while (true) {
+                        while (!testCleanup.get()) {
                             try {
                                 Thread.sleep(10)
                             } catch (_: InterruptedException) {
                             }
                         }
-                        @Suppress("UNREACHABLE_CODE")
                         backend.get()
                     }
                     else -> backend.get()
@@ -6865,24 +6940,29 @@ class PolicyWriteTest {
                 true
             },
         )
-        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 300, initialDraft = setOf("com.seed"))
-        await { vm.state.value.policyDraftKnown }
-        val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
-        setPendingPolicyWrite(vm, pendingB)
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 300, initialDraft = setOf("com.seed"))
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingB)
-        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
-        // 首延 500ms 空窗內放行 save：save 證成功落盤 B，deferred 完成；
-        // 首輪讀仍滯留（超時 Unknown），次輪 fast Known(B)＋已完成即 SUCCESS。
-        Thread.sleep(200)
-        saveRelease.set(true)
-        await(timeoutMs = 20_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
-        assertTrue(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.B"), vm.state.value.policyDraft)
-        assertNull(vm.state.value.pendingPolicyWrite)
-        assertNull(activeTxOf(vm))
-        assertTrue(reconcilingKeysOf(vm).isEmpty())
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            // 首延 500ms 空窗內放行 save：save 證成功落盤 B，deferred 完成；
+            // 首輪讀仍滯留（超時 Unknown），次輪 fast Known(B)＋已完成即 SUCCESS。
+            Thread.sleep(200)
+            saveRelease.set(true)
+            await(timeoutMs = 20_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm.state.value.policyDraft)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertNull(activeTxOf(vm))
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+        } finally {
+            testCleanup.set(true)
+            saveRelease.set(true)
+        }
     }
 
     // Stage J4 (dialog trap)：SAVING 不可取消 vs RECONCILING 可取消（僅 UI dismiss，
@@ -9025,6 +9105,1139 @@ class PolicyWriteTest {
                 coord.close()
             } catch (_: Exception) {
             }
+        }
+    }
+
+    // PR #3: Cancellation at second commitMutex acquisition (confirm, clear, repair)
+    // must rethrow CancellationException cleanly without falling back to local-only
+    // checks or starting the LAZY store mutation; zero backend writes, LAZY unarmed
+    // and cancelled, no stranded coord.activeTx / writeMutex / activePolicyTx.
+    @Test
+    fun pr3_cancelAtCommitMutex_confirm_clear_repair_zeroWritesAndCleanRollback() {
+        fun policyRevisionMutexOf(vm: DualViewModel): kotlinx.coroutines.sync.Mutex {
+            val f = DualViewModel::class.java.getDeclaredField("policyRevisionMutex").apply { isAccessible = true }
+            return f.get(vm) as kotlinx.coroutines.sync.Mutex
+        }
+
+        // 1. confirmPolicyWrite
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+                val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { backend.get() },
+                    saveRaw = { _ -> saveCalls.incrementAndGet(); true },
+                )
+                val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { vm.state.value.policyDraftKnown }
+                val pending = PendingPolicyWrite(
+                    setOf("com.B"),
+                    System.currentTimeMillis(),
+                    baseCoordinatorRevision = coord.currentRevision(),
+                )
+                setPendingPolicyWrite(vm, pending)
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
+                val beforeChildren = scopeJob.children.toSet()
+                vm.confirmPolicyWrite(pending)
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(coord.writeMutex.isLocked)
+                val opJob = scopeJob.children.first { it !in beforeChildren }
+
+                runBlocking { coord.commitMutex.lock() }
+                revMutex.unlock()
+                Thread.sleep(50)
+                opJob.cancel()
+                coord.commitMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    !opJob.isActive &&
+                        vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked
+                }
+                assertEquals(0, saveCalls.get())
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(claimedTx.deferred.isCancelled)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+                assertFalse(coord.writeMutex.isLocked)
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+
+        // 2. clearPolicyDraft
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+                val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { backend.get() },
+                    saveRaw = { raw -> if (raw == null) clearCalls.incrementAndGet(); true },
+                )
+                val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { vm.state.value.policyDraftKnown }
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
+                val beforeChildren = scopeJob.children.toSet()
+                vm.clearPolicyDraft()
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
+                assertFalse(claimedTx.executionArmed.get())
+                val opJob = scopeJob.children.first { it !in beforeChildren }
+
+                runBlocking { coord.commitMutex.lock() }
+                revMutex.unlock()
+                Thread.sleep(50)
+                opJob.cancel()
+                coord.commitMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    !opJob.isActive &&
+                        vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked
+                }
+                assertEquals(0, clearCalls.get())
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(claimedTx.deferred.isCancelled)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+                assertFalse(coord.writeMutex.isLocked)
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+
+        // 3. confirmRepairCorruptDraft
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val repairCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { throw ClassCastException("corrupt") },
+                    saveRaw = { raw ->
+                        if (raw == null) repairCalls.incrementAndGet()
+                        true
+                    },
+                )
+                val vm = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { !vm.state.value.loading && vm.state.value.policyDraftCorrupt }
+                vm.requestRepairCorruptDraft()
+                assertTrue(vm.isCorruptRepairArmed())
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]!!
+                val beforeChildren = scopeJob.children.toSet()
+                vm.confirmRepairCorruptDraft()
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                val claimedTx = coordinatorTxOf(coord) as DualViewModel.PolicyTx
+                assertFalse(claimedTx.executionArmed.get())
+                val opJob = scopeJob.children.first { it !in beforeChildren }
+
+                runBlocking { coord.commitMutex.lock() }
+                revMutex.unlock()
+                Thread.sleep(50)
+                opJob.cancel()
+                coord.commitMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    !opJob.isActive &&
+                        vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked
+                }
+                assertEquals(0, repairCalls.get())
+                assertFalse(claimedTx.executionArmed.get())
+                assertTrue(claimedTx.deferred.isCancelled)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+                assertFalse(coord.writeMutex.isLocked)
+                assertTrue(vm.state.value.policyDraftCorrupt)
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+    }
+
+    // PR #3: Forced lock exception on h1Coord.withCommitLock with stale foreign committedRevision
+    // must FAIL CLOSED (UNKNOWN_REFRESH, 0 backend calls) across confirm/clear/repair.
+    @Test
+    fun pr3_forcedCommitLockException_withStaleForeignRevision_failsClosedZeroBackendCalls() {
+        fun policyRevisionMutexOf(vm: DualViewModel): kotlinx.coroutines.sync.Mutex {
+            val f = DualViewModel::class.java.getDeclaredField("policyRevisionMutex").apply { isAccessible = true }
+            return f.get(vm) as kotlinx.coroutines.sync.Mutex
+        }
+
+        // 1. confirmPolicyWrite
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+                val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { backend.get() },
+                    saveRaw = { _ -> saveCalls.incrementAndGet(); true },
+                )
+                val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { vm.state.value.policyDraftKnown }
+                val pending = PendingPolicyWrite(
+                    setOf("com.B"),
+                    System.currentTimeMillis(),
+                    baseCoordinatorRevision = coord.currentRevision(),
+                )
+                setPendingPolicyWrite(vm, pending)
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                vm.confirmPolicyWrite(pending)
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                // Advance coordinator revision silently (stale foreign rev) & force lock failure.
+                coord.bumpRevisionForTests()
+                coord.commitLockFailForTests = { IllegalStateException("forced commitMutex failure") }
+                revMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        vm.state.value.pendingPolicyWrite == null &&
+                        !coord.writeMutex.isLocked
+                }
+                assertEquals(0, saveCalls.get())
+                assertFalse(vm.state.value.policyDraftKnown)
+                assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+                assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+
+        // 2. clearPolicyDraft
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+                val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { backend.get() },
+                    saveRaw = { raw -> if (raw == null) clearCalls.incrementAndGet(); true },
+                )
+                val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { vm.state.value.policyDraftKnown }
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                vm.clearPolicyDraft()
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                coord.bumpRevisionForTests()
+                coord.commitLockFailForTests = { IllegalStateException("forced commitMutex failure") }
+                revMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked &&
+                        activeTxOf(vm) == null
+                }
+                assertEquals(0, clearCalls.get())
+                assertFalse(vm.state.value.policyDraftKnown)
+                assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+                assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+
+        // 3. confirmRepairCorruptDraft with non-Exception AssertionError via commitLockFailForTests
+        run {
+            val coord = PolicyTxCoordinator()
+            try {
+                val repairCalls = java.util.concurrent.atomic.AtomicInteger(0)
+                val store = HookPolicyStore(
+                    loadRaw = { throw ClassCastException("corrupt") },
+                    saveRaw = { raw ->
+                        if (raw == null) repairCalls.incrementAndGet()
+                        true
+                    },
+                    repairProbe = { LoadResult.Corrupt },
+                )
+                val vm = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+                await { !vm.state.value.loading && vm.state.value.policyDraftCorrupt }
+                vm.requestRepairCorruptDraft()
+                val revMutex = policyRevisionMutexOf(vm)
+                runBlocking { revMutex.lock() }
+                vm.confirmRepairCorruptDraft()
+                await(timeoutMs = 5_000L) { coordinatorTxOf(coord) != null }
+                coord.bumpRevisionForTests()
+                coord.commitLockFailForTests = { AssertionError("forced commitMutex Error") }
+                revMutex.unlock()
+
+                await(timeoutMs = 5_000L) {
+                    vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                        !coord.writeMutex.isLocked &&
+                        activeTxOf(vm) == null
+                }
+                assertEquals(0, repairCalls.get())
+                assertFalse(vm.state.value.policyDraftKnown)
+                assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+                assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+                assertNull(coordinatorTxOf(coord))
+                assertNull(activeTxOf(vm))
+            } finally {
+                try { coord.close() } catch (_: Exception) { }
+            }
+        }
+    }
+
+    // Item 2: autoRecheckTx must stage a placeholder (!known && msg.isEmpty()) on claimForPublish,
+    // never writing real terminal payload into pendingPublish before _latest via stageRealPayload.
+    @Test
+    fun autoRecheckTx_claimStagesPlaceholderOnly_neverRealInPendingOnClaim() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            val claimedSnapshot = java.util.concurrent.atomic.AtomicReference<PolicySettled?>(null)
+            val latestSnapshot = java.util.concurrent.atomic.AtomicReference<PolicySettled?>(null)
+            val entered = java.util.concurrent.CountDownLatch(1)
+            vm.afterClaimBeforeEmit = {
+                claimedSnapshot.set(coord.pendingPublish.get())
+                latestSnapshot.set(coord.latest.value)
+                entered.countDown()
+                gate.await()
+            }
+            saveRelease.set(true)
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+
+            val ph = claimedSnapshot.get()
+            assertNotNull(ph)
+            assertFalse("claimForPublish must stage placeholder (known=false)", ph!!.known)
+            assertTrue("claimForPublish must stage placeholder (msg empty)", ph.msg.isEmpty())
+            assertNull("_latest must still be null at claim hook", latestSnapshot.get())
+
+            gate.complete(Unit)
+            await(timeoutMs = 15_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            await(timeoutMs = 5_000L) { coord.pendingPublish.get() == null }
+            assertEquals(setOf("com.B"), coord.latest.value?.draft)
+            assertTrue(coord.latest.value?.known == true)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try { saveRelease.set(true) } catch (_: Exception) { }
+            try { gate.complete(Unit) } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Item 5: confirmRepairCorruptDraft CAS-loser without rev rejection must flip
+    // SAVING -> RECONCILING and follow the real winner instead of freezing in SAVING + loading=true.
+    @Test
+    fun confirmRepair_casLoserWithoutRevRejection_followsWinnerToIdle() {
+        val repairStarted = java.util.concurrent.CountDownLatch(1)
+        val repairRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val corrupt = java.util.concurrent.atomic.AtomicBoolean(true)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt.get()) throw ClassCastException("corrupt")
+                emptySet()
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    repairStarted.countDown()
+                    while (!repairRelease.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    corrupt.set(false)
+                }
+                true
+            },
+            repairProbe = { LoadResult.Corrupt },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { !vm.state.value.loading && vm.state.value.policyDraftCorrupt }
+            vm.requestRepairCorruptDraft()
+            vm.confirmRepairCorruptDraft()
+            assertTrue(repairStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx = activeTxOf(vm) as DualViewModel.PolicyTx
+            assertSame(tx, coordinatorTxOf(coord))
+
+            // Simulate another publisher claiming coord.activeTx BEFORE confirmRepair reaches completeWithRevisionChecked,
+            // keeping committedRevision equal to repairRevBefore (actually wait: completeWithRevision bumps rev!
+            // Instead test the case where coord.activeTx was claimed to null by tryCompleteClaim without rev bump,
+            // or a competing publisher took coord.activeTx with rev unchanged, then emits terminal).
+            assertTrue(coord.tryCompleteClaim(tx))
+            repairRelease.set(true)
+
+            // Wait until loser branch flips SAVING -> RECONCILING (no freeze in SAVING + loading=true!).
+            await(timeoutMs = 5_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vm.state.value.loading
+            }
+            // Deliver winner terminal via coordinator: VM converges cleanly to IDLE + CORRUPT_REPAIRED.
+            val winnerPayload = PolicySettled(
+                tx.txId, tx.key, emptySet(), true, MsgKind.INFO,
+                PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(), true,
+            )
+            assertTrue(coord.tryEmitSettled(winnerPayload))
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertFalse(vm.state.value.policyDraftCorrupt)
+            assertFalse(vm.state.value.loading)
+            assertNull(activeTxOf(vm))
+        } finally {
+            try { repairRelease.set(true) } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Item 5: reconciler receiving immediate Unavailable (prePoison / !hadReadTimeout) while
+    // save/clear deferred is still running with a coordinator must keep fence (RECONCILING)
+    // instead of tearing down activeTx prematurely.
+    @Test
+    fun reconciler_immediateUnavailableWithActiveDeferredAndCoord_keepsFenceUntilComplete() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val returnUnavailable = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (returnUnavailable.get()) null else backend.get()
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 150, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            returnUnavailable.set(true)
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            // Reconciler reads Unavailable 3x without timeout; must keep fence while deferred is active.
+            await(timeoutMs = 10_000L) {
+                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            Thread.sleep(200)
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertNotNull(activeTxOf(vm))
+            assertNotNull(coordinatorTxOf(coord))
+
+            // Release save and backend reads: autoRecheckTx settles IDLE + Known(B).
+            returnUnavailable.set(false)
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm.state.value.policyDraft)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try { saveRelease.set(true) } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Required #2 regression: refreshPolicyDraft() read started BEFORE tx.deferred completes
+    // must NEVER settle tx with stale Known(A) when tx completes mid-read.
+    @Test
+    fun refreshPolicyDraft_preCompletionRead_neverSettlesMidReadCompletedTx() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val blockNextRefreshLoad = java.util.concurrent.atomic.AtomicBoolean(false)
+        val refreshLoadEntered = java.util.concurrent.CountDownLatch(1)
+        val refreshLoadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val recheckEntered = java.util.concurrent.CountDownLatch(1)
+        val recheckRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (blockNextRefreshLoad.compareAndSet(true, false)) {
+                    // Snapshot stale pre-completion value "com.A", then pause mid-read while tx completes.
+                    val staleSnapshot = backend.get()
+                    refreshLoadEntered.countDown()
+                    while (!refreshLoadRelease.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    staleSnapshot
+                } else if (saveRelease.get() && !recheckRelease.get()) {
+                    recheckEntered.countDown()
+                    while (!recheckRelease.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    backend.get()
+                } else {
+                    backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 150, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pendingB)
+            vm.confirmPolicyWrite(pendingB)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val tx = activeTxOf(vm) as DualViewModel.PolicyTx
+
+            // Start refreshPolicyDraft BEFORE tx.deferred completes; pause mid-read holding stale "com.A".
+            blockNextRefreshLoad.set(true)
+            vm.refreshPolicyDraft()
+            assertTrue(refreshLoadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // Now complete tx mid-read (backend becomes com.B, tx.deferred completes true);
+            // pause autoRecheckTx so only refreshPolicyDraft runs to completion.
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(recheckEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { tx.deferred.isCompleted }
+
+            // Release the pre-completion refresh read returning stale Known(A): must NOT settle tx!
+            refreshLoadRelease.set(true)
+            await(timeoutMs = 5_000L) { !vm.state.value.policyRefreshing }
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            assertFalse("pre-completion refresh must never publish stale Known(A)", vm.state.value.policyDraftKnown)
+            assertSame(tx, activeTxOf(vm))
+            assertSame(tx, coordinatorTxOf(coord))
+
+            // Release autoRecheckTx (and refresh if its bounded read timed out) -> converges to Known(B).
+            recheckRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                if (vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING && !vm.state.value.policyRefreshing) {
+                    vm.refreshPolicyDraft()
+                }
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm.state.value.policyDraft)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try { saveRelease.set(true) } catch (_: Exception) { }
+            try { refreshLoadRelease.set(true) } catch (_: Exception) { }
+            try { recheckRelease.set(true) } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Round 2 Required #2 regression:
+    // When stageRealPayload returns null (placeholder tombstoned/superseded behind a newer _latest)
+    // with coordinator attached, confirmRepairCorruptDraft, confirmPolicyWrite (winnerPublish/reconciler),
+    // and refreshPolicyDraft late-join must NEVER publish Known/SUCCESS/CORRUPT_REPAIRED or call
+    // markObservedKnown(), and must fail closed to IDLE + !policyDraftKnown + policyRevisionStale +
+    // UNKNOWN_REFRESH + activePolicyTx == null.
+    @Test
+    fun stageRejectedStampedNull_withCoordinator_failsClosedToUnknownRefresh() {
+        // 1. confirmRepairCorruptDraft fast-path: placeholder tombstoned + superseded behind newer _latest.
+        val coord1 = PolicyTxCoordinator()
+        try {
+            val corrupt1 = java.util.concurrent.atomic.AtomicBoolean(true)
+            val store1 = HookPolicyStore(
+                loadRaw = {
+                    if (corrupt1.get()) throw ClassCastException("corrupt")
+                    emptySet()
+                },
+                saveRaw = { raw ->
+                    if (raw == null) corrupt1.set(false)
+                    true
+                },
+                repairProbe = { LoadResult.Corrupt },
+            )
+            val vm1 = makeVm(store1, userId = 0, initialDraft = null, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord1)
+            await { !vm1.state.value.loading && vm1.state.value.policyDraftCorrupt }
+            assertEquals(-1L, vm1.observedRevForTests())
+
+            vm1.requestRepairCorruptDraft()
+            assertTrue(vm1.isCorruptRepairArmed())
+            vm1.afterClaimBeforeEmit = {
+                val pend = coord1.pendingPublish.get()!!
+                assertTrue(coord1.discardOverrunPlaceholder(pend.txId, pend.key))
+                assertTrue(
+                    coord1.tryEmitSettled(
+                        PolicySettled(
+                            coord1.nextTxId(), "foreign-rep", setOf("com.NEW"), true,
+                            MsgKind.INFO, "foreign", false,
+                        ),
+                    ),
+                )
+                val foreignRev = coord1.latest.value!!.rev
+                val deadline = System.currentTimeMillis() + 5_000L
+                while (lastRevisionSeenRevOf(vm1) < foreignRev && System.currentTimeMillis() < deadline) {
+                    kotlinx.coroutines.delay(5)
+                }
+            }
+            vm1.confirmRepairCorruptDraft()
+            await(timeoutMs = 10_000L) {
+                vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm1.state.value.loading
+            }
+            assertFalse(vm1.state.value.policyDraftKnown)
+            assertTrue(vm1.state.value.policyDraftCorrupt)
+            assertTrue(revisionStaleOf(vm1))
+            assertEquals(MsgKind.CHANNEL, vm1.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm1.state.value.msg)
+            assertFalse(vm1.state.value.msg == PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText())
+            assertEquals(-1L, vm1.observedRevForTests())
+            assertNull(activeTxOf(vm1))
+            assertNull(coordinatorTxOf(coord1))
+            assertTrue(coord1.emitSuperseded.get() >= 1L)
+        } finally {
+            try { coord1.close() } catch (_: Exception) { }
+        }
+
+        // 2. confirmPolicyWrite timeout -> winnerPublish / reconciler: placeholder tombstoned/superseded.
+        val coord2 = PolicyTxCoordinator()
+        val saveRelease2 = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val backend2 = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val saveStarted2 = java.util.concurrent.CountDownLatch(1)
+            val store2 = HookPolicyStore(
+                loadRaw = { backend2.get() },
+                saveRaw = { raw ->
+                    saveStarted2.countDown()
+                    while (!saveRelease2.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    if (raw != null) backend2.set(raw)
+                    true
+                },
+            )
+            val vm2 = makeVm(store2, userId = 0, policyIoTimeoutMs = 150, policyTxCoordinator = coord2)
+            await { vm2.state.value.policyDraftKnown }
+            val obsRevBefore2 = vm2.observedRevForTests()
+            val pendingB2 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm2, pendingB2)
+            vm2.confirmPolicyWrite(pendingB2)
+            assertTrue(saveStarted2.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            vm2.afterClaimBeforeEmit = {
+                val pend = coord2.pendingPublish.get()!!
+                assertTrue(coord2.discardOverrunPlaceholder(pend.txId, pend.key))
+                assertTrue(
+                    coord2.tryEmitSettled(
+                        PolicySettled(
+                            coord2.nextTxId(), "foreign-wp", setOf("com.NEW2"), true,
+                            MsgKind.INFO, "foreign2", false,
+                        ),
+                    ),
+                )
+                val foreignRev = coord2.latest.value!!.rev
+                val deadline = System.currentTimeMillis() + 5_000L
+                while (lastRevisionSeenRevOf(vm2) < foreignRev && System.currentTimeMillis() < deadline) {
+                    kotlinx.coroutines.delay(5)
+                }
+            }
+            saveRelease2.set(true)
+            await(timeoutMs = 10_000L) {
+                vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE && activeTxOf(vm2) == null
+            }
+            assertFalse(vm2.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm2))
+            assertEquals(MsgKind.CHANNEL, vm2.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm2.state.value.msg)
+            assertFalse(vm2.state.value.msg.contains("已寫入"))
+            assertEquals(obsRevBefore2, vm2.observedRevForTests())
+            assertNull(vm2.state.value.pendingPolicyWrite)
+            assertNull(coordinatorTxOf(coord2))
+            assertTrue(coord2.emitSuperseded.get() >= 1L)
+        } finally {
+            try { saveRelease2.set(true) } catch (_: Exception) { }
+            try { coord2.close() } catch (_: Exception) { }
+        }
+
+        // 3. refreshPolicyDraft late-join: placeholder tombstoned/superseded before emitTxSettledStageOnly.
+        val coord3 = PolicyTxCoordinator()
+        try {
+            val backend3 = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val store3 = HookPolicyStore(
+                loadRaw = { backend3.get() },
+                saveRaw = { raw -> if (raw != null) backend3.set(raw); true },
+            )
+            val vm3 = makeVm(store3, userId = 0, policyIoTimeoutMs = 500, policyTxCoordinator = coord3)
+            await { vm3.state.value.policyDraftKnown }
+            val obsRevBefore3 = vm3.observedRevForTests()
+            val pendingB3 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            val tx3 = DualViewModel.PolicyTx(
+                coord3.nextTxId(), "r2-late-join-reject",
+                kotlinx.coroutines.CompletableDeferred(true), setOf("com.B"), store3,
+                isClear = false, pending = pendingB3, isRepair = false,
+                executionArmed = java.util.concurrent.atomic.AtomicBoolean(true),
+            )
+            val stateF = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            val stateFlow3 = stateF.get(vm3) as MutableStateFlow<UiState>
+            stateFlow3.value = stateFlow3.value.copy(
+                pendingPolicyWrite = pendingB3,
+                policyWritePhase = PolicyWritePhase.RECONCILING,
+                policyEpoch = stateFlow3.value.policyEpoch + 1,
+                policyDraftKnown = false,
+                policyDraftCorrupt = false,
+                loading = false,
+                msg = PolicyText(PolicyTextKind.WRITE_TIMEOUT).defaultText(),
+                msgKind = MsgKind.CHANNEL,
+            )
+            setLocalTx(vm3, tx3)
+            val recF = DualViewModel::class.java.getDeclaredField("policyReconciling").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            (recF.get(vm3) as MutableSet<String>).add(tx3.key)
+            coord3.activeTx.set(tx3)
+            backend3.set(setOf("com.B"))
+
+            vm3.afterClaimBeforeEmit = {
+                val pend = coord3.pendingPublish.get()!!
+                assertTrue(coord3.discardOverrunPlaceholder(pend.txId, pend.key))
+                assertTrue(
+                    coord3.tryEmitSettled(
+                        PolicySettled(
+                            coord3.nextTxId(), "foreign-lj", setOf("com.NEW3"), true,
+                            MsgKind.INFO, "foreign3", false,
+                        ),
+                    ),
+                )
+                val foreignRev = coord3.latest.value!!.rev
+                val deadline = System.currentTimeMillis() + 5_000L
+                while (lastRevisionSeenRevOf(vm3) < foreignRev && System.currentTimeMillis() < deadline) {
+                    kotlinx.coroutines.delay(5)
+                }
+            }
+            vm3.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) {
+                !vm3.state.value.policyRefreshing &&
+                    vm3.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    activeTxOf(vm3) == null
+            }
+            assertFalse(vm3.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm3))
+            assertEquals(MsgKind.CHANNEL, vm3.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm3.state.value.msg)
+            assertFalse(vm3.state.value.msg.contains("已寫入"))
+            assertEquals(obsRevBefore3, vm3.observedRevForTests())
+            assertNull(vm3.state.value.pendingPolicyWrite)
+            assertNull(coordinatorTxOf(coord3))
+            assertTrue(coord3.emitSuperseded.get() >= 1L)
+        } finally {
+            try { coord3.close() } catch (_: Exception) { }
+        }
+
+        // 4. confirmPolicyWrite fast-path pure tombstone (no foreign _latest):
+        // emitTxSettledStageOnly must NOT touch lastRevisionSeenTxId/Rev or observedRev when stamped == null.
+        val coord4 = PolicyTxCoordinator()
+        try {
+            val backend4 = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val store4 = HookPolicyStore(
+                loadRaw = { backend4.get() },
+                saveRaw = { raw -> if (raw != null) backend4.set(raw); true },
+            )
+            val vm4 = makeVm(store4, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord4)
+            await { vm4.state.value.policyDraftKnown }
+            val obsRevBefore4 = vm4.observedRevForTests()
+            assertEquals(-1L, lastRevisionSeenTxIdOf(vm4))
+            assertEquals(-1L, lastRevisionSeenRevOf(vm4))
+
+            vm4.afterClaimBeforeEmit = {
+                val pend = coord4.pendingPublish.get()!!
+                assertTrue(coord4.discardOverrunPlaceholder(pend.txId, pend.key))
+            }
+            val pendingB4 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm4, pendingB4)
+            vm4.confirmPolicyWrite(pendingB4)
+            await(timeoutMs = 10_000L) {
+                vm4.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    !vm4.state.value.loading &&
+                    activeTxOf(vm4) == null
+            }
+            assertFalse(vm4.state.value.policyDraftKnown)
+            assertTrue(revisionStaleOf(vm4))
+            assertEquals(MsgKind.CHANNEL, vm4.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm4.state.value.msg)
+            assertFalse(vm4.state.value.msg.contains("已寫入"))
+            assertEquals(obsRevBefore4, vm4.observedRevForTests())
+            assertEquals(-1L, lastRevisionSeenTxIdOf(vm4))
+            assertEquals(-1L, lastRevisionSeenRevOf(vm4))
+            assertNull(vm4.state.value.pendingPolicyWrite)
+            assertNull(coordinatorTxOf(coord4))
+            assertTrue(coord4.emitSuperseded.get() >= 1L)
+        } finally {
+            try { coord4.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Round 2 Required #3 regression:
+    // ok == false fail-fast CAS-loser on confirmPolicyWrite, clearPolicyDraft, and confirmRepairCorruptDraft
+    // must NOT call markPolicyUnknownLocked() right after !claimForPublish(...) loses, so launchLoserSync
+    // does not race with a premature version bump and converges cleanly to IDLE without stranding RECONCILING.
+    @Test
+    fun failFastClaimLoss_doesNotBumpVersionAcrossLaunchLoserSync() {
+        // 1. confirmPolicyWrite ok == false CAS-loser (both winner-emit convergence and timeout-fallback convergence).
+        val coordWrite = PolicyTxCoordinator()
+        val saveReleaseWrite = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val backendWrite = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val saveStartedWrite = java.util.concurrent.CountDownLatch(1)
+            val storeWrite = HookPolicyStore(
+                loadRaw = { backendWrite.get() },
+                saveRaw = { _ ->
+                    saveStartedWrite.countDown()
+                    while (!saveReleaseWrite.get()) {
+                        try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                    }
+                    false
+                },
+            )
+            val vmW = makeVm(storeWrite, userId = 0, policyIoTimeoutMs = 1_500, policyTxCoordinator = coordWrite)
+            await { vmW.state.value.policyDraftKnown }
+            val pendingW = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmW, pendingW)
+            vmW.confirmPolicyWrite(pendingW)
+            assertTrue(saveStartedWrite.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmW.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val txW = activeTxOf(vmW) as DualViewModel.PolicyTx
+            assertSame(txW, coordinatorTxOf(coordWrite))
+
+            val verBeforeLossW = vmW.policyDraftVersionForTests()
+            assertTrue(coordWrite.tryCompleteClaim(txW))
+            saveReleaseWrite.set(true)
+
+            await(timeoutMs = 5_000L) {
+                vmW.state.value.policyWritePhase == PolicyWritePhase.RECONCILING && !vmW.state.value.loading
+            }
+            assertEquals(
+                "confirmPolicyWrite ok==false CAS-loser must not bump policyDraftVersion prematurely",
+                verBeforeLossW,
+                vmW.policyDraftVersionForTests(),
+            )
+            val winnerW = PolicySettled(
+                txW.txId, txW.key, setOf("com.B"), true, MsgKind.INFO,
+                PolicyText(PolicyTextKind.WRITE_SUCCESS, 1).defaultText(), false,
+            )
+            assertTrue(coordWrite.tryEmitSettled(winnerW))
+            await(timeoutMs = 10_000L) { vmW.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmW.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vmW.state.value.policyDraft)
+            assertNull(activeTxOf(vmW))
+            assertNull(coordinatorTxOf(coordWrite))
+
+            // Also verify launchLoserSync timeout fallback path on ok == false CAS-loser converges cleanly to IDLE.
+            val coordWriteFb = PolicyTxCoordinator()
+            val saveReleaseWriteFb = java.util.concurrent.atomic.AtomicBoolean(false)
+            try {
+                val saveStartedWriteFb = java.util.concurrent.CountDownLatch(1)
+                val storeWriteFb = HookPolicyStore(
+                    loadRaw = { setOf("com.seed") },
+                    saveRaw = { _ ->
+                        saveStartedWriteFb.countDown()
+                        while (!saveReleaseWriteFb.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        false
+                    },
+                )
+                val vmWFb = makeVm(storeWriteFb, userId = 0, policyIoTimeoutMs = 400, policyTxCoordinator = coordWriteFb)
+                await { vmWFb.state.value.policyDraftKnown }
+                val pendingWFb = PendingPolicyWrite(setOf("com.B2"), System.currentTimeMillis())
+                setPendingPolicyWrite(vmWFb, pendingWFb)
+                vmWFb.confirmPolicyWrite(pendingWFb)
+                assertTrue(saveStartedWriteFb.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                await(timeoutMs = 5_000L) { vmWFb.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+                val txWFb = activeTxOf(vmWFb) as DualViewModel.PolicyTx
+                val verBeforeLossWFb = vmWFb.policyDraftVersionForTests()
+                assertTrue(coordWriteFb.tryCompleteClaim(txWFb))
+                saveReleaseWriteFb.set(true)
+
+                await(timeoutMs = 5_000L) {
+                    vmWFb.state.value.policyWritePhase == PolicyWritePhase.RECONCILING && !vmWFb.state.value.loading
+                }
+                assertEquals(verBeforeLossWFb, vmWFb.policyDraftVersionForTests())
+                await(timeoutMs = 10_000L) {
+                    vmWFb.state.value.policyWritePhase == PolicyWritePhase.IDLE && activeTxOf(vmWFb) == null
+                }
+                assertFalse(vmWFb.state.value.policyDraftKnown)
+                assertEquals(MsgKind.FAILED, vmWFb.state.value.msgKind)
+                assertNull(coordinatorTxOf(coordWriteFb))
+            } finally {
+                try { saveReleaseWriteFb.set(true) } catch (_: Exception) { }
+                try { coordWriteFb.close() } catch (_: Exception) { }
+            }
+        } finally {
+            try { saveReleaseWrite.set(true) } catch (_: Exception) { }
+            try { coordWrite.close() } catch (_: Exception) { }
+        }
+
+        // 2. clearPolicyDraft ok == false CAS-loser.
+        val coordClear = PolicyTxCoordinator()
+        val clearRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val clearStarted = java.util.concurrent.CountDownLatch(1)
+            val storeClear = HookPolicyStore(
+                loadRaw = { setOf("com.seed") },
+                saveRaw = { raw ->
+                    if (raw == null) {
+                        clearStarted.countDown()
+                        while (!clearRelease.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                },
+            )
+            val vmC = makeVm(storeClear, userId = 0, policyIoTimeoutMs = 1_500, policyTxCoordinator = coordClear)
+            await { vmC.state.value.policyDraftKnown }
+            vmC.clearPolicyDraft()
+            assertTrue(clearStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmC.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val txC = activeTxOf(vmC) as DualViewModel.PolicyTx
+            assertSame(txC, coordinatorTxOf(coordClear))
+
+            val verBeforeLossC = vmC.policyDraftVersionForTests()
+            assertTrue(coordClear.tryCompleteClaim(txC))
+            clearRelease.set(true)
+
+            await(timeoutMs = 5_000L) {
+                vmC.state.value.policyWritePhase == PolicyWritePhase.RECONCILING && !vmC.state.value.loading
+            }
+            assertEquals(
+                "clearPolicyDraft ok==false CAS-loser must not bump policyDraftVersion prematurely",
+                verBeforeLossC,
+                vmC.policyDraftVersionForTests(),
+            )
+            val winnerC = PolicySettled(
+                txC.txId, txC.key, emptySet(), true, MsgKind.INFO,
+                PolicyText(PolicyTextKind.CLEAR_SUCCESS).defaultText(), true,
+            )
+            assertTrue(coordClear.tryEmitSettled(winnerC))
+            await(timeoutMs = 10_000L) { vmC.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmC.state.value.policyDraftKnown)
+            assertTrue(vmC.state.value.policyDraft.isEmpty())
+            assertNull(activeTxOf(vmC))
+            assertNull(coordinatorTxOf(coordClear))
+        } finally {
+            try { clearRelease.set(true) } catch (_: Exception) { }
+            try { coordClear.close() } catch (_: Exception) { }
+        }
+
+        // 3. confirmRepairCorruptDraft ok == false CAS-loser.
+        val coordRepair = PolicyTxCoordinator()
+        val repairRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val repairStarted = java.util.concurrent.CountDownLatch(1)
+            val storeRepair = HookPolicyStore(
+                loadRaw = { throw ClassCastException("corrupt") },
+                saveRaw = { raw ->
+                    if (raw == null) {
+                        repairStarted.countDown()
+                        while (!repairRelease.get()) {
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                },
+                repairProbe = { LoadResult.Corrupt },
+            )
+            val vmR = makeVm(storeRepair, userId = 0, initialDraft = null, policyIoTimeoutMs = 1_500, policyTxCoordinator = coordRepair)
+            await { !vmR.state.value.loading && vmR.state.value.policyDraftCorrupt }
+            vmR.requestRepairCorruptDraft()
+            vmR.confirmRepairCorruptDraft()
+            assertTrue(repairStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmR.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val txR = activeTxOf(vmR) as DualViewModel.PolicyTx
+            assertSame(txR, coordinatorTxOf(coordRepair))
+
+            val verBeforeLossR = vmR.policyDraftVersionForTests()
+            assertTrue(coordRepair.tryCompleteClaim(txR))
+            repairRelease.set(true)
+
+            await(timeoutMs = 5_000L) {
+                vmR.state.value.policyWritePhase == PolicyWritePhase.RECONCILING && !vmR.state.value.loading
+            }
+            assertEquals(
+                "confirmRepairCorruptDraft ok==false CAS-loser must not bump policyDraftVersion prematurely",
+                verBeforeLossR,
+                vmR.policyDraftVersionForTests(),
+            )
+            val winnerR = PolicySettled(
+                txR.txId, txR.key, emptySet(), true, MsgKind.INFO,
+                PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(), true,
+            )
+            assertTrue(coordRepair.tryEmitSettled(winnerR))
+            await(timeoutMs = 10_000L) { vmR.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmR.state.value.policyDraftKnown)
+            assertFalse(vmR.state.value.policyDraftCorrupt)
+            assertNull(activeTxOf(vmR))
+            assertNull(coordinatorTxOf(coordRepair))
+        } finally {
+            try { repairRelease.set(true) } catch (_: Exception) { }
+            try { coordRepair.close() } catch (_: Exception) { }
+        }
+    }
+
+    // Round 3 Critical + Required regression:
+    // 1) Fast path in SAVING (loading=true) holds afterClaimBeforeEmit while concurrent
+    //    refreshPolicyDraft sees coord.activeTx == null and spawns launchLoserSync ->
+    //    applyAuthoritativeSettled clearing activePolicyTx: must clear loading=false & IDLE
+    //    instead of wedging SAVING + loading=true.
+    // 2) Fast path in SAVING (loading=true) pauses in read-after-ack while concurrent
+    //    refreshPolicyDraft wins late-join claimForPublish -> IDLE: must clear loading=false
+    //    instead of wedging IDLE + loading=true.
+    @Test
+    fun fastPath_concurrentRefreshPolicyDraft_neverWedgesSavingLoadingTrue() {
+        // 1. applyAuthoritativeSettled during SAVING (afterClaimBeforeEmit window).
+        val coord1 = PolicyTxCoordinator()
+        val claimRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+        try {
+            val backing1 = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val store1 = HookPolicyStore(
+                loadRaw = { backing1.get() },
+                saveRaw = { raw ->
+                    if (raw != null) backing1.set(raw)
+                    true
+                },
+            )
+            val vm1 = makeVm(store1, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord1)
+            await { vm1.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm1, pendingB)
+
+            val claimEntered = java.util.concurrent.CountDownLatch(1)
+            vm1.afterClaimBeforeEmit = {
+                claimEntered.countDown()
+                claimRelease.await()
+            }
+            vm1.confirmPolicyWrite(pendingB)
+            assertTrue(claimEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(PolicyWritePhase.SAVING, vm1.state.value.policyWritePhase)
+            assertTrue(vm1.state.value.loading)
+            assertNull(coordinatorTxOf(coord1))
+            assertNotNull(activeTxOf(vm1))
+
+            // Concurrent refresh sees coord.activeTx == null !== txSnap -> spawns launchLoserSync(txSnap).
+            vm1.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { !vm1.state.value.policyRefreshing }
+            // Release afterClaimBeforeEmit: fast path calls emitTxSettledStageOnly (writes _latest),
+            // which wakes launchLoserSync -> applyAuthoritativeSettled while fast path also enters policySettleLock.
+            claimRelease.complete(Unit)
+
+            await(timeoutMs = 5_000L) {
+                vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm1.state.value.loading
+            }
+            assertTrue(vm1.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm1.state.value.policyDraft)
+            assertNull(activeTxOf(vm1))
+            assertNull(coordinatorTxOf(coord1))
+        } finally {
+            try { claimRelease.complete(Unit) } catch (_: Exception) { }
+            try { coord1.close() } catch (_: Exception) { }
+        }
+
+        // 2. refreshPolicyDraft late-join wins claimForPublish during SAVING (read-after-ack window).
+        val coord2 = PolicyTxCoordinator()
+        val ackGate = java.util.concurrent.CountDownLatch(1)
+        try {
+            val backing2 = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.A"))
+            val calls2 = java.util.concurrent.atomic.AtomicInteger(0)
+            val ackReadEntered = java.util.concurrent.CountDownLatch(1)
+            val store2 = HookPolicyStore(
+                loadRaw = {
+                    val n = calls2.incrementAndGet()
+                    if (n == 2) {
+                        // Fast path's read-after-ack (after save deferred completed true) pauses here.
+                        ackReadEntered.countDown()
+                        ackGate.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    }
+                    backing2.get()
+                },
+                saveRaw = { raw ->
+                    if (raw != null) backing2.set(raw)
+                    true
+                },
+            )
+            val vm2 = makeVm(store2, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord2)
+            await { vm2.state.value.policyDraftKnown }
+            val pendingB2 = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm2, pendingB2)
+
+            vm2.confirmPolicyWrite(pendingB2)
+            assertTrue(ackReadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(PolicyWritePhase.SAVING, vm2.state.value.policyWritePhase)
+            assertTrue(vm2.state.value.loading)
+
+            // Concurrent refreshPolicyDraft wins late-join while fast path is blocked in ackRead.
+            vm2.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) {
+                !vm2.state.value.policyRefreshing && vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            assertFalse(
+                "refreshPolicyDraft late-join during SAVING must clear loading=false",
+                vm2.state.value.loading,
+            )
+
+            // Release fast path ackRead -> loses claimForPublish -> must NOT re-wedge loading=true.
+            ackGate.countDown()
+            Thread.sleep(100)
+            assertEquals(PolicyWritePhase.IDLE, vm2.state.value.policyWritePhase)
+            assertFalse(vm2.state.value.loading)
+            assertTrue(vm2.state.value.policyDraftKnown)
+            assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
+            assertNull(activeTxOf(vm2))
+            assertNull(coordinatorTxOf(coord2))
+        } finally {
+            try { ackGate.countDown() } catch (_: Exception) { }
+            try { coord2.close() } catch (_: Exception) { }
         }
     }
 }
