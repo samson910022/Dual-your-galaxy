@@ -1110,7 +1110,7 @@ class PolicyWriteTest {
 
         // 重複維：核對中重複 confirm 不耗第二次 save。
         vm.confirmPolicyWrite(pending, pending.generation)
-        Thread.sleep(100)
+        await(timeoutMs = 5_000L) { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         // IN_PROGRESS 覆寫 TIMEOUT 後，pending/相位仍保留（僅 msg 變化）。
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
@@ -2927,6 +2927,10 @@ class PolicyWriteTest {
 
         // 等 reconciler 交接完成（外層 finally 在 mutex 釋放後啟動，取號先於
         // refresh），仍在 500ms 首延空窗內，再做 refresh（只推 freshness）。
+        // WALL-CLOCK kept — must land inside the reconciler's 500ms first-delay
+        // window; highest flake risk on loaded CI (the thread wake must stay
+        // <500ms). The reconciler's completion has no observable seam today,
+        // so no await() can replace this bound; do NOT lengthen the sleep.
         Thread.sleep(200)
         backend.set(setOf("com.fresh"))
         val msgBeforeYield = vm.state.value.msg
@@ -3694,7 +3698,7 @@ class PolicyWriteTest {
 
         // 同世代重試即 IN_PROGRESS 明示（沿用既有 latch 語義）。
         vm.confirmPolicyWrite(pendingB, pendingB.generation)
-        Thread.sleep(200)
+        await(timeoutMs = 5_000L) { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
         assertEquals(1, saveCalls.get())
@@ -4924,7 +4928,7 @@ class PolicyWriteTest {
             val pendingC = PendingPolicyWrite(setOf("com.C"), System.currentTimeMillis())
             setPendingPolicyWrite(vm2, pendingC)
             vm2.confirmPolicyWrite(pendingC, pendingC.generation)
-            Thread.sleep(300)
+            await(timeoutMs = 5_000L) { vm2.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
             assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm2.state.value.msg)
             assertEquals(MsgKind.INFO, vm2.state.value.msgKind)
             assertEquals(pendingC, vm2.state.value.pendingPolicyWrite)
@@ -7050,6 +7054,11 @@ class PolicyWriteTest {
             await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             // 首延 500ms 空窗內放行 save：save 證成功落盤 B，deferred 完成；
             // 首輪讀仍滯留（超時 Unknown），次輪 fast Known(B)＋已完成即 SUCCESS。
+            // WALL-CLOCK kept — must land inside the reconciler's 500ms
+            // first-delay window; highest flake risk on loaded CI (the thread
+            // wake must stay <500ms). The reconciler's completion has no
+            // observable seam today, so no await() can replace this bound;
+            // do NOT lengthen the sleep.
             Thread.sleep(200)
             saveRelease.set(true)
             await(timeoutMs = 20_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
@@ -7283,6 +7292,11 @@ class PolicyWriteTest {
             vm1.confirmPolicyWrite(pendingB!!, pendingB!!.generation)
             assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 10_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            // WALL-CLOCK kept — sleep(2500) deliberately overshoots the 2s
+            // stalled-emit fallback so the fallback fires before saveRelease;
+            // the emit-stall path has no observable seam (nothing signals
+            // "stalled-emit fallback timer fired"), so a bounded sleep over
+            // the fallback interval is the only option.
             Thread.sleep(2500)
             saveRelease.set(true)
             await(timeoutMs = 20_000L) { vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE }
@@ -8525,7 +8539,6 @@ class PolicyWriteTest {
 
             // Pre-timeout destroy: cancel while blocked in the final bounded read.
             vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
-            Thread.sleep(500)
             // N2 outer-finally aborts the PREPARING Tx (no handover, no delete).
             await(timeoutMs = 5_000L) { coordinatorTxOf(coord) == null && activeTxOf(vmA) == null }
             assertNull(coordinatorTxOf(coord))
@@ -8538,7 +8551,7 @@ class PolicyWriteTest {
             // VM-B with the same coordinator+store: nothing executable to inherit.
             val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
             assertTrue(initBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            Thread.sleep(200)
+            await(timeoutMs = 5_000L) { !vmB.state.value.loading }
             assertNull(activeTxOf(vmB))
             assertNull(coordinatorTxOf(coord))
             assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
@@ -8648,7 +8661,6 @@ class PolicyWriteTest {
             assertFalse(tx1.deferred.isCompleted)
 
             vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("rotation"))
-            Thread.sleep(500)
             await(timeoutMs = 5_000L) { coordinatorTxOf(coord) == null && activeTxOf(vmA) == null }
             assertTrue(tx1.deferred.isCancelled)
             assertEquals(0, deleteCalls.get())
@@ -8661,7 +8673,7 @@ class PolicyWriteTest {
 
             val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
             assertTrue(initBEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            Thread.sleep(200)
+            await(timeoutMs = 5_000L) { !vmB.state.value.loading }
             assertNull(activeTxOf(vmB))
             assertNull(coordinatorTxOf(coord))
             assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
@@ -9018,6 +9030,22 @@ class PolicyWriteTest {
             // load samples the pre-commit revision and then blocks, spanning
             // the winner terminal below.
             val vm2 = makeVm2Direct(vm2Store, coord, policyIoTimeoutMs = 5_000)
+            // Spanning-load completion seam: install a counting sampler on VM2
+            // BEFORE releasing the blocked init load. revBeforeInit is sampled
+            // synchronously inside the VM constructor (before this install), so
+            // the first post-install count is the post-IO revMovedInit sample —
+            // the last externally observable point of the spanning load. Everything
+            // after that sample (version-fence discard here) runs synchronously
+            // and non-suspending on the IO thread, so once the counter fires the
+            // load can no longer alter Known/draft. The reconciler/follower/probe
+            // paths never sample revisions (exhaustive check of every
+            // sampledCurrentRevision call site), so count >= 1 is the spanning
+            // load itself, not an unrelated reader.
+            val spanningLoadSamples = java.util.concurrent.atomic.AtomicInteger(0)
+            vm2.revisionSamplerForTests = {
+                spanningLoadSamples.incrementAndGet()
+                coord.currentRevision()
+            }
             assertTrue(loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             assertEquals(revBefore, coord.currentRevision())
 
@@ -9039,9 +9067,12 @@ class PolicyWriteTest {
 
             // Release the spanning load: revMoved is true, but the version fence
             // (winner pre-bump) discards instead of washing, preserving Known(B).
+            // Await the spanning load's post-IO revMovedInit sample (see the
+            // spanningLoadSamples install above) — deterministic completion
+            // seam; the version-fence discard after that sample is synchronous,
+            // so IDLE+Known(B) is then guaranteed stable.
             loadRelease.set(true)
-            Thread.sleep(500)
-            await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            await(timeoutMs = 10_000L) { spanningLoadSamples.get() >= 1 }
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
             assertNull(activeTxOf(vm1))
@@ -9106,6 +9137,22 @@ class PolicyWriteTest {
 
             // Fresh VM2 with no Tx in flight; its init load blocks at entry.
             val vm2 = makeVm2Direct(vm2Store, coord, policyIoTimeoutMs = 5_000)
+            // Spanning-load completion seam: install a counting sampler on VM2
+            // BEFORE releasing the blocked init load. revBeforeInit is sampled
+            // synchronously inside the VM constructor (before this install), so
+            // the first post-install count is the post-IO revMovedInit sample —
+            // the last externally observable point of the spanning load. Everything
+            // after that sample (revMoved wash to Unknown here) runs synchronously
+            // and non-suspending on the IO thread, so once the counter fires the
+            // load can no longer apply the read as Known. The reconciler/follower/
+            // probe paths never sample revisions (exhaustive check of every
+            // sampledCurrentRevision call site), so count >= 1 is the spanning
+            // load itself, not an unrelated reader.
+            val spanningLoadSamples = java.util.concurrent.atomic.AtomicInteger(0)
+            vm2.revisionSamplerForTests = {
+                spanningLoadSamples.incrementAndGet()
+                coord.currentRevision()
+            }
             assertTrue(loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
             assertNull(coordinatorTxOf(coord))
             assertEquals(revBefore, coord.currentRevision())
@@ -9130,9 +9177,13 @@ class PolicyWriteTest {
             // Release the spanning init load while the foreign terminal is still
             // gated (no _latest, version fence passes, revMoved with foreign
             // identity): must wash Unknown, never apply as Known.
+            // Await the spanning load's post-IO revMovedInit sample (see the
+            // spanningLoadSamples install above) — deterministic completion
+            // seam; the wash after that sample is synchronous, so the
+            // assertFalse below can never race the load's discard decision.
             loadRelease.set(true)
-            Thread.sleep(800)
-                        assertFalse(vm2.state.value.policyDraftKnown)
+            await(timeoutMs = 10_000L) { spanningLoadSamples.get() >= 1 }
+            assertFalse(vm2.state.value.policyDraftKnown)
 
             // Release the winner: both VMs converge IDLE+Known(B).
             releaseGate.complete(Unit)

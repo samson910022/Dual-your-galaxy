@@ -153,11 +153,14 @@ class PolicyToctouBarrierTest {
             // Stale Known discarded: stay Unknown, no disarm/mark wash.
             assertFalse(vm.state.value.policyDraftKnown)
             assertEquals(observedBefore, vm.observedRevForTests())
-            // Exactly revBefore + revMoved: the mark path (3rd read) must not run
-            // on discard (already pinned by !thirdHappened below, so ==2 is the
-            // stable equivalent of >=2 — no background path samples this VM's
-            // sampler between install and refresh settle).
-            assertEquals("rev sampler must see exactly revBefore + revMoved", 2, calls.get())
+            // Both arms deterministic in this fixture (>=2: revBeforeRefresh +
+            // revMovedRefresh both sample before the discard decision — neither
+            // is pre-empted since the refresh path always reaches the
+            // revMovedRefresh sample; <=2: the mark path (3rd read) must not
+            // run on the discard path, and no background path samples this
+            // VM's sampler between install and refresh settle).
+            assertTrue("rev sampler must see at least revBefore + revMoved", calls.get() >= 2)
+            assertTrue("rev sampler must not exceed revBefore + revMoved", calls.get() <= 2)
             assertFalse("mark path (3rd read) must not run on discard", thirdHappened.get())
             // Latch discipline: the 2nd read observed the bump (revMoved true);
             // the 3rd read gate stayed closed (no release needed, no hang).

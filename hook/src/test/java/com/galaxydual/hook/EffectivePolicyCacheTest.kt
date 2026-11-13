@@ -332,6 +332,15 @@ class EffectivePolicyCacheTest {
     // This is preferred because (a) a throwing iterator signals corrupt prefs
     // content, not a transient IPC blip, and (b) an explicit invalidate()
     // (same-process listener hygiene or TTL expiry) still recovers promptly.
+    //
+    // FIXME(P3): deliberate tradeoff pending PRODUCT SIGN-OFF. A hostile
+    // remote that is only transiently bad (one rebel write, then fixed out of
+    // band) is suppressed for the full maxCacheAgeMs after the first hostile
+    // read — recovery only via TTL expiry or invalidate(), never via a normal
+    // poll, because the sanitized seed-only value is cached as a SUCCESSFUL
+    // read. Do not strengthen this pin (e.g. re-reading to detect recovery)
+    // without product sign-off on the retry-storm vs staleness balance; the
+    // assertions below intentionally pin current behavior, not desired UX.
     @Test
     fun hostileRemoteSanitizesToSeedOnlyAndCaches() {
         var reads = 0

@@ -277,7 +277,11 @@ class PolicyWriteCrossVmTest {
             assertNull(vmC.state.value.pendingPolicyWrite)
             assertFalse(vmC.state.value.policyDraftKnown)
             assertEquals(MsgKind.CHANNEL, vmC.state.value.msgKind)
-            // Direction-safe negative: 300ms window, any C write fails the test.
+            // Direction-safe negative: any C write fails the test. No latch exists
+            // for this arm (the stale-gate rejection is fully synchronous — no
+            // pending created, no coroutine launched — so there is no reconciler
+            // to await); keep a short bounded window as regression cover against a
+            // future async regression on this path. See the file header.
             Thread.sleep(300)
             assertEquals(0, saveCallsC.get())
             assertEquals(setOf("com.B"), backend.get())
@@ -289,7 +293,14 @@ class PolicyWriteCrossVmTest {
             // refuse (UNKNOWN_REFRESH, zero C writes), proving even a borrowed base
             // cannot overwrite unseen B without a fresh read.
             // Deterministic aging (no real 800ms sleep): backdate staged nanos.
-            try { coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L) } catch (_: Throwable) { Thread.sleep(800) }
+            // A failure here means the pendingPublishAtNanos AtomicLong seam is
+            // gone — fail loudly instead of silently substituting a wall-clock
+            // wait that would turn this deterministic test timing-dependent.
+            try {
+                coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L)
+            } catch (_: Throwable) {
+                throw AssertionError("pendingPublishAtNanos seam missing")
+            }
             setStale(vmC, false)
             seedKnown(vmC, setOf("com.A"))
             val borrowed = PendingPolicyWrite(
@@ -486,7 +497,14 @@ class PolicyWriteCrossVmTest {
             assertNotNull(coord.pendingPublish.get())
             // Omit emitStaged (publisher died here). Age past threshold.
             // Deterministic aging (no real 800ms sleep): backdate staged nanos.
-            try { coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L) } catch (_: Throwable) { Thread.sleep(800) }
+            // A failure here means the pendingPublishAtNanos AtomicLong seam is
+            // gone — fail loudly instead of silently substituting a wall-clock
+            // wait that would turn this deterministic test timing-dependent.
+            try {
+                coord.pendingPublishAtNanos.set(System.nanoTime() - 5_000_000_000L)
+            } catch (_: Throwable) {
+                throw AssertionError("pendingPublishAtNanos seam missing")
+            }
 
             // VM-C freshly verifies B, then writes C. Must succeed (retire stranded real).
             val vmC = makeVm2Direct(store, coord, policyIoTimeoutMs = 300)

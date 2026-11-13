@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 // K4 P2#6: bounded refresh (zero-queue + at-most-one guard + stuck breaker).
@@ -16,6 +17,19 @@ import java.util.concurrent.atomic.AtomicLong
 // queue without bound. This pins: queue/outstanding bounded (<=1, no growth),
 // budget respected, post-invalidate recovery.
 class PolicyRefreshGateTest {
+
+    // Bounded poll until the condition holds; throws AssertionError after
+    // 5s so a stuck worker fails fast instead of hanging the test suite.
+    // Yields (no sleep quanta) — matches the existing drain idiom.
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition()) {
+            if (System.nanoTime() >= deadline) {
+                throw AssertionError("await timed out after 5s")
+            }
+            Thread.yield()
+        }
+    }
 
     // Reader that ignores interruption (simulates uninterruptible Binder
     // read): swallows InterruptedException and keeps sleeping to the full
@@ -148,7 +162,7 @@ class PolicyRefreshGateTest {
             repeat(3) {
                 val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
                 assertNull(r)
-                Thread.sleep(600)
+                await { gate.activeCount() == 0 }
             }
             assertTrue("breaker must be open after 3 consecutive timeouts", gate.isStuck())
             assertTrue(gate.stuckShortCircuits.get() >= 1)
@@ -162,8 +176,8 @@ class PolicyRefreshGateTest {
             // Recovery: invalidate resets the breaker; a good reader succeeds.
             gate.invalidate()
             assertFalse(gate.isStuck())
-            // Ensure the stale worker drained (600ms > 500ms stall).
-            Thread.sleep(600)
+            // Ensure the stale worker drained.
+            await { gate.activeCount() == 0 }
             val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
             assertEquals(setOf("ok"), good)
             assertFalse(gate.isStuck())
@@ -204,7 +218,7 @@ class PolicyRefreshGateTest {
             repeat(3) {
                 val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
                 assertNull(r)
-                Thread.sleep(600)
+                await { gate.activeCount() == 0 }
             }
             assertTrue("breaker must be open after 3 consecutive timeouts", gate.isStuck())
             assertEquals(0L, gate.halfOpenProbes.get())
@@ -213,7 +227,7 @@ class PolicyRefreshGateTest {
             assertNull(shorted)
             assertEquals("no probe before cooldown", 0L, gate.halfOpenProbes.get())
             assertTrue(gate.isStuck())
-            // Worker drained (600ms sleeps > 500ms stalls) + cooldown elapsed:
+            // Worker drained (await activeCount==0) + cooldown elapsed:
             // the next read is the single bounded probe — upstream has
             // recovered, so it succeeds and closes the breaker.
             clock.addAndGet(300L)
@@ -249,7 +263,7 @@ class PolicyRefreshGateTest {
             repeat(3) {
                 val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
                 assertNull(r)
-                Thread.sleep(600)
+                await { gate.activeCount() == 0 }
             }
             assertTrue(gate.isStuck())
             assertEquals(200L, gate.halfOpenCooldownMs())
@@ -258,7 +272,7 @@ class PolicyRefreshGateTest {
             clock.addAndGet(300L)
             val failedProbe = gate.readBounded(ignoringReader(500), timeoutMs = 50)
             assertNull(failedProbe)
-            Thread.sleep(600)
+            await { gate.activeCount() == 0 }
             assertTrue("failed probe must keep the breaker open", gate.isStuck())
             assertEquals(1L, gate.halfOpenProbes.get())
             assertEquals(1L, gate.halfOpenFailureCount())
