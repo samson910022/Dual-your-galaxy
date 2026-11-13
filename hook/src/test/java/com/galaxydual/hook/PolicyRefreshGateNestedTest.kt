@@ -30,6 +30,12 @@ class PolicyRefreshGateNestedTest {
             value
         }
 
+    // NOTE (T12): this test deliberately pins the PRE-FIX failure shape —
+    // one gate shared between the outer policy read and its nested probe
+    // self-contends the single-flight permit, so the outer always falls back
+    // to seed-only. It documents why the gates must stay split. If the
+    // capability/policy gates ever merge, DELETE this test together with the
+    // gate split (it would then assert behavior that no longer exists).
     @Test
     fun sharedGateNestedProbeSelfContends() {
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-nested-shared")

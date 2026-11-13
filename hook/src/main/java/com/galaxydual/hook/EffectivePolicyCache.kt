@@ -14,9 +14,16 @@ package com.galaxydual.hook
 // Phase7: follower grace is budget-aware + process-tunable via
 // [get]'s followerGraceMs param (default [DEFAULT_FOLLOWER_GRACE_MS] 50ms;
 // system_server may pass 0 to skip the grace sleep entirely).
+// H8: the caller degrades the follower grace to 0 when the deadline basis is
+// broken (DualHook passes followerGraceMs = 0 and deadlineMs = -1 on a broken
+// nanoTime sample); a zero grace falls back to cached/seed synchronously —
+// the same fail-closed shape DeadlineBudget gives broken clocks (no budget).
 import java.util.concurrent.atomic.AtomicLong
 
-class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }) {
+class EffectivePolicyCache(
+    private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val onLog: (String) -> Unit = {},
+) {
     private val lock = Any()
     private var cached: Set<String> = emptySet()
     private var valid = false
@@ -89,10 +96,35 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
         const val DEFAULT_FOLLOWER_GRACE_MS = 50L
     }
 
-    // Phase7 observability: follower grace waits taken (grace > 0 path).
-    // Skipped (grace <= 0) fast-paths do not increment. Monotonic, never
-    // reset (process-lifetime; tests read only).
+    // Phase7 observability: follower grace waits taken. Counted inside the
+    // lock immediately before waitGrace(), so hits==1 implies the follower
+    // was parked (or about to park) in the wait; fast-paths that return
+    // without waiting never increment — neither do grace <= 0 skips, nor a
+    // follower that finds the leader already done on entry (no wait).
+    // Monotonic, never reset (process-lifetime; tests read only).
     val followerGraceHits = AtomicLong(0L)
+
+    // H9 observability: monotonic counters for the seed-only fallback shapes
+    // that used to return silently, plus a process-wide throttled failure
+    // log (at most one line per FALLBACK_LOG_THROTTLE_MS, including the live
+    // counter values) so a dead daemon cannot spam system_server on every
+    // query. Counters are plain increments; the log path is allocation-light
+    // and never throws.
+    val contentionFallbackSeedOnly = AtomicLong(0L)
+    val invalidatedDiscardSeedOnly = AtomicLong(0L)
+    val graceExpiredSeedOnly = AtomicLong(0L)
+    // O3: the failureCooldownMs-window seed-only fallback (no prior good
+    // value, or an explicit invalidation since) is a distinct shape from an
+    // invalidate-during-IO discard; counted separately so H9 sees it.
+    val cooldownFallbackSeedOnly = AtomicLong(0L)
+    // CR-O4: the merge-failed / failed-read fallback (reader returned null or
+    // threw, or the merged set could not be built) with nothing good cached
+    // and nothing to resurrect — the last H9-silent seed-only arm, counted
+    // like its siblings. (hadGoodValue && !invalidated still returns the
+    // last-known-good snapshot and never counts here.)
+    val failedReadSeedOnly = AtomicLong(0L)
+    private val lastFallbackLogMs = AtomicLong(Long.MIN_VALUE)
+    private val FALLBACK_LOG_THROTTLE_MS = 5_000L
 
     @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private fun waitGrace(timeoutMs: Long) {
@@ -103,6 +135,39 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
     @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private fun notifyFollowers() {
         (lock as java.lang.Object).notifyAll()
+    }
+
+    // H9: one throttled failure line per FALLBACK_LOG_THROTTLE_MS across all
+    // seed-only causes. Logging must never break the hook path and
+    // must never let a dead daemon spam the log on every whitelist query.
+    // O2/CR-N2: a broken clock (nowMs() throws => Long.MIN_VALUE sentinel,
+    // matching lastStuckOpenMs/lastFallbackLogMs — -1L is a legitimate
+    // negative millisecond sample and must never be mistaken for it) skips
+    // the log entirely — including the throttle-guard update — so a dead
+    // clock cannot bypass the 5s throttle and spam; counters at the call
+    // sites may still increment (observability only).
+    private fun noteSeedOnlyFallback(cause: String) {
+        val now = try {
+            nowMs()
+        } catch (_: Throwable) {
+            Long.MIN_VALUE
+        }
+        if (now == Long.MIN_VALUE) return
+        val last = lastFallbackLogMs.get()
+        if (last != Long.MIN_VALUE && now - last < FALLBACK_LOG_THROTTLE_MS) return
+        if (!lastFallbackLogMs.compareAndSet(last, now)) return
+        try {
+            onLog(
+                "policy cache seed-only fallback ($cause): " +
+                    "contention=${contentionFallbackSeedOnly.get()} " +
+                    "invalidatedDiscard=${invalidatedDiscardSeedOnly.get()} " +
+                    "graceExpired=${graceExpiredSeedOnly.get()} " +
+                    "cooldown=${cooldownFallbackSeedOnly.get()} " +
+                    "failedRead=${failedReadSeedOnly.get()}",
+            )
+        } catch (_: Throwable) {
+            // Diagnostics only.
+        }
     }
 
     fun get(
@@ -124,7 +189,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             nowMs()
         } catch (_: Throwable) {
             synchronized(lock) {
-                return if (valid) cached.toSet()
+                return if (valid) cached
                 else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
         }
@@ -137,15 +202,19 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 valid = false
                 invalidated = true
             }
-            if (valid) return cached.toSet()
+            if (valid) return cached
             // During the cooldown, do not retry the reader; return the cache/seed.
             // Phase 5: comment language unified to English (was Chinese).
             val lf = lastFailureMs
             if (lf != null && now0 - lf < failureCooldownMs) {
                 // After an explicit invalidation, never resurrect a stale
                 // pre-invalidation cached value: fall back to the seed alone.
-                return if (hadGoodValue && !invalidated) cached.toSet()
-                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                if (hadGoodValue && !invalidated) return cached
+                // H9: cooldown-throttled seed-only fallback (no good value
+                // yet, or explicit invalidation since).
+                cooldownFallbackSeedOnly.incrementAndGet()
+                noteSeedOnlyFallback("cooldown")
+                return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
             // Stage C single-flight claim: a second concurrent miss becomes a
             // follower. Phase3: followers do NOT return seed-only immediately;
@@ -155,7 +224,7 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             if (inFlightGen != null) {
                 // Re-check valid under the same guard before leaving (a peer
                 // may have committed between the valid check above and here).
-                if (valid) return cached.toSet()
+                if (valid) return cached
                 isFollower = true
                 // Fall through to the grace wait outside the lock.
                 // gen0 unused for followers; assign a placeholder to satisfy
@@ -180,31 +249,44 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             } catch (_: Throwable) {
                 0L
             }
+            // Phase7: an explicit followerGraceMs is honored even when it
+            // exceeds the process default (tests use longer graces to pin
+            // notifyAll semantics); the clamp only enforces the lower bound 0.
+            // Warning: deadlineMs is interpreted on the cache's nowMs() basis
+            // (the same basis as elapsed/now1), NOT wall-clock millis — a
+            // wall-clock deadlineMs silently mis-clamps the grace; callers on
+            // a custom nowMs must sample deadlineMs from that same clock.
             val remainingGrace = if (deadlineMs > 0L) {
                 try {
-                    minOf(followerGraceMs - elapsed, deadlineMs - now1).coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
+                    minOf(followerGraceMs - elapsed, deadlineMs - now1).coerceAtLeast(0L)
                 } catch (_: Throwable) {
                     0L
                 }
             } else {
                 try {
-                    (followerGraceMs - elapsed).coerceIn(0L, DEFAULT_FOLLOWER_GRACE_MS)
+                    (followerGraceMs - elapsed).coerceAtLeast(0L)
                 } catch (_: Throwable) {
                     0L
                 }
             }
             if (remainingGrace <= 0L) {
                 synchronized(lock) {
-                    if (valid) return cached.toSet()
+                    if (valid) return cached
+                    // H9: grace-expired follower fell back to seed-only.
+                    graceExpiredSeedOnly.incrementAndGet()
+                    noteSeedOnlyFallback("grace-expired")
                     return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 }
             }
-            try {
-                followerGraceHits.incrementAndGet()
-            } catch (_: Throwable) {
-            }
             synchronized(lock) {
                 if (!valid && inFlightGen != null) {
+                    // TT-P3-1: count the hit only once we are parked (or about
+                    // to park) inside the lock — a pre-park preemption must not
+                    // yield a false hits==1 for a follower that never waits.
+                    try {
+                        followerGraceHits.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
                     try {
                         waitGrace(remainingGrace)
                     } catch (t: Throwable) {
@@ -216,7 +298,14 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                         }
                     }
                 }
-                if (valid) return cached.toSet()
+                if (valid) return cached
+                // H9: the grace arm fired — the follower's grace expired (it
+                // either parked for its full grace, or never parked because
+                // the leader failed fast / released before this follower
+                // re-acquired the lock) with no committed value. graceExpired-
+                // SeedOnly counts this arm, not proof of parking.
+                graceExpiredSeedOnly.incrementAndGet()
+                noteSeedOnlyFallback("grace-expired")
                 return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
             }
         }
@@ -246,14 +335,20 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
             synchronized(lock) {
                 try {
                     // A peer may have committed while we were in IO; prefer it.
-                    if (valid) return cached.toSet()
+                    if (valid) return cached
                     // Loser-drop still applies: an invalidate during IO means
                     // seed-only (never resurrect stale).
                     if (gen0 != generation) {
+                        // H9: invalidate-during-IO discard -> seed-only.
+                        invalidatedDiscardSeedOnly.incrementAndGet()
+                        noteSeedOnlyFallback("invalidated-discard")
                         return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                     }
-                    return if (hadGoodValue && !invalidated) cached.toSet()
-                    else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                    if (hadGoodValue && !invalidated) return cached
+                    // H9: contention fallback with nothing committed yet.
+                    contentionFallbackSeedOnly.incrementAndGet()
+                    noteSeedOnlyFallback("contention")
+                    return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 } finally {
                     if (inFlightGen == gen0) {
                         inFlightGen = null
@@ -283,29 +378,41 @@ class EffectivePolicyCache(private val nowMs: () -> Long = { System.nanoTime() /
                 // Loser discards: invalidated while IO was in flight, or a peer
                 // already committed a good value.
                 if (gen0 != generation) {
-                    return if (valid) cached.toSet() else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                    if (valid) return cached
+                    // H9: invalidate-during-IO discard -> seed-only.
+                    invalidatedDiscardSeedOnly.incrementAndGet()
+                    noteSeedOnlyFallback("invalidated-discard")
+                    return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 }
-                if (valid) return cached.toSet()
+                if (valid) return cached
                 if (mergeOk && merged != null) {
-                    // Defensive snapshot: callers receive copies (see returns
-                    // above), so a caller-held mutable view can never shrink or
-                    // poison the cached value.
-                    cached = merged.toSet()
+                    // H4: commit-time snapshot — merged is a fresh set the
+                    // cache solely owns; wrap it once, share it on every
+                    // hot-path return (no per-call toSet() copy). The cached
+                    // view is unmodifiable, so a caller that tries to mutate
+                    // the returned set fails fast instead of corrupting
+                    // policy state; PolicySource.effective returns a plain
+                    // LinkedHashSet, which we never hand out mutable again.
+                    cached = java.util.Collections.unmodifiableSet(merged)
                     valid = true
                     hadGoodValue = true
                     invalidated = false
                     lastFailureMs = null
                     failureLogged = false
                     lastRefreshMs = now1
-                    return cached.toSet()
+                    return cached
                 } else {
                     // Sliding cooldown: refresh lastFailureMs on every failure
                     // unconditionally; consecutive failures stay throttled (see
                     // cooldownThrottlesConsecutiveFailures). Success/invalidate clears
                     // it (branch above). Phase 5: unified to English.
                     lastFailureMs = now1
-                    return if (hadGoodValue && !invalidated) cached.toSet()
-                    else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                    if (hadGoodValue && !invalidated) return cached
+                    // CR-O4: H9 — failed read with nothing good to resurrect:
+                    // seed-only fallback, counted like the sibling arms.
+                    failedReadSeedOnly.incrementAndGet()
+                    noteSeedOnlyFallback("failed-read")
+                    return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 }
             } finally {
                 // Stage C: release the single-flight claim, but only if it is

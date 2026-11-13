@@ -30,39 +30,61 @@ object WhitelistPolicy {
     private const val DESCRIBE_CACHE_MAX = 128
     private val describeCache = ConcurrentHashMap<Executable, String>()
 
-    // Caps unexpected-args observe-only spam on the hot path: mismatch logs
-    // fire only while extra is non-empty, and at most the first N times per
-    // process (a persistently mismatched method would otherwise log on every
-    // query). Wired via logBounded() (no dead fields); see BoundedLogTest.
-    private const val MAX_UNEXPECTED_ARGS_LOGS = 8
-    private val unexpectedArgsLogs = AtomicInteger(0)
+    // H13: caps unexpected-args observe-only spam on the hot path. The old
+    // single process-global 8-log allowance could be drained by one noisy
+    // method, silencing every other method for the process lifetime. Now each
+    // distinct methodDesc gets its own small budget
+    // (MAX_UNEXPECTED_ARGS_PER_METHOD) and a process-global cap
+    // (MAX_UNEXPECTED_ARGS_GLOBAL_LOGS) backstops the aggregate worst case.
+    // Per-method accounting uses a bounded map (UNEXPECTED_ARGS_KEYS_MAX);
+    // once full, unseen keys fall back to the global cap only.
+    private const val MAX_UNEXPECTED_ARGS_PER_METHOD = 8
+    internal const val MAX_UNEXPECTED_ARGS_GLOBAL_LOGS = 64
+    private const val UNEXPECTED_ARGS_KEYS_MAX = 128
+    private val unexpectedArgsLogs = AtomicInteger(0) // attempts (logged + suppressed)
+    private val unexpectedArgsGlobalLogs = AtomicInteger(0) // emitted, capped by MAX_UNEXPECTED_ARGS_GLOBAL_LOGS
+    private val perMethodLogs = ConcurrentHashMap<String, AtomicInteger>()
 
-    // Bounded mismatch logger (P2-4): logs the first MAX_UNEXPECTED_ARGS_LOGS
-    // mismatches, then stays silent. Returns true when the message was
-    // logged (false when suppressed). Test seam: remainingBudget() exposes
-    // the budget for JVM tests without touching Android. The Boolean return
-    // is the rate-limit contract (callers must not assume a log fired).
-    internal fun logBounded(onLog: (String) -> Unit, msg: String): Boolean {
-        val n = unexpectedArgsLogs.incrementAndGet()
-        if (n <= MAX_UNEXPECTED_ARGS_LOGS) {
-            try {
-                onLog(msg)
-            } catch (_: Throwable) {
-            }
-            return true
+    // Bounded mismatch logger (P2-4/H13). Returns true when the message was
+    // logged (false when suppressed). Test seam: remainingUnexpectedArgsBudget()
+    // exposes the GLOBAL budget for JVM tests without touching Android.
+    // methodKey is the caller's methodDesc;
+    // when null, callers share the "" bucket. The Boolean return is the
+    // rate-limit contract (callers must not assume a log fired).
+    internal fun logBounded(onLog: (String) -> Unit, msg: String, methodKey: String? = null): Boolean {
+        unexpectedArgsLogs.incrementAndGet()
+        val key = methodKey ?: ""
+        // Bounded map growth: at the key cap, unseen keys bypass per-method
+        // accounting and are governed by the global cap alone.
+        val per = if (perMethodLogs.size < UNEXPECTED_ARGS_KEYS_MAX || perMethodLogs.containsKey(key)) {
+            perMethodLogs.computeIfAbsent(key) { AtomicInteger(0) }
+        } else {
+            null
         }
-        return false
+        if (per != null && per.incrementAndGet() > MAX_UNEXPECTED_ARGS_PER_METHOD) {
+            return false
+        }
+        if (unexpectedArgsGlobalLogs.incrementAndGet() > MAX_UNEXPECTED_ARGS_GLOBAL_LOGS) {
+            return false
+        }
+        try {
+            onLog(msg)
+        } catch (_: Throwable) {
+        }
+        return true
     }
 
     internal fun unexpectedArgsLogCount(): Int = unexpectedArgsLogs.get()
 
     internal fun remainingUnexpectedArgsBudget(): Int =
-        (MAX_UNEXPECTED_ARGS_LOGS - unexpectedArgsLogs.get()).coerceAtLeast(0)
+        (MAX_UNEXPECTED_ARGS_GLOBAL_LOGS - unexpectedArgsGlobalLogs.get()).coerceAtLeast(0)
 
-    // Test-only reset (JVM tests run in one process; without reset the 8-log
+    // Test-only reset (JVM tests run in one process; without reset the log
     // budget would leak across tests).
     internal fun resetUnexpectedArgsLogsForTest() {
         unexpectedArgsLogs.set(0)
+        unexpectedArgsGlobalLogs.set(0)
+        perMethodLogs.clear()
     }
 
     // Human-readable hook target for logs, e.g. "Bar#isWhitelisted(String)".
@@ -156,6 +178,7 @@ object WhitelistPolicy {
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with non-Boolean declared return ${HookLog.shortClass(declaredReturnType)}; " +
                         "returning original",
+                methodDesc,
                 )
                 return result
             }
@@ -171,6 +194,7 @@ object WhitelistPolicy {
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with unverified package arg (size=${args.size}); " +
                         "returning original",
+                methodDesc,
                 )
                 return result
             }
@@ -180,6 +204,7 @@ object WhitelistPolicy {
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: boolean " +
                         "result with non-String package arg at index $effectiveIndex; " +
                         "returning original",
+                methodDesc,
                 )
                 return result
             }
@@ -198,6 +223,7 @@ object WhitelistPolicy {
                     logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "list with non-String elements; returning original",
+                    methodDesc,
                     )
                     return result
                 }
@@ -206,6 +232,7 @@ object WhitelistPolicy {
                     logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "unverified collection element type/generic for list; returning original",
+                    methodDesc,
                     )
                     return result
                 }
@@ -222,6 +249,7 @@ object WhitelistPolicy {
                 logBounded(onLog,
                     "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                         "sorted/navigable set ${HookLog.shortClass(result.javaClass)}; returning original",
+                methodDesc,
                 )
                 return result
             }
@@ -230,6 +258,7 @@ object WhitelistPolicy {
                     logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "set with non-String elements; returning original",
+                    methodDesc,
                     )
                     return result
                 }
@@ -238,6 +267,7 @@ object WhitelistPolicy {
                     logBounded(onLog, 
                         "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                             "unverified collection element type/generic for set; returning original",
+                    methodDesc,
                     )
                     return result
                 }
@@ -272,6 +302,7 @@ object WhitelistPolicy {
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                     "unsupported collection ${HookLog.shortClass(result.javaClass)}; " +
                     "returning original",
+            methodDesc,
             )
             return result
         }
@@ -294,6 +325,7 @@ object WhitelistPolicy {
             "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                 "unrecognized result ${result?.let { HookLog.shortClass(it.javaClass) } ?: "null"}; " +
                 "returning original",
+        methodDesc,
         )
         return result
     }
@@ -365,6 +397,7 @@ object WhitelistPolicy {
                 "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
                     "merged type ${HookLog.shortClass(merged.javaClass)} incompatible with " +
                     "declared ${HookLog.shortClass(declaredReturnType)}; returning original",
+            methodDesc,
             )
             return original
         }

@@ -8201,6 +8201,10 @@ class DualViewModel(
                             if (nowPendingNull) {
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
+                                // A2-2: the pending vanished mid-SAVING — the draft fence
+                                // must be dropped just like the preIoAbort path, or a stale
+                                // Known fence survives an unfinished write.
+                                markPolicyUnknownLocked()
                             }
                             _state.update {
                                 if (nowPendingNull) {
@@ -8208,6 +8212,10 @@ class DualViewModel(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                        msgKind = MsgKind.CHANNEL,
                                     )
                                 } else {
                                     it.copy(
@@ -8266,6 +8274,9 @@ class DualViewModel(
                                 if (nowPendingNull2) {
                                     inFlightWrites.remove(key)
                                     policyWriteSaving.remove(key)
+                                    // A2-2: after the await, the pending vanished — drop the
+                                    // draft fence exactly like the preIoAbort path.
+                                    markPolicyUnknownLocked()
                                 }
                                 _state.update {
                                     if (nowPendingNull2) {
@@ -8273,6 +8284,10 @@ class DualViewModel(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
                                             policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraftKnown = false,
+                                            policyDraftCorrupt = false,
+                                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                            msgKind = MsgKind.CHANNEL,
                                         )
                                     } else {
                                         it.copy(

@@ -30,8 +30,9 @@ class PolicyRefreshBudgetTest {
             )
             val elapsed = System.nanoTime() / 1_000_000L - start
             assertNull(result)
-            // Must return near the budget, not after the 2s stall.
-            assertTrue("elapsed=$elapsed", elapsed < 1_500)
+            // Hang-guard only (not a hot-path SLA): must return near the
+            // budget, not after the 2s stall.
+            assertTrue("hang-guard: elapsed=$elapsed", elapsed < 1_000)
         } finally {
             executor.shutdownNow()
         }

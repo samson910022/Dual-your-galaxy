@@ -2,7 +2,6 @@
 package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // P1-1 contract: no cross-process push on LSPosed API 102.0.0.
@@ -85,12 +84,11 @@ class CrossProcessFreshnessContractTest {
     }
 
     @Test
-    fun sameProcessListenerIsLocalOnly_neverFiresForCrossProcessWrite() {
-        // Documents the API 102.0.0 reality pinning this contract: even a
-        // registered OnSharedPreferenceChangeListener is local-only, so a
-        // hook-side test must never assert that an app-side write becomes
-        // visible without an explicit poll (TTL) or reboot. This test pins
-        // the cache side of that contract: staleness persists until poll.
+    fun staleCachePersistsUntilPollOrInvalidate() {
+        // Pins the cache side of the API 102.0.0 contract: without an
+        // explicit poll (TTL expiry) or invalidate(), the hook cache serves
+        // the stale value forever — no cross-process write can have pushed
+        // an update into this process.
         var time = 1_000L
         val cache = EffectivePolicyCache(nowMs = { time })
         assertEquals(
@@ -109,6 +107,27 @@ class CrossProcessFreshnessContractTest {
             },
         )
         assertEquals(0, reads)
-        assertTrue(true)
+        // Advance past the TTL: the next read polls and picks up the fresh
+        // value (the only freshness mechanism besides invalidate()).
+        time = 1_000L + 60_000L + 1L
+        assertEquals(
+            setOf("fresh"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("fresh")
+            },
+        )
+        assertEquals(1, reads)
+        // T-F8: invalidate() arm — the other freshness signal: after an
+        // explicit invalidate the very next read polls again.
+        cache.invalidate()
+        assertEquals(
+            setOf("fresh-2"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("fresh-2")
+            },
+        )
+        assertEquals(2, reads)
     }
 }

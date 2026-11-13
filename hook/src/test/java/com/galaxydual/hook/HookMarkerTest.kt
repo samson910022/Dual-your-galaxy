@@ -40,6 +40,46 @@ class HookMarkerTest {
         assertEquals(42L, HookMarker.parseTimeMs(raw))
     }
 
+    // H12: unknown scope tokens are dropped (fail-closed — never treated as
+    // an active scope) and counted in unknownScopeDrops. Known tokens in the
+    // same line still survive.
+    @Test fun parse_dropsUnknownScopeTokensAndCountsThem() {
+        val before = HookMarker.unknownScopeDrops.get()
+        val logs = mutableListOf<String>()
+        val raw = "scope=system_server,evil_scope,also_unknown,daagent\n"
+        assertEquals(setOf("system_server", "daagent"), HookMarker.parseScopes(raw) { logs.add(it) })
+        assertEquals(before + 2L, HookMarker.unknownScopeDrops.get())
+        assertEquals(1, logs.size)
+        assertTrue(logs[0].contains("unknown scope"))
+    }
+
+    // CR-O2/H12 parity: markActive validates `want` against the same
+    // allowlist as on-disk tokens — an unknown scope is never persisted
+    // (fail-closed), is counted on the drop channel, and the write proceeds
+    // with only the disk history (or nothing, and no marker is written).
+    @Test fun markActive_unknownScopeNotPersistedAndCounted() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val file = File(dir, "galaxydual_hook.active")
+            val before = HookMarker.unknownScopeDrops.get()
+            val logs = mutableListOf<String>()
+            assertFalse(HookMarker.markActive("evil_scope", file, 1000L, logs::add))
+            assertFalse(file.exists())
+            assertEquals(before + 1L, HookMarker.unknownScopeDrops.get())
+            assertTrue(logs.any { it.contains("unknown scope") })
+            // Disk history survives; only the bogus want is dropped.
+            file.writeText(HookMarker.buildContent(setOf("system_server"), 1000L))
+            val dropsBefore2 = HookMarker.unknownScopeDrops.get()
+            assertTrue(HookMarker.markActive("evil_scope", file, 2000L, logs::add))
+            val raw = file.readText()
+            assertEquals(setOf("system_server"), HookMarker.parseScopes(raw))
+            assertFalse(raw.contains("evil_scope"))
+            assertEquals(dropsBefore2 + 1L, HookMarker.unknownScopeDrops.get())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     // markActive merges: a second scope joins the first instead of
     // overwriting it (both hook processes share one marker file).
     @Test fun markActive_mergesScopesAcrossWrites() {

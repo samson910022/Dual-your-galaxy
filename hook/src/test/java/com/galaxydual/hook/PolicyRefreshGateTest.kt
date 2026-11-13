@@ -48,7 +48,7 @@ class PolicyRefreshGateTest {
             val r0 = gate.readBounded(ignoringReader(2_000), timeoutMs = 50)
             val elapsed0 = System.nanoTime() / 1_000_000L - start0
             assertNull(r0)
-            assertTrue("budget respected elapsed=$elapsed0", elapsed0 < 1_500)
+            assertTrue("hang-guard: budget respected elapsed=$elapsed0", elapsed0 < 1_000)
             // Worker still busy (ignoring reader runs 2s). Immediate second
             // read must NOT queue: guard contention or SynchronousQueue
             // rejection short-circuits to null, fast, with a drop counted.
@@ -57,7 +57,7 @@ class PolicyRefreshGateTest {
             val r1 = gate.readBounded({ setOf("fast") }, timeoutMs = 50)
             val elapsed1 = System.nanoTime() / 1_000_000L - start1
             assertNull("second read while worker stuck must drop to null", r1)
-            assertTrue("drop must be fast elapsed=$elapsed1", elapsed1 < 1_500)
+            assertTrue("hang-guard: drop must be fast elapsed=$elapsed1", elapsed1 < 1_000)
             assertTrue(
                 "droppedRefreshCount must grow (before=$dropsBefore after=${gate.droppedRefreshCount.get()})",
                 gate.droppedRefreshCount.get() > dropsBefore,
@@ -157,7 +157,7 @@ class PolicyRefreshGateTest {
             val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
             val elapsed = System.nanoTime() / 1_000_000L - start
             assertNull(shorted)
-            assertTrue("short-circuit must be fast elapsed=$elapsed", elapsed < 1_500)
+            assertTrue("hang-guard: short-circuit must be fast elapsed=$elapsed", elapsed < 1_000)
             assertEquals("zero queue while stuck", 0, gate.queueDepth())
             // Recovery: invalidate resets the breaker; a good reader succeeds.
             gate.invalidate()

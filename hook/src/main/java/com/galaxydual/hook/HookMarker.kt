@@ -2,6 +2,8 @@
 package com.galaxydual.hook
 
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 // Phase F4b-P2 (issue #6): hook-active marker shared by the hook writer and
 // the app reader.
@@ -75,22 +77,85 @@ object HookMarker {
 
     // Pure: extracts the scope set; null/blank/garbage (including unknown
     // lines) yields emptySet(), never null, never throws.
-    fun parseScopes(raw: String?): Set<String> {
+    // H12: scope tokens are allowlisted — only {system_server, daagent} (the
+    // only scopes this module ever writes) are honored; anything else is
+    // dropped (fail-closed: an unknown token can never describe a scope) and
+    // counted. At most UNKNOWN_SCOPE_DROP_LOG_CAP log lines per process;
+    // pass onLog to observe drops, otherwise they are counted silently.
+    private val ALLOWED_SCOPES = setOf(SCOPE_SYSTEM_SERVER, SCOPE_DAAGENT)
+    private const val UNKNOWN_SCOPE_DROP_LOG_CAP = 4
+    val unknownScopeDrops = AtomicLong(0L)
+    private val unknownScopeDropLogs = AtomicInteger(0)
+
+    fun parseScopes(raw: String?, onLog: ((String) -> Unit)? = null): Set<String> {
         if (raw.isNullOrBlank()) return emptySet()
         val out = LinkedHashSet<String>()
+        var dropped = 0
         for (line in raw.lineSequence()) {
             val trimmed = line.trim()
             if (!trimmed.startsWith("scope=")) continue
             trimmed.removePrefix("scope=").split(",").forEach { token ->
                 val scope = token.trim()
-                if (scope.isNotEmpty()) out.add(scope)
+                if (scope.isEmpty()) return@forEach
+                if (ALLOWED_SCOPES.contains(scope)) {
+                    out.add(scope)
+                } else {
+                    dropped++
+                }
+            }
+        }
+        if (dropped > 0) {
+            unknownScopeDrops.addAndGet(dropped.toLong())
+            val n = unknownScopeDropLogs.incrementAndGet()
+            if (n <= UNKNOWN_SCOPE_DROP_LOG_CAP) {
+                try {
+                    onLog?.invoke(
+                        "marker ignored $dropped unknown scope token(s) (allowlist={system_server,daagent})",
+                    )
+                } catch (_: Throwable) {
+                    // Diagnostics only.
+                }
             }
         }
         return out
     }
 
+    // H15: best-effort lost-update telemetry. Both hook processes write the
+    // same primary file read-merge-write with no locking, so a concurrent
+    // write may drop a scope. Track the per-process monotonic union of every
+    // scope this process has ever read from disk; a merged write that no
+    // longer contains a bit we previously saw means a previously recorded
+    // scope vanished (peer write clobber, partial write, external edit).
+    // Counter + log only — never repaired here. Process-local by design: a
+    // fresh process starts at 0 and only reports against scopes it has
+    // observed itself; writes are rare (one per hook install per process).
+    private const val SCOPE_BIT_SYSTEM_SERVER = 1L
+    private const val SCOPE_BIT_DAAGENT = 2L
+    val scopeMergeLostUpdates = AtomicLong(0L)
+    private val everSeenScopeBits = AtomicLong(0L)
+    // CR-N4: process-lifetime cap for the "lost update suspected" line —
+    // mirrors UNKNOWN_SCOPE_DROP_LOG_CAP so a pathological merge storm cannot
+    // spam the log on every hook install. The counter always increments;
+    // only the line is capped.
+    private const val LOST_UPDATE_LOG_CAP = 4
+    private val lostUpdateLogs = AtomicInteger(0)
+
+    private fun scopeBits(scopes: Set<String>): Long {
+        var bits = 0L
+        for (scope in scopes) {
+            when (scope) {
+                SCOPE_SYSTEM_SERVER -> bits = bits or SCOPE_BIT_SYSTEM_SERVER
+                SCOPE_DAAGENT -> bits = bits or SCOPE_BIT_DAAGENT
+            }
+        }
+        return bits
+    }
+
+    // H11 note: timeMs is consumed by the app for its diagnostics surface
+    // (HookStateProvider / DualViewModel read the marker's timeMs line), so
+    // it is not dead code — kept for the boot-time staleness comparison the
+    // docs already call out as future hardening.
     // Pure: extracts the timeMs line; absent/unparseable yields null.
-    // Kept for a future boot-time staleness check (see header: not wired).
     fun parseTimeMs(raw: String?): Long? {
         if (raw.isNullOrBlank()) return null
         for (line in raw.lineSequence()) {
@@ -123,9 +188,37 @@ object HookMarker {
     ): Boolean {
         try {
             val want = scope.trim()
-            val merged = (parseScopes(readTextOrNull(markerFile, onLog, "primary")) +
-                parseScopes(readTextOrNull(fallbackFile, onLog, "fallback"))).toMutableSet()
-            if (want.isNotEmpty()) merged.add(want)
+            val merged = (parseScopes(readTextOrNull(markerFile, onLog, "primary"), onLog) +
+                parseScopes(readTextOrNull(fallbackFile, onLog, "fallback"), onLog)).toMutableSet()
+            if (want.isNotEmpty()) {
+                // CR-O2/H12 parity: `want` must pass the same allowlist as the
+                // on-disk tokens — an unknown scope can never be persisted
+                // (fail-closed). Counted on the same drop channel; a single
+                // safeLog per call (markActive is once-per-install) and the
+                // unknown scope is skipped, never merged.
+                if (ALLOWED_SCOPES.contains(want)) {
+                    merged.add(want)
+                } else {
+                    unknownScopeDrops.incrementAndGet()
+                    safeLog(onLog, "marker ignored unknown scope want='$want' (allowlist={system_server,daagent})")
+                }
+            }
+            // H15: detect a previously-seen scope disappearing from the
+            // merged view (concurrent writers, partial write, external
+            // edit). Monotonic process-local union; log + counter only.
+            val mergedBits = scopeBits(merged)
+            val seen = everSeenScopeBits.getAndUpdate { it or mergedBits }
+            if (seen != 0L && (mergedBits and seen) != seen) {
+                scopeMergeLostUpdates.incrementAndGet()
+                val n = lostUpdateLogs.incrementAndGet()
+                if (n <= LOST_UPDATE_LOG_CAP) {
+                    safeLog(
+                        onLog,
+                        "marker: previously recorded scope vanished across merges " +
+                            "(lost update suspected), now writing=${merged.sorted().joinToString(",")}",
+                    )
+                }
+            }
             if (merged.isEmpty()) {
                 safeLog(onLog, "marker not written: no scope to record")
                 return false
@@ -180,19 +273,88 @@ object HookMarker {
         }
     }
 
-    // Best-effort single-file write (mkdirs + writeText); false on any
-    // failure, never throws.
+    // Best-effort single-file write: write to a sibling tmp file first, then
+    // atomic rename over the target (H11) so a concurrent reader never
+    // observes a half-written marker. If rename is unavailable/refused on a
+    // given ROM, fall back to the old direct write (best effort, see header).
+    // false on any failure, never throws.
+    // CR-N3: a process that dies between the tmp write and the rename leaves
+    // an orphan `*.tmp-*` sibling; delete at most ORPHAN_TMP_SWEEP_MAX such
+    // siblings per call (older than ORPHAN_TMP_STALE_MS so a concurrent
+    // in-flight write's tmp is never taken out from under its rename — a
+    // young tmp is skipped). Enumeration failure or any per-file error is
+    // swallowed: sweeping must never break the write.
+    // Frozen-writer caveat (SIGSTOP / debugger / frozen >= ORPHAN_TMP_STALE_MS):
+    // a writer stopped after it created its tmp but before the rename can see
+    // its own tmp age past the staleness window and be swept by another
+    // process's call. The rename then fails and the write falls back to a
+    // non-atomic direct write of the target (or fails). Fail-soft: the target
+    // file itself is never deleted or truncated by the sweep; at worst a
+    // crash during that direct write leaves a torn marker, which readScopes
+    // maps to "not detected" (fail-closed) — no target data loss.
+    private const val ORPHAN_TMP_SWEEP_MAX = 16
+    private const val ORPHAN_TMP_STALE_MS = 60_000L
+
     private fun tryWrite(file: File, content: String): Boolean {
+        try {
+            val prefix = file.name + ".tmp-"
+            val siblings = file.parentFile?.listFiles { _, name -> name.startsWith(prefix) }
+            if (siblings != null) {
+                var swept = 0
+                val now = System.currentTimeMillis()
+                for (sibling in siblings) {
+                    if (swept >= ORPHAN_TMP_SWEEP_MAX) break
+                    try {
+                        if (!sibling.isFile) continue
+                        val mtime = sibling.lastModified()
+                        if (mtime > 0L && now - mtime < ORPHAN_TMP_STALE_MS) continue
+                        if (sibling.delete()) swept++
+                    } catch (_: Throwable) {
+                        // Best effort: keep sweeping.
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // Best effort: a sweep failure must never break the write.
+        }
+        // Unique tmp name per write: both hook processes write the same
+        // primary file, and a shared tmp name would let one process rename
+        // the other's half-written tmp over the target (lost update).
+        val tmp: File? = try {
+            file.parentFile?.let {
+                File(it, file.name + ".tmp-" + System.nanoTime() + "-" + Thread.currentThread().id)
+            }
+        } catch (_: Exception) {
+            null
+        }
         return try {
             try {
                 file.parentFile?.mkdirs()
             } catch (_: Exception) {
                 // Best effort: parents normally exist.
             }
+            if (tmp != null) {
+                try {
+                    tmp.writeText(content)
+                    if (tmp.renameTo(file)) return true
+                    // renameTo refused (filesystem/SELinux): fall through to
+                    // the direct write with the tmp file removed below.
+                } catch (_: Exception) {
+                    // tmp path failed: fall through to the direct write.
+                }
+            }
             file.writeText(content)
             true
         } catch (_: Exception) {
             false
+        } finally {
+            if (tmp != null) {
+                try {
+                    if (tmp.exists()) tmp.delete()
+                } catch (_: Throwable) {
+                    // Best effort cleanup.
+                }
+            }
         }
     }
 
