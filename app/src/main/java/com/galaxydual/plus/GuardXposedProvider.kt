@@ -224,18 +224,27 @@ class GuardXposedProvider(
 internal fun isTrustedXposedCaller(callingUid: Int, myUid: Int): Boolean {
     if (callingUid < 0) return false
     if (callingUid == 0 || callingUid == 1000) return true
-    return callingUid == myUid
+    if (callingUid == myUid) return true
+    val callerUser = callingUid / 100_000
+    val myUser = myUid / 100_000
+    val appId = callingUid % 100_000
+    return callerUser == myUser && appId == 1000
 }
 
 // 拒絕診斷的 uid 類別 (純函數,可 JVM 測)：只記粗類別，絕不記 binder 內容、
-// arg、extras 或包名。shell 單列（2000 為 adb/shell 高風險）；其餘 1001..9999
+// arg、extras 或包名。shell 單列（2000 為 adb/shell 高風險）；其餘 0..9999
 // 特權 uid 歸 privileged；負數歸 negative；其餘一律 app（含一般 app 與
-// FIRST_APPLICATION_UID 邊界）。self 不會走到拒絕分支（受信），故無 self 類別。
-internal fun uidRejectionCategory(callingUid: Int, myUid: Int): String = when {
-    callingUid < 0 -> "negative"
-    callingUid == 2000 -> "shell"
-    callingUid in 1001..9999 && callingUid != myUid -> "privileged"
-    else -> "app"
+// FIRST_APPLICATION_UID 邊界）。多用戶（secondary user / work profile）下
+// UID 高位帶有 userId * 100_000，取 appId = callingUid % 100_000 正規化。
+// self 不會走到拒絕分支（受信），故無 self 類別。
+internal fun uidRejectionCategory(callingUid: Int, myUid: Int): String {
+    if (callingUid < 0) return "negative"
+    val appId = callingUid % 100_000
+    return when {
+        appId == 2000 -> "shell"
+        appId in 0..9999 && callingUid != myUid -> "privileged"
+        else -> "app"
+    }
 }
 
 // call 的門控＋委派決策 (純函數,可 JVM 測):method 為 null 或 callingUid

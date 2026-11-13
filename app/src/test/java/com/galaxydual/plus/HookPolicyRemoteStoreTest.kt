@@ -24,6 +24,13 @@ class HookPolicyRemoteStoreTest {
     fun setUp() {
         // Phase2 #2 身份自檢 + 全域毒為全域狀態，跨測必須隔離。
         resetRemotePoisonForTests()
+        testIdentityCheckHook = null
+    }
+
+    @org.junit.After
+    fun tearDown() {
+        resetRemotePoisonForTests()
+        testIdentityCheckHook = null
     }
 
     // Minimal in-memory SharedPreferences with an Editor that records explicit
@@ -52,8 +59,12 @@ class HookPolicyRemoteStoreTest {
         var commitSucceeds = true
         var commitThrows = false
         var corruptType = false
+        var cancelOnAll = false
 
-        override fun getAll(): MutableMap<String, *> = LinkedHashMap(data)
+        override fun getAll(): MutableMap<String, *> {
+            if (cancelOnAll) throw kotlinx.coroutines.CancellationException("backup cancelled")
+            return LinkedHashMap(data)
+        }
         override fun getString(key: String?, defValue: String?): String? =
             if (data[key] is String) data[key] as? String else defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
@@ -1384,4 +1395,233 @@ class HookPolicyRemoteStoreTest {
         }
     }
 
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun cancellationException_propagatesFromIsServiceAvailable() {
+        val store = remoteHookPolicyStore {
+            throw kotlinx.coroutines.CancellationException("test cancel")
+        }
+        store.repairCorrupt()
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun cancellationException_propagatesFromLoadResult() {
+        val store = remoteHookPolicyStore {
+            throw kotlinx.coroutines.CancellationException("test cancel")
+        }
+        store.loadResult()
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun cancellationException_propagatesFromHasCorruptEvidence() {
+        val store = remoteHookPolicyStore {
+            throw kotlinx.coroutines.CancellationException("test cancel")
+        }
+        store.hasCorruptEvidence()
+    }
+
+    @Test
+    fun perStoreIdentityTracking_isolatesDistinctStoreInstances() {
+        resetRemotePoisonForTests()
+        try {
+            val prefsA = RecordingPrefs()
+            val prefsB = RecordingPrefs()
+            val storeA = remoteHookPolicyStore { prefsA }
+            val storeB = remoteHookPolicyStore { prefsB }
+
+            // Store A reads from prefsA
+            val resA1 = storeA.loadResult()
+            assertTrue(resA1 is LoadResult.Known)
+
+            // Store B reads from prefsB; must NOT falsely treat storeA's prefs as wrapper churn
+            val resB1 = storeB.loadResult()
+            assertTrue(resB1 is LoadResult.Known)
+
+            // Store A reads again; identity is stable for store A
+            val resA2 = storeA.loadResult()
+            assertTrue(resA2 is LoadResult.Known)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test
+    fun checkPrefsIdentityStable_detectsWrapperChurnAcrossDistinctInstancesWhenPoisonPresent() {
+        resetRemotePoisonForTests()
+        try {
+            val storeRef = AtomicReference<SharedPreferences?>(null)
+            val prefs1 = RecordingPrefs()
+            val prefs2 = RecordingPrefs()
+
+            // 1. Initial check records prefs1
+            assertTrue(checkPrefsIdentityStable(prefs1, storeRef))
+
+            // 2. Perform GC to verify strong reference prevents GC-induced churn evasion
+            System.gc()
+
+            // 3. Without poison or corrupt evidence, distinct instance is allowed (legitimate swap)
+            // But when poison is present:
+            remotePoison.set(PoisonState(mapOf(WeakPrefKey(prefs1) to 1L), 1L))
+
+            // 4. Distinct instance prefs2 must now be detected as wrapper churn and rejected
+            assertFalse(
+                "Wrapper churn across distinct instances must be detected when poison is present",
+                checkPrefsIdentityStable(prefs2, storeRef),
+            )
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test
+    fun wrapperChurn_detectedAcrossDistinctInstancesWhenPoisonPresentInStore() {
+        resetRemotePoisonForTests()
+        try {
+            var currentPrefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { currentPrefs }
+
+            // Store loads with initial prefs instance
+            val res1 = store.loadResult()
+            assertTrue(res1 is LoadResult.Known)
+
+            // Introduce poison to currentPrefs
+            remotePoison.set(PoisonState(mapOf(WeakPrefKey(currentPrefs) to 1L), 1L))
+
+            // Force GC: strong reference in store keeps previous identity
+            System.gc()
+
+            // Distinct instance arrives (wrapper churn)
+            currentPrefs = RecordingPrefs()
+
+            // Store must detect wrapper churn and fail closed (Unavailable)
+            val res2 = store.loadResult()
+            assertTrue("Must fail closed to Unavailable on wrapper churn when poison present", res2 is LoadResult.Unavailable)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test
+    fun repairCorrupt_rethrowsCancellationExceptionDuringBackupWithoutClearingPolicy() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("com.example.protected")))
+            assertEquals(
+                setOf("com.example.protected"),
+                prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+            )
+
+            // Simulate cancellation during backup
+            prefs.cancelOnAll = true
+
+            try {
+                store.repairCorrupt()
+                org.junit.Assert.fail("Expected CancellationException to be rethrown")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                assertEquals("backup cancelled", ce.message)
+            }
+
+            // Verify policy was NOT cleared
+            assertEquals(
+                setOf("com.example.protected"),
+                prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+            )
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test
+    fun repairCorrupt_rethrowsCancellationExceptionFromCustomBackupHookWithoutClearingPolicy() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("com.example.protected")))
+
+            store.setBackupHook {
+                throw kotlinx.coroutines.CancellationException("custom backup hook cancelled")
+            }
+
+            try {
+                store.repairCorrupt()
+                org.junit.Assert.fail("Expected CancellationException to be rethrown")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                assertEquals("custom backup hook cancelled", ce.message)
+            }
+
+            // Verify policy was NOT cleared
+            assertEquals(
+                setOf("com.example.protected"),
+                prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet(),
+            )
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test
+    fun repairProbeAndLoadRaw_failClosedOnIdentityCheckExceptions() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("com.example.ok")))
+
+            // When identity check throws a non-cancellation Throwable:
+            testIdentityCheckHook = {
+                throw RuntimeException("simulated identity check crash")
+            }
+
+            // 1. loadRaw must catch the exception and fail closed to null -> loadResult() is Unavailable
+            val loadRes = store.loadResult()
+            assertTrue(
+                "loadResult must fail closed to Unavailable on identity check exception, was $loadRes",
+                loadRes is LoadResult.Unavailable,
+            )
+
+            // 2. repairProbe must catch the exception and fail closed (identityOk = false) -> loadForRepair() is Unavailable
+            val repairRes = store.loadForRepair()
+            assertTrue(
+                "loadForRepair must fail closed to Unavailable on identity check exception, was $repairRes",
+                repairRes is LoadResult.Unavailable,
+            )
+        } finally {
+            testIdentityCheckHook = null
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun loadRaw_propagatesCancellationExceptionFromIdentityCheck() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            testIdentityCheckHook = {
+                throw kotlinx.coroutines.CancellationException("identity check cancelled")
+            }
+            store.loadResult()
+        } finally {
+            testIdentityCheckHook = null
+            resetRemotePoisonForTests()
+        }
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun repairProbe_propagatesCancellationExceptionFromIdentityCheck() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            testIdentityCheckHook = {
+                throw kotlinx.coroutines.CancellationException("identity check cancelled")
+            }
+            store.loadForRepair()
+        } finally {
+            testIdentityCheckHook = null
+            resetRemotePoisonForTests()
+        }
+    }
 }
