@@ -242,14 +242,90 @@ class PolicyTxCoordinator {
         -1L
     }
 
-    suspend fun <T> withCommitLock(block: suspend () -> T): T = commitMutex.withLock { block() }
+    internal var commitLockFailForTests: (() -> Throwable)? = null
+
+    suspend fun <T> withCommitLock(block: suspend () -> T): T {
+        commitLockFailForTests?.let { throw it() }
+        return commitMutex.withLock { block() }
+    }
+
+    private fun canAdvanceLatest(cur: PolicySettled?, incoming: PolicySettled): Boolean {
+        if (cur == null) return true
+        if (incoming.rev == -1L) {
+            if (cur.rev != -1L) return false
+            return incoming.txId > cur.txId ||
+                (incoming.txId == cur.txId && incoming.key == cur.key)
+        }
+        if (cur.rev == -1L) return true
+        if (incoming.rev > cur.rev) return true
+        return incoming.rev == cur.rev &&
+            incoming.txId == cur.txId &&
+            incoming.key == cur.key
+    }
+
+    private fun tryUpdateLatestMonotonic(incoming: PolicySettled): Boolean {
+        while (true) {
+            val cur = _latest.value
+            if (!canAdvanceLatest(cur, incoming)) return false
+            if (_latest.compareAndSet(cur, incoming)) return true
+        }
+    }
+
+    private fun clearPendingOwnerIfMatch(txId: Long, key: String) {
+        try {
+            val own = try { pendingOwner.get() } catch (_: Exception) { null }
+            if (own != null && own.txId == txId && own.key == key) {
+                pendingOwner.compareAndSet(own, null)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun clearPendingAndOwnerIfMatch(
+        txId: Long,
+        key: String,
+        rev: Long,
+        fallbackA: PolicySettled? = null,
+        fallbackB: PolicySettled? = null,
+    ) {
+        try {
+            val curP = try { pendingPublish.get() } catch (_: Exception) { null }
+            if (curP != null && curP.txId == txId && curP.key == key &&
+                (curP.rev == rev || rev == -1L)
+            ) {
+                if (pendingPublish.compareAndSet(curP, null)) {
+                    clearPendingOwnerIfMatch(curP.txId, curP.key)
+                }
+            } else {
+                if (fallbackA != null) {
+                    try {
+                        if (pendingPublish.compareAndSet(fallbackA, null)) {
+                            clearPendingOwnerIfMatch(fallbackA.txId, fallbackA.key)
+                        }
+                    } catch (_: Exception) { }
+                }
+                if (fallbackB != null) {
+                    try {
+                        if (pendingPublish.compareAndSet(fallbackB, null)) {
+                            clearPendingOwnerIfMatch(fallbackB.txId, fallbackB.key)
+                        }
+                    } catch (_: Exception) { }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
 
     // Stage L1 P1: atomic complete (CAS + revision bump + stage) under commitMutex.
     // Returns true=winner (staged, caller must invoke afterClaimBeforeEmit hook
     // then emit after unlock); false=loser (no stage, no bump).
     // Stage L3: stamp rev (= committedRevision) into pending placeholder; _latest
     // 不寫 placeholder（非終態），終態經 stageRealPayload 寫入。
+    // Placeholder-only invariant: payload must be (!known && msg.isEmpty()).
     suspend fun completeWithRevision(tx: DualViewModel.PolicyTx, payload: PolicySettled): Boolean {
+        require(!payload.known && payload.msg.isEmpty()) {
+            "completeWithRevision only accepts placeholder payloads (!known && msg.isEmpty())"
+        }
         var ok = false
         commitMutex.withLock {
             try {
@@ -288,6 +364,9 @@ class PolicyTxCoordinator {
         payload: PolicySettled,
         revBefore: Long,
     ): Boolean {
+        require(!payload.known && payload.msg.isEmpty()) {
+            "completeWithRevisionChecked only accepts placeholder payloads (!known && msg.isEmpty())"
+        }
         var ok = false
         commitMutex.withLock {
             try {
@@ -605,21 +684,23 @@ class PolicyTxCoordinator {
                     } catch (_: Exception) {
                         payload
                     }
-                    pendingPublish.set(stamped)
-                    // Stage M3/N3: refresh fence time on overwrite (same lock).
-                    try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
-                    try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
-                    val latestCur = try { _latest.value } catch (_: Exception) { null }
                     val canSetLatest = try {
-                        if (latestCur == null || stamped.rev == -1L || latestCur.rev == -1L) true
-                        else if (stamped.rev > latestCur.rev) true
-                        else stamped.rev == latestCur.rev &&
-                            stamped.txId == latestCur.txId && stamped.key == latestCur.key
+                        tryUpdateLatestMonotonic(stamped)
                     } catch (_: Exception) { false }
                     if (canSetLatest) {
-                        try { _latest.value = stamped } catch (_: Exception) { }
+                        pendingPublish.set(stamped)
+                        // Stage M3/N3: refresh fence time on overwrite (same lock).
+                        try { pendingPublishAtMs.set(System.currentTimeMillis()) } catch (_: Exception) { }
+                        try { pendingPublishAtNanos.set(System.nanoTime()) } catch (_: Exception) { }
                         out = stamped
                     } else {
+                        try {
+                            if (pendingPublish.compareAndSet(cur, null)) {
+                                clearPendingOwnerIfMatch(cur.txId, cur.key)
+                            }
+                        } catch (_: Exception) {
+                        }
+                        val latestCur = try { _latest.value } catch (_: Exception) { null }
                         emitSuperseded.incrementAndGet()
                         logCoord(
                             "stage superseded txId=${payload.txId} rev=${stamped.rev} " +
@@ -721,6 +802,13 @@ class PolicyTxCoordinator {
                 val cur = try { pendingPublish.get() } catch (_: Exception) { null }
                 if (cur != null && cur.txId == toEmit.txId && cur.key == toEmit.key && cur.rev != -1L) {
                     try { toEmit = toEmit.copy(rev = cur.rev) } catch (_: Exception) { }
+                } else if (cur != null && (cur.txId != toEmit.txId || cur.key != toEmit.key)) {
+                    emitSuperseded.incrementAndGet()
+                    logCoord(
+                        "emit rejected (foreign pending) txId=${toEmit.txId} " +
+                            "by pending txId=${cur.txId} rev=${cur.rev}",
+                    )
+                    return
                 }
             }
         } catch (_: Exception) {
@@ -734,49 +822,24 @@ class PolicyTxCoordinator {
         } catch (_: Exception) {
         }
         val finalEmit = toEmit
-        // Overtake guard: stale (rev < latest) never overwrites _latest nor
-        // SharedFlow order — explicit supersede, never silent.
-        // Stage N3 P1#3: equal rev from a DIFFERENT identity is also stale
-        // (borrowed-rev resurrection); only same-identity equal rev may refresh.
-        try {
-            val curLatest = try { _latest.value } catch (_: Exception) { null }
-            if (curLatest != null && finalEmit.rev != -1L && curLatest.rev != -1L) {
-                val sameIdentity = finalEmit.txId == curLatest.txId && finalEmit.key == curLatest.key
-                if (finalEmit.rev < curLatest.rev || (finalEmit.rev == curLatest.rev && !sameIdentity)) {
-                    emitSuperseded.incrementAndGet()
-                    logCoord(
-                        "emit superseded txId=${finalEmit.txId} rev=${finalEmit.rev} " +
-                            "behind latest rev=${curLatest.rev} txId=${curLatest.txId}",
-                    )
-                    try {
-                        val curP = try { pendingPublish.get() } catch (_: Exception) { null }
-                        if (curP != null && curP.txId == finalEmit.txId &&
-                            curP.key == finalEmit.key && curP.rev == finalEmit.rev
-                        ) {
-                            pendingPublish.compareAndSet(curP, null)
-                        }
-                    } catch (_: Exception) {
-                    }
-                    return
-                }
-            }
-            // Ensure _latest holds it (idempotent when stageReal already set;
-            // synthetic path sets here).
-            // Stage N3: equal-rev different-identity never overwrites (borrowed rev).
-            try {
-                val cur2 = try { _latest.value } catch (_: Exception) { null }
-                val canSet = try {
-                    if (cur2 == null || finalEmit.rev == -1L || cur2.rev == -1L) true
-                    else if (finalEmit.rev > cur2.rev) true
-                    else finalEmit.rev == cur2.rev &&
-                        finalEmit.txId == cur2.txId && finalEmit.key == cur2.key
-                } catch (_: Exception) { false }
-                if (canSet) {
-                    _latest.value = finalEmit
-                }
-            } catch (_: Exception) {
-            }
+        // Overtake guard: stale (rev < latest) or -1L sentinel over positive
+        // latest never overwrites _latest nor SharedFlow order — explicit
+        // supersede, never silent. Stage N3 P1#3: equal rev from a DIFFERENT
+        // identity is also stale (borrowed-rev resurrection). Atomic CAS loop.
+        val updatedLatest = try {
+            tryUpdateLatestMonotonic(finalEmit)
         } catch (_: Exception) {
+            false
+        }
+        if (!updatedLatest) {
+            val curLatest = try { _latest.value } catch (_: Exception) { null }
+            emitSuperseded.incrementAndGet()
+            logCoord(
+                "emit superseded txId=${finalEmit.txId} rev=${finalEmit.rev} " +
+                    "behind latest rev=${curLatest?.rev} txId=${curLatest?.txId}",
+            )
+            clearPendingAndOwnerIfMatch(finalEmit.txId, finalEmit.key, finalEmit.rev)
+            return
         }
         var ok = false
         try {
@@ -785,27 +848,13 @@ class PolicyTxCoordinator {
             ok = false
         }
         if (ok) {
-            try {
-                val curP = try { pendingPublish.get() } catch (_: Exception) { null }
-                if (curP != null && curP.txId == finalEmit.txId &&
-                    curP.key == finalEmit.key && curP.rev == finalEmit.rev
-                ) {
-                    if (pendingPublish.compareAndSet(curP, null)) {
-                        try {
-                            val own = try { pendingOwner.get() } catch (_: Exception) { null }
-                            if (own != null && own.txId == curP.txId && own.key == curP.key) {
-                                pendingOwner.compareAndSet(own, null)
-                            }
-                        } catch (_: Exception) {
-                        }
-                    }
-                } else {
-                    // Legacy fallback: direct compare (synthetic without pending → no-op).
-                    try { pendingPublish.compareAndSet(payload, null) } catch (_: Exception) { }
-                    try { pendingPublish.compareAndSet(finalEmit, null) } catch (_: Exception) { }
-                }
-            } catch (_: Exception) {
-            }
+            clearPendingAndOwnerIfMatch(
+                finalEmit.txId,
+                finalEmit.key,
+                finalEmit.rev,
+                fallbackA = payload,
+                fallbackB = finalEmit,
+            )
             return
         }
         try {
@@ -813,6 +862,8 @@ class PolicyTxCoordinator {
                 var delivered = false
                 try {
                     delivered = withTimeoutOrNull(2_000L) { _settled.emit(finalEmit); true } ?: false
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Exception) {
                     delivered = false
                 }
@@ -839,26 +890,13 @@ class PolicyTxCoordinator {
                     } catch (_: Exception) {
                     }
                 }
-                try {
-                    val curP2 = try { pendingPublish.get() } catch (_: Exception) { null }
-                    if (curP2 != null && curP2.txId == finalEmit.txId &&
-                        curP2.key == finalEmit.key && curP2.rev == finalEmit.rev
-                    ) {
-                        if (pendingPublish.compareAndSet(curP2, null)) {
-                            try {
-                                val own2 = try { pendingOwner.get() } catch (_: Exception) { null }
-                                if (own2 != null && own2.txId == curP2.txId && own2.key == curP2.key) {
-                                    pendingOwner.compareAndSet(own2, null)
-                                }
-                            } catch (_: Exception) {
-                            }
-                        }
-                    } else {
-                        try { pendingPublish.compareAndSet(payload, null) } catch (_: Exception) { }
-                        try { pendingPublish.compareAndSet(finalEmit, null) } catch (_: Exception) { }
-                    }
-                } catch (_: Exception) {
-                }
+                clearPendingAndOwnerIfMatch(
+                    finalEmit.txId,
+                    finalEmit.key,
+                    finalEmit.rev,
+                    fallbackA = payload,
+                    fallbackB = finalEmit,
+                )
             }
         } catch (_: Exception) {
         }
@@ -970,33 +1008,19 @@ class PolicyTxCoordinator {
             }
         } catch (_: Exception) {
         }
-        try {
-            val curLatest = try { _latest.value } catch (_: Exception) { null }
-            if (curLatest != null && stamped.rev != -1L && curLatest.rev != -1L) {
-                val sameId = stamped.txId == curLatest.txId && stamped.key == curLatest.key
-                if (stamped.rev < curLatest.rev || (stamped.rev == curLatest.rev && !sameId)) {
-                    emitSuperseded.incrementAndGet()
-                    logCoord(
-                        "tryEmit superseded txId=${stamped.txId} rev=${stamped.rev} " +
-                            "behind latest rev=${curLatest.rev}",
-                    )
-                    return false
-                }
-            }
-            try {
-                val cur2 = try { _latest.value } catch (_: Exception) { null }
-                val canSet = try {
-                    if (cur2 == null || stamped.rev == -1L || cur2.rev == -1L) true
-                    else if (stamped.rev > cur2.rev) true
-                    else stamped.rev == cur2.rev &&
-                        stamped.txId == cur2.txId && stamped.key == cur2.key
-                } catch (_: Exception) { false }
-                if (canSet) {
-                    _latest.value = stamped
-                }
-            } catch (_: Exception) {
-            }
+        val updatedLatest = try {
+            tryUpdateLatestMonotonic(stamped)
         } catch (_: Exception) {
+            false
+        }
+        if (!updatedLatest) {
+            val curLatest = try { _latest.value } catch (_: Exception) { null }
+            emitSuperseded.incrementAndGet()
+            logCoord(
+                "tryEmit superseded txId=${stamped.txId} rev=${stamped.rev} " +
+                    "behind latest rev=${curLatest?.rev}",
+            )
+            return false
         }
         return tryEmitShared(stamped)
     }
@@ -1027,6 +1051,8 @@ class PolicyTxCoordinator {
             withTimeoutOrNull(timeoutMs) {
                 merge(latest.filterNotNull(), settled).first { it.txId == txId && it.key == key }
             }
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Exception) {
             null
         }
@@ -1123,6 +1149,10 @@ class PolicyTxCoordinator {
             }
         } catch (_: Exception) {
             // Best effort.
+        }
+        try {
+            commitLockFailForTests = null
+        } catch (_: Exception) {
         }
         try {
             if (commitMutex.isLocked) {

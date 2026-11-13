@@ -14,6 +14,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -163,6 +164,7 @@ class PolicyTxCoordinatorPhase4Test {
             assertEquals(512, coord.claimTombstones.size)
             assertFalse(coord.isTombstoned(tx.txId, tx.key))
             assertEquals(genBefore, coord.orphanDropGen.get())
+            assertTrue(coord.tombstoneRejects.get() >= 1L)
         } finally {
             coord.close()
         }
@@ -177,10 +179,12 @@ class PolicyTxCoordinatorPhase4Test {
             repeat(512) { i -> coord.claimTombstones["old:$i"] = i.toLong() }
             val tx = placeholderTx(coord, "phase4-overrun-full", completedOwner = false)
             stagePlaceholder(coord, tx)
+            val rejectsBefore = coord.tombstoneRejects.get()
             assertFalse(runBlocking { coord.discardOverrunPlaceholder(tx.txId, tx.key) })
             assertNotNull(coord.pendingPublish.get())
             assertEquals(512, coord.claimTombstones.size)
             assertFalse(coord.isTombstoned(tx.txId, tx.key))
+            assertTrue(coord.tombstoneRejects.get() > rejectsBefore)
         } finally {
             coord.close()
         }
@@ -288,6 +292,138 @@ class PolicyTxCoordinatorPhase4Test {
                 "opMutex->writeMutex->policyRevisionMutex->commitMutex",
                 coord.policyTxLockOrder(),
             )
+        } finally {
+            coord.close()
+        }
+    }
+
+    @Test
+    fun completeWithRevisionChecked_claimsMatching_rejectsStale_enforcesPlaceholderOnly() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            // Non-placeholder payloads must be rejected fail-loud by both claim methods.
+            val txBad = placeholderTx(coord, "phase4-non-ph", completedOwner = true)
+            val realPayload = PolicySettled(txBad.txId, txBad.key, setOf("com.p"), true, MsgKind.INFO, "ok", false)
+            val msgOnlyPayload = PolicySettled(txBad.txId, txBad.key, setOf("com.p"), false, MsgKind.CHANNEL, "err", false)
+            for (bad in listOf(realPayload, msgOnlyPayload)) {
+                var threwUnchecked = false
+                try {
+                    coord.completeWithRevision(txBad, bad)
+                } catch (_: IllegalArgumentException) {
+                    threwUnchecked = true
+                }
+                assertTrue("completeWithRevision must reject non-placeholder $bad", threwUnchecked)
+                var threwChecked = false
+                try {
+                    coord.completeWithRevisionChecked(txBad, bad, 0L)
+                } catch (_: IllegalArgumentException) {
+                    threwChecked = true
+                }
+                assertTrue("completeWithRevisionChecked must reject non-placeholder $bad", threwChecked)
+            }
+
+            // Stale revBefore rejected: activeTx intact, committedRevision unchanged.
+            val tx1 = placeholderTx(coord, "phase4-checked-stale", completedOwner = true)
+            coord.activeTx.set(tx1)
+            val bumped = coord.bumpRevisionForTests()
+            assertEquals(1L, bumped)
+            val ph1 = PolicySettled(tx1.txId, tx1.key, emptySet(), false, MsgKind.CHANNEL, "", true)
+            assertFalse(coord.completeWithRevisionChecked(tx1, ph1, 0L))
+            assertTrue(coord.activeTx.get() === tx1)
+            assertEquals(1L, coord.committedRevision.get())
+            assertNull(coord.pendingPublish.get())
+
+            // Matching revBefore succeeds: activeTx cleared, committedRevision bumped, placeholder staged.
+            assertTrue(coord.completeWithRevisionChecked(tx1, ph1, 1L))
+            assertNull(coord.activeTx.get())
+            assertEquals(2L, coord.committedRevision.get())
+            assertEquals(2L, coord.pendingPublish.get()?.rev)
+        } finally {
+            coord.close()
+        }
+    }
+
+    @Test
+    fun latest_negativeOneSentinel_neverOverwritesPositiveRev() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val first = PolicySettled(
+                coord.nextTxId(), "phase4-pos-1",
+                setOf("com.1"), true, MsgKind.INFO, "m1", false,
+            )
+            assertTrue(coord.tryEmitSettled(first))
+            val posLatest = coord.latest.value
+            assertNotNull(posLatest)
+            assertTrue(posLatest!!.rev > 0L)
+
+            // Verify stageRealPayload rejects -1L sentinel when _latest already holds positive rev.
+            val txNeg = placeholderTx(coord, "phase4-neg-sentinel", completedOwner = true)
+            val negPending = PolicySettled(
+                txNeg.txId, txNeg.key, setOf("com.bad"), false, MsgKind.CHANNEL, "", false, rev = -1L,
+            )
+            coord.pendingPublish.set(negPending)
+            val supersededBefore = coord.emitSuperseded.get()
+            val stagedNeg = coord.stageRealPayload(
+                PolicySettled(txNeg.txId, txNeg.key, setOf("com.bad"), true, MsgKind.INFO, "bad", false, rev = -1L),
+            )
+            assertNull(stagedNeg)
+            assertTrue(coord.emitSuperseded.get() > supersededBefore)
+            assertEquals(posLatest, coord.latest.value)
+
+            // Verify tryUpdateLatestMonotonic itself rejects an incoming -1L sentinel over positive rev.
+            val m = PolicyTxCoordinator::class.java.getDeclaredMethod(
+                "tryUpdateLatestMonotonic",
+                PolicySettled::class.java,
+            ).apply { isAccessible = true }
+            val negSentinel = PolicySettled(
+                txNeg.txId, txNeg.key, setOf("com.bad"), true, MsgKind.INFO, "bad", false, rev = -1L,
+            )
+            assertFalse(m.invoke(coord, negSentinel) as Boolean)
+            assertEquals(posLatest, coord.latest.value)
+
+            // Also verify emitStaged with synthetic rev behind an explicit positive latest does not overwrite.
+            val highPos = PolicySettled(
+                coord.nextTxId(), "phase4-pos-high",
+                setOf("com.high"), true, MsgKind.INFO, "high", false, rev = 10L,
+            )
+            assertTrue(coord.tryEmitSettled(highPos))
+            assertEquals(10L, coord.latest.value!!.rev)
+            coord.emitStaged(
+                PolicySettled(txNeg.txId, txNeg.key, setOf("com.bad"), true, MsgKind.INFO, "bad", false, rev = -1L),
+            )
+            assertEquals(highPos, coord.latest.value)
+        } finally {
+            coord.close()
+        }
+    }
+
+    @Test
+    fun stageRealPayload_superseded_doesNotStrandPendingPublish() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val txA = placeholderTx(coord, "phase4-superseded-A", completedOwner = true)
+            stagePlaceholder(coord, txA)
+            assertNotNull(coord.pendingPublish.get())
+            assertSame(txA, coord.pendingOwner.get())
+
+            // Advance _latest beyond txA's claim rev (1) with a newer txB (rev=2).
+            val txB = placeholderTx(coord, "phase4-newer-B", completedOwner = true)
+            val newerB = PolicySettled(
+                txB.txId, txB.key, setOf("com.B"), true, MsgKind.INFO, "okB", false, rev = 2L,
+            )
+            assertTrue(coord.tryEmitSettled(newerB))
+            assertEquals(2L, coord.latest.value?.rev)
+
+            val supersededBefore = coord.emitSuperseded.get()
+            val stagedA = coord.stageRealPayload(
+                PolicySettled(txA.txId, txA.key, setOf("com.A"), true, MsgKind.INFO, "okA", false),
+            )
+            assertNull(stagedA)
+            assertNull("superseded stageRealPayload must not strand pendingPublish", coord.pendingPublish.get())
+            assertNull("superseded stageRealPayload must clear matching pendingOwner", coord.pendingOwner.get())
+            assertEquals(txB.txId, coord.latest.value?.txId)
+            assertEquals(2L, coord.latest.value?.rev)
+            assertTrue(coord.emitSuperseded.get() > supersededBefore)
         } finally {
             coord.close()
         }
