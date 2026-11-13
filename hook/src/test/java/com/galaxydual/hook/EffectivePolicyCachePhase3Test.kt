@@ -75,6 +75,109 @@ class EffectivePolicyCachePhase3Test {
         assertTrue(results.contains(setOf("b")))
     }
 
+    // P1-2 (deterministic in-lock budget recomputation): each nowMs sample
+    // advances the fake clock by 25ms. The follower's entry budget is still
+    // positive (first sample now0=25, second now1=50 -> remainingGrace=25ms;
+    // the leader consumes 25ms too), but when it re-samples nowMs() inside
+    // the parking lock its own window has fully lapsed (elapsed2 = 50ms), so
+    // it must NOT park at all — followerGraceHits stays 0 and it falls back
+    // to seed-only via the graceExpired arm. This pins the in-lock
+    // recomputation deterministically (no threads observe timing luck).
+    @Test
+    fun autoAdvancingClockSkipsGraceWhenBudgetLapsesBeforeParking() {
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.addAndGet(25) })
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val leader = Thread {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true, followerGraceMs = 50) {
+                leaderStarted.countDown()
+                try {
+                    leaderRelease.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                }
+                setOf("leader")
+            }
+        }
+        leader.start()
+        assertTrue("leader must enter reader", leaderStarted.await(5, TimeUnit.SECONDS))
+        val followerResult = cache.get(emptySet(), nonEmptyPolicyGateOpen = true, followerGraceMs = 50) {
+            setOf("follower-read")
+        }
+        assertEquals(emptySet<String>(), followerResult)
+        // Never parked: the in-lock now2 re-sample proved the budget had lapsed.
+        assertEquals(0L, cache.followerGraceHits.get())
+        assertEquals(1L, cache.graceExpiredSeedOnly.get())
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+    }
+
+    // P1-2 (herd serialization, latch-frozen leader): N=4 followers arrive at
+    // staggered injected-clock times (0 / 30 / 45 / 60) against a leader that
+    // never commits inside the grace window. Each follower computes its OWN
+    // bounded budget on entry AND re-checks it inside the parking lock; none
+    // may park meaningfully beyond its own window.
+    // Honest limit: exact per-follower park duration cannot be asserted with
+    // sub-millisecond determinism (wait() wakes on wall-clock granularity and
+    // legal spurious wakeups), so the per-follower wall-clock bound is asserted
+    // with a generous slack rather than equality; the tight in-lock
+    // recomputation itself is pinned deterministically by
+    // autoAdvancingClockSkipsGraceWhenBudgetLapsesBeforeParking. Also unpinned
+    // here: positive-budget (elapsed2 > 0, budget2 > 0) re-clamp amounts — the
+    // recompute is exercised only at its skip-edge; the positive-budget arm
+    // (partial park, not full skip) has no suite-wide pin yet.
+    @Test
+    fun herdFollowersParkOnlyTheirOwnBoundedWindow() {
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.get() })
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val deadline = 80L // shared end-to-end deadline (fake-clock basis)
+        val leader = Thread {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true, followerGraceMs = 50, deadlineMs = deadline) {
+                leaderStarted.countDown()
+                try {
+                    leaderRelease.await(10, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                }
+                setOf("leader")
+            }
+        }
+        leader.start()
+        assertTrue("leader must enter reader", leaderStarted.await(5, TimeUnit.SECONDS))
+        // (arrival fake-time ms, expected budget after entry + in-lock recomputation)
+        val arrivals = listOf(0L to 50L, 30L to 50L, 45L to 35L, 60L to 20L)
+        val durations = LongArray(arrivals.size)
+        for ((index, arrival) in arrivals.withIndex()) {
+            val (arrivalMs, _) = arrival
+            time.set(arrivalMs)
+            val start = System.nanoTime()
+            val result = cache.get(emptySet(), nonEmptyPolicyGateOpen = true, followerGraceMs = 50, deadlineMs = deadline) {
+                setOf("follower-read")
+            }
+            durations[index] = (System.nanoTime() - start) / 1_000_000L
+            // Fail-closed: never the leader's (never-committed) value, seed only.
+            assertEquals(emptySet<String>(), result)
+        }
+        // Stagger serialized arrivals => each follower entered with a full
+        // grace window on the frozen clock, budget clamped only by the shared
+        // deadline: 50/50/35/20ms. None may park much beyond its own budget.
+        for (i in arrivals.indices) {
+            val budget = arrivals[i].second
+            val bound = 2 * budget + 250L // ~2x budget + generous CI slack (documented)
+            assertTrue(
+                "follower #$i stagger-budget ${budget}ms but parked ${durations[i]}ms (bound ${bound}ms)",
+                durations[i] < bound,
+            )
+        }
+        assertEquals(4L, cache.followerGraceHits.get())
+        assertEquals(4L, cache.graceExpiredSeedOnly.get())
+        leaderRelease.countDown()
+        leader.join(2_000)
+        assertFalse(leader.isAlive)
+    }
+
     @Test
     fun contentionDoesNotRenewFailureCooldown() {
         var time = 1_000L

@@ -279,7 +279,34 @@ class EffectivePolicyCache(
                 }
             }
             synchronized(lock) {
-                if (!valid && inFlightGen != null) {
+                // P1-2 (herd parking): re-sample nowMs() and recompute the
+                // remaining wait budget INSIDE the parking lock — time spent
+                // acquiring it (or being preempted between the entry-time
+                // computation above and this point) must not overshoot the
+                // follower grace or the end-to-end deadline. A zero/negative
+                // budget skips waitGrace entirely (seed-only fallback), so a
+                // follower can never park for its full entry-time window after
+                // its deadline has already lapsed.
+                val now2: Long = try {
+                    nowMs()
+                } catch (_: Throwable) {
+                    now1
+                }
+                val elapsed2: Long = try {
+                    (now2 - now0).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
+                val budget2: Long = try {
+                    if (deadlineMs > 0L) {
+                        minOf(remainingGrace, followerGraceMs - elapsed2, deadlineMs - now2)
+                    } else {
+                        minOf(remainingGrace, followerGraceMs - elapsed2)
+                    }
+                } catch (_: Throwable) {
+                    0L
+                }
+                if (budget2 > 0L && !valid && inFlightGen != null) {
                     // TT-P3-1: count the hit only once we are parked (or about
                     // to park) inside the lock — a pre-park preemption must not
                     // yield a false hits==1 for a follower that never waits.
@@ -288,7 +315,7 @@ class EffectivePolicyCache(
                     } catch (_: Throwable) {
                     }
                     try {
-                        waitGrace(remainingGrace)
+                        waitGrace(budget2)
                     } catch (t: Throwable) {
                         if (t is InterruptedException) {
                             try {
@@ -300,10 +327,11 @@ class EffectivePolicyCache(
                 }
                 if (valid) return cached
                 // H9: the grace arm fired — the follower's grace expired (it
-                // either parked for its full grace, or never parked because
-                // the leader failed fast / released before this follower
-                // re-acquired the lock) with no committed value. graceExpired-
-                // SeedOnly counts this arm, not proof of parking.
+                // either parked for its full (recomputed) budget, or never
+                // parked because the budget had already lapsed / the leader
+                // released before this follower re-acquired the lock) with no
+                // committed value. graceExpiredSeedOnly counts this arm, not
+                // proof of parking.
                 graceExpiredSeedOnly.incrementAndGet()
                 noteSeedOnlyFallback("grace-expired")
                 return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)

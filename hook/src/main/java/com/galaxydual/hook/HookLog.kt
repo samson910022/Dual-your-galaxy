@@ -2,13 +2,13 @@
 package com.galaxydual.hook
 
 // Shared log-hygiene helpers (fail-closed, never throws).
-//
-// Package-qualified names never enter logs: exception logs keep only the
-// simple class name + truncated message (take 200), class logs keep only the
-// simple name (take 200). This bounds hostile message length on the hot path
-// and avoids leaking ROM package structure into lspd logs.
-// Used by DualHook / HookInstaller / WhitelistPatch / WhitelistPolicy.
-internal object HookLog {
+// Public: app-module call sites (e.g. MainActivity) reuse the same short-form
+// helpers; package-qualified names never enter logs: exception logs keep only
+// the simple class name + truncated message (take 200), class logs keep only
+// the simple name (take 200). This bounds hostile message length on the hot
+// path and avoids leaking ROM package structure into lspd logs.
+// Used by DualHook / HookInstaller / WhitelistPatch / WhitelistPolicy / app.
+object HookLog {
     private const val MAX_LOG_PART = 200
 
     fun shortEx(t: Throwable): String = try {

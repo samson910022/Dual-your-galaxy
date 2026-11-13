@@ -90,6 +90,7 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
+import com.galaxydual.hook.HookLog
 import com.galaxydual.hook.PolicySource
 import java.io.File
 import java.util.Locale
@@ -3613,7 +3614,10 @@ class MainActivity : ComponentActivity() {
                 s.policyWritePhase == PolicyWritePhase.RECONCILING,
             )
         } catch (e: Exception) {
-            Log.w(TAG, "syncPolicyWriteDialog failed", e)
+            // SEC-L2: no raw exception/message in the log line — constant
+            // message + class-name-only via HookLog (never e.message,
+            // never the full stack).
+            Log.w(TAG, "syncPolicyWriteDialog failed: " + HookLog.shortEx(e))
         }
     }
 

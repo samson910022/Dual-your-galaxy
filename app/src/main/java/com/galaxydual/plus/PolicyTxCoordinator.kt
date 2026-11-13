@@ -1072,6 +1072,10 @@ class PolicyTxCoordinator {
     //   outcome stands; never two winners);
     // - on a won CAS: owner cleared, orphanDropRev/Gen bumped (paired order,
     //   rev before gen) — identical to the locked drop paths.
+    // - accepted over-broad fence on a LOST CAS: the tombstone inserted above
+    //   is kept even though no drop happened (the loser is fenced as seen) —
+    //   deliberate fail-closed bias, bounded by the claim-tombstone eviction
+    //   cap; no real payload is affected (placeholders carry no truth).
     // Placeholders carry no truth (_latest untouched), so a won lock-free drop
     // can never publish or destroy a real payload.
     internal fun dropStagedPlaceholderIfMatch(txId: Long, key: String): Boolean = try {

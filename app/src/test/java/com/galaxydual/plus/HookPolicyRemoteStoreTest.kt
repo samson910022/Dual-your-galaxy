@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -1149,9 +1150,11 @@ class HookPolicyRemoteStoreTest {
         }
     }
 
-    // Phase2 #1 value 截斷：超 4KB 只存類型+長度。
+    // SEC-M: value 超 4KB（joined length）— 標記不是內容，讀回「驗證」只會假
+    // 成功；備份鉤子必須誠實回 Failed（修復仍發生，結果為 RepairedNoBackup，
+    // backupFailureCount 遞增，且不寫入任何 BACKUP_KEY 標記）。
     @Test
-    fun backup_truncatesOversizeValue() {
+    fun backup_oversizeValue_reportsNoBackup_notMarkerWrite() {
         resetRemotePoisonForTests()
         try {
             val prefs = RecordingPrefs()
@@ -1162,12 +1165,43 @@ class HookPolicyRemoteStoreTest {
             ).commit())
             prefs.corruptType = true
             val store = remoteHookPolicyStore { prefs }
-            assertTrue(store.repairCorrupt() is RepairResult.Repaired)
-            @Suppress("UNCHECKED_CAST")
-            val bak = prefs.all[BACKUP_KEY] as? Set<String>
-            assertTrue(bak != null)
-            assertEquals(1, bak!!.size)
-            assertTrue(bak.single().contains("200"))
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            assertEquals(0L, backupFailureCount.get())
+            assertTrue(store.repairCorrupt() is RepairResult.RepairedNoBackup)
+            assertEquals(
+                "oversize backup failure must be counted",
+                1L,
+                backupFailureCount.get(),
+            )
+            // 不得寫入任何「類型名+長度」標記鍵（標記不是內容）。
+            assertNull("no marker backup key may be written", prefs.all[BACKUP_KEY])
+            // 修復的刪除確實發生（政策鍵已刪）。
+            assertTrue(prefs.all[PolicySource.POLICY_KEY_EXTRA_PACKAGES] == null)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // SEC-M: 非 Set（String 型錯亂）且超 BACKUP_MAX_CHARS — 同樣不得寫入標記鍵
+    // 假裝備份成功；誠實回 Failed → RepairedNoBackup（刪除仍發生）。
+    @Test
+    fun backup_oversizeStringConfusion_reportsNoBackup() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val hugeString = "x".repeat(BACKUP_MAX_CHARS + 1)
+            assertTrue(prefs.edit().putString(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                hugeString,
+            ).commit())
+            prefs.corruptType = true
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+            assertEquals(0L, backupFailureCount.get())
+            assertTrue(store.repairCorrupt() is RepairResult.RepairedNoBackup)
+            assertEquals(1L, backupFailureCount.get())
+            assertNull("no marker backup key may be written", prefs.all[BACKUP_KEY])
+            assertTrue(prefs.all[PolicySource.POLICY_KEY_EXTRA_PACKAGES] == null)
         } finally {
             resetRemotePoisonForTests()
         }

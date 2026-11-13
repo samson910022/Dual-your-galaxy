@@ -43,7 +43,8 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
 // Phase2 hardening bounds (fail-closed, bounded memory).
-// - 備份單一固定鍵覆寫，不無界增長；value 截斷 ≤4KB；遷移批量刪上限
+// - 備份單一固定鍵覆寫，不無界增長；備份值 ≤4KB（超限/非 Set 型錯亂一律
+//   BackupOutcome.Failed，不偽裝成功）；遷移批量刪上限
 //   BACKUP_MIGRATION_MAX_KEYS/次（殘留下次再清）。
 // - 毒/證據全域 cap：滿時不逐舊、只 bump gen + log + metric 並丟新（fail-closed；
 //   毒另置 overflow 閂使次讀強制 Unknown）；讀寫皆 purge stale。
@@ -1213,7 +1214,10 @@ fun remoteHookPolicyStore(
         // A3-1：commit 後讀回 BACKUP_KEY 驗證，失敗誠實回報）。
         // - 固定鍵 dual_policy.bak 覆寫（不再 dual_policy.bak.<ts> 無界增長）；
         //   每次修復先遷移清除舊 bak.* 鍵（至多殘留 1 個新鍵）。
-        // - value 截斷 ≤4KB：超限只存「類型名+長度」單條（免大 value 撐爆 prefs）。
+        // - value ≤4KB：超限（總長超 BACKUP_MAX_CHARS 或非 Set 型錯亂值）不再
+        //   存「類型名+長度」標記 — 標記不是內容，讀回驗證只會假成功；
+        //   SEC-M: 一律回 BackupOutcome.Failed（修復仍進行，結果誠實為
+        //   RepairedNoBackup）。讀回比對僅對完整內容生效。
         // - A3-1（S3）：commit 回 false／拋出／讀回 BACKUP_KEY 缺席或內容不一致
         //   → BackupOutcome.Failed（+backupFailureCount++＋logStore 一行），
         //   repairCorrupt 據以回 RepairedNoBackup —— 修復（刪除）仍發生，但絕不
@@ -1264,18 +1268,31 @@ fun remoteHookPolicyStore(
                                 var total = 0
                                 for (s in asSet) total += s.length
                                 if (total > BACKUP_MAX_CHARS) {
-                                    setOf("${rawObj.javaClass.name}:${asSet.size}")
+                                    // SEC-M: the size marker is NOT content — once
+                                    // truncated away it preserves nothing recoverable,
+                                    // so the read-back "verify" would be a lie. Record
+                                    // the failure honestly (repair still proceeds;
+                                    // outcome is RepairedNoBackup).
+                                    return@setBackupHook recordRepairBackupFailure(
+                                        "backup exceeds BACKUP_MAX_CHARS ($total chars); marker is not content",
+                                    )
                                 } else {
                                     // 逐條亦截斷單條超長（防單包名異常大）。
                                     asSet.map { if (it.length > BACKUP_MAX_CHARS) it.take(BACKUP_MAX_CHARS) else it }.toSet()
                                 }
                             } else {
-                                // 非 Set（String 型錯亂等）：走 toString 分支。
+                                // SEC-M: 非 Set（String 型錯亂等）— a type/length marker
+                                // is NOT content either; report Failed honestly instead
+                                // of fake-verifying a marker.
                                 val s = try { rawObj.toString() } catch (_: Throwable) { null }
                                 if (s == null) {
-                                    setOf("${rawObj.javaClass.name}:unreadable")
+                                    return@setBackupHook recordRepairBackupFailure(
+                                        "backup value not a Set and unreadable (${rawObj.javaClass.simpleName.take(64)}); marker is not content",
+                                    )
                                 } else if (s.length > BACKUP_MAX_CHARS) {
-                                    setOf("${rawObj.javaClass.name}:${s.length}")
+                                    return@setBackupHook recordRepairBackupFailure(
+                                        "backup value not a Set and exceeds BACKUP_MAX_CHARS (${s.length} chars); marker is not content",
+                                    )
                                 } else {
                                     setOf(s)
                                 }
@@ -1284,7 +1301,9 @@ fun remoteHookPolicyStore(
                             throw ce
                         } catch (_: Throwable) {
                             null
-                        } ?: setOf("${rawObj.javaClass.name}:unreadable")
+                        } ?: return@setBackupHook recordRepairBackupFailure(
+                            "backup snapshot unreadable (${rawObj.javaClass.simpleName.take(64)}); marker is not content",
+                        )
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {

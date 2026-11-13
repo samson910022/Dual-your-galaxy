@@ -369,6 +369,7 @@ class PolicyRepairAbortTest {
         )
         // 備份失敗（如讀回不一致）：刪除仍繼續，但結果不得宣稱已備份。
         store.setBackupHook { BackupOutcome.Failed }
+        val backupFailuresBefore = backupFailureCount.get()
         val coord = PolicyTxCoordinator()
         val vm = makeCorruptVm(store, coord)
 
@@ -394,9 +395,12 @@ class PolicyRepairAbortTest {
         assertFalse(
             vm.state.value.msg == PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
         )
+        // A3-1: before/after delta assertion (like HookPolicyStoreTest): the
+        // counter may have been advanced by earlier tests in the same JVM —
+        // pin the DELTA this repair caused, not the absolute value.
         assertTrue(
-            "backup failure must be counted",
-            backupFailureCount.get() >= 1L,
+            "backup failure must increment backupFailureCount",
+            backupFailureCount.get() >= backupFailuresBefore + 1L,
         )
     }
 
@@ -458,5 +462,113 @@ class PolicyRepairAbortTest {
         assertFalse(vm.state.value.policyDraftCorrupt)
         assertEquals(setOf("com.recovered"), vm.state.value.policyDraft)
         assertEquals(0, deleteCalls.get())
+    }
+
+    // P2-2 (fail-closed revision sampling, armed-repair arm): a NON-NULL
+    // coordinator whose revision source cannot be sampled (throws) makes the
+    // repair arm unverifiable — the arm must FAIL CLOSED (UNKNOWN_REFRESH +
+    // CHANNEL, never CORRUPT_REPAIR_FIRST) and no store IO may happen.
+    @Test
+    fun samplerFailure_repairArmFailsClosed_unknownRefresh_noArm() {
+        val corrupt = AtomicBoolean(true)
+        val backend = AtomicReference<Set<String>?>(null)
+        val deleteCalls = AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt.get()) throw ClassCastException("corrupt prefs")
+                backend.get()
+            },
+            saveRaw = { raw ->
+                if (raw == null) deleteCalls.incrementAndGet()
+                if (raw == null) {
+                    corrupt.set(false)
+                    backend.set(emptySet())
+                } else {
+                    backend.set(raw)
+                }
+                true
+            },
+            repairProbe = { LoadResult.Corrupt },
+        )
+        val coord = PolicyTxCoordinator()
+        val vm = makeCorruptVm(store, coord)
+        // Coordinator attached but its revision source is unreadable:
+        // -1 with a source attached = unverifiable (not rev-gate opt-out).
+        vm.revisionSamplerForTests = { throw IllegalStateException("sampler down") }
+
+        vm.requestRepairCorruptDraft()
+        assertFalse("sampler failure must not arm the repair gate", vm.isCorruptRepairArmed())
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+        // Confirm also refuses to arm (fail-closed) — no delete, no arm.
+        vm.confirmRepairCorruptDraft()
+        assertFalse(vm.isCorruptRepairArmed())
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+        assertEquals(0, deleteCalls.get())
+    }
+
+    // P2-2 (fail-closed revision sampling, clear IO-entry): a NON-NULL
+    // coordinator whose revision source cannot be sampled mid-clear makes the
+    // clear unverifiable — the in-lock probe aborts before any IO starts;
+    // no store.clear() may run and no FAILED/CLEAR_FAILED terminal is
+    // published (UNKNOWN_REFRESH + CHANNEL).
+    @Test
+    fun samplerFailure_clearIoEntryFailsClosed_unknownRefresh_noDelete() {
+        val backend = AtomicReference<Set<String>?>(setOf("com.seed"))
+        val clearCalls = AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls.incrementAndGet()
+                    backend.set(emptySet())
+                } else {
+                    backend.set(raw)
+                }
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = emptyList(),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.NOOP,
+            hookDirectReads = { listOf(MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            hookPolicyStore = store,
+            currentUserId = { 0 },
+            policyIoTimeoutMs = 500L,
+            policyTxCoordinator = coord,
+        )
+        vms.add(vm)
+        coords.add(coord)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftKnown }
+        // Go unverifiable at the IO-entry probe point.
+        vm.revisionSamplerForTests = { throw IllegalStateException("sampler down") }
+
+        vm.clearPolicyDraft()
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertEquals("sampler failure must refuse the delete before IO starts", 0, clearCalls.get())
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+        assertFalse(vm.state.value.policyDraftKnown)
     }
 }
