@@ -9,6 +9,7 @@ package com.galaxydual.plus
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.os.Process
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
@@ -23,7 +24,21 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     override fun onCreate() {
         super.onCreate()
-        XposedServiceHelper.registerListener(this)
+        // S2: hook 只讀 user 0；非 owner 進程（如 work profile）即使註冊 binder
+        // 也只會讀寫到非本人的草稿通道，永遠不會生效 —— 不註冊（fail-closed，
+        // 也省一個跨進程監聽器）。uid 拆解失敗一律視為非 owner（fail-closed）。
+        val owner = try {
+            userIdFromUid(Process.myUid()) == 0
+        } catch (t: Throwable) {
+            try {
+                System.err.println("[GalaxyApp] owner-user check failed (${t.javaClass.name}); skipping XposedServiceHelper registration")
+            } catch (_: Throwable) {
+            }
+            false
+        }
+        if (owner) {
+            XposedServiceHelper.registerListener(this)
+        }
     }
 
     override fun onServiceBind(service: XposedService) {
@@ -44,8 +59,13 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         for (listener in GalaxyApp.serviceBindListeners) {
             try {
                 listener()
-            } catch (_: Throwable) {
-                // Best effort: listener must not break service bind.
+            } catch (e: Throwable) {
+                // A3-11: 監聽器例外不得靜默吞掉 —— 單行 log（僅 tag＋異常類別名，
+                // 絕不含 listener 內容／政策資料），並繼續通知其餘監聽者。
+                try {
+                    System.err.println("[GalaxyApp] service bind listener threw ${e.javaClass.name}; continuing")
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -67,18 +87,28 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
         // 讀/寫指定 group 的 remote preferences;service 缺席時回 null
         // (fail-closed:呼叫端視為無持久化草稿)。
+        // S2: 非 owner 進程回 null（hook 只讀 user 0；非 owner 寫入不會被看到，
+        // 故直接 fail-closed，與 GalaxyApp.onCreate 不註冊綁定同策）。
         // Phase 4:包 try/catch -> null (fail-closed 內聚):binder 死亡/拋出
         // (含 Error) 不得越過此邊界,呼叫端統一視為無持久化草稿。
         // 與 HookPolicyStore 全鏈一致：CancellationException 透傳（協程取消
         // 不得被吞為缺席），其餘 Throwable（含 Error）才轉 null。
-        fun remotePreferences(group: String): SharedPreferences? =
-            try {
+        fun remotePreferences(group: String): SharedPreferences? {
+            val owner = try {
+                userIdFromUid(Process.myUid()) == 0
+            } catch (_: Throwable) {
+                // uid 拆解失敗 → fail-closed（視為非 owner）。
+                false
+            }
+            if (!owner) return null
+            return try {
                 serviceRef.get()?.getRemotePreferences(group)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
                 null
             }
+        }
 
         // 供呼叫端在訂閱後補發已綁定狀態 (避免 lost-event 競態)。
         fun isServiceConnected(): Boolean = serviceRef.get() != null

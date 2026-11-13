@@ -338,6 +338,68 @@ class PolicyRepairAbortTest {
         assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
     }
 
+    // A3-1 (S3): backup 失敗時修復照常發生（刪除確實發生、草稿轉 Known(empty)），
+    // 但 VM 不得再宣稱 CORRUPT_REPAIRED —— 必須是誠實的 REPAIRED_NO_BACKUP
+    // （channel 類訊息），且 backupFailureCount 計數遞增。
+    @Test
+    fun backupFailure_repairProceeds_surfacesRepairedNoBackup_notRepaired() {
+        val corrupt = AtomicBoolean(true)
+        val backend = AtomicReference<Set<String>?>(null)
+        val deleteCalls = AtomicInteger(0)
+        val probeCalls = AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt.get()) throw ClassCastException("corrupt prefs")
+                backend.get()
+            },
+            saveRaw = { raw ->
+                if (raw == null) deleteCalls.incrementAndGet()
+                if (raw == null) {
+                    corrupt.set(false)
+                    backend.set(emptySet())
+                } else {
+                    backend.set(raw)
+                }
+                true
+            },
+            repairProbe = {
+                probeCalls.incrementAndGet()
+                LoadResult.Corrupt
+            },
+        )
+        // 備份失敗（如讀回不一致）：刪除仍繼續，但結果不得宣稱已備份。
+        store.setBackupHook { BackupOutcome.Failed }
+        val coord = PolicyTxCoordinator()
+        val vm = makeCorruptVm(store, coord)
+
+        vm.requestRepairCorruptDraft()
+        assertTrue(vm.isCorruptRepairArmed())
+        vm.confirmRepairCorruptDraft()
+        await(timeoutMs = 5_000L) {
+            vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                vm.state.value.msg == PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP).defaultText()
+        }
+
+        // 修復確實發生：刪除已呼叫、草稿 Known(empty)、Corrupt 已清。
+        assertEquals(1, deleteCalls.get())
+        assertTrue(vm.state.value.policyDraftKnown)
+        assertEquals(emptySet<String>(), vm.state.value.policyDraft)
+        assertFalse(vm.state.value.policyDraftCorrupt)
+        // 誠實訊息：REPAIRED_NO_BACKUP（CHANNEL），不得是 CORRUPT_REPAIRED。
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP).defaultText(),
+            vm.state.value.msg,
+        )
+        assertFalse(
+            vm.state.value.msg == PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
+        )
+        assertTrue(
+            "backup failure must be counted",
+            backupFailureCount.get() >= 1L,
+        )
+    }
+
     @Test
     fun subsequentKnown_afterUnavailableRetention_recoversViaRefresh() {
         val corrupt = AtomicBoolean(true)

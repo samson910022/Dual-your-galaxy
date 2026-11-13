@@ -4382,7 +4382,7 @@ class MainActivity : ComponentActivity() {
                 .setCancelable(cancelable)
                 .setPositiveButton(getString(R.string.policy_write_positive), null)
                 .setNegativeButton(getString(R.string.dialog_cancel), null)
-                .setNeutralButton(try { getString(R.string.policy_write_snooze) } catch (_: Exception) { "稍後刷新" }, null)
+                .setNeutralButton(getString(R.string.policy_write_snooze), null)
                 .setOnCancelListener {
                     // Stage J4：RECONCILING 期 Back/觸外僅本地 dismiss（不清 VM fence，
                     // 不調 cancel）；SAVING/QUEUED 沿既有 cancel 語義。
@@ -4432,7 +4432,7 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 confirmSaving
             }
-            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) vm.confirmPolicyWrite(pending)
+            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
         // 點按時即時重讀 phase；Stage J4：SAVING 即 toast「寫入中，無法取消」且不調 VM；
@@ -6814,11 +6814,25 @@ private class DualViewModelFactory(
         if (modelClass.isAssignableFrom(DualViewModel::class.java)) {
             // Application context: the factory is Activity-scoped but the
             // prefs handle must not pin the Activity.
-            val prefs = appContext.applicationContext.getSharedPreferences(
-                CHANNEL_PREFS_NAME,
-                Context.MODE_PRIVATE,
-            )
-            val pref = loadChannelPreference(prefs)
+            // A3-10: getSharedPreferences 本身亦可能拋出（hostile/mock prefs）；
+            // 取得失敗一律視為「無偏好」→ AUTO（fail-closed），不得崩潰。
+            val prefs = try {
+                appContext.applicationContext.getSharedPreferences(
+                    CHANNEL_PREFS_NAME,
+                    Context.MODE_PRIVATE,
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            // A3-10: 主執行緒 factory 路徑絕不得因 hostile/mock prefs（含 CE）
+            // 噴出導致 crash-on-launch —— 一律降級 AUTO（fail-closed）。
+            // loadChannelPreference 內的 CE 重拋僅供 suspend 呼叫端使用，
+            // 此處顯式吸收一切 Throwable。
+            val pref = try {
+                if (prefs != null) loadChannelPreference(prefs) else ChannelPreference.AUTO
+            } catch (_: Throwable) {
+                ChannelPreference.AUTO
+            }
             // Phase I I4：factory 跑主執行緒，永不直呼 binder IPC（shizukuAuthorizedNow）。
             // 啟動以 fail-closed false 組裝（明選 SHIZUKU 不受影響，仍直選 SHIZUKU；
             // AUTO 若真有 Shizuku 授權，VM init probeChannels 經 onIo 探測後由
@@ -6840,7 +6854,7 @@ private class DualViewModelFactory(
                 shizukuGateway = asm.shizukuGateway,
                 persistPreference = { p ->
                     try {
-                        prefs.saveChannelPreference(p)
+                        prefs?.saveChannelPreference(p)
                     } catch (_: Exception) {
                         // Best effort: the in-memory swap already happened.
                     }
@@ -6915,6 +6929,9 @@ private class DualViewModelFactory(
                         PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
                         PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
                         PolicyTextKind.UNRESOLVED_REFRESH -> res.getString(R.string.policy_unresolved_refresh)
+                        PolicyTextKind.POLICY_NOT_ACKNOWLEDGED -> res.getString(R.string.policy_not_acknowledged)
+                        PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST -> res.getString(R.string.policy_blind_clear_refresh_first)
+                        PolicyTextKind.REPAIRED_NO_BACKUP -> res.getString(R.string.policy_repaired_no_backup)
                     }
                 },
                 // Stage G2：跨 VM 最小 coordinator（App-scoped；Application 單例，

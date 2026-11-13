@@ -147,44 +147,85 @@ class PolicyTxCoordinatorPhase4Test {
         }
     }
 
-    // Phase4 bound: 512 tombstones full -> recover rejects the new drop
-    // (null, pending KEPT, size stays 512); no arbitrary eviction.
+    // Phase4/A2-1 bound: 512 tombstones full -> recover evicts the
+    // strictly-oldest-rev tombstone (rev-gated) to make room; the placeholder
+    // drops, its identity is tombstoned, and the table stays at 512.
+    // A subsequent drop must also succeed (no permanent write wedge).
     @Test
-    fun recover_tombstoneFull_rejectsAndKeepsFence() {
+    fun recover_tombstoneFull_evictsOldestRevAndProceeds() {
         val coord = PolicyTxCoordinator()
         try {
-            repeat(512) { i -> coord.claimTombstones["old:$i"] = i.toLong() }
-            assertEquals(512, coord.claimTombstones.size)
+            repeat(CLAIM_TOMBSTONE_MAX) { i -> coord.claimTombstones["old:$i"] = i.toLong() }
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
             val tx = placeholderTx(coord, "phase4-full", completedOwner = true)
             stagePlaceholder(coord, tx)
             val genBefore = coord.orphanDropGen.get()
-            assertNull(coord.recoverStalePendingLocked(System.nanoTime(), 0))
-            // Fence kept for STALE retry; table untouched (no eviction).
-            assertNotNull(coord.pendingPublish.get())
-            assertEquals(512, coord.claimTombstones.size)
-            assertFalse(coord.isTombstoned(tx.txId, tx.key))
-            assertEquals(genBefore, coord.orphanDropGen.get())
-            assertTrue(coord.tombstoneRejects.get() >= 1L)
+            val evictBefore = coord.tombstoneEvictions.get()
+            assertNotNull(coord.recoverStalePendingLocked(System.nanoTime(), 0))
+            // Placeholder dropped; new identity tombstoned; oldest evicted.
+            assertNull(coord.pendingPublish.get())
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
+            assertFalse(coord.claimTombstones.containsKey("old:0"))
+            assertTrue(coord.claimTombstones.containsKey("old:1"))
+            assertTrue(coord.isTombstoned(tx.txId, tx.key))
+            assertTrue(coord.orphanDropGen.get() > genBefore)
+            assertTrue(coord.tombstoneEvictions.get() > evictBefore)
+            // Subsequent confirm gate is not wedged: a fresh claim+drop works.
+            val tx2 = placeholderTx(coord, "phase4-full-2", completedOwner = true)
+            stagePlaceholder(coord, tx2)
+            assertNotNull(coord.recoverStalePendingLocked(System.nanoTime(), 0))
+            assertTrue(coord.isTombstoned(tx2.txId, tx2.key))
         } finally {
             coord.close()
         }
     }
 
-    // Phase4 bound: 512 tombstones full -> overrun discard refuses (false,
-    // pending KEPT); below the cap it still discards + tombstones.
+    // A2-1 reject fallback: when every tombstone in the full table is NOT
+    // strictly older than the incoming rev, the drop keeps the fence and the
+    // caller retries STALE (fail-closed) — eviction never kicks out a fence
+    // newer than the incoming one.
     @Test
-    fun discardOverrun_tombstoneFull_refusesAndKeepsFence() {
+    fun recover_tombstoneFull_noOlderEntry_keepsFenceAndRejects() {
         val coord = PolicyTxCoordinator()
         try {
-            repeat(512) { i -> coord.claimTombstones["old:$i"] = i.toLong() }
+            repeat(CLAIM_TOMBSTONE_MAX) { i -> coord.claimTombstones["new:$i"] = (1_000L + i) }
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
+            val tx = placeholderTx(coord, "phase4-full-nonewer", completedOwner = true)
+            stagePlaceholder(coord, tx)
+            val rejectsBefore = coord.tombstoneRejects.get()
+            val genBefore = coord.orphanDropGen.get()
+            assertNull(coord.recoverStalePendingLocked(System.nanoTime(), 0))
+            // Fence kept; no eviction of newer entries; rejection counted.
+            assertNotNull(coord.pendingPublish.get())
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
+            assertFalse(coord.isTombstoned(tx.txId, tx.key))
+            assertEquals(genBefore, coord.orphanDropGen.get())
+            assertTrue(coord.tombstoneRejects.get() > rejectsBefore)
+            assertTrue(coord.claimTombstones.containsKey("new:0"))
+        } finally {
+            coord.close()
+        }
+    }
+
+    // Phase4/A2-1 bound: 512 tombstones full -> overrun discard evicts the
+    // strictly-oldest-rev tombstone and proceeds (no permanent wedge); below
+    // the cap it still discards + tombstones.
+    @Test
+    fun discardOverrun_tombstoneFull_evictsOldestAndProceeds() {
+        val coord = PolicyTxCoordinator()
+        try {
+            repeat(CLAIM_TOMBSTONE_MAX) { i -> coord.claimTombstones["old:$i"] = i.toLong() }
             val tx = placeholderTx(coord, "phase4-overrun-full", completedOwner = false)
             stagePlaceholder(coord, tx)
             val rejectsBefore = coord.tombstoneRejects.get()
-            assertFalse(runBlocking { coord.discardOverrunPlaceholder(tx.txId, tx.key) })
-            assertNotNull(coord.pendingPublish.get())
-            assertEquals(512, coord.claimTombstones.size)
-            assertFalse(coord.isTombstoned(tx.txId, tx.key))
-            assertTrue(coord.tombstoneRejects.get() > rejectsBefore)
+            val evictBefore = coord.tombstoneEvictions.get()
+            assertTrue(runBlocking { coord.discardOverrunPlaceholder(tx.txId, tx.key) })
+            assertNull(coord.pendingPublish.get())
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
+            assertFalse(coord.claimTombstones.containsKey("old:0"))
+            assertTrue(coord.isTombstoned(tx.txId, tx.key))
+            assertTrue(coord.tombstoneEvictions.get() > evictBefore)
+            assertEquals(rejectsBefore, coord.tombstoneRejects.get())
         } finally {
             coord.close()
         }
@@ -200,6 +241,57 @@ class PolicyTxCoordinatorPhase4Test {
             assertNull(coord.pendingPublish.get())
             assertTrue(coord.isTombstoned(tx.txId, tx.key))
             assertTrue(coord.orphanDropGen.get() >= 1L)
+        } finally {
+            coord.close()
+        }
+    }
+
+    // A2-1 + N3: an identity whose tombstone was EVICTED from the full table
+    // still cannot stage via a claimed payload — tombstone eviction only
+    // bounds the drop fence; stageRealPayload rejects the exact identity
+    // independently of the tombstone (no matching pending claim / superseded
+    // by a foreign pending claim), and _latest is never written.
+    @Test
+    fun tombstoneEvictedIdentity_cannotStage_latestUntouched() {
+        val coord = PolicyTxCoordinator()
+        try {
+            // Claim + drop a placeholder: identity gets tombstoned with rev=1
+            // (first claim revision of a fresh coordinator).
+            val tx = placeholderTx(coord, "phase4-evicted-victim", completedOwner = true)
+            stagePlaceholder(coord, tx)
+            val dropRev = coord.pendingPublish.get()!!.rev
+            assertNotNull(coord.recoverStalePendingLocked(System.nanoTime(), 0))
+            assertTrue(coord.isTombstoned(tx.txId, tx.key))
+            // Fill the rest of the table with strictly-newer revs, then one
+            // more strictly-newer insert evicts the victim (table's oldest).
+            repeat(CLAIM_TOMBSTONE_MAX - 1) { i ->
+                coord.claimTombstones["fill:$i"] = dropRev + 1 + i
+            }
+            assertEquals(CLAIM_TOMBSTONE_MAX, coord.claimTombstones.size)
+            assertTrue(
+                coord.tryInsertClaimTombstone(
+                    coord.nextTxId(), "evictor", dropRev + CLAIM_TOMBSTONE_MAX + 1,
+                ),
+            )
+            assertFalse("victim tombstone must be evicted", coord.isTombstoned(tx.txId, tx.key))
+            assertNull("no synthetic _latest event yet", coord.latest.value)
+            val supersededBefore = coord.emitSuperseded.get()
+            // Re-claim is mandatory; the stale claimed payload must reject
+            // (no matching pending claim).
+            val staleClaim = PolicySettled(
+                tx.txId, tx.key, setOf("com.p"), true, MsgKind.INFO, "m", false, rev = dropRev,
+            )
+            val staged = runBlocking { coord.stageRealPayload(staleClaim) }
+            assertNull("evicted identity must re-claim; stage must reject", staged)
+            assertNull("_latest must not be overwritten by the rejected stage", coord.latest.value)
+            // And even while a FOREIGN pending claim is held, the stale
+            // identity is rejected (superseded), never borrows the foreign claim.
+            val txB = placeholderTx(coord, "phase4-evicted-foreign", completedOwner = false)
+            stagePlaceholder(coord, txB)
+            val stagedWithForeignPending = runBlocking { coord.stageRealPayload(staleClaim) }
+            assertNull(stagedWithForeignPending)
+            assertNull("_latest must not be overwritten", coord.latest.value)
+            assertTrue("rejections counted as superseded", coord.emitSuperseded.get() > supersededBefore)
         } finally {
             coord.close()
         }

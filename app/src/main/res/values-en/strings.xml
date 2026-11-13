@@ -90,6 +90,9 @@
     <string name="policy_clear_timeout">Draft clear timed out with unknown result; reconciling, do not retry</string>
     <!-- Stage G2: single authoritative recheck after deferred completion still unknown (unresolved; button is refresh draft). -->
     <string name="policy_unresolved_refresh">Result still unknown; tap “Refresh draft” to confirm</string>
+    <string name="policy_not_acknowledged">Confirmation box not ticked; nothing was written</string>
+    <string name="policy_blind_clear_refresh_first">A confirmed draft existed but the remote is now unknown; a refresh was triggered first. Check the hook connection or restart the app, then clear again</string>
+    <string name="policy_repaired_no_backup">Cleared the corrupt policy draft, but the backup failed: the old corrupt content was not preserved</string>
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
     <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
@@ -125,8 +128,8 @@
     <string name="policy_write_collapsed_announce">Collapsed, showing first %1$d only</string>
     <!-- Stage L4 P2#2 (b) single-confirm inspectability bound 200: over-cap warning + capped toggle/announce (%1$d=total, %2$d=inspectable 200). N4: saves replace (no merge/batching). -->
     <string name="policy_write_over_cap_warning">Exceeds single-confirm inspectability bound (%1$d total, showing first %2$d). Each save replaces the entire draft (no merge): keep a single policy to at most %2$d items so every item is inspectable before confirming</string>
-    <string name="policy_write_show_all_capped">Show first %2$d of %1$d (over cap; saves replace, keep single policy ≤%2$d)</string>
-    <string name="policy_write_expanded_announce_capped">Expanded first %2$d of %1$d; over cap, saves replace (keep single policy ≤%2$d)</string>
+    <string name="policy_write_show_all_capped">Show first %2$d of %1$d (over cap; shrink required, saving replaces the whole set)</string>
+    <string name="policy_write_expanded_announce_capped">Expanded first %2$d of %1$d; over cap, shrink required (saving replaces the whole set)</string>
     <!-- Stage L4 P2#3 corrupt repair (CCE only, separate from Unavailable blind-clear). -->
     <string name="policy_corrupt_detected">Remote policy is corrupt (type confusion); kept the old snapshot. Clearing requires repair confirmation; blind clear refused. Refresh first if reachable.</string>
     <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will attempt a best-effort backup (may fail; recovery not guaranteed) then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>

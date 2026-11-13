@@ -683,7 +683,7 @@ class ObserverFallbackTest {
             vm.requestPolicyWrite()
             val pC = vm.state.value.pendingPolicyWrite
             assertNotNull("write C request must not be blocked after observer Success", pC)
-            vm.confirmPolicyWrite(pC!!)
+            vm.confirmPolicyWrite(pC!!, pC!!.generation)
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm.state.value.policyDraft == setOf("com.C")
@@ -713,7 +713,7 @@ class ObserverFallbackTest {
             vm.requestPolicyWrite()
             val pD = vm.state.value.pendingPolicyWrite
             assertNotNull("write D request must not be blocked after observer Mismatch", pD)
-            vm.confirmPolicyWrite(pD!!)
+            vm.confirmPolicyWrite(pD!!, pD!!.generation)
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm.state.value.policyDraft == setOf("com.D")
@@ -743,7 +743,7 @@ class ObserverFallbackTest {
             vm.requestPolicyWrite()
             val pE = vm.state.value.pendingPolicyWrite
             assertNotNull("write E request must not be blocked after observer Failed", pE)
-            vm.confirmPolicyWrite(pE!!)
+            vm.confirmPolicyWrite(pE!!, pE!!.generation)
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm.state.value.policyDraft == setOf("com.E")
@@ -775,7 +775,7 @@ class ObserverFallbackTest {
             vm.requestPolicyWrite()
             val pG = vm.state.value.pendingPolicyWrite
             assertNotNull("write G request must not be blocked after e2e observeSettledFor", pG)
-            vm.confirmPolicyWrite(pG!!)
+            vm.confirmPolicyWrite(pG!!, pG!!.generation)
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm.state.value.policyDraft == setOf("com.G")
@@ -1217,7 +1217,7 @@ class ObserverFallbackTest {
             vm.requestPolicyWrite()
             val pendingNext = vm.state.value.pendingPolicyWrite
             assertNotNull("subsequent write must not be blocked", pendingNext)
-            vm.confirmPolicyWrite(pendingNext!!)
+            vm.confirmPolicyWrite(pendingNext!!, pendingNext!!.generation)
             await(timeoutMs = 10_000L) {
                 vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm.state.value.policyDraft == setOf("com.NEXT")
@@ -1406,7 +1406,7 @@ class ObserverFallbackTest {
             vm1.requestPolicyWrite()
             val pC = vm1.state.value.pendingPolicyWrite
             assertNotNull("VM1 must not be wedged after foreign tx2 settled", pC)
-            vm1.confirmPolicyWrite(pC!!)
+            vm1.confirmPolicyWrite(pC!!, pC!!.generation)
             await(timeoutMs = 10_000L) {
                 vm1.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
                     vm1.state.value.policyDraft == setOf("com.C")

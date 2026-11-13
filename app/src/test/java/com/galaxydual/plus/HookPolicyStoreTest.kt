@@ -341,7 +341,154 @@ class HookPolicyStoreTest {
                 }
             },
         )
+        // A3-1：備份鉤子拋出 → saveRaw 照常清除，但結果不得宣稱 Repaired ——
+        // 必須是 RepairedNoBackup（修復發生、證據未保留）。
         store.setBackupHook { throw RuntimeException("backup boom") }
-        assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+        assertTrue(store.repairCorrupt() is RepairResult.RepairedNoBackup)
+    }
+}
+
+// A3-1 (S3 backup honesty): 備份提交後讀回不一致 / 鉤子回報失敗 → RepairedNoBackup
+//（刪除仍發生），且不得宣稱 Repaired；backupFailureCount 遞增；log 記錄。
+class BackupHonestyTest {
+    @Test
+    fun repair_backupHookReportsFailed_noBackupResult_andDeleteStillHappens() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        var deleteCalls = 0
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls++
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        resetRemotePoisonForTests()
+        val failuresBefore = backupFailureCount.get()
+        store.setBackupHook { BackupOutcome.Failed }
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.RepairedNoBackup)
+        assertTrue("backup failure must be counted", backupFailureCount.get() > failuresBefore)
+        assertEquals(1, deleteCalls)
+        assertTrue(store.loadResult() is LoadResult.Known)
+    }
+
+    @Test
+    fun repair_backupHookWritten_reportsRepaired_andNoFailureCounter() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                } else {
+                    backing = raw
+                }
+                true
+            },
+        )
+        resetRemotePoisonForTests()
+        val failuresBefore = backupFailureCount.get()
+        store.setBackupHook { BackupOutcome.Written }
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.Repaired)
+        assertEquals(failuresBefore, backupFailureCount.get())
+    }
+}
+
+// A3-1/SL5: maybeLogFirstBackupFailure is throttled to ONE stderr line per
+// 24h per process, rate-limited by the in-memory AtomicLong timestamp (process
+// lifetime bounds it); it is called on EVERY backup failure and the timestamp
+// check is the rate limiter — not a newCount==1L call-site gate.
+// backupFailureCount is incremented unconditionally at the single count
+// point (repairCorrupt). Tests below inject nowMs directly (the function's
+// default is System.currentTimeMillis()).
+class BackupFailureThrottleTest {
+    private fun corruptStore(): HookPolicyStore {
+        var corrupt = true
+        var backing: Set<String>? = null
+        return HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt")
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                } else {
+                    backing = raw
+                }
+                true
+            },
+        )
+    }
+
+    private fun countNonEmptyLines(text: String): Int =
+        text.split('\n').count { it.isNotEmpty() }
+
+    // 直接節流函式：24h 內第二次呼叫靜默；跨 24h 再寫一行；計數與節流解耦。
+    @Test
+    fun throttle_writesAtMostOncePer24h() {
+        val err = System.err
+        val buf = java.io.ByteArrayOutputStream()
+        backupFailureFirstLogAtMs.set(0L)
+        try {
+            System.setErr(java.io.PrintStream(buf))
+            maybeLogFirstBackupFailure(1_000_000L)
+            assertEquals(1, countNonEmptyLines(buf.toString()))
+            maybeLogFirstBackupFailure(1_000_001L) // 同 24h 窗內：靜默
+            assertEquals(1, countNonEmptyLines(buf.toString()))
+            maybeLogFirstBackupFailure(1_000_000L + 86_400_001L) // 跨 24h：再寫
+            assertEquals(2, countNonEmptyLines(buf.toString()))
+        } finally {
+            System.setErr(err)
+            backupFailureFirstLogAtMs.set(0L)
+        }
+    }
+
+    // RepairedNoBackup 路徑：兩次 Failed 皆推進 backupFailureCount；
+    // 第二次在同一 24h 窗內不輸出新節流行，計數照常遞增。
+    @Test
+    fun repairFailedTwiceWithin24h_noSecondLog_countIncrementsBothTimes() {
+        val err = System.err
+        val buf = java.io.ByteArrayOutputStream()
+        resetRemotePoisonForTests()
+        backupFailureFirstLogAtMs.set(0L)
+        try {
+            System.setErr(java.io.PrintStream(buf))
+            val countBefore = backupFailureCount.get()
+            val s1 = corruptStore().also { it.setBackupHook { BackupOutcome.Failed } }
+            assertTrue(s1.repairCorrupt() is RepairResult.RepairedNoBackup)
+            val countAfterFirst = backupFailureCount.get()
+            assertTrue("first Failed must increment the counter", countAfterFirst > countBefore)
+            assertTrue("first Failed within budget must log", buf.toString().contains("evidence not preserved"))
+            buf.reset()
+            val s2 = corruptStore().also { it.setBackupHook { BackupOutcome.Failed } }
+            assertTrue(s2.repairCorrupt() is RepairResult.RepairedNoBackup)
+            assertTrue("second Failed must still increment the counter", backupFailureCount.get() > countAfterFirst)
+            assertFalse(
+                "second Failed within 24h must not log the throttled line",
+                buf.toString().contains("evidence not preserved"),
+            )
+        } finally {
+            System.setErr(err)
+            backupFailureFirstLogAtMs.set(0L)
+        }
     }
 }

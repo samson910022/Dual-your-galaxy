@@ -298,7 +298,7 @@ class PolicyWriteCrossVmTest {
                 baseCoordinatorRevision = 1L,
             )
             setPendingPolicyWrite(vmC, borrowed)
-            vmC.confirmPolicyWrite(borrowed)
+            vmC.confirmPolicyWrite(borrowed, borrowed.generation)
             await(timeoutMs = 10_000L) { vmC.state.value.pendingPolicyWrite == null }
             assertEquals(0, saveCallsC.get())
             assertEquals(setOf("com.B"), backend.get())
@@ -320,7 +320,7 @@ class PolicyWriteCrossVmTest {
             vmC.requestPolicyWrite()
             val pendingC = vmC.state.value.pendingPolicyWrite
             assertNotNull(pendingC)
-            vmC.confirmPolicyWrite(pendingC!!)
+            vmC.confirmPolicyWrite(pendingC!!, pendingC!!.generation)
             await(timeoutMs = 15_000L) { vmC.state.value.pendingPolicyWrite == null }
             assertTrue(vmC.state.value.policyDraftKnown)
             assertEquals(setOf("com.C"), vmC.state.value.policyDraft)
@@ -497,7 +497,7 @@ class PolicyWriteCrossVmTest {
             vmC.requestPolicyWrite()
             val pendingC = vmC.state.value.pendingPolicyWrite
             assertNotNull(pendingC)
-            vmC.confirmPolicyWrite(pendingC!!)
+            vmC.confirmPolicyWrite(pendingC!!, pendingC!!.generation)
             await(timeoutMs = 15_000L) { vmC.state.value.pendingPolicyWrite == null }
             assertTrue(vmC.state.value.policyDraftKnown)
             assertEquals(setOf("com.C"), vmC.state.value.policyDraft)
@@ -580,7 +580,7 @@ class PolicyWriteCrossVmTest {
             // Queue the confirm behind the held opMutex.
             vm.cancelSavedSelection()
             assertTrue(blockerEntered.await(5, TimeUnit.SECONDS))
-            vm.confirmPolicyWrite(pending!!)
+            vm.confirmPolicyWrite(pending!!, pending!!.generation)
             // Inject the window: pending cleared, QUEUED survives, ownerless.
             clearPendingKeepPhase(vm)
             assertNull(vm.state.value.pendingPolicyWrite)

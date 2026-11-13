@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- Default locale is Traditional Chinese; do not sync to simplified/English. -->
 <!-- p28-1 字串資源化：預設為繁中（values/），英文見 values-en/。技術 detail（診斷內文、
      VM 其餘 msg）保留程式內字面；寫入拒絕理由、包名就地驗證、診斷複製按鈕/成功訊息
      為使用者可見短句，已資源化（中英＋繁中；三繁中檔鎖一致，見 UiSemanticsP28Test/RemoveConfirmMessageTest）。
@@ -92,6 +93,9 @@
     <string name="policy_clear_timeout">清除草稿逾時，結果未知，正在核對，請勿重試</string>
     <!-- Stage G2：deferred 完成後單次權威重查仍未知（unresolved；按鈕即重新整理草稿）。 -->
     <string name="policy_unresolved_refresh">結果仍未知，請點「重新整理草稿」確認結果</string>
+    <string name="policy_not_acknowledged">尚未勾選確認框，未寫入任何內容</string>
+    <string name="policy_blind_clear_refresh_first">先前曾確認草稿內容，但遠端目前未知；已先觸發重新整理。請檢查 Hook 連線或重新啟動 App 後再清除</string>
+    <string name="policy_repaired_no_backup">已清除損壞的政策草稿，但備份失敗：舊的損壞內容未被保留</string>
     <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
     <string name="policy_refreshed">已重新整理政策草稿</string>
     <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>
