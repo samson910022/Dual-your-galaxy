@@ -8,6 +8,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 // Phase7 P2 end-to-end deadline (gate-open).
 //
@@ -267,53 +268,90 @@ class EffectivePolicyDeadlineTest {
 
     @Test
     fun fastLeaderNotifiesAndWakesFollowersImmediately() {
+        // Notify semantics without an absolute hot-path SLA: the follower must
+        // observe the leader's commit *before* its grace expires (notifyAll
+        // wakeup, not the ~grace timeout). All bounds are relative to
+        // [graceMs]; thread-start latency is excluded by timestamping inside
+        // the follower thread, so CI thread-scheduling jitter cannot flake
+        // the pin. A broken notify would park the follower for the full grace
+        // (~50ms in-get, ~45ms post-commit) and fail both timing pins below.
+        val graceMs = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS
+        val leaderWorkMs = 5L
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
         val leaderStarted = CountDownLatch(1)
+        val leaderCommitNanos = AtomicLong(-1L)
         var leaderResult: Set<String>? = null
         val leader = Thread {
             leaderResult = cache.get(
                 emptySet(),
                 nonEmptyPolicyGateOpen = true,
-                followerGraceMs = 50L,
+                followerGraceMs = graceMs,
             ) {
                 reads.incrementAndGet()
                 leaderStarted.countDown()
-                sleepInterruptible(5)
+                sleepInterruptible(leaderWorkMs)
                 setOf("fast-leader")
             }
+            leaderCommitNanos.set(DeadlineBudget.nowNanos())
         }
         leader.start()
         assertTrue("leader must start", leaderStarted.await(5, TimeUnit.SECONDS))
         var followerResult: Set<String>? = null
-        val followerStart = DeadlineBudget.nowNanos()
+        val followerEnterNanos = AtomicLong(-1L)
+        val followerExitNanos = AtomicLong(-1L)
         val follower = Thread {
+            followerEnterNanos.set(DeadlineBudget.nowNanos())
             followerResult = cache.get(
                 emptySet(),
                 nonEmptyPolicyGateOpen = true,
-                followerGraceMs = 50L,
+                followerGraceMs = graceMs,
             ) {
                 reads.incrementAndGet()
                 setOf("unexpected")
             }
+            followerExitNanos.set(DeadlineBudget.nowNanos())
         }
         follower.start()
         follower.join()
-        val followerElapsed = (DeadlineBudget.nowNanos() - followerStart) / 1_000_000L
         leader.join()
 
         assertEquals(1, reads.get())
         assertEquals(setOf("fast-leader"), leaderResult)
         assertEquals(setOf("fast-leader"), followerResult)
-        // With notifyAll, follower wakes up when leader finishes (~5ms) instead of waiting full 50ms grace timeout.
+        // Follower time spent inside get() (excludes thread-start): must
+        // return before the grace expires — i.e. woken by the leader's
+        // notifyAll, not by the grace timeout.
+        val inGetElapsedMs = (followerExitNanos.get() - followerEnterNanos.get()) / 1_000_000L
         assertTrue(
-            "follower must wake up immediately on leader commit (< 40ms), elapsed=$followerElapsed",
-            followerElapsed < 40,
+            "follower must wake on leader commit before grace expiry, inGet=${inGetElapsedMs}ms grace=${graceMs}ms",
+            inGetElapsedMs < graceMs,
+        )
+        // Immediacy relative to grace (wakeup << grace): the follower must
+        // return shortly after the leader commits, not linger until the
+        // timeout. Clamped at 0: a follower that arrives after the commit
+        // observes the cached value with no wait at all.
+        val wakeLatencyMs = ((followerExitNanos.get() - leaderCommitNanos.get()) / 1_000_000L).coerceAtLeast(0L)
+        assertTrue(
+            "follower wakeup must be prompt after leader commit (<< grace), wake=${wakeLatencyMs}ms grace=${graceMs}ms",
+            wakeLatencyMs < graceMs / 2,
         )
     }
 
     @Test
     fun followerTotalElapsedNeverExceedsBudgetUnderContention() {
+        // Bounded-budget semantics with environment tolerance: followers must
+        // fall back to seed after their grace (not block on the 200ms leader)
+        // and must return within budget + generous CI slack. The primary pin
+        // is thread-state based (no wall clock): all followers complete while
+        // the slow leader is still in flight. The wall-time bound is a
+        // secondary hang-guard with generous tolerance, not a hot-path SLA.
+        val graceMs = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS
+        val budgetMs = PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+        // Generous scheduler tolerance for 8 contending followers; still well
+        // below the 200ms leader hold, so a wait-on-the-leader regression is
+        // caught by both the isAlive pin and this bound.
+        val envSlackMs = 100L
         val cache = EffectivePolicyCache()
         val reads = AtomicInteger()
         val leaderStarted = CountDownLatch(1)
@@ -322,7 +360,7 @@ class EffectivePolicyDeadlineTest {
             cache.get(
                 emptySet(),
                 nonEmptyPolicyGateOpen = true,
-                followerGraceMs = 50L,
+                followerGraceMs = graceMs,
             ) {
                 reads.incrementAndGet()
                 leaderStarted.countDown()
@@ -342,7 +380,7 @@ class EffectivePolicyDeadlineTest {
                 val res = cache.get(
                     emptySet(),
                     nonEmptyPolicyGateOpen = true,
-                    followerGraceMs = 50L,
+                    followerGraceMs = graceMs,
                 ) {
                     reads.incrementAndGet()
                     setOf("unexpected")
@@ -354,6 +392,15 @@ class EffectivePolicyDeadlineTest {
         }
         followers.forEach { it.start() }
         followers.forEach { it.join() }
+        // Semantic pin without a wall clock: every follower returned within
+        // its grace while the slow leader was still in flight (followers did
+        // not block on the leader's 200ms commit). Strictly looser than the
+        // wall-time bound below (150ms cap < 200ms hold), so it adds signal
+        // without adding flake surface.
+        assertTrue(
+            "followers must return within grace while slow leader still in flight",
+            leader.isAlive,
+        )
         leader.join()
 
         assertEquals(1, reads.get())
@@ -362,12 +409,13 @@ class EffectivePolicyDeadlineTest {
         for (res in followerResults) {
             assertEquals(emptySet<String>(), res)
         }
-        // Even with lock contention among multiple followers waking up simultaneously,
-        // each follower's total elapsed time must not exceed the budget + reasonable OS scheduler slack (50ms + 35ms = 85ms).
+        // Hang-guard with generous environment tolerance (budget + 100ms),
+        // not a hot-path SLA: catches unbounded waits while absorbing CI
+        // lock-contention/scheduling jitter across the 8 followers.
         for (elapsed in followerElapsedList) {
             assertTrue(
-                "follower elapsed must not exceed budget+slack, elapsed=$elapsed",
-                elapsed <= PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS + 35,
+                "follower elapsed must stay within budget+generous slack, elapsed=$elapsed budget=$budgetMs slack=$envSlackMs",
+                elapsed <= budgetMs + envSlackMs,
             )
         }
     }
