@@ -9562,7 +9562,11 @@ class DualViewModel(
                         try { preJob.cancel() } catch (_: Exception) { }
                         LoadResult.Unavailable
                     }
-                    if (preRead !is LoadResult.Corrupt) {
+                    if (preRead is LoadResult.Known) {
+                        // Verified Known may clear corrupt (fail-closed): authoritative
+                        // pre-read proves healed, so clear the bit. Stays Unknown
+                        // (requires explicit refresh to adopt the healed value);
+                        // only Unavailable below must retain corrupt.
                         synchronized(policySettleLock) {
                             if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
                                 inFlightWrites.remove(key)
@@ -9570,10 +9574,7 @@ class DualViewModel(
                             }
                             markPolicyUnknownLocked()
                             _state.update { cur ->
-                                val preMsg = policyText(
-                                    if (preRead is LoadResult.Known) PolicyText(PolicyTextKind.UNKNOWN_REFRESH)
-                                    else PolicyText(PolicyTextKind.REFRESH_FAILED),
-                                )
+                                val knownMsg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH))
                                 if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
@@ -9581,7 +9582,7 @@ class DualViewModel(
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
                                         policyDraftCorrupt = false,
-                                        msg = preMsg,
+                                        msg = knownMsg,
                                         msgKind = MsgKind.CHANNEL,
                                     )
                                 } else {
@@ -9589,6 +9590,41 @@ class DualViewModel(
                                         loading = false,
                                         policyDraftKnown = false,
                                         policyDraftCorrupt = false,
+                                        msg = knownMsg,
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                        }
+                        return@withLock
+                    }
+                    if (preRead is LoadResult.Unavailable) {
+                        // P2 retention: transient Unavailable never proves healed.
+                        // Preserve corrupt evidence + bump generations (fail-closed
+                        // fence) so the next tap still routes to repair request.
+                        synchronized(policySettleLock) {
+                            if (_state.value.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
+                            }
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                val preMsg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED))
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = true,
+                                        msg = preMsg,
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = true,
                                         msg = preMsg,
                                         msgKind = MsgKind.CHANNEL,
                                     )
@@ -9860,7 +9896,47 @@ class DualViewModel(
                             try { finalJob.cancel() } catch (_: Exception) { }
                             LoadResult.Unavailable
                         }
-                        if (finalRead !is LoadResult.Corrupt) {
+                        if (finalRead is LoadResult.Known) {
+                            // Verified Known may clear corrupt (fail-closed): fresh
+                            // revalidation proves healed, so clear the bit. Stays
+                            // Unknown (requires explicit refresh to adopt value);
+                            // only Unavailable below must retain corrupt.
+                            val pcKnown = preClaimTx
+                            if (pcKnown != null) {
+                                try { policyTxCoordinator?.tryCompleteClaim(pcKnown) } catch (_: Exception) { }
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                            }
+                            try { h1RepairDeferred?.cancel() } catch (_: Exception) { }
+                            synchronized(policySettleLock) {
+                                if (pcKnown != null) {
+                                    activePolicyTx.compareAndSet(pcKnown, null)
+                                    policyReconciling.remove(pcKnown.key)
+                                    preClaimTx = null
+                                }
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
+                                markPolicyUnknownLocked()
+                                _state.update { cur ->
+                                    cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                            return@withLock
+                        }
+                        if (finalRead is LoadResult.Unavailable) {
+                            // P2 retention: transient Unavailable never proves healed.
+                            // Preserve corrupt evidence + bump generations (fail-closed
+                            // fence); do NOT delete. Next tap still routes to repair.
                             val pcAbort = preClaimTx
                             if (pcAbort != null) {
                                 try { policyTxCoordinator?.tryCompleteClaim(pcAbort) } catch (_: Exception) { }
@@ -9880,17 +9956,13 @@ class DualViewModel(
                                 policyWriteSaving.remove(key)
                                 markPolicyUnknownLocked()
                                 _state.update { cur ->
-                                    val abortMsg = policyText(
-                                        if (finalRead is LoadResult.Known) PolicyText(PolicyTextKind.UNKNOWN_REFRESH)
-                                        else PolicyText(PolicyTextKind.REFRESH_FAILED),
-                                    )
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
                                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                                         policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                                        msg = abortMsg,
+                                        policyDraftCorrupt = true,
+                                        msg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED)),
                                         msgKind = MsgKind.CHANNEL,
                                     )
                                 }
