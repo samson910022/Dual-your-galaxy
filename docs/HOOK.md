@@ -37,9 +37,10 @@
   新鮮度**不依賴**它。新鮮度機制＝**輪詢**：
   `EffectivePolicyCache` TTL（`maxCacheAgeMs` 60 秒）到期後下次讀取重讀同一
   cached 實例；因實例永久快取，輪詢仍可能讀到舊值直到**重啟**（daemon 重建
-  才重同步權威值）。寫入側應 bump **版本／序列鍵**（`dual_policy` 內另存
-  `extra_whitelist_version` 單調序號，hook 側比對序號判定是否過期，見下），
-  讀者以序號＋TTL 判定新鮮度，重啟語義見 §2.3。端到端仍需 on-device 驗證
+  才重同步權威值）。（寫入側的「版本／序列鍵」方案——`dual_policy` 內另存
+  `extra_whitelist_version` 單調序號，hook 側比對序號判定是否過期——**規劃中／未實作**：
+  目前沒有任何代碼讀寫該鍵，見下），讀者目前僅能以 TTL＋重啟語義判定新鮮度，
+  重啟語義見 §2.3。端到端仍需 on-device 驗證
   （DEVICE-UNVERIFIED）。
    hook 側 TTL 一覽（皆見 `EffectivePolicyCache`，與 App 側 TTL 對照見 `docs/USAGE.md` 政策 TTL 對照表）：
    - 快取 TTL `maxCacheAgeMs` 60 秒：到期後下次讀取 fail-closed 回 seed（`invalidated=true`），不復活過期值；TTL 到期不 bump 世代（到期前已發起的在途新鮮讀仍可滿足到期）。能力缺失（`PROP_CAP_REMOTE` false→`emptySet()` 成功空讀）同樣被快取 60 秒，故 false 有效重試＝max(60 秒 TTL，5 秒 latch 內閘)；latch 5 秒僅在快取 miss（TTL 到期／`invalidate()`）後才可達。
@@ -58,11 +59,13 @@
   on-device 證明——若 LSPosed 同 group 永回同一快取實例則此層生產永不命中，
   若 wrapper 共享底層 mMap 則仍有污染風險。TODO(on-device)：驗證 daemon 重建
   後新實例是否重同步權威值、同 group 是否回同一實例、wrapper 是否共享 mMap。
-  版本／序列鍵（P1-1 poll 配套，DEVICE-UNVERIFIED）：寫入側在同 group 另存
-  單調 `extra_whitelist_version`（Long，每次 save/clear＋1）；hook 側重讀時
-  比對序號（舊序號＝過期，沿用 TTL 回退），App 側 reconciler／refresh 以序號
-  判定是否需重讀。序號本身亦經同一永久快取實例，故仍受重啟語義約束（daemon
-  重建前序號亦可能過期），僅為「可觀測的新鮮度證據」，非推送替代。
+  版本／序列鍵（P1-1 poll 配套，**規劃中／未實作**，DEVICE-UNVERIFIED）：此方案尚未接線——
+  沒有任何代碼讀寫 `extra_whitelist_version`（寫入側 save/clear 不 bump、hook 側重讀不比對）。
+  規劃內容為：寫入側在同 group 另存單調 `extra_whitelist_version`（Long，每次 save/clear＋1），
+  hook 側重讀時比對序號（舊序號＝過期，沿用 TTL 回退），App 側 reconciler／refresh 以序號
+  判定是否需重讀。即使將來實作，序號本身亦經同一永久快取實例，故仍受重啟語義約束（daemon
+  重建前序號亦可能過期），僅為「可觀測的新鮮度證據」，非推送替代。目前新鮮度僅靠 TTL＋重啟語義，
+  不得假設序號存在。
 - App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
   Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
@@ -287,7 +290,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 3. **callback 命中**證據（非 marker／clinit-only）；能區分「hook 已裝」與「查詢路徑真的被攔截」。
 4. 正確處理 Android user／profile isolation 與 install-state 語意（尤其 `*Installed*Whitelist*` 複合查詢的 userId／已安裝判斷）；Stage 1 對此類查詢 **fail-closed 排除**，S24／DAAgent 相關 overload 仍標記 **[待實機驗證]**。
 5. 在目標 ROM（例如 S24／DAAgent）做**受控的空政策 vs 非空政策**對照，確認只有預期查詢被擴展、安裝／移除／Knox 路徑不受影響，且無 bootloop／崩潰回歸。
-6. **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy`＋版本序號 bump）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新序號／新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。
+6. **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy` 集合寫入；`extra_whitelist_version` 版本序號 bump **未實作**，不得作為本閘門的前提）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。
 
 Stage 1 明確保持 `*Installed*Whitelist*` 排除：daagent 不掛
 `getAllInstalledWhitelistedPackages`／`isInstalledWhitelistedPackage`；system_server 不掛

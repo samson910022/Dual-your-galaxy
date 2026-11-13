@@ -7,7 +7,7 @@
 > 暫存）故已移除；僅保留功能必需的 `QUERY_ALL_PACKAGES`（個人來源 catalog 經
 > PackageManager 列舉，見 `SourceInventory.loadSourceApps`）。不上 Play 不是保留過寬權限的充分理由。
 > 全程不碰 Secure Folder（Knox 容器）。
-> 本文件描述包含設計目標與未完成流程；凡 [待實作]／[待實機驗證] 皆不宣稱為可用功能，
+> 本文件描述包含設計目標與未完成流程；凡 [待實作]／[待實機驗證]／[已接線] 皆不宣稱為可用功能（[已接線]＝有程式碼並已接通，但端到端未實機驗證），
 > 驗證須依個別情境判讀，不能由正常成功案例推論所有通道與安全負向邊界。歷史 S24 寫入紀錄與本輪唯讀調查見下方更新。
 
 > **2026-11-05 更新**：[S24 調查與追蹤計畫](UX_REVIEW_S24.md) 彙整既有 #6/#9 的正常 SHELL clone/remove、手動通道證據，以及新發現與 issues #21–#29。本文較舊 F4a 的「無實機／Factory 靜態選路」敘述屬歷史階段，不代表手動重選仍未實作；未完成項目仍不得宣稱可用。
@@ -17,7 +17,7 @@
 - [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
  （`DualRepository.cloneVerified / removeVerified`＋二次確認）、lint／CI 閘門。
 - [部分已驗證] App 內一鍵 clone 真通道＋手動 picker（F4a 已接線＋picker＋marker：`MainActivity` 四通道按鈕＋Hook marker 行＋`StateFlow`，`DualViewModel.selectChannel/clone/refresh`；真 gateway 為 `SuCmdGateway`（`su -c`）／Shizuku UserService `ShizukuCmdGateway`（`newProcess` 在 13.1.5 已移除），選不到回 `NoOp`＋唯讀 fail-closed，`channelReady` gating（`channelReadyFor` [已支援]：hook 訊號永不授權，NONE 永不就緒）。[S24 已驗證]僅限 ROOT 一鍵 `cloned:`、已授權 SHIZUKU 一鍵（已安裝 verify 單次）、`pm uninstall --user 95` 回滾＋`su -c` 重裝；寫後主驗證以 listing 為準（`pm path` 僅輔助診斷，見 #22）；Shizuku 未授權／binder 死引導、App 內 Shizuku 首次選路、marker gateway-`cat` 顯示行、callback 可驗日誌、非空政策生效、當前 source 可追溯部署仍 [待實機驗證]；指定正常 SHELL clone/remove＋手動通道歷史見 [S24 調查](UX_REVIEW_S24.md) §5，指定範圍外的 binder round-trip、授權四情境、su 實機行為、端到端 pm、LSPosed 啟用偵測及當前 source 可追溯部署仍待驗）。
-- [已支援] 非空 whitelist policy 政策來源（App 寫入 LSPosed remote preferences group `dual_policy`／hook 讀同一 group/key；僅 owner user（user 0）能寫入草稿，非 owner 的寫入 hook 讀不到；JVM 測試覆蓋，端到端 [待實機驗證] DEVICE-UNVERIFIED；靜態種子預設為空，故預設仍 observe-only）。
+- [已接線] 非空 whitelist policy 政策來源（端到端未實機驗證／DEVICE-UNVERIFIED）：App 寫入 LSPosed remote preferences group `dual_policy`／hook 讀同一 group/key；僅 owner user（user 0）能寫入草稿，非 owner 的寫入 hook 讀不到；JVM 測試覆蓋，端到端 [待實機驗證] DEVICE-UNVERIFIED；靜態種子預設為空，故預設仍 observe-only。
 - [部分已驗證] LSPosed 載入（system hook 單方法（getAllWhitelistedPackages）deoptimize＋hooked [S24 已驗證]、isInstalledWhitelistedPackage* 未掛（見 HOOK §1.4）、daagent 新路徑 `using provider.WhiteListApps` 連續命中（僅類別選取） [S24 已驗證]、marker 主路徑 scope=system_server（早於本次開機約5.5h，不能宣稱本次開機有效） [S24 已驗證]，其餘 LSPosed 寫入、非空政策 [待實機驗證]）、Shizuku（已授權一鍵已驗；未授權路徑／首次選路／binder 死引導待驗；含重啟後重啟動）、
   雙開實機（`install-existing / path / uninstall --user` 端到端；其中
   `install-existing --user 95`＋`pm list packages --user 95` 二次確認

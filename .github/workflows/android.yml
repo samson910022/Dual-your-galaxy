@@ -26,15 +26,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
         with:
           gradle-home-cache-includes: |
             caches
@@ -50,7 +50,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Run Android instrumentation
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 29
           arch: x86_64
@@ -63,7 +63,7 @@ jobs:
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Upload instrumentation reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: locale-instrumentation-reports
           path: |
@@ -77,10 +77,10 @@ jobs:
     timeout-minutes: 30
     steps:
       # Check out the repository.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Provision JDK 17 required by AGP 8.x and Kotlin 2.x.
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: "17"
@@ -88,7 +88,7 @@ jobs:
       # Provision Gradle: the pinned 8.7 wrapper (./gradlew + gradle-wrapper.jar)
       # fixes the version, so runner preinstalled updates cannot change it.
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
         with:
           gradle-home-cache-includes: |
             caches
@@ -305,11 +305,12 @@ jobs:
           echo "merged manifest: $MERGED"
           # Exact attribute values, not a bare FQN substring: the merged manifest
           # must carry the guard provider at the debug-suffixed authority.
-          # NOTE (debug-only): this parity gate asserts the DEBUG variant
+          # NOTE (debug variant): this parity gate asserts the DEBUG variant
           # authority (com.galaxydual.plus.debug.XposedService). The release
-          # authority differs by applicationId suffix; the invariant (exactly
-          # one GuardXposedProvider, zero libxposed XposedProvider) holds for
-          # every variant, only the literal below is debug-specific.
+          # invariant (exactly one GuardXposedProvider, zero libxposed
+          # XposedProvider, release authority without the .debug suffix) is
+          # enforced by the "Policy provider parity (release merged manifest)"
+          # step below.
           grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
           grep -F 'android:authorities="com.galaxydual.plus.debug.XposedService"' "$MERGED"
           if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
@@ -317,6 +318,56 @@ jobs:
             exit 1
           fi
           echo "PASS: policy provider parity"
+      # D4: release-variant parity for the policy provider (mirrors the debug
+      # gate above). :app:processReleaseMainManifest only merges manifests — it
+      # does NOT package or sign an APK, so no release keystore is needed.
+      # NOTE (CI-guard interaction): app/build.gradle.kts fails any CI
+      # invocation whose task name contains "Release" when no release signing
+      # key is configured (that guard exists to stop unsigned release
+      # PACKAGING in CI). This manifest-only step therefore opts out of the CI
+      # signing detection for this single gradle invocation
+      # (CI=false GITHUB_ACTIONS=). It never assembles or signs a release APK;
+      # the signing guard stays fail-closed for packaging tasks.
+      # Release authority = ${applicationId}.XposedService =
+      # com.galaxydual.plus.XposedService (NO .debug suffix).
+      - name: Policy provider parity (release merged manifest)
+        run: |
+          set -e
+          set -o pipefail
+          echo "== release merged manifest =="
+          CI=false GITHUB_ACTIONS= ./gradlew :app:processReleaseMainManifest --no-daemon
+          # Exactly one merged release manifest (either AGP output layout).
+          MERGED=$(find app/build/intermediates/merged_manifest app/build/intermediates/merged_manifests -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
+          if [ -z "$MERGED" ]; then
+            echo "FAIL: no merged release AndroidManifest.xml under app/build/intermediates; run :app:processReleaseMainManifest first"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$MERGED" | wc -l)" != "1" ]; then
+            echo "FAIL: expected exactly 1 merged release AndroidManifest.xml, found:"
+            printf '%s\n' "$MERGED"
+            exit 1
+          fi
+          echo "merged release manifest: $MERGED"
+          # Same invariant, release authority: exactly one GuardXposedProvider
+          # node at the release (unsuffixed) authority, ZERO libxposed
+          # XposedProvider nodes.
+          grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
+          grep -F 'android:authorities="com.galaxydual.plus.XposedService"' "$MERGED"
+          PROVIDER_NODES=$(grep -c -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED")
+          if [ "$PROVIDER_NODES" != "1" ]; then
+            echo "FAIL: expected exactly 1 GuardXposedProvider node in release merged manifest, found $PROVIDER_NODES"
+            exit 1
+          fi
+          if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
+            echo "FAIL: release merged manifest still declares the libxposed XposedProvider"
+            exit 1
+          fi
+          # Release authority must NOT carry the debug applicationIdSuffix.
+          if grep -F 'com.galaxydual.plus.debug.XposedService' "$MERGED"; then
+            echo "FAIL: release merged manifest carries the debug-suffixed authority"
+            exit 1
+          fi
+          echo "PASS: release policy provider parity"
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |
@@ -430,7 +481,7 @@ jobs:
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unit-test-reports
           path: |
@@ -448,7 +499,7 @@ jobs:
           attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "compile androidTest attempt $attempt failed (max 3)"; exit 1; fi; echo "compile androidTest attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
       - name: Upload APK artifacts (debug + androidTest)
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: apk-debug
           path: |
@@ -471,7 +522,7 @@ jobs:
       # Always keep lint reports, even when the lint step fails.
       - name: Upload lint reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lint-reports
           path: |
@@ -493,15 +544,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
         with:
           gradle-home-cache-includes: |
             caches
@@ -517,7 +568,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Run instrumentation on emulator (API 34)
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 34
           target: default
@@ -591,7 +642,7 @@ jobs:
           sha256sum "$APP_APK" "$TEST_APK"
       - name: Upload instrumentation reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: instrumentation-reports
           path: |
@@ -601,7 +652,7 @@ jobs:
           retention-days: 30
       - name: Upload tested APKs + provenance
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tested-apk-provenance
           path: |

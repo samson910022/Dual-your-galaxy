@@ -14,7 +14,9 @@ package com.galaxydual.hook
 // Union-only: the remote side can only add entries, never shrink the seed.
 //
 // Package grammar mirrors core ShellEscaper ([a-zA-Z0-9._-]+) without
-// importing it, keeping :hook free of app-side types.
+// importing it, keeping :hook free of app-side types. It is a superset of
+// the Android package grammar by design; see the equality-only CONTRACT
+// comment at isValidPackage before reusing these tokens elsewhere.
 object PolicySource {
 
     private val PKG = Regex("^[a-zA-Z0-9._-]+$")
@@ -56,6 +58,19 @@ object PolicySource {
     @Volatile
     internal var remotePolicyReader: () -> Set<String>? = { emptySet() }
 
+    // CONTRACT (equality-only, S7): tokens accepted here are used ONLY for
+    // equality matching / set membership against the (seed ∪ sanitized remote)
+    // policy sets — never for anything else. This grammar is a deliberate
+    // SUPERSET of the Android package grammar (it admits '-', '..' and
+    // separator oddities such as "a-", "..", "com..x"), which is safe only
+    // because of that equality-only use: today no code path feeds a token to
+    // PackageManager, a URI, a file path, an Intent/ComponentName, logging,
+    // or display output on the strength of this check. ANY future reuse
+    // beyond equality matching (PackageManager lookup, logging, display,
+    // Intent/ComponentName/Uri/file paths) MUST re-validate against a real
+    // Android package grammar (e.g. dot-separated segments of
+    // [A-Za-z][A-Za-z0-9_]*) and MUST NOT rely on this regex. Do not loosen
+    // it further without re-checking every consumer of effective()/sanitize().
     fun isValidPackage(pkg: String): Boolean =
         pkg.isNotEmpty() && PKG.matches(pkg)
 
