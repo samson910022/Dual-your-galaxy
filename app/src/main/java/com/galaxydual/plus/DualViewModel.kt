@@ -928,45 +928,37 @@ class DualViewModel(
         // for owner); abandoned (false) => may abort/unclaim. Armed Txs ignore
         // this (inherit regardless).
         val ownerAlive: AtomicBoolean = AtomicBoolean(true),
+        // Stage (PR#60 P2#2): typed repair outcome carried on the SHARED Tx.
+        // Written by the repair deferred BEFORE it completes; all repair
+        // terminals derive msg+msgKind from this — on any VM that observes
+        // the tx (winner, reconciler, late-join, coordinator replay).
+        val repairResult: AtomicReference<RepairResult?> = AtomicReference(null),
     )
     // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
     private val policyTxId = AtomicLong(0L)
     private val activePolicyTx = AtomicReference<PolicyTx?>(null)
-    // Stage (PR#60 P1-1): repair outcome plumbing for the non-fast paths.
-    // The repair deferred writes the RepairResult here BEFORE completing, so
-    // reconciler / late-join terminals for a repair Tx publish the honest
-    // backup outcome (RepairedNoBackup ⇒ REPAIRED_NO_BACKUP/CHANNEL) instead of
-    // an unconditional CORRUPT_REPAIRED. Keyed by tx.key (process-unique via
-    // clearGeneration); the entry is purged at every settle/terminal that
-    // clears the fence. An ABSENT entry (e.g. Tx inherited by a fresh VM —
-    // the new VM never ran the lambda) falls back to the honest "attempted,
-    // not guaranteed" CORRUPT_REPAIRED wording on INFO, mirroring the fast
-    // path's default branch (its text self-describes backup-not-guaranteed).
-    private val repairOutcomes = java.util.concurrent.ConcurrentHashMap<String, RepairResult>()
-
-    // Two legal orders for purging a repairOutcomes entry: (1) AFTER any
-    // critical section whose lambda re-reads it (e.g. settleReconcilerTerminal
-    // purges post-applyUnderLock — mandatory when a lambda consumes the map),
-    // or (2) BEFORE apply only when nothing under the lock re-reads the map
-    // (precomputed payloads only), as on the fast-path winnerPublish arms.
-    // CE-skipping purges leave an enum-only, process-unique entry behind —
-    // harmless by key uniqueness; do not "fix" by purging earlier.
-    private fun purgeRepairOutcome(txKey: String) {
-        try { repairOutcomes.remove(txKey) } catch (_: Exception) { }
-    }
-
     // Repair Success terminal (msg, kind) — mirrors the fast path's
-    // construction exactly: a recorded RepairedNoBackup ⇒ REPAIRED_NO_BACKUP +
-    // CHANNEL; anything else (recorded Repaired, or unknown/absent) ⇒
-    // CORRUPT_REPAIRED + INFO ("backup attempted, not guaranteed" wording).
-    private fun repairSuccessTerminal(txKey: String): Pair<String, MsgKind> {
-        val noBackup = try {
-            repairOutcomes[txKey] is RepairResult.RepairedNoBackup
-        } catch (_: Exception) {
-            false
+    // construction exactly: a RepairedNoBackup recorded ON THE SHARED TX ⇒
+    // REPAIRED_NO_BACKUP + CHANNEL; anything else (recorded Repaired, or
+    // unknown/absent) ⇒ CORRUPT_REPAIRED + INFO ("backup attempted, not
+    // guaranteed" wording). The outcome rides the Tx, so every VM that
+    // observes the tx (winner, reconciler, late-join, coordinator replay)
+    // derives the same pair — the entry dies with the tx, never outlives it.
+    private fun repairSuccessTerminal(tx: PolicyTx): Pair<String, MsgKind> {
+        val result: RepairResult? = try {
+            tx.repairResult.get()
+        } catch (_: Throwable) {
+            null
         }
-        return if (noBackup) {
+        if (tx.isRepair && result == null) {
+            // Defensive arm: repair completed ⇒ deferred completed ⇒ ref
+            // non-null (same lambda order). A null here means the outcome was
+            // lost between completion and terminal — count it; the terminal
+            // keeps the honest CORRUPT_REPAIRED/INFO fallback wording.
+            try { repairOutcomeMissingCount.incrementAndGet() } catch (_: Exception) { }
+        }
+        return if (result is RepairResult.RepairedNoBackup) {
             policyText(PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP)) to MsgKind.CHANNEL
         } else {
             policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIRED)) to MsgKind.INFO
@@ -993,6 +985,12 @@ class DualViewModel(
     private val lastRevisionSeenRev = AtomicLong(-1L)
     // Stage L3 gap 可觀測計數（JVM 可讀；跳號僅標記不丟失）。
     internal val revisionGapCount = AtomicLong(0L)
+    // Stage (PR#60 P2#2): defensive-arm observability — incremented exactly
+    // when a repair Tx's Success terminal is published but the outcome carried
+    // ON THE SHARED TX (repairResult) is still null (should be impossible:
+    // the repair lambda sets it before completing). Mirrors revisionGapCount;
+    // intentionally not wired into a diagnostics dump (no dump exists for it).
+    internal val repairOutcomeMissingCount = AtomicLong(0L)
     private val policyRevisionStale = AtomicBoolean(false)
     // Stage O1 P1#1 (consent): authoritatively observed policy revision.
     // The coordinator committedRevision sampled at the moment this VM's current
@@ -1272,7 +1270,6 @@ class DualViewModel(
         return synchronized(policySettleLock) {
             val owned = activePolicyTx.compareAndSet(tx, null)
             policyReconciling.remove(tx.key)
-            purgeRepairOutcome(tx.key)
             owned
         }
     }
@@ -1308,7 +1305,6 @@ class DualViewModel(
         val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
         if (curLocal != null && curLocal !== tx) {
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             return
         }
         val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
@@ -1317,7 +1313,6 @@ class DualViewModel(
         if (shouldClear) {
             try { activePolicyTx.compareAndSet(tx, null) } catch (_: Exception) { }
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             try { policyRevisionStale.set(true) } catch (_: Exception) { }
             try { markPolicyUnknownLocked() } catch (_: Exception) { }
             _state.update { cur ->
@@ -1340,7 +1335,6 @@ class DualViewModel(
             }
         } else {
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
         }
     }
 
@@ -1400,7 +1394,6 @@ class DualViewModel(
                 }
                 try {
                     policyReconciling.remove(tx.key)
-                    purgeRepairOutcome(tx.key)
                 } catch (_: Exception) {
                 }
                 _state.update { cur ->
@@ -1489,7 +1482,6 @@ class DualViewModel(
                 false
             }
         try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-        purgeRepairOutcome(tx.key)
         // A3-3 (C1): complete the coordinator claim (best effort; CAS is idempotent
         // and fail-safe when the claim is already consumed or foreign). CE rethrown.
         try {
@@ -1635,7 +1627,6 @@ class DualViewModel(
             synchronized(policySettleLock) {
                 activePolicyTx.compareAndSet(tx, null)
                 policyReconciling.remove(tx.key)
-                purgeRepairOutcome(tx.key)
                 val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
                 val curCoord = try { coord.activeTx.get() } catch (_: Exception) { null }
                 if (curLocal == null && curCoord == null) {
@@ -1711,7 +1702,6 @@ class DualViewModel(
                     clearObsoleteLocalTxLocked(tx, coord)
                 } else if (curLocal != null && curLocal !== tx) {
                     try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                    purgeRepairOutcome(tx.key)
                 } else {
                     _state.update { cur ->
                         if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
@@ -1819,7 +1809,6 @@ class DualViewModel(
             val curCoord = try { coord?.activeTx?.get() } catch (_: Exception) { null }
             if (curLocal != null && curLocal !== tx) {
                 try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                purgeRepairOutcome(tx.key)
                 return
             }
             if (coord != null && curCoord != null && curCoord !== tx) {
@@ -1829,7 +1818,6 @@ class DualViewModel(
             val canApplyUi = (curLocal === tx) || (_state.value.policyWritePhase == PolicyWritePhase.RECONCILING)
             if (!canApplyUi) {
                 try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                purgeRepairOutcome(tx.key)
                 return
             }
             val latestAny = try { coord?.latest?.value } catch (_: Exception) { null }
@@ -1839,7 +1827,6 @@ class DualViewModel(
             if (supersededByLatest) {
                 try { activePolicyTx.compareAndSet(tx, null) } catch (_: Exception) { }
                 try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                purgeRepairOutcome(tx.key)
                 try { policyRevisionStale.set(true) } catch (_: Exception) { }
                 try { markPolicyUnknownLocked() } catch (_: Exception) { }
                 _state.update { cur ->
@@ -1882,7 +1869,6 @@ class DualViewModel(
             }
             try { activePolicyTx.compareAndSet(tx, null) } catch (_: Exception) { }
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.RECONCILING &&
                     cur.policyWritePhase != PolicyWritePhase.SAVING
@@ -1914,7 +1900,6 @@ class DualViewModel(
         val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
         if (curLocalFb != null && curLocalFb !== tx) {
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             return
         }
         if (curCoordFb != null && curCoordFb !== tx) {
@@ -1961,7 +1946,6 @@ class DualViewModel(
         val curCoordAfter = try { coord.activeTx.get() } catch (_: Exception) { null }
         if (curLocalAfter != null && curLocalAfter !== tx) {
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             return
         }
         if (curCoordAfter != null && curCoordAfter !== tx) {
@@ -2004,7 +1988,6 @@ class DualViewModel(
                     if (lNow === tx || (lNow == null && _state.value.policyWritePhase == PolicyWritePhase.RECONCILING)) {
                         activePolicyTx.compareAndSet(tx, null)
                         policyReconciling.remove(tx.key)
-                        purgeRepairOutcome(tx.key)
                         policyRevisionStale.set(true)
                         markPolicyUnknownLocked()
                         _state.update { cur ->
@@ -2401,7 +2384,6 @@ class DualViewModel(
                 if (!claimed) {
                     activePolicyTx.compareAndSet(tx, null)
                     policyReconciling.remove(tx.key)
-                    purgeRepairOutcome(tx.key)
                     return@synchronized false
                 }
             }
@@ -2615,7 +2597,7 @@ class DualViewModel(
                 if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
                 // Pre-build terminal payload, claim with PLACEHOLDER-ONLY (never pass real
                 // payload to completeWithRevision), then stageRealPayload -> atomic settle -> emitStaged.
-                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                 val successMsg = repairTerminal?.first ?: if (tx.isClear) policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS))
                 else writeSuccessMsg(decision.packages.size, tx.pending, tx.sanitized)
                 val successKind: MsgKind = repairTerminal?.second ?: MsgKind.INFO
@@ -2883,7 +2865,6 @@ class DualViewModel(
             val curLocal = try { activePolicyTx.get() } catch (_: Throwable) { null }
             if (curLocal != null && curLocal !== tx) {
                 try { policyReconciling.remove(tx.key) } catch (_: Throwable) { }
-                purgeRepairOutcome(tx.key)
                 return
             }
             try {
@@ -2894,12 +2875,10 @@ class DualViewModel(
             }
             try {
                 policyReconciling.remove(tx.key)
-                purgeRepairOutcome(tx.key)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
             }
-            purgeRepairOutcome(tx.key)
             try {
                 markPolicyUnknownLocked()
             } catch (ce: CancellationException) {
@@ -3011,7 +2990,6 @@ class DualViewModel(
                 policyReconciling.remove(tx.key)
             } catch (_: Exception) {
             }
-            purgeRepairOutcome(tx.key)
             return
         }
         if (coord != null && curCoord != null && curCoord !== tx) {
@@ -3025,7 +3003,6 @@ class DualViewModel(
                 policyReconciling.remove(tx.key)
             } catch (_: Exception) {
             }
-            purgeRepairOutcome(tx.key)
             return
         }
         // Check if coordinator already has our terminal or an unseen foreign terminal,
@@ -3094,7 +3071,6 @@ class DualViewModel(
                         if (lNow === tx || (lNow == null && _state.value.policyWritePhase == PolicyWritePhase.RECONCILING)) {
                             activePolicyTx.compareAndSet(tx, null)
                             policyReconciling.remove(tx.key)
-                            purgeRepairOutcome(tx.key)
                             policyRevisionStale.set(true)
                             markPolicyUnknownLocked()
                             _state.update { cur ->
@@ -3120,7 +3096,7 @@ class DualViewModel(
         }
         val terminalPayload: PolicySettled = when (decision) {
             is PolicyTxSettle.Success -> {
-                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                 val successMsg = repairTerminal?.first ?: if (tx.isClear) {
                     policyText(PolicyText(PolicyTextKind.CLEAR_SUCCESS))
                 } else {
@@ -3160,7 +3136,6 @@ class DualViewModel(
             val canApply = (lNow === tx) || (lNow == null && _state.value.policyWritePhase == PolicyWritePhase.RECONCILING)
             if (!canApply) {
                 try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                purgeRepairOutcome(tx.key)
                 return@synchronized
             }
             if (!claimedCoord) {
@@ -3168,7 +3143,6 @@ class DualViewModel(
                     policyOwnershipGen.get() != ownershipSnap
                 ) {
                     try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-                    purgeRepairOutcome(tx.key)
                     return@synchronized
                 }
             }
@@ -3189,7 +3163,6 @@ class DualViewModel(
             }
             try { activePolicyTx.compareAndSet(tx, null) } catch (_: Exception) { }
             try { policyReconciling.remove(tx.key) } catch (_: Exception) { }
-            purgeRepairOutcome(tx.key)
             _state.update { cur ->
                 if (cur.policyWritePhase != PolicyWritePhase.RECONCILING &&
                     cur.policyWritePhase != PolicyWritePhase.SAVING
@@ -6653,7 +6626,6 @@ class DualViewModel(
             val wonLocal = (curLocal === tx) && activePolicyTx.compareAndSet(tx, null)
             try {
                 policyReconciling.remove(tx.key)
-                purgeRepairOutcome(tx.key)
             } catch (_: Exception) {
             }
             if (wonLocal) {
@@ -6745,11 +6717,9 @@ class DualViewModel(
                     }
                 }
             }
-            // Purge only AFTER the applyUnderLock lambda has consumed the map
-            // (the local _state payload builder re-reads repairOutcomes);
-            // purging earlier wiped the honest RepairedNoBackup coloring and
-            // silently degraded the user-visible terminal to the legacy default.
-            purgeRepairOutcome(tx.key)
+            // The repair outcome rides the shared Tx (tx.repairResult); it is
+            // consumed under the lock by applyUnderLock and dies with the Tx —
+            // no per-VM purge on settle.
         }
         if (stamped != null) {
             try {
@@ -7138,7 +7108,6 @@ class DualViewModel(
                             val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
                             if (curLocal === tx) activePolicyTx.compareAndSet(tx, null)
                             policyReconciling.remove(tx.key)
-                            purgeRepairOutcome(tx.key)
                             if (curLocal === tx || (curLocal == null && _state.value.policyWritePhase == PolicyWritePhase.RECONCILING)) {
                                 _state.update { cur ->
                                     cur.copy(
@@ -7246,7 +7215,7 @@ class DualViewModel(
                                     MsgKind.INFO, policyText(PolicyText(PolicyTextKind.REFRESHED)), true,
                                 )
                             } else if (groundDecision is PolicyTxSettle.Success) {
-                                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                                 PolicySettled(
                                     tx.txId, tx.key, emptySet(), true,
                                     repairTerminal?.second ?: MsgKind.INFO,
@@ -7279,7 +7248,7 @@ class DualViewModel(
                                     disarmBlindClear()
                                     if (tx.isRepair) disarmCorruptRepair()
                                     try { noteLastKnownDraft(emptySet()) } catch (_: Exception) { }
-                                    val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                                    val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                                     _state.update { cur ->
                                         cur.copy(
                                             pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -7439,7 +7408,7 @@ class DualViewModel(
                                 } else if (finalResult is LoadResult.Known) {
                                     when (settleDecision) {
                                         is PolicyTxSettle.Success -> {
-                                            val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                                            val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                                             PolicySettled(
                                                 tx.txId, tx.key, emptySet(), true,
                                                 repairTerminal?.second ?: MsgKind.INFO,
@@ -7484,7 +7453,7 @@ class DualViewModel(
                                                 disarmBlindClear()
                                                 if (tx.isRepair) disarmCorruptRepair()
                                                 try { noteLastKnownDraft(emptySet()) } catch (_: Exception) { }
-                                                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx.key) else null
+                                                val repairTerminal: Pair<String, MsgKind>? = if (tx.isRepair) repairSuccessTerminal(tx) else null
                                                 _state.update { cur ->
                                                     cur.copy(
                                                         pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
@@ -7579,7 +7548,6 @@ class DualViewModel(
                             val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
                             if (curLocal === tx) activePolicyTx.compareAndSet(tx, null)
                             policyReconciling.remove(tx.key)
-                            purgeRepairOutcome(tx.key)
                             if (curLocal === tx || (curLocal == null && _state.value.policyWritePhase == PolicyWritePhase.RECONCILING)) {
                                 _state.update { cur ->
                                     cur.copy(
@@ -7727,9 +7695,10 @@ class DualViewModel(
                     } else if (txSnap.isRepair) {
                         if (result.packages.isEmpty()) {
                             // Late-join repair success: publish the honest backup
-                            // outcome recorded by the repair lambda (mirrors the
-                            // fast path); absent ⇒ attempted-not-guaranteed wording.
-                            val repairTerminal = repairSuccessTerminal(txSnap.key)
+                            // outcome carried on the shared Tx (repairResult) —
+                            // mirrors the fast path; absent ⇒ attempted-not-
+                            // guaranteed wording.
+                            val repairTerminal = repairSuccessTerminal(txSnap)
                             PolicySettled(
                                 txSnap.txId, txSnap.key, result.packages, true,
                                 repairTerminal.second, repairTerminal.first, true,
@@ -7763,7 +7732,6 @@ class DualViewModel(
                         val curLocal = try { activePolicyTx.get() } catch (_: Exception) { null }
                         val wonLocal = (curLocal === txSnap) && activePolicyTx.compareAndSet(txSnap, null)
                         try { policyReconciling.remove(txSnap.key) } catch (_: Exception) { }
-                        purgeRepairOutcome(txSnap.key)
                         if (wonLocal) {
                             if (policyTxCoordinator != null && stamped == null) {
                                 applyStageRejectedUnderLock(txSnap, fenceHeld = true)
@@ -8638,7 +8606,6 @@ class DualViewModel(
                             synchronized(policySettleLock) {
                                 activePolicyTx.compareAndSet(tx, null)
                                 policyReconciling.remove(tx.key)
-                                purgeRepairOutcome(tx.key)
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
@@ -8707,7 +8674,6 @@ class DualViewModel(
                             if (pc != null) {
                                 activePolicyTx.compareAndSet(pc, null)
                                 policyReconciling.remove(pc.key)
-                                purgeRepairOutcome(pc.key)
                                 preClaimTx = null
                             }
                             val nowPendingNull = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
@@ -8781,7 +8747,6 @@ class DualViewModel(
                                 if (pc != null) {
                                     activePolicyTx.compareAndSet(pc, null)
                                     policyReconciling.remove(pc.key)
-                                    purgeRepairOutcome(pc.key)
                                     preClaimTx = null
                                 }
                                 val nowPendingNull2 = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
@@ -8954,7 +8919,7 @@ class DualViewModel(
                             }
                             synchronized(policySettleLock) {
                                 val wonLocal = (pcFast == null) || activePolicyTx.compareAndSet(pcFast, null)
-                                if (pcFast != null) { policyReconciling.remove(pcFast.key); purgeRepairOutcome(pcFast.key) }
+                                if (pcFast != null) { policyReconciling.remove(pcFast.key) }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
@@ -9032,7 +8997,7 @@ class DualViewModel(
                             }
                             synchronized(policySettleLock) {
                                 val wonLocal = (pcFailFast == null) || activePolicyTx.compareAndSet(pcFailFast, null)
-                                if (pcFailFast != null) { policyReconciling.remove(pcFailFast.key); purgeRepairOutcome(pcFailFast.key) }
+                                if (pcFailFast != null) { policyReconciling.remove(pcFailFast.key) }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
@@ -9645,7 +9610,6 @@ class DualViewModel(
                             synchronized(policySettleLock) {
                                 activePolicyTx.compareAndSet(txClear, null)
                                 policyReconciling.remove(txClear.key)
-                                purgeRepairOutcome(txClear.key)
                                 inFlightWrites.remove(key)
                                 preClaimTx = null
                                 markPolicyUnknownLocked()
@@ -9702,7 +9666,6 @@ class DualViewModel(
                                 if (pcRevAbort != null) {
                                     activePolicyTx.compareAndSet(pcRevAbort, null)
                                     policyReconciling.remove(pcRevAbort.key)
-                                    purgeRepairOutcome(pcRevAbort.key)
                                 }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
@@ -9898,7 +9861,7 @@ class DualViewModel(
                         }
                         synchronized(policySettleLock) {
                             val wonLocal = (pcClearFast == null) || activePolicyTx.compareAndSet(pcClearFast, null)
-                            if (pcClearFast != null) { policyReconciling.remove(pcClearFast.key); purgeRepairOutcome(pcClearFast.key) }
+                            if (pcClearFast != null) { policyReconciling.remove(pcClearFast.key) }
                             inFlightWrites.remove(key)
                             preClaimTx = null
                             if (wonLocal) {
@@ -9946,7 +9909,6 @@ class DualViewModel(
                                 if (pcFenceAbort != null) {
                                     activePolicyTx.compareAndSet(pcFenceAbort, null)
                                     policyReconciling.remove(pcFenceAbort.key)
-                                    purgeRepairOutcome(pcFenceAbort.key)
                                 }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
@@ -10013,7 +9975,7 @@ class DualViewModel(
                         }
                         synchronized(policySettleLock) {
                             val wonLocal = (pcClearFailFast == null) || activePolicyTx.compareAndSet(pcClearFailFast, null)
-                            if (pcClearFailFast != null) { policyReconciling.remove(pcClearFailFast.key); purgeRepairOutcome(pcClearFailFast.key) }
+                            if (pcClearFailFast != null) { policyReconciling.remove(pcClearFailFast.key) }
                             inFlightWrites.remove(key)
                             preClaimTx = null
                             if (wonLocal) {
@@ -10529,8 +10491,9 @@ class DualViewModel(
                     var h1RepairDeferred: Deferred<Boolean>? = null
                     var repairRevBeforeProbe: Long? = null
                     // A3-1: fast-path 需要知道修復是「Repaired」還是「RepairedNoBackup」
-                    // 才能誠實揭露備份失敗 —— 結果寫入此 ref 供 success 分支取用
-                    // （PolicyTx.deferred 為 Deferred<Boolean>，不變更其型別）。
+                    // 才能誠實揭露備份失敗 —— 結果寫入此 ref（同一 ref 同時掛在
+                    // PolicyTx.repairResult 上，跨 VM 終態據此推導；fast path 分支
+                    // 直接讀同一 ref）（PolicyTx.deferred 為 Deferred<Boolean>，不變更其型別）。
                     val repairResultRef = AtomicReference<RepairResult?>(null)
                     val h1RepairCoord = policyTxCoordinator
                     if (h1RepairCoord != null) {
@@ -10570,10 +10533,6 @@ class DualViewModel(
                                 RepairResult.RepairFailed
                             }
                             try {
-                                repairOutcomes[key] = r
-                            } catch (_: Exception) {
-                            }
-                            try {
                                 repairResultRef.set(r)
                             } catch (_: Exception) {
                             }
@@ -10588,6 +10547,7 @@ class DualViewModel(
                             isClear = true,
                             pending = null,
                             isRepair = true,
+                            repairResult = repairResultRef,
                         )
                         val h1ClaimRes = h1RepairCoord.tryClaimWrite(tx, armedRepairBaseRev)
                         if (h1ClaimRes == PolicyTxCoordinator.ClaimWriteResult.BUSY) {
@@ -10766,7 +10726,6 @@ class DualViewModel(
                             synchronized(policySettleLock) {
                                 activePolicyTx.compareAndSet(tx, null)
                                 policyReconciling.remove(tx.key)
-                                purgeRepairOutcome(tx.key)
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
@@ -10824,7 +10783,6 @@ class DualViewModel(
                                     if (pcRevAbort != null) {
                                         activePolicyTx.compareAndSet(pcRevAbort, null)
                                         policyReconciling.remove(pcRevAbort.key)
-                                        purgeRepairOutcome(pcRevAbort.key)
                                     }
                                     inFlightWrites.remove(key)
                                     policyWriteSaving.remove(key)
@@ -10894,7 +10852,6 @@ class DualViewModel(
                                 if (pcKnown != null) {
                                     activePolicyTx.compareAndSet(pcKnown, null)
                                     policyReconciling.remove(pcKnown.key)
-                                    purgeRepairOutcome(pcKnown.key)
                                     preClaimTx = null
                                 }
                                 inFlightWrites.remove(key)
@@ -10936,7 +10893,6 @@ class DualViewModel(
                                 if (pcAbort != null) {
                                     activePolicyTx.compareAndSet(pcAbort, null)
                                     policyReconciling.remove(pcAbort.key)
-                                    purgeRepairOutcome(pcAbort.key)
                                     preClaimTx = null
                                 }
                                 inFlightWrites.remove(key)
@@ -10972,10 +10928,6 @@ class DualViewModel(
                                 throw ce
                             } catch (_: Throwable) {
                                 RepairResult.RepairFailed
-                            }
-                            try {
-                                repairOutcomes[key] = r
-                            } catch (_: Exception) {
                             }
                             try {
                                 repairResultRef.set(r)
@@ -11014,6 +10966,7 @@ class DualViewModel(
                                 pending = null,
                                 isRepair = true,
                                 executionArmed = AtomicBoolean(true),
+                                repairResult = repairResultRef,
                             )
                             if (writeLocked) {
                                 try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
@@ -11063,7 +11016,6 @@ class DualViewModel(
                                         synchronized(policySettleLock) {
                                             activePolicyTx.compareAndSet(pcFast, null)
                                             policyReconciling.remove(pcFast.key)
-                                            purgeRepairOutcome(pcFast.key)
                                             inFlightWrites.remove(key)
                                             policyWriteSaving.remove(key)
                                             preClaimTx = null
@@ -11142,7 +11094,6 @@ class DualViewModel(
                                             clearObsoleteLocalTxLocked(pcFast, coordR)
                                         } else if (curLocal != null && curLocal !== pcFast) {
                                             try { policyReconciling.remove(pcFast.key) } catch (_: Exception) { }
-                                            purgeRepairOutcome(pcFast.key)
                                         } else {
                                             _state.update { cur ->
                                                 if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
@@ -11187,7 +11138,7 @@ class DualViewModel(
                             }
                             synchronized(policySettleLock) {
                                 val wonLocal = (pcFast == null) || activePolicyTx.compareAndSet(pcFast, null)
-                                if (pcFast != null) { policyReconciling.remove(pcFast.key); purgeRepairOutcome(pcFast.key) }
+                                if (pcFast != null) { policyReconciling.remove(pcFast.key) }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
@@ -11263,7 +11214,7 @@ class DualViewModel(
                             }
                             synchronized(policySettleLock) {
                                 val wonLocal = (pcFailFast == null) || activePolicyTx.compareAndSet(pcFailFast, null)
-                                if (pcFailFast != null) { policyReconciling.remove(pcFailFast.key); purgeRepairOutcome(pcFailFast.key) }
+                                if (pcFailFast != null) { policyReconciling.remove(pcFailFast.key) }
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 preClaimTx = null
