@@ -42,9 +42,11 @@ expected_reason() {
     fail-duplicate-exact-provider.merged.xml|fail-duplicate-exact-provider.xmltree.txt)
       printf 'with android:name exactly' ;;
     fail-debug-authority-in-release.merged.xml|fail-debug-authority-in-release.xmltree.txt)
-      printf 'authorities exactly equal' ;;
+      printf 'cross-variant authority' ;;
     fail-empty-authority.merged.xml|fail-empty-authority.xmltree.txt)
-      printf 'authorities exactly equal' ;;
+      printf 'android:authorities is empty' ;;
+    fail-foreign-provider-same-authority.merged.xml|fail-foreign-provider-same-authority.xmltree.txt)
+      printf 'unexpected provider' ;;
     fail-empty.xmltree.txt)
       printf 'no elements parsed' ;;
     fail-enabled-false.merged.xml|fail-enabled-false.xmltree.txt)
@@ -56,11 +58,13 @@ expected_reason() {
     fail-missing-exported.merged.xml|fail-missing-exported.xmltree.txt)
       printf 'missing android:exported' ;;
     fail-multi-authority.merged.xml|fail-multi-authority.xmltree.txt)
-      printf 'authorities exactly equal' ;;
+      printf 'carries multiple authorities' ;;
     fail-namespaced-application-permission.merged.xml)
       printf 'namespace-qualified element' ;;
     fail-namespaced-provider.merged.xml)
       printf 'namespace-qualified element' ;;
+    fail-namespaced-provider.xmltree.txt)
+      printf 'namespace-qualified element token' ;;
     fail-namespaced-application-permission.xmltree.txt)
       printf 'namespace-qualified element token' ;;
     fail-name-in-activity.merged.xml|fail-name-in-activity.xmltree.txt)
@@ -70,7 +74,7 @@ expected_reason() {
     fail-readpermission-present.merged.xml|fail-readpermission-present.xmltree.txt)
       printf 'must NOT carry android:readPermission' ;;
     fail-split-attribute.merged.xml|fail-split-attribute.xmltree.txt)
-      printf 'authorities exactly equal' ;;
+      printf 'splits the expected' ;;
     fail-tools-namespace-shadow.merged.xml)
       printf 'with android:name exactly' ;;
     fail-two-guard-providers.merged.xml|fail-two-guard-providers.xmltree.txt)
@@ -78,7 +82,7 @@ expected_reason() {
     fail-writepermission-present.merged.xml|fail-writepermission-present.xmltree.txt)
       printf 'must NOT carry android:writePermission' ;;
     fail-wrong-authority.merged.xml|fail-wrong-authority.xmltree.txt)
-      printf 'authorities exactly equal' ;;
+      printf "android:authorities is '" ;;
     fail-xposed-provider-node.merged.xml|fail-xposed-provider-node.xmltree.txt)
       printf 'contains XposedProvider' ;;
     *)

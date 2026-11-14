@@ -43,7 +43,11 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          # Failure classification (scripts/ci-retry-guard.sh): dependency-verification
+          # failures (signature: "Dependency verification failed" / verification-metadata /
+          # checksum mismatch) exit 1 immediately with ::error:: — never retried; only
+          # transient failures (e.g. 504s) are retried, up to the attempt cap.
+          bash scripts/ci-retry-guard.sh 5 30 "wrapper warmup" -- ./gradlew --version
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -59,7 +63,7 @@ jobs:
             # Two-phase: Phase 1 builds/deps with retry (5x/30s) so transient 504s during
             # dependency download don't fail the run; Phase 2 runs the real tests once
             # (never re-run the tests themselves on retry).
-            attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+            bash scripts/ci-retry-guard.sh 5 30 "Phase1 assemble" -- ./gradlew :app:assembleDebugAndroidTest --no-daemon
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Upload instrumentation reports
         if: always()
@@ -97,18 +101,18 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
-      # Validate all workflow YAML files with python (stdlib + PyYAML fallback).
+          bash scripts/ci-retry-guard.sh 5 30 "wrapper warmup" -- ./gradlew --version
+      # Validate all workflow YAML files with python + PyYAML (installed below, deterministic).
       - name: YAML syntax check (python)
         run: |
+          python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2' || python3 -m pip install --quiet 'pyyaml==6.0.2'
           python3 - <<'PY'
           import glob, sys
           try:
               import yaml
-              has_yaml = True
           except ImportError:
-              has_yaml = False
-              print("PyYAML not available, falling back to basic parse check")
+              print("FAIL: PyYAML import failed even after pip install pyyaml; refusing to silently degrade the YAML gate")
+              sys.exit(1)
           files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
           if not files:
               print("no workflow yaml files found")
@@ -118,10 +122,7 @@ jobs:
               try:
                   with open(f, encoding="utf-8") as fh:
                       text = fh.read()
-                  if has_yaml:
-                      yaml.safe_load(text)
-                  else:
-                      assert text.strip(), f"empty file: {f}"
+                  yaml.safe_load(text)
                   print(f"OK: {f}")
               except Exception as e:
                   print(f"FAIL: {f}: {e}")
@@ -131,10 +132,11 @@ jobs:
       # Compile all modules (app APK + hook/core AARs). No swallow-echo fallback here:
       # any compilation failure must propagate a nonzero exit code and fail the job.
       # Phase A2: wrapper is committed, so always use ./gradlew (pinned Gradle 8.7).
+      # Dependency-verification failures fail fast (ci-retry-guard.sh, no retry).
       - name: Assemble app, hook, core (debug)
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :hook:assembleDebug :core:assembleDebug --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          bash scripts/ci-retry-guard.sh 5 30 "assemble" -- ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest :hook:assembleDebug :core:assembleDebug --no-daemon
       # Release-gate parity: run the shared artifact verifier on the debug APK in PR CI.
       - name: Verify debug APK artifacts (shared release gate)
         run: |
@@ -160,15 +162,39 @@ jobs:
           set -e
           set -o pipefail
           echo "== (a) merged manifest has no android:sharedUserId attribute =="
-          if [ ! -d app/build/intermediates/merged_manifests ]; then
-            echo "FAIL: app/build/intermediates/merged_manifests missing; run :app:assembleDebug first"
+          # Prefer the new AGP 8.x `merged_manifest` (processDebugMainManifest)
+          # layout; fall back to the legacy `merged_manifests` layout ONLY when
+          # the new-layout root does not exist at all. If the new-layout root
+          # exists but yields zero debug manifests, FAIL — never fall back to
+          # the legacy tree (a stale legacy manifest would silently weaken the
+          # gate). Scope to the debug variant (path component exactly 'debug')
+          # and require EXACTLY ONE merged manifest in the chosen layout — zero
+          # means the merge task did not run; more than one means an unexpected
+          # variant is present, and grepping an arbitrary pick would silently
+          # weaken the gate. `|| true` keeps a missing legacy root from
+          # aborting the step under set -e/pipefail.
+          if [ -d app/build/intermediates/merged_manifest ]; then
+            LAYOUT="app/build/intermediates/merged_manifest (processDebugMainManifest)"
+            MERGED_FILES=$(find app/build/intermediates/merged_manifest -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
+            if [ -z "$MERGED_FILES" ]; then
+              echo "FAIL: app/build/intermediates/merged_manifest exists but contains zero debug AndroidManifest.xml (path '*/debug/*'); refusing to fall back to the legacy layout — run :app:assembleDebug first"
+              exit 1
+            fi
+          else
+            LAYOUT="app/build/intermediates/merged_manifests (legacy processDebugManifest)"
+            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
+          fi
+          if [ -z "$MERGED_FILES" ]; then
+            echo "FAIL: no merged debug AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest missing and legacy app/build/intermediates/merged_manifests yielded zero files matching '*/debug/*'; run :app:assembleDebug first)"
             exit 1
           fi
-          MERGED=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml | head -n 1)
-          if [ -z "$MERGED" ] || [ ! -f "$MERGED" ]; then
-            echo "FAIL: no merged AndroidManifest.xml under app/build/intermediates/merged_manifests; run :app:assembleDebug first"
+          MERGED_COUNT=$(printf '%s\n' "$MERGED_FILES" | wc -l)
+          if [ "$MERGED_COUNT" != "1" ]; then
+            echo "FAIL: expected exactly 1 merged debug AndroidManifest.xml in $LAYOUT, found $MERGED_COUNT:"
+            printf '%s\n' "$MERGED_FILES"
             exit 1
           fi
+          MERGED="$MERGED_FILES"
           echo "merged manifest: $MERGED"
           if grep -E 'android:sharedUserId[[:space:]]*=' "$MERGED"; then echo "FAIL: android:sharedUserId attribute found in merged manifest $MERGED (uid gate would admit siblings)"; exit 1; fi
           echo "== (b) APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool scan) =="
@@ -276,7 +302,10 @@ jobs:
       # the libxposed service AAR's exported XposedProvider at the same authority.
       # Why: the AAR's provider is exported with no permission, so any app could
       # call SendBinder and hijack the policy channel; the merged manifest must
-      # carry only GuardXposedProvider at ${applicationId}.XposedService.
+      # carry ONLY GuardXposedProvider at ${applicationId}.XposedService — no
+      # other <provider> (foreign name or impostor) may claim that authority,
+      # which the parity gate rejects. The gate enforces nothing about any
+      # other authority.
       - name: Policy provider parity
         run: |
           set -e
@@ -290,23 +319,28 @@ jobs:
           grep -F -A1 'android:name=".GuardXposedProvider"' "$MAN" | grep -F 'android:authorities="${applicationId}.XposedService"'
           echo "== merged manifest =="
           # Prefer the new AGP 8.x `merged_manifest` (processDebugMainManifest)
-          # layout; fall back to the legacy `merged_manifests` layout only when
-          # the new one yields no files. Scope to the debug variant and require
-          # EXACTLY ONE merged manifest in the chosen layout — zero means the
-          # merge task did not run; more than one means an unexpected variant is
-          # present, and grepping an arbitrary pick would silently weaken the
-          # gate. `|| true` keeps a missing root from aborting the step under
-          # set -e/pipefail.
-          MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*debug*' -name AndroidManifest.xml 2>/dev/null || true)
-          if [ -n "$MERGED_NEW" ]; then
+          # layout — when the new-layout root exists it is authoritative: zero
+          # debug manifests under it means the merge task did not run, and
+          # falling back to the legacy tree could validate a stale artifact.
+          # Scope to the debug variant (a literal `debug` path component) and
+          # require EXACTLY ONE merged manifest — more than one means an
+          # unexpected variant is present, and grepping an arbitrary pick would
+          # silently weaken the gate. `|| true` keeps a missing root from
+          # aborting the step under set -e/pipefail.
+          if [ -d app/build/intermediates/merged_manifest ]; then
+            MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
+            if [ -z "$MERGED_NEW" ]; then
+              echo "FAIL: new-layout merged_manifest exists but contains zero debug AndroidManifest.xml (path '*/debug/*'; processDebugMainManifest did not run; refusing to fall back to a possibly stale legacy tree; run :app:assembleDebug first)"
+              exit 1
+            fi
             LAYOUT="app/build/intermediates/merged_manifest (processDebugMainManifest)"
             MERGED_FILES="$MERGED_NEW"
           else
             LAYOUT="app/build/intermediates/merged_manifests (legacy processDebugManifest)"
-            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*debug*' -name AndroidManifest.xml 2>/dev/null || true)
+            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
           fi
           if [ -z "$MERGED_FILES" ]; then
-            echo "FAIL: no merged debug AndroidManifest.xml found (new layout app/build/intermediates/merged_manifest and legacy app/build/intermediates/merged_manifests both yielded zero files matching '*debug*'; run :app:assembleDebug first)"
+            echo "FAIL: no merged debug AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest absent and legacy tree yielded zero files matching '*/debug/*'; run :app:assembleDebug first)"
             exit 1
           fi
           MERGED_COUNT=$(printf '%s\n' "$MERGED_FILES" | wc -l)
@@ -319,9 +353,11 @@ jobs:
           echo "merged manifest: $MERGED"
           # Provider-node parse gate: exactly one <provider> carrying BOTH the
           # GuardXposedProvider name and the debug-suffixed authority on the
-          # SAME element, exported=true, no android:permission, zero libxposed
+          # SAME element, exported=true, no android:permission, NO foreign
+          # <provider> claiming the pinned authority, zero libxposed
           # XposedProvider nodes anywhere, and zero wrong-element name
-          # occurrences. NOTE (debug variant): this parity gate asserts the
+          # occurrences. Nothing is enforced about any other authority.
+          # NOTE (debug variant): this parity gate asserts the
           # DEBUG variant authority (com.galaxydual.plus.debug.XposedService).
           # The release invariant (release authority without the .debug suffix)
           # is enforced by the "Policy provider parity (release merged
@@ -349,23 +385,28 @@ jobs:
           echo "== release merged manifest =="
           ALLOW_RELEASE_MANIFEST_MERGE=1 ./gradlew :app:processReleaseMainManifest --no-daemon
           # Prefer the new AGP 8.x `merged_manifest` (processReleaseMainManifest)
-          # layout; fall back to the legacy `merged_manifests` layout only when
-          # the new one yields no files. Scope to the release variant and
-          # require EXACTLY ONE merged manifest in the chosen layout — zero
-          # means the merge task did not run; more than one means an unexpected
-          # variant is present, and grepping an arbitrary pick would silently
-          # weaken the gate. `|| true` keeps a missing root from aborting the
-          # step under set -e/pipefail.
-          MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
-          if [ -n "$MERGED_NEW" ]; then
+          # layout — when the new-layout root exists it is authoritative: zero
+          # release manifests under it means the merge task did not run, and
+          # falling back to the legacy tree could validate a stale artifact.
+          # Scope to the release variant (a literal `release` path component)
+          # and require EXACTLY ONE merged manifest — more than one means an
+          # unexpected variant is present, and grepping an arbitrary pick would
+          # silently weaken the gate. `|| true` keeps a missing root from
+          # aborting the step under set -e/pipefail.
+          if [ -d app/build/intermediates/merged_manifest ]; then
+            MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*/release/*' -name AndroidManifest.xml 2>/dev/null || true)
+            if [ -z "$MERGED_NEW" ]; then
+              echo "FAIL: new-layout merged_manifest exists but no release AndroidManifest.xml under it (path '*/release/*'; processReleaseMainManifest did not run; refusing to fall back to a possibly stale legacy tree)"
+              exit 1
+            fi
             LAYOUT="app/build/intermediates/merged_manifest (processReleaseMainManifest)"
             MERGED_FILES="$MERGED_NEW"
           else
             LAYOUT="app/build/intermediates/merged_manifests (legacy processReleaseManifest)"
-            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
+            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/release/*' -name AndroidManifest.xml 2>/dev/null || true)
           fi
           if [ -z "$MERGED_FILES" ]; then
-            echo "FAIL: no merged release AndroidManifest.xml found (new layout app/build/intermediates/merged_manifest and legacy app/build/intermediates/merged_manifests both yielded zero files matching '*release*'; run :app:processReleaseMainManifest first)"
+            echo "FAIL: no merged release AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest absent and legacy tree yielded zero files matching '*/release/*'; run :app:processReleaseMainManifest first)"
             exit 1
           fi
           if [ "$(printf '%s\n' "$MERGED_FILES" | wc -l)" != "1" ]; then
@@ -377,9 +418,10 @@ jobs:
           echo "merged release manifest: $MERGED"
           # Provider-node parse gate: exactly one <provider> with the
           # GuardXposedProvider name AND the release (unsuffixed) authority on
-          # the SAME element, exported=true, no android:permission, zero
-          # libxposed XposedProvider nodes anywhere, zero wrong-element name
-          # occurrences.
+          # the SAME element, exported=true, no android:permission, NO foreign
+          # <provider> claiming the pinned authority, zero libxposed
+          # XposedProvider nodes anywhere, zero wrong-element name occurrences.
+          # Nothing is enforced about any other authority.
           python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority com.galaxydual.plus.XposedService
           # Release authority must NOT carry the debug applicationIdSuffix.
           if grep -F 'com.galaxydual.plus.debug.XposedService' "$MERGED"; then
@@ -390,7 +432,8 @@ jobs:
       # Parity-checker fixture self-test: every fail-* fixture must exit 1 and
       # every pass-* fixture must exit 0, proving the provider-node gate fails
       # closed (wrong-element names, split name/authority, exported=false, an
-      # unexpected android:permission, and the debug/release authority pair).
+      # unexpected android:permission, a foreign provider claiming the pinned
+      # authority, and the debug/release authority pair).
       - name: Provider parity checker self-test
         run: bash scripts/check-provider-parity.test.sh
       # H1 honesty gate: unverified features must never be claimed as working.
@@ -501,7 +544,7 @@ jobs:
           # Two-phase: Phase 1 warms unit-test dependencies with retry (5x/30s) so
           # transient 504s during download do not fail the run; Phase 2 runs the
           # actual JVM tests exactly once. 下載可 retry，測試/lint 只跑一次.
-          attempt=1; until ./gradlew :app:compileDebugUnitTestKotlin :core:compileDebugUnitTestKotlin :hook:compileDebugUnitTestKotlin --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 warm unit-test deps attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 warm unit-test deps attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          bash scripts/ci-retry-guard.sh 5 30 "Phase1 warm unit-test deps" -- ./gradlew :app:compileDebugUnitTestKotlin :core:compileDebugUnitTestKotlin :hook:compileDebugUnitTestKotlin --no-daemon
           ./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon
       # Always keep test reports, even when the test step fails.
       - name: Upload unit test reports
@@ -521,7 +564,7 @@ jobs:
       - name: Compile androidTest (no device needed)
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 3 ]; then echo "compile androidTest attempt $attempt failed (max 3)"; exit 1; fi; echo "compile androidTest attempt $attempt failed, sleep 20"; sleep 20; attempt=$((attempt+1)); done
+          bash scripts/ci-retry-guard.sh 3 20 "compile androidTest" -- ./gradlew :app:assembleDebugAndroidTest --no-daemon
       - name: Upload APK artifacts (debug + androidTest)
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -542,7 +585,7 @@ jobs:
           # Two-phase: Phase 1 warms lint dependencies (lintChecksClasspath) with
           # retry (5x/30s) so transient 504s during download do not fail the run;
           # Phase 2 runs lint exactly once. 下載可 retry，測試/lint 只跑一次.
-          attempt=1; until ./gradlew :app:generateDebugLintModel :core:generateDebugLintModel :hook:generateDebugLintModel --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 warm lintChecksClasspath deps attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 warm lintChecksClasspath deps attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          bash scripts/ci-retry-guard.sh 5 30 "Phase1 warm lintChecksClasspath deps" -- ./gradlew :app:generateDebugLintModel :core:generateDebugLintModel :hook:generateDebugLintModel --no-daemon
           ./gradlew lint --no-daemon
       # Always keep lint reports, even when the lint step fails.
       - name: Upload lint reports
@@ -586,7 +629,7 @@ jobs:
       - name: Warm Gradle wrapper
         run: |
           chmod +x ./gradlew
-          attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+          bash scripts/ci-retry-guard.sh 5 30 "wrapper warmup" -- ./gradlew --version
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -602,7 +645,7 @@ jobs:
           script: |
             chmod +x ./gradlew
             # Warm Gradle wrapper (retry on 504): pre-download gradle-8.7-bin.zip
-            attempt=1; until ./gradlew --version; do if [ "$attempt" -ge 5 ]; then echo "wrapper warmup attempt $attempt failed (max 5)"; exit 1; fi; echo "wrapper warmup attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+            bash scripts/ci-retry-guard.sh 5 30 "wrapper warmup" -- ./gradlew --version
             adb shell input keyevent 82 || true
             adb shell input keyevent 224 || true
             adb shell wm dismiss-keyguard || true
@@ -610,7 +653,7 @@ jobs:
             # Two-phase: Phase 1 builds/deps with retry (5x/30s) so transient 504s during
             # dependency download don't fail the run; Phase 2 runs the real tests once
             # (never re-run the tests themselves on retry).
-            attempt=1; until ./gradlew :app:assembleDebugAndroidTest --no-daemon; do if [ "$attempt" -ge 5 ]; then echo "Phase1 assemble attempt $attempt failed (max 5)"; exit 1; fi; echo "Phase1 assemble attempt $attempt failed, sleep 30"; sleep 30; attempt=$((attempt+1)); done
+            bash scripts/ci-retry-guard.sh 5 30 "Phase1 assemble" -- ./gradlew :app:assembleDebugAndroidTest --no-daemon
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
       - name: Record tested APK provenance
         if: always()

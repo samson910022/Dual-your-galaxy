@@ -20,6 +20,15 @@
 #   * that element has android:enabled absent or EXACTLY "true" (string compare);
 #   * NO <application> element carries android:permission (a component-level
 #     default would be inherited by the provider as well);
+#   * NO <provider> element other than the GuardXposedProvider itself carries
+#     the --authority (foreign/impostor provider claiming the pinned authority
+#     fails closed; the FQN pin alone cannot see a name that avoids the
+#     GuardXposedProvider marker). android:authorities is ';'-separated (Android
+#     tokenizes it), so the foreign rule compares per-TOKEN: any ';'-separated
+#     token that strips to exactly --authority counts as a claim;
+#   * <provider> elements nested under <queries> are NOT claimants (a <queries>
+#     block declares package visibility, never claims an authority) and are
+#     skipped by every rule above in both parser modes;
 #   * zero elements of ANY tag whose android:name contains "XposedProvider"
 #     other than the pinned GuardXposedProvider itself (covers the libxposed
 #     service io.github.libxposed.service.XposedProvider);
@@ -38,10 +47,12 @@
 # error still exits non-zero (fail closed); parse errors report ::error::
 # explicitly.
 #
-# --authority is an EXACT string compare against android:authorities (Android
-# uses ';' as the separator for multi-authority providers; today this app's
-# GuardXposedProvider pins a single authority — pass the full string if that
-# ever changes).
+# --authority is matched two ways. On the pinned GuardXposedProvider element
+# the comparison is an EXACT whole-string compare (Guard claims only the exact
+# authority; a ';' in its value is the intentional multi-authority rejection).
+# Everywhere else android:authorities is ';'-tokenized by Android, so the
+# foreign-provider rule and the carrier lookup in the split-attribute arm
+# compare per-TOKEN (split on ';', strip, token == --authority).
 import argparse
 import re
 import sys
@@ -63,6 +74,19 @@ def die(reason):
     sys.exit(1)
 
 
+def authority_tokens(value):
+    """';'-split an android:authorities attribute into stripped tokens.
+
+    Android tokenizes multi-authority providers on ';', so a substring compare
+    would either miss a token (";com.x.Y") or false-positive on a suffix of a
+    longer authority. Empty tokens are dropped (an empty segment can never
+    equal a non-empty --authority).
+    """
+    if not value:
+        return []
+    return [token.strip() for token in value.split(";") if token.strip()]
+
+
 def parse_merged_xml(path):
     try:
         tree = ET.parse(path)
@@ -71,31 +95,39 @@ def parse_merged_xml(path):
     except OSError as exc:
         die(f"merged-xml unreadable file {path}: {exc}")
     elements = []
-    for el in tree.getroot().iter():
+
+    def walk(el, in_queries):
         # Framework elements in a merged manifest are UNnamespaced. A tag
         # carrying any namespace (evil:provider) must never satisfy the
         # contract; die fail-closed (mirroring aapt2-xmltree mode, which dies
         # on namespace-qualified element tokens). Non-string tags (comments,
         # PIs) iterate as non-str and are ignored below.
         raw_tag = el.tag
-        if not isinstance(raw_tag, str):
-            raw_tag = ""
-        if "}" in raw_tag:
-            die(f"{path}: namespace-qualified element {raw_tag} (refusing to parse)")
-        tag = raw_tag
-        local = raw_tag
-        if ":" in local:
-            local = local.rsplit(":", 1)[-1]
-        # Only attributes in the android namespace are honored; bare or
-        # tools: attributes must NOT satisfy (or shadow) the android contract.
-        attrs = {}
-        for key, value in el.attrib.items():
-            if not key.startswith("{"):
-                continue
-            ns, _, ln = key[1:].partition("}")
-            if ns == ANDROID_NS:
-                attrs[ln] = value
-        elements.append({"tag": tag, "local": local, "attrs": attrs})
+        if isinstance(raw_tag, str):
+            if "}" in raw_tag:
+                die(f"{path}: namespace-qualified element {raw_tag} (refusing to parse)")
+            tag = raw_tag
+            local = raw_tag
+            if ":" in local:
+                local = local.rsplit(":", 1)[-1]
+            child_in_queries = in_queries or local == "queries"
+            # Only attributes in the android namespace are honored; bare or
+            # tools: attributes must NOT satisfy (or shadow) the android contract.
+            attrs = {}
+            for key, value in el.attrib.items():
+                if not key.startswith("{"):
+                    continue
+                ns, _, ln = key[1:].partition("}")
+                if ns == ANDROID_NS:
+                    attrs[ln] = value
+            elements.append({"tag": tag, "local": local, "attrs": attrs,
+                             "in_queries": child_in_queries})
+        else:
+            child_in_queries = in_queries
+        for child in el:
+            walk(child, child_in_queries)
+
+    walk(tree.getroot(), False)
     if not elements:
         die(f"merged-xml parse produced no elements: {path}")
     return elements
@@ -142,6 +174,11 @@ def parse_xmltree_text(text, source):
             element = {"tag": token, "local": token, "attrs": {}, "line": lineno}
             while stack and stack[-1][0] >= indent:
                 stack.pop()
+            # Ancestor chain = remaining stack after closing siblings/deeper
+            # levels; a <provider> under <queries> declares package visibility,
+            # never claims the authority, so it is flagged here and skipped by
+            # the provider rules downstream.
+            element["in_queries"] = any(parent["local"] == "queries" for _, parent in stack)
             elements.append(element)
             stack.append((indent, element))
             continue
@@ -179,7 +216,10 @@ def element_name(element):
 def check_elements(elements, authority):
     errors = []
 
-    providers = [e for e in elements if e["tag"] == "provider"]
+    # <provider> elements under <queries> declare package visibility only and
+    # never claim the authority; they are not claimants anywhere in this gate.
+    providers = [e for e in elements
+                 if e["tag"] == "provider" and not e.get("in_queries")]
     pinned = [p for p in providers if element_name(p) == EXPECTED_PROVIDER]
 
     # Explicit node count: exactly one <provider> named exactly the pinned
@@ -191,14 +231,69 @@ def check_elements(elements, authority):
             f"'{EXPECTED_PROVIDER}', found {len(pinned)}"
         )
 
-    # Name AND authority on the SAME element, exactly once.
+    # Name AND authority on the SAME element, exactly once. Each failure shape
+    # gets its own message so fixture pins can attribute the exact arm.
     matching = [p for p in pinned if p["attrs"].get("authorities") == authority]
     if len(matching) != 1:
-        present = ", ".join(sorted({p["attrs"].get("authorities", "<absent>") for p in pinned})) or "none"
-        errors.append(
-            f"expected exactly 1 GuardXposedProvider <provider> whose authorities exactly equal "
-            f"'{authority}', found {len(matching)} (GuardXposedProvider provider authorities present: {present})"
-        )
+        if not pinned:
+            errors.append(
+                f"expected exactly 1 GuardXposedProvider <provider> whose authorities exactly equal "
+                f"'{authority}', found 0 (no GuardXposedProvider provider present)"
+            )
+        else:
+            for p in pinned:
+                a = p["attrs"].get("authorities")
+                if a == authority:
+                    continue
+                carrier = next(
+                    (q for q in providers
+                     if q is not p and authority in authority_tokens(q["attrs"].get("authorities"))),
+                    None,
+                )
+                if a is None:
+                    errors.append(
+                        f"GuardXposedProvider <provider> is missing android:authorities "
+                        f"(expected '{authority}')"
+                    )
+                elif not a.strip():
+                    errors.append(
+                        f"GuardXposedProvider <provider> android:authorities is empty "
+                        f"(expected '{authority}')"
+                    )
+                elif ";" in a:
+                    errors.append(
+                        f"GuardXposedProvider <provider> android:authorities carries multiple "
+                        f"authorities '{a}' (expected exactly '{authority}')"
+                    )
+                elif carrier is not None:
+                    errors.append(
+                        f"GuardXposedProvider <provider> android:authorities '{a}' splits the "
+                        f"expected '{authority}', which is carried by <{carrier['tag']}> "
+                        f"'{element_name(carrier)}' (name and authority must live on the same element)"
+                    )
+                elif (".debug." in a) != (".debug." in authority):
+                    errors.append(
+                        f"GuardXposedProvider <provider> carries the cross-variant authority "
+                        f"'{a}' (expected '{authority}')"
+                    )
+                else:
+                    errors.append(
+                        f"GuardXposedProvider <provider> android:authorities is '{a}', "
+                        f"expected '{authority}'"
+                    )
+
+    # Foreign-provider rule: EVERY <provider> carrying the pinned authority
+    # must BE the GuardXposedProvider. An impostor with a plain foreign name
+    # would otherwise pass the FQN-based pinning above. Authorities are
+    # ';'-separated by Android, so the comparison is per-TOKEN (split on ';',
+    # strip): a foreign provider with authorities="x;<expected>" claims the
+    # authority just as an exact match would.
+    for provider in providers:
+        if authority in authority_tokens(provider["attrs"].get("authorities")) and element_name(provider) != EXPECTED_PROVIDER:
+            errors.append(
+                f"unexpected provider '{element_name(provider) or '<absent>'}' claiming pinned "
+                f"authority '{authority}' (only GuardXposedProvider may)"
+            )
 
     # exported=true (string compare) on the pinned element.
     target = matching[0] if len(matching) == 1 else (pinned[0] if pinned else None)

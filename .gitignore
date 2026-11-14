@@ -20,3 +20,4 @@ release-key.properties
 *.key.properties
 local.defaults.properties
 .kotlin/
+__pycache__/
