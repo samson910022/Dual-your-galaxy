@@ -56,7 +56,7 @@ class HookPolicyStoreTest {
     }
 
     @Test
-    fun throwingBackendRecoversEmptyAndSelfClears() {
+    fun throwingBackendReportsUnknownAndNeverSelfClears() {
         // Stage J3 (P1 blind-overwrite CCE self-clear)：型別錯亂 (ClassCastException)
         // 永不 auto-delete——loadResult 回 Unknown，不呼叫 saveRaw(null)，保留舊快照。
         var cleared = false

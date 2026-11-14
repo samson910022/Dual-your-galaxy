@@ -469,14 +469,12 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
-        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）。
-        policyAcknowledged = savedInstanceState?.getBoolean(KEY_POLICY_ACK) ?: false
-        policyAckGeneration =
-            if (savedInstanceState?.containsKey(KEY_POLICY_ACK_GEN) == true) {
-                savedInstanceState.getLong(KEY_POLICY_ACK_GEN)
-            } else {
-                null
-            }
+        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）→ 不再保留。
+        // Consent 是 session-scoped：Bundle 還原的 ack 與 per-process 世代計數器
+        // 撞代（process 死後計數器重置，舊 Bundle 的 gen 會誤配新世代）。dialog
+        // 首個 render 本來就會清掉它，此處直接移除這個脆弱的還原窗口。
+        policyAcknowledged = false
+        policyAckGeneration = null
         // Stage B P2：完整清單展開開關保留（同世代旋轉保留，跨世代重置見 sync）。
         policyWriteExpanded = savedInstanceState?.getBoolean(KEY_POLICY_EXPANDED) ?: false
         policyWriteExpandedGeneration =
@@ -583,9 +581,8 @@ class MainActivity : ComponentActivity() {
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
-        // Stage2：政策寫入確認勾選綁定世代保留。
-        outState.putBoolean(KEY_POLICY_ACK, policyAcknowledged)
-        if (policyAckGeneration != null) outState.putLong(KEY_POLICY_ACK_GEN, policyAckGeneration!!)
+        // Stage2：政策寫入確認勾選綁定世代保留 → 不再寫入 Bundle（consent 為
+        // session-scoped；見 onCreate 還原處說明）。
         // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
         outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
         if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
@@ -5876,9 +5873,8 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
-        // Stage2：政策寫入確認勾選綁定世代（同 remove ack 模式，旋轉保留）。
-        private const val KEY_POLICY_ACK = "policyAck"
-        private const val KEY_POLICY_ACK_GEN = "policyAckGen"
+        // Stage2：政策寫入確認勾選綁定世代 → 不再經 Bundle 持久化（consent 為
+        // session-scoped；舊 key policyAck/policyAckGen 已廢棄）。
         // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
         private const val KEY_POLICY_EXPANDED = "policyExpanded"
         private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"

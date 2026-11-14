@@ -1131,6 +1131,38 @@ class HookPolicyRemoteStoreTest {
         }
     }
 
+    // commit-vs-apply pin（repair 備份路徑）：GapCommitPrefs.apply() 直接擲
+    // UnsupportedOperationException —— 備份事務只要碰到 apply()，本測試即炸。
+    // 生產備份鉤子（prefs.all 快照 → 單 edit 批量遷移+備份 → 讀回驗證）必須全程
+    // 走 commit()。 corruptType=true 使 loadResult() 回報 Corrupt 並落腐化證據，
+    // 與 backup_* 系列同一 Corrupt 後端。
+    @Test
+    fun repairCorrupt_backupPath_usesCommitNotApply_gapCommitPrefs() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = GapCommitPrefs(commitSucceeds = true)
+            prefs.corruptType = true
+            // 種下 Set 型值（備份快照讀得到原始物件，不經型別解析）。
+            assertTrue(
+                prefs.edit().putStringSet(
+                    PolicySource.POLICY_KEY_EXTRA_PACKAGES,
+                    mutableSetOf("com.example.a"),
+                ).commit(),
+            )
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.loadResult() is LoadResult.Corrupt)
+
+            // apply() throws UnsupportedOperationException in this harness —
+            // reaching it fails the test; success proves the backup path committed.
+            assertTrue(store.repairCorrupt() is RepairResult.Repaired)
+
+            val bak = prefs.getAll()[BACKUP_KEY] as? Set<*>
+            assertEquals(setOf("com.example.a"), bak?.map { it.toString() }?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
     // Phase2 #1 String 型錯亂走 toString 分支。
     @Test
     fun backup_stringConfusionUsesToStringBranch() {
@@ -1358,6 +1390,10 @@ class HookPolicyRemoteStoreTest {
     private class GapCommitPrefs(var commitSucceeds: Boolean) : SharedPreferences {
         private val data = linkedMapOf<String, Any?>()
         @Volatile var blockCommit = false
+        // 型別錯亂開關（與 RecordingPrefs 同義）：鍵存在時 getStringSet 擲 CCE，
+        // 使 loadResult() 回報 Corrupt 並落腐化證據；鍵缺席不拋（修復刪除後
+        // post-read 即 Known(empty)）。
+        @Volatile var corruptType = false
         @Volatile var commitEntered = java.util.concurrent.CountDownLatch(1)
         private val commitRelease = java.util.concurrent.atomic.AtomicBoolean(true)
 
@@ -1381,6 +1417,10 @@ class HookPolicyRemoteStoreTest {
         override fun getString(key: String?, defValue: String?): String? =
             if (data[key] is String) data[key] as? String else defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+            if (corruptType && data.containsKey(key)) {
+                // 與 RecordingPrefs 同義：模擬 RemotePreferences 內部轉型 ClassCastException。
+                throw ClassCastException("java.lang.String cannot be cast to java.util.Set")
+            }
             @Suppress("UNCHECKED_CAST")
             val stored = data[key] as? MutableSet<String>
             return stored ?: defValues

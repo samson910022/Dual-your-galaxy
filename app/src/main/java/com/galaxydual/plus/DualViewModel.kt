@@ -676,9 +676,14 @@ class DualViewModel(
     // 測試注入可控 fake)；生產由 factory 分別接線 (wall 走 currentTimeMillis，
     // mono 走 elapsedRealtime)。Constructor stays Android-free。
     private val nowWallMs: () -> Long = System::currentTimeMillis,
-    // 同意時效單調時鐘 (見上)：request 的 requestedAtMs 與 confirm 的 TTL
-    // 差值皆經此取時， wall 回撥不得延長有效期。
-    private val nowMonoMs: () -> Long = System::currentTimeMillis,
+    // 同意時效/TTL 單調時鐘 (見上)：request 的 requestedAtMs 與 confirm 的 TTL
+    // 差值皆經此取時。生產由 factory 以 SystemClock.elapsedRealtime() 接線
+    // （boot-monotonic，NTP-immune；僅在本 boot 可比，不用於 wall-clock 顯示——
+    // 那是 nowWallMs 的職責）；本 VM class 預設為 System.nanoTime()/1e6
+    // （測試多注入 fake）。兩者皆非 NTP 可步進，consent TTLs tolerate neither
+    // NTP steps nor reboot drift；pending 為 in-memory only，consent TTLs
+    // 亦不跨 process 存活（process 死亡即消失，無持久化比對問題）。
+    private val nowMonoMs: () -> Long = { System.nanoTime() / 1_000_000L },
     // PR-7 P2 (issue #26, 階段 1):選取持久化 store。生產由 MainActivity 綁定
     // SharedPreferences (selectionStore());JVM 測試注入 HashMap 後端;null
     // 表示無持久化 (既有測試路徑,所有選取操作退化為純記憶體)。
@@ -2368,7 +2373,12 @@ class DualViewModel(
     // Rollback-safe: local CAS failure => return (coord untouched when coordCur
     // was already tx, else coord CAS attempted first below); coord CAS failure =>
     // roll back local and return without touching the winner.
-    private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean) {
+    // P2-A: Boolean 回傳——true 僅代表 handover 實際登記成功（本地＋coordinator
+    // 皆為該 Tx、policyReconciling 已加、invokeOnCompletion＋reconciler 已掛）；
+    // false 代表拒登（canJoinTx 失敗→aborted／本地 CAS 敗／coordinator CAS 敗→
+    // 已回滾本地）。呼叫端（F3 armed-register）必須據此決定 RECONCILING 或落回
+    // IDLE，不得假設登記成功。既有呼叫端可忽略回傳值（source-compatible）。
+    private fun registerHandoverTx(tx: PolicyTx, isClear: Boolean): Boolean {
         // Stage N2 P1: never expose/transfer a PREPARING (unvalidated) Tx as
         // executable. Handover is only for post-validation timeouts (armed);
         // an unarmed handover request is aborted without store touch.
@@ -2377,7 +2387,7 @@ class DualViewModel(
         // via init (init returns Busy early).
         if (!canJoinTx(tx)) {
             abortUnarmedTx(tx)
-            return
+            return false
         }
         val registered = synchronized(policySettleLock) {
             val localCur = try { activePolicyTx.get() } catch (_: Exception) { null }
@@ -2405,9 +2415,54 @@ class DualViewModel(
             policyReconciling.add(tx.key)
             true
         }
-        if (!registered) return
+        if (!registered) return false
         attachDeferredAutoRecheck(tx)
         if (isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
+        return true
+    }
+
+    // F3 fail-closed backstop：mid-await CE unwind（或理論上的 wonLocal==false
+    // 殘留）把 phase 擱淺在 SAVING 時，呼叫端在 policySettleLock 下調用本 helper，
+    // 把擱淺的 SAVING 原地改寫為收斂終態。三條寫入路徑（confirm／clear／repair）
+    // 共用：predicate 統一為 phase==SAVING（repair 的 CE catch 會先把 loading 清掉
+    // 但 phase 仍 SAVING，故以 phase 為唯一準繩；confirm 臂再要求 loading——既有
+    // 語義，SAVING 下 loading 本為 true，等價且多一道防線）。lambda 內再檢一次：
+    // 合法終態（phase 已被移出 SAVING）為 no-op，不誤覆寫。handedOff（htx 或 armed
+    // Tx 已註冊 reconciler）→ RECONCILING 並保留 cur.msg/msgKind（交接者負責收斂、
+    // 收斂時附誠實新終態），否則 IDLE＋UNKNOWN_REFRESH。corrupt：clear/confirm
+    // 傳 false（該 arm 僅宣告 view 未知、不保留損壞語境）；repair 傳 true（store
+    // 仍持損壞證據，直到 reconciler 驗證 Known(empty) 才清位）。policyEpoch 隨行
+    // +1（相位變遷慣例）。best-effort：本 helper 不 rethrow；呼叫端負責
+    // policySettleLock 與 try/catch 外殼（與同 finally 的其他清理一致）。
+    // P3-A：IDLE arm（handedOff==false）在 _state.update 之前先 markPolicyUnknownLocked
+    // （與 F2 siblings 一致）——否則在途 stale-Known load 可在 fail-closed flip 後
+    // 落地 Known。predicate（phase==SAVING && (!requireLoading || loading)）與 lambda 內
+    // 檢查一致：合法終態不 bump。RECONCILING arm 不變（handedOff==true 跳過本 bump）。
+    private fun failClosedSavingRepairIfAbandoned(
+        handedOff: Boolean,
+        corrupt: Boolean,
+        requireLoading: Boolean,
+    ) {
+        if (!handedOff) {
+            val s0 = _state.value
+            if (s0.policyWritePhase == PolicyWritePhase.SAVING &&
+                (!requireLoading || s0.loading)
+            ) {
+                markPolicyUnknownLocked()
+            }
+        }
+        _state.update { cur ->
+            if (cur.policyWritePhase != PolicyWritePhase.SAVING || (requireLoading && !cur.loading)) cur
+            else cur.copy(
+                loading = false,
+                policyWritePhase = if (handedOff) PolicyWritePhase.RECONCILING else PolicyWritePhase.IDLE,
+                policyDraftKnown = false,
+                policyDraftCorrupt = corrupt,
+                policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                msg = if (handedOff) cur.msg else policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                msgKind = if (handedOff) cur.msgKind else MsgKind.CHANNEL,
+            )
+        }
     }
 
     // P2-4: Busy waiter — a VM that marked itself BUSY (live PREPARING owner
@@ -8692,6 +8747,19 @@ class DualViewModel(
                                 preClaimTx = null
                             }
                             val nowPendingNull = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
+                            if (!nowPendingNull) {
+                                // F2: a *different* pending exists — this VM's view of the
+                                // committed draft is still no longer authoritative, so the
+                                // draft fence must be dropped exactly like the vanished arm
+                                // (fail-closed REFRESH semantics). pendingPolicyWrite itself
+                                // is NOT touched — a different pending may exist. The
+                                // in-flight/saving keys ARE ours alone (generation-bound via
+                                // policyWriteKey) and are dropped symmetrically with the
+                                // vanished arm so they don't leak.
+                                inFlightWrites.remove(key)
+                                policyWriteSaving.remove(key)
+                                markPolicyUnknownLocked()
+                            }
                             if (nowPendingNull) {
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
@@ -8700,23 +8768,22 @@ class DualViewModel(
                                 // Known fence survives an unfinished write.
                                 markPolicyUnknownLocked()
                             }
-                            _state.update {
-                                if (nowPendingNull) {
-                                    it.copy(
-                                        loading = false,
-                                        policyWritePhase = PolicyWritePhase.IDLE,
-                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                        policyDraftKnown = false,
-                                        policyDraftCorrupt = false,
-                                        msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                                        msgKind = MsgKind.CHANNEL,
-                                    )
-                                } else {
-                                    it.copy(
-                                        loading = false,
-                                        policyWritePhase = PolicyWritePhase.QUEUED,
-                                    )
-                                }
+                            _state.update { cur ->
+                                // F2: both arms converge to the same fail-closed UNKNOWN_REFRESH
+                                // terminal (the mismatch arm previously restored QUEUED without
+                                // dropping the fence). Predicate-gated: a legitimate terminal
+                                // may already have moved phase out of SAVING (concurrent
+                                // reconciler/cancel) — never overwrite it.
+                                if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
+                                else cur.copy(
+                                    loading = false,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = false,
+                                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
                             }
                         }
                         return@withLock
@@ -8765,6 +8832,19 @@ class DualViewModel(
                                     preClaimTx = null
                                 }
                                 val nowPendingNull2 = try { _state.value.pendingPolicyWrite == null } catch (_: Exception) { true }
+                                if (!nowPendingNull2) {
+                                    // F2: a *different* pending exists — this VM's view of the
+                                    // committed draft is still no longer authoritative, so the
+                                    // draft fence must be dropped exactly like the vanished arm
+                                    // (fail-closed REFRESH semantics). pendingPolicyWrite itself
+                                    // is NOT touched — a different pending may exist. The
+                                    // in-flight/saving keys ARE ours alone (generation-bound via
+                                    // policyWriteKey) and are dropped symmetrically with the
+                                    // vanished arm so they don't leak.
+                                    inFlightWrites.remove(key)
+                                    policyWriteSaving.remove(key)
+                                    markPolicyUnknownLocked()
+                                }
                                 if (nowPendingNull2) {
                                     inFlightWrites.remove(key)
                                     policyWriteSaving.remove(key)
@@ -8772,23 +8852,22 @@ class DualViewModel(
                                     // draft fence exactly like the preIoAbort path.
                                     markPolicyUnknownLocked()
                                 }
-                                _state.update {
-                                    if (nowPendingNull2) {
-                                        it.copy(
-                                            loading = false,
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraftKnown = false,
-                                            policyDraftCorrupt = false,
-                                            msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                                            msgKind = MsgKind.CHANNEL,
-                                        )
-                                    } else {
-                                        it.copy(
-                                            loading = false,
-                                            policyWritePhase = PolicyWritePhase.QUEUED,
-                                        )
-                                    }
+                                _state.update { cur ->
+                                    // F2: both arms converge to the same fail-closed UNKNOWN_REFRESH
+                                    // terminal (the mismatch arm previously restored QUEUED without
+                                    // dropping the fence). Predicate-gated: a legitimate terminal
+                                    // may already have moved phase out of SAVING (concurrent
+                                    // reconciler/cancel) — never overwrite it.
+                                    if (cur.policyWritePhase != PolicyWritePhase.SAVING) cur
+                                    else cur.copy(
+                                        loading = false,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = false,
+                                        msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
                                 }
                             }
                             return@withLock
@@ -8915,10 +8994,12 @@ class DualViewModel(
                             } else {
                                 sanitized
                             }
+                            // F6: 訊息計數使用 committed finalDraft——在 Known-ack 分歧下
+                            // finalDraft 是 store 的 ground truth，而非本 VM 的 sanitized 提案。
                             val finalMsg = if (isRefresh) {
                                 policyText(PolicyText(PolicyTextKind.REFRESHED))
                             } else {
-                                writeSuccessMsg(sanitized.size, cur, sanitized)
+                                writeSuccessMsg(finalDraft.size, cur, sanitized)
                             }
                             val payload = pcFast?.let {
                                 PolicySettled(it.txId, it.key, finalDraft, true, MsgKind.INFO, finalMsg, false)
@@ -8942,6 +9023,18 @@ class DualViewModel(
                                     if (pcFast != null && policyTxCoordinator != null && stamped == null) {
                                         applyStageRejectedUnderLock(pcFast, key, fenceHeld = true)
                                     } else {
+                                        // F4 (F2/F9): the VM's own successful confirm/clear is an
+                                        // authoritative observation of the committed draft —
+                                        // clear the stale flag (unconditional, matching the
+                                        // foreign-known-settle handler). markObservedKnown() is
+                                        // deliberately NOT called here: when stamped != null the
+                                        // stamped under commitMutex inside emitTxSettledStageOnly; observedSnapshot is set from stamped.rev immediately after staging (no sampling race), so a
+                                        // mark would be redundant AND could overshoot observed to
+                                        // an unseen FOREIGN B commit; when stamped == null the
+                                        // reachable states (coord==null legacy → sampled=-1 →
+                                        // falls back to current observed — a no-op) make the
+                                        // mark meaningless at best.
+                                        try { policyRevisionStale.set(false) } catch (_: Exception) { }
                                         bumpPolicyGenerations()
                                         disarmBlindClear()
                                         try { noteLastKnownDraft(finalDraft) } catch (_: Exception) { }
@@ -9063,14 +9156,51 @@ class DualViewModel(
                     try { abortUnarmedTx(pcOuterSave) } catch (_: Exception) { }
                 }
                 val htx = handoverTx
+                var htxRegistered = false
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
                     policyWriteSaving.remove(htx.key)
-                    registerHandoverTx(htx, isClear = false)
+                    htxRegistered = try {
+                        registerHandoverTx(htx, isClear = false)
+                    } catch (_: Throwable) {
+                        false
+                    }
                 } else {
                     inFlightWrites.remove(key)
                     policyWriteSaving.remove(key)
                 }
+                // F3：CE 在 SAVING await 期間穿透時，未套用任何終態——loading=true /
+                // phase=SAVING 會被本 finally 遺留（legacy DEL／coord==null 路徑沒有
+                // recovery hook，phase 會永遠卡在 SAVING）。此處把擱淺的 SAVING 原地
+                // 改寫為收斂終態。正常終態都會把 phase 移出 SAVING 或至少清 loading；
+                // 三條寫入路徑（confirm／clear／repair）的 unwind 皆以 predicate-gated
+                // repair 覆蓋（本區塊／clear finally／repair finally＋repair CE catch），
+                // lambda 內再檢一次——合法終態不會被誤覆寫。此分支只可能在
+                // mid-await CE unwind，或理論上的 wonLocal==false 殘留（activePolicyTx
+                // CAS(pcFast, null) 敗北、終態未被套用時）觸發——兩者都 fail-closed
+                // 收斂。htx（timeout handover）由上方區塊註冊，此處不重複註冊；
+                // pcOuterSave（armed 但 htx==null、尚未交接）先在此註冊
+                // （registerHandoverTx：掛 reconciler＋invokeOnCompletion），註冊成功
+                // 才有交接者負責收斂，RECONCILING 才是誠實的；登記被拒／拋出則落回
+                // IDLE＋UNKNOWN_REFRESH（P2-A：以回傳值為準，不再假設成功）。
+                // handedOff 時保留 cur.msg/msgKind（交接者
+                // 收斂時附誠實新終態），否則 UNKNOWN_REFRESH＋CHANNEL。
+                // best-effort：不 rethrow，與同 finally 的其他清理一致。
+                try {
+                    synchronized(policySettleLock) {
+                        var armedRegistered = htxRegistered
+                        if (!armedRegistered && pcOuterSave != null && _state.value.policyWritePhase == PolicyWritePhase.SAVING) {
+                            try {
+                                armedRegistered = canJoinTx(pcOuterSave) &&
+                                    registerHandoverTx(pcOuterSave, isClear = false)
+                            } catch (_: Throwable) {
+                                armedRegistered = false
+                            }
+                        }
+                        val handedOff = htxRegistered || armedRegistered
+                        failClosedSavingRepairIfAbandoned(handedOff = handedOff, corrupt = false, requireLoading = true)
+                    }
+                } catch (_: Exception) { }
             }
         }
     }
@@ -9883,6 +10013,18 @@ class DualViewModel(
                                 if (pcClearFast != null && policyTxCoordinator != null && stamped == null) {
                                     applyStageRejectedUnderLock(pcClearFast, key, fenceHeld = true)
                                 } else {
+                                    // F4 (F2/F9): the VM's own successful confirm/clear is an
+                                    // authoritative observation of the committed draft —
+                                    // clear the stale flag (unconditional, matching the
+                                    // foreign-known-settle handler). markObservedKnown() is
+                                    // deliberately NOT called here: when stamped != null the
+                                    // stamped under commitMutex inside emitTxSettledStageOnly; observedSnapshot is set from stamped.rev immediately after staging (no sampling race), so a
+                                    // mark would be redundant AND could overshoot observed to
+                                    // an unseen FOREIGN B commit; when stamped == null the
+                                    // reachable states (coord==null legacy → sampled=-1 →
+                                    // falls back to current observed — a no-op) make the
+                                    // mark meaningless at best.
+                                    try { policyRevisionStale.set(false) } catch (_: Exception) { }
                                     bumpPolicyGenerations()
                                     disarmBlindClear()
                                     try { noteLastKnownDraft(finalDraft) } catch (_: Exception) { }
@@ -10036,14 +10178,47 @@ class DualViewModel(
                     try { abortUnarmedTx(pcOuterClear) } catch (_: Exception) { }
                 }
                 val htx = handoverTx
+                var htxRegistered = false
                 if (htx != null) {
                     inFlightWrites.remove(htx.key)
                     policyWriteSaving.remove(htx.key)
-                    registerHandoverTx(htx, isClear = true)
+                    htxRegistered = try {
+                        registerHandoverTx(htx, isClear = true)
+                    } catch (_: Throwable) {
+                        false
+                    }
                 } else {
                     inFlightWrites.remove(key)
                     policyWriteSaving.remove(key)
                 }
+                // F3：CE 在 SAVING await 期間穿透（legacy DEL／coord==null 路徑，
+                // 無 recovery hook）——loading=true／phase=SAVING 會被本 finally
+                // 遺留。此處把擱淺的 SAVING 原地改寫為收斂終態。正常終態都會把
+                // phase 移出 SAVING，predicate（phase==SAVING）在正常終態下不可
+                // 見；helper lambda 內再檢一次。htx（timeout handover）由上方區塊
+                // 註冊，此處不重複註冊；pcOuterClear（armed 但 htx==null、尚未
+                // 交接）在 phase 仍為 SAVING 時先在此註冊（registerHandoverTx：
+                // 掛 reconciler＋invokeOnCompletion），註冊成功 RECONCILING 才
+                // 誠實（有交接者負責收斂）；登記被拒／拋出則落回 IDLE＋UNKNOWN_REFRESH
+                // （P2-A：以回傳值為準，不再假設成功）。
+                // best-effort：不 rethrow，與同 finally 的其他清理一致。
+                try {
+                    synchronized(policySettleLock) {
+                        var armedRegistered = htxRegistered
+                        if (!armedRegistered && pcOuterClear != null &&
+                            _state.value.policyWritePhase == PolicyWritePhase.SAVING
+                        ) {
+                            try {
+                                armedRegistered = canJoinTx(pcOuterClear) &&
+                                    registerHandoverTx(pcOuterClear, isClear = true)
+                            } catch (_: Throwable) {
+                                armedRegistered = false
+                            }
+                        }
+                        val handedOff = htxRegistered || armedRegistered
+                        failClosedSavingRepairIfAbandoned(handedOff = handedOff, corrupt = false, requireLoading = false)
+                    }
+                } catch (_: Exception) { }
             }
         }
     }
@@ -10297,6 +10472,45 @@ class DualViewModel(
             var writeLocked = false
             var preClaimTx: PolicyTx? = null
             var coordClaimedTx: PolicyTx? = null
+            // P2-B：CE catch 與 outer finally 共用的 handover 登記（兩條 unwind 路徑
+            // 行為一致，禁止各自重複發明；冪等、每條路徑最多真正登記一次）。登記順序
+            // 先 htx（timeout handover 已就位），否則仍未登記的 armed Tx（preClaimTx、
+            // phase==SAVING）於此刻登記。回傳 true＝handover 就位（登記＋reconciler
+            // 已掛）；false＝未登記（本地 CAS 敗於 winner／coordinator CAS 敗已回滾／
+            // unarmed abort／phase 已非 SAVING）。htx 與 armed 登記一律以
+            // registerHandoverTx 的回傳值為準（P2-A），不再假設成功。
+            var htxRegistered = false
+            var htxTried = false
+            var armedRegistered = false
+            val tryArmedRegister: () -> Boolean = {
+                if (!htxTried) {
+                    htxTried = true
+                    val htx = handoverTx
+                    if (htx != null) {
+                        inFlightWrites.remove(htx.key)
+                        policyWriteSaving.remove(htx.key)
+                        htxRegistered = try {
+                            registerHandoverTx(htx, isClear = true)
+                        } catch (_: Throwable) {
+                            false
+                        }
+                    } else {
+                        inFlightWrites.remove(key)
+                        policyWriteSaving.remove(key)
+                    }
+                }
+                if (!htxRegistered && !armedRegistered) {
+                    val pc = preClaimTx
+                    if (pc != null && _state.value.policyWritePhase == PolicyWritePhase.SAVING) {
+                        armedRegistered = try {
+                            canJoinTx(pc) && registerHandoverTx(pc, isClear = true)
+                        } catch (_: Throwable) {
+                            false
+                        }
+                    }
+                }
+                htxRegistered || armedRegistered
+            }
             try {
                 opMutex.withLock {
                     if (isPolicyReconcilingLocked()) {
@@ -11262,7 +11476,42 @@ class DualViewModel(
                     }
                 }
             } catch (e: CancellationException) {
-                _state.update { it.copy(loading = false) }
+                // CE catch 在 commit fail-closed 終態之前，先呼叫與 outer finally 共用
+                // 的 tryArmedRegister（兩條 unwind 路徑行為必須一致）：登記仍未登記的
+                // armed Tx（preClaimTx、phase==SAVING），或為已設的 handoverTx 完成登記——
+                // 否則 armed Tx 會留著 fence 卻無 reconciler，本 VM 的 writers 永遠 BUSY
+                // （只有新 VM 認領能收斂）。登記成功（handedOff=true）→ RECONCILING
+                // （like confirm：保留 cur.msg/msgKind，收斂時由 handover 方附誠實新終態）；
+                // 否則 → IDLE＋CORRUPT_REPAIR_FAILED＋corrupt=true（repair 未完成，store
+                // 仍持損壞證據）。IDLE 分支再與 failClosedSavingRepairIfAbandoned 的
+                // IDLE arm 對齊：在 _state.update 之前先 bump 世代（P3-A），避免在途
+                // stale-Known load 在 flip 後落地 Known；predicate（phase==SAVING）與
+                // helper 一致——合法終態不 bump。
+                val handedOff = try { tryArmedRegister() } catch (_: Throwable) { false }
+                if (!handedOff) {
+                    // 與 failClosedSavingRepairIfAbandoned 的 IDLE arm 對齊（P3-A）：
+                    // 僅當 predicate（phase==SAVING）真的會 flip 才 bump——legitimate
+                    // 終態（phase 已非 SAVING）不得 bump。
+                    val s0 = _state.value
+                    if (s0.policyWritePhase == PolicyWritePhase.SAVING) {
+                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                    }
+                }
+                _state.update { cur ->
+                    if (cur.policyWritePhase == PolicyWritePhase.SAVING) cur.copy(
+                        loading = false,
+                        policyWritePhase = if (handedOff) PolicyWritePhase.RECONCILING else PolicyWritePhase.IDLE,
+                        policyDraftKnown = false,
+                        // Repair is only reachable when corrupt==true: the repair never
+                        // completed, so the store still holds the corrupt evidence —
+                        // never wash corrupt to false here (fail-closed, matches the
+                        // repair pre-IO abort which also preserves corrupt).
+                        policyDraftCorrupt = true,
+                        msg = if (handedOff) cur.msg else policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                        msgKind = if (handedOff) cur.msgKind else MsgKind.FAILED,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    ) else cur.copy(loading = false)
+                }
                 throw e
             } finally {
                 if (writeLocked) {
@@ -11282,15 +11531,23 @@ class DualViewModel(
                     policyWriteSaving.remove(key)
                     try { abortUnarmedTx(pcOuterRepair) } catch (_: Exception) { }
                 }
-                val htx = handoverTx
-                if (htx != null) {
-                    inFlightWrites.remove(htx.key)
-                    policyWriteSaving.remove(htx.key)
-                    registerHandoverTx(htx, isClear = true)
-                } else {
-                    inFlightWrites.remove(key)
-                    policyWriteSaving.remove(key)
-                }
+                // P2-B：htx／armed 登記已移入與 CE catch 共用的 tryArmedRegister
+                // （冪等，只執行一次；CE catch 已登記則此處短路返回）。登記一律以
+                // registerHandoverTx 回傳值為準（P2-A）。
+                // F3：CE 在 SAVING await 期間穿透（legacy DEL／coord==null 路徑，
+                // 無 recovery hook）——phase=SAVING 會被本 finally 遺留（repair 的
+                // CE catch 已先嚐試 armed-register 並 commit RECONCILING 或
+                // CORRUPT_REPAIR_FAILED 終態；若 catch 已收斂，phase 不再是 SAVING，
+                // 此處 predicate-gated backstop no-op，helper lambda 內再檢一次，
+                // 最多只是無害複檢）。handover 就位 → RECONCILING（有交接者負責收斂）；
+                // 否則 → IDLE（corrupt 證據不清：repair 未完成，store 仍持證據）。
+                // best-effort：不 rethrow。
+                try {
+                    synchronized(policySettleLock) {
+                        val handedOff = tryArmedRegister()
+                        failClosedSavingRepairIfAbandoned(handedOff = handedOff, corrupt = true, requireLoading = false)
+                    }
+                } catch (_: Exception) { }
             }
         }
     }

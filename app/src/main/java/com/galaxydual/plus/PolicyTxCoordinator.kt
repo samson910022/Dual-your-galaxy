@@ -1127,43 +1127,6 @@ class PolicyTxCoordinator {
         false
     }
 
-    // Zero-call legacy: no production/test caller (overrun path uses
-    // discardOverrunPlaceholder; normal paths settle via CAS). Kept for API
-    // compatibility; do not use in new code.
-    @Deprecated("Zero-call legacy; use discardOverrunPlaceholder/retire/recover instead.")
-    fun clearPendingPublish(payload: PolicySettled) {
-        // NOTE: no direct compareAndSet(payload, null) here — pendingPublish
-        // holds the STAMPED copy (same txId/key/rev, different object identity
-        // after completeWithRevision/stageRealPayload), so a reference-equality
-        // CAS against the caller's unstamped payload would always fail. Clear
-        // by identity below instead.
-        // Rev-aware clear: pending may hold stamped (same txId/key/rev, different
-        // draft/known). Clear when identity matches AND the current holder is
-        // still a placeholder. P1-2: never clear a staged REAL by identity —
-        // stageRealPayload overwrites the placeholder with a new object carrying
-        // the SAME txId/key/rev; an overrun discard racing that overwrite must
-        // abandon (leave to retire/recover), not destroy the real.
-        try {
-            val cur = try { pendingPublish.get() } catch (_: Exception) { null }
-            if (cur != null && cur.txId == payload.txId && cur.key == payload.key &&
-                (cur.rev == payload.rev || payload.rev == -1L)
-            ) {
-                val curIsPlaceholder = try { !cur.known && cur.msg.isEmpty() } catch (_: Exception) { false }
-                if (!curIsPlaceholder) return
-                if (pendingPublish.compareAndSet(cur, null)) {
-                    try {
-                        val own = try { pendingOwner.get() } catch (_: Exception) { null }
-                        if (own != null && own.txId == cur.txId && own.key == cur.key) {
-                            pendingOwner.compareAndSet(own, null)
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-
     // Stage H2 settled 廣播：勝者終態（IDLE+draft/Known/msg）replay=8。
     // 勝者在 tryClaim 成功後、settle 前 tryEmit；敗者以有界 withTimeout 訂閱
     // 同一 txId，收到即應用本地 IDLE 終態；逾時則走顯式 reconcile 兜底，不永久卡死。
@@ -1390,6 +1353,12 @@ class PolicyTxCoordinator {
         }
         try {
             commitLockFailForTests = null
+        } catch (_: Exception) {
+        }
+        // test-only reset restores the fresh-process fence contract; production never
+        // calls resetForTest (the S4 process-lifetime fence stays monotonic in production).
+        try {
+            lastKnownPolicyDraft.set(null)
         } catch (_: Exception) {
         }
         try {

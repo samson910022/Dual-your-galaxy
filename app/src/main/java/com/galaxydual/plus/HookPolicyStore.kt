@@ -63,9 +63,10 @@ internal const val FALLBACK_CORRUPT_TYPE = "ClassCastException"
 internal val poisonEvictCount = AtomicLong(0L)
 internal val evidenceEvictCount = AtomicLong(0L)
 internal val identityMismatchCount = AtomicLong(0L)
-// 上次見到的 provider 實例身份 (identityHashCode)。0 = 無。
-// 用於 wrapper-churn 自檢：連續兩次 resolve 身份不同即視為不穩定。
-internal val lastPrefsHash = AtomicLong(0L)
+// 身份穩定自檢的唯一 identity 訊號是強引用 gate（lastRef.get() === prefs，
+// 見 checkPrefsIdentityStable；per-store AtomicReference 預設 globalLastPrefsIdentity）。
+// 不做 identityHashCode 追蹤——32-bit hash 有碰撞風險且 GC 引發 wrapper-churn
+// 會逃逸（早期 lastPrefsHash 僅供自檢觀察，已刪除；強引用一併持有實體參照）。
 
 internal fun logStore(msg: String) {
     try {
@@ -179,7 +180,6 @@ internal fun resetRemotePoisonForTests() {
     } catch (_: Throwable) {
     }
     try {
-        lastPrefsHash.set(0L)
         globalLastPrefsIdentity.set(null)
         testIdentityCheckHook = null
     } catch (_: Throwable) {
@@ -223,10 +223,6 @@ internal fun checkPrefsIdentityStable(
         System.identityHashCode(prefs)
     } catch (_: Throwable) {
         0
-    }
-    try {
-        lastPrefsHash.set(curHash.toLong())
-    } catch (_: Throwable) {
     }
 
     val prev = try {
@@ -304,10 +300,6 @@ internal fun notePrefsIdentity(
     prefs: SharedPreferences,
     lastRef: AtomicReference<SharedPreferences?> = globalLastPrefsIdentity,
 ) {
-    try {
-        lastPrefsHash.set(System.identityHashCode(prefs).toLong())
-    } catch (_: Throwable) {
-    }
     try {
         lastRef.set(prefs)
     } catch (_: Throwable) {

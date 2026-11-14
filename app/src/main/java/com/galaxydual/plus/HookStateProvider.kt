@@ -76,6 +76,7 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.nio.file.AccessDeniedException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.NoSuchFileException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
@@ -199,9 +200,31 @@ suspend fun readHookStateWithGateway(
 // Null when the file is absent/unreadable (SELinux denial included); never
 // throws. Callers pass the exact files to read (see allHookMarkerFiles), so
 // tests control exactly which files are touched.
+// BOUND: at most 8 * 1024 bytes are read (same MARKER_READ_CAP_BYTES bound
+// as readMarkerTextNio); markers are legitimately <100 bytes, so behavior on
+// legit files is identical. UTF-8 decoding applies to the retained prefix.
+// GUARD: refuses non-regular files (Files.isRegularFile, NOFOLLOW_LINKS) by
+// throwing IOException, which the catch-all maps to null — same fail-closed
+// Denied semantics as readMarkerTextNio for a pre-planted FIFO at a
+// world-writable /data/local/tmp marker path. Same TOCTOU caveat as
+// readMarkerTextNio: a regular→FIFO swap between check and open(2) can still
+// block; the direct stage is not budget-covered (documented, not a
+// regression).
 private fun readTextOrNull(file: File): String? {
     return try {
-        if (!file.isFile) null else file.readText()
+        if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            throw IOException("marker path is not a regular file (refusing to open): ${file.path}")
+        }
+        Files.newInputStream(file.toPath()).use { input ->
+            val buf = ByteArray(MARKER_READ_CAP_BYTES)
+            var off = 0
+            while (off < buf.size) {
+                val n = input.read(buf, off, buf.size - off)
+                if (n < 0) break
+                off += n
+            }
+            String(buf, 0, off, Charsets.UTF_8)
+        }
     } catch (_: Exception) {
         null
     }
@@ -339,8 +362,38 @@ sealed interface MarkerRead {
 // (Files.readString would need Java 11 / core-library-desugaring, which this
 // module does not enable; newInputStream has existed since API 26 and minSdk
 // is 29, so no version branch is required.)
-private fun readMarkerTextNio(file: File): String =
-    Files.newInputStream(file.toPath()).use { it.readBytes().toString(Charsets.UTF_8) }
+// CAP: at most 8 * 1024 bytes are read (markers are legitimately <100 bytes),
+// matching the hook module's bound — the six direct-read paths include two
+// shell-writable /data/local/tmp files, so the reader must not be unbounded.
+// UTF-8 decoding applies to the retained prefix; a multibyte sequence split
+// at the cap boundary decodes with replacement chars, which is fine for a
+// diagnostic prefix. Behavior on legit <100-byte markers is unchanged.
+// GUARD: the path must be a regular file (Files.isRegularFile,
+// NOFOLLOW_LINKS) before opening — a pre-planted FIFO at a world-writable
+// /data/local/tmp marker path would otherwise block newInputStream/read
+// forever and park Dispatchers.IO, defeating the 10 s gateway-stage budget.
+// Non-regular files throw IOException, which readDirectMarker maps to
+// MarkerRead.Denied (UNKNOWN_*, fail-closed). Honest limitation: a
+// regular→FIFO swap between the check and open(2) can still block — a pure
+// JVM cannot close that TOCTOU window without native O_NONBLOCK, so the
+// direct stage is not budget-covered (documented, not a regression).
+private const val MARKER_READ_CAP_BYTES = 8 * 1024
+
+private fun readMarkerTextNio(file: File): String {
+    if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        throw IOException("marker path is not a regular file (refusing to open): ${file.path}")
+    }
+    return Files.newInputStream(file.toPath()).use { input ->
+        val buf = ByteArray(MARKER_READ_CAP_BYTES)
+        var off = 0
+        while (off < buf.size) {
+            val n = input.read(buf, off, buf.size - off)
+            if (n < 0) break
+            off += n
+        }
+        String(buf, 0, off, Charsets.UTF_8)
+    }
+}
 
 // IO: one direct attempt at a marker file. Read-first, never `isFile()`:
 // `File.isFile()` returns false for genuinely missing files AND for
