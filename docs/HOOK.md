@@ -327,10 +327,10 @@ system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_
 自報 scope（H3 評估、H4 退場）：自 scope prefs 自報方案已由 F4b-P2
 file marker（`HookMarker`：自 Phase 5 起每 scope 各寫一個檔，
 `/data/system/galaxydual_hook.active.{system_server,daagent}` 為主、
-`/data/local/tmp/…` 同名為備（僅 tmp+rename 寫入；rename 被拒＝marker 不寫成、讀視為「未偵測到」，直接覆寫的後備路徑已移除；tmp+rename 亦隱含兩項副作用：寫入前會掃除同目錄下逾 60 秒的 `*.tmp-*` 孤兒暫存檔（至多 16 個），以及對父目錄呼叫 `mkdirs()`）；
+`/data/local/tmp/…` 同名為備（僅 tmp+rename 寫入；rename 被拒＝marker 不寫成，直接覆寫的後備路徑已移除；是否顯示「未偵測到」依本文件 §1.5 四態規則——僅當確定可讀但缺失時顯示，EACCES 一律顯示「狀態未知」——取決於讀取當下的判讀，非固定字串；tmp+rename 亦隱含兩項副作用：寫入前會掃除同目錄下逾 60 秒的 `*.tmp-*` 孤兒暫存檔（至多 16 個），以及對父目錄呼叫 `mkdirs()`）；
 parser 仍相容舊版單檔
 `/data/system/galaxydual_hook.active`＋`/data/local/tmp/...`，App 側恆 union
-六路徑，scope `system_server`／`daagent`；`/data/local/tmp` 路徑僅作存在性證據（1777 目錄下任何本機 app 皆可預置 `scope=system_server,daagent`
+六路徑，scope `system_server`／`daagent`；`/data/local/tmp` 路徑僅作存在性證據（1777 目錄下，凡該 ROM 的 SELinux 策略允許寫入 shell_data_file 的域——例如 shell／root，S24 上 system_server 皆得 EACCES；本機 app 能否寫入亦屬 ROM 相關——皆可預置 `scope=system_server,daagent`
 內容偽造「偵測到歷史 Hook 標記」，不證明 hook 安裝、不證明權限），見本文件 §1.2／§1.3
 與 `HookMarker.kt`）取代，不再注入自家 UI 進程。理由：file marker 有
 S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detected"），

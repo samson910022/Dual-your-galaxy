@@ -42,17 +42,26 @@ import java.util.concurrent.atomic.AtomicLong
 // Write semantics (renamed from the old fall-back-to-direct-write): a marker
 // write is tmp-file + rename(2) only. If the rename is refused on a given
 // ROM, the tmp is deleted, nothing else is written, and the write returns
-// false — the marker is best-effort by contract, and a missing marker reads
-// as "not detected" (fail-closed). The old non-atomic direct write (which
-// followed symlinks) no longer exists.
+// false — the marker is best-effort by contract. "Not detected" is a UI
+// verdict that additionally requires positively-checked absence under the
+// app's four-state rule (docs/HOOK.md §1.5): a missing marker with EACCES
+// on every path must surface as 狀態未知, never 未偵測到. The old non-atomic
+// direct write (which followed symlinks) no longer exists.
 //
 // Spoof surface (honesty note — tracked behavior, not a bug fix): the
-// /data/local/tmp fallback paths (LEGACY_MARKER_PATH_SYSTEM_SERVER /
-// LEGACY_MARKER_PATH_DAAGENT; the read-compat legacy single-file
-// LEGACY_MARKER_PATH is never written) are unioned by readers for
-// read-compat, and /data/local/tmp is world-writable (1777). Any local app
-// can pre-create those paths with planted `scope=system_server,daagent`
-// content and flip the app's LSPosed picker row to "偵測到歷史 Hook 標記".
+// per-scope tmp fallback paths (LEGACY_MARKER_PATH_SYSTEM_SERVER /
+// LEGACY_MARKER_PATH_DAAGENT) — used by the writer only after the primary
+// /data/system write fails — are unioned by readers; the read-compat legacy
+// single-file LEGACY_MARKER_PATH is never written, and is unioned by
+// readers for read-compat only. /data/local/tmp is world-writable (1777),
+// and which non-system SELinux domains may actually write there is
+// ROM-dependent — the S24 evidence shows even system_server getting EACCES —
+// so an unprivileged app MAY or MAY NOT be able to pre-create the paths on a
+// given ROM, but nothing in this module makes it impossible. Any domain the
+// ROM's policy lets write shell_data_file (e.g. shell/root, and on some ROMs
+// ordinary apps) could pre-create those paths with planted
+// `scope=system_server,daagent` content and flip the app's LSPosed picker row
+// to "偵測到歷史 Hook 標記".
 // The marker is EXISTENCE evidence only — a planted file proves no hook
 // privilege and no hook installation. The reader union treats tmp-path
 // positives identically to primary-path positives (no spoof resistance);
