@@ -2,6 +2,7 @@ package com.galaxydual.hook
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -9,9 +10,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // Phase F4b-P2 (issue #6): JVM unit tests for the hook-active marker.
-// Pure build/parse plus temp-file read-merge-write -- no device, no
+// Pure build/parse plus temp-file per-scope writes -- no device, no
 // framework stubs (HookMarker is framework-free like WhitelistPolicy).
+//
+// Phase 5 (issue #6): each hook process writes ONLY its own per-scope
+// file; readers union all marker files (per-scope primary/fallback +
+// legacy single-files). No read-merge-write, no lock, no cross-process
+// primitive; legacy files stay read-compat forever.
 class HookMarkerTest {
+
+    // Temp "six production paths": per-scope primary x2, per-scope fallback
+    // x2, legacy single-file x2 (names mirror the production basenames).
+    private fun sixTempFiles(dir: File): List<File> = listOf(
+        File(dir, "galaxydual_hook.active.system_server"),
+        File(dir, "galaxydual_hook.active.daagent"),
+        File(dir, "legacy-tmp.galaxydual_hook.active.system_server"),
+        File(dir, "legacy-tmp.galaxydual_hook.active.daagent"),
+        File(dir, "galaxydual_hook.active"),
+        File(dir, "legacy-tmp.galaxydual_hook.active"),
+    )
 
     // buildContent renders sorted scopes + timestamp; parseScopes recovers
     // the set and parseTimeMs the timestamp.
@@ -55,55 +72,75 @@ class HookMarkerTest {
 
     // CR-O2/H12 parity: markActive validates `want` against the same
     // allowlist as on-disk tokens — an unknown scope is never persisted
-    // (fail-closed), is counted on the drop channel, and the write proceeds
-    // with only the disk history (or nothing, and no marker is written).
+    // (fail-closed), is counted on the drop channel, and no file is
+    // written. There is no merge anymore, so even a pre-existing valid
+    // marker is left untouched.
     @Test fun markActive_unknownScopeNotPersistedAndCounted() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
-            val file = File(dir, "galaxydual_hook.active")
+            val file = File(dir, "galaxydual_hook.active.system_server")
             val before = HookMarker.unknownScopeDrops.get()
             val logs = mutableListOf<String>()
-            assertFalse(HookMarker.markActive("evil_scope", file, 1000L, logs::add))
+            assertFalse(HookMarker.markActive("system!!!", file, 1000L, logs::add))
             assertFalse(file.exists())
             assertEquals(before + 1L, HookMarker.unknownScopeDrops.get())
             assertTrue(logs.any { it.contains("unknown scope") })
-            // Disk history survives; only the bogus want is dropped.
+            // A pre-existing valid marker survives untouched; only the
+            // bogus want is rejected (no read-merge-write to corrupt it).
             file.writeText(HookMarker.buildContent(setOf("system_server"), 1000L))
             val dropsBefore2 = HookMarker.unknownScopeDrops.get()
-            assertTrue(HookMarker.markActive("evil_scope", file, 2000L, logs::add))
+            assertFalse(HookMarker.markActive("system!!!", file, 2000L, logs::add))
             val raw = file.readText()
             assertEquals(setOf("system_server"), HookMarker.parseScopes(raw))
-            assertFalse(raw.contains("evil_scope"))
+            assertEquals(1000L, HookMarker.parseTimeMs(raw))
+            assertFalse(raw.contains("system!!!"))
             assertEquals(dropsBefore2 + 1L, HookMarker.unknownScopeDrops.get())
         } finally {
             dir.deleteRecursively()
         }
     }
 
-    // markActive merges: a second scope joins the first instead of
-    // overwriting it (both hook processes share one marker file).
-    @Test fun markActive_mergesScopesAcrossWrites() {
+    // Phase 5: a freshly written per-scope file contains EXACTLY the one
+    // scope + timeMs line — never a union with anything else.
+    @Test fun markActive_writesExactlyItsOwnScope() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
-            val file = File(dir, "galaxydual_hook.active")
-            val logs = mutableListOf<String>()
-            assertTrue(HookMarker.markActive("system_server", file, 1000L, logs::add))
-            assertTrue(HookMarker.markActive("daagent", file, 2000L, logs::add))
-            val raw = file.readText()
-            assertEquals(setOf("system_server", "daagent"), HookMarker.parseScopes(raw))
-            // Latest write stamps the time.
-            assertEquals(2000L, HookMarker.parseTimeMs(raw))
+            val ss = File(dir, "galaxydual_hook.active.system_server")
+            assertTrue(HookMarker.markActive("system_server", ss, 1000L, {}))
+            assertEquals(
+                HookMarker.buildContent(setOf("system_server"), 1000L),
+                ss.readText(),
+            )
+            assertEquals(setOf("system_server"), HookMarker.parseScopes(ss.readText()))
         } finally {
             dir.deleteRecursively()
         }
     }
 
-    // A blank scope with no prior file records nothing and returns false:
-    // never claim active without evidence.
+    // Phase 5: two sequential markActive calls for the two scopes land in
+    // their OWN files; readScopes unions the six files and sees both
+    // scopes; the system_server file NEVER contains daagent.
+    @Test fun markActive_twoScopesUnionAcrossPerScopeFiles() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val files = sixTempFiles(dir)
+            val (ss, daagent) = files
+            assertTrue(HookMarker.markActive("system_server", ss, 1000L, {}))
+            assertTrue(HookMarker.markActive("daagent", daagent, 2000L, {}))
+            assertFalse(ss.readText().contains("daagent"))
+            assertFalse(daagent.readText().contains("system_server"))
+            assertEquals(setOf("system_server", "daagent"), HookMarker.readScopes(files))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // A blank scope writes nothing and returns false: never claim active
+    // without evidence.
     @Test fun markActive_blankScopeWithNoHistoryWritesNothing() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
-            val file = File(dir, "galaxydual_hook.active")
+            val file = File(dir, "galaxydual_hook.active.system_server")
             assertFalse(HookMarker.markActive("   ", file, 1000L, {}))
             assertFalse(file.exists())
         } finally {
@@ -114,22 +151,38 @@ class HookMarkerTest {
     // Unreadable/missing file reads as no scopes (app shows "not detected").
     @Test fun readScopes_missingFileIsEmpty() {
         val missing = File("/definitely/not/a/real/path/galaxydual_hook.active")
-        assertTrue(HookMarker.readScopes(missing).isEmpty())
+        assertTrue(HookMarker.readScopes(listOf(missing)).isEmpty())
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
             File(dir, "junk.active").writeText("not a marker\n")
-            assertTrue(HookMarker.readScopes(File(dir, "junk.active")).isEmpty())
+            assertTrue(HookMarker.readScopes(listOf(File(dir, "junk.active"))).isEmpty())
         } finally {
             dir.deleteRecursively()
         }
     }
 
-    // Path constants (real-device EACCES evidence): the primary marker lives
-    // under /data/system (system_data_file, writable by system_server); the
-    // pre-evidence /data/local/tmp location is the fallback only.
-    @Test fun paths_primaryIsSystemAndLegacyIsTmp() {
+    // Path constants (real-device EACCES evidence): the primary per-scope
+    // markers live under /data/system (system_data_file, writable by
+    // system_server); the legacy single-files are read-compat only.
+    @Test fun paths_perScopeAndLegacyCompat() {
         assertEquals("/data/system/galaxydual_hook.active", HookMarker.MARKER_PATH)
         assertEquals("/data/local/tmp/galaxydual_hook.active", HookMarker.LEGACY_MARKER_PATH)
+        assertEquals("/data/system/galaxydual_hook.active.system_server", HookMarker.MARKER_PATH_SYSTEM_SERVER)
+        assertEquals("/data/system/galaxydual_hook.active.daagent", HookMarker.MARKER_PATH_DAAGENT)
+        assertEquals("/data/local/tmp/galaxydual_hook.active.system_server", HookMarker.LEGACY_MARKER_PATH_SYSTEM_SERVER)
+        assertEquals("/data/local/tmp/galaxydual_hook.active.daagent", HookMarker.LEGACY_MARKER_PATH_DAAGENT)
+        // Writer path resolution: allowlist-checked, unknown -> null.
+        assertEquals(HookMarker.MARKER_PATH_SYSTEM_SERVER, HookMarker.markerPathFor("system_server"))
+        assertEquals(HookMarker.MARKER_PATH_DAAGENT, HookMarker.markerPathFor("daagent"))
+        assertEquals(HookMarker.LEGACY_MARKER_PATH_SYSTEM_SERVER, HookMarker.fallbackMarkerPathFor("system_server"))
+        assertEquals(HookMarker.LEGACY_MARKER_PATH_DAAGENT, HookMarker.fallbackMarkerPathFor("daagent"))
+        assertNull(HookMarker.markerPathFor("evil_scope"))
+        assertNull(HookMarker.markerPathFor(""))
+        assertNull(HookMarker.fallbackMarkerPathFor("evil_scope"))
+        assertNull(HookMarker.fallbackMarkerPathFor("  "))
+        // The writer NEVER resolves the legacy single-file paths.
+        assertFalse(HookMarker.MARKER_PATH == HookMarker.markerPathFor("system_server"))
+        assertFalse(HookMarker.LEGACY_MARKER_PATH == HookMarker.fallbackMarkerPathFor("daagent"))
     }
 
     // Fallback order: when the primary is writable the fallback file is left
@@ -148,7 +201,7 @@ class HookMarkerTest {
     }
 
     // Fallback order: when the primary write fails (here the "primary" is a
-    // directory, so writeText throws) the merged content still lands in the
+    // directory, so writeText throws) the content still lands in the
     // fallback file and markActive reports success.
     @Test fun markActive_fallsBackWhenPrimaryUnwritable() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
@@ -164,33 +217,135 @@ class HookMarkerTest {
         }
     }
 
-    // Merge history spans both files: a scope previously recorded via the
-    // fallback path is preserved when the next write lands on the primary.
-    @Test fun markActive_mergesHistoryFromBothFiles() {
+    // Phase 5: the writer NEVER writes the legacy single-file markers: a
+    // full two-scope write sequence in a temp dir leaves the legacy files
+    // absent.
+    @Test fun markActive_neverWritesLegacySingleFile() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
-            val primary = File(dir, "primary.active")
-            val fallback = File(dir, "fallback.active")
-            fallback.writeText(HookMarker.buildContent(setOf("daagent"), 1000L))
-            assertTrue(HookMarker.markActive("system_server", primary, 2000L, {}, fallback))
-            assertEquals(setOf("system_server", "daagent"), HookMarker.parseScopes(primary.readText()))
+            val files = sixTempFiles(dir)
+            assertTrue(HookMarker.markActive("system_server", files[0], 1000L, {}, files[2]))
+            assertTrue(HookMarker.markActive("daagent", files[1], 2000L, {}, files[3]))
+            assertFalse(files[4].exists())
+            assertFalse(files[5].exists())
+            // Directory scan: exactly the two per-scope primaries exist — no
+            // legacy single-file and no orphan tmp sibling at all.
+            assertEquals(
+                setOf(files[0].name, files[1].name),
+                dir.listFiles().orEmpty().map { it.name }.toSet(),
+            )
         } finally {
             dir.deleteRecursively()
         }
     }
 
-    // Reads UNION both files: scopes recorded via either write path are
-    // honored together.
-    @Test fun readScopes_unionsPrimaryAndFallback() {
+    // Byte-exact writer format pin: the app<->hook on-disk contract is
+    // `scope=<scope>\ntimeMs=<ms>\n` (two lines). A format drift (e.g. a
+    // renamed key) must fail here even though buildContent round-trips.
+    @Test fun markActive_writesExactlyScopeAndTimeMsBytes() {
         val dir = Files.createTempDirectory("hookmarker").toFile()
         try {
-            val primary = File(dir, "primary.active")
-            val fallback = File(dir, "fallback.active")
-            primary.writeText(HookMarker.buildContent(setOf("system_server"), 1000L))
-            fallback.writeText(HookMarker.buildContent(setOf("daagent"), 2000L))
-            assertEquals(setOf("system_server", "daagent"), HookMarker.readScopes(primary, fallback))
+            val marker = File(dir, "marker.active")
+            assertTrue(HookMarker.markActive("system_server", marker, 1234L, {}))
+            assertEquals("scope=system_server\ntimeMs=1234\n", marker.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // Both paths unwritable (primary and fallback are directories): the write
+    // fails for BOTH, markActive returns false and never throws.
+    @Test fun markActive_bothPathsUnwritableReturnsFalse() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val primary = File(dir, "primaryDir").apply { mkdir() }
+            val fallback = File(dir, "fallbackDir").apply { mkdir() }
+            assertFalse(HookMarker.markActive("system_server", primary, 1000L, {}, fallback))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun readScopes_unionsAllFiles() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val files = sixTempFiles(dir)
+            val (ss, daagent) = files
+            ss.writeText(HookMarker.buildContent(setOf("system_server"), 1000L))
+            daagent.writeText(HookMarker.buildContent(setOf("daagent"), 2000L))
+            assertEquals(setOf("system_server", "daagent"), HookMarker.readScopes(files))
             // One side missing still yields the other side's scopes.
-            assertEquals(setOf("system_server"), HookMarker.readScopes(primary, File(dir, "absent.active")))
+            assertEquals(setOf("system_server"), HookMarker.readScopes(listOf(ss, File(dir, "absent.active"))))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // A garbage per-scope file is ignored while the peer scope still reads.
+    @Test fun readScopes_garbagePerScopeFileIgnoredPeerSurvives() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val files = sixTempFiles(dir)
+            val (ss, daagent) = files
+            ss.writeText("this is not a marker\nscope=evil_scope\n")
+            daagent.writeText(HookMarker.buildContent(setOf("daagent"), 2000L))
+            assertEquals(setOf("daagent"), HookMarker.readScopes(files))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // Legacy back-compat (read-compat forever): a legacy single-file seeded
+    // with BOTH scopes still surfaces both, and a garbage legacy file is
+    // ignored while per-scope files still read.
+    @Test fun readScopes_legacySingleFileBackCompat() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val files = sixTempFiles(dir)
+            val legacyPrimary = files[4]
+            legacyPrimary.writeText(HookMarker.buildContent(setOf("system_server", "daagent"), 1500L))
+            assertEquals(setOf("system_server", "daagent"), HookMarker.readScopes(files))
+            // Garbage legacy files do not break the union.
+            legacyPrimary.writeText("garbage\n")
+            files[5].writeText("also garbage\ntimeMs=abc\n")
+            assertTrue(HookMarker.readScopes(files).isEmpty())
+            // ... while a valid per-scope file next to garbage legacy still reads.
+            files[0].writeText(HookMarker.buildContent(setOf("system_server"), 3000L))
+            assertEquals(setOf("system_server"), HookMarker.readScopes(files))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // Concurrent writers of the two per-scope files never clobber each
+    // other: distinct files, no shared state. (In-process stand-in for the
+    // cross-process case -- not a real two-process test; proves the union
+    // converges with no locking.)
+    @Test fun markActive_concurrentWritersBothSurvive() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val files = sixTempFiles(dir)
+            val (ss, daagent) = files
+            val start = CountDownLatch(1)
+            val done = CountDownLatch(2)
+            val results = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()
+            val t1 = Thread {
+                start.await()
+                results[1] = HookMarker.markActive("system_server", ss, 1000L, {})
+                done.countDown()
+            }
+            val t2 = Thread {
+                start.await()
+                results[2] = HookMarker.markActive("daagent", daagent, 2000L, {})
+                done.countDown()
+            }
+            t1.start(); t2.start()
+            start.countDown()
+            assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            t1.join(1000); t2.join(1000)
+            assertEquals(true, results[1])
+            assertEquals(true, results[2])
+            assertEquals(setOf("system_server", "daagent"), HookMarker.readScopes(files))
         } finally {
             dir.deleteRecursively()
         }

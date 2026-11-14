@@ -325,8 +325,11 @@ system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_
 留空 scope 只會擴大注入面；將來真有 settings 側檢查再加回。
 
 自報 scope（H3 評估、H4 退場）：自 scope prefs 自報方案已由 F4b-P2
-file marker（`HookMarker`：`/data/system` 主＋`/data/local/tmp` 備，
-scope `system_server`／`daagent`，按實際安裝數寫入，見本文件 §1.2／§1.3
+file marker（`HookMarker`：自 Phase 5 起每 scope 各寫一個檔，
+`/data/system/galaxydual_hook.active.{system_server,daagent}` 為主、
+`/data/local/tmp/…` 同名為備；parser 仍相容舊版單檔
+`/data/system/galaxydual_hook.active`＋`/data/local/tmp/...`，App 側恆 union
+六路徑，scope `system_server`／`daagent`，見本文件 §1.2／§1.3
 與 `HookMarker.kt`）取代，不再注入自家 UI 進程。理由：file marker 有
 S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detected"），
 是目標 hook 存活證據；自家 prefs 只能證明自注入，需額外 2 scope 的
@@ -389,11 +392,19 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - 驗證 marker 檔案（需 ROOT／shell 讀權限；App 直接讀不到即顯示「狀態未知」，
   屬正常 fail-closed，不代表 hook 沒裝；僅確定可讀但缺失才顯示「未偵測到」）：
   ```bash
-  adb shell su -c 'cat /data/system/galaxydual_hook.active' 2>/dev/null \
-    || adb shell cat /data/local/tmp/galaxydual_hook.active
-  # 期望輸出（scope 依實際安裝而定）：
-  # scope=daagent,system_server
-  # timeMs=1710000000000
+  for p in /data/system/galaxydual_hook.active.system_server \
+           /data/system/galaxydual_hook.active.daagent \
+           /data/local/tmp/galaxydual_hook.active.system_server \
+           /data/local/tmp/galaxydual_hook.active.daagent \
+           /data/system/galaxydual_hook.active \
+           /data/local/tmp/galaxydual_hook.active; do
+    adb shell su -c "cat $p" 2>/dev/null
+  done
+  # Phase 5 起每個 scope 各寫一個檔（system_server / daagent 進程各自只寫自己的；
+  # 舊版單檔 galaxydual_hook.active 仍會被讀取相容）：
+  #   /data/system/galaxydual_hook.active.system_server -> scope=system_server
+  #   /data/system/galaxydual_hook.active.daagent       -> scope=daagent
+  #   timeMs=1710000000000
   ```
   App 內 LSPosed 模式的 Hook 行顯示同一內容（歷史標記文案／`未偵測到`／`狀態未知（…）`）。
 

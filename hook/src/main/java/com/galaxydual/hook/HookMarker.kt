@@ -23,12 +23,28 @@ import java.util.concurrent.atomic.AtomicLong
 // wrote only /data/local/tmp, but on-device system_server got EACCES writing
 // there (shell_data_file/tmp context is not writable by the system_server
 // SELinux domain). The primary path is therefore /data/system (labeled
-// system_data_file, writable by system_server); the old /data/local/tmp path
-// is kept as a FALLBACK write target (and read source) so a ROM where
-// /data/system is unexpectedly unwritable can still record the signal.
-// Writer order is fixed: primary first, fallback only when the primary write
-// fails. Reader order is fixed the same way, and reads UNION both files so a
-// scope recorded via the fallback is never lost.
+// system_data_file) — verified writable for the system_server domain on S24
+// only; other ROMs are unverified. The daagent per-scope paths live in the
+// SAME two contexts, and daagent got EACCES on BOTH legacy paths on S24
+// (docs/HOOK.md §1.5), so daagent marker writability is entirely unverified
+// (likely EACCES): a missing daagent marker proves nothing about the daagent
+// hook — lspd logs remain the daagent install evidence. The old
+// /data/local/tmp path is kept as a FALLBACK write target (and read source)
+// so a ROM where /data/system is unexpectedly unwritable can still record
+// the signal. Phase 5: that fallback is now a per-scope tmp file; the
+// legacy single-file tmp path is never written again. Writer order is fixed:
+// primary first, fallback only when the primary write fails. Reader order is
+// fixed the same way, and reads UNION all six files.
+//
+// Per-scope files (Phase 5, issue #6): each hook process writes ONLY its own
+// per-scope file (tmp->rename atomic, same as before); concurrent writers
+// cannot clobber each other because no file is shared for writing (no read,
+// no merge, no lock, no cross-process primitive). The app unions all marker
+// files, so a scope recorded by either process survives regardless of the
+// other. The legacy single-file markers (MARKER_PATH / LEGACY_MARKER_PATH)
+// are read-compat ONLY: the writer NEVER writes them anymore; they stay
+// readable forever because existing installs may have been written by
+// previous module versions.
 //
 // Honesty limits (DEVICE-UNVERIFIED, pending real-device validation):
 // - staleness: the file SURVIVES REBOOTS. After a reboot (or after the user
@@ -38,29 +54,73 @@ import java.util.concurrent.atomic.AtomicLong
 //   UI. A boot-time comparison (marker timeMs vs device boot time) would
 //   harden this, but the right clock source needs on-device verification, so
 //   it is deliberately NOT implemented here (no fake freshness).
-// - SELinux: whether the app uid can directly read either path on a given
-//   ROM is unverified (a direct read is likely denied); an unreadable file
-//   reads as "not detected", never as active. When a SHELL/ROOT channel is
-//   ready the app additionally retries via `cat` over the gateway (see
+// - SELinux: whether the app uid can directly read any of the paths on a
+//   given ROM is unverified (a direct read is likely denied); an unreadable
+//   file reads as "not detected", never as active. When a SHELL/ROOT channel
+//   is ready the app additionally retries via `cat` over the gateway (see
 //   HookStateProvider.readHookStateWithGateway); that path is equally
 //   unverified on-device.
-// - merging: both hook processes write the same primary file, so markActive
-//   read-merge-writes (existing scopes UNION new scope, reading BOTH the
-//   primary and the fallback first). A concurrent write may drop one scope;
-//   the next hook event rewrites it. No locking, no IPC.
+// - scope union: readers see the UNION of the per-scope files plus any
+//   legacy single-file content; no scope-completeness claim is made (a
+//   missing per-scope file proves nothing about the peer process).
+// - deletion remains possible: any file can vanish at any time (reboot is
+//   not required); the marker is existence evidence only.
 //
 // Framework-free (no android.* / LibXposed types): build/parse/mark run as
 // plain JVM unit tests (hook/src/test HookMarkerTest).
 object HookMarker {
-    // Primary marker path: /data/system is labeled system_data_file, which
-    // the system_server SELinux domain can write (unlike /data/local/tmp,
-    // where real-device system_server got EACCES -- see header).
+    // LEGACY single-file marker path (read-compat ONLY): written by previous
+    // module versions (pre-Phase-5). The writer NEVER writes this path
+    // anymore; it stays readable forever because existing installs may have
+    // been written by those versions. Do not re-add a writer for it.
     const val MARKER_PATH = "/data/system/galaxydual_hook.active"
 
-    // Fallback marker path: the pre-EACCES-evidence location. Tried only
-    // when the primary write fails (writer) and unioned into reads, so a
-    // scope recorded here is still honored.
+    // LEGACY tmp fallback single-file marker (read-compat ONLY): same
+    // read-forever contract as MARKER_PATH; the writer never writes it.
     const val LEGACY_MARKER_PATH = "/data/local/tmp/galaxydual_hook.active"
+
+    // Per-scope marker path for the system_server hook process (primary,
+    // /data/system labeled system_data_file -- see header).
+    const val MARKER_PATH_SYSTEM_SERVER = "/data/system/galaxydual_hook.active.system_server"
+
+    // Per-scope marker path for the daagent hook process (primary).
+    const val MARKER_PATH_DAAGENT = "/data/system/galaxydual_hook.active.daagent"
+
+    // Per-scope FALLBACK path for system_server: tried only when the primary
+    // per-scope write fails (a ROM where /data/system is unexpectedly
+    // unwritable can still record the signal).
+    const val LEGACY_MARKER_PATH_SYSTEM_SERVER = "/data/local/tmp/galaxydual_hook.active.system_server"
+
+    // Per-scope FALLBACK path for daagent.
+    const val LEGACY_MARKER_PATH_DAAGENT = "/data/local/tmp/galaxydual_hook.active.daagent"
+
+    // Per-scope path resolution for the writer: allowlist-checked, unknown
+    // scope -> null. Pure, never throws.
+    fun markerPathFor(scope: String): String? = when (scope.trim()) {
+        SCOPE_SYSTEM_SERVER -> MARKER_PATH_SYSTEM_SERVER
+        SCOPE_DAAGENT -> MARKER_PATH_DAAGENT
+        else -> null
+    }
+
+    // Per-scope FALLBACK path resolution: allowlist-checked, unknown scope ->
+    // null. Pure, never throws.
+    fun fallbackMarkerPathFor(scope: String): String? = when (scope.trim()) {
+        SCOPE_SYSTEM_SERVER -> LEGACY_MARKER_PATH_SYSTEM_SERVER
+        SCOPE_DAAGENT -> LEGACY_MARKER_PATH_DAAGENT
+        else -> null
+    }
+
+    // The six marker paths every reader unions, in fixed read order:
+    // per-scope primary (system_server, daagent), per-scope fallback, then
+    // the two legacy single-file paths (read-compat forever).
+    private val DEFAULT_MARKER_FILES: List<File> = listOf(
+        File(MARKER_PATH_SYSTEM_SERVER),
+        File(MARKER_PATH_DAAGENT),
+        File(LEGACY_MARKER_PATH_SYSTEM_SERVER),
+        File(LEGACY_MARKER_PATH_DAAGENT),
+        File(MARKER_PATH),
+        File(LEGACY_MARKER_PATH),
+    )
 
     // Scope written by onSystemServerStarting after whitelist-query hooks.
     const val SCOPE_SYSTEM_SERVER = "system_server"
@@ -120,37 +180,6 @@ object HookMarker {
         return out
     }
 
-    // H15: best-effort lost-update telemetry. Both hook processes write the
-    // same primary file read-merge-write with no locking, so a concurrent
-    // write may drop a scope. Track the per-process monotonic union of every
-    // scope this process has ever read from disk; a merged write that no
-    // longer contains a bit we previously saw means a previously recorded
-    // scope vanished (peer write clobber, partial write, external edit).
-    // Counter + log only — never repaired here. Process-local by design: a
-    // fresh process starts at 0 and only reports against scopes it has
-    // observed itself; writes are rare (one per hook install per process).
-    private const val SCOPE_BIT_SYSTEM_SERVER = 1L
-    private const val SCOPE_BIT_DAAGENT = 2L
-    val scopeMergeLostUpdates = AtomicLong(0L)
-    private val everSeenScopeBits = AtomicLong(0L)
-    // CR-N4: process-lifetime cap for the "lost update suspected" line —
-    // mirrors UNKNOWN_SCOPE_DROP_LOG_CAP so a pathological merge storm cannot
-    // spam the log on every hook install. The counter always increments;
-    // only the line is capped.
-    private const val LOST_UPDATE_LOG_CAP = 4
-    private val lostUpdateLogs = AtomicInteger(0)
-
-    private fun scopeBits(scopes: Set<String>): Long {
-        var bits = 0L
-        for (scope in scopes) {
-            when (scope) {
-                SCOPE_SYSTEM_SERVER -> bits = bits or SCOPE_BIT_SYSTEM_SERVER
-                SCOPE_DAAGENT -> bits = bits or SCOPE_BIT_DAAGENT
-            }
-        }
-        return bits
-    }
-
     // H11 note: timeMs is consumed by the app for its diagnostics surface
     // (HookStateProvider / DualViewModel read the marker's timeMs line), so
     // it is not dead code — kept for the boot-time staleness comparison the
@@ -167,70 +196,57 @@ object HookMarker {
         return null
     }
 
-    // Best-effort read-merge-write: existing scopes (UNIONED across the
-    // primary and fallback files, so history recorded via either path
-    // survives) UNION [scope], stamped with nowMs. Write order is fixed:
-    // primary first, fallback only when the primary write fails. Returns
-    // true only when one of the files was written. NEVER throws (any
-    // Throwable -> onLog + false): the hook path must survive even when both
-    // paths are unwritable on a given ROM.
+    // Best-effort per-scope write: records ONLY [scope], stamped with nowMs,
+    // into the scope's own marker file (no read, no merge — each hook
+    // process owns its file, so concurrent writers cannot clobber each
+    // other). Write order is fixed: primary first, fallback only when the
+    // primary write fails. Returns true only when one of the files was
+    // written. NEVER throws (any Throwable -> onLog + false): the hook path
+    // must survive even when both paths are unwritable on a given ROM.
     //
     // markerFile/nowMs are parameters (not statics) so JVM tests can point
     // at a temp dir; production passes the defaults. fallbackFile trails
     // onLog (rather than sitting next to markerFile) so existing positional
-    // call sites keep compiling with identical semantics.
+    // call sites keep compiling with identical semantics. Path selection:
+    // explicit markerFile/fallbackFile > allowlist-derived per-scope default
+    // > fail — except that an explicit markerFile WITHOUT an explicit
+    // fallbackFile targets NO fallback (never silently the production tmp
+    // path, which would make JVM-injected tests write real host paths).
+    // The scope allowlist is enforced FIRST: an unknown scope is
+    // never persisted (fail-closed), is counted on the drop channel, and no
+    // file is written.
     fun markActive(
         scope: String,
-        markerFile: File = File(MARKER_PATH),
+        markerFile: File? = null,
         nowMs: Long = System.currentTimeMillis(),
         onLog: (String) -> Unit = {},
-        fallbackFile: File = File(LEGACY_MARKER_PATH),
+        fallbackFile: File? = null,
     ): Boolean {
         try {
             val want = scope.trim()
-            val merged = (parseScopes(readTextOrNull(markerFile, onLog, "primary"), onLog) +
-                parseScopes(readTextOrNull(fallbackFile, onLog, "fallback"), onLog)).toMutableSet()
-            if (want.isNotEmpty()) {
-                // CR-O2/H12 parity: `want` must pass the same allowlist as the
-                // on-disk tokens — an unknown scope can never be persisted
-                // (fail-closed). Counted on the same drop channel; a single
-                // safeLog per call (markActive is once-per-install) and the
-                // unknown scope is skipped, never merged.
-                if (ALLOWED_SCOPES.contains(want)) {
-                    merged.add(want)
-                } else {
-                    unknownScopeDrops.incrementAndGet()
-                    safeLog(onLog, "marker ignored unknown scope want='$want' (allowlist={system_server,daagent})")
-                }
-            }
-            // H15: detect a previously-seen scope disappearing from the
-            // merged view (concurrent writers, partial write, external
-            // edit). Monotonic process-local union; log + counter only.
-            val mergedBits = scopeBits(merged)
-            val seen = everSeenScopeBits.getAndUpdate { it or mergedBits }
-            if (seen != 0L && (mergedBits and seen) != seen) {
-                scopeMergeLostUpdates.incrementAndGet()
-                val n = lostUpdateLogs.incrementAndGet()
-                if (n <= LOST_UPDATE_LOG_CAP) {
-                    safeLog(
-                        onLog,
-                        "marker: previously recorded scope vanished across merges " +
-                            "(lost update suspected), now writing=${merged.sorted().joinToString(",")}",
-                    )
-                }
-            }
-            if (merged.isEmpty()) {
-                safeLog(onLog, "marker not written: no scope to record")
+            // CR-O2/H12 parity: `want` must pass the same allowlist as the
+            // on-disk tokens — an unknown scope can never be persisted
+            // (fail-closed). Counted on the same drop channel; a single
+            // safeLog per call (markActive is once-per-install) and the
+            // unknown scope is never written.
+            if (!ALLOWED_SCOPES.contains(want)) {
+                unknownScopeDrops.incrementAndGet()
+                safeLog(onLog, "marker ignored unknown scope want='$want' (allowlist={system_server,daagent})")
                 return false
             }
-            val content = buildContent(merged, nowMs)
-            if (tryWrite(markerFile, content)) {
-                safeLog(onLog, "marker wrote scope=${merged.sorted().joinToString(",")}")
+            val primary = markerFile ?: markerPathFor(want)?.let { File(it) }
+            // explicit primary without explicit fallback => no fallback target
+            // (never the production tmp path by accident).
+            val fallback = fallbackFile
+                ?: if (markerFile == null) fallbackMarkerPathFor(want)?.let { File(it) } else null
+            val content = buildContent(setOf(want), nowMs)
+            if (primary != null && tryWrite(primary, content)) {
+                safeLog(onLog, "marker wrote scope=$want")
                 return true
             }
             safeLog(onLog, "marker primary write failed, trying fallback")
-            if (tryWrite(fallbackFile, content)) {
-                safeLog(onLog, "marker wrote fallback scope=${merged.sorted().joinToString(",")}")
+            if (fallback != null && tryWrite(fallback, content)) {
+                safeLog(onLog, "marker wrote fallback scope=$want")
                 return true
             }
             safeLog(onLog, "marker write failed: primary and fallback unwritable")
@@ -242,33 +258,32 @@ object HookMarker {
     }
 
     // Best-effort read: missing/unreadable/garbage files -> emptySet()
-    // (caller maps that to "not detected"). Reads BOTH the primary and the
-    // fallback file and returns the UNION, so a scope recorded via either
-    // write path is honored. Never throws.
+    // (caller maps that to "not detected"). Reads the given files (default:
+    // the six production paths — per-scope primary ×2, per-scope fallback ×2,
+    // legacy single-file ×2) and returns the UNION, so a scope recorded via
+    // any write path is honored. Garbage/unreadable files are ignored.
+    // Never throws.
     fun readScopes(
-        markerFile: File = File(MARKER_PATH),
-        fallbackFile: File = File(LEGACY_MARKER_PATH),
+        markerFiles: List<File> = DEFAULT_MARKER_FILES,
     ): Set<String> {
         return try {
-            parseScopes(readTextOrNull(markerFile)) +
-                parseScopes(readTextOrNull(fallbackFile))
+            val out = LinkedHashSet<String>()
+            for (file in markerFiles) {
+                out += parseScopes(readTextOrNull(file))
+            }
+            out
         } catch (_: Throwable) {
             emptySet()
         }
     }
 
     // Null when the file is absent or unreadable (SELinux denial included);
-    // never throws. Shared by markActive/readScopes so both agree on what
-    // "unreadable" means.
-    private fun readTextOrNull(
-        file: File,
-        onLog: (String) -> Unit = {},
-        which: String = "primary",
-    ): String? {
+    // never throws. Silent by design (readScopes/diagnose paths treat an
+    // unreadable file as "not detected", never as active, never as an error).
+    private fun readTextOrNull(file: File): String? {
         return try {
             if (!file.isFile) null else file.readText()
-        } catch (e: Exception) {
-            safeLog(onLog, "marker $which read failed, ignoring: ${HookLog.shortEx(e)}: ${HookLog.shortMsg(e)}")
+        } catch (_: Exception) {
             null
         }
     }
@@ -317,9 +332,10 @@ object HookMarker {
         } catch (_: Throwable) {
             // Best effort: a sweep failure must never break the write.
         }
-        // Unique tmp name per write: both hook processes write the same
-        // primary file, and a shared tmp name would let one process rename
-        // the other's half-written tmp over the target (lost update).
+        // Unique tmp name per write: a shared tmp name would let one writer
+        // rename another writer's half-written tmp over the target. (Each
+        // hook process now writes its own per-scope file, but the tmp name is
+        // unique regardless, so a stray tmp can never alias a peer's write.)
         val tmp: File? = try {
             file.parentFile?.let {
                 File(it, file.name + ".tmp-" + System.nanoTime() + "-" + Thread.currentThread().id)
