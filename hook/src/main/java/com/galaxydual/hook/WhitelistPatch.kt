@@ -36,6 +36,14 @@ import java.lang.reflect.Modifier
 // list whose clear/addAll ALSO throws during rollback: union was computed on
 // a copy and the live list got only a single addAll -- it may stay dirty.
 // That class cannot be made atomic through the in-place MutableList API.
+// Two further hostile-addAll cases are indistinguishable from success and
+// are NOT signaled: (a) a hostile addAll that returns normally but mangles
+// the list -- silently dropping original ROM entries or seeding extra ones
+// -- is logged as "+N added" while the ROM list is in fact corrupted; (b) if
+// addAll throws after partially appending, the best-effort rollback
+// (clear() + addAll(snapshot)) can itself fail, and then ORIGINAL ROM
+// whitelist entries may be lost -- fail-closed for the affected apps, but
+// data loss with no signal to the caller.
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
@@ -84,10 +92,11 @@ object WhitelistPatch {
         extra: Set<String>,
     ): Map<String, Outcome> {
         val results = LinkedHashMap<String, Outcome>()
+        val targetShort = HookLog.shortClass(target)
         if (extra.isEmpty()) {
             for (name in fieldNames) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: empty policy set ($OBSERVE_ONLY_MARKER)",
+                    "skip patch $name on $targetShort: empty policy set ($OBSERVE_ONLY_MARKER)",
                 )
             }
             return results
@@ -97,14 +106,14 @@ object WhitelistPatch {
                 target.getDeclaredField(name)
             } catch (_: Throwable) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: field not found",
+                    "skip patch $name on $targetShort: field not found",
                 )
                 continue
             }
             val isStatic = Modifier.isStatic(field.modifiers)
             if (!isStatic) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: field is not static",
+                    "skip patch $name on $targetShort: field is not static",
                 )
                 continue
             }
@@ -129,23 +138,40 @@ object WhitelistPatch {
                 }
                 if (!accessible) {
                     results[name] = Outcome.Skipped(
-                        "skip patch $name on ${target.name}: cannot access non-final field " +
+                        "skip patch $name on $targetShort: cannot access non-final field " +
                             "(setAccessible failed, fail-closed)",
                     )
                     continue
                 }
                 // Accessible now (or already was); a later get/set failure is
                 // still recorded as Skipped by the precise handlers below.
+                // Phase 5: `isAccessible` is deprecated upstream; spelled as
+                // setAccessible (not trySetAccessible: absent from the
+                // compileSdk 34 android.jar stubs, so it does not compile on
+                // this baseline). Revisit on the compileSdk 37 migration
+                // (see gradle.properties plan): prefer trySetAccessible.
             }
             val current = try {
                 field.get(null)
             } catch (t: Throwable) {
                 results[name] = Outcome.Skipped(
-                    "skip patch $name on ${target.name}: read failed (${t.javaClass.simpleName})",
+                    "skip patch $name on $targetShort: read failed (${HookLog.shortEx(t)})",
                 )
                 continue
             }
-            when (val outcome = apply(current, true, extra, name, target.name, isFinal)) {
+            // Defense-in-depth: even a hostile ROM object that escapes every
+            // guard inside apply() must not abort the whole field loop — a
+            // throwing apply() for one candidate field must never deny its
+            // sibling (DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA) its attempt.
+            // One bad field costs exactly its own outcome entry.
+            val outcome = try {
+                apply(current, true, extra, name, target.name, isFinal)
+            } catch (t: Throwable) {
+                Outcome.Skipped(
+                    "skip patch $name on $targetShort: apply threw (${HookLog.shortEx(t)})",
+                )
+            }
+            when (outcome) {
                 is Outcome.Replaced -> {
                     if (outcome.added == 0) {
                         // Already complete: skip set(), nothing to write.
@@ -157,7 +183,7 @@ object WhitelistPatch {
                         results[name] = outcome
                     } catch (t: Throwable) {
                         results[name] = Outcome.Skipped(
-                            "skip patch $name on ${target.name}: write failed (${t.javaClass.simpleName})",
+                            "skip patch $name on $targetShort: write failed (${HookLog.shortEx(t)})",
                         )
                     }
                 }
@@ -175,25 +201,28 @@ object WhitelistPatch {
         className: String,
         isFinal: Boolean = false,
     ): Outcome {
+        // Desensitized owner: callers pass Class.name (package-qualified);
+        // logs keep only the short simple name.
+        val owner = HookLog.shortName(className)
         if (extra.isEmpty()) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: empty policy set ($OBSERVE_ONLY_MARKER)",
+                "skip patch $fieldName on $owner: empty policy set ($OBSERVE_ONLY_MARKER)",
             )
         }
         if (!isStatic) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: field is not static",
+                "skip patch $fieldName on $owner: field is not static",
             )
         }
         if (isFinal) {
             return Outcome.ObserveOnly(
-                "$OBSERVE_ONLY_MARKER $fieldName on $className: static final field, " +
+                "$OBSERVE_ONLY_MARKER $fieldName on $owner: static final field, " +
                     "not reassigned via Field.set (no force-write; ART unverified)",
             )
         }
         if (current == null) {
             return Outcome.Skipped(
-                "skip patch $fieldName on $className: field value is null",
+                "skip patch $fieldName on $owner: field value is null",
             )
         }
         if (current is MutableList<*>) {
@@ -201,26 +230,35 @@ object WhitelistPatch {
             // MutableList<Int> as MutableList<String> would ClassCastException
             // inside the lambda (erasure), so inspect via the star-projected
             // view first. A raw list holding non-Strings must not be polluted
-            // with Strings (would ClassCastException the reader).
-            if (current.any { it !is String }) {
+            // with Strings (would ClassCastException the reader). A hostile
+            // ROM list whose iterator()/hasNext() throws is caught here too:
+            // inspection must never escape apply() unhandled.
+            val hasNonString = try {
+                current.any { it !is String }
+            } catch (t: Throwable) {
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: MutableList holds non-String elements",
+                    "skip patch $fieldName on $owner: MutableList element inspection failed (${HookLog.shortEx(t)})",
+                )
+            }
+            if (hasNonString) {
+                return Outcome.Skipped(
+                    "skip patch $fieldName on $owner: MutableList holds non-String elements",
                 )
             }
             @Suppress("UNCHECKED_CAST")
             val list = current as MutableList<String>
-            // Copy-on-write: snapshot, then compute union + addAll on a plain
-            // ArrayList. The live list is never used for computation, so any
-            // throw before the single addAll below leaves it untouched.
+            // Copy-on-write: the union is materialized first as a NEW list
+            // (`add`, via `extra.filter { it !in snapshot }`); the live list
+            // is not touched until the final addAll applies exactly that
+            // precomputed delta.
             val snapshot: ArrayList<String>
             val add: List<String>
             try {
                 snapshot = ArrayList(list)
                 add = extra.filter { !snapshot.contains(it) }
-                ArrayList(snapshot).apply { addAll(add) }
             } catch (t: Throwable) {
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: failed to compute union (${t.javaClass.simpleName})",
+                    "skip patch $fieldName on $owner: failed to compute union (${HookLog.shortEx(t)})",
                 )
             }
             if (add.isEmpty()) return Outcome.PatchedInPlace(added = 0)
@@ -237,7 +275,7 @@ object WhitelistPatch {
                     // Swallowed: narrowed promise applies (see header).
                 }
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $className: list is not modifiable (${t.javaClass.simpleName})",
+                    "skip patch $fieldName on $owner: list is not modifiable (${HookLog.shortEx(t)})",
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
@@ -250,7 +288,7 @@ object WhitelistPatch {
             return Outcome.Replaced((arr.toList() + add).toTypedArray(), added = add.size)
         }
         return Outcome.Skipped(
-            "skip patch $fieldName on $className: unsupported type ${current.javaClass.name}",
+            "skip patch $fieldName on $owner: unsupported type ${HookLog.shortClass(current.javaClass)}",
         )
     }
 }

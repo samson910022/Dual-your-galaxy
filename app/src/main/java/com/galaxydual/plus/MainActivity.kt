@@ -76,6 +76,7 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
 import androidx.annotation.VisibleForTesting
@@ -89,6 +90,8 @@ import com.galaxydual.core.DualRepository
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
+import com.galaxydual.hook.HookLog
+import com.galaxydual.hook.PolicySource
 import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
@@ -160,6 +163,29 @@ class MainActivity : ComponentActivity() {
     private lateinit var clearSelBtn: Button
     private lateinit var saveSelBtn: Button
     private lateinit var cancelSaveBtn: Button
+    // Stage2 (hook-policy-source P1)：白名單政策（草稿）最小入口（核心引擎頁
+    // 技術卡一節＋兩階段寫入對話框，沿用 remove ack 模式；不改首頁大佈局）。
+    private lateinit var policyDraftView: TextView
+    private lateinit var writePolicyBtn: Button
+    private lateinit var clearPolicyBtn: Button
+    private lateinit var refreshPolicyBtn: Button
+    private var policyWriteDialog: AlertDialog? = null
+    private var serviceBindListener: (() -> Unit)? = null
+    private var shownPolicyWrite: PendingPolicyWrite? = null
+    // Phase 5：已顯示 dialog 的 saving 相位快照（early-return 偵測 QUEUED→SAVING
+    // 翻轉，翻轉沿播報一次；僅 UI 播報用，不參與門控）。
+    private var shownPolicyWriteSaving: Boolean = false
+    private var policyAcknowledged = false
+    private var policyAckGeneration: Long? = null
+    // Stage J4 (dialog trap)：RECONCILING 期使用者 Back/觸外/取消導致的本地 dismiss
+    // 世代（僅 UI 層抑制重建，不調 vm.cancelPolicyWrite、不清 VM fence；pending 仍在，
+    // reconciler／late-join 照常結清；該世代終態 IDLE 或新世代即清除）。
+    private var policyWriteDismissedForReconcilingGen: Long? = null
+    // Stage B P2 dialog 完整清單（方案 A Toggle）：展開/收合純 UI 開關。
+    // rest>0 才顯示 Toggle；in-place 切換保 ack；世代重置同步重置 expanded；
+    // 旋轉經 KEY_POLICY_EXPANDED(/GEN) 保留，同世代保留、跨世代重置。
+    private var policyWriteExpanded = false
+    private var policyWriteExpandedGeneration: Long? = null
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
@@ -218,6 +244,10 @@ class MainActivity : ComponentActivity() {
     // View 實字雙比對，避免無關 render 重播 POLITE；旋轉重建以 View 為準）。
     private var lastBatchResultText: String? = null
     private var lastCatalogErrorText: String? = null
+    // P2 去重：政策草稿行（policyDraftView）每輪 render 比照 catalogErrorView
+    // 去重——文字未變不重設（TalkBack 不重播），liveRegion 僅在文字變化時
+    // POLITE，否則 NONE。旋轉重建以 View 實字為準補寫。
+    private var lastPolicyDraftText: String? = null
 
     // Two-phase remove dialog (PR-4 P1, issue #23): driven by
     // UiState.pendingRemove, never by a click counter. Non-null pending shows
@@ -439,6 +469,28 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
+        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）→ 不再保留。
+        // Consent 是 session-scoped：Bundle 還原的 ack 與 per-process 世代計數器
+        // 撞代（process 死後計數器重置，舊 Bundle 的 gen 會誤配新世代）。dialog
+        // 首個 render 本來就會清掉它，此處直接移除這個脆弱的還原窗口。
+        policyAcknowledged = false
+        policyAckGeneration = null
+        // Stage B P2：完整清單展開開關保留（同世代旋轉保留，跨世代重置見 sync）。
+        policyWriteExpanded = savedInstanceState?.getBoolean(KEY_POLICY_EXPANDED) ?: false
+        policyWriteExpandedGeneration =
+            if (savedInstanceState?.containsKey(KEY_POLICY_EXPANDED_GEN) == true) {
+                savedInstanceState.getLong(KEY_POLICY_EXPANDED_GEN)
+            } else {
+                null
+            }
+        // Stage J4：RECONCILING 期本地抑制世代保留（旋轉重建不丟抑制；跨世代/
+        // 終態清除仍由 syncPolicyWriteDialog 負責，此處僅恢復原始值）。
+        policyWriteDismissedForReconcilingGen =
+            if (savedInstanceState?.containsKey(KEY_POLICY_WRITE_DISMISSED_GEN) == true) {
+                savedInstanceState.getLong(KEY_POLICY_WRITE_DISMISSED_GEN)
+            } else {
+                null
+            }
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -454,6 +506,13 @@ class MainActivity : ComponentActivity() {
             msgView.text = getString(R.string.shizuku_listener_failed, sanitizeForDisplay(e.message ?: "unknown"))
             msgView.setTextColor(msgColorFor(MsgKind.CHANNEL))
         }
+        // 5.1.5:service 綁定時刷新政策草稿 (避免晚綁定導致草稿看似空)。
+        val serviceBindListener = { vm.refreshPolicyDraft() }
+        this.serviceBindListener = serviceBindListener
+        GalaxyApp.addServiceBindListener(serviceBindListener)
+        // 補發：若服務在訂閱前已綁定，listener 不會收到 onServiceBind，
+        // 此處主動觸發一次刷新，避免 lost-event 競態。
+        if (GalaxyApp.isServiceConnected()) serviceBindListener()
         // Lifecycle-aware collection: renders every state update while STARTED.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -522,6 +581,14 @@ class MainActivity : ComponentActivity() {
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
+        // Stage2：政策寫入確認勾選綁定世代保留 → 不再寫入 Bundle（consent 為
+        // session-scoped；見 onCreate 還原處說明）。
+        // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
+        outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
+        if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
+        // Stage J4：RECONCILING 期本地抑制世代保留（同世代旋轉保留；跨世代/終態
+        // 清除見 syncPolicyWriteDialog：pending 清除、世代不匹配不抑制、非 RECONCILING 清除）。
+        if (policyWriteDismissedForReconcilingGen != null) outState.putLong(KEY_POLICY_WRITE_DISMISSED_GEN, policyWriteDismissedForReconcilingGen!!)
     }
 
     override fun onDestroy() {
@@ -543,6 +610,14 @@ class MainActivity : ComponentActivity() {
         pendingBatchRequest = null
         shownBatchRequest = null
         shownBatchWasFresh = null
+        try {
+            policyWriteDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        policyWriteDialog = null
+        shownPolicyWrite = null
+        shownPolicyWriteSaving = false
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -568,6 +643,8 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             // Best effort: listeners are already gone with the process anyway.
         }
+        serviceBindListener?.let { GalaxyApp.removeServiceBindListener(it) }
+        serviceBindListener = null
         super.onDestroy()
     }
 
@@ -921,6 +998,47 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             contentDescription = getString(R.string.unsave_selection_cd)
             setOnClickListener { vm.cancelSavedSelection() }
+        }
+        // Stage2：白名單政策（草稿）最小入口。寫入需二次確認
+        // (requestPolicyWrite 建 pending，dialog 勾選後 confirm)；勾選≠安裝、
+        // 寫草稿≠安裝 (見 DualViewModel/confirmPolicyWrite)。
+        policyDraftView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        writePolicyBtn = Button(this).apply {
+            text = getString(R.string.action_write_policy)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.write_policy_cd)
+            setOnClickListener { vm.requestPolicyWrite() }
+        }
+        clearPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_clear_policy_draft)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.clear_policy_draft_cd)
+            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper，直調 VM
+            // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
+            // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
+            // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
+            setOnClickListener { vm.onClearPolicyButtonTap() }
+        }
+        // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
+        // 未知提示，不改 dialog 主流程）。
+        refreshPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_refresh_policy_draft)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            contentDescription = getString(R.string.refresh_policy_draft_cd)
+            setOnClickListener { vm.refreshPolicyDraft() }
         }
         sourceContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1558,6 +1676,16 @@ class MainActivity : ComponentActivity() {
         techCard.addView(inventoryView)
         techCard.addView(lastOpView)
         techCard.addView(diagView)
+        // Stage2：白名單政策（草稿）一節（最小入口：計數行＋寫入/清除/重新整理列；
+        // 寫入走兩階段確認 dialog，見 syncPolicyWriteDialog）。
+        techCard.addView(policyDraftView)
+        val policyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(writePolicyBtn, rowParams())
+            addView(clearPolicyBtn, rowParams())
+            addView(refreshPolicyBtn, rowParams())
+        }
+        techCard.addView(policyRow)
         tabEngineLayout.addView(techCard)
 
         // Engine Action Buttons
@@ -2289,7 +2417,11 @@ class MainActivity : ComponentActivity() {
         // Phase F F1：catalogLabels 本輪預取（reloadCatalog IO 路徑已查好的 label 就地取用）。
         // Phase L L1：sync 已在指紋比對前完成，此處不再重算 hash／重 sync。
         val catalogLabels = catalogLabelsFor(s.sourceCatalog)
-        for (pkg in s.cloned) {
+        // P2 有界：分身列最多渲染前 MAX_CLONED_ROWS 行，超出以截斷行提示
+        // （與來源清單 MAX_SOURCE_ROWS 同式）；寫入/指紋不受影響。
+        val visibleCloned = s.cloned.take(MAX_CLONED_ROWS)
+        val clonedRest = s.cloned.size - visibleCloned.size
+        for (pkg in visibleCloned) {
             // PR #63 re-review #4 P2：外層改垂直堆疊（每 app 一個 row，childCount/key 語意不變）；
             // 上方 icon+文字佔滿寬度，下方移除鈕獨立一行可自然伸展，避免 320dp/大字體英文截斷。
             val row = LinearLayout(this).apply {
@@ -2520,6 +2652,28 @@ class MainActivity : ComponentActivity() {
                         // Best effort.
                     }
                 }
+            }
+        }
+        // P2 截斷行：超出 MAX_CLONED_ROWS 時明示剩餘數（與來源清單截斷提示同式）。
+        if (clonedRest > 0) {
+            try {
+                val truncView = TextView(this).apply {
+                    text = try {
+                        resources.getQuantityString(
+                            R.plurals.source_truncated,
+                            s.cloned.size,
+                            s.cloned.size,
+                            MAX_CLONED_ROWS,
+                        )
+                    } catch (_: Exception) {
+                        "…等共 ${s.cloned.size} 項，僅顯示前 $MAX_CLONED_ROWS 項"
+                    }
+                    textSize = 12f
+                    setTextColor(getColor(R.color.oneui_text_secondary))
+                }
+                clonedAppsContainer.addView(truncView)
+            } catch (_: Exception) {
+                // Best effort.
             }
         }
     }
@@ -2981,6 +3135,43 @@ class MainActivity : ComponentActivity() {
         // P4 a11y：同步更新 contentDescription (含展開狀態)。
         diagView.text = renderDiagnoseText(s, diagExpanded)
         diagView.contentDescription = renderDiagnoseDescription(s, diagExpanded)
+        // Stage2：白名單政策（草稿）計數行（最小入口；buildUi 前 render 走守衛）。
+        // P2 去重（mirror updateCatalogErrorView）：文字未變不重設，避免
+        // TalkBack 每輪重播；liveRegion 僅在變化時 POLITE，否則 NONE。
+        try {
+            if (::policyDraftView.isInitialized) {
+                val newDraftText = if (s.policyDraftKnown) {
+                    getString(R.string.policy_draft_format, s.policyDraft.size)
+                } else {
+                    getString(R.string.policy_draft_unknown)
+                }
+                val draftViewCurrent = try {
+                    policyDraftView.text.toString()
+                } catch (_: Exception) {
+                    null
+                }
+                val draftChanged = lastPolicyDraftText != newDraftText || draftViewCurrent != newDraftText
+                try {
+                    policyDraftView.accessibilityLiveRegion =
+                        if (draftChanged) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                        else View.ACCESSIBILITY_LIVE_REGION_NONE
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                if (draftChanged) {
+                    if (draftViewCurrent != newDraftText) {
+                        try {
+                            policyDraftView.text = newDraftText
+                        } catch (_: Exception) {
+                            // Best effort.
+                        }
+                    }
+                    lastPolicyDraftText = newDraftText
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
 
         // One UI 6 Modern Views dynamic update
         // Phase B B4：分身列表移出此 try（獨立指紋＋獨立 try/catch，下見），
@@ -3241,6 +3432,59 @@ class MainActivity : ComponentActivity() {
         saveSelBtn.isEnabled = !busy && verifiedTargetAvailable(s)
         cancelSaveBtn.isEnabled = !busy
         batchBtn.isEnabled = batchEnabled(s)
+        // Phase 2 政策重新整理可觀測：刷新在途時禁用按鈕並帶狀態 CD，
+        // 避免連打誤解；buildUi 前 render 走守衛（測試路徑）。
+        // 政策寫入/清除鈕比照 refreshBtn：任一寫入相位在途（QUEUED/SAVING）即禁用。
+        try {
+            if (::refreshPolicyBtn.isInitialized) {
+                refreshPolicyBtn.isEnabled = !s.policyRefreshing
+                refreshPolicyBtn.contentDescription = getString(
+                    if (s.policyRefreshing) R.string.refresh_policy_draft_cd_refreshing
+                    else R.string.refresh_policy_draft_cd,
+                )
+                // P3 sighted affordance：刷新在途時按鈕文字切為載入中（僅視覺，
+                // 文案以資源為準），避免 sighted 用戶無感知；CD 已同步。
+                try {
+                    val wantText = getString(
+                        if (s.policyRefreshing) R.string.status_loading
+                        else R.string.action_refresh_policy_draft,
+                    )
+                    if (refreshPolicyBtn.text.toString() != wantText) {
+                        refreshPolicyBtn.text = wantText
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+            if (::writePolicyBtn.isInitialized) {
+                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            if (::clearPolicyBtn.isInitialized) {
+                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                // Stage L4 fix(a) 修復模式標籤：Corrupt 下重貼 repair 文案＋CD，
+                // 使 TalkBack 可感知「修復（兩步確認）」而非「清除」；msg 播報仍走
+                // VM 的 CORRUPT_DETECTED / REPAIR_FIRST 資源文案。非 Corrupt 回原
+                // 清除文案（Unavailable 盲清維持清除語義）。
+                try {
+                    val wantText = getString(clearPolicyButtonTextRes(s.policyDraftCorrupt))
+                    if (clearPolicyBtn.text.toString() != wantText) {
+                        clearPolicyBtn.text = wantText
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+                try {
+                    val wantCd = getString(clearPolicyButtonCdRes(s.policyDraftCorrupt))
+                    if (clearPolicyBtn.contentDescription?.toString() != wantCd) {
+                        clearPolicyBtn.contentDescription = wantCd
+                    }
+                } catch (_: Exception) {
+                    // Best effort.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
         // Stage4 a11y：busy 時搜尋框禁用，避免 busy 期間輸入觸發無謂重渲染。
         searchInput.isEnabled = !busy
         // p28-1 禁用原因行：只在非 busy 且不可寫時顯示 VM 拒絕理由。
@@ -3349,6 +3593,28 @@ class MainActivity : ComponentActivity() {
             syncBatchDialog(pendingBatchRequest, s)
         } catch (e: Exception) {
             Log.w(TAG, "syncBatchDialog failed", e)
+        }
+        // Stage2：兩階段政策寫入 dialog（state-driven，同 pendingRemove 模式；
+        // 旋轉由 retained ViewModel 重播 state，無需重送）。
+        // Phase 3：唯一真相為 state（s.policyWritePhase）；不再讀
+        // vm.policyOperationInProgress / policyWriteCommitInProgress getter
+        //（相容保留，見 DualViewModel）。五參：pending＋全域 loading（僅顯示用，
+        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/saving/reconciling。
+        try {
+            syncPolicyWriteDialog(
+                s.pendingPolicyWrite,
+                s.loading,
+                s.policyWritePhase != PolicyWritePhase.IDLE,
+                // Stage J4：拆分 SAVING（不可取消）vs RECONCILING（可取消僅 dismiss，
+                // 見 sync 內 cancelable＝!saving||reconciling；confirm 仍兩者皆禁）。
+                s.policyWritePhase == PolicyWritePhase.SAVING,
+                s.policyWritePhase == PolicyWritePhase.RECONCILING,
+            )
+        } catch (e: Exception) {
+            // SEC-L2: no raw exception/message in the log line — constant
+            // message + class-name-only via HookLog (never e.message,
+            // never the full stack).
+            Log.w(TAG, "syncPolicyWriteDialog failed: " + HookLog.shortEx(e))
         }
     }
 
@@ -3533,13 +3799,13 @@ class MainActivity : ComponentActivity() {
             setText(R.string.remove_confirm_acknowledge)
             // 窄螢幕可見可操作：24px 改 dp 換算＋WRAP_CONTENT＋最小觸控高 48dp。
             val d = resources.displayMetrics.density
-            val hPad = (24 * d).toInt()
+            val hPad = (CONFIRM_ACK_HPAD_DP * d).toInt()
             setPadding(hPad, 0, hPad, 0)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
-            minimumHeight = (48 * d).toInt()
+            minimumHeight = (CONFIRM_ACK_MIN_HEIGHT_DP * d).toInt()
             // 同世代重建（旋轉）恢復勾選；跨世代已在上重置為 false。
             isChecked = removeAcknowledged
         }
@@ -3658,10 +3924,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Stage1 批次建立兩步確認（Activity 本地，沿用 remove ack 世代契約）：
-    // batchBtn 點擊只建立請求快照（世代/數量/目標）並顯示對話框，確認後才
-    // vm.cloneSelected()。VM 守衛（isWritable、起始 pin）完全不經手，此處只做
-    // UI 門控（canConfirmBatch）與文案呈現（buildBatchConfirmMessage）。
     private fun requestBatchConfirm() {
         if (isFinishing || isDestroyed) return
         val s = try {
@@ -3898,6 +4160,529 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: 無障礙屬性失敗不影響顯示。
         }
+    }
+
+    private fun syncPolicyWriteDialog(
+        pending: PendingPolicyWrite?,
+        globalLoading: Boolean,
+        policyOp: Boolean,
+        policySaving: Boolean,
+        policyReconciling: Boolean = false,
+    ) {
+        if (isFinishing || isDestroyed) return
+        if (pending == null) {
+            try {
+                policyWriteDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            // 無待確認即無世代可綁定：勾選與世代一併清除，避免殘留污染下一世代。
+            policyAcknowledged = false
+            policyAckGeneration = null
+            // Stage B P2：展開開關同步重置（同 ack，避免殘留污染下一世代）。
+            policyWriteExpanded = false
+            policyWriteExpandedGeneration = null
+            // Stage J4：pending 清除即清除 RECONCILING 本地抑制（終態已到）。
+            policyWriteDismissedForReconcilingGen = null
+            return
+        }
+        // Stage J4：RECONCILING 期本地抑制（使用者已 Back/取消/稍后刷新主動關閉）：
+        // 不重建 dialog，VM fence 保留，reconciler／late-join 照常結清；新世代即清除。
+        if (policyReconciling && policyWriteDismissedForReconcilingGen == pending.generation) {
+            try {
+                policyWriteDialog?.dismiss()
+            } catch (_: Exception) {
+            }
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            return
+        }
+        if (!policyReconciling) {
+            policyWriteDismissedForReconcilingGen = null
+        }
+        // Stage J4：confirm 門控沿用舊 policySaving 語義（SAVING||RECONCILING 即禁確認）；
+        // cancelable 拆分（SAVING 不可取消，RECONCILING 可取消僅 dismiss）。
+        val confirmSaving = policySaving || policyReconciling
+        // Nit：直接以 (policySaving, policyReconciling) 調雙參真相
+        // (!saving || reconciling)；舊 savingOnly 中介與此等價（真值表一致），故省去。
+        val cancelable = policyDialogShouldBeCancelable(policySaving, policyReconciling)
+        if (policyWriteDialog?.isShowing == true && shownPolicyWrite == pending) {
+            // Stage L4: positive 門控改可檢視上界（含 total<=200，display≡inspectability）。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, confirmSaving)
+            // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
+            // Stage J4：RECONCILING 點按為本地 dismiss（不清 VM fence）。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+            policyWriteDialog?.setCancelable(cancelable)
+            policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
+            // queued/saving 忙碌文案：全量重建（冪等），render 每幀同步。
+            // Phase 5：SAVING 翻轉播報寫入中（POLITE，不洗掉 dialog 內容）。
+            val wasSaving = shownPolicyWriteSaving
+            try {
+                policyWriteDialog?.setMessage(policyWriteMessage(pending, policyOp, confirmSaving))
+            } catch (_: Exception) {
+                // Best effort: 文案更新失敗不影響門控。
+            }
+            if (confirmSaving && !wasSaving) {
+                shownPolicyWriteSaving = true
+                try {
+                    val announce = try {
+                        getString(R.string.policy_write_saving_announce)
+                    } catch (_: Exception) {
+                        "政策寫入中"
+                    }
+                    policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
+                } catch (_: Exception) {
+                    // Best effort: 播報失敗不影響門控。
+                }
+            } else if (!confirmSaving) {
+                shownPolicyWriteSaving = false
+            }
+            return
+        }
+        try {
+            policyWriteDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort.
+        }
+        shownPolicyWrite = pending
+        shownPolicyWriteSaving = confirmSaving
+        // 同世代（旋轉重建）保留勾選，跨世代重置（見 policyAckShouldReset 純函數；
+        // 此處為 Activity 側實現，JVM 以該純函數鎖定語義）。
+        if (policyAckShouldReset(policyAckGeneration, pending.generation)) {
+            policyAcknowledged = false
+            policyAckGeneration = null
+        }
+        // Stage B P2：世代重置同步重置 expanded（同 ack 契約，見
+        // policyWriteExpandedShouldReset；early-return 分支不動，此處僅新 dialog）。
+        if (policyWriteExpandedShouldReset(policyWriteExpandedGeneration, pending.generation)) {
+            policyWriteExpanded = false
+            policyWriteExpandedGeneration = null
+        }
+        val message = policyWriteMessage(pending, policyOp, confirmSaving)
+        // 破壞性確認顯示完整包名以供核對（政策寫入放寬白名單，需明示對象；
+        // 包名來自 catalog/PM，非使用者隱私輸入；匯出/日誌仍經遮蔽）。
+        // Stage B P2（方案 A Toggle）：預設收合前 50 項＋溢出行（全量 200 行會擠出
+        // ack）；rest>0 才顯示 Toggle，in-place 切換完整/收合，保 ack，播報；
+        // 寫入仍用完整 pending.packages（截斷僅顯示）。
+        val sorted = pending.packages.sorted()
+        val hasOverflow = sorted.size > POLICY_DIALOG_PREVIEW_MAX
+        // 溢出不存在時強制收合（expanded 無意義，Toggle 隱藏）。
+        val effectiveExpanded = policyWriteExpanded && hasOverflow
+        val listViews = buildPolicyListView(sorted, effectiveExpanded)
+        val packagesText = listViews.packagesText
+        val scrollView = listViews.scrollView
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            // Phase 5 a11y：dialog 內容區 POLITE（TalkBack 跟隨訊息/相位變化）。
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            // Stage B P2：包名超過 POLICY_DIALOG_LIST_INLINE_MAX 項時 ScrollView 限高
+            // policyDialogListMaxHeightDp（小螢幕回 SMALL，否則 NORMAL），
+            // ack checkbox 永遠可見；少量時 WRAP_CONTENT 不留空。
+            val maxHeightDp = currentPolicyDialogListMaxHeightDp()
+            val listParams = if (sorted.size > POLICY_DIALOG_LIST_INLINE_MAX) {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(maxHeightDp),
+                )
+            } else {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+            }
+            addView(scrollView, listParams)
+        }
+        // Stage B P2 Toggle：僅 rest>0（即 hasOverflow）顯示；in-place 切換保 ack。
+        var toggleBtn: Button? = null
+        if (hasOverflow) {
+            // P3 toggle label minOf：expanded 收合標籤的 %1$d 為實際顯示數
+            // min(200, total)，收合為 50；避免 expanded 顯示 200 卻標 50。
+            val initialPreview = if (effectiveExpanded) minOf(sorted.size, POLICY_DIALOG_DISPLAY_MAX)
+            else minOf(sorted.size, POLICY_DIALOG_PREVIEW_MAX)
+            val initialLabel = policyWriteToggleLabel(effectiveExpanded, sorted.size, initialPreview)
+            toggleBtn = Button(this).apply {
+                text = initialLabel
+                minimumHeight = dp(48)
+                contentDescription = initialLabel
+            }
+            container.addView(
+                toggleBtn,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            val toggleRef = toggleBtn
+            toggleRef.setOnClickListener {
+                val newExpanded = !policyWriteExpanded
+                policyWriteExpanded = newExpanded
+                policyWriteExpandedGeneration = if (newExpanded) pending.generation else null
+                // in-place 切換：重算可見列＋CD＋按鈕文案＋播報，不重建 dialog，保 ack。
+                try {
+                    val (newShown, _) = policyWriteVisibleList(sorted, newExpanded)
+                    packagesText.text = buildPolicyListText(sorted, newShown)
+                    scrollView.contentDescription = policyWriteListSummary(sorted.size, newShown.size, newExpanded)
+                    // Toggle 文案的計數語義：show_less 的 %1$d 為實際展開顯示數
+                    // min(200, total)（P3 minOf，不再寫死 50），show_all 的 %1$d
+                    // 為總數；expanded 播報為總數，collapsed 播報為預覽數。
+                    // P3 expanded generation symmetry：展開綁定 pending.generation，
+                    // 收合清回 null（與 ack 世代契約對稱，跨世代由 shouldReset 清）。
+                    val previewSize = if (newExpanded) minOf(sorted.size, POLICY_DIALOG_DISPLAY_MAX)
+                    else minOf(sorted.size, POLICY_DIALOG_PREVIEW_MAX)
+                    val newLabel = policyWriteToggleLabel(newExpanded, sorted.size, previewSize)
+                    toggleRef.text = newLabel
+                    try {
+                        toggleRef.contentDescription = newLabel
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        scrollView.scrollTo(0, 0)
+                    } catch (_: Exception) {
+                    }
+                    val announce = policyWriteToggleAnnounce(newExpanded, sorted.size, previewSize)
+                    try {
+                        scrollView.announceForAccessibility(announce)
+                    } catch (_: Exception) {
+                        // Best effort.
+                    }
+                } catch (_: Exception) {
+                    // Best effort: 切換失敗不影響門控與 ack。
+                }
+            }
+        }
+        val acknowledgement = CheckBox(this).apply {
+            setText(R.string.policy_write_acknowledge)
+            val d = resources.displayMetrics.density
+            val hPad = (CONFIRM_ACK_HPAD_DP * d).toInt()
+            setPadding(hPad, 0, hPad, 0)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            minimumHeight = (CONFIRM_ACK_MIN_HEIGHT_DP * d).toInt()
+            isChecked = policyAcknowledged
+        }
+        // 把 ack checkbox 放在 scrollable list 之下。
+        container.addView(
+            acknowledgement,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        try {
+            policyWriteDialog = AlertDialog.Builder(this)
+                .setTitle(getString(R.string.policy_write_title))
+                .setMessage(message)
+                .setView(container)
+                .setCancelable(cancelable)
+                .setPositiveButton(getString(R.string.policy_write_positive), null)
+                .setNegativeButton(getString(R.string.dialog_cancel), null)
+                .setNeutralButton(getString(R.string.policy_write_snooze), null)
+                .setOnCancelListener {
+                    // Stage J4：RECONCILING 期 Back/觸外僅本地 dismiss（不清 VM fence，
+                    // 不調 cancel）；SAVING/QUEUED 沿既有 cancel 語義。
+                    val recNow = try {
+                        vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+                    } catch (_: Exception) {
+                        policyReconciling
+                    }
+                    if (recNow) {
+                        policyWriteDismissedForReconcilingGen = pending.generation
+                        try {
+                            policyWriteDialog?.dismiss()
+                        } catch (_: Exception) {
+                        }
+                        policyWriteDialog = null
+                        shownPolicyWrite = null
+                        shownPolicyWriteSaving = false
+                    } else {
+                        vm.cancelPolicyWrite(pending)
+                    }
+                }
+                .show()
+        } catch (_: Exception) {
+            policyWriteDialog = null
+            shownPolicyWrite = null
+            shownPolicyWriteSaving = false
+            return
+        }
+        acknowledgement.setOnCheckedChangeListener { _, checked ->
+            policyAcknowledged = checked
+            policyAckGeneration = if (checked) pending.generation else null
+            // 確定性路徑：用本次 sync 傳入的 render 幀 policySaving（同 remove dialog
+            // 的 loading/blockKey 模式），不即時重讀 live 狀態；loading 變化由
+            // 下一次 render 的 early-return 同步，真正寫入門控在 Positive 點擊
+            // 即時重讀＋VM confirmPolicyWrite 世代守衛雙層 fail-closed。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyWriteCanConfirmInspectable(pending.packages.size, checked, confirmSaving)
+        }
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            // 點擊瞬間值：即時重讀 live state（非 render 幀 stale 值），SAVING/
+            // RECONCILING 才禁用（QUEUED 可確認，避免 request 即 QUEUED 導致恆
+            // 禁用死鎖；核對中請勿重試）；世代守衛在 VM。
+            // Stage L4: 點擊亦經可檢視上界（display≡inspectability，超限禁寫）。
+            val curPolicySaving = try {
+                val ph = vm.state.value.policyWritePhase
+                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
+            } catch (_: Exception) {
+                confirmSaving
+            }
+            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
+        }
+        // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
+        // 點按時即時重讀 phase；Stage J4：SAVING 即 toast「寫入中，無法取消」且不調 VM；
+        // RECONCILING 即本地 dismiss（不清 VM fence，不調 cancel）；queued 才調 cancel。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.setOnClickListener {
+            val phNow = try {
+                vm.state.value.policyWritePhase
+            } catch (_: Exception) {
+                if (policyReconciling) PolicyWritePhase.RECONCILING
+                else if (policySaving) PolicyWritePhase.SAVING else PolicyWritePhase.IDLE
+            }
+            if (phNow == PolicyWritePhase.SAVING) {
+                val denied = try {
+                    getString(R.string.policy_write_cancel_denied)
+                } catch (_: Exception) {
+                    "寫入中，無法取消"
+                }
+                try {
+                    Toast.makeText(this, denied, Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
+                    // Best effort: toast 失敗不影響門控。
+                }
+            } else if (phNow == PolicyWritePhase.RECONCILING) {
+                policyWriteDismissedForReconcilingGen = pending.generation
+                try {
+                    policyWriteDialog?.dismiss()
+                } catch (_: Exception) {
+                }
+                policyWriteDialog = null
+                shownPolicyWrite = null
+                shownPolicyWriteSaving = false
+            } else {
+                vm.cancelPolicyWrite(pending)
+            }
+        }
+        // Stage J4：稍后刷新（RECONCILING 期手動恢復入口）：觸發一次顯式重讀
+        // （reconciler 已退出 unresolved 時經 late-join 結清；否則 yielding），
+        // 並本地 dismiss（不清 fence），待終態重建或保持抑制。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            // Stage J4：僅 RECONCILING 期有效（QUEUED/SAVING 點按 no-op，避免無用
+            // refresh＋SAVING commit 期併發 IO；按鈕常建、early-return 常駐，故門控在前）。
+            val recNow = try { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING } catch (_: Exception) { policyReconciling }
+            if (!recNow) return@setOnClickListener
+            try { vm.refreshPolicyDraft() } catch (_: Exception) { }
+            policyWriteDismissedForReconcilingGen = pending.generation
+            try { policyWriteDialog?.dismiss() } catch (_: Exception) { }
+            policyWriteDialog = null; shownPolicyWrite = null; shownPolicyWriteSaving = false
+        }
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+            policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, confirmSaving)
+        // Phase 5：negative 保持可點（見上 toast/本地 dismiss），Back/觸外以 cancelable 門控。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+        policyWriteDialog?.setCancelable(cancelable)
+        policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
+        // Phase 5：初建即 SAVING 時播報一次（early-return 分支覆蓋後續翻轉）。
+        if (confirmSaving) {
+            try {
+                val announce = try {
+                    getString(R.string.policy_write_saving_announce)
+                } catch (_: Exception) {
+                    "政策寫入中"
+                }
+                policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
+        // P3 expanded dialog a11y window：初建即播報清單摘要（總數/顯示數），
+        // 使 TalkBack 用戶不需逐項滑讀即知範圍；ScrollView CD 承載同文。
+        // shown 數由 PolicyListViews.shownSize 直攜（不經 text.lines() 反推，
+        // 溢出行不計入可見列，避免 off-by-one）。
+        if (!confirmSaving) {
+            try {
+                val summary = policyWriteListSummary(sorted.size, listViews.shownSize, effectiveExpanded)
+                policyWriteDialog?.window?.decorView?.announceForAccessibility(summary)
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
+    }
+
+    // Stage B P2 完整清單視圖（方案 A Toggle 抽取）：依 expanded 決定可見列＋CD。
+    // - 收合：前 POLICY_DIALOG_PREVIEW_MAX 項＋溢出行，CD 走 list_cd_collapsed；
+    // - 展開：前 POLICY_DIALOG_DISPLAY_MAX 項＋溢出計數（P2 有界，寫入仍用完整
+    //   pending.packages），CD 走 list_cd（完整）或 collapsed（仍有溢出時）。
+    // 資源缺失 fail-closed 回中文 fallback（見純函數 policyWriteListCdFallback）。
+    private data class PolicyListViews(
+        val scrollView: ScrollView,
+        val packagesText: TextView,
+        // a11y off-by-one 修復：播報摘要的 shown 數直接攜帶可見列數，不再經
+        // packagesText.lines().size 反推（後者把溢出行「…等共 N 項」亦計為一列，
+        // 溢出時恆多 1）。buildPolicyListView 同步賦值，呼叫端以此為準。
+        val shownSize: Int,
+    )
+
+    private fun buildPolicyListView(sorted: List<String>, expanded: Boolean): PolicyListViews {
+        val (shown, _) = policyWriteVisibleList(sorted, expanded)
+        val packagesText = TextView(this).apply {
+            text = buildPolicyListText(sorted, shown)
+            // 無 contentDescription：摘要由外層 ScrollView 承載，內外重複會致
+            // TalkBack 朗讀兩次。
+            setTextIsSelectable(true)
+        }
+        val summary = policyWriteListSummary(sorted.size, shown.size, expanded)
+        val scrollView = ScrollView(this).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            contentDescription = summary
+            addView(
+                packagesText,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        return PolicyListViews(scrollView, packagesText, shown.size)
+    }
+
+    private fun buildPolicyListText(sorted: List<String>, shown: List<String>): String {
+        val rest = sorted.size - shown.size
+        val lines = ArrayList<String>(shown.size + 1)
+        lines.addAll(shown)
+        if (rest > 0) {
+            val more = try {
+                resources.getQuantityString(
+                    R.plurals.policy_write_preview_more,
+                    sorted.size,
+                    sorted.size,
+                    shown.size,
+                )
+            } catch (_: Exception) {
+                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項"
+            }
+            lines.add(more)
+        }
+        return lines.joinToString("\n")
+    }
+
+    private fun policyWriteListSummary(total: Int, shownSize: Int, expanded: Boolean): String {
+        // Stage L4 display≡inspectability：超限展開仍視截斷（僅 200 可檢視，
+        // 不得謊稱完整）。expanded 僅 total<=200 才回完整，否則一律截斷 CD。
+        val useFull = (expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shownSize
+        return if (useFull) {
+            try {
+                getString(R.string.policy_write_list_cd, total)
+            } catch (_: Exception) {
+                policyWriteListCdFallback(total, shownSize, true)
+            }
+        } else {
+            try {
+                getString(R.string.policy_write_list_cd_collapsed, total, shownSize)
+            } catch (_: Exception) {
+                policyWriteListCdFallback(total, shownSize, false)
+            }
+        }
+    }
+
+    private fun policyWriteToggleLabel(expanded: Boolean, total: Int, shownSize: Int): String {
+        // Stage L4: 超限收合按鈕改 capped（「顯示全部」失實，改前 200＋縮減指引；寫入整組取代）。
+        val overCap = total > POLICY_DIALOG_DISPLAY_MAX
+        return try {
+            if (expanded) getString(R.string.policy_write_show_less, shownSize)
+            else if (overCap) getString(R.string.policy_write_show_all_capped, total, shownSize)
+            else getString(R.string.policy_write_show_all, total)
+        } catch (_: Exception) {
+            if (!expanded && overCap) policyWriteShowAllCappedFallback(total, shownSize)
+            else policyWriteToggleLabelFallback(expanded, total, shownSize)
+        }
+    }
+
+    private fun policyWriteToggleAnnounce(expanded: Boolean, total: Int, shownSize: Int): String {
+        // Stage L4: 超限展開播報改 capped（「完整清單」失實，改前 200＋縮減指引；寫入整組取代）。
+        val overCap = total > POLICY_DIALOG_DISPLAY_MAX
+        return try {
+            if (expanded && overCap) getString(R.string.policy_write_expanded_announce_capped, total, shownSize)
+            else if (expanded) getString(R.string.policy_write_expanded_announce, total)
+            else getString(R.string.policy_write_collapsed_announce, shownSize)
+        } catch (_: Exception) {
+            if (expanded && overCap) policyWriteExpandedAnnounceCappedFallback(total, shownSize)
+            else policyWriteToggleAnnounceFallback(expanded, total, shownSize)
+        }
+    }
+
+    private fun policyWriteOverCapWarning(total: Int, shownSize: Int): String {
+        return try {
+            getString(R.string.policy_write_over_cap_warning, total, shownSize)
+        } catch (_: Exception) {
+            policyWriteOverCapWarningFallback(total, shownSize)
+        }
+    }
+
+    private fun currentPolicyDialogListMaxHeightDp(): Int {
+        return try {
+            val cfg = resources.configuration
+            policyDialogListMaxHeightDp(cfg.smallestScreenWidthDp, cfg.screenHeightDp)
+        } catch (_: Exception) {
+            POLICY_DIALOG_LIST_MAX_HEIGHT_DP
+        }
+    }
+
+    // 政策寫入 dialog 訊息（含 dropped 與 busy 後綴；皆經資源解析，JVM 縫合語義
+    // 由純函數 policyWriteBusySuffix/truncatePolicyPreview 鎖定）。
+    // - 主模板走 R.plurals.policy_write_message（Phase 5：前身 <string> 帶無用 %2$s，
+    //   現移除 %2$s，清單另以 ScrollView 顯示，僅留計數 %1$d；中英 plurals 化）。
+    // - dropped 後綴走 R.plurals.policy_dropped（前身硬編碼拼接，現資源化）。
+    // - busy 後綴走 R.string.policy_write_busy_*（前身僅純函數硬編碼，生產改資源；
+    //   純函數保留為 JVM seam，文案與 zh 資源同字）。
+    private fun policyWriteMessage(
+        pending: PendingPolicyWrite,
+        policyOp: Boolean,
+        policySaving: Boolean,
+    ): String {
+        var message = try {
+            resources.getQuantityString(
+                R.plurals.policy_write_message,
+                pending.packages.size,
+                pending.packages.size,
+            )
+        } catch (_: Exception) {
+            "政策寫入（${pending.packages.size} 項）"
+        }
+        if (pending.droppedCount > 0) {
+            val droppedSuffix = try {
+                resources.getQuantityString(
+                    R.plurals.policy_dropped,
+                    pending.droppedCount,
+                    pending.droppedCount,
+                )
+            } catch (_: Exception) {
+                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+            }
+            message += "\n$droppedSuffix"
+        }
+        // Stage L4: 超限警告（total>200 即附，display≡inspectability 指引縮減；
+        // N4：寫入整組取代、不合併，故指引為單次 ≤200 而非分批累加）。
+        if (pending.packages.size > POLICY_DIALOG_DISPLAY_MAX) {
+            val shown = minOf(pending.packages.size, POLICY_DIALOG_DISPLAY_MAX)
+            message += "\n" + policyWriteOverCapWarning(pending.packages.size, shown)
+        }
+        val busySuffix = try {
+            if (policySaving) getString(R.string.policy_write_busy_saving)
+            else if (policyOp) getString(R.string.policy_write_busy_queued)
+            else ""
+        } catch (_: Exception) {
+            policyWriteBusySuffix(policyOp, policySaving)
+        }
+        message += busySuffix
+        return message
     }
 
     // Best-effort display name for the dialog: the PackageManager label when
@@ -4242,6 +5027,9 @@ class MainActivity : ComponentActivity() {
             val apps: List<SourceAppEntry>? = withContext(Dispatchers.IO) {
                 try {
                     loadSourceApps(packageManager, selfSerial())
+                } catch (e: CancellationException) {
+                    // catalogJob 取消透傳 (loadSourceApps 內層同語義,不吞為 null)。
+                    throw e
                 } catch (_: Exception) {
                     null
                 }
@@ -4259,6 +5047,7 @@ class MainActivity : ComponentActivity() {
 
     // B 去重：比照 msg/writeBlock（shouldUpdate＋View 實字雙比對），
     // 無關 render 不重設相同文字，避免 POLITE 重播；旋轉重建以 View 為準。
+    // P3：空時 liveRegion 恆 NONE（避免 TalkBack 聚焦空錯誤區），非空才 POLITE。
     private fun updateCatalogErrorView() {
         try {
             if (!::catalogErrorView.isInitialized) return
@@ -4276,6 +5065,13 @@ class MainActivity : ComponentActivity() {
             val wantVisible = !err.isNullOrEmpty()
             if ((catalogErrorView.visibility == View.VISIBLE) != wantVisible) {
                 catalogErrorView.visibility = if (wantVisible) View.VISIBLE else View.GONE
+            }
+            try {
+                catalogErrorView.accessibilityLiveRegion =
+                    if (wantVisible) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                    else View.ACCESSIBILITY_LIVE_REGION_NONE
+            } catch (_: Exception) {
+                // Best effort.
             }
         } catch (_: Exception) {
             // Best effort: view may not be ready in tests.
@@ -4367,8 +5163,11 @@ class MainActivity : ComponentActivity() {
         }
         // P2/P3：sticky bar 顯示簡短原因/摘要（捲動時仍可見）；完整明細僅在 batchResultView。
         // a11y：避免朗讀 50 筆逐項明細，改為單句摘要/原因 + 前往詳情提示。
+        // P3 focusable doc：sticky bar 可聚焦（鍵盤/TalkBack 可達），CD 承載摘要＋前往詳情。
         if (::batchBarStatusView.isInitialized) {
             try {
+                batchBarStatusView.isFocusable = true
+                batchBarStatusView.isFocusableInTouchMode = false
                 if (newBatchText.isBlank()) {
                     batchBarStatusView.visibility = View.GONE
                     batchBarStatusView.text = ""
@@ -5003,6 +5802,9 @@ class MainActivity : ComponentActivity() {
         formatBatchReportSummary(report, batchReportStrings())
 
     // PR64 P3：VM 無 Context，核准失效訊息以常數/前綴標記，UI 依 locale 本地化顯示。
+    // P2 擴展：DualViewModel 其餘硬編碼 msg="..."（clone/remove/batch/probe，
+    // VM 本體無 Context 不動）一律經 vmMessageRes 映射為資源＋參數後解析；
+    // 未映射回退原文（fail-open 顯示，不靜默丟訊息）。
     private fun localizeVmMessage(msg: String): String {
         if (msg.isEmpty()) return msg
         return try {
@@ -5018,7 +5820,17 @@ class MainActivity : ComponentActivity() {
                         msg
                     }
                 }
-                else -> msg
+                else -> {
+                    val mapped = vmMessageRes(msg) ?: return msg
+                    val (resId, arg) = mapped
+                    if (resId == R.string.input_too_long) {
+                        getString(resId, MAX_PACKAGE_INPUT_CHARS)
+                    } else if (arg == null) {
+                        getString(resId)
+                    } else {
+                        getString(resId, arg)
+                    }
+                }
             }
         } catch (_: Exception) {
             msg
@@ -5061,6 +5873,13 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
+        // Stage2：政策寫入確認勾選綁定世代 → 不再經 Bundle 持久化（consent 為
+        // session-scoped；舊 key policyAck/policyAckGen 已廢棄）。
+        // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
+        private const val KEY_POLICY_EXPANDED = "policyExpanded"
+        private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"
+        // Stage J4：RECONCILING 期本地抑制世代（同世代旋轉保留，跨世代/終態清除見 sync）。
+        private const val KEY_POLICY_WRITE_DISMISSED_GEN = "policyWriteDismissedGen"
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -5089,6 +5908,20 @@ class MainActivity : ComponentActivity() {
 
         // Phase B B4：pkg→label 內存快取上限（與圖示快取同級，顯示用）。
         private const val MAX_LABEL_CACHE = 200
+
+        // Phase 5 政策寫入 dialog 尺寸閾值（等值提取字面量，行為不變）：
+        // POLICY_DIALOG_LIST_INLINE_MAX = 清單超過此項數才限高（少量
+        // WRAP_CONTENT 不留空，ack 永遠可見）；
+        // POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 限高（經 dp() 轉 px）；
+        // POLICY_DIALOG_LIST_MAX_HEIGHT_SMALL_DP = 小螢幕限高（smallestWidth<360
+        // 或 screenHeight<640 經 dp() 轉 px；見 policyDialogListMaxHeightDp）；
+        // CONFIRM_ACK_HPAD_DP／CONFIRM_ACK_MIN_HEIGHT_DP = 確認勾選
+        // 水平內邊距／最小觸控高（remove／policy 兩 dialog 共用，48dp 觸控目標）。
+        private const val POLICY_DIALOG_LIST_INLINE_MAX = 10
+        private const val POLICY_DIALOG_LIST_MAX_HEIGHT_DP = 320
+        private const val POLICY_DIALOG_LIST_MAX_HEIGHT_SMALL_DP = 240
+        private const val CONFIRM_ACK_HPAD_DP = 24
+        private const val CONFIRM_ACK_MIN_HEIGHT_DP = 48
 
         // PR-37 Phase C #5 圖示淘汰純決策 (JVM 可測 seam)：快取已滿
         // (orderedKeys.size >= maxSize) 時回傳最久未用 key（Phase D 起 LRU：
@@ -5239,6 +6072,88 @@ internal fun batchTargetUnavailable(s: UiState): Boolean =
 internal fun shouldUpdateBatchResultText(old: String?, new: String?): Boolean = old != new
 
 internal fun shouldUpdateCatalogErrorText(old: String?, new: String?): Boolean = old != new
+
+// P2 政策草稿行去重守衛（純函數，JVM 可測；render 比照 catalogErrorView 去重）。
+// 文字未變不重設（TalkBack 不重播）；liveRegion 僅在變化時 POLITE，否則 NONE。
+internal fun shouldUpdatePolicyDraftText(old: String?, new: String?): Boolean = old != new
+
+internal fun policyDraftLiveRegion(changed: Boolean): Int =
+    if (changed) android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE
+    else android.view.View.ACCESSIBILITY_LIVE_REGION_NONE
+
+// P2 VM 硬編碼字串資源化（純函數，JVM 可測，不碰 Context）。
+//
+// DualViewModel 本體無 Context（msg="..." 硬編碼中英混雜，JVM 測試鎖定字面，
+// 故 VM 側不動）；顯示經 MainActivity.localizeVmMessage 解析。此函數將已知
+// VM 字面/前綴映射為 (stringRes, 格式參數)：精確字面回 arg=null（無參模板），
+// 前綴回 (res, 剩餘後綴為 %1$s 參數，原文透傳不翻譯）；未知回 null（呼叫端
+// 回退原文）。順序敏感：精確先於前綴，長前綴先於短前綴（verified-id/serial
+// 先於通用「移除目標已變更（」）。
+//
+// 已知限制（locale-mixed by design）：前綴模板已本地化，但 %1$s 餘部是 VM
+// 原文透傳（不翻譯）。包名／技術細節餘部為 locale-neutral 故中英皆完整；
+// 但結構化中文訊息（移除目標已變更 verified-id/serial/label、選取目標
+// user/serial、選取已綁定舊目標、已保存選取、批次中斷 target/partial、
+// serial 缺失後綴等）餘部本身含中文子句（例「5 ≠ 3），請重新確認」），
+// EN 下仍為「EN 前綴＋中文餘部」混合。VM 訊息為不透明字串（無 Context＋
+// 需鎖定字面），以 regex 解析數字重組多參模板屬脆弱（包名可含數字／符號，
+// 誤解析風險高於混合文案成本），故維持透傳並以 StageJ5PolishTest 鎖定混合
+// 為已知限制；未來 VM 改發結構化參數時再拆多參模板。
+// Stage L5 P3: VmMessage sealed typed-args 屬大重構，DEFER——本 shim 維持現狀，
+// 不在此階段實作（VM 無 Context＋JVM 鎖字面，見上）。
+internal fun vmMessageRes(msg: String): Pair<Int, String?>? {
+    when (msg) {
+        "invalid package" -> return R.string.invalid_package to null
+        "no dual profile" -> return R.string.vm_no_dual_profile to null
+        "沒有待確認的移除" -> return R.string.vm_no_pending_remove to null
+        "未勾選任何應用" -> return R.string.policy_empty_selection to null
+        "already in progress: batch clone" -> return R.string.vm_busy_batch_clone to null
+        "已清除勾選（未卸載任何分身）" -> return R.string.vm_selection_cleared to null
+        "保存選取失敗" -> return R.string.vm_save_failed to null
+        "取消保存失敗" -> return R.string.vm_unsave_failed to null
+        "已取消保存選取（不影響已安裝分身與目前勾選）" -> return R.string.vm_save_cancelled to null
+        "無選取 store,無法保存" -> return R.string.vm_no_store_save to null
+        "無選取 store,無法取消保存" -> return R.string.vm_no_store_unsave to null
+        "確認已過期，請重新確認移除" -> return R.string.vm_remove_ttl_expired to null
+        "移除目標無法驗證（serial 缺失），請重新確認" -> return R.string.vm_target_unverifiable to null
+        "無法驗證分身身分（serial 缺失），請重試" -> return R.string.vm_serial_unknown_retry to null
+        "清單已過期（STALE），請重新查詢後再保存" -> return R.string.vm_list_stale_resave to null
+    }
+    // 超長模板帶實際數字（VM 已內插 $MAX_PACKAGE_INPUT_CHARS）：前綴命中即走
+    // input_too_long 資源＋常數參數（呼叫端以 MAX_PACKAGE_INPUT_CHARS 解析）。
+    if (msg.startsWith("輸入過長（超過 ")) return R.string.input_too_long to null
+    val prefixes = listOf(
+        "already in progress: " to R.string.vm_in_progress,
+        "cloned: " to R.string.vm_cloned,
+        "removed: " to R.string.vm_removed,
+        "clone verification failed: " to R.string.vm_clone_verify_failed,
+        "clone verification mismatch: " to R.string.vm_clone_mismatch,
+        "clone result unknown: " to R.string.vm_clone_unknown,
+        "clone failed: " to R.string.vm_clone_failed,
+        "remove result unknown: " to R.string.vm_remove_unknown,
+        "remove failed: " to R.string.vm_remove_failed,
+        "已取消移除：" to R.string.vm_remove_cancelled,
+        "等待確認移除：" to R.string.vm_await_remove,
+        "未安裝，無需移除：" to R.string.vm_not_installed,
+        "移除目標已變更（verified id " to R.string.vm_target_changed_verified_id,
+        "移除目標已變更（serial " to R.string.vm_target_changed_serial,
+        "移除目標已變更（" to R.string.vm_target_changed_label,
+        "無法驗證分身身分（serial 缺失），" to R.string.vm_serial_unknown_suffix,
+        "選取目標已變更（user " to R.string.vm_select_target_user,
+        "選取目標已變更（serial " to R.string.vm_select_target_serial,
+        "選取已綁定舊目標" to R.string.vm_target_rebound,
+        "已保存選取 " to R.string.vm_saved_selection,
+        "批次無法開始：channel error: " to R.string.vm_batch_no_start,
+        "批次中斷：目標已變更（user " to R.string.vm_batch_target_changed,
+        "批次中斷：已完成 " to R.string.vm_batch_partial,
+        "probe failed: " to R.string.vm_probe_failed,
+        "foreground failed: " to R.string.vm_foreground_failed,
+    )
+    for ((prefix, res) in prefixes) {
+        if (msg.startsWith(prefix)) return res to msg.removePrefix(prefix)
+    }
+    return null
+}
 
 // B1 去重鍵去時間（純函數，JVM 可測）：可見文字保留完整時間資訊，
 // 僅去重比對前剝除時間關鍵參數，避免 LSPosed displayText 時間戳漂移導致恆 false。
@@ -5469,7 +6384,7 @@ internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
             HookStatus.UNKNOWN_NO_DIAGNOSTIC ->
                 "Unknown (no diagnostic channel; switch to a ROOT/Shizuku channel and re-probe, see #27)"
         }
-        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), whitelist policy branch pending, writes disabled"
+        return "LSPosed Hook: $enStatus${s.hookEvidence().timeEvidenceText()}; write channel is a placeholder (NoOp), writes disabled; whitelist policy source wired (end-to-end DEVICE-UNVERIFIED)"
     }
     // ACTIVE is historical existence+scope evidence only (the marker
     // survives reboots; S24 evidence shows it predating boot by ~5.5h
@@ -5487,7 +6402,7 @@ internal fun renderHookText(s: UiState, isEnglish: Boolean = false): String? {
             "狀態未知（無可用診斷通道；切到 ROOT／Shizuku 真通道後重探，見 #27）"
     }
     return "LSPosed Hook：$status${s.hookEvidence().timeEvidenceText()}；寫入通道為佔位（NoOp），" +
-        "待 whitelist 政策分支，寫入已禁用"
+        "寫入已禁用；白名單政策來源已接線（端到端 DEVICE-UNVERIFIED）"
 }
 
 // 診斷事件行：穩定碼 + 繁中摘要/下一步常顯（scope-limited 繁中，非雙語）；展開時加 exit/技術 detail。
@@ -5536,7 +6451,35 @@ internal fun renderDiagnoseDescription(s: UiState, expanded: Boolean): String {
 // 「…等 M 項」收尾（與來源清單 MAX_SOURCE_ROWS 同式截斷提示）。
 const val BATCH_REPORT_MAX_ROWS = 50
 
+// 分身列表渲染上限（P2 有界）：最多渲染前 N 行，超出以截斷行提示
+// （與來源清單 MAX_SOURCE_ROWS 同式）；指紋/寫入不受影響。
+const val MAX_CLONED_ROWS = 200
+
+// 政策寫入 dialog 展開顯示上限（P2 有界）：expanded 顯示封頂前 N 項＋溢出計數，
+// 寫入仍用完整 pending.packages（截斷僅顯示）。
+
 // 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派)。
+// Phase 5 polish：政策寫入 dialog 包名預覽上限（效能＋a11y 護欄）：清單最多
+// 顯示前 N 項，超出以「…等共 M 項」收尾（與批次報告同式）；完整集合仍在
+// pending.packages 內，寫入數不受截斷影響。contentDescription 另給摘要
+// （見 syncPolicyWriteDialog），TalkBack 不逐項朗讀 200 行。
+const val POLICY_DIALOG_PREVIEW_MAX = 50
+
+// P2 有界：展開顯示封頂（寫入仍用完整 pending.packages，截斷僅顯示）。
+const val POLICY_DIALOG_DISPLAY_MAX = 200
+
+// 政策寫入 dialog 包名預覽截斷（MainActivity 頂層 internal，JVM 可測）：回傳
+// （顯示列，溢出數）。呼叫端顯示列 join＋溢出行（資源
+// policy_write_preview_more），寫入仍用完整 pending.packages。
+internal fun truncatePolicyPreview(
+    sorted: List<String>,
+    max: Int = POLICY_DIALOG_PREVIEW_MAX,
+): Pair<List<String>, Int> {
+    if (sorted.size <= max) return sorted to 0
+    return sorted.take(max) to (sorted.size - max)
+}
+
+// 批次逐項結果文字 (MainActivity 頂層 internal，JVM 可測；render 僅委派；保留繁中 scope-limited，非雙語)。
 // - 未知口徑與 DualViewModel.isBatchUnknownOutcome 一致：VerifyUnknown 與
 //   ChannelError（身份暫時無法判定、零寫入，需重查）皆計未知；NoDual 計失敗
 //   （真 Absent＋M13 短路語意），其餘非 Success 皆計失敗。彙總計數由呼叫端
@@ -5658,6 +6601,116 @@ internal fun batchRequestMatchesLive(request: BatchConfirmRequest, live: UiState
         live,
         request.wasFresh,
     )
+// Phase 3（hook-policy-source P1，階段 3）：政策寫入 dialog 純門控（JVM 可測，
+// 無需 Robolectric；Activity 側 syncPolicyWriteDialog 只呼叫此三函數）。
+// - positive：僅寫入中（SAVING）禁用＋需 ack 勾選；排隊（QUEUED）可確認/可取消。
+// - negative/Back：僅 SAVING 禁用（queued 仍可取消，P1 #1 語義）。
+// - busy 後綴：SAVING 顯示寫入中，QUEUED（op 非 saving）顯示等待中，皆附換行。
+// Stage L4 P2#2 (b) 單次確認可檢視上界 200（display≡inspectability）：
+// positive 另須 total<=POLICY_DIALOG_DISPLAY_MAX；超限即禁用＋超限警告＋
+// 縮減指引（N4：寫入整組取代、不合併，故指引為單次 ≤200 而非分批累加；
+// 寫入仍用完整 pending.packages，但須經門控縮減確認）。
+internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean): Boolean =
+    !policySaving && acknowledged
+
+// Stage L4 單確認可檢視門控 single source：!saving && ack && total<=200。
+// 二參舊版保留（既有測試／舊調用，不含 total 檢查）；三參／Inspectable 版為
+// 生產真相（syncPolicyWriteDialog 一律用此）。display≡inspectability。
+internal fun policyWriteCanConfirmInspectable(total: Int, acknowledged: Boolean, policySaving: Boolean): Boolean =
+    !policySaving && acknowledged && total <= POLICY_DIALOG_DISPLAY_MAX
+
+internal fun policyDialogCanConfirm(policySaving: Boolean, acknowledged: Boolean, total: Int): Boolean =
+    policyWriteCanConfirmInspectable(total, acknowledged, policySaving)
+
+internal fun policyWriteIsOverCap(total: Int): Boolean = total > POLICY_DIALOG_DISPLAY_MAX
+
+// Stage J4 (dialog trap)：SAVING 不可取消 vs RECONCILING 可取消（僅 UI 層 dismiss，
+// 不清 VM fence）。雙參為真相；單參相容保留（舊測試／舊調用：reconciling=false）。
+// 語義：(!saving || reconciling)——SAVING 且非 RECONCILING 才不可取消。
+internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !policySaving
+
+internal fun policyDialogShouldBeCancelable(saving: Boolean, reconciling: Boolean): Boolean =
+    !saving || reconciling
+
+internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
+    storedGeneration != pendingGeneration
+
+internal fun policyWriteBusySuffix(policyOp: Boolean, policySaving: Boolean): String = when {
+    policySaving -> "\n（寫入中…）"
+    policyOp -> "\n（等待中…）"
+    else -> ""
+}
+
+// Stage B P2 dialog 完整清單（方案 A Toggle）純函數（JVM 可測，無 Android 依賴）：
+// - policyDialogListMaxHeightDp：小螢幕（smallestWidth<360 或 screenHeight<640）
+//   回 SMALL（240dp），否則回 NORMAL（320dp）；非法輸入（<=0）fail-closed 回 SMALL。
+// - policyWriteVisibleList：expanded 封頂 POLICY_DIALOG_DISPLAY_MAX（200）＋
+//   溢出計數（寫入仍用完整 pending.packages），否則走 truncate 预览。
+// - policyWriteExpandedShouldReset：同 ack 世代契約（stored != pending 即重置為收合）。
+// - policyWriteListCdFallback / ToggleLabel/AnnounceFallback：資源缺失時的
+//   中文 fallback（生產經 getString，catch 即回此；JVM 以此鎖定算術與文案）。
+internal fun policyDialogListMaxHeightDp(smallestWidthDp: Int, screenHeightDp: Int): Int =
+    if (smallestWidthDp <= 0 || screenHeightDp <= 0) {
+        240
+    } else if (smallestWidthDp < 360 || screenHeightDp < 640) {
+        240
+    } else {
+        320
+    }
+
+internal fun policyWriteVisibleList(
+    sorted: List<String>,
+    expanded: Boolean,
+    max: Int = POLICY_DIALOG_PREVIEW_MAX,
+): Pair<List<String>, Int> =
+    if (expanded) {
+        // P2 上界：expanded 顯示封頂 POLICY_DIALOG_DISPLAY_MAX（200）＋溢出計數，
+        // 寫入仍用完整 pending.packages（截斷僅顯示，見 buildPolicyListText 溢出行）。
+        val shown = sorted.take(POLICY_DIALOG_DISPLAY_MAX)
+        shown to (sorted.size - shown.size)
+    } else truncatePolicyPreview(sorted, max)
+
+internal fun policyWriteExpandedShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
+    storedGeneration != pendingGeneration
+
+internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean): String =
+    // Stage L4: 超限展開仍視截斷（display≡inspectability：expanded 僅 200，
+    // 不得謊稱完整）。expanded 僅 total<=200 才回完整，否則一律截斷。
+    if ((expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shown) "政策包名列表，共 $total 項"
+    else "政策包名列表，共 $total 項，僅顯示前 $shown 項"
+
+internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String =
+    // display≡inspectability：收合態超限不得謊稱「顯示全部」，複用 capped 語義。
+    if (!expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteShowAllCappedFallback(total, shown)
+    else if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）"
+
+internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String =
+    // display≡inspectability：展開態超限不得謊稱「完整清單」，複用 capped 語義。
+    if (expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteExpandedAnnounceCappedFallback(total, shown)
+    else if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
+
+// Stage L4 capped variants fallback（超限時 Toggle/播報複用收合語義）：
+// - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超限須縮減；寫入整組取代）。
+// - expanded_announce_capped：展開播報超限文案（已展開前 200，共 N，超限須縮減；寫入整組取代）。
+// - over_cap_warning：dialog 超限警告（共 N，僅示前 200，單次 ≤200；寫入整組取代、不合併）。
+internal fun policyWriteShowAllCappedFallback(total: Int, shown: Int): String =
+    "顯示前 $shown 項（共 $total 項，超限須縮減；寫入整組取代）"
+
+internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): String =
+    "已展開前 $shown 項，共 $total 項，超限須縮減；寫入整組取代"
+
+internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String =
+    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤$shown 項，以確保逐項可檢視確認"
+
+// Stage L4 fix(a) 修復模式標籤：Corrupt 下按鈕重貼 repair 文案＋CD。
+// 路由 single source 已移至 DualViewModel.kt
+// clearPolicyButtonRoute(known,corrupt,armed)（VM onClearPolicyButtonTap 唯一經此分發）：
+// 僅 !known&&corrupt 走修復，其餘一律 CLEAR。
+internal fun clearPolicyButtonTextRes(corrupt: Boolean): Int =
+    if (corrupt) R.string.action_repair_policy_draft else R.string.action_clear_policy_draft
+
+internal fun clearPolicyButtonCdRes(corrupt: Boolean): Int =
+    if (corrupt) R.string.repair_policy_draft_cd else R.string.clear_policy_draft_cd
 
 internal fun sanitizeRemoveConfirmField(raw: String, maxCodePoints: Int? = null, maxOutput: Int = Int.MAX_VALUE): String {
     require(maxOutput >= TRUNCATION_MARKER.length + 2)
@@ -5718,6 +6771,13 @@ internal fun buildBatchConfirmMessage(
     targetId: Int,
     targetSerial: Int,
 ): String = String.format(java.util.Locale.ROOT, template, count, targetId, targetSerial)
+// owner-user 門控用:由 uid 拆出 userId。
+// uid = userId * UserHandle.PER_USER_RANGE + appId (AOSP 公式);
+// PER_USER_RANGE 為 @hide,公開 SDK 無法引用,故 100_000 字面單點存放在此。
+// Phase 4:負值守衛 (<0 回 -1):Process.myUid() 恆非負,負值僅出現在測試/
+// 異常路徑;舊碼整數除法向零截斷會把負值誤判為 user 0 (owner),直接 fail-open,
+// 故顯式回 -1 拒絕。
+internal fun userIdFromUid(uid: Int): Int = if (uid < 0) -1 else uid / 100_000
 
 // Builds the F4b-P1 ViewModel with the persisted channel selection.
 // DEVICE-UNVERIFIED: selection/exec never ran on a device.
@@ -5740,8 +6800,9 @@ internal fun buildBatchConfirmMessage(
 // F4b-P2 (issue #6): the picker UI above calls selectChannel() for all four
 // preferences; the LSPosed hook-enable signal comes from the marker file
 // (HookStateProvider, refreshed on every probe) and is display-only. The
-// LSPosed gateway stays the NoOp placeholder: the real hook gateway (plus
-// the whitelist policy branch) is still future work.
+// LSPosed gateway stays the NoOp placeholder: the whitelist policy source is
+// wired (end-to-end DEVICE-UNVERIFIED), but the real hook execution channel
+// remains a NoOp placeholder.
 // DEVICE-UNVERIFIED: marker read + LSPosed placeholder behavior never ran
 // on a device (staleness/SELinux limits documented in HookMarker).
 private class DualViewModelFactory(
@@ -5753,11 +6814,25 @@ private class DualViewModelFactory(
         if (modelClass.isAssignableFrom(DualViewModel::class.java)) {
             // Application context: the factory is Activity-scoped but the
             // prefs handle must not pin the Activity.
-            val prefs = appContext.applicationContext.getSharedPreferences(
-                CHANNEL_PREFS_NAME,
-                Context.MODE_PRIVATE,
-            )
-            val pref = loadChannelPreference(prefs)
+            // A3-10: getSharedPreferences 本身亦可能拋出（hostile/mock prefs）；
+            // 取得失敗一律視為「無偏好」→ AUTO（fail-closed），不得崩潰。
+            val prefs = try {
+                appContext.applicationContext.getSharedPreferences(
+                    CHANNEL_PREFS_NAME,
+                    Context.MODE_PRIVATE,
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            // A3-10: 主執行緒 factory 路徑絕不得因 hostile/mock prefs（含 CE）
+            // 噴出導致 crash-on-launch —— 一律降級 AUTO（fail-closed）。
+            // loadChannelPreference 內的 CE 重拋僅供 suspend 呼叫端使用，
+            // 此處顯式吸收一切 Throwable。
+            val pref = try {
+                if (prefs != null) loadChannelPreference(prefs) else ChannelPreference.AUTO
+            } catch (_: Throwable) {
+                ChannelPreference.AUTO
+            }
             // Phase I I4：factory 跑主執行緒，永不直呼 binder IPC（shizukuAuthorizedNow）。
             // 啟動以 fail-closed false 組裝（明選 SHIZUKU 不受影響，仍直選 SHIZUKU；
             // AUTO 若真有 Shizuku 授權，VM init probeChannels 經 onIo 探測後由
@@ -5779,7 +6854,7 @@ private class DualViewModelFactory(
                 shizukuGateway = asm.shizukuGateway,
                 persistPreference = { p ->
                     try {
-                        prefs.saveChannelPreference(p)
+                        prefs?.saveChannelPreference(p)
                     } catch (_: Exception) {
                         // Best effort: the in-memory swap already happened.
                     }
@@ -5797,6 +6872,17 @@ private class DualViewModelFactory(
                 nowWallMs = { System.currentTimeMillis() },
                 nowMonoMs = { SystemClock.elapsedRealtime() },
                 selectionStore = selPrefs.selectionStore(),
+                // Stage2:政策草稿 store 綁定 LSPosed remote preferences
+                // (dual_policy/extra_whitelist_packages,與 hook 側同一 group)。
+                // service 缺席時 store 仍有 instance,但 save/clear 回 false、
+                // load 回空 (fail-closed),見 remoteHookPolicyStore。
+                hookPolicyStore = remoteHookPolicyStore {
+                    GalaxyApp.remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                },
+                // Stage2:owner-user 門控 (hook 讀 user 0;非 owner 寫入無效)。
+                // UserHandle.myUserId()/getUserId() 皆 @hide 公開 SDK 無法引用;
+                // 以公開的 Process.myUid() 拆解 (見 userIdFromUid)。
+                currentUserId = { userIdFromUid(Process.myUid()) },
                 // p28-1 review（en 殘留）：寫入拒絕理由經 Application Context
                 // 解析資源（applicationContext，不持 Activity；JVM 測試注入假值）。
                 blockText = { block ->
@@ -5805,12 +6891,76 @@ private class DualViewModelFactory(
                         *block.args.toTypedArray(),
                     )
                 },
+                // Phase 5 polish：政策 VM 訊息經 Application Context 解析資源
+                // （applicationContext，不持 Activity；JVM 預設繁中 defaultText，
+                // 測試可注入假值）。plurals（DROPPED/WRITE_SUCCESS）走
+                // getQuantityString；其餘走 getString。
+                policyText = { pt ->
+                    val res = appContext.applicationContext.resources
+                    when (pt.kind) {
+                        PolicyTextKind.BUSY -> res.getString(R.string.policy_busy)
+                        PolicyTextKind.OWNER_WRITE -> res.getString(R.string.policy_owner_write)
+                        PolicyTextKind.OWNER_OPERATE -> res.getString(R.string.policy_owner_operate)
+                        PolicyTextKind.UNKNOWN_REFRESH -> res.getString(R.string.policy_unknown_refresh)
+                        PolicyTextKind.EMPTY_SELECTION -> res.getString(R.string.policy_empty_selection)
+                        PolicyTextKind.CATALOG_LOADING -> res.getString(R.string.policy_catalog_loading)
+                        PolicyTextKind.CATALOG_MISSING -> res.getString(R.string.policy_catalog_missing)
+                        PolicyTextKind.DROPPED -> res.getQuantityString(R.plurals.policy_dropped, pt.count, pt.count)
+                        PolicyTextKind.CANCELLED -> res.getString(R.string.policy_cancelled)
+                        PolicyTextKind.NO_PENDING -> res.getString(R.string.policy_no_pending)
+                        PolicyTextKind.IN_PROGRESS -> res.getString(R.string.policy_in_progress)
+                        PolicyTextKind.TTL_EXPIRED -> res.getString(R.string.policy_ttl_expired)
+                        PolicyTextKind.NO_STORE_WRITE -> res.getString(R.string.policy_no_store_write)
+                        PolicyTextKind.NO_STORE_CLEAR -> res.getString(R.string.policy_no_store_clear)
+                        PolicyTextKind.NO_STORE_READ -> res.getString(R.string.policy_no_store_read)
+                        PolicyTextKind.WRITE_SUCCESS -> res.getQuantityString(R.plurals.policy_written, pt.count, pt.count)
+                        PolicyTextKind.WRITE_FAILED -> res.getString(R.string.policy_write_failed)
+                        PolicyTextKind.CLEAR_SUCCESS -> res.getString(R.string.policy_cleared)
+                        PolicyTextKind.CLEAR_FAILED -> res.getString(R.string.policy_clear_failed)
+                        PolicyTextKind.REFRESHED -> res.getString(R.string.policy_refreshed)
+                        PolicyTextKind.REFRESH_FAILED -> res.getString(R.string.policy_refresh_failed)
+                        PolicyTextKind.BLIND_CLEAR_FIRST -> res.getString(R.string.policy_blind_clear_first)
+                        PolicyTextKind.BLIND_CLEAR_EXPIRED -> res.getString(R.string.policy_blind_clear_expired)
+                        PolicyTextKind.CORRUPT_DETECTED -> res.getString(R.string.policy_corrupt_detected)
+                        PolicyTextKind.CORRUPT_REPAIR_FIRST -> res.getString(R.string.policy_corrupt_repair_first)
+                        PolicyTextKind.CORRUPT_REPAIRED -> res.getString(R.string.policy_corrupt_repaired)
+                        PolicyTextKind.CORRUPT_REPAIR_FAILED -> res.getString(R.string.policy_corrupt_repair_failed)
+                        PolicyTextKind.CORRUPT_REPAIR_TIMEOUT -> res.getString(R.string.policy_corrupt_repair_timeout)
+                        PolicyTextKind.WRITE_TIMEOUT -> res.getString(R.string.policy_write_timeout)
+                        PolicyTextKind.CLEAR_TIMEOUT -> res.getString(R.string.policy_clear_timeout)
+                        PolicyTextKind.UNRESOLVED_REFRESH -> res.getString(R.string.policy_unresolved_refresh)
+                        PolicyTextKind.POLICY_NOT_ACKNOWLEDGED -> res.getString(R.string.policy_not_acknowledged)
+                        PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST -> res.getString(R.string.policy_blind_clear_refresh_first)
+                        PolicyTextKind.REPAIRED_NO_BACKUP -> res.getString(R.string.policy_repaired_no_backup)
+                    }
+                },
+                // Stage G2：跨 VM 最小 coordinator（App-scoped；Application 單例，
+                // VM onCleared 不清除，新 VM init 認領）。
+                policyTxCoordinator = (appContext.applicationContext as? GalaxyApp)?.policyTxCoordinator
+                    ?: appCoordinatorFallback,
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }
 
     companion object {
+        // Stage G2 P2-2：fallback 改實例級語義＋測試重置入口。
+        // 生產一律走 GalaxyApp 單例（App-scoped）；此 fallback 僅用於 Application
+        // 非 GalaxyApp 的極罕路徑（如 JVM/測試 factory 直構）。原靜態單例的 scope
+        // 永不關＋activeTx 跨用例共享，故改為可重置：測試經 resetFallbackForTest
+        // 清 activeTx 並重建 scope（舊 scope 取消），免跨測試污染。
+        @Volatile
+        private var appCoordinatorFallback = PolicyTxCoordinator()
+
+        internal fun resetFallbackForTest() {
+            try {
+                appCoordinatorFallback.close()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            appCoordinatorFallback = PolicyTxCoordinator()
+        }
+
         // Canonical su locations; presence heuristic only (see header).
         private val SU_PATHS = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su")
 

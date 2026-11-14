@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.galaxydual.plus.debug">
+    <application android:label="Galaxy Dual Plus">
+        <provider
+            android:name="com.galaxydual.plus.GuardXposedProvider"
+            android:authorities="com.galaxydual.plus.debug.XposedService"
+            android:exported="true" />
+        <evil:provider xmlns:evil="urn:evil" android:name="org.other.EvilProvider" android:authorities="com.galaxydual.plus.debug.XposedService" android:exported="true"/>
+    </application>
+</manifest>

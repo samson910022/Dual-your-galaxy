@@ -4,6 +4,10 @@
 # release workflow (release.yml, release APKs) to avoid drift.
 #
 # Usage: verify-release-artifacts.sh <apk> [<apk>...]
+# NOTE: run from the repository root — several checks read repo-relative
+# paths (app/build.gradle.kts). The checker path itself is resolved via the
+# script's location, so this script works from any CWD; the repo-root
+# assumption is only for repo files.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -33,6 +37,10 @@ fail() {
   exit 1
 }
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROVIDER_PARITY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/provider-parity.XXXXXX")"
+trap 'rm -rf "$PROVIDER_PARITY_TMP"' EXIT
+
 for apk in "$@"; do
   if [ ! -f "$apk" ]; then
     fail "APK not found: $apk"
@@ -45,6 +53,50 @@ for apk in "$@"; do
   else
     fail "ShizukuProvider not found in packaged manifest of $apk"
   fi
+
+  # 1b. Packaged manifest provisions exactly one GuardXposedProvider at the
+  #     expected authority — name and authority on the SAME <provider>
+  #     element, exported=true, no android:permission, zero libxposed
+  #     XposedProvider nodes anywhere, and zero wrong-element occurrences of
+  #     the GuardXposedProvider name (e.g. an <activity>). Enforced by parsing
+  #     the aapt2 xmltree dump (scripts/check-provider-parity.py; fixtures in
+  #     scripts/fixtures/provider-parity/ run via scripts/check-provider-parity.test.sh).
+  #     Loud hard-fail, never a skip: CI has the SDK, and a
+  #     silent pass here would mask a manifest-merge regression shipping the
+  #     unguarded (exported, no-permission) provider. Variant handling: the
+  #     expected authority is derived from the APK's ACTUAL applicationId
+  #     (aapt2 dump packagename), never from the APK filename — a renamed
+  #     *-debug*.apk built from release code must not slip the debug
+  #     authority past the release gate (PR CI invokes this on the debug
+  #     APK, whose applicationIdSuffix=.debug; the release APK carries
+  #     com.galaxydual.plus, no .debug). The mapping is exact and anything
+  #     else fails closed: com.galaxydual.plus.debug -> debug authority;
+  #     com.galaxydual.plus -> release authority (and only a release-
+  #     expected APK carrying the .debug authority fails the leak guard).
+  if ! APK_PACKAGE="$("$AAPT2" dump packagename "$apk" 2>/dev/null)"; then
+    fail "aapt2 dump packagename failed for $apk"
+  fi
+  APK_PACKAGE="$(printf '%s' "$APK_PACKAGE" | tr -d '[:space:]')"
+  case "$APK_PACKAGE" in
+    com.galaxydual.plus.debug) EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService" ;;
+    com.galaxydual.plus)       EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService" ;;
+    *) fail "unsupported APK package name '$APK_PACKAGE' in $apk (expected exactly 'com.galaxydual.plus.debug' or 'com.galaxydual.plus')" ;;
+  esac
+  MANIFEST_DUMP_FILE="$PROVIDER_PARITY_TMP/$(basename -- "$apk").xmltree.txt"
+  if ! "$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml > "$MANIFEST_DUMP_FILE" 2>/dev/null; then
+    fail "aapt2 dump of AndroidManifest.xml failed for $apk"
+  fi
+  if [ ! -s "$MANIFEST_DUMP_FILE" ]; then
+    fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
+  fi
+  if ! python3 "$SCRIPT_DIR/check-provider-parity.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE" --authority "$EXPECTED_AUTHORITY"; then
+    fail "GuardXposedProvider provider parity check failed for $apk"
+  fi
+  if [ "$EXPECTED_AUTHORITY" = "com.galaxydual.plus.XposedService" ] \
+    && grep -qF 'com.galaxydual.plus.debug.XposedService' "$MANIFEST_DUMP_FILE"; then
+    fail "release-expected APK carries the debug authority (com.galaxydual.plus.debug.XposedService): $apk"
+  fi
+  echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
 
   # 2. ShizukuProvider survives into the released DEX (exact descriptor).
   FOUND=0

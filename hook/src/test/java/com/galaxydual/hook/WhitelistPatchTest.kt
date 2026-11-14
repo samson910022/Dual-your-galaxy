@@ -137,7 +137,40 @@ class WhitelistPatchTest {
         val out = WhitelistPatch.apply(null, true, setOf("b"), "MY_FIELD", "com.foo.Bar")
         val reason = (out as WhitelistPatch.Outcome.Skipped).reason
         assertTrue(reason.contains("MY_FIELD"))
-        assertTrue(reason.contains("com.foo.Bar"))
+        // Desensitized: only the short simple name is logged, never the
+        // package-qualified name.
+        assertTrue(reason.contains("Bar"))
+        assertTrue(!reason.contains("com.foo.Bar"))
+    }
+
+    // Hostile ROM list whose iterator() throws: the element-type guard must
+    // not let the failure escape apply() (it once propagated out of the
+    // field loop and lost the sibling field's outcome). The fixture extends
+    // AbstractMutableList because a plain AbstractList is not a MutableList
+    // and would land in the unsupported-type branch instead of the
+    // element-guard branch under test.
+    private class HostileIteratorList : AbstractMutableList<String?>() {
+        private val backing: MutableList<String?> = mutableListOf("a")
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String? = backing[index]
+        override fun set(index: Int, element: String?): String? = backing.set(index, element)
+        override fun add(index: Int, element: String?) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String? = backing.removeAt(index)
+        override fun iterator(): MutableIterator<String?> =
+            throw IllegalStateException("injected iterator failure")
+    }
+
+    @Test
+    fun hostileListIteratorThrowReturnsSkipped() {
+        val out = WhitelistPatch.apply(HostileIteratorList(), true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should mention element inspection failure, was: ${o.reason}",
+            o.reason.contains("element inspection failed"),
+        )
     }
 
     // Simulates a hostile custom list: lands the element, then throws on the

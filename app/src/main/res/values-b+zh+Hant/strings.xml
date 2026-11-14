@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
+<!-- Default locale is Traditional Chinese; do not sync to simplified/English. -->
 <!-- p28-1 字串資源化：預設為繁中（values/），英文見 values-en/。技術 detail（診斷內文、
      VM 其餘 msg）保留程式內字面；寫入拒絕理由、包名就地驗證、診斷複製按鈕/成功訊息
      為使用者可見短句，已資源化（中英＋繁中；三繁中檔鎖一致，見 UiSemanticsP28Test/RemoveConfirmMessageTest）。
@@ -48,6 +49,98 @@
     <string name="save_selection_cd">保存目前勾選（只保存勾選，不寫入分身）</string>
     <string name="action_unsave_selection">取消保存</string>
     <string name="unsave_selection_cd">取消保存選取（不卸載分身，不清除目前勾選）</string>
+    <!-- Stage2 (hook-policy-source P1)：白名單政策（草稿）最小入口。 -->
+    <string name="action_write_policy">寫入政策</string>
+    <string name="write_policy_cd">將目前勾選寫入白名單政策草稿（只寫草稿，不安裝分身）</string>
+    <string name="action_clear_policy_draft">清除草稿</string>
+    <string name="clear_policy_draft_cd">清除已保存的政策草稿（不影響已安裝分身與目前勾選）</string>
+    <!-- Stage L4 fix(a)：Corrupt 修復模式按鈕（兩步確認：第一 tap 備份警告＋arm，第二 tap 執行）。 -->
+    <string name="action_repair_policy_draft">修復損壞草稿</string>
+    <string name="repair_policy_draft_cd">修復損壞的政策草稿（嘗試備份後清除，備份可能失敗；需按兩次確認；不影響已安裝分身與目前勾選）</string>
+    <!-- Phase 2：手動重新整理草稿（唯讀，不觸發寫入）。 -->
+    <string name="action_refresh_policy_draft">重新整理草稿</string>
+    <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
+    <string name="refresh_policy_draft_cd_refreshing">正在重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
+    <string name="policy_draft_format">白名單政策（草稿・尚未生效）：%1$d 項</string>
+    <string name="policy_draft_unknown">白名單政策（草稿・尚未生效）：未知（LSPosed 服務未連線，請點「重新整理草稿」重試）</string>
+    <string name="policy_write_title">確認寫入政策（僅草稿，不生效）</string>
+    <plurals name="policy_write_message">
+        <item quantity="one">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
+        <item quantity="other">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）：\n須勾選下方確認框才會啟用「確認寫入」。</item>
+    </plurals>
+    <string name="policy_write_acknowledge">我已確認上述包名為要放寬白名單的對象。</string>
+    <string name="policy_write_positive">確認寫入</string>
+    <!-- Phase 5 polish：政策 VM 訊息資源化（前身硬編碼繁中＋一處英文 "already in progress"）；三語系同鍵，VM 經 policyText 注入解析（生產 Context，JVM 預設繁中），見 DualViewModel.PolicyText。 -->
+    <string name="policy_busy">政策寫入進行中，請稍候</string>
+    <string name="policy_owner_write">政策草稿必須由主用戶（owner user）寫入，否則 hook 讀不到</string>
+    <string name="policy_owner_operate">政策草稿必須由主用戶（owner user）操作，否則 hook 讀不到</string>
+    <string name="policy_unknown_refresh">遠端政策未知，請先重新整理後再寫入</string>
+    <string name="policy_empty_selection">未勾選任何應用</string>
+    <string name="policy_catalog_loading">來源清單尚未載入，請稍候再試</string>
+    <string name="policy_catalog_missing">勾選的應用已不在來源清單，請重選</string>
+    <string name="policy_cancelled">已取消寫入政策（未寫入任何草稿）</string>
+    <string name="policy_no_pending">沒有待確認的政策寫入</string>
+    <string name="policy_in_progress">政策寫入已在進行中，請稍候</string>
+    <string name="policy_ttl_expired">確認已逾時，請重新確認後再寫入</string>
+    <string name="policy_no_store_write">無政策 store，無法寫入政策</string>
+    <string name="policy_no_store_clear">無政策 store，無法清除草稿</string>
+    <string name="policy_no_store_read">無政策 store，無法讀取草稿</string>
+    <string name="policy_write_failed">寫入政策失敗</string>
+    <string name="policy_clear_failed">清除草稿失敗</string>
+    <!-- Stage A（P1 超時不確定性）：IO 逾時文案（CHANNEL 口徑：逾時、結果未知、
+         正在核對、請勿重試；pending 保留，reconciler 核對中）。 -->
+    <string name="policy_write_timeout">寫入政策逾時，結果未知，正在核對，請勿重試</string>
+    <string name="policy_clear_timeout">清除草稿逾時，結果未知，正在核對，請勿重試</string>
+    <!-- Stage G2：deferred 完成後單次權威重查仍未知（unresolved；按鈕即重新整理草稿）。 -->
+    <string name="policy_unresolved_refresh">結果仍未知，請點「重新整理草稿」確認結果</string>
+    <string name="policy_not_acknowledged">尚未勾選確認框，未寫入任何內容</string>
+    <string name="policy_blind_clear_refresh_first">先前曾確認草稿內容，但遠端目前未知；已先觸發重新整理。請檢查 Hook 連線或重新啟動 App 後再清除</string>
+    <string name="policy_repaired_no_backup">已清除損壞的政策草稿，但備份失敗：舊的損壞內容未被保留</string>
+    <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
+    <string name="policy_refreshed">已重新整理政策草稿</string>
+    <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>
+    <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理</string>
+    <!-- Stage D：blind-clear 確認逾時（arm 超過 5 分鐘，需重 arm；CHANNEL 口徑）。 -->
+    <string name="policy_blind_clear_expired">清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理</string>
+    <plurals name="policy_dropped">
+        <item quantity="one">已捨去 %1$d 項不在來源清單的勾選</item>
+        <item quantity="other">已捨去 %1$d 項不在來源清單的勾選</item>
+    </plurals>
+    <plurals name="policy_written">
+        <item quantity="one">已寫入政策草稿 %1$d 項（勾選≠安裝，可隨時清除）</item>
+        <item quantity="other">已寫入政策草稿 %1$d 項（勾選≠安裝，可隨時清除）</item>
+    </plurals>
+    <!-- Phase 5 dialog/a11y：包名預覽截斷、清單摘要、忙碌後綴、取消拒絕 toast、寫入中播報。 -->
+    <plurals name="policy_write_preview_more">
+        <item quantity="one">…等共 %1$d 項，僅顯示前 %2$d 項</item>
+        <item quantity="other">…等共 %1$d 項，僅顯示前 %2$d 項</item>
+    </plurals>
+    <string name="policy_write_list_cd">政策包名列表，共 %1$d 項</string>
+    <string name="policy_write_busy_saving">"\n（寫入中…）"</string>
+    <string name="policy_write_busy_queued">"\n（等待中…）"</string>
+    <string name="policy_write_cancel_denied">寫入中，無法取消</string>
+    <string name="policy_write_saving_announce">政策寫入中</string>
+    <!-- Stage J4：RECONCILING 期手動恢復入口（neutral 按鈕；資源化，前身硬編碼）。 -->
+    <string name="policy_write_snooze">稍後刷新</string>
+    <!-- Stage B P2 dialog 完整清單（方案 A Toggle）：溢出時 in-place 展開/收合；
+         Toggle 僅 rest>0 顯示，保 ack，播報展開/收合；清單 CD 區分完整/截斷。 -->
+    <string name="policy_write_show_all">顯示全部（共 %1$d 項）</string>
+    <string name="policy_write_show_less">收合（僅顯示前 %1$d 項）</string>
+    <string name="policy_write_list_cd_collapsed">政策包名列表，共 %1$d 項，僅顯示前 %2$d 項</string>
+    <string name="policy_write_expanded_announce">已展開完整清單，共 %1$d 項</string>
+    <string name="policy_write_collapsed_announce">已收合，僅顯示前 %1$d 項</string>
+    <!-- Stage L4 P2#2 (b) 單次確認可檢視上界 200：超限警告＋capped Toggle/播報
+         （超限即禁用確認，須縮減至單次 ≤200；寫入整組取代、不合併；
+          %1$d=總數，%2$d=可檢視數 200）。N4 取代分批指引。 -->
+    <string name="policy_write_over_cap_warning">超出單次可檢視上限（共 %1$d 項，僅顯示前 %2$d 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤%2$d 項，以確保逐項可檢視確認</string>
+    <string name="policy_write_show_all_capped">顯示前 %2$d 項（共 %1$d 項，超限須縮減；寫入整組取代）</string>
+    <string name="policy_write_expanded_announce_capped">已展開前 %2$d 項，共 %1$d 項，超限須縮減；寫入整組取代</string>
+    <!-- Stage L4 P2#3 corrupt 修復（CCE 損壞專用，與盲清 Unavailable 分離）。 -->
+    <string name="policy_corrupt_detected">遠端政策已損壞（類型錯亂），已保留舊快照；清除需經修復確認，盲清已拒絕；若可連線建議先重新整理</string>
+    <string name="policy_corrupt_repair_first">檢測到損壞的政策條目，修復將嘗試備份後清除損壞內容（備份僅 best-effort、可能失敗、無法保證可恢復；具破壞性且無法復原），請於5分鐘內再次確認修復；若可連線建議先重新整理</string>
+    <string name="policy_corrupt_repaired">已修復損壞的政策草稿（已嘗試備份並清除，現為空；備份不保證成功）</string>
+    <string name="policy_corrupt_repair_failed">修復損壞的政策草稿失敗，仍為損壞狀態；建議重試或檢查服務連線</string>
+    <string name="policy_corrupt_repair_timeout">修復損壞政策逾時，結果未知，正在核對，請勿重試</string>
     <plurals name="batch_create">
         <item quantity="one">建立 %1$d 個分身</item>
         <item quantity="other">建立 %1$d 個分身</item>
@@ -113,7 +206,7 @@
     <string name="status_ready">就緒</string>
     <!-- p28-1 review：寫入拒絕理由（使用者可見短句；原 DualViewModel.writeBlockReason
          全文硬編碼繁中）。%1$s=Hook 狀態（動態證據）、明選分支 %1$s=模式 %2$s=通道身份。 -->
-    <string name="write_block_lsposed">LSPosed 通道為佔位（NoOp）：whitelist 政策分支待實作，寫入已拒絕；Hook 狀態：%1$s；如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」</string>
+    <string name="write_block_lsposed">LSPosed 通道為佔位（NoOp）：寫入已拒絕；白名單政策來源已接線（端到端 DEVICE-UNVERIFIED）。Hook 狀態：%1$s；如需寫入請切到 Auto/Root/Shizuku 後點「重新連線並更新」</string>
     <string name="write_block_noop">通道未就緒：真通道已接線但未選中（NoOp 回退），目前為唯讀，寫入已禁用；請檢查授權後點「重新連線並更新」</string>
     <string name="write_block_explicit">所選模式 %1$s（%2$s 通道）探測未通過，寫入已禁用（明選不跨通道）；可切到 Auto 或點「重新連線並更新」重試</string>
     <string name="write_block_pm">探測通過但 PM 不可讀（pm list users 失敗），寫入已禁用；請檢查授權後點「重新連線並更新」</string>
@@ -139,12 +232,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">雙開白名單注入器</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後，方可突破限制注入白名單；寫入分身仍需特權通道（Auto／Root／Shizuku）</string>
+    <string name="hero_subtitle_apps">需 LSPosed Hook 生效後（待實機驗證），方可突破限制注入白名單；寫入分身仍需特權通道（Auto／Root／Shizuku）；政策預設為空，hooks 預設 observe-only（只觀察、不改變行為，草稿尚未生效）</string>
     <string name="hero_subtitle_engine">隔離環境 · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
-    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後，方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道。</string>
+    <string name="hook_mode_subtitle">需 LSPosed Hook 生效後（待實機驗證），方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道；政策預設為空，hooks 預設 observe-only（只觀察、不改變行為，草稿尚未生效）。</string>
     <string name="hook_mode_subtitle_ops">當前特權通道（Auto／Root／Shizuku）可直接在已驗證分身中建立／移除分身，無需 Hook；LSPosed 僅用於更深度的三星白名單與原生介面整合。</string>
     <string name="hook_badge_sec_hook">已注入 SecPackageHook</string>
     <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>
@@ -159,7 +252,7 @@
     <string name="section_pending_apps_hint">勾選後請用「批次建立」寫入分身（勾選本身不寫入）</string>
     <string name="section_advanced_manual">進階手動包名注入</string>
     <string name="status_hook_daemon_running">原生 Dual Messenger 核心 Hook 運作中</string>
-    <string name="status_hook_daemon_desc">已成功攔截 com.samsung.android.daagent 白名單驗證回呼</string>
+    <string name="status_hook_daemon_desc">Hook 已安裝（僅存在性證據，未確認攔截生效）</string>
     <string name="engine_status_title">底層注入狀態</string>
     <string name="engine_status_subtitle">One UI · Android 10+</string>
     <string name="engine_status_active">常駐中</string>
@@ -232,4 +325,50 @@
     <string name="nav_tab_cd_selected">%1$s，%2$s</string>
     <!-- Phase 3 P3 B7: 設定 nav 開啟對話框 (非切頁)，CD 明示開啟對話框。 -->
     <string name="settings_tab_cd">關於，點兩下開啟對話框</string>
+    <!-- P2：VM 硬編碼字串資源化（前身 DualViewModel msg="..." 硬編碼中英混雜；VM 本體
+         無 Context，顯示經 MainActivity.localizeVmMessage/vmMessageRes 解析；JVM 以
+         vmMessageRes 鎖定映射）。%1$s=原文動態後綴（包名/數量/技術細節透傳，不翻譯）。
+         已知限制（locale-mixed by design）：前綴模板已本地化，%1$s 餘部原文透傳；
+         包名/技術細節餘部為 locale-neutral 故完整，但結構化中文訊息餘部含中文子句
+         （verified-id/serial/label、select-target、rebound、saved-selection、batch、
+         serial 缺失後綴），EN 下為「EN 前綴＋中文餘部」混合（見 MainActivity
+         vmMessageRes KDoc＋StageJ5PolishTest 混合斷言）；VM 改發結構化參數前維持透傳。 -->
+    <string name="vm_no_dual_profile">無雙開設定檔</string>
+    <string name="vm_no_pending_remove">沒有待確認的移除</string>
+    <string name="vm_busy_batch_clone">批次建立進行中，請稍候</string>
+    <string name="vm_selection_cleared">已清除勾選（未卸載任何分身）</string>
+    <string name="vm_save_failed">保存選取失敗</string>
+    <string name="vm_unsave_failed">取消保存失敗</string>
+    <string name="vm_save_cancelled">已取消保存選取（不影響已安裝分身與目前勾選）</string>
+    <string name="vm_no_store_save">無選取 store，無法保存</string>
+    <string name="vm_no_store_unsave">無選取 store，無法取消保存</string>
+    <string name="vm_remove_ttl_expired">確認已過期，請重新確認移除</string>
+    <string name="vm_target_unverifiable">移除目標無法驗證（serial 缺失），請重新確認</string>
+    <string name="vm_serial_unknown_retry">無法驗證分身身分（serial 缺失），請重試</string>
+    <string name="vm_list_stale_resave">清單已過期（STALE），請重新查詢後再保存</string>
+    <string name="vm_in_progress">進行中，請稍候：%1$s</string>
+    <string name="vm_cloned">已建立分身：%1$s</string>
+    <string name="vm_removed">已移除：%1$s</string>
+    <string name="vm_clone_failed">建立分身失敗：%1$s</string>
+    <string name="vm_clone_verify_failed">建立分身驗證失敗：%1$s</string>
+    <string name="vm_clone_mismatch">建立分身驗證不一致：%1$s</string>
+    <string name="vm_clone_unknown">建立分身結果未知：%1$s</string>
+    <string name="vm_remove_failed">移除失敗：%1$s</string>
+    <string name="vm_remove_unknown">移除結果未知：%1$s</string>
+    <string name="vm_remove_cancelled">已取消移除：%1$s</string>
+    <string name="vm_await_remove">等待確認移除：%1$s</string>
+    <string name="vm_not_installed">未安裝，無需移除：%1$s</string>
+    <string name="vm_target_changed_verified_id">移除目標已變更（verified id %1$s</string>
+    <string name="vm_target_changed_serial">移除目標已變更（serial %1$s</string>
+    <string name="vm_target_changed_label">移除目標已變更（%1$s</string>
+    <string name="vm_serial_unknown_suffix">無法驗證分身身分（serial 缺失），%1$s</string>
+    <string name="vm_select_target_user">選取目標已變更（user %1$s</string>
+    <string name="vm_select_target_serial">選取目標已變更（serial %1$s</string>
+    <string name="vm_target_rebound">選取已綁定舊目標%1$s</string>
+    <string name="vm_saved_selection">已保存選取 %1$s</string>
+    <string name="vm_batch_no_start">批次無法開始：channel error: %1$s</string>
+    <string name="vm_batch_target_changed">批次中斷：目標已變更（user %1$s</string>
+    <string name="vm_batch_partial">批次中斷：已完成 %1$s</string>
+    <string name="vm_probe_failed">探測失敗：%1$s</string>
+    <string name="vm_foreground_failed">前台恢復失敗：%1$s</string>
 </resources>

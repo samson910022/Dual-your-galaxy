@@ -45,6 +45,97 @@
     <string name="save_selection_cd">Save current checks (checks only, never writes clones)</string>
     <string name="action_unsave_selection">Unsave selection</string>
     <string name="unsave_selection_cd">Drop the saved selection (never uninstalls, keeps current checks)</string>
+    <!-- Stage2 (hook-policy-source P1): minimal whitelist-policy (draft) entry. -->
+    <string name="action_write_policy">Write policy</string>
+    <string name="write_policy_cd">Write current checks into the whitelist policy draft (draft only, never installs clones)</string>
+    <string name="action_clear_policy_draft">Clear policy draft</string>
+    <string name="clear_policy_draft_cd">Drop the saved policy draft (never touches installed clones or current checks)</string>
+    <!-- Stage L4 fix(a): corrupt-repair mode button (two-tap confirm: first tap arms with backup warning, second executes). -->
+    <string name="action_repair_policy_draft">Repair corrupt draft</string>
+    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; never touches installed clones or current checks)</string>
+    <string name="action_refresh_policy_draft">Refresh draft</string>
+    <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
+    <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
+    <string name="policy_draft_format">Whitelist policy (draft, not yet effective): %1$d entries</string>
+    <string name="policy_draft_unknown">Whitelist policy (draft, not yet effective): unknown (LSPosed service not connected; tap Refresh draft to retry)</string>
+    <string name="policy_write_title">Confirm policy write (draft only, not effective)</string>
+    <plurals name="policy_write_message">
+        <item quantity="one">Write the following %1$d package into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
+        <item quantity="other">Write the following %1$d packages into the whitelist policy draft (dual_policy; checks never install, clear anytime):\nTick the box below to enable “Write policy”.</item>
+    </plurals>
+    <string name="policy_write_acknowledge">I confirm the packages above should be relaxed in the whitelist.</string>
+    <string name="policy_write_positive">Write policy</string>
+    <!-- Phase 5 polish: resourced policy VM messages (were hardcoded Traditional
+         Chinese + one English "already in progress"); same keys across locales,
+         resolved via the policyText injection (production Context, JVM zh default). -->
+    <string name="policy_busy">Policy write in progress, please wait</string>
+    <string name="policy_owner_write">Policy draft must be written by the owner user, otherwise the hook cannot see it</string>
+    <string name="policy_owner_operate">Policy draft must be operated by the owner user, otherwise the hook cannot see it</string>
+    <string name="policy_unknown_refresh">Remote policy unknown; refresh before writing</string>
+    <string name="policy_empty_selection">No apps selected</string>
+    <string name="policy_catalog_loading">Source list not loaded yet, please retry shortly</string>
+    <string name="policy_catalog_missing">Selected apps are no longer in the source list; please reselect</string>
+    <string name="policy_cancelled">Policy write cancelled (no draft written)</string>
+    <string name="policy_no_pending">No pending policy write</string>
+    <string name="policy_in_progress">Policy write already in progress</string>
+    <string name="policy_ttl_expired">Confirmation expired; please reconfirm before writing</string>
+    <string name="policy_no_store_write">No policy store; cannot write policy</string>
+    <string name="policy_no_store_clear">No policy store; cannot clear draft</string>
+    <string name="policy_no_store_read">No policy store; cannot read draft</string>
+    <string name="policy_write_failed">Policy write failed</string>
+    <string name="policy_clear_failed">Failed to clear draft</string>
+    <!-- Stage A (P1 timeout uncertainty): IO timeout copy (CHANNEL wording:
+         timed out, result unknown, reconciling, do not retry; pending kept). -->
+    <string name="policy_write_timeout">Policy write timed out with unknown result; reconciling, do not retry</string>
+    <string name="policy_clear_timeout">Draft clear timed out with unknown result; reconciling, do not retry</string>
+    <!-- Stage G2: single authoritative recheck after deferred completion still unknown (unresolved; button is refresh draft). -->
+    <string name="policy_unresolved_refresh">Result still unknown; tap “Refresh draft” to confirm</string>
+    <string name="policy_not_acknowledged">Confirmation box not ticked; nothing was written</string>
+    <string name="policy_blind_clear_refresh_first">A confirmed draft existed but the remote is now unknown; a refresh was triggered first. Check the hook connection or restart the app, then clear again</string>
+    <string name="policy_repaired_no_backup">Cleared the corrupt policy draft, but the backup failed: the old corrupt content was not preserved</string>
+    <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
+    <string name="policy_refreshed">Policy draft refreshed</string>
+    <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
+    <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
+    <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
+    <string name="policy_blind_clear_expired">Clear confirmation expired (over 5 minutes); clear again to confirm. Refresh first if reachable.</string>
+    <plurals name="policy_dropped">
+        <item quantity="one">Dropped %1$d checked item not in the source list</item>
+        <item quantity="other">Dropped %1$d checked items not in the source list</item>
+    </plurals>
+    <plurals name="policy_written">
+        <item quantity="one">Wrote %1$d package into the policy draft (checks never install, clear anytime)</item>
+        <item quantity="other">Wrote %1$d packages into the policy draft (checks never install, clear anytime)</item>
+    </plurals>
+    <!-- Phase 5 dialog/a11y: package preview truncation, list summary, busy suffix, cancel-denied toast, saving announcement. -->
+    <plurals name="policy_write_preview_more">
+        <item quantity="one">… %1$d row total, showing the first %2$d</item>
+        <item quantity="other">… %1$d rows total, showing the first %2$d</item>
+    </plurals>
+    <string name="policy_write_list_cd">Policy package list, %1$d items total</string>
+    <string name="policy_write_busy_saving">"\n(writing…)"</string>
+    <string name="policy_write_busy_queued">"\n(waiting…)"</string>
+    <string name="policy_write_cancel_denied">Write in progress, cannot cancel</string>
+    <string name="policy_write_saving_announce">Policy write in progress</string>
+    <string name="policy_write_snooze">Refresh later</string>
+    <!-- Stage B P2 full-list dialog (option A Toggle): in-place expand/collapse on
+         overflow; Toggle only when rest>0, preserves ack, announces; list CD
+         distinguishes full vs truncated. -->
+    <string name="policy_write_show_all">Show all (%1$d total)</string>
+    <string name="policy_write_show_less">Collapse (first %1$d only)</string>
+    <string name="policy_write_list_cd_collapsed">Policy package list, %1$d items total, showing first %2$d</string>
+    <string name="policy_write_expanded_announce">Expanded full list, %1$d items total</string>
+    <string name="policy_write_collapsed_announce">Collapsed, showing first %1$d only</string>
+    <!-- Stage L4 P2#2 (b) single-confirm inspectability bound 200: over-cap warning + capped toggle/announce (%1$d=total, %2$d=inspectable 200). N4: saves replace (no merge/batching). -->
+    <string name="policy_write_over_cap_warning">Exceeds single-confirm inspectability bound (%1$d total, showing first %2$d). Each save replaces the entire draft (no merge): keep a single policy to at most %2$d items so every item is inspectable before confirming</string>
+    <string name="policy_write_show_all_capped">Show first %2$d of %1$d (over cap; shrink required, saving replaces the whole set)</string>
+    <string name="policy_write_expanded_announce_capped">Expanded first %2$d of %1$d; over cap, shrink required (saving replaces the whole set)</string>
+    <!-- Stage L4 P2#3 corrupt repair (CCE only, separate from Unavailable blind-clear). -->
+    <string name="policy_corrupt_detected">Remote policy is corrupt (type confusion); kept the old snapshot. Clearing requires repair confirmation; blind clear refused. Refresh first if reachable.</string>
+    <string name="policy_corrupt_repair_first">Corrupt policy entry detected; repair will attempt a best-effort backup (may fail; recovery not guaranteed) then clear the corrupt content (destructive and irreversible). Confirm repair again within 5 minutes; refresh first if reachable.</string>
+    <string name="policy_corrupt_repaired">Repaired the corrupt policy draft (attempted backup and cleared, now empty; backup not guaranteed)</string>
+    <string name="policy_corrupt_repair_failed">Failed to repair the corrupt policy draft; still corrupt. Retry or check the service connection.</string>
+    <string name="policy_corrupt_repair_timeout">Repair of the corrupt policy timed out with unknown result; reconciling, do not retry</string>
     <plurals name="batch_create">
         <item quantity="one">Create %1$d clone</item>
         <item quantity="other">Create %1$d clones</item>
@@ -111,12 +202,12 @@
     <!-- p28-1 review: user-visible write-block reasons (were hardcoded Traditional
          Chinese in DualViewModel.writeBlockReason). %1$s=hook state; explicit
          branch %1$s=mode %2$s=channel identity. -->
-    <string name="write_block_lsposed">LSPosed channel is a placeholder (NoOp): whitelist policy branch pending, writes are refused. Hook state: %1$s. To write, switch to Auto/Root/Shizuku, then tap Reconnect and refresh.</string>
+    <string name="write_block_lsposed">LSPosed channel is a placeholder (NoOp): writes are refused; the whitelist policy source is wired (end-to-end DEVICE-UNVERIFIED). Hook state: %1$s. To write, switch to Auto/Root/Shizuku, then tap Reconnect and refresh.</string>
     <string name="write_block_noop">Channel not ready: a real channel is connected but not selected (NoOp fallback); currently read-only and writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
     <string name="write_block_explicit">Selected mode %1$s (%2$s channel) failed probing; writes are disabled (an explicit mode never crosses channels). Switch to Auto, or tap Reconnect and refresh to retry.</string>
     <string name="write_block_pm">Probing passed but PM is not readable (pm list users failed); writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
     <string name="write_block_readonly">Read-only: no privileged channel available; writes are disabled. Check authorization, then tap Reconnect and refresh.</string>
-    <!-- P2-3 Auto degrade typed reasons (probe产物, resolved via resources; no Verbatim on the main path). No args. -->
+    <!-- P2-3 Auto degrade typed reasons (probe output, resolved via resources; no Verbatim on the main path). No args. -->
     <string name="auto_degrade_su_to_shizuku">Auto degraded based on probing: su was detected but its probe was denied (id -u failed), switched to Shizuku; to restore ROOT, check su authorization then tap Reconnect and refresh.</string>
     <string name="auto_degrade_both_failed">Auto probing found both channels failed (su present but denied and Shizuku not passed), currently read-only; check authorization then tap Reconnect and refresh.</string>
     <string name="auto_degrade_no_channel">Auto probing found no usable channel (no su and Shizuku not passed), currently read-only; authorize Shizuku or gain ROOT then tap Reconnect and refresh.</string>
@@ -138,12 +229,12 @@
     <string name="hero_brand_title">Galaxy Tool</string>
     <string name="hero_title_apps">Dual App Whitelist Injector</string>
     <string name="hero_title_engine">Dual your Galaxy</string>
-    <string name="hero_subtitle_apps">Requires an active LSPosed Hook to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku)</string>
+    <string name="hero_subtitle_apps">Requires an active LSPosed Hook (pending device verification) to lift limits and inject the whitelist; writing clones still needs a privileged channel (Auto/Root/Shizuku); the policy set is empty by default so hooks stay observe-only (drafts are not yet effective)</string>
     <string name="hero_subtitle_engine">Isolated Environment · Core Engine</string>
     <string name="badge_samsung_hook">SAMSUNG DUAL MESSENGER HOOK</string>
     <string name="badge_oneui_sandbox">ONE UI 6 SANDBOX</string>
     <string name="hook_mode_title">Hook Mode: LSPosed (%1$s)</string>
-    <string name="hook_mode_subtitle">Requires an active LSPosed Hook to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku.</string>
+    <string name="hook_mode_subtitle">Requires an active LSPosed Hook (pending device verification) to lift dual limits and inject third-party apps into the native whitelist; no Knox or Secure Folder needed; writes need Auto/Root/Shizuku; the policy set is empty by default so hooks stay observe-only (drafts are not yet effective).</string>
     <string name="hook_mode_subtitle_ops">Clone and remove work on the verified profile through this privileged channel (Auto/Root/Shizuku) with no Hook required; LSPosed only adds deeper Samsung whitelist and native UI integration.</string>
     <string name="hook_badge_sec_hook">SecPackageHook Injected</string>
     <string name="hook_badge_sec_pm">SecPackageManager Intercepting</string>
@@ -161,7 +252,7 @@
     <string name="section_pending_apps_hint">Check apps to select; Batch create writes the clones (checking alone writes nothing)</string>
     <string name="section_advanced_manual">Advanced Manual Package Entry</string>
     <string name="status_hook_daemon_running">Native Dual Messenger Core Hook Running</string>
-    <string name="status_hook_daemon_desc">Successfully intercepted daagent whitelist verification callbacks</string>
+    <string name="status_hook_daemon_desc">Hook installed (existence evidence only, interception not confirmed)</string>
     <string name="engine_status_title">Low-Level Injection Status</string>
     <string name="engine_status_subtitle">One UI · Android 10+</string>
     <string name="engine_status_active">Resident</string>
@@ -233,4 +324,52 @@
     <string name="nav_tab_cd_selected">%1$s, %2$s</string>
     <!-- Phase 3 P3 B7: settings nav opens a dialog (not a tab); CD names it. -->
     <string name="settings_tab_cd">About, double-tap opens dialog</string>
+    <!-- P2: VM hardcoded-string localization (was DualViewModel msg="..." mixed literals; the VM
+         has no Context, display resolves via MainActivity.localizeVmMessage/vmMessageRes; JVM pins
+         the mapping via vmMessageRes). %1$s=raw dynamic suffix (package/count/tech detail, untranslated).
+         Known limitation (locale-mixed by design): prefix template is localized, %1$s remainder
+         passes through verbatim; package/tech remainders are locale-neutral, but structured
+         Chinese-message remainders carry Chinese clauses (verified-id/serial/label,
+         select-target, rebound, saved-selection, batch, serial-missing suffix), so EN renders
+         "EN prefix + Chinese remainder" mixed (see MainActivity vmMessageRes KDoc +
+         StageJ5PolishTest mixed assertion); keep pass-through until the VM emits
+         structured params. -->
+    <string name="vm_no_dual_profile">No dual profile</string>
+    <string name="vm_no_pending_remove">No pending removal to confirm</string>
+    <string name="vm_busy_batch_clone">Batch clone already in progress</string>
+    <string name="vm_selection_cleared">Selection cleared (no clones uninstalled)</string>
+    <string name="vm_save_failed">Failed to save selection</string>
+    <string name="vm_unsave_failed">Failed to cancel saved selection</string>
+    <string name="vm_save_cancelled">Saved selection cancelled (installed clones and current selection unaffected)</string>
+    <string name="vm_no_store_save">No selection store; cannot save</string>
+    <string name="vm_no_store_unsave">No selection store; cannot cancel saved selection</string>
+    <string name="vm_remove_ttl_expired">Confirmation expired; please request removal again</string>
+    <string name="vm_target_unverifiable">Removal target unverifiable (serial missing); please confirm again</string>
+    <string name="vm_serial_unknown_retry">Cannot verify clone identity (serial missing); please retry</string>
+    <string name="vm_list_stale_resave">List is stale (STALE); please refresh before saving</string>
+    <string name="vm_in_progress">Already in progress: %1$s</string>
+    <string name="vm_cloned">Cloned: %1$s</string>
+    <string name="vm_removed">Removed: %1$s</string>
+    <string name="vm_clone_failed">Clone failed: %1$s</string>
+    <string name="vm_clone_verify_failed">Clone verification failed: %1$s</string>
+    <string name="vm_clone_mismatch">Clone verification mismatch: %1$s</string>
+    <string name="vm_clone_unknown">Clone result unknown: %1$s</string>
+    <string name="vm_remove_failed">Remove failed: %1$s</string>
+    <string name="vm_remove_unknown">Remove result unknown: %1$s</string>
+    <string name="vm_remove_cancelled">Removal cancelled: %1$s</string>
+    <string name="vm_await_remove">Awaiting removal confirmation: %1$s</string>
+    <string name="vm_not_installed">Not installed, nothing to remove: %1$s</string>
+    <string name="vm_target_changed_verified_id">Removal target changed (verified id %1$s</string>
+    <string name="vm_target_changed_serial">Removal target changed (serial %1$s</string>
+    <string name="vm_target_changed_label">Removal target changed (%1$s</string>
+    <string name="vm_serial_unknown_suffix">Cannot verify clone identity (serial missing), %1$s</string>
+    <string name="vm_select_target_user">Selection target changed (user %1$s</string>
+    <string name="vm_select_target_serial">Selection target changed (serial %1$s</string>
+    <string name="vm_target_rebound">Selection was bound to an old target%1$s</string>
+    <string name="vm_saved_selection">Selection saved: %1$s</string>
+    <string name="vm_batch_no_start">Cannot start batch: channel error: %1$s</string>
+    <string name="vm_batch_target_changed">Batch interrupted: target changed (user %1$s</string>
+    <string name="vm_batch_partial">Batch interrupted: completed %1$s</string>
+    <string name="vm_probe_failed">Probe failed: %1$s</string>
+    <string name="vm_foreground_failed">Foreground refresh failed: %1$s</string>
 </resources>

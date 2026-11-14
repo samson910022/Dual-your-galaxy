@@ -1,0 +1,299 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+package com.galaxydual.hook
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+
+// K4 P2#6: bounded refresh (zero-queue + at-most-one guard + stuck breaker).
+//
+// Regression: newSingleThreadExecutor has an unbounded LinkedBlockingQueue;
+// cancel(true) cannot stop an interrupt-ignoring Binder read nor remove a
+// queued task, so repeated 5s-cooldown misses behind a stuck worker grew the
+// queue without bound. This pins: queue/outstanding bounded (<=1, no growth),
+// budget respected, post-invalidate recovery.
+class PolicyRefreshGateTest {
+
+    // Bounded poll until the condition holds; throws AssertionError after
+    // 5s so a stuck worker fails fast instead of hanging the test suite.
+    // Yields (no sleep quanta) — matches the existing drain idiom.
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition()) {
+            if (System.nanoTime() >= deadline) {
+                throw AssertionError("await timed out after 5s")
+            }
+            Thread.yield()
+        }
+    }
+
+    // Reader that ignores interruption (simulates uninterruptible Binder
+    // read): swallows InterruptedException and keeps sleeping to the full
+    // duration. cancel(true) therefore never frees the worker early.
+    private fun ignoringReader(sleepMs: Long, value: Set<String>? = setOf("stuck")): () -> Set<String>? =
+        {
+            val end = System.nanoTime() + sleepMs * 1_000_000L
+            var remaining = sleepMs
+            while (remaining > 0) {
+                try {
+                    Thread.sleep(remaining)
+                    break
+                } catch (_: InterruptedException) {
+                    // Ignore: keep sleeping (uninterruptible).
+                    remaining = (end - System.nanoTime()) / 1_000_000L
+                    if (remaining <= 0) break
+                }
+            }
+            value
+        }
+
+    @Test
+    fun zeroQueueAndGuardBoundOutstanding() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-1")
+        try {
+            val gate = PolicyRefreshGate(executor = executor)
+            // Occupy the single worker with an interrupt-ignoring 2s read;
+            // caller budget is 50ms so this times out but the worker stays busy.
+            val start0 = System.nanoTime() / 1_000_000L
+            val r0 = gate.readBounded(ignoringReader(2_000), timeoutMs = 50)
+            val elapsed0 = System.nanoTime() / 1_000_000L - start0
+            assertNull(r0)
+            assertTrue("hang-guard: budget respected elapsed=$elapsed0", elapsed0 < 1_000)
+            // Worker still busy (ignoring reader runs 2s). Immediate second
+            // read must NOT queue: guard contention or SynchronousQueue
+            // rejection short-circuits to null, fast, with a drop counted.
+            val dropsBefore = gate.droppedRefreshCount.get()
+            val start1 = System.nanoTime() / 1_000_000L
+            val r1 = gate.readBounded({ setOf("fast") }, timeoutMs = 50)
+            val elapsed1 = System.nanoTime() / 1_000_000L - start1
+            assertNull("second read while worker stuck must drop to null", r1)
+            assertTrue("hang-guard: drop must be fast elapsed=$elapsed1", elapsed1 < 1_000)
+            assertTrue(
+                "droppedRefreshCount must grow (before=$dropsBefore after=${gate.droppedRefreshCount.get()})",
+                gate.droppedRefreshCount.get() > dropsBefore,
+            )
+            // Zero queue: SynchronousQueue never holds tasks.
+            assertEquals(0, gate.queueDepth())
+            assertTrue("active<=1 active=${gate.activeCount()}", gate.activeCount() <= 1)
+            // Guard released after each call (permits back to 1).
+            assertEquals(1, gate.outstandingPermitsAvailable())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun repeatedCooldownMissesDoNotGrowQueue() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-2")
+        try {
+            val gate = PolicyRefreshGate(executor = executor)
+            val now = AtomicLong(0L)
+            val cache = EffectivePolicyCache(nowMs = { now.get() })
+            val seed = setOf("com.seed.app")
+            // First miss: ignoring reader stalls 2s, gate times out at 50ms,
+            // cache falls back to seed (fail-closed observe-only).
+            var r = cache.get(seed, nonEmptyPolicyGateOpen = true) {
+                gate.readBounded(ignoringReader(2_000), timeoutMs = 50)
+            }
+            assertEquals(seed, r)
+            assertEquals(0, gate.queueDepth())
+            val dropsAfterFirst = gate.droppedRefreshCount.get() +
+                gate.stuckShortCircuits.get() + gate.consecutiveTimeouts.get()
+            // Repeated 5s-cooldown misses: advance past the 5s failure
+            // cooldown so each iteration is a real miss (reader invoked).
+            // Worker is still stuck (2s ignoring read from first miss may have
+            // drained; use a fresh long stall each time by keeping the worker
+            // busy: submit a background ignoring task directly).
+            // Simpler deterministic pin: occupy worker via a raw submit, then
+            // issue cache misses that must drop without queueing.
+            repeat(5) {
+                now.addAndGet(6_000L)
+                // Invalidate the breaker between iterations so every miss
+                // reaches the guard/executor (breaker would otherwise
+                // short-circuit after 3 timeouts — covered separately).
+                gate.invalidate()
+                r = cache.get(seed, nonEmptyPolicyGateOpen = true) {
+                    gate.readBounded(ignoringReader(2_000), timeoutMs = 50)
+                }
+                assertEquals("iteration $it must fall back to seed", seed, r)
+                assertEquals("queue must stay zero at iteration $it", 0, gate.queueDepth())
+                assertTrue(
+                    "active<=1 at iteration $it active=${gate.activeCount()}",
+                    gate.activeCount() <= 1,
+                )
+                assertEquals(
+                    "guard released at iteration $it",
+                    1,
+                    gate.outstandingPermitsAvailable(),
+                )
+            }
+            // Drops/timeouts recorded, but nothing queued.
+            assertTrue(
+                "breaker/drops recorded (after=$dropsAfterFirst timeouts=${gate.consecutiveTimeouts.get()} " +
+                    "drops=${gate.droppedRefreshCount.get()} stuck=${gate.stuckShortCircuits.get()})",
+                gate.consecutiveTimeouts.get() + gate.droppedRefreshCount.get() +
+                    gate.stuckShortCircuits.get() > dropsAfterFirst,
+            )
+            assertEquals(0, gate.queueDepth())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun stuckBreakerShortCircuitsThenInvalidateRecovers() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-3")
+        try {
+            // Small breaker (3 timeouts) with a controllable clock for the
+            // time-since-last-success arm (far future forces age arm off;
+            // count arm drives the trip).
+            val gate = PolicyRefreshGate(
+                executor = executor,
+                maxConsecutiveTimeouts = 3,
+            )
+            // 3 consecutive timeouts (500ms stall vs 50ms budget).
+            // Wait for the stuck worker to drain between submits (else the
+            // guard/rejection would drop instead of timing out; both map to
+            // null but only a timeout increments the breaker streak).
+            repeat(3) {
+                val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+                assertNull(r)
+                await { gate.activeCount() == 0 }
+            }
+            assertTrue("breaker must be open after 3 consecutive timeouts", gate.isStuck())
+            assertTrue(gate.stuckShortCircuits.get() >= 1)
+            // While open: short-circuit without submit (fast null, no budget wait).
+            val start = System.nanoTime() / 1_000_000L
+            val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
+            val elapsed = System.nanoTime() / 1_000_000L - start
+            assertNull(shorted)
+            assertTrue("hang-guard: short-circuit must be fast elapsed=$elapsed", elapsed < 1_000)
+            assertEquals("zero queue while stuck", 0, gate.queueDepth())
+            // Recovery: invalidate resets the breaker; a good reader succeeds.
+            gate.invalidate()
+            assertFalse(gate.isStuck())
+            // Ensure the stale worker drained.
+            await { gate.activeCount() == 0 }
+            val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
+            assertEquals(setOf("ok"), good)
+            assertFalse(gate.isStuck())
+            assertEquals(0L, gate.consecutiveTimeouts.get())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun factoryIsZeroQueueSingleThread() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-factory")
+        try {
+            assertEquals(1, executor.maximumPoolSize)
+            assertTrue(executor.queue is java.util.concurrent.SynchronousQueue<*>)
+            assertTrue(executor.threadFactory.newThread({}).isDaemon)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    // M4 P2#6 fix: timed half-open retry without any invalidate signal (no
+    // cross-process push on API 102.0.0). 3 timeouts trip the breaker; the
+    // upstream then recovers silently; after the cooldown ONE bounded probe
+    // must succeed and close the breaker (no manual invalidate).
+    @Test
+    fun halfOpenProbeRecoversWithoutInvalidate() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-halfopen")
+        try {
+            val clock = AtomicLong(0L)
+            val gate = PolicyRefreshGate(
+                executor = executor,
+                nowMs = { clock.get() },
+                maxConsecutiveTimeouts = 3,
+                halfOpenInitialMs = 200L,
+                halfOpenMaxMs = 1_000L,
+            )
+            repeat(3) {
+                val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+                assertNull(r)
+                await { gate.activeCount() == 0 }
+            }
+            assertTrue("breaker must be open after 3 consecutive timeouts", gate.isStuck())
+            assertEquals(0L, gate.halfOpenProbes.get())
+            // Cooldown not elapsed: short-circuit, no probe submitted.
+            val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
+            assertNull(shorted)
+            assertEquals("no probe before cooldown", 0L, gate.halfOpenProbes.get())
+            assertTrue(gate.isStuck())
+            // Worker drained (await activeCount==0) + cooldown elapsed:
+            // the next read is the single bounded probe — upstream has
+            // recovered, so it succeeds and closes the breaker.
+            clock.addAndGet(300L)
+            assertEquals(0, gate.activeCount())
+            val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
+            assertEquals(setOf("ok"), good)
+            assertEquals("exactly one half-open probe", 1L, gate.halfOpenProbes.get())
+            assertFalse("probe success must close the breaker", gate.isStuck())
+            assertEquals(0L, gate.consecutiveTimeouts.get())
+            assertEquals(0L, gate.halfOpenFailureCount())
+            assertEquals(0, gate.queueDepth())
+            assertEquals(1, gate.outstandingPermitsAvailable())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    // Half-open backoff: a failed probe re-opens + doubles the cooldown; the
+    // next read inside the new window short-circuits without probing; after
+    // the longer cooldown a probe succeeds.
+    @Test
+    fun halfOpenProbeFailBacksOffThenRecovers() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-gate-backoff")
+        try {
+            val clock = AtomicLong(0L)
+            val gate = PolicyRefreshGate(
+                executor = executor,
+                nowMs = { clock.get() },
+                maxConsecutiveTimeouts = 3,
+                halfOpenInitialMs = 200L,
+                halfOpenMaxMs = 1_000L,
+            )
+            repeat(3) {
+                val r = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+                assertNull(r)
+                await { gate.activeCount() == 0 }
+            }
+            assertTrue(gate.isStuck())
+            assertEquals(200L, gate.halfOpenCooldownMs())
+            // First probe after cooldown still sees a stuck upstream: it
+            // times out, stays open, and backs off to 400ms.
+            clock.addAndGet(300L)
+            val failedProbe = gate.readBounded(ignoringReader(500), timeoutMs = 50)
+            assertNull(failedProbe)
+            await { gate.activeCount() == 0 }
+            assertTrue("failed probe must keep the breaker open", gate.isStuck())
+            assertEquals(1L, gate.halfOpenProbes.get())
+            assertEquals(1L, gate.halfOpenFailureCount())
+            assertEquals("cooldown must double after probe fail", 400L, gate.halfOpenCooldownMs())
+            // Inside the new 400ms window: short-circuit, no second probe.
+            clock.addAndGet(100L)
+            val shorted = gate.readBounded({ setOf("never-submitted") }, timeoutMs = 50)
+            assertNull(shorted)
+            assertEquals("no probe inside backoff window", 1L, gate.halfOpenProbes.get())
+            // Past the backoff window with a recovered upstream: probe
+            // succeeds and resets backoff to the initial cooldown.
+            clock.addAndGet(400L)
+            assertEquals(0, gate.activeCount())
+            val good = gate.readBounded({ setOf("ok") }, timeoutMs = 2_000)
+            assertEquals(setOf("ok"), good)
+            assertEquals(2L, gate.halfOpenProbes.get())
+            assertFalse(gate.isStuck())
+            assertEquals(0L, gate.halfOpenFailureCount())
+            assertEquals(200L, gate.halfOpenCooldownMs())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+}

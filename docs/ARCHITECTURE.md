@@ -15,6 +15,26 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 - `core`: pure-Kotlin privilege routing, command gateway, and `pm` output parsing.
 - `hook`: LSPosed module (API 102), loaded only inside target Samsung processes.
 
+## GuardXposedProvider (policy provider parity)
+
+- The libxposed `service` AAR declares its own exported `XposedProvider` at
+  `content://<applicationId>.XposedService` with no permission, so any app could
+  call `SendBinder` and deliver a fake `IBinder` to hijack the policy channel
+  (`XposedServiceHelper.onBinderReceived`). The app manifest removes that node
+  (`tools:node="remove"`) and declares `GuardXposedProvider` at the same
+  authority.
+- `GuardXposedProvider` delegates `call()` to the library provider instance but
+  gates it: only root (`uid == 0`), system (`appId == 1000` — exact `1000`, or the
+  same-user system UID in multi-user, `uid % 100_000 == 1000` within the app's
+  user), or the app itself (`uid == Process.myUid()`) may deliver a binder;
+  **everything else is rejected — including shell (`2000`) and general app
+  UIDs** — and gets `null`. The trusted set is exactly that; the
+  `uid < FIRST_APPLICATION_UID` superset is **not** trusted. The UID checked is
+  the kernel-set `Binder.getCallingUid()`, never a caller-supplied value. CRUD
+  stays inert (`null`/`0`).
+- The pure decision function `isTrustedXposedCaller` / `guardedPolicyCall` is
+  JVM-tested; the real SendBinder round-trip remains DEVICE-UNVERIFIED.
+
 ## PrivilegeRouter
 
 ```kotlin
@@ -32,12 +52,12 @@ val privilege: Privilege = when {
 > [S24 調查](UX_REVIEW_S24.md) §5)：已觀察 —— (1)類別選取：
 > daagent `using provider.WhiteListApps` 連續命中×7（僅類別選取，
 > 不等於 `<clinit>` 執行／回調／放寬）；(2)hook 註冊：system
-> `DualAppManagerService` 雙方法 deoptimize＋hooked（僅註冊，
+> `DualAppManagerService` 單方法（getAllWhitelistedPackages）deoptimize＋hooked（僅註冊，
 > 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
 >（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
 > 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
-> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（預設空政策，
-> observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
+> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（政策來源已接線至 LSPosed
+> remote preferences，端到端未驗；靜態種子預設空，故預設 observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
 > 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
@@ -59,6 +79,44 @@ val privilege: Privilege = when {
 > plus no Shizuku => `ROOT`) would have become hasShizuku true, hasRoot false
 > => `SHELL` (silent de-escalation). The rename changes the JVM method
 > identity so old binaries fail to bind instead of silently changing meaning.
+
+> Build-note: `gradle.properties` sets
+> `android.experimental.disableCompileSdkChecks=true` as an **accepted, documented
+> risk** for the `io.github.libxposed` 102.0.0 AARs (`service`/`interface`/`api`),
+> whose AAR metadata declares `minCompileSdk=37` while this project compiles
+> against SDK 34 on the AGP 8.5.2 baseline. The app only uses APIs available in
+> 34; the API 29 instrumentation run is the runtime-compatibility guard. This
+> flag will be revisited on the next AGP/compileSdk upgrade.
+>
+> Build-note: `gradle/verification-metadata.xml` enforces dependency
+> verification in **sha256** mode with `verify-signatures=false`; regenerate via
+> `./gradlew --write-verification-metadata sha256 <tasks>` (never hand-edit hashes
+> except the aapt2 caveat below). It covers all currently-run classpaths
+> (incl. lint / debug / test); the residual is the emulator/device RUNTIME
+> path (artifacts are pinned; the on-device execution is unverified), and
+> `release.yml` remains unpinned (tracked as follow-up). Caveat: the aapt2
+> **platform-classifier** artifacts
+> (`-windows.jar`/`-osx.jar`) are not resolvable on this Linux host, so those
+> entries were added manually with sha256 hashes verified locally from Google's
+> Maven (`dl.google.com`); the linux classifier stays Gradle-generated.
+> Wrapper provenance: the committed `gradle/wrapper/gradle-wrapper.jar`
+> (81a82aaea5abcc8ff68b3dfcb58b3c3c429378efd98e7433460610fecd7ae45f) matches
+> Gradle 8.13's published wrapper jar — the 8.7 distribution download itself is
+> independently pinned via `distributionSha256Sum` (official 8.7-bin checksum),
+> so the skew affects only wrapper bootstrap, not the 8.7 toolchain. Follow-up
+> (not done): swap the committed jar for the official Gradle 8.7 wrapper jar to
+> remove the version skew.
+>
+> Device + SDK 矩陣（release gate 實證口徑：JVM／emulator 綠燈不等於 S24 裝置驗收）：
+>
+> | 環境 | SDK／版本 | 用途 | 狀態 |
+> | --- | --- | --- | --- |
+> | S24 SM-S9210（OneUI `oneui=90000`、Android 17／API 37） | API 37 實機 | 五層部分已驗證的唯一實機來源（見 `docs/UX_REVIEW_S24.md` §5） | 歷史證據（2026-11-05）；當前 source 可追溯部署未驗 |
+> | Emulator API 29（minSdk floor） | API 29 | CI `locale-instrumentation` job：`:app:connectedDebugAndroidTest` | 每 PR 自動執行 |
+> | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
+> | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
+> | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據 |
+> | 政策 Tx 結清／coordinator（Stage G1/G2） | —（VM 語義，非裝置驗證） | JVM 鎖定（`PolicyWriteTest`：settle helper／世代拆分／跨 VM 認領（auto-recheck 間接覆蓋）；reconciler 總預算 15 秒） | JVM 綠燈不等於裝置驗收；旋轉重建實機恢復未驗 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
 
@@ -95,7 +153,8 @@ val privilege: Privilege = when {
   authorized, else `NoOp` fail-closed; hook never auto-selected). Explicit
   LSPosed maps to the NoOp placeholder with the picker UI + file-marker
   enable detection done in P2 (hook writes /data/system marker, app reads
-  direct + gateway cat; whitelist policy still pending).
+  direct + gateway cat; whitelist policy source wired to LSPosed remote
+  preferences, end-to-end DEVICE-UNVERIFIED).
 
 ## PmOutputParser
 
@@ -124,9 +183,30 @@ val privilege: Privilege = when {
    `busy = loading` disables 7 buttons + dialog (positive/negative) while in flight; cancel preserves message, pending follows preserve rules.
    註（#53）：`DualViewModel.refreshLocked()` 已遷移到 `refreshVerified()` 8 命令單一快照（snapshot 1 ＋ typed target 3 ＋ list 1 ＋ re-verify triple 3），VM 只做 `RefreshOutcome→UiState` 映射，第二次 triple 即 strict-equality fence；pinned target 攜帶真 parentId，parent drift fail-closed；serial intra-triple conflict fail-closed, inter-refresh rebuild = whole-world FRESH。 Refresh `Unknown` keeps the old `cloned` list, marks the inventory STALE, and reports `pmReadable=true` (vs `NoDual` which clears `cloned`), an inter-refresh rebuild no longer emits `VERIFY_MISMATCH` (a rebuild between refreshes publishes the whole new world as FRESH on the next refresh), and `Unknown` has four shapes (typed refusal, confirmed id missing from the pm snapshot, Absent with an empty snapshot, and post-list identity drift). `TargetMoved` (confirmed post-list drift → `VERIFY_MISMATCH`, STALE live target, selection cleared; inter-refresh rebuild still whole FRESH). serial==null 前後時 strict equality 僅為 (id,null,parent)：FRESH 只保證同 id/parent 兩次確認 + 列舉成功，不保證 incarnation continuity（能力限制；有 serial 時才消除 resolve→list 漂移）。
 
-   測試驗收分階段：JVM unit tests（CI `testDebugUnitTest`）只保證併發語意，不替代 S24 實機驗收。
+   測試驗收分階段：JVM unit tests（CI `testDebugUnitTest` 全綠）只保證併發語意，不替代 S24 實機驗收。
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
-   `app/src/androidTest/` 現已含 8 個檔案 / 7 個 test class 的 harness（27 個自動化測試：20 JUnit4 + 7 JUnit3，見 docs/ACCEPTANCE.md §5）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
+   `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
+
+## Policy draft flow (hook-policy-source P2-P4 semantics)
+- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
+- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例；`extra_whitelist_version` 版本序號 **規劃中／未實作**，新鮮度目前僅靠 TTL＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
+- 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活，後續全 `BUSY`，由 `refreshPolicyDraft` late-join 結清回 `IDLE`）；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
+- UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
+- Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。
+- 跨 VM（Stage G2）：`PolicyTxCoordinator` App-scoped（`GalaxyApp` 單例），`activeTx` 跨 VM 唯一真相；Tx 攜 pending，新 VM init 認領（繼承 fence＋`RECONCILING`＋Unknown＋reconciler join 同一 deferred）；`deferred.invokeOnCompletion` 單次 auto-recheck（有界獨立池，不耗 reconciler 預算，Unknown→unresolved 待手動 `refreshPolicyDraft` late-join）；終態 `tryClaimCoordinatorPublish` CAS 勝者發布；reconciler 總預算 15 秒，超限誠實 unresolved 滯留待 late-join。
+- 完整語義（pending 世代、TTL、fence、blind-clear 二次確認〈僅 Unavailable 瞬斷：TTL＋世代＋disarm，Corrupt 走修復流程〉）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒、reconciler 總預算 15 秒、auto-recheck 單次 vs hook 側快取 60 秒／失敗節流 5 秒）。
+
+### Poison 封裝（remote prefs 樂觀值隔離，`HookPolicyStore` 內部狀態）
+
+- 封裝：`remotePoison: AtomicReference<PoisonState(entries, gen, overflow)>`（copy-on-write，全域單例，弱鍵；`internal` 僅測試可見，VM 經 `loadResult/loadForRepair/repairCorrupt` 間接使用，不直觸狀態）。
+- 證據：`remoteCorruptEvidence: AtomicReference<Map<WeakPrefKey, CorruptEvidence>>`（per-instance CCE 診斷，first-wins；與 poison fence 並存，不替代）。
+- 狀態表（set/cleared 條件）：
+  | 狀態 | 寫入條件 | 清除條件 |
+  |---|---|---|
+  | poison fence（某 prefs 加毒） | `prePoison`（save/commit 前，先加毒 gen+1 再 commit）／CCE 讀命中 `ensurePoisoned` | 成功 save/clear 以 token 相等 `clearPoison`（防 lost-poison：併發新毒 token 更大即不清除）；Verified Known 讀（unpoisoned 成功讀） |
+  | corrupt evidence（某 instance 腐壞） | `loadResult` 捕獲 CCE → `recordCorruptEvidence`（first-wins） | Verified Known（unpoisoned 成功讀 `clearCorruptEvidence`）或成功修復；transient 失敗保留舊證據 |
+  | overflow 閂 | 任一表達 bound（`POISON_MAX_ENTRIES`／`EVIDENCE_MAX_ENTRIES`）採 drop-new＋閂鎖＋`poisonEvictCount/evidenceEvictCount` 可觀測 | 永不自動清除（重啟重置；見 `resetRemotePoisonForTests` 測試重置） |
+- TTL/真相單一來源：`docs/USAGE.md` §政策 TTL 對照為準（App 側 5 分鐘／IO 10 秒／reconciler 15 秒；hook 側快取 60 秒／失敗節流 5 秒；單調時鐘）。
 
 ## Non-Goals
 

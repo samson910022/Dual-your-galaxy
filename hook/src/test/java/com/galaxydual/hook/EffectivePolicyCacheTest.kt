@@ -1,0 +1,816 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+package com.galaxydual.hook
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+// JVM unit tests for the pure effective-policy cache (EffectivePolicyCache).
+class EffectivePolicyCacheTest {
+
+    @Test
+    fun firstGetComputesAndCaches() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        assertEquals(setOf("com.seed.app", "com.remote.app"), first)
+        assertEquals(1, reads)
+    }
+
+    // T-F5: the committed snapshot is handed out by reference everywhere —
+    // no per-call copies — and the cached view is unmodifiable.
+    @Test
+    fun cachedSnapshotIsReusedAndUnmodifiable() {
+        val cache = EffectivePolicyCache()
+        val first = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
+        val second = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("b") }
+        assertSame(first, second)
+        assertThrows(UnsupportedOperationException::class.java) {
+            @Suppress("UNCHECKED_CAST")
+            (first as java.util.Set<String>).add("x")
+        }
+    }
+
+    // T-F6: contention fallback counter (H9).
+    @Test
+    fun contentionFallbackCountsSeedOnlyFallback() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                throw PolicyRefreshContentionException("guard")
+            },
+        )
+        assertEquals(1L, cache.contentionFallbackSeedOnly.get())
+        assertEquals(0L, cache.cooldownFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
+        assertEquals(0L, cache.invalidatedDiscardSeedOnly.get())
+    }
+
+    // T-F6: invalidate-during-IO discard counter (H9). The reader invalidates
+    // the cache from inside IO; the in-flight leader must discard and return
+    // seed-only (loser-drop), never resurrect a merged value.
+    @Test
+    fun invalidateDuringIoDiscardCountsSeedOnlyFallback() {
+        val cache = EffectivePolicyCache()
+        val result = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+            cache.invalidate()
+            setOf("b")
+        }
+        assertEquals(emptySet<String>(), result)
+        assertEquals(1L, cache.invalidatedDiscardSeedOnly.get())
+        assertEquals(0L, cache.contentionFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
+    }
+
+    @Test
+    fun secondGetReturnsCachedValue() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        assertEquals(setOf("com.seed.app", "com.remote.app"), second)
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun invalidateForcesRecompute() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("a")
+        }
+        cache.invalidate()
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("a")
+            },
+        )
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun nullReadIsNotCachedAndReturnsSeed() {
+        var reads = 0
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            null
+        }
+        assertEquals(setOf("com.seed.app"), first)
+        assertEquals(1, reads)
+
+        // A failed read is not cached: the reader is retried on the next get
+        // (cooldown elapsed).
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            null
+        }
+        assertEquals(setOf("com.seed.app"), second)
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun nullThenValueCachesOnSuccess() {
+        var reads = 0
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                null
+            },
+        )
+        assertEquals(
+            setOf("com.seed.app", "com.remote.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(2, reads)
+
+        // Now cached: the reader is not called again.
+        assertEquals(
+            setOf("com.seed.app", "com.remote.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun emptySeedAndRemoteReturnsEmpty() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        val result = cache.get(emptySet()) {
+            reads++
+            emptySet()
+        }
+        assertEquals(emptySet<String>(), result)
+        // Stage C: gate closed short-circuits without touching the reader.
+        assertEquals(0, reads)
+    }
+
+    @Test
+    fun emptyRemoteReadIsCachedLikeAnySuccess() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            emptySet()
+        }
+        assertEquals(setOf("com.seed.app"), first)
+        // An empty-but-successful read is still a success: it must be cached,
+        // not retried (kills `if (remote != null && remote.isNotEmpty())`).
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            emptySet()
+        }
+        assertEquals(setOf("com.seed.app"), second)
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun invalidateUsesNewRemoteValue() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("a")
+            },
+        )
+        cache.invalidate()
+        // Kills both "discard new value" (would return "a") and "accumulate old
+        // value" (would return "a" + "b").
+        assertEquals(
+            setOf("b"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("b")
+            },
+        )
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun invalidateThenFailedReadReturnsSeedNotStaleCache() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.seed.app", "com.remote.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { setOf("com.remote.app") },
+        )
+        cache.invalidate()
+        // After invalidation a failed read must not resurrect the stale cache.
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
+        )
+    }
+
+    @Test
+    fun failedReadStillSanitizesSeed() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.ok.app"),
+            cache.get(setOf("com.ok.app", "bad pkg"), nonEmptyPolicyGateOpen = true) { null },
+        )
+    }
+
+    // CR-O4: a failed read with NO prior good value falls back to the seed
+    // alone and is counted under failedReadSeedOnly (the merge-failed
+    // no-good-value arm), never resurrecting stale state; the sibling
+    // seed-only counters stay at zero for this shape.
+    @Test
+    fun failedReadSeedOnlyCountsFailedReadArm() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
+        )
+        assertEquals(1L, cache.failedReadSeedOnly.get())
+        assertEquals(0L, cache.cooldownFallbackSeedOnly.get())
+        assertEquals(0L, cache.graceExpiredSeedOnly.get())
+    }
+
+    // CR-O4: a failed read AFTER invalidation (nothing to resurrect,
+    // last-known-good suppressed) also counts under failedReadSeedOnly —
+    // the H9 line keeps every failed-read seed-only shape visible.
+    @Test
+    fun failedReadAfterInvalidateCountsFailedReadArm() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("com.good.app"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("com.good.app") },
+        )
+        cache.invalidate()
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null },
+        )
+        // Post-invalidate failed read falls to seed and is counted.
+        assertEquals(1L, cache.failedReadSeedOnly.get())
+    }
+
+    // Design-marker pin (P3-4, unreachable arm today): this test pins a state
+    // production cannot produce today — every path that sets the cache's
+    // `valid` flag to false ALSO sets `invalidated = true` (TTL expiry and
+    // invalidate() do both), so a FAILED read with hadGoodValue==true and
+    // !invalidated never occurs through the public API. The pin is kept
+    // deliberately as a design marker for the last-known-good return arm
+    // (failed read must NOT count failedReadSeedOnly when a good snapshot is
+    // legitimately returnable). If production ever creates this state,
+    // revisit this test — do not "fix" the reflection synthesized flag flip.
+    // CR-O4 (negative pin): a FAILED read while hadGoodValue==true and
+    // !invalidated returns the last-known-good snapshot and must NOT count
+    // failedReadSeedOnly (the last-known-good return arm). The arm is not
+    // reachable through the public API today (valid==false implies
+    // invalidated==true in the current code), so the test synthesizes it by
+    // flipping the cache's `valid` flag via reflection; hadGoodValue and
+    // invalidated keep their production values.
+    @Test
+    fun failedReadWithLastKnownGoodLeavesFailedReadArmZero() {
+        val cache = EffectivePolicyCache()
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("com.good.app") }
+        val f = EffectivePolicyCache::class.java.getDeclaredField("valid")
+        f.isAccessible = true
+        f.setBoolean(cache, false)
+        assertEquals(setOf("com.good.app"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { null })
+        assertEquals(0L, cache.failedReadSeedOnly.get())
+    }
+
+    @Test
+    fun corruptRemoteSetIsSanitizedAndCached() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        // A corrupt prefs entry can carry a non-String element; sanitize must
+        // drop it instead of throwing out of the hook chain.
+        @Suppress("UNCHECKED_CAST")
+        val corrupt = setOf("com.ok.app", 42) as Set<String>
+        assertEquals(
+            setOf("com.ok.app"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                corrupt
+            },
+        )
+        // The sanitized set is a successful read and must be cached.
+        assertEquals(
+            setOf("com.ok.app"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads++
+                corrupt
+            },
+        )
+        assertEquals(1, reads)
+    }
+
+    // P2-3: a hostile remote set (iterator throws) is sanitized to seed-only
+    // and CACHED as a successful read (fail-closed observe-only). Contrast
+    // with a null/throwing READER (failed read, not cached, retried under the
+    // 5s failure cooldown above).
+    //
+    // Tradeoff (60s TTL vs 5s cooldown): caching the sanitized seed-only value
+    // for the full TTL avoids a hostile-entry retry storm (every query would
+    // otherwise re-run hostile iteration + sanitize on the hot path), at the
+    // cost of delaying a concurrent legitimate remote fix until TTL/invalidate.
+    // This is preferred because (a) a throwing iterator signals corrupt prefs
+    // content, not a transient IPC blip, and (b) an explicit invalidate()
+    // (same-process listener hygiene or TTL expiry) still recovers promptly.
+    //
+    // FIXME(P3): deliberate tradeoff pending PRODUCT SIGN-OFF. A hostile
+    // remote that is only transiently bad (one rebel write, then fixed out of
+    // band) is suppressed for the full maxCacheAgeMs after the first hostile
+    // read — recovery only via TTL expiry or invalidate(), never via a normal
+    // poll, because the sanitized seed-only value is cached as a SUCCESSFUL
+    // read. Do not strengthen this pin (e.g. re-reading to detect recovery)
+    // without product sign-off on the retry-storm vs staleness balance; the
+    // assertions below intentionally pin current behavior, not desired UX.
+    @Test
+    fun hostileRemoteSanitizesToSeedOnlyAndCaches() {
+        var reads = 0
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
+        val hostile = object : AbstractSet<String>() {
+            override val size: Int get() = 1
+            override fun iterator(): Iterator<String> = throw IllegalStateException("boom")
+        }
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                hostile
+            },
+        )
+        // Sanitized to seed-only and cached: the hostile value is never
+        // resurrected, and the reader is not retried while cached.
+        assertEquals(
+            setOf("com.seed.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                hostile
+            },
+        )
+        assertEquals(1, reads)
+    }
+
+    // Stage C single-flight: exactly one reader call under concurrency. The
+    // leader performs the read (sleep guarantees overlap so followers arrive
+    // while it is in flight); followers never call reader and return the
+    // seed-only fallback (or the merged snapshot if they arrive after the
+    // commit), so each result is either merged or seed-only.
+    @Test
+    fun concurrentGetsSingleFlightExactlyOnce() {
+        val threads = 8
+        val barrier = CyclicBarrier(threads)
+        val reads = AtomicInteger()
+        val cache = EffectivePolicyCache()
+        val results = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val seed = setOf("com.seed.app")
+        val merged = setOf("com.seed.app", "com.remote.app")
+        val workers = (1..threads).map {
+            Thread {
+                barrier.await()
+                results.add(
+                    cache.get(seed, nonEmptyPolicyGateOpen = true) {
+                        reads.incrementAndGet()
+                        Thread.sleep(200)
+                        setOf("com.remote.app")
+                    },
+                )
+            }
+        }
+        workers.forEach { it.start() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
+        assertEquals(threads, results.size)
+        for (result in results) {
+            assertTrue(result == merged || result == seed)
+        }
+        assertEquals(1, reads.get())
+    }
+
+    // Stage C: after an explicit invalidate, a concurrent herd still performs
+    // exactly one read; followers fall back to seed-only (empty here).
+    @Test
+    fun invalidateHerdSingleFlightExactlyOnce() {
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") },
+        )
+        cache.invalidate()
+        val threads = 8
+        val barrier = CyclicBarrier(threads)
+        val reads = AtomicInteger()
+        val results = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val workers = (1..threads).map {
+            Thread {
+                barrier.await()
+                results.add(
+                    cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                        reads.incrementAndGet()
+                        Thread.sleep(200)
+                        setOf("b")
+                    },
+                )
+            }
+        }
+        workers.forEach { it.start() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
+        assertEquals(threads, results.size)
+        for (result in results) {
+            assertTrue(result == setOf("b") || result == emptySet<String>())
+        }
+        assertEquals(1, reads.get())
+        // The leader committed: a follow-up get is served cached, no new read.
+        assertEquals(
+            setOf("b"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                reads.incrementAndGet()
+                setOf("c")
+            },
+        )
+        assertEquals(1, reads.get())
+    }
+
+    // Stage C: after TTL expiry, a concurrent herd still performs exactly one
+    // read; followers fall back to seed-only (empty here).
+    @Test
+    fun ttlHerdSingleFlightExactlyOnce() {
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        assertEquals(
+            setOf("a"),
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") },
+        )
+        time = 1_000L + 60_000L
+        val threads = 8
+        val barrier = CyclicBarrier(threads)
+        val reads = AtomicInteger()
+        val results = Collections.synchronizedList(mutableListOf<Set<String>>())
+        val workers = (1..threads).map {
+            Thread {
+                barrier.await()
+                results.add(
+                    cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                        reads.incrementAndGet()
+                        Thread.sleep(200)
+                        setOf("b")
+                    },
+                )
+            }
+        }
+        workers.forEach { it.start() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
+        assertEquals(threads, results.size)
+        for (result in results) {
+            assertTrue(result == setOf("b") || result == emptySet<String>())
+        }
+        assertEquals(1, reads.get())
+    }
+
+    // P3-8: invalidate() wakes grace-parked followers. A follower parked in
+    // waitGrace does NOT need the leader's commit to return: invalidate()
+    // drops the in-flight single-flight claim and notifyAll() wakes every
+    // follower parked in the grace wait; the woken follower re-checks `valid`
+    // (false right after an invalidate) and falls back to seed-only instead
+    // of parking out its full grace window. The follower result here is
+    // seed-only (never the leader's would-be value, which is discarded as a
+    // loser after the generation bump anyway).
+    @Test
+    fun invalidateWakesGraceParkedFollowerPromptly() {
+        val cache = EffectivePolicyCache()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        // T-F9: failure flag set inside the reader thread, asserted on the
+        // main thread — an assertTrue() inside the reader would be swallowed
+        // by the cache's failed-read handling (Throwable -> null).
+        val leaderLatchFailed = AtomicBoolean(false)
+        val leader = Thread {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                leaderStarted.countDown()
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
+                setOf("leader")
+            }
+        }
+        leader.start()
+        try {
+            assertTrue("leader must enter reader", leaderStarted.await(5, TimeUnit.SECONDS))
+            // Generous grace: without a working invalidate()-notifyAll wake the
+            // follower would park the full 10s — this test joins with 2s and
+            // asserts completion, so a broken wake fails loudly instead of the
+            // follower silently parking out the window.
+            var followerResult: Set<String>? = null
+            val follower = Thread {
+                followerResult = cache.get(
+                    emptySet(),
+                    nonEmptyPolicyGateOpen = true,
+                    followerGraceMs = 10_000L,
+                ) {
+                    setOf("unexpected")
+                }
+            }
+            follower.start()
+            // Deterministic handshake: wait until the follower entered the grace
+            // wait (followerGraceHits is bumped just before waitGrace), never a
+            // fixed sleep. Bounded spin with yield — 5s cap.
+            val graceDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (cache.followerGraceHits.get() < 1L && System.nanoTime() < graceDeadlineNanos) {
+                Thread.yield()
+            }
+            assertEquals(1L, cache.followerGraceHits.get())
+            cache.invalidate()
+            follower.join(2_000)
+            assertFalse("invalidate() must wake the grace-parked follower promptly", follower.isAlive)
+            assertEquals(emptySet<String>(), followerResult)
+            // The woken follower fell back to seed-only via the grace arm.
+            assertEquals(1L, cache.graceExpiredSeedOnly.get())
+            leaderRelease.countDown()
+            leader.join(2_000)
+            assertFalse(leader.isAlive)
+            assertFalse("leader latch never released", leaderLatchFailed.get())
+        } finally {
+            // Best-effort force-release: an assert failure above must never leak
+            // this non-daemon leader parked in the shared JVM. Extra countDowns on
+            // a CountDownLatch are safe, and the join is best-effort.
+            leaderRelease.countDown()
+            try {
+                leader.join(5_000)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // Stage C: gate closed short-circuits to empty with zero reader calls and
+    // no state change (a later gate-open read still performs a fresh read).
+    @Test
+    fun gateClosedShortCircuitsWithZeroReads() {
+        var reads = 0
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(0, reads)
+        assertFalse(cache.isCached())
+        // No state was populated: the first gate-open read still reads once.
+        assertEquals(
+            setOf("com.seed.app", "com.remote.app"),
+            cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+                reads++
+                setOf("com.remote.app")
+            },
+        )
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun cooldownThrottlesFailedReads() {
+        var reads = 0
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        cache.invalidate()
+        val r1 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            null
+        }
+        assertEquals(setOf("com.seed.app"), r1)
+        assertEquals(2, reads)
+
+        val r2 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        // After invalidation, the cooldown path must not resurrect the stale
+        // pre-invalidation cached value: it falls back to the seed alone.
+        assertEquals(setOf("com.seed.app"), r2)
+        assertEquals(2, reads)
+
+        time = 7_000
+        val r3 = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            setOf("com.remote.app")
+        }
+        assertEquals(setOf("com.seed.app", "com.remote.app"), r3)
+        assertEquals(3, reads)
+    }
+
+    @Test
+    fun throwingReaderIsFailedReadAndRetried() {
+        var reads = 0
+        val time = java.util.concurrent.atomic.AtomicLong(0)
+        val cache = EffectivePolicyCache(nowMs = { time.addAndGet(6_000) })
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            throw RuntimeException("boom")
+        }
+        assertEquals(setOf("com.seed.app"), first)
+        assertEquals(1, reads)
+
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            throw RuntimeException("boom")
+        }
+        assertEquals(setOf("com.seed.app"), second)
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun cooldownWithNoPriorGoodValueReturnsSeed() {
+        var reads = 0
+        var time = 0L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        val first = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            null
+        }
+        assertEquals(setOf("com.seed.app"), first)
+        assertEquals(1, reads)
+
+        time = 1_000L
+        val second = cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) {
+            reads++
+            null
+        }
+        assertEquals(setOf("com.seed.app"), second)
+        // Cooldown now triggers even at epoch 0: the second read is throttled.
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun invalidateResetsCooldownAndAllowsImmediateRetry() {
+        var reads = 0
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        // First a successful read, then invalidate, then a failed read that
+        // starts a cooldown.
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("a") }
+        cache.invalidate()
+        val r1 = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; null }
+        assertEquals(emptySet<String>(), r1)
+        assertEquals(2, reads)
+        // Within the cooldown window, a second read would normally be
+        // throttled; but an explicit invalidate resets the cooldown and lets
+        // the reader run again immediately.
+        cache.invalidate()
+        val r2 = cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("b") }
+        assertEquals(setOf("b"), r2)
+        assertEquals(3, reads)
+    }
+
+    @Test
+    fun isCachedAndHadGoodValueTransitions() {
+        val cache = EffectivePolicyCache()
+        assertFalse(cache.isCached())
+        assertFalse(cache.hadGoodValue())
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
+        assertTrue(cache.isCached())
+        assertTrue(cache.hadGoodValue())
+        cache.invalidate()
+        assertFalse(cache.isCached())
+        assertTrue(cache.hadGoodValue())
+        // A failed read with no prior good value keeps both false.
+        val c2 = EffectivePolicyCache()
+        c2.get(emptySet(), nonEmptyPolicyGateOpen = true) { null }
+        assertFalse(c2.isCached())
+        assertFalse(c2.hadGoodValue())
+    }
+
+    @Test
+    fun failureLoggingTransitionsOncePerRecovery() {
+        val cache = EffectivePolicyCache()
+        // First-ever failure logs.
+        assertTrue(cache.shouldLogFailure())
+        // Repeated failure does not log again.
+        assertFalse(cache.shouldLogFailure())
+        // A successful read resets the transition, so the next failure logs.
+        cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") }
+        assertTrue(cache.shouldLogFailure())
+        // Invalidate resets the transition as well.
+        cache.invalidate()
+        assertTrue(cache.shouldLogFailure())
+    }
+
+    @Test
+    fun cacheExpiresAfterMaxAgeAndRereads() {
+        var reads = 0
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        assertEquals(setOf("a"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("a") })
+        assertEquals(1, reads)
+        // After the bounded freshness TTL, a valid cache is re-read even
+        // without an explicit invalidation.
+        time = 1_000L + 60_000L
+        assertEquals(setOf("b"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { reads++; setOf("b") })
+        assertEquals(2, reads)
+    }
+
+    @Test
+    fun ttlExpiryThenFailedReadFallsBackToSeed() {
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        assertEquals(setOf("a"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("a") })
+        // Expire the cache, then a failed re-read must not resurrect the stale
+        // value: it falls back to the seed alone (fail-closed).
+        time = 1_000L + 60_000L
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), nonEmptyPolicyGateOpen = true) { null })
+    }
+
+    // 冷卻滑動回歸：連續失敗仍節流。四次 get、時間推進跨兩窗口，reads==2。
+    // 第一次失敗建冷卻；第二次在窗內被節流；第三次跨窗重試再失敗（刷新冷卻）；
+    // 第四次落在「舊窗口外、新窗口內」，唯有滑動刷新才會被節流（舊碼僅首錯
+    // 設 lastFailureMs，第四次會誤重試致 reads==3）。
+    @Test
+    fun cooldownThrottlesConsecutiveFailures() {
+        var reads = 0
+        var time = 1_000L
+        val cache = EffectivePolicyCache(nowMs = { time })
+        val failing: () -> Set<String>? = { reads++; null }
+
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
+        assertEquals(1, reads)
+
+        time = 2_000L
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
+        assertEquals(1, reads)
+
+        time = 7_000L
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
+        assertEquals(2, reads)
+
+        // 舊窗口（自 1_000 起 5s）已過，新窗口（自 7_000 起 5s）內：必須節流。
+        time = 8_000L
+        assertEquals(setOf("com.seed.app"), cache.get(setOf("com.seed.app"), true, reader = failing))
+        assertEquals(2, reads)
+        // O3: the two cooldown-throttled seed-only returns (at t=2_000 and
+        // t=8_000) are counted, so H9 sees the cooldown fallback shape.
+        assertEquals(2L, cache.cooldownFallbackSeedOnly.get())
+    }
+
+    @Test
+    fun gateClosedNonEmptyRemoteReturnsEmpty() {
+        // Default gate (closed): sanitized non-empty merge must not reach
+        // callers even through the cache layer (observe-only).
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) { setOf("com.remote.app") },
+        )
+        assertEquals(
+            emptySet<String>(),
+            cache.get(emptySet()) { setOf("a") },
+        )
+    }
+
+    @Test
+    fun gateClosedSeedFallbackReturnsEmpty() {
+        // Default gate (closed): seed-only fallback is also blocked while the
+        // gate is closed (fail-closed to empty, not the seed alone).
+        val cache = EffectivePolicyCache()
+        assertEquals(
+            emptySet<String>(),
+            cache.get(setOf("com.seed.app")) { null },
+        )
+    }
+}

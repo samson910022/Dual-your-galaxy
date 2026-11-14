@@ -2,6 +2,7 @@
 <!-- MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content. -->
 <!-- App manifest: launcher activity plus Shizuku provider and dual-app permissions. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.galaxydual.plus">
 
     <!-- PR-7 P2 (#26) 權限審計結論 (見 docs/USAGE.md「權限」節): -->
@@ -22,6 +23,7 @@
          選取僅本機持久化，重裝即失效符合 fail-closed。 -->
     <!-- Do NOT add android:sharedUserId: uid-equality gate (ShizukuCmdGateway.isAllowedCaller) would admit sibling packages; redesign gate first. ShizukuProvider is not a trust boundary for GalaxyExecService. -->
     <application
+        android:name=".GalaxyApp"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Galaxy Dual Plus"
@@ -46,5 +48,29 @@
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Stage2 (hook-policy-source P1):移除 libxposed service AAR 合併進來
+             的 XposedProvider (同 authority ${applicationId}.XposedService)。
+             原宣告 exported 且無權限,任何 app 皆可呼叫 SendBinder 交付假
+             IBinder 劫持政策通道;改以守衛版取代 (見下一節點)。
+             註:tools:node="replace" 對不同名節點無效 (merger 以 name 配對,
+             會產生 duplicate authority),故以 remove + 宣告為可靠做法。 -->
+        <provider
+            android:name="io.github.libxposed.service.XposedProvider"
+            tools:node="remove" />
+
+        <!-- 守衛版 provider:同一 authority,但只信任 LSPosed daemon
+             (僅 root(0)/system(1000)/self，shell 拒絕——其 callingUid 由
+              kernel 設定、一般 app 無法偽造),見 GuardXposedProvider。
+             Threat model: this exported provider accepts SendBinder only from
+              root (uid 0) / system (uid 1000, appId 1000) / the app itself;
+              every other caller — including shell (2000) — is rejected with
+              null. The checked UID is the kernel-set Binder.getCallingUid(),
+              never a caller-supplied value. -->
+        <provider
+            android:name=".GuardXposedProvider"
+            android:authorities="${applicationId}.XposedService"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
     </application>
 </manifest>

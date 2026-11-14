@@ -15,14 +15,83 @@
 - 原本回傳 `true`／已在名單 → 保持不變。
 - 原本回傳 `false`／不在名單 → 僅當該包名在模組政策集合內才放行。
 - 目前政策集合（`EXTRA_WHITELIST_PACKAGES`，經 `PolicySource.effective(seed, remote)`
-  決策）預設為**空**，即 hooks 為 observe-only 佔位：會安裝、會記 log，
-  但不改變任何行為。接上政策來源（例如 RemotePreferences）後才真正放寬。
-  決策為 union-only（只增不減），包名校驗與 `core/ShellEscaper` 同規則；
-  靜態欄位合併由純函數 `WhitelistPatch` 執行（`MutableList` 原地追加、
-  `String[]` 重建替換，其餘一律放棄並記 log）。`remote` 快照目前為空
- （無政策來源已接線；未來工作才考慮 RemotePreferences 唯讀＋變更監聽），
-  行為與空種子完全一致
-  [待實機驗證]。
+  決策）的靜態種子為**空**，故 hooks 為 observe-only 佔位：會安裝、會記 log，
+  但不改變任何行為。決策為 union-only（只增不減），包名校驗與
+  `core/ShellEscaper` 同規則；靜態欄位合併由純函數 `WhitelistPatch` 執行
+  （`MutableList` 原地追加、`String[]` 重建替換，其餘一律放棄並記 log）。
+- 政策來源已接線：App 端（`GalaxyApp` 取得 `XposedService`）把使用者草稿
+  寫入 LSPosed remote preferences group `dual_policy`／key
+  `extra_whitelist_packages`；hook 側 `DualHook.readRemotePolicy()` 以
+  `getRemotePreferences(PolicySource.POLICY_PREFS_NAME)` 讀同一 group/key。常數單一來源於
+  `PolicySource.POLICY_PREFS_NAME`／`POLICY_KEY_EXTRA_PACKAGES`。
+- owner-user 需求：hook 讀 user 0；草稿必須由 owner user 寫入（非 owner
+  用戶的寫入不會被 hook 讀到）。「hook 讀 user 0」為 assertion，非實機證明；
+  app 寫入後 hook 是否真讀到，需 on-device 端到端證明（DEVICE-UNVERIFIED）。
+- 跨行程新鮮度（P1-1，已修正為 POLL ONLY，API 102.0.0 無推送）：
+  LSPosed API 102.0.0 的 `IXposedService` **沒有**遠端偏好回調 transaction；
+  `RemotePreferences` 在 daemon 抓取 `mMap` 一次後只通知**同行程**監聽器；
+  `XposedService.getRemotePreferences` 為 `computeIfAbsent` 永久快取。
+  因此 hook 行程註冊的 `OnSharedPreferenceChangeListener` **永遠不會**因
+  app 行程寫入而觸發——舊文案「daemon 推送＋invalidate 近乎即時」為誤述，
+  已更正。`DualHook` 保留註冊僅為同行程 hygiene（防 stale-instance 洩漏），
+  新鮮度**不依賴**它。新鮮度機制＝**輪詢**：
+  `EffectivePolicyCache` TTL（`maxCacheAgeMs` 60 秒）到期後下次讀取重讀同一
+  cached 實例；因實例永久快取，輪詢仍可能讀到舊值直到**重啟**（daemon 重建
+  才重同步權威值）。（寫入側的「版本／序列鍵」方案——`dual_policy` 內另存
+  `extra_whitelist_version` 單調序號，hook 側比對序號判定是否過期——**規劃中／未實作**：
+  目前沒有任何代碼讀寫該鍵，見下），讀者目前僅能以 TTL＋重啟語義判定新鮮度，
+  重啟語義見 §2.3。端到端仍需 on-device 驗證
+  （DEVICE-UNVERIFIED）。
+   hook 側 TTL 一覽（皆見 `EffectivePolicyCache`，與 App 側 TTL 對照見 `docs/USAGE.md` 政策 TTL 對照表）：
+   - 快取 TTL `maxCacheAgeMs` 60 秒：到期後下次讀取 fail-closed 回 seed（`invalidated=true`），不復活過期值；TTL 到期不 bump 世代（到期前已發起的在途新鮮讀仍可滿足到期）。能力缺失（`PROP_CAP_REMOTE` false→`emptySet()` 成功空讀）同樣被快取 60 秒，故 false 有效重試＝max(60 秒 TTL，5 秒 latch 內閘)；latch 5 秒僅在快取 miss（TTL 到期／`invalidate()`）後才可達。
+   - 失敗節流 `failureCooldownMs` 5 秒：遠端讀取失敗（null／拋出，未被快取）後不重試 reader，回 `last-known-good`（未 invalidate 時）或 seed；`invalidate()` 顯式重置節流。注意與上條區分：失敗（未快取）由 5 秒節流，能力-false 空讀（已快取）由 60 秒 TTL 閘控。
+    - reconciler 總預算 `POLICY_RECONCILE_TOTAL_BUDGET_MS` 15 秒（App 側，Stage F2/G2）：reconciler join＋3 讀＋退避合計有界；超限即誠實 unresolved（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留＋`RECONCILING` 續留，Tx 存活），由手動 `refreshPolicyDraft` late-join 結清回 `IDLE`（見 `docs/USAGE.md` 政策 TTL 對照表）。
+    - 單次 auto-recheck（App 側，Stage G2）：`deferred.invokeOnCompletion` 在 handoverTx 登記時掛單次權威重查（`boundedReconcileRead` 有界獨立池，不耗 reconciler 三讀預算）→走 settle helper（deferred 完成＋Known==預期才結清）；Unknown 保持 unresolved＋`UNRESOLVED_REFRESH`（按鈕即重新整理草稿，待手動 refresh late-join）。
+   - 閘門關閉短路（Stage C）：`NON_EMPTY_POLICY_EFFECTIVE_GATE` 關閉時 `get()` 直接回空集合，不碰 reader、不加鎖、不讀時鐘——observe-only 下零 IPC 讀取，故上述 TTL 在閘門關閉時皆不觸發。
+- 樂觀快取限制：`RemotePreferences.commit()` 先更新行程內快取再走 binder，
+  故 save/clear 失敗後同一行程的 `load()` 可能樂觀讀到未落盤的值；冷啟動
+  會從 daemon 重新抓取。hook 側框架的快取／讀取行為（是否一律讀取 daemon
+  的權威值）尚未實機驗證（DEVICE-UNVERIFIED）。App 在失敗發生時即回報
+  失敗，不以樂觀值宣稱成功。
+  App 側另有新身份穿透實驗路徑（DEVICE-UNVERIFIED）：失敗後僅當 provider
+  解出不同身份的新 `SharedPreferences` 實例才允許一次穿透讀，同實例永回
+  Unknown 直到成功 save/clear；此「新身份＝新 mMap」僅為比較假設，未經
+  on-device 證明——若 LSPosed 同 group 永回同一快取實例則此層生產永不命中，
+  若 wrapper 共享底層 mMap 則仍有污染風險。TODO(on-device)：驗證 daemon 重建
+  後新實例是否重同步權威值、同 group 是否回同一實例、wrapper 是否共享 mMap。
+  版本／序列鍵（P1-1 poll 配套，**規劃中／未實作**，DEVICE-UNVERIFIED）：此方案尚未接線——
+  沒有任何代碼讀寫 `extra_whitelist_version`（寫入側 save/clear 不 bump、hook 側重讀不比對）。
+  規劃內容為：寫入側在同 group 另存單調 `extra_whitelist_version`（Long，每次 save/clear＋1），
+  hook 側重讀時比對序號（舊序號＝過期，沿用 TTL 回退），App 側 reconciler／refresh 以序號
+  判定是否需重讀。即使將來實作，序號本身亦經同一永久快取實例，故仍受重啟語義約束（daemon
+  重建前序號亦可能過期），僅為「可觀測的新鮮度證據」，非推送替代。目前新鮮度僅靠 TTL＋重啟語義，
+  不得假設序號存在。
+- App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
+  Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
+  生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
+  （Unknown fence、blind-clear 二次確認〈僅 Unavailable 瞬斷專用：第一次 tap 告警並 arm，
+  第二次 tap 先判 TTL〈逾 5 分鐘重 arm〉再判世代〈`policyDraftVersion`／`policyFreshnessGen`
+  失配重 arm〉，同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm；
+  Corrupt 永不盲清，走修復流程〉、手動重整、超時轉 RECONCILING 核對）；端到端仍
+  DEVICE-UNVERIFIED。
+- 熱路徑 stall 預算（P1-2，K4 P2#6 硬化，Phase7 端到端 total）：hook 白名單查詢執行緒上的有效政策重讀經
+  `PolicyRefreshGate`（at-most-one guard＋stuck-worker breaker）＋零隊列執行器
+  （`ThreadPoolExecutor(0,1,60s,SynchronousQueue)`，滿載／爭用即拒收）＋50ms 端到端總預算
+  （`DEFAULT_STALL_BUDGET_MS`，Phase7 起為 capability＋prefs 兩段共享的單一 total：每段取
+  `min(50, remaining)`，`remaining<=0` 直接跳過 fail-closed 回 null；follower grace 取
+  `min(50, remaining)`，耗盡強制 0）；超時／爭用／拒收／熔斷／deadline 耗盡一律回 seed／last-known-good
+  （fail-closed observe-only），慢 binder 讀在背景取消（uninterruptible 讀亦僅滯留
+  單一 worker，隊列恆零、不增長），永不 pin 住查詢執行緒。強制重建卡死的 uninterruptible worker 現受
+  **兩道獨立上限**約束（PR#60 r6 Finding #3）：(1) 每個 invalidate-epoch 的 `MAX_WORKER_REBUILDS`（回收節流，
+  `invalidate()` 會歸零 `workerRebuilds`）；(2) 每個 gate 實例的 `MAX_PROCESS_ABANDONED_WORKER_REBUILDS=4L`
+  （process-lifetime 硬駐留上限，`invalidate()`／`onSuccess()` 皆不重置；全行程兩個 gate ⇒ 最多 8 個殘留
+  stuck daemon）。重建時 `activeCount<=0` 的 drained worker 不消耗此預算；真正 abandon（activeCount>0 且已換新
+  executor）才計數。超過 cap 一律 fail-closed（丟棄＋有界日誌＋backoff 續期，不再開新執行緒）；**超過 cap 後、worker 仍 busy 時僅能 process restart 恢復**（或將來另行設計有界 rebind；drained worker 走半開探針照常恢復、不消耗此預算）——此為刻意僅記錄、不實作的重啟策略，文件不承諾其自動恢復。
+  JVM 以 `PolicyRefreshBudgetTest`
+  鎖定超時回退（leader-timeout）＋`PolicyRefreshGateTest` 鎖定有界＋熔斷＋invalidate 恢復＋
+  `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速），
+  並以 `PolicyRefreshGateProcessCapTest` 鎖定 epoch 與 process 預算分離（invalidate 只重置 epoch）、drained 探針
+  不消耗 process 預算、cap 耗盡後一律 fail-closed（拒絕換新 executor）、以及雙 gate 實例預算互相獨立。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
@@ -198,6 +267,8 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   （`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，空政策原樣返回 observe-only）。
   JVM 單測僅鎖定 `WhitelistPolicy.apply`／eligibility／guard 決策，安裝與回調需 LSPosed
   daagent 實機驗證。
+- 持久化與生效的區分：App 端成功持久化草稿（`HookPolicyStore` save/clear → LSPosed remote preferences group `dual_policy`）僅證明寫入通道，**不**代表 daagent（或 system_server）已套用或撤銷任何政策。端到端 DEVICE-UNVERIFIED；政策是否真正生效需 on-device 驗證（見 §1.4 硬閘門）。
+
 
 ### 1.4 JVM 測試邊界與啟用非空政策前的硬閘門
 
@@ -207,10 +278,18 @@ hook 是否真的安裝、攔截器 callback 是否被命中、符合 eligibilit
 LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPosed 執行行為、ART 內聯／
 去最佳化效果亦不在 JVM 測試範圍（見 §1.2 反內聯待辦）。
 
+JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLICY_EFFECTIVE_GATE` 的依據**——開 gate 只認下列硬閘門的裝置證據，不以 JVM 綠燈開啟 gate。
+
 **程式碼層級非空政策閘門（code gate，非裝置驗證）：** `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`
 （預設 `false`）關閉時，`PolicySource.effective(...)` 即使在 sanitized 合併後產生非空集合，也會
 **fail-closed 回傳空集合**（Stage 1 預設 observe-only 不變）。此閘門僅為程式碼層級阻擋，必須保持
 `false`，直到下列裝置硬閘門（hard gate）以裝置證據滿足後才考慮開啟；開啟本身不構成裝置驗證。
+**程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
+
+| # | sealed gate | 行為 | JVM 鎖定 |
+| --- | --- | --- | --- |
+| S1 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（`const val = false`，編譯期封緘，執行期不可翻轉） | `effective()` 的 sanitized 非空合併一律回空集合 | `PolicySourceTest`（gate 預設關閉斷言） |
+| S2 | `EffectivePolicyCache.get()` 閘門關閉短路（Stage C） | 關閉時直接回空，不碰 reader、不加鎖、不讀時鐘（零 IPC 讀取） | `EffectivePolicyCacheTest`（gate-closed 零讀取） |
 
 **啟用任何非空政策前的硬閘門（hard gate，缺一不可）：**
 
@@ -219,6 +298,7 @@ LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPo
 3. **callback 命中**證據（非 marker／clinit-only）；能區分「hook 已裝」與「查詢路徑真的被攔截」。
 4. 正確處理 Android user／profile isolation 與 install-state 語意（尤其 `*Installed*Whitelist*` 複合查詢的 userId／已安裝判斷）；Stage 1 對此類查詢 **fail-closed 排除**，S24／DAAgent 相關 overload 仍標記 **[待實機驗證]**。
 5. 在目標 ROM（例如 S24／DAAgent）做**受控的空政策 vs 非空政策**對照，確認只有預期查詢被擴展、安裝／移除／Knox 路徑不受影響，且無 bootloop／崩潰回歸。
+6. **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy` 集合寫入；`extra_whitelist_version` 版本序號 bump **未實作**，不得作為本閘門的前提）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。
 
 Stage 1 明確保持 `*Installed*Whitelist*` 排除：daagent 不掛
 `getAllInstalledWhitelistedPackages`／`isInstalledWhitelistedPackage`；system_server 不掛
@@ -245,8 +325,13 @@ system vs android 釐清：`system` 是 LSPosed 作用域偽名（代表 system_
 留空 scope 只會擴大注入面；將來真有 settings 側檢查再加回。
 
 自報 scope（H3 評估、H4 退場）：自 scope prefs 自報方案已由 F4b-P2
-file marker（`HookMarker`：`/data/system` 主＋`/data/local/tmp` 備，
-scope `system_server`／`daagent`，按實際安裝數寫入，見本文件 §1.2／§1.3
+file marker（`HookMarker`：自 Phase 5 起每 scope 各寫一個檔，
+`/data/system/galaxydual_hook.active.{system_server,daagent}` 為主、
+`/data/local/tmp/…` 同名為備（僅 tmp+rename 寫入；rename 被拒＝marker 不寫成，直接覆寫的後備路徑已移除；是否顯示「未偵測到」依本文件 §1.5 四態規則——僅當確定可讀但缺失時顯示；無可判讀通道時一律顯示「狀態未知」；事實上，一個 gateway 六條皆返回 exit 0 且六份內容皆非 malformed（空白或可解析且無 scope 之乾淨標記）時，即使直接讀因 EACCES 全拒絕，仍可裁定「未偵測到」——取決於讀取當下的判讀，非固定字串；tmp+rename 亦隱含兩項副作用：寫入前會掃除同目錄下逾 60 秒的 `*.tmp-*` 孤兒暫存檔（至多 16 個），以及對父目錄呼叫 `mkdirs()`）；
+parser 仍相容舊版單檔
+`/data/system/galaxydual_hook.active`＋`/data/local/tmp/...`，App 側恆 union
+六路徑，scope `system_server`／`daagent`；`/data/local/tmp` 路徑僅作存在性證據（1777 目錄下，凡該 ROM 的 SELinux 策略允許寫入 shell_data_file 的域——例如 shell／root，S24 上 system_server 皆得 EACCES；本機 app 能否寫入亦屬 ROM 相關——皆可預置 `scope=system_server,daagent`
+內容偽造「偵測到歷史 Hook 標記」，不證明 hook 安裝、不證明權限），見本文件 §1.2／§1.3
 與 `HookMarker.kt`）取代，不再注入自家 UI 進程。理由：file marker 有
 S24 實機 EACCES 經驗＋安裝數證據（未安裝不寫，誠實 "not detected"），
 是目標 hook 存活證據；自家 prefs 只能證明自注入，需額外 2 scope 的
@@ -309,11 +394,19 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - 驗證 marker 檔案（需 ROOT／shell 讀權限；App 直接讀不到即顯示「狀態未知」，
   屬正常 fail-closed，不代表 hook 沒裝；僅確定可讀但缺失才顯示「未偵測到」）：
   ```bash
-  adb shell su -c 'cat /data/system/galaxydual_hook.active' 2>/dev/null \
-    || adb shell cat /data/local/tmp/galaxydual_hook.active
-  # 期望輸出（scope 依實際安裝而定）：
-  # scope=daagent,system_server
-  # timeMs=1710000000000
+  for p in /data/system/galaxydual_hook.active.system_server \
+           /data/system/galaxydual_hook.active.daagent \
+           /data/local/tmp/galaxydual_hook.active.system_server \
+           /data/local/tmp/galaxydual_hook.active.daagent \
+           /data/system/galaxydual_hook.active \
+           /data/local/tmp/galaxydual_hook.active; do
+    adb shell su -c "cat $p" 2>/dev/null
+  done
+  # Phase 5 起每個 scope 各寫一個檔（system_server / daagent 進程各自只寫自己的；
+  # 舊版單檔 galaxydual_hook.active 仍會被讀取相容）：
+  #   /data/system/galaxydual_hook.active.system_server -> scope=system_server
+  #   /data/system/galaxydual_hook.active.daagent       -> scope=daagent
+  #   timeMs=1710000000000
   ```
   App 內 LSPosed 模式的 Hook 行顯示同一內容（歷史標記文案／`未偵測到`／`狀態未知（…）`）。
 
@@ -330,7 +423,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 ## English Summary
 
 - The hook module extends Samsung Dual whitelist *queries* only (extend-only, never shrink);
-  default policy set is empty so hooks are observe-only placeholders.
+  default policy set is empty so hooks are observe-only placeholders; the draft channel (app → remote prefs group `dual_policy` → hook read) is wired but end-to-end DEVICE-UNVERIFIED.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
   (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/
   `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity
@@ -363,6 +456,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   A code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) until that hard gate is satisfied;
   this is a code gate, not device verification, and Stage 1 defaults remain unchanged.
+
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>observe-only;
