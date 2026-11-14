@@ -9027,13 +9027,18 @@ class DualViewModel(
                                         // authoritative observation of the committed draft —
                                         // clear the stale flag (unconditional, matching the
                                         // foreign-known-settle handler). markObservedKnown() is
-                                        // deliberately NOT called here: when stamped != null the
-                                        // stamped under commitMutex inside emitTxSettledStageOnly; observedSnapshot is set from stamped.rev immediately after staging (no sampling race), so a
-                                        // mark would be redundant AND could overshoot observed to
-                                        // an unseen FOREIGN B commit; when stamped == null the
-                                        // reachable states (coord==null legacy → sampled=-1 →
-                                        // falls back to current observed — a no-op) make the
-                                        // mark meaningless at best.
+                                        // deliberately NOT called here. When stamped != null,
+                                        // observedSnapshot was already set to stamped.rev inside
+                                        // emitTxSettledStageOnly (no sampling race), so a mark
+                                        // would be redundant AND could overshoot observed to an
+                                        // unseen FOREIGN B commit. When stamped == null (no staged
+                                        // payload): (a) coord==null legacy → sampledCurrentRevision()
+                                        // returns -1 → mark is a no-op; (b) claimless-with-coordinator
+                                        // edge → sampledCurrentRevision() returns committedRevision()
+                                        // (>= 0, unconditionally assigned, no max/merge) and COULD
+                                        // absorb a foreign commit. The defense is therefore that this
+                                        // call site NEVER marks; the no-mark rule is the contract,
+                                        // not an impossibility proof.
                                         try { policyRevisionStale.set(false) } catch (_: Exception) { }
                                         bumpPolicyGenerations()
                                         disarmBlindClear()
@@ -10017,13 +10022,18 @@ class DualViewModel(
                                     // authoritative observation of the committed draft —
                                     // clear the stale flag (unconditional, matching the
                                     // foreign-known-settle handler). markObservedKnown() is
-                                    // deliberately NOT called here: when stamped != null the
-                                    // stamped under commitMutex inside emitTxSettledStageOnly; observedSnapshot is set from stamped.rev immediately after staging (no sampling race), so a
-                                    // mark would be redundant AND could overshoot observed to
-                                    // an unseen FOREIGN B commit; when stamped == null the
-                                    // reachable states (coord==null legacy → sampled=-1 →
-                                    // falls back to current observed — a no-op) make the
-                                    // mark meaningless at best.
+                                    // deliberately NOT called here. When stamped != null,
+                                    // observedSnapshot was already set to stamped.rev inside
+                                    // emitTxSettledStageOnly (no sampling race), so a mark
+                                    // would be redundant AND could overshoot observed to an
+                                    // unseen FOREIGN B commit. When stamped == null (no staged
+                                    // payload): (a) coord==null legacy → sampledCurrentRevision()
+                                    // returns -1 → mark is a no-op; (b) claimless-with-coordinator
+                                    // edge → sampledCurrentRevision() returns committedRevision()
+                                    // (>= 0, unconditionally assigned, no max/merge) and COULD
+                                    // absorb a foreign commit. The defense is therefore that this
+                                    // call site NEVER marks; the no-mark rule is the contract,
+                                    // not an impossibility proof.
                                     try { policyRevisionStale.set(false) } catch (_: Exception) { }
                                     bumpPolicyGenerations()
                                     disarmBlindClear()
