@@ -627,6 +627,9 @@ class PolicyRefreshGate(
                     throw PolicyRefreshContentionException("busy")
                 }
                 if (!outstanding.tryAcquire()) {
+                    // Same metric as its sibling busy arm above: the refusal
+                    // is a stuck-busy drop, not a plain guard contention.
+                    busyStuckDrops.incrementAndGet()
                     stuckShortCircuits.incrementAndGet()
                     droppedRefreshCount.incrementAndGet()
                     throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
@@ -1097,7 +1100,13 @@ class PolicyRefreshGate(
         }
         if (trip && !stuckOpen) {
             stuckOpen = true
-            halfOpenFailures.set(0L)
+            // Deliberately NO halfOpenFailures reset here: the breaker opening
+            // is carried by stuckOpen=true and halfOpenCooldownMs() derives
+            // from the counter. A racing onProbeFail may have just incremented
+            // it; zeroing here would erase that increment and regress the
+            // half-open backoff schedule to its initial cooldown (30s) for a
+            // still-failing upstream. Success is the only legitimate resetter
+            // (same discipline as the invalidate()/onSuccess() resets).
             try {
                 lastStuckOpenMs.set(nowMs())
             } catch (_: Throwable) {

@@ -45,11 +45,39 @@ class WhitelistPatchReflectTest {
         var ARR: Array<String> = arrayOf("a")
     }
 
+    // Hostile ROM list whose iterator() throws: the field-loop entry point
+    // must still evaluate the SIBLING candidate field (sibling isolation;
+    // one hostile field may never deny the other its outcome entry).
+    object HostileDualListHolder {
+        @JvmField
+        var BAD: MutableList<String> = HostileIteratorList()
+
+        @JvmField
+        var GOOD: MutableList<String> = mutableListOf("a")
+    }
+
+    // Mirrors the ROM holder shape for the hostile-list fixture: a
+    // MutableList whose iterator() throws IllegalStateException.
+    private class HostileIteratorList : AbstractMutableList<String>() {
+        private val backing: MutableList<String> = mutableListOf("a")
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun iterator(): MutableIterator<String> =
+            throw IllegalStateException("injected iterator failure")
+    }
+
     @Before
     fun reset() {
         MutableHolder.ARR = arrayOf("a")
         DualHolder.DUAL_APP_WHITELIST_PACKAGES = arrayOf("a")
         DualHolder.DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA = arrayOf("a")
+        HostileDualListHolder.BAD = HostileIteratorList()
+        HostileDualListHolder.GOOD = mutableListOf("a")
     }
 
     @Test
@@ -192,6 +220,30 @@ class WhitelistPatchReflectTest {
         val single = out.getValue("ARR")
         assertTrue(single is WhitelistPatch.Outcome.Skipped)
         assertTrue((single as WhitelistPatch.Outcome.Skipped).reason.contains("not static"))
+    }
+
+    // Sibling isolation: field 1's list throws from iterator(); the field
+    // loop must record Skipped for field 1 and still evaluate field 2 —
+    // its outcome appears in the results map, patched in place.
+    @Test
+    fun hostileFieldDoesNotDenySiblingField() {
+        val out = WhitelistPatch.patchFields(
+            HostileDualListHolder::class.java,
+            listOf("BAD", "GOOD"),
+            setOf("b"),
+        )
+        assertEquals(2, out.size)
+        val bad = out.getValue("BAD")
+        assertTrue("BAD should be Skipped, was: $bad", bad is WhitelistPatch.Outcome.Skipped)
+        assertTrue(
+            "BAD Skipped reason should mention element inspection failure, was: " +
+                (bad as WhitelistPatch.Outcome.Skipped).reason,
+            bad.reason.contains("element inspection failed"),
+        )
+        val good = out.getValue("GOOD")
+        assertTrue("GOOD should be PatchedInPlace, was: $good", good is WhitelistPatch.Outcome.PatchedInPlace)
+        assertEquals(1, (good as WhitelistPatch.Outcome.PatchedInPlace).added)
+        assertEquals(listOf("a", "b"), HostileDualListHolder.GOOD)
     }
 
     // P2 regression (PR #20): a non-public static NON-FINAL field (ROM

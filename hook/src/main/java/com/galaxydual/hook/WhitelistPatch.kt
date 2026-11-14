@@ -36,6 +36,14 @@ import java.lang.reflect.Modifier
 // list whose clear/addAll ALSO throws during rollback: union was computed on
 // a copy and the live list got only a single addAll -- it may stay dirty.
 // That class cannot be made atomic through the in-place MutableList API.
+// Two further hostile-addAll cases are indistinguishable from success and
+// are NOT signaled: (a) a hostile addAll that returns normally but mangles
+// the list -- silently dropping original ROM entries or seeding extra ones
+// -- is logged as "+N added" while the ROM list is in fact corrupted; (b) if
+// addAll throws after partially appending, the best-effort rollback
+// (clear() + addAll(snapshot)) can itself fail, and then ORIGINAL ROM
+// whitelist entries may be lost -- fail-closed for the affected apps, but
+// data loss with no signal to the caller.
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
@@ -151,7 +159,19 @@ object WhitelistPatch {
                 )
                 continue
             }
-            when (val outcome = apply(current, true, extra, name, target.name, isFinal)) {
+            // Defense-in-depth: even a hostile ROM object that escapes every
+            // guard inside apply() must not abort the whole field loop — a
+            // throwing apply() for one candidate field must never deny its
+            // sibling (DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA) its attempt.
+            // One bad field costs exactly its own outcome entry.
+            val outcome = try {
+                apply(current, true, extra, name, target.name, isFinal)
+            } catch (t: Throwable) {
+                Outcome.Skipped(
+                    "skip patch $name on $targetShort: apply threw (${HookLog.shortEx(t)})",
+                )
+            }
+            when (outcome) {
                 is Outcome.Replaced -> {
                     if (outcome.added == 0) {
                         // Already complete: skip set(), nothing to write.
@@ -210,8 +230,17 @@ object WhitelistPatch {
             // MutableList<Int> as MutableList<String> would ClassCastException
             // inside the lambda (erasure), so inspect via the star-projected
             // view first. A raw list holding non-Strings must not be polluted
-            // with Strings (would ClassCastException the reader).
-            if (current.any { it !is String }) {
+            // with Strings (would ClassCastException the reader). A hostile
+            // ROM list whose iterator()/hasNext() throws is caught here too:
+            // inspection must never escape apply() unhandled.
+            val hasNonString = try {
+                current.any { it !is String }
+            } catch (t: Throwable) {
+                return Outcome.Skipped(
+                    "skip patch $fieldName on $owner: MutableList element inspection failed (${HookLog.shortEx(t)})",
+                )
+            }
+            if (hasNonString) {
                 return Outcome.Skipped(
                     "skip patch $fieldName on $owner: MutableList holds non-String elements",
                 )

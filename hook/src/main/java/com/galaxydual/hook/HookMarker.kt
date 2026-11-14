@@ -2,6 +2,9 @@
 package com.galaxydual.hook
 
 import java.io.File
+import java.io.FileInputStream
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -35,6 +38,27 @@ import java.util.concurrent.atomic.AtomicLong
 // legacy single-file tmp path is never written again. Writer order is fixed:
 // primary first, fallback only when the primary write fails. Reader order is
 // fixed the same way, and reads UNION all six files.
+//
+// Write semantics (renamed from the old fall-back-to-direct-write): a marker
+// write is tmp-file + rename(2) only. If the rename is refused on a given
+// ROM, the tmp is deleted, nothing else is written, and the write returns
+// false — the marker is best-effort by contract, and a missing marker reads
+// as "not detected" (fail-closed). The old non-atomic direct write (which
+// followed symlinks) no longer exists.
+//
+// Spoof surface (honesty note — tracked behavior, not a bug fix): the
+// /data/local/tmp fallback paths (LEGACY_MARKER_PATH_SYSTEM_SERVER /
+// LEGACY_MARKER_PATH_DAAGENT; the read-compat legacy single-file
+// LEGACY_MARKER_PATH is never written) are unioned by readers for
+// read-compat, and /data/local/tmp is world-writable (1777). Any local app
+// can pre-create those paths with planted `scope=system_server,daagent`
+// content and flip the app's LSPosed picker row to "偵測到歷史 Hook 標記".
+// The marker is EXISTENCE evidence only — a planted file proves no hook
+// privilege and no hook installation. The reader union treats tmp-path
+// positives identically to primary-path positives (no spoof resistance);
+// the exposure is mitigated only by the existence-only UI wording and the
+// docs caveat (docs/HOOK.md §1.5). Accepted and tracked, not fixable from
+// the writer side.
 //
 // Per-scope files (Phase 5, issue #6): each hook process writes ONLY its own
 // per-scope file (tmp->rename atomic, same as before); concurrent writers
@@ -140,11 +164,24 @@ object HookMarker {
 
     // Pure: extracts the scope set; null/blank/garbage (including unknown
     // lines) yields emptySet(), never null, never throws.
+    // Bounded: at most MAX_MARKER_LINES lines are scanned; anything beyond
+    // the line cap is dropped unread (a hostile planted file cannot make the
+    // parser chew through megabytes of scope= lines). Legitimate markers
+    // are two lines, so nothing real is lost.
     // H12: scope tokens are allowlisted — only {system_server, daagent} (the
     // only scopes this module ever writes) are honored; anything else is
     // dropped (fail-closed: an unknown token can never describe a scope) and
     // counted. At most UNKNOWN_SCOPE_DROP_LOG_CAP log lines per process;
     // pass onLog to observe drops, otherwise they are counted silently.
+    // Defensive read/parse bounds (hostile or planted giant files must not
+    // be buffered whole or scanned unbounded). MAX_MARKER_BYTES caps what
+    // readScopes reads from any single marker file; anything beyond the cap
+    // is dropped. MAX_MARKER_LINES caps how many lines parseScopes scans;
+    // legitimate markers are exactly two lines (scope=..., timeMs=...), so
+    // 16 is generous headroom, not a format constraint.
+    private const val MAX_MARKER_BYTES = 8 * 1024
+    private const val MAX_MARKER_LINES = 16
+
     private val ALLOWED_SCOPES = setOf(SCOPE_SYSTEM_SERVER, SCOPE_DAAGENT)
     private const val UNKNOWN_SCOPE_DROP_LOG_CAP = 4
     val unknownScopeDrops = AtomicLong(0L)
@@ -154,7 +191,10 @@ object HookMarker {
         if (raw.isNullOrBlank()) return emptySet()
         val out = LinkedHashSet<String>()
         var dropped = 0
+        var lines = 0
         for (line in raw.lineSequence()) {
+            lines++
+            if (lines > MAX_MARKER_LINES) break
             val trimmed = line.trim()
             if (!trimmed.startsWith("scope=")) continue
             trimmed.removePrefix("scope=").split(",").forEach { token ->
@@ -188,9 +228,15 @@ object HookMarker {
     // it is not dead code — kept for the boot-time staleness comparison the
     // docs already call out as future hardening.
     // Pure: extracts the timeMs line; absent/unparseable yields null.
+    // Bounded: at most MAX_MARKER_LINES lines are scanned (mirrors
+    // parseScopes); anything beyond the cap is dropped unread. Legitimate
+    // markers are two lines, so nothing real is lost.
     fun parseTimeMs(raw: String?): Long? {
         if (raw.isNullOrBlank()) return null
+        var lines = 0
         for (line in raw.lineSequence()) {
+            lines++
+            if (lines > MAX_MARKER_LINES) break
             val trimmed = line.trim()
             if (trimmed.startsWith("timeMs=")) {
                 return trimmed.removePrefix("timeMs=").trim().toLongOrNull()
@@ -243,12 +289,12 @@ object HookMarker {
             val fallback = fallbackFile
                 ?: if (markerFile == null) fallbackMarkerPathFor(want)?.let { File(it) } else null
             val content = buildContent(setOf(want), nowMs)
-            if (primary != null && tryWrite(primary, content)) {
+            if (primary != null && tryWrite(primary, content, onLog)) {
                 safeLog(onLog, "marker wrote scope=$want")
                 return true
             }
             safeLog(onLog, "marker primary write failed, trying fallback")
-            if (fallback != null && tryWrite(fallback, content)) {
+            if (fallback != null && tryWrite(fallback, content, onLog)) {
                 safeLog(onLog, "marker wrote fallback scope=$want")
                 return true
             }
@@ -266,26 +312,61 @@ object HookMarker {
     // legacy single-file ×2) and returns the UNION, so a scope recorded via
     // any write path is honored. Garbage/unreadable files are ignored.
     // Never throws.
+    // Bounded: each file is read at most MAX_MARKER_BYTES (8 KiB) via a bounded
+    // stream read — a hostile or planted giant file is never buffered whole;
+    // bytes past the cap are dropped. parseScopes additionally scans at most
+    // MAX_MARKER_LINES (16) lines per file. Each file's read+parse is wrapped
+    // individually: a non-regular file (FIFO/device/symlink, refused before
+    // open by the no-follow gate in readTextOrNull) or an I/O error is skipped
+    // and can never zero the union of the others. (A TOCTOU regular→FIFO swap
+    // between the gate and open(2) can still block the read — see
+    // readTextOrNull; a blocked read is not an exception.)
     fun readScopes(
         markerFiles: List<File> = DEFAULT_MARKER_FILES,
     ): Set<String> {
-        return try {
-            val out = LinkedHashSet<String>()
-            for (file in markerFiles) {
+        val out = LinkedHashSet<String>()
+        for (file in markerFiles) {
+            try {
                 out += parseScopes(readTextOrNull(file))
+            } catch (_: Throwable) {
+                // Skip this file: a single failure never sinks the union.
             }
-            out
-        } catch (_: Throwable) {
-            emptySet()
         }
+        return out
     }
 
     // Null when the file is absent or unreadable (SELinux denial included);
     // never throws. Silent by design (readScopes/diagnose paths treat an
     // unreadable file as "not detected", never as active, never as an error).
+    // Bounded read: reads at most MAX_MARKER_BYTES + 1 bytes from the stream
+    // via a plain read(2)-style loop (works on every Android API level; no
+    // InputStream.readNBytes, which is only API 33+) and decodes only the
+    // first MAX_MARKER_BYTES — the tail of a bigger file is dropped.
     private fun readTextOrNull(file: File): String? {
         return try {
-            if (!file.isFile) null else file.readText()
+            // No-follow regular-file gate BEFORE opening: a planted FIFO,
+            // device node, or symlink at a marker path must not be opened
+            // (a FIFO open(2) with no writer would block the read thread
+            // forever). Folds the old File.isFile check into this single
+            // NOFOLLOW_LINKS test, which is strictly stricter (symlinks to
+            // regular files are now rejected too).
+            // TOCTOU honesty note: a hostile swap (regular -> FIFO) between
+            // this check and open(2) can still block the read. This narrows
+            // the window but does NOT eliminate it — a blocked read is not
+            // an exception, so readScopes' per-file catch cannot isolate it.
+            // There is no O_NONBLOCK equivalent in pure JVM without native
+            // calls. Best-effort narrowing, stated as such.
+            if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return null
+            FileInputStream(file).use { input ->
+                val buf = ByteArray(MAX_MARKER_BYTES + 1)
+                var off = 0
+                while (off < buf.size) {
+                    val n = input.read(buf, off, buf.size - off)
+                    if (n < 0) break
+                    off += n
+                }
+                String(buf, 0, minOf(off, MAX_MARKER_BYTES), Charsets.UTF_8)
+            }
         } catch (_: Exception) {
             null
         }
@@ -293,27 +374,43 @@ object HookMarker {
 
     // Best-effort single-file write: write to a sibling tmp file first, then
     // atomic rename over the target (H11) so a concurrent reader never
-    // observes a half-written marker. If rename is unavailable/refused on a
-    // given ROM, fall back to the old direct write (best effort, see header).
-    // false on any failure, never throws.
+    // observes a half-written marker. false on any failure, never throws.
+    // If the rename is refused on a given ROM (filesystem/SELinux — e.g. the
+    // sticky-bit EPERM when the fallback path is a pre-planted attacker-owned
+    // symlink in the 1777 /data/local/tmp), there is NO fall-through to a
+    // direct write: the tmp is deleted, the refusal is logged, and false is
+    // returned. rename-refusal ⇒ marker unwritten ⇒ "not detected" — the
+    // marker is best-effort by contract and a missing marker reads as
+    // "not detected" (fail-closed; never worse than the on-device EACCES
+    // reality). The former non-atomic direct write (file.writeText, which
+    // follows symlinks and would truncate the symlink target with
+    // system_server/daagent privileges) no longer exists.
     // CR-N3: a process that dies between the tmp write and the rename leaves
     // an orphan `*.tmp-*` sibling; delete at most ORPHAN_TMP_SWEEP_MAX such
     // siblings per call (older than ORPHAN_TMP_STALE_MS so a concurrent
     // in-flight write's tmp is never taken out from under its rename — a
-    // young tmp is skipped). Enumeration failure or any per-file error is
+    // young tmp is skipped). A sibling whose mtime cannot be determined
+    // (lastModified() == 0, stat failure) is also skipped: unknown age is
+    // treated as fresh, since deleting on a failed stat could unlink a
+    // peer's in-flight tmp. Only a known-age tmp past the staleness window
+    // is swept. Enumeration failure or any per-file error is
     // swallowed: sweeping must never break the write.
+    // Pre-planted tmp: the tmp is created with createNewFile() (atomic
+    // exists-or-creates) as the ONLY gate before writing — a tmp path that
+    // already exists (including a pre-planted symlink) is never opened or
+    // followed; the write is refused, logged, and the marker stays unwritten
+    // (fail-closed).
     // Frozen-writer caveat (SIGSTOP / debugger / frozen >= ORPHAN_TMP_STALE_MS):
     // a writer stopped after it created its tmp but before the rename can see
     // its own tmp age past the staleness window and be swept by another
-    // process's call. The rename then fails and the write falls back to a
-    // non-atomic direct write of the target (or fails). Fail-soft: the target
-    // file itself is never deleted or truncated by the sweep; at worst a
-    // crash during that direct write leaves a torn marker, which readScopes
-    // maps to "not detected" (fail-closed) — no target data loss.
+    // process's call. The rename then fails and the write is REFUSED (no
+    // direct-write fallback — see above): the marker is unwritten and reads
+    // as "not detected" (fail-closed). Fail-soft: the target file itself is
+    // never deleted or truncated by the sweep — no target data loss.
     private const val ORPHAN_TMP_SWEEP_MAX = 16
     private const val ORPHAN_TMP_STALE_MS = 60_000L
 
-    private fun tryWrite(file: File, content: String): Boolean {
+    private fun tryWrite(file: File, content: String, onLog: (String) -> Unit = {}): Boolean {
         try {
             val prefix = file.name + ".tmp-"
             val siblings = file.parentFile?.listFiles { _, name -> name.startsWith(prefix) }
@@ -324,8 +421,15 @@ object HookMarker {
                     if (swept >= ORPHAN_TMP_SWEEP_MAX) break
                     try {
                         if (!sibling.isFile) continue
+                        // lastModified() returns 0 on stat failure. mtime <= 0L
+                        // (stat failure / unknown) is treated as FRESH and
+                        // skipped — never unlink a peer's in-flight tmp on a
+                        // failed stat. Only a known-age tmp is eligible:
+                        // mtime > 0L && now - mtime >= ORPHAN_TMP_STALE_MS.
+                        // (now - mtime < 0, a future mtime, is skipped too.)
                         val mtime = sibling.lastModified()
-                        if (mtime > 0L && now - mtime < ORPHAN_TMP_STALE_MS) continue
+                        if (mtime <= 0L) continue
+                        if (now - mtime < ORPHAN_TMP_STALE_MS) continue
                         if (sibling.delete()) swept++
                     } catch (_: Throwable) {
                         // Best effort: keep sweeping.
@@ -353,17 +457,49 @@ object HookMarker {
                 // Best effort: parents normally exist.
             }
             if (tmp != null) {
+                // Single atomic exists-or-creates gate BEFORE any write:
+                // createNewFile() returns false if the tmp path already
+                // exists — including a pre-planted symlink (the symlink
+                // itself exists, so it is never opened or followed) — and
+                // atomically creates a fresh regular file otherwise. No
+                // exists() fast path: createNewFile() IS the TOCTOU-free
+                // check-and-create, so only the file this call just created
+                // is ever opened for writing. An attacker who plants the
+                // tmp between allocation and here wins nothing: the write
+                // is refused (fail-closed), never redirected.
+                val created = try {
+                    tmp.createNewFile()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!created) {
+                    safeLog(onLog, "tmp create refused for ${file.name} (pre-existing or uncreatable tmp path); marker unwritten (fail-closed)")
+                    return false
+                }
                 try {
                     tmp.writeText(content)
-                    if (tmp.renameTo(file)) return true
-                    // renameTo refused (filesystem/SELinux): fall through to
-                    // the direct write with the tmp file removed below.
-                } catch (_: Exception) {
-                    // tmp path failed: fall through to the direct write.
+                } catch (t: Exception) {
+                    // Tmp path failed: NO fall-through to a direct write
+                    // (rename-refusal semantics — see KDoc above).
+                    safeLog(onLog, "tmp write failed for ${file.name} (${HookLog.shortEx(t)}); marker unwritten (fail-closed)")
+                    return false
                 }
+                if (tmp.renameTo(file)) return true
+                // renameTo refused (filesystem/SELinux — e.g. sticky-bit EPERM
+                // on a 1777 world-writable dir with a pre-planted
+                // attacker-owned symlink at the fallback path): do NOT fall
+                // through to file.writeText — that follows symlinks and would
+                // TRUNCATE the symlink target with system_server/daagent
+                // privileges. Fail closed instead: delete the tmp (finally
+                // block), log, return false. The marker is best-effort; a
+                // missing marker reads as "not detected".
+                safeLog(onLog, "rename refused for ${file.name}; marker unwritten (fail-closed)")
+                return false
             }
-            file.writeText(content)
-            true
+            // No tmp sibling could be allocated: without the atomic rename
+            // path there is no write this contract allows.
+            safeLog(onLog, "no tmp sibling for ${file.name}; marker unwritten (fail-closed)")
+            return false
         } catch (_: Exception) {
             false
         } finally {

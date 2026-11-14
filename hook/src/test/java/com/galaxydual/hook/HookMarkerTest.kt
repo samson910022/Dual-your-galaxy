@@ -317,6 +317,103 @@ class HookMarkerTest {
         }
     }
 
+    // Phase 2(b): parseScopes line-cap: a 100-line flood (garbage first
+    // line, then scope=daagent lines, then overflow lines beyond the 16-line
+    // cap) must still recover daagent from within the first 16 lines, must
+    // not crash, and must never scan the overflow lines (pinned via the
+    // unknown-scope drop counter staying flat).
+    @Test fun parseScopes_lineCapStillRecoversScopeAndIgnoresOverflow() {
+        val raw = buildString {
+            append("garbage flood line\n")           // line 1
+            repeat(15) { append("scope=daagent\n") }  // lines 2..16 (cap)
+            repeat(84) { append("scope=evil_overflow_token\n") } // lines 17..100
+        }
+        val before = HookMarker.unknownScopeDrops.get()
+        val scopes = HookMarker.parseScopes(raw)
+        assertEquals(setOf("daagent"), scopes)
+        assertEquals(before, HookMarker.unknownScopeDrops.get())
+    }
+
+    // Finding P3 (Phase 3): parseTimeMs line-cap, mirroring parseScopes — a
+    // 100-line flood with timeMs only past the 16-line cap must yield null
+    // (the overflow line is never scanned); a timeMs inside the cap still
+    // parses.
+    @Test fun parseTimeMs_lineCapDropsOverflow() {
+        val beyondCap = buildString {
+            repeat(16) { append("junk flood line\n") }          // lines 1..16 (cap)
+            append("timeMs=1710000000000\n")                    // line 17: never scanned
+        }
+        assertNull(HookMarker.parseTimeMs(beyondCap))
+        val withinCap = buildString {
+            repeat(15) { append("junk flood line\n") }          // lines 1..15
+            append("timeMs=1710000000000\n")                    // line 16: still scanned
+        }
+        assertEquals(1710000000000L, HookMarker.parseTimeMs(withinCap))
+    }
+
+    // Phase 2(a): a ~256 KB marker file of junk bytes is never buffered
+    // whole: readScopes returns emptySet() (and the JVM would additionally
+    // throw OutOfMemoryError if the read were unbounded — deliberately not
+    // asserted).
+    @Test fun readScopes_giantFileIsBoundedAndReadsEmpty() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val file = File(dir, "galaxydual_hook.active.system_server")
+            file.writeText("junk line with no marker keys 0123456789\n".repeat(6 * 1024))
+            assertTrue("fixture should be ~256 KB, was ${file.length()}", file.length() > 200 * 1024)
+            assertEquals(emptySet<String>(), HookMarker.readScopes(listOf(file)))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // Phase 2(c): symlink-truncation regression. The evil fallback path is a
+    // pre-planted symlink to a victim file (the /data/local/tmp 1777 attack
+    // shape). The write must be REFUSED (tmp alloc fails here, mirroring the
+    // on-device sticky-bit EPERM that makes renameTo() fail) — never fall
+    // through to a direct write that follows the symlink and TRUNCATES the
+    // victim with system_server/daagent privileges.
+    // Note: with a parent directory still writable, a plain symlink lets
+    // rename(2) replace the symlink itself without touching the target, so
+    // the tmp path must be made to fail UID-independently — here by an
+    // overlong tmp filename (base name 247 chars + ".tmp-<nanoTime>-<tid>"
+    // exceeds NAME_MAX 255). The parent stays a directory; the spec's
+    // "parent is a regular FILE" variant is pinned separately below.
+    @Test fun markActive_symlinkFallbackTruncationIsRefused() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val victim = File(dir, "victim.txt").apply { writeText("IMPORTANT") }
+            val evil = File(dir, "e".repeat(240) + ".active") // 247 chars, legal name
+            Files.createSymbolicLink(evil.toPath(), victim.toPath())
+            val unwritablePrimary = File(dir, "primaryDir").apply { mkdir() }
+            assertFalse(HookMarker.markActive("daagent", unwritablePrimary, 1000L, {}, evil))
+            assertEquals("IMPORTANT", victim.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // Phase 2(c), spec-literal variant: the fallback path lives UNDER a
+    // regular file (its parent is a regular FILE, not a directory), so tmp
+    // creation and rename are impossible. markActive must return false and
+    // the victim must remain untouched. (This variant also failed closed
+    // before the direct-write removal; kept as defense-in-depth for the
+    // rename-refusal contract — the bypass it closes is pinned by the
+    // symlink test above.)
+    @Test fun markActive_parentRegularFileFallbackRefusedVictimIntact() {
+        val dir = Files.createTempDirectory("hookmarker").toFile()
+        try {
+            val victim = File(dir, "victim.txt").apply { writeText("IMPORTANT") }
+            val blocker = File(dir, "blocker").apply { writeText("not a directory") }
+            val evil = File(blocker, "evil.active")
+            val unwritablePrimary = File(dir, "primaryDir").apply { mkdir() }
+            assertFalse(HookMarker.markActive("daagent", unwritablePrimary, 1000L, {}, evil))
+            assertEquals("IMPORTANT", victim.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     // Concurrent writers of the two per-scope files never clobber each
     // other: distinct files, no shared state. (In-process stand-in for the
     // cross-process case -- not a real two-process test; proves the union
