@@ -112,8 +112,11 @@ object HookMarker {
 
     // The six marker paths every reader unions, in fixed read order:
     // per-scope primary (system_server, daagent), per-scope fallback, then
-    // the two legacy single-file paths (read-compat forever).
-    private val DEFAULT_MARKER_FILES: List<File> = listOf(
+    // the two legacy single-file paths (read-compat forever). Public: the
+    // app module (HookStateProvider / DiagnoseFreshness) unions the same
+    // list via allHookMarkerFiles() — the single source of truth; do not
+    // copy it.
+    val DEFAULT_MARKER_FILES: List<File> = listOf(
         File(MARKER_PATH_SYSTEM_SERVER),
         File(MARKER_PATH_DAAGENT),
         File(LEGACY_MARKER_PATH_SYSTEM_SERVER),
