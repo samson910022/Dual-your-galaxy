@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.galaxydual.plus.debug">
+    <application android:label="Galaxy Dual Plus">
+        <activity android:name="com.galaxydual.plus.MainActivity" android:exported="true" />
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.galaxydual.plus.debug.shizuku"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <provider
+            android:name="com.galaxydual.plus.GuardXposedProvider"
+            android:authorities="com.galaxydual.plus.debug.XposedService"
+            android:exported="true" />
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="com.galaxydual.plus.debug.androidx-startup"
+            android:exported="false" />
+        <provider
+            android:name="com.other.vendor.GuardXposedProvider"
+            android:authorities="com.galaxydual.plus.debug.XposedService"
+            android:exported="true" />
+    </application>
+</manifest>

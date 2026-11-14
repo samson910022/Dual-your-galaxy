@@ -4,6 +4,10 @@
 # release workflow (release.yml, release APKs) to avoid drift.
 #
 # Usage: verify-release-artifacts.sh <apk> [<apk>...]
+# NOTE: run from the repository root — several checks read repo-relative
+# paths (app/build.gradle.kts). The checker path itself is resolved via the
+# script's location, so this script works from any CWD; the repo-root
+# assumption is only for repo files.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -33,6 +37,10 @@ fail() {
   exit 1
 }
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROVIDER_PARITY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/provider-parity.XXXXXX")"
+trap 'rm -rf "$PROVIDER_PARITY_TMP"' EXIT
+
 for apk in "$@"; do
   if [ ! -f "$apk" ]; then
     fail "APK not found: $apk"
@@ -46,11 +54,14 @@ for apk in "$@"; do
     fail "ShizukuProvider not found in packaged manifest of $apk"
   fi
 
-  # 1b. Packaged manifest provisions exactly one GuardXposedProvider and ZERO
-  #     references to the libxposed service XposedProvider. The name count
-  #     below matches only the interpreted `name(...)="FQN"` attribute line
-  #     (exactly one per provider node); the accompanying Raw duplicate on
-  #     the same attribute does not match this pattern. Loud hard-fail, never a skip: CI has the SDK, and a
+  # 1b. Packaged manifest provisions exactly one GuardXposedProvider at the
+  #     expected authority — name and authority on the SAME <provider>
+  #     element, exported=true, no android:permission, zero libxposed
+  #     XposedProvider nodes anywhere, and zero wrong-element occurrences of
+  #     the GuardXposedProvider name (e.g. an <activity>). Enforced by parsing
+  #     the aapt2 xmltree dump (scripts/check-provider-parity.py; fixtures in
+  #     scripts/fixtures/provider-parity/ run via scripts/check-provider-parity.test.sh).
+  #     Loud hard-fail, never a skip: CI has the SDK, and a
   #     silent pass here would mask a manifest-merge regression shipping the
   #     unguarded (exported, no-permission) provider. Variant handling: PR CI
   #     invokes this on the debug APK (debug applicationIdSuffix=.debug), so the
@@ -58,30 +69,22 @@ for apk in "$@"; do
   #     is only accepted for *-debug*.apk / */debug/* paths; anything else
   #     expects the release authority (com.galaxydual.plus.XposedService, no
   #     .debug). A release-expected APK carrying the .debug authority fails.
-  if ! MANIFEST_DUMP="$("$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml 2>/dev/null)"; then
-    fail "aapt2 dump of AndroidManifest.xml failed for $apk"
-  fi
-  if [ -z "$MANIFEST_DUMP" ]; then
-    fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
-  fi
-  # aapt2 prints each attribute twice (interpreted + Raw), so count only the
-  # interpreted `name(...)="FQN"` lines: exactly one per provider node.
-  guard_nodes="$(printf '%s\n' "$MANIFEST_DUMP" | grep -oE 'name\([^)]*\)="com\.galaxydual\.plus\.GuardXposedProvider"' | wc -l | tr -d ' ' || true)"
-  if [ "${guard_nodes:-0}" -ne 1 ]; then
-    fail "expected exactly one GuardXposedProvider node in packaged manifest of $apk, found ${guard_nodes:-0}"
-  fi
-  if printf '%s\n' "$MANIFEST_DUMP" | grep -qF 'io.github.libxposed.service.XposedProvider'; then
-    fail "packaged manifest of $apk references io.github.libxposed.service.XposedProvider (unguarded provider must not ship)"
-  fi
   case "$apk" in
     *-debug*.apk|*/debug/*) EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService" ;;
     *)                      EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService" ;;
   esac
-  if ! printf '%s\n' "$MANIFEST_DUMP" | grep -qF "$EXPECTED_AUTHORITY"; then
-    fail "GuardXposedProvider authority '$EXPECTED_AUTHORITY' not found in packaged manifest of $apk"
+  MANIFEST_DUMP_FILE="$PROVIDER_PARITY_TMP/$(basename -- "$apk").xmltree.txt"
+  if ! "$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml > "$MANIFEST_DUMP_FILE" 2>/dev/null; then
+    fail "aapt2 dump of AndroidManifest.xml failed for $apk"
+  fi
+  if [ ! -s "$MANIFEST_DUMP_FILE" ]; then
+    fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
+  fi
+  if ! python3 "$SCRIPT_DIR/check-provider-parity.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE" --authority "$EXPECTED_AUTHORITY"; then
+    fail "GuardXposedProvider provider parity check failed for $apk"
   fi
   if [ "$EXPECTED_AUTHORITY" = "com.galaxydual.plus.XposedService" ] \
-    && printf '%s\n' "$MANIFEST_DUMP" | grep -qF 'com.galaxydual.plus.debug.XposedService'; then
+    && grep -qF 'com.galaxydual.plus.debug.XposedService' "$MANIFEST_DUMP_FILE"; then
     fail "release-expected APK carries the debug authority (com.galaxydual.plus.debug.XposedService): $apk"
   fi
   echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
