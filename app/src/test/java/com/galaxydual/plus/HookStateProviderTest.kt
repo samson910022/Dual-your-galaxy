@@ -548,6 +548,36 @@ class HookStateProviderTest {
         assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
     }
 
+    // Direct-read guard: a pre-planted symlink at a world-writable marker
+    // path must NOT be followed by the NOFOLLOW_LINKS regular-file guard.
+    // The link target holds a well-formed marker (would read ACTIVE if the
+    // guard were bypassed), yet diagnosis must fail closed: the direct read
+    // yields Denied, no gateway is attached, and the verdict is
+    // UNKNOWN_NO_DIAGNOSTIC — never ACTIVE off the link target, never INACTIVE.
+    // Uses the DEFAULT reader (the guard under test lives in it); the target's
+    // content is deliberately scope-bearing to catch a broken NOFOLLOW check.
+    // Files.createSymbolicLink throws on platforms that refuse symlinks
+    // (non-Unix): the pin skips there.
+    @Test fun diagnosis_symlinkMarkerIsNotFollowedByDirectGuard() = runBlocking {
+        val dir = Files.createTempDirectory("hookstate").toFile()
+        try {
+            val target = File(dir, "target_marker")
+            target.writeText(HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 99L))
+            val link = File(dir, "galaxydual_hook.active")
+            try {
+                Files.createSymbolicLink(link.toPath(), target.toPath())
+            } catch (e: Exception) {
+                // Platform refuses symlinks (non-Unix): the pin is not applicable.
+                org.junit.Assume.assumeTrue("symlink creation unsupported on this platform", false)
+                return@runBlocking
+            }
+            val diagnosis = diagnoseHookState(markerFiles = listOf(link), diagnosticGateways = emptyList())
+            assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, diagnosis.status)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     // Phase 2 finding 2 regression: scopes gathered before the round budget
     // cuts the gateway stage are positive evidence and must still be reported
     // as ACTIVE — unioned, never dropped — with the round bounded at

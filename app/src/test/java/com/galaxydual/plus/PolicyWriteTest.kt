@@ -5685,6 +5685,27 @@ class PolicyWriteTest {
         }
     }
 
+    // resetForTest 清 lastKnownPolicyDraft：測試重置還原 fresh-process fence
+    // 契約（生產永不呼叫 resetForTest，S4 行程級 fence 在生產單調不減）。
+    // 直接針對 coordinator 的公開 val 斷言：顯式寫入後 resetForTest 必歸 null。
+    @Test
+    fun resetForTest_clearsLastKnownPolicyDraft() {
+        val coord = PolicyTxCoordinator()
+        try {
+            coord.resetForTest()
+            assertNull(coord.lastKnownPolicyDraft.get())
+            coord.lastKnownPolicyDraft.set(HashSet(setOf("com.example.a")))
+            assertEquals(setOf("com.example.a"), coord.lastKnownPolicyDraft.get())
+            coord.resetForTest()
+            assertNull(coord.lastKnownPolicyDraft.get())
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Stage I1 T2：雙活快徑 vs reconciler 衝突——恰一勝者（舊碼敗新碼過）。
     // VM 慢 save 在途（SAVING＋前置認領＋writeMutex 持有）；併發勝者（模擬雙活
     // 對端 reconciler 先勝，經 settle 結清認領）後放行 save：快徑 ok==true＋
@@ -11492,4 +11513,328 @@ class PolicyWriteTest {
         )
         assertEquals(MsgKind.CHANNEL, vmUnknown.state.value.msgKind)
     }
+
+    // F2 (post-await mismatch)：confirm 在途（SAVING，save 阻塞）時，另一個
+    // pending 被注入（不同包集）；save 放行後 post-await re-check 發現
+    // pendingPolicyWrite != pendingAtCall（是別的 pending，非 null）——
+    // fence 必須如同 vanished arm 被丟棄（fail-closed UNKNOWN_REFRESH），
+    // 且不得誤結為 QUEUED/SAVING，pending（別人的）不得被動。
+    @Test
+    fun postAwaitMismatchDifferentPending_dropsFenceAndReportsRefresh() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending, pending.generation)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+
+        // 在途（post-await 之前、pre-IO 門檻已過）換成「另一個」pending。
+        val other = PendingPolicyWrite(setOf("com.other"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, other)
+        saveRelease.set(true)
+        assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+        await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        // 別人的 pending 不得被動；不得誤發佈 SUCCESS（INFO）終態。
+        assertEquals(other, vm.state.value.pendingPolicyWrite)
+        assertFalse(vm.state.value.msgKind == MsgKind.INFO)
+    }
+
+    // F4 (F2/F9)：VM 自身的 confirm/clear 成功終態是對已提交草稿的權威觀察——
+    // 必須清除 policyRevisionStale。自 F4 mark 移除後，observed 不再經
+    // markObservedKnown 推進，而是由 emitTxSettledStageOnly 的 stageRealPayload
+    // （commitMutex 內 stage 出 stamped；observedSnapshot 隨即以 stamped.rev 設置）
+    // 釘住；本測試釘住 stale wash＋INFO/Known 終態與 observed 嚴格前進。
+    // 注意 stale 必須在 SAVING 在途中設置（save 阻塞、pre-IO 門檻已過後）：
+    // 事前設置會被 confirm 的 stale 短路 fail-closed（UNKNOWN_REFRESH，不寫 store），
+    // 永遠到不了成功終態——故本 pin 以 mid-flight 變異演練。
+    @Test
+    fun confirmSuccessClearsStaleAndRemarksKnown() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            // 觀察值可能在 init 已被推進（本 harness 中為 0）——以「成功後嚴格前進」
+            // 為判據（成功 claim 經 completeWithRevision 將 committedRevision 推至 ≥1，
+            // observed 再由 stageRealPayload 的 snapshot bump 以 stamped.rev 推進）。
+            val obsBefore = vm.observedRevForTests()
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            vm.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // 外來異 Tx 於在途中撞 revision：stale 置位（成功 claim 不受 rev 門控）。
+            setRevisionStaleForRepairTest(vm, true)
+            assertTrue(revisionStaleOf(vm))
+            saveRelease.set(true)
+
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm.state.value.loading
+            }
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertFalse(revisionStaleOf(vm))
+            val obsAfter = vm.observedRevForTests()
+            assertTrue("observedRev must advance: before=$obsBefore after=$obsAfter", obsAfter > obsBefore)
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // F3：CE 在 SAVING await 期間穿透（legacy DEL／coord==null 路徑，無 recovery
+    // hook）——外層 finally 必須把擱淺的 SAVING/loading=true 改寫為收斂終態
+    // （IDLE＋UNKNOWN_REFRESH＋draftKnown=false）。h1 無 armed Tx（coord==null)，
+    // 且不經 viewModelScope 以外的任何取消來源：只取消範圍本身（confirm job 隨之
+    // 取消），不呼叫 onCleared()。
+    @Test
+    fun savingMidAwaitCancellation_repairsLoadingAndPhaseToIdle() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000)
+        await { vm.state.value.policyDraftKnown }
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        vm.confirmPolicyWrite(pending, pending.generation)
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+        assertTrue(vm.state.value.loading)
+
+        // 只取消 confirm job 所在的 scope（rotation 式），不經 onCleared()。
+        vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+
+        try {
+            await(timeoutMs = 2_000L) {
+                !vm.state.value.loading && vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+        } finally {
+            saveRelease.set(true)
+        }
+        assertFalse(vm.state.value.loading)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertNull(activeTxOf(vm))
+    }
+
+    // F3 armed 變體（P3-C）：coord-backed confirm——Tx 在 SAVING 開始前已 arm
+    // （executionArmed=true，由 h1 pre-IO gate 設置後才啟 lazy save），save 阻塞
+    // 於 store.save、coord claim 已 armed。mid-await CE 穿透後，外層 finally 的
+    // armed-register 必須把仍未交接的 armed Tx 登記＋掛 reconciler，phase 改寫為
+    // RECONCILING（而非 IDLE＋UNKNOWN_REFRESH），activePolicyTx 持有該 Tx。
+    // 對照：legacy（coord==null）版即上方 savingMidAwaitCancellation_repairsLoadingAndPhaseToIdle
+    // （h1 無 armed Tx → IDLE）。只取消 viewModelScope（confirm job 隨之取消），
+    // 不經 onCleared()；blocking save 跑在 coordinator 的 app-scoped IO scope 上，
+    // viewModelScope.cancel 不會中斷它，故 saveRelease 仍須釋放。
+    @Test
+    fun savingMidAwaitCancellation_armedCoord_flipsToReconciling() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            vm.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertTrue(vm.state.value.loading)
+
+            // 只取消 confirm job 所在的 scope（rotation 式），不經 onCleared()。
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+
+            try {
+                await(timeoutMs = 2_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            } finally {
+                saveRelease.set(true)
+            }
+            assertEquals(PolicyWritePhase.RECONCILING, vm.state.value.policyWritePhase)
+            assertFalse(vm.state.value.loading)
+            assertFalse(vm.state.value.policyDraftKnown)
+            // armed Tx 已登記（handover 就位）：本地 activePolicyTx 持有該 Tx。
+            assertNotNull(activeTxOf(vm))
+        } finally {
+            saveRelease.set(true)
+        }
+    }
+
+    // F3：CE 在 clear 的 SAVING await 期間穿透（legacy DEL／coord==null 路徑，
+    // 無 recovery hook）——外層 finally 必須把擱淺的 SAVING/loading=true 改寫為
+    // 收斂終態（IDLE＋UNKNOWN_REFRESH＋draftKnown=false）。與 confirm 版同一
+    // harness：阻塞的 saveRaw（clear 經 saveRaw(null) 落盤），只取消
+    // viewModelScope（clear job 隨之取消），不經 onCleared()。
+    @Test
+    fun clearMidAwaitCancellation_repairsLoadingAndPhaseToIdle() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw) else backend.set(emptySet())
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000)
+        await { vm.state.value.policyDraftKnown }
+
+        vm.clearPolicyDraft()
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+        assertTrue(vm.state.value.loading)
+
+        // 只取消 clear job 所在的 scope（rotation 式），不經 onCleared()。
+        vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+
+        try {
+            await(timeoutMs = 2_000L) {
+                !vm.state.value.loading && vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+        } finally {
+            saveRelease.set(true)
+        }
+        assertFalse(vm.state.value.loading)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertNull(activeTxOf(vm))
+    }
+
+    // F3：CE 在 repair 的 SAVING await 期間穿透（legacy DEL／coord==null 路徑，
+    // 無 recovery hook）——repair 的 CE catch 必須把擱淺的 SAVING 改寫為
+    // IDLE＋CORRUPT_REPAIR_FAILED（retain corrupt，絕不洗白），loading=false。
+    // corrupt-evidence harness：loadRaw 恆拋 CCE（Corrupt），blocking 的
+    // repairCorrupt 經 saveRaw(null) 阻塞；只取消 viewModelScope，不經 onCleared()。
+    @Test
+    fun repairMidAwaitCancellation_repairsLoadingAndPhaseToIdle() {
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                true
+            },
+        )
+        val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, initialDraft = null)
+        await { !vm.state.value.loading }
+        await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+
+        vm.requestRepairCorruptDraft()
+        vm.confirmRepairCorruptDraft()
+        assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+        assertTrue(vm.state.value.loading)
+
+        // 只取消 repair job 所在的 scope（rotation 式），不經 onCleared()。
+        vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+
+        try {
+            await(timeoutMs = 2_000L) {
+                !vm.state.value.loading && vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+        } finally {
+            saveRelease.set(true)
+        }
+        assertFalse(vm.state.value.loading)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertTrue(vm.state.value.policyDraftCorrupt)
+        assertNull(activeTxOf(vm))
+    }
+
 }
