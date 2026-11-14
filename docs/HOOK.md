@@ -81,9 +81,17 @@
   `min(50, remaining)`，`remaining<=0` 直接跳過 fail-closed 回 null；follower grace 取
   `min(50, remaining)`，耗盡強制 0）；超時／爭用／拒收／熔斷／deadline 耗盡一律回 seed／last-known-good
   （fail-closed observe-only），慢 binder 讀在背景取消（uninterruptible 讀亦僅滯留
-  單一 worker，隊列恆零、不增長），永不 pin 住查詢執行緒。JVM 以 `PolicyRefreshBudgetTest`
+  單一 worker，隊列恆零、不增長），永不 pin 住查詢執行緒。強制重建卡死的 uninterruptible worker 現受
+  **兩道獨立上限**約束（PR#60 r6 Finding #3）：(1) 每個 invalidate-epoch 的 `MAX_WORKER_REBUILDS`（回收節流，
+  `invalidate()` 會歸零 `workerRebuilds`）；(2) 每個 gate 實例的 `MAX_PROCESS_ABANDONED_WORKER_REBUILDS=4L`
+  （process-lifetime 硬駐留上限，`invalidate()`／`onSuccess()` 皆不重置；全行程兩個 gate ⇒ 最多 8 個殘留
+  stuck daemon）。重建時 `activeCount<=0` 的 drained worker 不消耗此預算；真正 abandon（activeCount>0 且已換新
+  executor）才計數。超過 cap 一律 fail-closed（丟棄＋有界日誌＋backoff 續期，不再開新執行緒）；**超過 cap 後、worker 仍 busy 時僅能 process restart 恢復**（或將來另行設計有界 rebind；drained worker 走半開探針照常恢復、不消耗此預算）——此為刻意僅記錄、不實作的重啟策略，文件不承諾其自動恢復。
+  JVM 以 `PolicyRefreshBudgetTest`
   鎖定超時回退（leader-timeout）＋`PolicyRefreshGateTest` 鎖定有界＋熔斷＋invalidate 恢復＋
-  `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速）。
+  `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速），
+  並以 `PolicyRefreshGateProcessCapTest` 鎖定 epoch 與 process 預算分離（invalidate 只重置 epoch）、drained 探針
+  不消耗 process 預算、cap 耗盡後一律 fail-closed（拒絕換新 executor）、以及雙 gate 實例預算互相獨立。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。

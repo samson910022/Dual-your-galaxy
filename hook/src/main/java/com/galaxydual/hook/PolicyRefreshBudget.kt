@@ -285,11 +285,56 @@ class PolicyRefreshGate(
     private val log: (String) -> Unit = {},
 ) {
     companion object {
-        // Leak bound: at most MAX_WORKER_REBUILDS forced executor rebuilds
-        // per invalidate-epoch (invalidate() resets the counter; onSuccess
-        // does not). See tryRebuildStuckWorker for the stuck-thread residency
-        // note.
+        // Epoch budget (recovery throttle): at most MAX_WORKER_REBUILDS
+        // forced executor rebuilds per invalidate-epoch (invalidate() resets
+        // the counter; onSuccess does not). This bounds rebuild CHURN within
+        // one epoch and is a recovery throttle ONLY — it is NOT the
+        // process-lifetime abandoned-worker residency bound. See
+        // MAX_PROCESS_ABANDONED_WORKER_REBUILDS below and tryRebuildStuckWorker
+        // for the stuck-thread residency note.
         const val MAX_WORKER_REBUILDS = 1L
+
+        /**
+         * PR#60 r6 (Finding #3): hard process-lifetime bound on abandoned
+         * (interrupt-ignoring) worker rebuilds. Independent of invalidate()/
+         * probe epochs. Per GATE instance; two gates per process
+         * (policyRefreshGate + capabilityGate in DualHook) => at most
+         * 2x this many resident stuck daemons. Never reset by invalidate()/
+         * onSuccess(); while the abandoned worker remains BUSY, recovery
+         * beyond the cap has no forced-replacement path and is
+         * process-restart-bound (see docs note — deliberately NOT
+         * implemented here). If the stuck read ever completes, the
+         * half-open probe recovers normally without consuming this budget.
+         *
+         * The per-epoch MAX_WORKER_REBUILDS budget is a recovery THROTTLE:
+         * after invalidate() it allows one fresh rebuild per epoch so a
+         * post-policy-change stuck-worker episode can recover. It says
+         * nothing about how many abandoned (shutdownNow-refused,
+         * interrupt-ignoring) daemon threads can accumulate across epochs in
+         * a long-lived system_server/daagent process. THIS constant is the
+         * hard residency bound: it counts every forced executor replacement
+         * of a still-busy worker, is never reset, and caps the total number
+         * of such stuck daemons this gate can leave resident.
+         *
+         * At rebuild time an `activeCount <= 0` probe consumes NOTHING from
+         * this budget — when budget remains the gate reports "drained" and
+         * consumes nothing (the worker provably drained; the executor is
+         * reclaimable). Only a REAL abandon (activeCount > 0 and a fresh
+         * executor is created) consumes one unit.
+         *
+         * Beyond the cap a forced rebuild is REFUSED (checked before the
+         * activeCount() probe): the caller fail-closes (drop + bounded log +
+         * half-open backoff renewal) and no new worker thread is created.
+         * While the abandoned worker remains BUSY there is no forced
+         * replacement and the gate stays fail-closed until a process restart.
+         * If the stuck read ever completes, the half-open probe recovers
+         * without consuming this budget (no rebuild needed). Restart-only for
+         * the still-busy case; a bounded rebind, should one ever be
+         * designed, would be documented here — none is implemented, and no
+         * additional threads are ever spawned to "help" past the residency
+         * bound.
+         */
+        const val MAX_PROCESS_ABANDONED_WORKER_REBUILDS = 4L
         // H3 get-timeout floor: a future.get() that waited < this proves nothing
         // about the reader (it is a scheduling race or a handoff that ate the
         // budget, not a stuck read) and must NOT be counted as a reader timeout
@@ -332,10 +377,19 @@ class PolicyRefreshGate(
     val halfOpenProbes = AtomicLong(0L)
     // Phase3: stuck-busy worker rebuild metrics. workerRebuilds counts forced
     // executor replacements after a busy worker outlived k*cooldown or
-    // HALF_OPEN_MAX_MS; busyStuckDrops counts busy short-circuits below the
-    // rebuild threshold.
+    // HALF_OPEN_MAX_MS (EPOCH budget: invalidate() resets it; onSuccess does
+    // not). abandonedWorkerRebuilds (PR#60 r6, Finding #3) is the
+    // process-lifetime HARD residency bound: every forced replacement of a
+    // still-busy (interrupt-ignoring) worker increments it, and it is never
+    // reset — not by invalidate(), not by onSuccess(). busyStuckDrops counts
+    // busy short-circuits below the rebuild threshold.
     val workerRebuilds = AtomicLong(0L)
+    val abandonedWorkerRebuilds = AtomicLong(0L)
     val busyStuckDrops = AtomicLong(0L)
+    // PR#60 r6 (Finding #3): forensics only — how many times a forced rebuild
+    // was REFUSED because the process-lifetime abandoned-worker budget was
+    // exhausted. Never reset. One AtomicLong increment per denial (cheap).
+    internal val processCapDenials = AtomicLong(0L)
     private val halfOpenFailures = AtomicLong(0L)
     private val lastStuckOpenMs = AtomicLong(Long.MIN_VALUE)
 
@@ -409,6 +463,11 @@ class PolicyRefreshGate(
 
     fun workerRebuildCount(): Long = workerRebuilds.get()
 
+    // JVM-test visible (mirrors workerRebuildCount()): process-lifetime
+    // count of forced rebuilds that left an abandoned (interrupt-ignoring)
+    // worker resident. Never reset.
+    fun abandonedWorkerRebuildCount(): Long = abandonedWorkerRebuilds.get()
+
     fun busyStuckDropCount(): Long = busyStuckDrops.get()
 
     // Bounded busy threshold (shared by readBounded/readBoundedOrThrow stuck
@@ -428,12 +487,22 @@ class PolicyRefreshGate(
     // Custom executors cannot be rebuilt (unknown factory) — counted/logged
     // only. Caller must hold the outstanding guard.
     //
-    // Leak bound: at most MAX_WORKER_REBUILDS rebuilds per invalidate-epoch
-    // (invalidate() resets the counter; onSuccess does not); the old
-    // interrupt-ignoring worker thread is a daemon that never exits, so it
-    // stays resident permanently — at most MAX_WORKER_REBUILDS such stuck
-    // threads per epoch (1 policy + 1 capability = at most 2 per process per
-    // epoch). Past the cap the gate only short-circuits + counts (no new threads).
+    // Leak bound is TWO independent bounds (PR#60 r6, Finding #3):
+    // (1) EPOCH budget MAX_WORKER_REBUILDS per invalidate-epoch — a recovery
+    //     throttle (invalidate() resets the counter; onSuccess does not), not
+    //     a residency bound;
+    // (2) PROCESS budget MAX_PROCESS_ABANDONED_WORKER_REBUILDS per gate
+    //     instance — the hard residency bound (never reset by invalidate()/
+    //     onSuccess()). Two gates per process (policyRefreshGate +
+    //     capabilityGate) => at most 2 * MAX_PROCESS_ABANDONED_WORKER_REBUILDS
+    //     resident stuck daemons. The old interrupt-ignoring worker thread is
+    //     a daemon that never exits, so it stays resident permanently once
+    //     abandoned. Past the process cap the gate only short-circuits +
+    //     counts (fail-closed drop + bounded log + backoff renewal; no new
+    //     threads). While the abandoned worker remains BUSY there is no
+    //     recovery beyond the cap short of a process restart — documented,
+    //     not implemented; a completed read recovers via the half-open
+    //     probe without consuming the budget.
     // Fresh thread names carry the rebuild count suffix for lspd forensics.
     private fun tryRebuildStuckWorker(): Boolean {
         synchronized(rebuildLock) {
@@ -442,6 +511,31 @@ class PolicyRefreshGate(
             try {
                 if (workerRebuilds.get() >= MAX_WORKER_REBUILDS) return false
                 val cur = executor as? ThreadPoolExecutor ?: return false
+                // PR#60 r6 (Finding #3): hard process-lifetime residency
+                // bound, checked BEFORE the activeCount() probe so a refusal
+                // is never misread as a drained worker. This consumes no
+                // budget by itself (only the real-abandon path below
+                // increments abandonedWorkerRebuilds). When budget remains,
+                // a drained worker (activeCount <= 0) still returns "true"
+                // below and consumes nothing; when the cap is exhausted the
+                // refusal fires here, fail-closed, even if the worker just
+                // drained (only the still-busy case is restart-bound; a
+                // completed read recovers via the half-open probe without
+                // consuming this budget).
+                if (abandonedWorkerRebuilds.get() >= MAX_PROCESS_ABANDONED_WORKER_REBUILDS) {
+                    val denial = processCapDenials.incrementAndGet()
+                    if (denial <= 4L) {
+                        // Bounded forensics: at most 4 denial lines per gate
+                        // instance per process (≤8 per process with
+                        // policyRefreshGate + capabilityGate).
+                        throttledLog(
+                            "policy refresh worker rebuild refused: process-lifetime abandoned-worker " +
+                                "budget exhausted (${abandonedWorkerRebuilds.get()}/$MAX_PROCESS_ABANDONED_WORKER_REBUILDS)",
+                            force = true,
+                        )
+                    }
+                    return false
+                }
                 if (cur.activeCount <= 0) return true
                 try {
                     cur.shutdownNow()
@@ -457,6 +551,7 @@ class PolicyRefreshGate(
                 }
                 executor = fresh
                 workerRebuilds.incrementAndGet()
+                abandonedWorkerRebuilds.incrementAndGet()
                 throttledLog(
                     "policy refresh worker rebuilt after stuck busy " +
                         "(rebuild $n/$MAX_WORKER_REBUILDS, fail-closed probe continues)",
@@ -942,18 +1037,26 @@ class PolicyRefreshGate(
     // still drains on its own; the zero-queue + guard bounds it to <=1).
     // Also resets half-open backoff so the next failure starts from the
     // initial cooldown again.
-    // H6: resets the per-epoch forced-rebuild counter as well — an
-    // operator/policy change is the explicit "start fresh" signal, so a
-    // post-invalidate stuck-worker episode may rebuild once more. onSuccess()
-    // deliberately does NOT reset it (that would defeat MAX_WORKER_REBUILDS
-    // as a bounded leak within each invalidate-epoch: success+re-stuck cycles
-    // would then rebuild forever).
+    // H6: resets the EPOCH budget ONLY (workerRebuilds -> 0) — an
+    // operator/policy change is the explicit "start fresh" signal for the
+    // recovery throttle, so a post-invalidate stuck-worker episode may
+    // rebuild once more. The PROCESS budget (abandonedWorkerRebuilds /
+    // processCapDenials) is deliberately NOT touched: it is the hard
+    // residency bound (see MAX_PROCESS_ABANDONED_WORKER_REBUILDS), and
+    // invalidate() must not resurrect abandoned-worker capacity.
+    // onSuccess() also deliberately does NOT reset the EPOCH counter (that
+    // would defeat MAX_WORKER_REBUILDS as a bounded leak within each
+    // invalidate-epoch: success+re-stuck cycles would then rebuild
+    // forever). Neither path ever resets the PROCESS counter.
     fun invalidate() {
         consecutiveTimeouts.set(0L)
         stuckOpen = false
         halfOpenFailures.set(0L)
         lastStuckOpenMs.set(Long.MIN_VALUE)
         workerRebuilds.set(0L)
+        // NOTE (PR#60 r6, Finding #3): abandonedWorkerRebuilds and
+        // processCapDenials are intentionally absent here — they are
+        // process-lifetime and never reset.
     }
 
     private fun onSuccess() {
