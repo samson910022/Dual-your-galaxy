@@ -68,7 +68,7 @@ N: android=http://schemas.android.com/apk/res/android (line=4)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="moe.shizuku.client.V3_SUPPORT" (Raw: "moe.shizuku.client.V3_SUPPORT")
             A: http://schemas.android.com/apk/res/android:value(0x01010024)=true
           E: provider (line=105)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.GuardXposedProvider" (Raw: "com.galaxydual.plus.GuardXposedProvider")
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.other.vendor.GuardXposedProvider" (Raw: "com.other.vendor.GuardXposedProvider")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
             A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.XposedService" (Raw: "com.galaxydual.plus.debug.XposedService")
           E: receiver (line=114)

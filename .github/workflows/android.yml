@@ -289,19 +289,33 @@ jobs:
           grep -F -A1 'android:name="io.github.libxposed.service.XposedProvider"' "$MAN" | grep -F 'tools:node="remove"'
           grep -F -A1 'android:name=".GuardXposedProvider"' "$MAN" | grep -F 'android:authorities="${applicationId}.XposedService"'
           echo "== merged manifest =="
-          if [ ! -d app/build/intermediates/merged_manifests ]; then
-            echo "FAIL: app/build/intermediates/merged_manifests missing; run :app:assembleDebug first"
+          # Prefer the new AGP 8.x `merged_manifest` (processDebugMainManifest)
+          # layout; fall back to the legacy `merged_manifests` layout only when
+          # the new one yields no files. Scope to the debug variant and require
+          # EXACTLY ONE merged manifest in the chosen layout — zero means the
+          # merge task did not run; more than one means an unexpected variant is
+          # present, and grepping an arbitrary pick would silently weaken the
+          # gate. `|| true` keeps a missing root from aborting the step under
+          # set -e/pipefail.
+          MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*debug*' -name AndroidManifest.xml 2>/dev/null || true)
+          if [ -n "$MERGED_NEW" ]; then
+            LAYOUT="app/build/intermediates/merged_manifest (processDebugMainManifest)"
+            MERGED_FILES="$MERGED_NEW"
+          else
+            LAYOUT="app/build/intermediates/merged_manifests (legacy processDebugManifest)"
+            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*debug*' -name AndroidManifest.xml 2>/dev/null || true)
+          fi
+          if [ -z "$MERGED_FILES" ]; then
+            echo "FAIL: no merged debug AndroidManifest.xml found (new layout app/build/intermediates/merged_manifest and legacy app/build/intermediates/merged_manifests both yielded zero files matching '*debug*'; run :app:assembleDebug first)"
             exit 1
           fi
-          # Exactly one merged manifest: zero means the merge task did not run;
-          # more than one means an unexpected variant is present, and grepping an
-          # arbitrary pick would silently weaken the gate.
-          MERGED_COUNT=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml | wc -l)
+          MERGED_COUNT=$(printf '%s\n' "$MERGED_FILES" | wc -l)
           if [ "$MERGED_COUNT" != "1" ]; then
-            echo "FAIL: expected exactly 1 merged AndroidManifest.xml, found $MERGED_COUNT"
+            echo "FAIL: expected exactly 1 merged debug AndroidManifest.xml in $LAYOUT, found $MERGED_COUNT:"
+            printf '%s\n' "$MERGED_FILES"
             exit 1
           fi
-          MERGED=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml)
+          MERGED="$MERGED_FILES"
           echo "merged manifest: $MERGED"
           # Provider-node parse gate: exactly one <provider> carrying BOTH the
           # GuardXposedProvider name and the debug-suffixed authority on the
@@ -320,10 +334,12 @@ jobs:
       # NOTE (CI-guard interaction): app/build.gradle.kts fails any CI
       # invocation whose task name contains "Release" when no release signing
       # key is configured (that guard exists to stop unsigned release
-      # PACKAGING in CI). This manifest-only step therefore opts out of the CI
-      # signing detection for this single gradle invocation
-      # (CI=false GITHUB_ACTIONS=). It never assembles or signs a release APK;
-      # the signing guard stays fail-closed for packaging tasks.
+      # PACKAGING in CI). This manifest-only step therefore passes
+      # ALLOW_RELEASE_MANIFEST_MERGE=1, a narrow allowlist in the build script
+      # that waives the signing guard ONLY for manifest-merge/process tasks
+      # (processReleaseMainManifest / processReleaseManifest /
+      # processReleaseResources) — never for packaging or signing. The guard
+      # stays fail-closed for actual release packaging tasks.
       # Release authority = ${applicationId}.XposedService =
       # com.galaxydual.plus.XposedService (NO .debug suffix).
       - name: Policy provider parity (release merged manifest)
@@ -331,18 +347,33 @@ jobs:
           set -e
           set -o pipefail
           echo "== release merged manifest =="
-          CI=false GITHUB_ACTIONS= ./gradlew :app:processReleaseMainManifest --no-daemon
-          # Exactly one merged release manifest (either AGP output layout).
-          MERGED=$(find app/build/intermediates/merged_manifest app/build/intermediates/merged_manifests -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
-          if [ -z "$MERGED" ]; then
-            echo "FAIL: no merged release AndroidManifest.xml under app/build/intermediates; run :app:processReleaseMainManifest first"
+          ALLOW_RELEASE_MANIFEST_MERGE=1 ./gradlew :app:processReleaseMainManifest --no-daemon
+          # Prefer the new AGP 8.x `merged_manifest` (processReleaseMainManifest)
+          # layout; fall back to the legacy `merged_manifests` layout only when
+          # the new one yields no files. Scope to the release variant and
+          # require EXACTLY ONE merged manifest in the chosen layout — zero
+          # means the merge task did not run; more than one means an unexpected
+          # variant is present, and grepping an arbitrary pick would silently
+          # weaken the gate. `|| true` keeps a missing root from aborting the
+          # step under set -e/pipefail.
+          MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
+          if [ -n "$MERGED_NEW" ]; then
+            LAYOUT="app/build/intermediates/merged_manifest (processReleaseMainManifest)"
+            MERGED_FILES="$MERGED_NEW"
+          else
+            LAYOUT="app/build/intermediates/merged_manifests (legacy processReleaseManifest)"
+            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*release*' -name AndroidManifest.xml 2>/dev/null || true)
+          fi
+          if [ -z "$MERGED_FILES" ]; then
+            echo "FAIL: no merged release AndroidManifest.xml found (new layout app/build/intermediates/merged_manifest and legacy app/build/intermediates/merged_manifests both yielded zero files matching '*release*'; run :app:processReleaseMainManifest first)"
             exit 1
           fi
-          if [ "$(printf '%s\n' "$MERGED" | wc -l)" != "1" ]; then
-            echo "FAIL: expected exactly 1 merged release AndroidManifest.xml, found:"
-            printf '%s\n' "$MERGED"
+          if [ "$(printf '%s\n' "$MERGED_FILES" | wc -l)" != "1" ]; then
+            echo "FAIL: expected exactly 1 merged release AndroidManifest.xml in $LAYOUT, found:"
+            printf '%s\n' "$MERGED_FILES"
             exit 1
           fi
+          MERGED="$MERGED_FILES"
           echo "merged release manifest: $MERGED"
           # Provider-node parse gate: exactly one <provider> with the
           # GuardXposedProvider name AND the release (unsuffixed) authority on

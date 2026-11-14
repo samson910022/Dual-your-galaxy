@@ -63,15 +63,24 @@ for apk in "$@"; do
   #     scripts/fixtures/provider-parity/ run via scripts/check-provider-parity.test.sh).
   #     Loud hard-fail, never a skip: CI has the SDK, and a
   #     silent pass here would mask a manifest-merge regression shipping the
-  #     unguarded (exported, no-permission) provider. Variant handling: PR CI
-  #     invokes this on the debug APK (debug applicationIdSuffix=.debug), so the
-  #     expected authority is derived from the APK path — the .debug authority
-  #     is only accepted for *-debug*.apk / */debug/* paths; anything else
-  #     expects the release authority (com.galaxydual.plus.XposedService, no
-  #     .debug). A release-expected APK carrying the .debug authority fails.
-  case "$apk" in
-    *-debug*.apk|*/debug/*) EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService" ;;
-    *)                      EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService" ;;
+  #     unguarded (exported, no-permission) provider. Variant handling: the
+  #     expected authority is derived from the APK's ACTUAL applicationId
+  #     (aapt2 dump packagename), never from the APK filename — a renamed
+  #     *-debug*.apk built from release code must not slip the debug
+  #     authority past the release gate (PR CI invokes this on the debug
+  #     APK, whose applicationIdSuffix=.debug; the release APK carries
+  #     com.galaxydual.plus, no .debug). The mapping is exact and anything
+  #     else fails closed: com.galaxydual.plus.debug -> debug authority;
+  #     com.galaxydual.plus -> release authority (and only a release-
+  #     expected APK carrying the .debug authority fails the leak guard).
+  if ! APK_PACKAGE="$("$AAPT2" dump packagename "$apk" 2>/dev/null)"; then
+    fail "aapt2 dump packagename failed for $apk"
+  fi
+  APK_PACKAGE="$(printf '%s' "$APK_PACKAGE" | tr -d '[:space:]')"
+  case "$APK_PACKAGE" in
+    com.galaxydual.plus.debug) EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService" ;;
+    com.galaxydual.plus)       EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService" ;;
+    *) fail "unsupported APK package name '$APK_PACKAGE' in $apk (expected exactly 'com.galaxydual.plus.debug' or 'com.galaxydual.plus')" ;;
   esac
   MANIFEST_DUMP_FILE="$PROVIDER_PARITY_TMP/$(basename -- "$apk").xmltree.txt"
   if ! "$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml > "$MANIFEST_DUMP_FILE" 2>/dev/null; then

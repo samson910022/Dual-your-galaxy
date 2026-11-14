@@ -1,0 +1,9 @@
+N: android=http://schemas.android.com/apk/res/android (line=4)
+  E: manifest (line=4)
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1
+    A: package="com.galaxydual.plus.debug" (Raw: "com.galaxydual.plus.debug")
+      E: application (line=8)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Galaxy Dual Plus" (Raw: "Galaxy Dual Plus")
+          E: provider (line=11)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.GuardXposedProvider" (Raw: "com.galaxydual.plus.GuardXposedProvider")
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.XposedService" (Raw: "com.galaxydual.plus.debug.XposedService")
