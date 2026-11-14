@@ -3298,28 +3298,48 @@ class DualViewModel(
     private val blindClearArmedVersion = AtomicLong(-1L)
     private val blindClearArmedFreshGen = AtomicLong(-1L)
 
-    // S4（blind-clear defense-in-depth）：本次行程最後一次「已驗證 Known」的
-    // 政策草稿快照（null＝從未觀察到）。所有 verified-Known 終態/刷新/載入的
-    // noteLastKnownDraft() 呼叫點更新此欄。僅作為盲清前置門：盲清 armed 且
-    // 本欄非 null 時，clearPolicyDraft 不再單純依賴兩次點擊，而是先強制一次
+    // S4（blind-clear defense-in-depth）：行程級（process-lifetime）最後一次
+    // 「已驗證 Known」的政策草稿快照（null＝從未觀察到），由 app-scoped
+    // coordinator（GalaxyApp 持有的 PolicyTxCoordinator）持有，而非 VM 本機欄。
+    // 同行程內跨 Activity 重建／重開（新 VM 實例）不變；只有新行程（新 coordinator、
+    // 本欄＋VM 本機欄皆 null）才解除。所有 verified-Known 終態/刷新/載入的
+    // noteLastKnownDraft() 呼叫點更新此欄（同一防禦拷貝複製第二份寫入 coordinator；兩份皆為拷貝，
+    // 互不共享可變身份）。
+    // 僅作為盲清前置門：盲清 armed 且（coordinator 或 VM 本機）有 Known 歷史時，
+    // clearPolicyDraft 不再單純依賴兩次點擊，而是先強制一次
     // 權威重讀（refreshPolicyDraft）；只有重讀恢復 Known 才允許本次清除，
     // 重讀失敗（仍 Unknown/Unavailable）→ 中止並提示（UNKNOWN_REFRESH）。
-    // Known 本身即證據；本欄只是「曾經 Known」的會話歷史，永不被覆寫為 null。
+    // Known 本身即證據；此欄只是「曾經 Known」的行程級歷史，永不被覆寫為 null。
     private val lastKnownPolicyDraft = AtomicReference<Set<String>?>(null)
 
     private fun noteLastKnownDraft(draft: Set<String>) {
         try {
             // 防禦性拷貝：呼叫端集合可能於後續被重用/變異（sanitize 已產新集合，
-            // 此處再防一次）。永不拋出。
-            lastKnownPolicyDraft.set(HashSet(draft))
-        } catch (_: Exception) {
+            // 此處再防一次）。永不拋出（Throwable 亦吞：OOM 等不應波及呼叫路徑）。
+            val copy = HashSet(draft)
+            // coordinator 先寫入（行程級史實的跨 VM 信號，monotonic），再寫 VM 本機；
+            // VM 本機沿用舊路徑作為 coordinator 不存在時的回退。
+            try { policyTxCoordinator?.lastKnownPolicyDraft?.set(HashSet(copy)) } catch (_: Throwable) {}
+            lastKnownPolicyDraft.set(copy)
+        } catch (_: Throwable) {
         }
     }
 
+    // S4 fence 讀取助手：coordinator 有 Known 歷史即視為觀察過 Known；coordinator
+    // 不可讀（取值拋出）時回退 VM 本機欄（舊測試路徑無 coordinator 時亦走此路）。
+    // coordinator presence OR VM-local presence counts；coordinator 不可讀則回退本機。
+    private fun lastKnownDraftObserved(): Boolean = try {
+        val c = policyTxCoordinator?.lastKnownPolicyDraft?.get()
+        c != null || lastKnownPolicyDraft.get() != null
+    } catch (_: Throwable) {
+        lastKnownPolicyDraft.get() != null
+    }
+
     // 測試可見性：最後 Known 快照（驗證 S4 門控的存在/刷新行為；production 未用）。
+    // 優先回 coordinator 持有的行程級值；coordinator 無值時回 VM 本機欄。
     @androidx.annotation.VisibleForTesting
     internal fun lastKnownPolicyDraftForTests(): Set<String>? = try {
-        lastKnownPolicyDraft.get()
+        (policyTxCoordinator?.lastKnownPolicyDraft?.get() ?: lastKnownPolicyDraft.get())
     } catch (_: Throwable) {
         null
     }
@@ -9185,18 +9205,21 @@ class DualViewModel(
                 }
                 return
             }
-            // Phase 2 S4：本次行程曾觀察到 Known 草稿（lastKnownPolicyDraft 非空）
+            // Phase 2 S4：行程級曾觀察到 Known 草稿（coordinator 持有的行程級
+            // 「曾經 Known」歷史非空；跨 Activity 重建／重開不變，僅新行程解除）
             // 但遠端目前未知 → 兩次點擊確認不再足夠：先強制一次權威重讀
             // （refreshPolicyDraft），本次點擊不刪除任何內容；只有重讀恢復
             // Known 後下一次清除才走一般 Known 單步路徑（新鮮重讀本身即為
             // 證據）。重讀仍未知 → 中止，草稿維持未知，不盲刪（fail-closed）。
-            // SM (session permanence, intentional): 一旦本行程觀察過 Known，
-            // 「refresh-first」狀態即對本行程餘下時間永久生效——每次雙擊都
-            // 只觸發重讀而永不盲刪，直到重讀恢復 Known。這是刻意的會話級
-            // fail-closed 設計；重啟 App（新行程 lastKnown==null）即解除，
-            // 回復到經典雙擊盲清。不提供程式化的第三次確認（SM 約定：(a) 文案
-            // 提供可行的補救、(b) 單測釘住「重讀失敗兩次仍不刪」語義）。
-            if (lastKnownPolicyDraft.get() != null) {
+            // SM (session permanence → process-lifetime, intentional): 一旦本行程
+            // 觀察過 Known，「refresh-first」狀態即對本行程餘下時間永久生效——
+            // 每次雙擊都只觸發重讀而永不盲刪，直到重讀恢復 Known。此為刻意的
+            // 行程級（process-lifetime）fail-closed 設計：同行程內 Activity
+            // 重開／VM 重建皆不解除（coordinator 持有，GalaxyApp 級生命週期）；
+            // 僅新行程（新 coordinator、lastKnown==null）即解除，回復到經典雙擊
+            // 盲清。不提供程式化的第三次確認（SM 約定：(a) 文案提供可行的補救、
+            // (b) 單測釘住「重讀失敗兩次仍不刪」語義）。
+            if (lastKnownDraftObserved()) {
                 // consume 本 arm（重新開始）；刷新成 Known 後下一次點擊走 Known 路徑。
                 disarmBlindClear()
                 try {
@@ -9223,12 +9246,12 @@ class DualViewModel(
         // arms below re-check this and abort like the Unknown path instead of
         // deleting content we no longer know. One comment line per check site;
         // the refresh-first abort helper is shared. Armed on Known OR on a
-        // session-observed Known (lastKnownPolicyDraft): the latter is
-        // defense-in-depth — today unreachable (the S4 refresh-first gate
-        // returns before this capture whenever lastKnown!=null && !known),
-        // keeping a fail-closed fence even if that gate ever moves.
+        // process-lifetime observed Known (coordinator-held via lastKnownDraftObserved):
+        // the latter is defense-in-depth — today unreachable (the S4 refresh-first gate
+        // returns before this capture whenever observed && !known), keeping a
+        // fail-closed fence even if that gate ever moves.
         val knownCommitFence = hookPolicyStore != null &&
-            (_state.value.policyDraftKnown || lastKnownPolicyDraft.get() != null)
+            (_state.value.policyDraftKnown || lastKnownDraftObserved())
         fun abortBlindClearCommit(key: String) {
             synchronized(policySettleLock) {
                 inFlightWrites.remove(key)
@@ -13940,8 +13963,9 @@ enum class PolicyTextKind {
     // VM 層第二道門（UI positive 鈕為第一道），不寫 store、不清 pending。
     // msgKind INVALID。
     POLICY_NOT_ACKNOWLEDGED,
-    // Phase 2 S4（blind-clear refresh-first）：盲清第二次點擊時發現本次行程
-    // 曾記住最後 Known 草稿快照，遂強制先重讀（refreshPolicyDraft）；本次
+    // Phase 2 S4（blind-clear refresh-first）：盲清第二次點擊時發現行程級
+    // （process-lifetime，coordinator 持有；同行程 Activity 重開不變，僅新行程
+    // 解除）最後 Known 草稿快照，遂強制先重讀（refreshPolicyDraft）；本次
     // 點擊不刪除任何內容。恢復 Known 後下一次清除即走一般 Known 單步路徑；
     // 若重讀仍未知，草稿維持未知且不可盲刪（fail-closed）。msgKind CHANNEL。
     BLIND_CLEAR_REFRESH_FIRST,

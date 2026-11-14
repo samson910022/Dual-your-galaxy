@@ -65,6 +65,16 @@ class PolicyTxCoordinator {
     // pending＋世代bump＋reconciler join 同一 deferred）。
     val activeTx = AtomicReference<DualViewModel.PolicyTx?>(null)
 
+    // S4 process-lifetime fence (PR#60 fix round): process-lifetime sticky "曾經驗證
+    // Known" indicator, owned by the app-scoped coordinator (GalaxyApp), NOT the
+    // per-Activity ViewModel. MONOTONIC: never reset to null within the process;
+    // a new process = a new coordinator = null (classic double-tap semantics restored).
+    // S4 行程級圍欄（PR#60 修正輪）：行程級「曾經驗證 Known」黏性指示器，由
+    // app-scoped coordinator（GalaxyApp）持有，而非每 Activity 的 ViewModel。
+    // 單調（MONOTONIC）：行程內永不重置為 null；新行程＝新 coordinator＝null
+    //（恢復經典雙擊語義）。
+    val lastKnownPolicyDraft = AtomicReference<Set<String>?>(null)
+
     // Stage I1 (P1#1)：Tx 全域身份——App-scoped 單調計數器，跨 VM 唯一。
     // VM 本地 policyTxId 隨 VM 重建歸零（A→重建→B 皆取 1，碰撞致 settled 誤配），
     // 故 coordinator 側統一發號；DualViewModel 四處建 Tx 皆經 nextTxId()（無
