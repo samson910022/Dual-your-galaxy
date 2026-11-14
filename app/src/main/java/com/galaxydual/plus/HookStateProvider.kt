@@ -36,7 +36,10 @@
 //     whole -- each path is catted separately), unioned with the same
 //     parser. Any gateway failure (non-zero exit, blank/
 //     garbage output, throwing gateway, NONE privilege) maps to "not
-//     detected", never to active, never throws.
+//     detected", never to active, and never throws for ordinary failures --
+//     except a CancellationException, which propagates (cooperative
+//     cancellation is never squashed here: every legacy catch rethrows CE
+//     before its Throwable arm).
 //  Both legacy readers are DEPRECATED: they conflate unreadable / absent /
 //  malformed (all inactive), so their INACTIVE must never be used as negative
 //  evidence. Production (DualViewModel.probeChannels) reads via
@@ -117,7 +120,8 @@ private fun firstScopesRaw(raws: List<String?>): String? =
 // IO: direct File reads of all SIX marker paths (see allHookMarkerFiles),
 // unioned via the shared parser. Missing, unreadable, or unparseable files
 // yield inactive. Never throws: every failure mode maps to
-// HookState(active=false), so callers need no catch.
+// HookState(active=false) -- except CancellationException, which propagates
+// (this reader suspends, and CE is rethrown end-to-end).
 // The markerFiles parameter exists so JVM tests can point at temp files;
 // production always uses the default six. No gateway is consulted here:
 // for the gateway-`cat` fallback see readHookStateWithGateway.
@@ -204,9 +208,12 @@ suspend fun readHookStateWithGateway(
 // as readMarkerTextNio); markers are legitimately <100 bytes, so behavior on
 // legit files is identical. UTF-8 decoding applies to the retained prefix.
 // GUARD: refuses non-regular files (Files.isRegularFile, NOFOLLOW_LINKS) by
-// throwing IOException, which the catch-all maps to null — same fail-closed
-// Denied semantics as readMarkerTextNio for a pre-planted FIFO at a
-// world-writable /data/local/tmp marker path. Same TOCTOU caveat as
+// throwing IOException, which the catch-all maps to null. The refusal is the
+// same discipline as readMarkerTextNio (never open a planted FIFO at a
+// world-writable /data/local/tmp marker path), but the verdict mapping
+// differs by design: legacy folds refusal into null (which the legacy
+// caller maps to inactive); the NIO path maps refusal to Denied (UNKNOWN_*).
+// Same TOCTOU caveat as
 // readMarkerTextNio: a regular→FIFO swap between check and open(2) can still
 // block; the direct stage is not budget-covered (documented, not a
 // regression).
@@ -301,8 +308,10 @@ fun HookState.displayText(): String =
 //      runs to completion on a Binder thread pinned up to EXEC_TIMEOUT_MS
 //      (60 s), the service-side exec pool is capped at 4
 //      (SERVICE_EXEC_MAX_CONCURRENT=4), and the late reply is dropped;
-//  (c) the budget is COOPERATIVE — a gateway that never suspends defeats it;
-//      production gateways poll at 50 ms (SU_WAIT_POLL_MS);
+//  (c) the budget is COOPERATIVE — a gateway that never suspends defeats it:
+//      the su gateway polls at 50 ms (SU_WAIT_POLL_MS); the Shizuku path is
+//      bounded-suspend (awaitBounded with a cancellable delay, exec pool
+//      capped at 4), so both suspension-based gateways cooperate;
 //  (d) the budget is 10 s for the whole gateway stage of one
 //      diagnostic round — the direct-read stage is local file IO and is not
 //      budget-covered. An su `cat` of a <100-byte marker file should cost
@@ -313,8 +322,10 @@ fun HookState.displayText(): String =
 // the cut (a fully-answered clean gateway, or complete direct reads).
 // The shared 10 s budget is spent in list order: an early hung gateway starves
 // later gateways (fail-closed; keep list order as the caller's stability
-// preference), and budget exhaustion yields UNKNOWN_UNREADABLE with no
-// forensic marker (deliberate fail-closed silence).
+// preference). Budget exhaustion with NO pre-cut positive absence yields
+// UNKNOWN_UNREADABLE and carries no forensic marker (deliberate fail-closed
+// silence); a pre-cut fully-answered clean gateway (gatewayFullyEmpty) or
+// fully-answered direct reads can still stand as INACTIVE.
 internal const val HOOK_DIAGNOSIS_ROUND_BUDGET_MS = 10_000L
 
 // P1 hook diagnosis state (issue #6, 配合 #27): ACTIVE needs a readable
@@ -380,6 +391,14 @@ sealed interface MarkerRead {
 private const val MARKER_READ_CAP_BYTES = 8 * 1024
 
 private fun readMarkerTextNio(file: File): String {
+    // Absence is POSITIVE evidence only when checked with the same NOFOLLOW
+    // semantics: notExists(NOFOLLOW) is true exclusively for a missing link;
+    // a symlink to a missing target still "exists" and falls through to the
+    // not-regular refusal below. A stat that itself fails still throws, and
+    // readDirectMarker maps it to Denied (fail-closed, never abs).
+    if (Files.notExists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        throw NoSuchFileException(file.path)
+    }
     if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
         throw IOException("marker path is not a regular file (refusing to open): ${file.path}")
     }
