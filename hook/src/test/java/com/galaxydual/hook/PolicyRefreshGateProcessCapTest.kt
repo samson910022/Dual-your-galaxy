@@ -7,6 +7,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
@@ -37,6 +38,22 @@ class PolicyRefreshGateProcessCapTest {
             value
         }
 
+    // Frozen-clock companion to the interrupt-ignoring readers: the rebuild
+    // arm re-probes activeCount() on the REAL scheduler at read time, so a
+    // loaded CI box that stalls the worker past the 50ms budget could flip
+    // activeCount() to 0 before the frozen clock is advanced. Park (0.5ms)
+    // until the worker has actually started, with a 5s nanos deadline;
+    // assert-fail loudly on deadline instead of flaking downstream.
+    private fun awaitWorkerBusy(gate: PolicyRefreshGate, deadlineSeconds: Long = 5) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(deadlineSeconds)
+        while (gate.activeCount() < 1) {
+            if (System.nanoTime() >= deadline) {
+                fail("worker did not become busy within ${deadlineSeconds}s (activeCount stayed 0)")
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(500_000L)
+        }
+    }
+
     private fun newGate(executor: ExecutorService, clock: AtomicLong): PolicyRefreshGate =
         PolicyRefreshGate(
             executor = executor,
@@ -55,6 +72,7 @@ class PolicyRefreshGateProcessCapTest {
         val before = gate.currentExecutorForTest()
         assertNull(gate.readBounded(ignoringReader(600), timeoutMs = 50))
         assertTrue(gate.isStuck())
+        awaitWorkerBusy(gate)
         // age=200 must exceed rebuildThresholdMs(cooldown=50) = 150, otherwise
         // the busy arm throws ContentionException("busy") instead of rebuilding.
         clock.addAndGet(200L)
@@ -95,6 +113,7 @@ class PolicyRefreshGateProcessCapTest {
             // Fifth epoch: trip again; the 4th executor's worker stays busy.
             assertNull(gate.readBounded(ignoringReader(600), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             clock.addAndGet(200L)
             val busyStuckDropsBefore = gate.busyStuckDropCount()
             val denialsBefore = gate.processCapDenials.get()
@@ -213,6 +232,7 @@ class PolicyRefreshGateProcessCapTest {
             val gate = newGate(executor, clock)
             assertNull(gate.readBounded(ignoringReader(600), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             clock.addAndGet(200L)
             assertEquals(setOf("ok"), gate.readBounded({ setOf("ok") }, timeoutMs = 2_000))
             assertEquals(1L, gate.workerRebuildCount())
@@ -242,12 +262,14 @@ class PolicyRefreshGateProcessCapTest {
             // Three more invalidate -> trip cycles once the process budget is spent.
             // Cycles 2-3 trip via the zero-success busy-worker rejection arm
             // (worker still busy), not via a real reader timeout — same budget path.
+            // Cycles 2 and 3 exercise the rejecting arm: their submissions are rejected by the saturated single-thread executor — the stale cycle-1 reader is never out-paced (this is the test's intended mechanism).
             repeat(3) {
                 gate.invalidate()
                 // 2s ignoring reader keeps the 4th executor's single worker
                 // busy across the whole cycle (epoch trip + denied rebuild).
                 assertNull(gate.readBounded(ignoringReader(2_000), timeoutMs = 50))
                 assertTrue(gate.isStuck())
+                awaitWorkerBusy(gate)
                 clock.addAndGet(200L)
                 val dropsBefore = gate.busyStuckDropCount()
                 val shortCircuitsBefore = gate.stuckShortCircuits.get()

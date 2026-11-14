@@ -15,6 +15,8 @@ import com.galaxydual.hook.PolicySource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 
 class HookPolicyStoreTest {
@@ -351,6 +353,21 @@ class HookPolicyStoreTest {
 // A3-1 (S3 backup honesty): 備份提交後讀回不一致 / 鉤子回報失敗 → RepairedNoBackup
 //（刪除仍發生），且不得宣稱 Repaired；backupFailureCount 遞增；log 記錄。
 class BackupHonestyTest {
+    // Resets the shared statics (remotePoison / backupFailureCount /
+    // backupFailureFirstLogAtMs / evidence maps) the tests mutate via
+    // repairCorrupt(), so a hard failure cannot leak poisoned state into
+    // other tests in the shared app-JVM fork. Delta-based assertions below
+    // are unchanged.
+    @Before
+    fun setUp() {
+        resetRemotePoisonForTests()
+    }
+
+    @After
+    fun tearDown() {
+        resetRemotePoisonForTests()
+    }
+
     @Test
     fun repair_backupHookReportsFailed_noBackupResult_andDeleteStillHappens() {
         var corrupt = true
@@ -373,7 +390,6 @@ class BackupHonestyTest {
                 }
             },
         )
-        resetRemotePoisonForTests()
         val failuresBefore = backupFailureCount.get()
         store.setBackupHook { BackupOutcome.Failed }
         val result = store.repairCorrupt()
@@ -402,7 +418,6 @@ class BackupHonestyTest {
                 true
             },
         )
-        resetRemotePoisonForTests()
         val failuresBefore = backupFailureCount.get()
         store.setBackupHook { BackupOutcome.Written }
         val result = store.repairCorrupt()
@@ -419,6 +434,28 @@ class BackupHonestyTest {
 // point (repairCorrupt). Tests below inject nowMs directly (the function's
 // default is System.currentTimeMillis()).
 class BackupFailureThrottleTest {
+    private var originalErr: java.io.PrintStream? = null
+
+    // Resets the shared statics (backupFailureFirstLogAtMs throttle
+    // timestamp, backupFailureCount, remote poison) and saves System.err, so
+    // a hard failure cannot leak into the shared app-JVM fork; @After
+    // restores both. The per-test try/finally blocks still restore System.err
+    // inline (defense in depth). Delta-based assertions are unchanged.
+    @Before
+    fun setUp() {
+        originalErr = System.err
+        resetRemotePoisonForTests()
+        backupFailureFirstLogAtMs.set(0L)
+    }
+
+    @After
+    fun tearDown() {
+        resetRemotePoisonForTests()
+        backupFailureFirstLogAtMs.set(0L)
+        originalErr?.let { System.setErr(it) }
+        originalErr = null
+    }
+
     private fun corruptStore(): HookPolicyStore {
         var corrupt = true
         var backing: Set<String>? = null
@@ -447,7 +484,6 @@ class BackupFailureThrottleTest {
     fun throttle_writesAtMostOncePer24h() {
         val err = System.err
         val buf = java.io.ByteArrayOutputStream()
-        backupFailureFirstLogAtMs.set(0L)
         try {
             System.setErr(java.io.PrintStream(buf))
             maybeLogFirstBackupFailure(1_000_000L)
@@ -468,8 +504,6 @@ class BackupFailureThrottleTest {
     fun repairFailedTwiceWithin24h_noSecondLog_countIncrementsBothTimes() {
         val err = System.err
         val buf = java.io.ByteArrayOutputStream()
-        resetRemotePoisonForTests()
-        backupFailureFirstLogAtMs.set(0L)
         try {
             System.setErr(java.io.PrintStream(buf))
             val countBefore = backupFailureCount.get()

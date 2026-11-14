@@ -3,6 +3,8 @@ package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 
 // P2-4/H13: mismatch logs are bounded twice: per-method (first 8 per distinct
@@ -10,9 +12,22 @@ import org.junit.Test
 // process-global 8 let the noisiest method drain every other method's budget.
 class BoundedLogTest {
 
+    // Reset the shared static log budgets before and after each test so a
+    // hard failure cannot leak counter state into other tests in the shared
+    // hook-JVM fork. No System.* mutation here — only WhitelistPolicy's
+    // static counters are reset.
+    @Before
+    fun setUp() {
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+    }
+
+    @After
+    fun tearDown() {
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+    }
+
     @Test
     fun mismatchLogsAreBoundedToEightPerMethod() {
-        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
         val extra = setOf("com.policy.app")
@@ -38,7 +53,6 @@ class BoundedLogTest {
 
     @Test
     fun differentMethodsGetIndependentBudgets() {
-        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
         val extra = setOf("com.policy.app")
@@ -62,7 +76,6 @@ class BoundedLogTest {
 
     @Test
     fun globalCapBackstopsManyMethods() {
-        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
         val extra = setOf("com.policy.app")
@@ -87,7 +100,6 @@ class BoundedLogTest {
 
     @Test
     fun logBoundedHelperReturnsFalseWhenSuppressed() {
-        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
         var logs = 0
         val onLog: (String) -> Unit = { logs++ }
         // Unkeyed callers share one bucket: first 8 fire, rest stay silent.

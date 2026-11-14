@@ -38,6 +38,18 @@ class HookMarkerTest {
         assertEquals(1710000000000L, HookMarker.parseTimeMs(raw))
     }
 
+    // Byte-exact multi-scope pin: input order is irrelevant — buildContent
+    // renders the scopes SORTED, joined by ",", then the trailing timeMs line.
+    // A drift in ordering/delimiter/newline must fail here even though
+    // buildContent round-trips. Wire format (same as the single-scope
+    // byte-exact pin below): `scope=<s1>,<s2>\ntimeMs=<ms>\n`.
+    @Test fun buildContent_sortsScopesByteExact() {
+        assertEquals(
+            "scope=daagent,system_server\ntimeMs=123\n",
+            HookMarker.buildContent(setOf("daagent", "system_server"), 123L),
+        )
+    }
+
     // Null/blank/garbage never parses as active: the app maps empty scopes
     // to "not detected", never to a fake active state.
     @Test fun parse_nullBlankGarbageYieldEmpty() {
