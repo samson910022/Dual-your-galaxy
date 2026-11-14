@@ -94,7 +94,7 @@ import java.util.concurrent.atomic.AtomicLong
 //   file reads as inactive under the legacy two-state view (the four-state
 //   diagnosis surfaces 狀態未知 instead), never as active. When a SHELL/ROOT channel
 //   is ready the app additionally retries via `cat` over the gateway (see
-//   HookStateProvider.readHookStateWithGateway); that path is equally
+//   HookStateProvider.diagnoseHookState); that path is equally
 //   unverified on-device.
 // - scope union: readers see the UNION of the per-scope files plus any
 //   legacy single-file content; no scope-completeness claim is made (a
@@ -292,7 +292,12 @@ object HookMarker {
             // unknown scope is never written.
             if (!ALLOWED_SCOPES.contains(want)) {
                 unknownScopeDrops.incrementAndGet()
-                safeLog(onLog, "marker ignored unknown scope want='$want' (allowlist={system_server,daagent})")
+                // Log hygiene: the scope is caller-supplied and unbounded;
+                // normalize control characters (HookLog) then cap at 64 so a
+                // hostile scope can never smuggle extra lines into the log.
+                // Only the unknown-scope line is capped — allowlisted scopes
+                // ([a-z_] only) are control-char-free by construction.
+                safeLog(onLog, "marker ignored unknown scope want='${HookLog.normalizeLogPart(want).take(64)}' (allowlist={system_server,daagent})")
                 return false
             }
             val primary = markerFile ?: markerPathFor(want)?.let { File(it) }

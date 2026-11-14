@@ -89,8 +89,12 @@ class PolicyToctouBarrierTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm)
-        await { vm.state.value.policyDraftKnown }
-        await { !vm.state.value.loading }
+        // The init load's loadRaw blocks up to 5 s on releaseIo before the
+        // backend answers; the previous 5 s await raced the IO unblock
+        // (losing on saturated runners). Give the same condition generous
+        // slack; the assertion itself is unchanged.
+        await(timeoutMs = 15_000L) { vm.state.value.policyDraftKnown }
+        await(timeoutMs = 5_000L) { !vm.state.value.loading }
         return vm
     }
 

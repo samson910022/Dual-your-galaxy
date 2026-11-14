@@ -573,6 +573,7 @@ class WhitelistPolicyTest {
 
     // Phase 4:hostile extra（迭代即拋）不得越過邊界：第二段 addAll 與第一段
     // 同 try，失敗退回無 extra 的拷貝（observe-only，不拋）。
+    // H1 固定：退回"原"Set 實例（identity，非拷貝）。
     @Test
     fun hostileExtraSetFallsBackWithoutThrowing() {
         val hostileExtra = object : AbstractSet<String>() {
@@ -580,8 +581,40 @@ class WhitelistPolicyTest {
             override fun iterator(): MutableIterator<String> =
                 throw IllegalStateException("boom")
         }
-        val out = WhitelistPolicy.apply(setOf("a"), emptyList(), hostileExtra, "m", log)
+        val original = setOf("a")
+        val out = WhitelistPolicy.apply(original, emptyList(), hostileExtra, "m", log)
         assertEquals(setOf("a"), out)
+        assertSame(original, out)
+    }
+
+    // H1 固定：addAll 階段（extra.filter 第二次迭代即拋）失敗時，退回"原"Set
+    // 實例（identity，非 fresh LinkedHashSet 拷貝）並恰好一行有界日誌。
+    // 此 extra 第一段 any 短路'成功'（"b" 不在 result），第二次迭代才拋，
+    // 專門鑽到第二段 try 的 addAll/filter 臂。
+    @Test
+    fun setMergeAddAllFailureReturnsOriginalWithOneBoundedLog() {
+        WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+        try {
+            val statefulExtra = object : AbstractSet<String>() {
+                override val size: Int get() = 2
+                override fun iterator(): MutableIterator<String> = object : MutableIterator<String> {
+                    private var n = 0
+                    override fun hasNext(): Boolean = n < 2
+                    override fun next(): String {
+                        n += 1
+                        if (n > 1) throw IllegalStateException("boom")
+                        return "b"
+                    }
+                    override fun remove(): Unit = throw UnsupportedOperationException()
+                }
+            }
+            val original = setOf("a")
+            val out = WhitelistPolicy.apply(original, emptyList(), statefulExtra, "merge-fail-pin", log)
+            assertSame(original, out)
+            assertEquals(1, logs.count { it.contains("set merge failed (addAll threw)") })
+        } finally {
+            WhitelistPolicy.resetUnexpectedArgsLogsForTest()
+        }
     }
 
     // Phase 4:hostile result（toMutableSet 拷貝即拋）退回原值（observe-only，

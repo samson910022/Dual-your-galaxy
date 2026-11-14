@@ -1,6 +1,8 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
+import java.util.concurrent.atomic.AtomicLong
+
 // Pure (framework-free) whitelist-policy source.
 //
 // DualHook cannot depend on :core (D1) and must not do IPC inside
@@ -83,6 +85,16 @@ object PolicySource {
     const val MAX_PACKAGE_LENGTH = 256
     const val MAX_POLICY_ENTRIES = 512
 
+    // H4: process-lifetime count of policy entries dropped by the caps
+    // (sanitize valid-entry cap / effective merged-set truncation). Never
+    // drives logic; observability only, never reset. Internal for tests.
+    // sanitize() adds raw.size - kept at the valid-cap break (hostile size =>
+    // best-effort +1); effective() adds the exact seed-first extras it
+    // truncates. The MAX_POLICY_ENTRIES*8 traversal bound is a defense for
+    // invalid-token floods, not an entry drop, and is intentionally not
+    // counted here.
+    internal val truncationDrops = AtomicLong(0L)
+
     fun sanitize(raw: Set<*>): Set<String> {
         val out = LinkedHashSet<String>()
         var seen = 0
@@ -109,7 +121,20 @@ object PolicySource {
                 // Bound total input traversal (defense against huge invalid-token
                 // payloads that never reach the valid-entry cap).
                 if (seen++ >= MAX_POLICY_ENTRIES * 8) break
-                if (out.size >= MAX_POLICY_ENTRIES) break
+                if (out.size >= MAX_POLICY_ENTRIES) {
+                    // Valid entry beyond the cap: count the unkept remainder
+                // (exact for sane writers with an all-valid tail; a mixed tail
+                // over-counts, since invalid tokens that would never become
+                // policy entries are included by construction; a hostile size
+                // read best-efforts +1). Never throws.
+                    val dropped = try {
+                        raw.size - out.size
+                    } catch (_: Throwable) {
+                        1
+                    }
+                    truncationDrops.addAndGet(dropped.coerceAtLeast(1).toLong())
+                    break
+                }
                 if (it is String &&
                     it.length <= MAX_PACKAGE_LENGTH &&
                     isValidPackage(it)
@@ -198,6 +223,7 @@ object PolicySource {
         // first MAX_POLICY_ENTRIES survivors are therefore seed-first. This is
         // fail-closed (never shrinks the seed to make room for remote).
         if (out.size > MAX_POLICY_ENTRIES) {
+            truncationDrops.addAndGet((out.size - MAX_POLICY_ENTRIES).toLong())
             val truncated = LinkedHashSet<String>(MAX_POLICY_ENTRIES)
             out.take(MAX_POLICY_ENTRIES).forEach { truncated.add(it) }
             return truncated

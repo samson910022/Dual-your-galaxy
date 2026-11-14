@@ -608,6 +608,10 @@ class DualHook : XposedModule() {
     // the same gate, tryAcquire always fails, the first true can never latch
     // (permanent seed-only). Separate gates keep the probe latchable.
     internal fun effectivePolicy(): Set<String> {
+        // 3.3 (sealed-gate short-circuit): with the code gate closed the
+        // cache returns emptySet() before any lock/IPC, discarding everything
+        // below — skip sampling the clock at all.
+        if (!PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE) return emptySet()
         // Phase7 P2 end-to-end deadline: single 50ms total budget shared by
         // capability probe + prefs read (plus budget-aware follower grace).
         // t0 sampled at entry with true System.nanoTime (never mocked);
@@ -658,7 +662,7 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             -1L
         }
-        return effectiveCache.get(
+        val policy = effectiveCache.get(
             EXTRA_WHITELIST_PACKAGES,
             nonEmptyPolicyGateOpen = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
             followerGraceMs = graceAtEntry,
@@ -687,6 +691,45 @@ class DualHook : XposedModule() {
                 reader = { readRemotePrefs() },
                 timeoutMs = rem,
             )
+        }
+        // H4: one throttled best-effort line when policy truncation advanced
+        // (unsealed path only — the gate-closed arm returned above).
+        maybeLogPolicyTruncationDrops()
+        return policy
+    }
+
+    // H4: PolicySource.truncationDrops is a process-lifetime monotonic
+    // counter; this only paces the log (at most one line per
+    // TRUNCATION_LOG_THROTTLE_MS, and only when the total advanced since the
+    // last emit). Mirrors EffectivePolicyCache.noteSeedOnlyFallback's
+    // throttle shape: nanoTime millis, Long.MIN_VALUE sentinel, CAS-claimed,
+    // never throws — a broken clock skips the log instead of bypassing the
+    // throttle.
+    private fun maybeLogPolicyTruncationDrops() {
+        val total = try {
+            PolicySource.truncationDrops.get()
+        } catch (_: Throwable) {
+            return
+        }
+        if (total <= 0L) return
+        val lastEmitted = truncationDropsAtLastLog.get()
+        if (total <= lastEmitted) return
+        val now = try {
+            System.nanoTime() / 1_000_000L
+        } catch (_: Throwable) {
+            return
+        }
+        val last = lastTruncationLogMs.get()
+        if (last != Long.MIN_VALUE && now - last < TRUNCATION_LOG_THROTTLE_MS) return
+        if (!lastTruncationLogMs.compareAndSet(last, now)) return
+        if (!truncationDropsAtLastLog.compareAndSet(lastEmitted, total)) return
+        try {
+            logi(
+                "policy truncation dropped extras beyond the " +
+                    "${PolicySource.MAX_POLICY_ENTRIES}-entry cap (merge keeps seed-priority order; total=$total)",
+            )
+        } catch (_: Throwable) {
+            // Diagnostics only.
         }
     }
 
@@ -1100,6 +1143,16 @@ class DualHook : XposedModule() {
         private val capabilityLatch = RemoteCapabilityLatch()
         @Volatile
         private var remoteCapableFalseCached: Boolean? = null
+
+        // H4: throttle state for the policy-truncation log (see
+        // maybeLogPolicyTruncationDrops). Process-lifetime, never reset; the
+        // counter it observes (PolicySource.truncationDrops) is the source
+        // of truth — this only paces the one log line.
+        private val lastTruncationLogMs =
+            java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE)
+        private val truncationDropsAtLastLog =
+            java.util.concurrent.atomic.AtomicLong(0L)
+        private const val TRUNCATION_LOG_THROTTLE_MS = 5_000L
 
         // Phase7 observability (optional): end-to-end deadline exhaustions
         // (remaining <= 0 skip before capability or prefs segment). Never
