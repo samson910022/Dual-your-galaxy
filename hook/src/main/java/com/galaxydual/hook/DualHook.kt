@@ -73,8 +73,9 @@ class DualHook : XposedModule() {
         }
         if (param.packageName == DA_AGENT_PACKAGE) {
             // Phase F4b-P2: same marker contract as system_server above,
-            // scope "daagent". Both processes read-merge-write the same file,
-            // so each installed scope survives the other's write.
+            // scope "daagent". This process writes ONLY its per-scope file
+            // (`.active.daagent`); the app unions all six marker paths, so
+            // this scope is honored regardless of the peer's write.
             // Marker semantics: install evidence only (at least one daagent
             // hook installed: WhiteListApps <clinit> and/or a query-method
             // hook below), not proof policy took effect. Empty policy =>

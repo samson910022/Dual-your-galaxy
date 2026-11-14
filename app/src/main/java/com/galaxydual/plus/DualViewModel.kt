@@ -639,8 +639,8 @@ class DualViewModel(
     private var retainedShizukuDiagnostic: CmdGateway? = null,
     // Hook-enable signal source (F4b-P2, P1 diagnostic split). Injected so JVM
     // tests never touch the device marker file; production reads via
-    // defaultDirectMarkerReads() (direct MarkerReads of BOTH marker paths,
-    // primary then fallback). hookDiagnosticGateways supplies the CURRENT
+    // defaultDirectMarkerReads() (direct MarkerReads of the SIX marker
+    // paths: per-scope primary/fallback + legacy single-files, unioned). hookDiagnosticGateways supplies the CURRENT
     // real-channel gateways INDEPENDENT of the selected write channel, so an
     // explicit-LSPosed (NoOp) selection still diagnoses through any
     // probe-verified ROOT/SHIZUKU channel; probeChannels further gates that
@@ -13104,7 +13104,7 @@ class DualViewModel(
             // to UNKNOWN_NO_DIAGNOSTIC, never to inactive.
             // Records the usable gateways of this round for the retained
             // expiry check below (diagnoseHookState swallows per-gateway
-            // failure: an attempted-but-failed `cat` pair collapses into the
+            // failure: an attempted-but-failed `cat` round collapses into the
             // status, so the round must remember it attempted an exec).
             var usableGateways: List<CmdGateway> = emptyList()
             val hook: HookDiagnosis = try {
@@ -13113,7 +13113,10 @@ class DualViewModel(
                         hookDirectReads()
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
-                        listOf(MarkerRead.Denied, MarkerRead.Denied)
+                        // The production direct-read list is six files wide
+                        // (see allHookMarkerFiles); mirror that here so the
+                        // catch path honors the six-path contract exactly.
+                        List(6) { MarkerRead.Denied }
                     }
                     val candidates = try {
                         hookDiagnosticGateways()
@@ -13190,7 +13193,7 @@ class DualViewModel(
             // probe-based evidence rewrite.
             // The expiry signal is the gateway exec itself failing, not just
             // UNKNOWN_UNREADABLE: positively-absent direct reads
-            // (Readable(null) x2) plus failed `cat`s collapse to INACTIVE
+            // (Readable(null) x6) plus failed `cat`s collapse to INACTIVE
             // viaGateway=false (direct wins, attempt info lost), so that
             // outcome with a non-empty usable list is also a proving failure.
             val gatewayExecFailed = usableGateways.isNotEmpty() &&

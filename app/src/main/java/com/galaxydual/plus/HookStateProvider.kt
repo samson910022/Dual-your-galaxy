@@ -3,30 +3,38 @@
 // Phase F4b-P2 (issue #6): app-side reader for the hook-active marker.
 //
 // DualHook (system_server + daagent processes) best-effort writes the marker
-// (primary /data/system/galaxydual_hook.active, fallback
-// /data/local/tmp/galaxydual_hook.active) after installing hooks; this file
-// reads it back into a HookState the LSPosed picker row displays as
-// "active (scopes)" vs "not detected". No IPC, no new dependencies beyond the
-// already-present CmdGateway abstraction: direct java.io.File reads first,
-// then (only when a SHELL/ROOT channel is ready) `cat` over the gateway, plus
-// the pure HookMarker parser shared with the writer (single source of truth
-// for the format, so reader/writer cannot drift).
+// (per-scope primary files /data/system/galaxydual_hook.active.{system_server,daagent},
+// per-scope fallbacks /data/local/tmp/....{system_server,daagent}; legacy
+// single-files /data/system/galaxydual_hook.active and
+// /data/local/tmp/galaxydual_hook.active kept read-compat only) after
+// installing hooks; this file reads it back into a HookState the LSPosed
+// picker row displays as "active (scopes)" vs "not detected". No IPC, no new
+// dependencies beyond the already-present CmdGateway abstraction: direct
+// java.io.File reads first, then (only when a SHELL/ROOT channel is ready)
+// `cat` over the gateway, plus the pure HookMarker parser shared with the
+// writer (single source of truth for the format, so reader/writer cannot
+// drift). All SIX paths are unioned everywhere: a scope recorded via any of
+// the six files is honored (existence evidence, never a completeness claim).
 //
 // Path rationale (REAL-DEVICE evidence, Nov 2026): the first marker revision
 // used only /data/local/tmp, but on-device system_server got EACCES writing
 // there, so the writer moved to /data/system (system_data_file, writable by
-// system_server) with /data/local/tmp kept as fallback. Reads therefore cover
-// BOTH paths (unioned): a scope recorded via either write path is honored,
-// and the fixed order is primary-then-fallback everywhere.
+// system_server) with /data/local/tmp kept as fallback. Phase 5 (issue #6)
+// split the marker into per-scope files so the two hook processes never
+// share a written file (no read-merge-write, no lock, no cross-process
+// primitive); readers union all six paths (per-scope primary x2, per-scope
+// fallback x2, then the two legacy single-file paths, in that fixed order).
 //
 // Read strategy (readHookState / readHookStateWithGateway, legacy two-state):
-//  1. direct File reads of both paths (most likely SELinux-denied for the app
+//  1. direct File reads of the six paths (most likely SELinux-denied for the app
 //     uid; denial reads as absent, never as active);
 //  2. only in readHookStateWithGateway, and only when `gateway` is non-null
 //     with SHELL-or-ROOT privilege (i.e. the caller already proved the
 //     channel: DualViewModel passes its active gateway only when channelReady
-//     holds), `cat <primary>` then `cat <fallback>` over the gateway, unioned
-//     with the same parser. Any gateway failure (non-zero exit, blank/
+//     holds), `cat` of one file at a time over the gateway for all SIX
+//     paths (a missing file exits cat non-zero, so one `cat a b` would die
+//     whole -- each path is catted separately), unioned with the same
+//     parser. Any gateway failure (non-zero exit, blank/
 //     garbage output, throwing gateway, NONE privilege) maps to "not
 //     detected", never to active, never throws.
 //  Both legacy readers are DEPRECATED: they conflate unreadable / absent /
@@ -52,7 +60,7 @@
 //   after the module was disabled until a hook process rewrites it. The UI
 //   therefore presents this as existence+scope evidence, never as proof of a
 //   live hook; a boot-time comparison stays future work (see HookMarker).
-// - SELinux: the app uid may be unable to directly read either path on some
+// - SELinux: the app uid may be unable to directly read any of the six paths on some
 //   ROMs, and the gateway-`cat` round-trip has never run on a device either.
 //   Legacy two-state reads (deprecated, see above) map unreadable/missing/
 //   garbage to inactive ("not detected"), never to active; diagnoseHookState
@@ -87,12 +95,32 @@ fun parseHookState(raw: String?): HookState {
     return HookState(active = scopes.isNotEmpty(), scopes = scopes, raw = raw)
 }
 
-// IO: direct File reads of BOTH marker paths (primary then fallback),
+// The six marker paths every reader unions, in fixed read order: per-scope
+// primary (system_server, daagent), per-scope fallback, then the two legacy
+// single-file paths (read-compat forever). Order only matters for the
+// diagnostics raw pick (first readable non-empty wins) — the scope union is
+// order-independent.
+internal fun allHookMarkerFiles(): List<File> = listOf(
+    File(HookMarker.MARKER_PATH_SYSTEM_SERVER),
+    File(HookMarker.MARKER_PATH_DAAGENT),
+    File(HookMarker.LEGACY_MARKER_PATH_SYSTEM_SERVER),
+    File(HookMarker.LEGACY_MARKER_PATH_DAAGENT),
+    File(HookMarker.MARKER_PATH),
+    File(HookMarker.LEGACY_MARKER_PATH),
+)
+
+// Diagnostics pick: the first readable raw (in the fixed six-file order)
+// whose parse yields a non-empty scope set; falls back to the first non-null
+// raw, then null. Used for the marker's timeMs line (hookMarkerTimeMs).
+private fun firstScopesRaw(raws: List<String?>): String? =
+    raws.firstOrNull { HookMarker.parseScopes(it).isNotEmpty() } ?: raws.firstOrNull { it != null }
+
+// IO: direct File reads of all SIX marker paths (see allHookMarkerFiles),
 // unioned via the shared parser. Missing, unreadable, or unparseable files
 // yield inactive. Never throws: every failure mode maps to
 // HookState(active=false), so callers need no catch.
-// The markerFile/fallbackFile parameters exist so JVM tests can point at temp
-// files; production always uses the defaults. No gateway is consulted here:
+// The markerFiles parameter exists so JVM tests can point at temp files;
+// production always uses the default six. No gateway is consulted here:
 // for the gateway-`cat` fallback see readHookStateWithGateway.
 //
 // DEPRECATED: inactive here conflates unreadable/absent/malformed (all map
@@ -103,17 +131,15 @@ fun parseHookState(raw: String?): HookState {
         "its inactive is not negative evidence. Use diagnoseHookState.",
 )
 fun readHookState(
-    markerFile: File = File(HookMarker.MARKER_PATH),
-    fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
+    markerFiles: List<File> = allHookMarkerFiles(),
 ): HookState {
     return try {
-        val primaryRaw = readTextOrNull(markerFile)
-        val fallbackRaw = readTextOrNull(fallbackFile)
-        if (primaryRaw == null && fallbackRaw == null) {
+        val raws = markerFiles.map { readTextOrNull(it) }
+        if (raws.all { it == null }) {
             HookState(active = false)
         } else {
-            val scopes = HookMarker.parseScopes(primaryRaw) + HookMarker.parseScopes(fallbackRaw)
-            HookState(active = scopes.isNotEmpty(), scopes = scopes, raw = primaryRaw ?: fallbackRaw)
+            val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
+            HookState(active = scopes.isNotEmpty(), scopes = scopes, raw = firstScopesRaw(raws))
         }
     } catch (_: Throwable) {
         HookState(active = false)
@@ -122,10 +148,13 @@ fun readHookState(
 
 // IO, suspend: full app-side read strategy -- direct File reads first (see
 // readHookState), then, only when `gateway` is a proven SHELL/ROOT channel,
-// `cat` of both marker paths over that gateway, unioned with the same parser.
-// `gateway` is an OPTIONAL injection point defaulting to null, which behaves
-// exactly like readHookState (old behavior); JVM tests inject a fake
-// CmdGateway plus temp/nonexistent files and never touch real device paths.
+// `cat` of all SIX marker paths over that gateway (one `cat` per file: a
+// missing file exits cat non-zero and would kill a combined command),
+// unioned with the same parser. `gateway` is an OPTIONAL injection point
+// defaulting to null, which behaves exactly like readHookState (old
+// behavior); JVM tests inject a fake CmdGateway plus temp/nonexistent files
+// and never touch real device paths (the gateway `cat`s always target the
+// six production paths, mirroring the legacy two-file behavior).
 // Production (DualViewModel.probeChannels) passes its active gateway only
 // when channelReady holds, so an unproven/NoOp channel never executes `cat`.
 // Never throws: unreadable output, non-zero exits, a throwing gateway, or a
@@ -140,11 +169,10 @@ fun readHookState(
 )
 suspend fun readHookStateWithGateway(
     gateway: CmdGateway? = null,
-    markerFile: File = File(HookMarker.MARKER_PATH),
-    fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
+    markerFiles: List<File> = allHookMarkerFiles(),
 ): HookState {
     return try {
-        val direct = readHookState(markerFile, fallbackFile)
+        val direct = readHookState(markerFiles)
         if (direct.active) return direct
         if (gateway == null ||
             (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT)
@@ -154,20 +182,19 @@ suspend fun readHookStateWithGateway(
         // Marker paths are compile-time constants with a shell-safe charset
         // ([a-zA-Z0-9._/-], no spaces), so plain interpolation is safe; there
         // is deliberately no caller-controlled input in these commands.
-        val primaryRaw = catOrNull(gateway, HookMarker.MARKER_PATH)
-        val fallbackRaw = catOrNull(gateway, HookMarker.LEGACY_MARKER_PATH)
-        if (primaryRaw == null && fallbackRaw == null) return direct
-        val scopes = HookMarker.parseScopes(primaryRaw) + HookMarker.parseScopes(fallbackRaw)
+        val raws = allHookMarkerFiles().map { catOrNull(gateway, it.path) }
+        if (raws.all { it == null }) return direct
+        val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
         if (scopes.isEmpty()) return direct
-        HookState(active = true, scopes = scopes, raw = primaryRaw ?: fallbackRaw)
+        HookState(active = true, scopes = scopes, raw = firstScopesRaw(raws))
     } catch (_: Throwable) {
         HookState(active = false)
     }
 }
 
 // Null when the file is absent/unreadable (SELinux denial included); never
-// throws. markerFile/fallbackFile are explicit (no statics) so tests control
-// exactly which files are touched.
+// throws. Callers pass the exact files to read (see allHookMarkerFiles), so
+// tests control exactly which files are touched.
 private fun readTextOrNull(file: File): String? {
     return try {
         if (!file.isFile) null else file.readText()
@@ -278,15 +305,13 @@ fun readDirectMarker(
     }
 }
 
-// Production direct reads of BOTH marker paths (primary then fallback). The
-// `reader` seam is threaded through for tests; production uses the default.
+// Production direct reads of all SIX marker paths (per fixed order, see
+// allHookMarkerFiles). The `reader` seam is threaded through for tests;
+// production uses the default.
 fun defaultDirectMarkerReads(
     reader: (File) -> String = ::readMarkerTextNio,
 ): List<MarkerRead> =
-    listOf(
-        readDirectMarker(File(HookMarker.MARKER_PATH), reader),
-        readDirectMarker(File(HookMarker.LEGACY_MARKER_PATH), reader),
-    )
+    allHookMarkerFiles().map { readDirectMarker(it, reader) }
 
 // Malformed content (readable but unparseable): raw non-null, non-blank, yet
 // parsing to no scopes ("garbage"). Malformed is NEITHER active NOR positive
@@ -307,9 +332,9 @@ internal fun isMalformedMarker(raw: String?): Boolean =
 //
 // Decision order:
 //  1. direct (or gateway) scopes non-empty -> ACTIVE (direct wins, no exec);
-//  2. a privileged gateway positively read BOTH paths with no scopes and no
-//     malformed content anywhere, or every direct path was positively checked
-//     with no scopes and no gateway saw malformed content -> INACTIVE;
+//  2. a privileged gateway positively read ALL SIX paths with no scopes and
+//     no malformed content anywhere, or every direct path was positively
+//     checked with no scopes and no gateway saw malformed content -> INACTIVE;
 //  3. a gateway was attempted but nothing positively read -> UNKNOWN_UNREADABLE;
 //  4. otherwise (direct denied/missing/malformed, no usable gateway) ->
 //     UNKNOWN_NO_DIAGNOSTIC.
@@ -321,8 +346,8 @@ suspend fun diagnoseHookState(
         .filterIsInstance<MarkerRead.Readable>()
         .fold(emptySet<String>()) { acc, read -> acc + HookMarker.parseScopes(read.raw) }
     if (directScopes.isNotEmpty()) {
-        val raw = directReads.filterIsInstance<MarkerRead.Readable>().firstOrNull { HookMarker.parseScopes(it.raw).isNotEmpty() }?.raw
-        return HookDiagnosis(HookStatus.ACTIVE, directScopes, raw, viaGateway = false)
+        val raws = directReads.filterIsInstance<MarkerRead.Readable>().map { it.raw }
+        return HookDiagnosis(HookStatus.ACTIVE, directScopes, firstScopesRaw(raws), viaGateway = false)
     }
     val directMalformed = directReads.any { it is MarkerRead.Readable && isMalformedMarker(it.raw) }
     val directComplete = directReads.isNotEmpty() && directReads.all { it is MarkerRead.Readable } && !directMalformed
@@ -332,28 +357,32 @@ suspend fun diagnoseHookState(
     for (gateway in diagnosticGateways) {
         if (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT) continue
         attemptedGateway = true
-        val primaryRaw = catOrNull(gateway, HookMarker.MARKER_PATH)
-        val fallbackRaw = catOrNull(gateway, HookMarker.LEGACY_MARKER_PATH)
-        if (primaryRaw != null || fallbackRaw != null) {
-            val scopes = HookMarker.parseScopes(primaryRaw) + HookMarker.parseScopes(fallbackRaw)
+        // One `cat` per path: a missing file exits cat non-zero and would
+        // kill a combined `cat a b c`, so the six paths are catted
+        // separately and each result arrives independently.
+        val raws = allHookMarkerFiles().map { catOrNull(gateway, it.path) }
+        if (raws.any { it != null }) {
+            val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
             if (scopes.isNotEmpty()) {
-                return HookDiagnosis(HookStatus.ACTIVE, scopes, primaryRaw ?: fallbackRaw, viaGateway = true)
+                return HookDiagnosis(HookStatus.ACTIVE, scopes, firstScopesRaw(raws), viaGateway = true)
             }
-            if (isMalformedMarker(primaryRaw) || isMalformedMarker(fallbackRaw)) {
+            if (raws.any { isMalformedMarker(it) }) {
                 gatewayMalformed = true
-            } else if (primaryRaw != null && fallbackRaw != null) {
+            } else if (raws.all { it != null }) {
                 gatewayFullyEmpty = true
             }
         }
     }
-    // A partial gateway read (only one path readable, no scopes) proves
-    // nothing about the other path: stay unknown, never claim inactive.
+    // A partial gateway read (some path unreadable, no scopes) proves
+    // nothing about the unread path: stay unknown, never claim inactive.
     // Malformed content anywhere likewise blocks an INACTIVE verdict: a
     // safely-read but unparseable file is not positive absence.
     if (gatewayFullyEmpty && !directMalformed) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
     // Positive direct evidence stands even when a gateway attempt failed: a
     // failed privileged retry cannot erase a completed direct check. A
-    // malformed gateway read cannot erase it either.
+    // malformed gateway read likewise blocks the INACTIVE verdict —
+    // fail-closed: safely-read-but-unparseable is not positive absence
+    // (same rule as the direct and gateway arms above).
     if (directComplete && !gatewayMalformed) return HookDiagnosis(HookStatus.INACTIVE)
     if (attemptedGateway) return HookDiagnosis(HookStatus.UNKNOWN_UNREADABLE, viaGateway = true)
     return HookDiagnosis(HookStatus.UNKNOWN_NO_DIAGNOSTIC)
@@ -362,12 +391,11 @@ suspend fun diagnoseHookState(
 // IO overload reading the real marker files for the direct stage. The
 // `reader` seam is threaded through for tests; production uses the default.
 suspend fun diagnoseHookState(
-    markerFile: File = File(HookMarker.MARKER_PATH),
-    fallbackFile: File = File(HookMarker.LEGACY_MARKER_PATH),
+    markerFiles: List<File> = allHookMarkerFiles(),
     diagnosticGateways: List<CmdGateway> = emptyList(),
     reader: (File) -> String = ::readMarkerTextNio,
 ): HookDiagnosis = diagnoseHookState(
-    listOf(readDirectMarker(markerFile, reader), readDirectMarker(fallbackFile, reader)),
+    markerFiles.map { readDirectMarker(it, reader) },
     diagnosticGateways,
 )
 
