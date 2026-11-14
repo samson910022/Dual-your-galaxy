@@ -303,27 +303,16 @@ jobs:
           fi
           MERGED=$(find app/build/intermediates/merged_manifests -name AndroidManifest.xml)
           echo "merged manifest: $MERGED"
-          # Exact attribute values, not a bare FQN substring: the merged manifest
-          # must carry the guard provider at the debug-suffixed authority.
-          # NOTE (debug variant): this parity gate asserts the DEBUG variant
-          # authority (com.galaxydual.plus.debug.XposedService). The release
-          # invariant (exactly one GuardXposedProvider, zero libxposed
-          # XposedProvider, release authority without the .debug suffix) is
-          # enforced by the "Policy provider parity (release merged manifest)"
-          # step below.
-          grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
-          grep -F 'android:authorities="com.galaxydual.plus.debug.XposedService"' "$MERGED"
-          # Mirror the release gate's node-count invariant (D4 below): exactly
-          # one GuardXposedProvider node in the debug merged manifest.
-          PROVIDER_NODES=$(grep -c -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED")
-          if [ "$PROVIDER_NODES" != "1" ]; then
-            echo "FAIL: expected exactly 1 GuardXposedProvider node in debug merged manifest, found $PROVIDER_NODES"
-            exit 1
-          fi
-          if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
-            echo "FAIL: merged manifest still declares the libxposed XposedProvider"
-            exit 1
-          fi
+          # Provider-node parse gate: exactly one <provider> carrying BOTH the
+          # GuardXposedProvider name and the debug-suffixed authority on the
+          # SAME element, exported=true, no android:permission, zero libxposed
+          # XposedProvider nodes anywhere, and zero wrong-element name
+          # occurrences. NOTE (debug variant): this parity gate asserts the
+          # DEBUG variant authority (com.galaxydual.plus.debug.XposedService).
+          # The release invariant (release authority without the .debug suffix)
+          # is enforced by the "Policy provider parity (release merged
+          # manifest)" step below.
+          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority com.galaxydual.plus.debug.XposedService
           echo "PASS: policy provider parity"
       # D4: release-variant parity for the policy provider (mirrors the debug
       # gate above). :app:processReleaseMainManifest only merges manifests — it
@@ -355,26 +344,24 @@ jobs:
             exit 1
           fi
           echo "merged release manifest: $MERGED"
-          # Same invariant, release authority: exactly one GuardXposedProvider
-          # node at the release (unsuffixed) authority, ZERO libxposed
-          # XposedProvider nodes.
-          grep -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED"
-          grep -F 'android:authorities="com.galaxydual.plus.XposedService"' "$MERGED"
-          PROVIDER_NODES=$(grep -c -F 'android:name="com.galaxydual.plus.GuardXposedProvider"' "$MERGED")
-          if [ "$PROVIDER_NODES" != "1" ]; then
-            echo "FAIL: expected exactly 1 GuardXposedProvider node in release merged manifest, found $PROVIDER_NODES"
-            exit 1
-          fi
-          if grep -F 'io.github.libxposed.service.XposedProvider' "$MERGED"; then
-            echo "FAIL: release merged manifest still declares the libxposed XposedProvider"
-            exit 1
-          fi
+          # Provider-node parse gate: exactly one <provider> with the
+          # GuardXposedProvider name AND the release (unsuffixed) authority on
+          # the SAME element, exported=true, no android:permission, zero
+          # libxposed XposedProvider nodes anywhere, zero wrong-element name
+          # occurrences.
+          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority com.galaxydual.plus.XposedService
           # Release authority must NOT carry the debug applicationIdSuffix.
           if grep -F 'com.galaxydual.plus.debug.XposedService' "$MERGED"; then
             echo "FAIL: release merged manifest carries the debug-suffixed authority"
             exit 1
           fi
           echo "PASS: release policy provider parity"
+      # Parity-checker fixture self-test: every fail-* fixture must exit 1 and
+      # every pass-* fixture must exit 0, proving the provider-node gate fails
+      # closed (wrong-element names, split name/authority, exported=false, an
+      # unexpected android:permission, and the debug/release authority pair).
+      - name: Provider parity checker self-test
+        run: bash scripts/check-provider-parity.test.sh
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |
