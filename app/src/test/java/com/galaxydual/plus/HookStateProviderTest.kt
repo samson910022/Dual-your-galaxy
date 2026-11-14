@@ -15,7 +15,10 @@ import com.galaxydual.core.Privilege
 import com.galaxydual.hook.HookMarker
 import java.io.File
 import java.nio.file.Files
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -176,6 +179,51 @@ class HookStateProviderTest {
         override suspend fun run(cmd: String): CmdResult {
             calls++
             return handler(cmd)
+        }
+    }
+
+    // Scripted gateway for the diagnostic stage (Phase 2): per-command
+    // CmdResult scripting with the same calls counter as FakeCatGateway, but
+    // a handler that may also throw (e.g. a dying binder) — the exception
+    // propagates out of run() exactly like a real gateway dying mid-call.
+    private class FakeScriptedGateway(
+        override val privilege: Privilege,
+        private val handler: (String) -> CmdResult,
+    ) : CmdGateway {
+        var calls = 0
+        override suspend fun run(cmd: String): CmdResult {
+            calls++
+            return handler(cmd)
+        }
+    }
+
+    // Never-answering gateway: each cat suspends far beyond the round budget,
+    // simulating a hung su spawn whose reply never arrives.
+    private class HangingGateway(
+        override val privilege: Privilege,
+    ) : CmdGateway {
+        var calls = 0
+        override suspend fun run(cmd: String): CmdResult {
+            calls++
+            delay(120_000)
+            return CmdResult(1, "", "never returns")
+        }
+    }
+
+    // Answers the first cat (system_server per-scope path) with a real
+    // system_server scope marker, then suspends far beyond the round budget
+    // on every subsequent cat — positive evidence gathered before a cut.
+    private class FirstCatThenHangingGateway(
+        override val privilege: Privilege,
+    ) : CmdGateway {
+        var calls = 0
+        override suspend fun run(cmd: String): CmdResult {
+            calls++
+            if (cmd == "cat ${HookMarker.MARKER_PATH_SYSTEM_SERVER}") {
+                return CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 1L), "")
+            }
+            delay(120_000)
+            return CmdResult(1, "", "never returns")
         }
     }
 
@@ -382,5 +430,134 @@ class HookStateProviderTest {
         val diagnosis = diagnoseHookState(reads, emptyList())
         assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
         assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, diagnosis.status)
+    }
+
+    // Phase 2 (PR #60): a timedOut `cat` is an untrusted reply, never a
+    // definite read and never a definite absence — the gateway is aborted
+    // after the first command instead of spending five more 60s su calls.
+    @Test fun diagnosis_timedOutFirstCatAbortsGateway() = runBlocking {
+        val gw = FakeScriptedGateway(Privilege.ROOT) {
+            CmdResult(exit = 1, out = "", err = "timeout after 60000ms: sh", timedOut = true)
+        }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(1, gw.calls)
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+    }
+
+    // Same abort rule for a post-dispatch transport loss (reply lost): the
+    // flags are untrusted, so the gateway gives up after the first `cat`.
+    @Test fun diagnosis_transportUnknownFirstCatAbortsGateway() = runBlocking {
+        val gw = FakeScriptedGateway(Privilege.ROOT) {
+            CmdResult(exit = 1, out = "", err = "shizuku: exec timed out after 60000ms", transportUnknown = true)
+        }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(1, gw.calls)
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+    }
+
+    // A truncated capture is never judged, not by exit code, not by content:
+    // even a scope-bearing payload cut short by the capture cap counts as a
+    // transport loss, the gateway is doomed after the first `cat`, and the
+    // reply can never produce an ACTIVE (or an INACTIVE) verdict.
+    @Test fun diagnosis_truncatedReplyIsTransportLossNotActive() = runBlocking {
+        val gw = FakeScriptedGateway(Privilege.SHELL) {
+            CmdResult(exit = 0, out = "scope=system_server\ntimeMs=1\n[truncated]", err = "", truncated = true)
+        }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(1, gw.calls)
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+    }
+
+    // A ROOT gateway that dies mid-call (throwing) is aborted after its
+    // first command; the independent SHELL gateway still gets to answer.
+    @Test fun diagnosis_throwingGatewayAbortsAfterFirstAndOtherGatewayStillAttempted() = runBlocking {
+        val gwRoot = FakeScriptedGateway(Privilege.ROOT) { throw RuntimeException("binder died") }
+        val gwShizuku = FakeScriptedGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.MARKER_PATH_DAAGENT}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 13L), "")
+                else -> CmdResult(1, "", "not found")
+            }
+        }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gwRoot, gwShizuku))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(1, gwRoot.calls)
+        assertEquals(6, gwShizuku.calls)
+    }
+
+    // A timed-out ROOT gateway aborts itself, but the next (SHELL) gateway
+    // in the list is still attempted and its evidence stands.
+    @Test fun diagnosis_timedOutGatewayStillLetsNextGatewayAnswer() = runBlocking {
+        val gwRoot = FakeScriptedGateway(Privilege.ROOT) {
+            CmdResult(exit = 1, out = "", err = "timeout after 60000ms: su", timedOut = true)
+        }
+        val gwShell = FakeScriptedGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.MARKER_PATH_DAAGENT}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 14L), "")
+                else -> CmdResult(1, "", "not found")
+            }
+        }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gwRoot, gwShell))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(setOf(HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
+        assertEquals(1, gwRoot.calls)
+    }
+
+    // A gateway throwing CancellationException is not "transport failed" —
+    // the caller's (or our own) cancellation intent propagates unchanged,
+    // never mapped to a verdict. (kotlin-test's assertFailsWith is absent
+    // from this module's classpath; the expected-exception attribute is the
+    // repo's established pattern for this exact assertion.)
+    @Test(expected = CancellationException::class)
+    fun diagnosis_cancellationExceptionFromGatewayPropagates() = runBlocking {
+        val gw = FakeScriptedGateway(Privilege.ROOT) { throw CancellationException("parent cancelled") }
+        diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        Unit
+    }
+
+    // The whole gateway stage is bounded by HOOK_DIAGNOSIS_ROUND_BUDGET_MS
+    // (withTimeoutOrNull): a gateway whose every cat suspends forever is
+    // cut at the round budget on virtual time — well short of six hanging
+    // cats — and the round reports UNKNOWN_UNREADABLE, never a fake inactive.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun diagnosis_roundBudgetBoundsHungGateway() = runTest {
+        val gw = HangingGateway(Privilege.ROOT)
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(1, gw.calls)
+        assertEquals(HOOK_DIAGNOSIS_ROUND_BUDGET_MS, testScheduler.currentTime)
+    }
+
+    // Phase 2 finding 1 regression: one gateway serves malformed content on
+    // every path (ROOT rootGarbageGateway) while another answers every path
+    // cleanly blank (SHELL shellCleanGateway). The clean gateway sets
+    // gatewayFullyEmpty, but the malformed observations must block the
+    // gateway INACTIVE arm — and the all-Denied direct reads cannot feed the
+    // direct arm either. Verdict must be UNKNOWN_UNREADABLE, never INACTIVE.
+    @Test fun finding1_malformedInOneGatewayBlocksGatewayInactive() = runBlocking {
+        val rootGarbageGateway = FakeScriptedGateway(Privilege.ROOT) { CmdResult(0, "garbage\n", "") }
+        val shellCleanGateway = FakeScriptedGateway(Privilege.SHELL) { CmdResult(0, "", "") }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(rootGarbageGateway, shellCleanGateway))
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+    }
+
+    // Phase 2 finding 2 regression: scopes gathered before the round budget
+    // cuts the gateway stage are positive evidence and must still be reported
+    // as ACTIVE — unioned, never dropped — with the round bounded at
+    // HOOK_DIAGNOSIS_ROUND_BUDGET_MS on virtual time.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun active_scopesCollectedBeforeBudgetCutAreReported() = runTest {
+        val gw = FirstCatThenHangingGateway(Privilege.ROOT)
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertTrue(diagnosis.scopes.contains(HookMarker.SCOPE_SYSTEM_SERVER))
+        assertEquals(HOOK_DIAGNOSIS_ROUND_BUDGET_MS, testScheduler.currentTime)
     }
 }

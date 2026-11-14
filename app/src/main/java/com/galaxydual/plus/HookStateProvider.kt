@@ -77,6 +77,8 @@ import java.io.IOException
 import java.nio.file.AccessDeniedException
 import java.nio.file.Files
 import java.nio.file.NoSuchFileException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 
 // Snapshot of the hook-enable signal for one UI render.
 data class HookState(
@@ -137,6 +139,8 @@ fun readHookState(
             val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
             HookState(active = scopes.isNotEmpty(), scopes = scopes, raw = firstScopesRaw(raws))
         }
+    } catch (ce: CancellationException) {
+        throw ce                                    // never swallowed (cooperative cancellation)
     } catch (_: Throwable) {
         HookState(active = false)
     }
@@ -154,7 +158,9 @@ fun readHookState(
 // Production (DualViewModel.probeChannels) passes its active gateway only
 // when channelReady holds, so an unproven/NoOp channel never executes `cat`.
 // Never throws: unreadable output, non-zero exits, a throwing gateway, or a
-// NONE-privilege gateway all map to inactive ("not detected").
+// NONE-privilege gateway all map to inactive ("not detected"). A
+// CancellationException is the one exception: cooperative cancellation is
+// never swallowed and always propagates.
 //
 // DEPRECATED: same conflation as readHookState -- inactive is not negative
 // evidence. Production reads via diagnoseHookState; this stays only for
@@ -183,6 +189,8 @@ suspend fun readHookStateWithGateway(
         val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
         if (scopes.isEmpty()) return direct
         HookState(active = true, scopes = scopes, raw = firstScopesRaw(raws))
+    } catch (ce: CancellationException) {
+        throw ce                                    // never swallowed (cooperative cancellation)
     } catch (_: Throwable) {
         HookState(active = false)
     }
@@ -200,13 +208,51 @@ private fun readTextOrNull(file: File): String? {
 }
 
 // Runs `cat <absPath>` over the gateway; null on non-zero exit or any
-// failure (including a throwing gateway). Never throws.
+// failure (including a throwing gateway). Re-throws CancellationException
+// (cooperative cancellation is never swallowed); every other failure maps
+// to null.
 private suspend fun catOrNull(gateway: CmdGateway, absPath: String): String? {
     return try {
         val res = gateway.run("cat $absPath")
         if (res.exit != 0) null else res.out
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (_: Throwable) {
         null
+    }
+}
+
+// One gateway `cat` attempt. Never maps a timeout/transport loss to a
+// definite read or a definite absence.
+private sealed interface CatOutcome {
+    data class Content(val raw: String?) : CatOutcome   // exit == 0 (blank allowed)
+    object Unreadable : CatOutcome                        // exit != 0 (missing/denied/garbage exit)
+    object TransportFailed : CatOutcome                    // timedOut / transportUnknown / truncated / gateway threw
+}
+
+// Diagnostic-stage counterpart of catOrNull: splits "gateway could not even
+// answer" (TransportFailed) from "gateway answered, file absent/denied"
+// (Unreadable) and from a real read (Content). The Content trust boundary is
+// explicit: timedOut / transportUnknown / truncated replies are NEVER judged
+// by exit code or content — the flags mean the reply is untrusted (a capture
+// cut short by a cap, read error, or join expiry can hide content, so it must
+// never feed an "empty evidence" decision), so all three are treated as a
+// transport loss. Re-throws
+// CancellationException (was: caught by Throwable, defeating cooperative
+// cancellation); any other gateway failure maps to TransportFailed, which
+// callers treat as "this gateway is doomed for the rest of the round".
+private suspend fun catDetailed(gateway: CmdGateway, absPath: String): CatOutcome {
+    return try {
+        val res = gateway.run("cat $absPath")
+        when {
+            res.timedOut || res.transportUnknown || res.truncated -> CatOutcome.TransportFailed
+            res.exit == 0 -> CatOutcome.Content(res.out)
+            else -> CatOutcome.Unreadable
+        }
+    } catch (ce: CancellationException) {
+        throw ce                                    // never swallowed (was: caught by Throwable)
+    } catch (_: Throwable) {
+        CatOutcome.TransportFailed                  // gateway died mid-call: further cats are doomed too
     }
 }
 
@@ -219,6 +265,34 @@ fun HookState.displayText(): String =
     } else {
         "未偵測到"
     }
+
+// Round budget for the gateway diagnostic stage of diagnoseHookState.
+// Anything still in flight at the deadline is abandoned via withTimeoutOrNull.
+// What abandonment means, per path:
+//  (a) su path — coroutine cancellation is delivered within one poll slice
+//      (SU_WAIT_POLL_MS=50) and the code then does best-effort
+//      destroyForcibly + bounded drain-join (SU_CANCEL_DRAIN_MS=300), but
+//      grandchildren of `su -c cat` may outlive the kill;
+//  (b) Shizuku path — the client-side wait is bounded/cancelled but the
+//      Binder transact is never force-stopped; the service-side `sh -c cat`
+//      runs to completion on a Binder thread pinned up to EXEC_TIMEOUT_MS
+//      (60 s), the service-side exec pool is capped at 4
+//      (SERVICE_EXEC_MAX_CONCURRENT=4), and the late reply is dropped;
+//  (c) the budget is COOPERATIVE — a gateway that never suspends defeats it;
+//      production gateways poll at 50 ms (SU_WAIT_POLL_MS);
+//  (d) the budget is 10 s for the whole gateway stage of one
+//      diagnostic round — the direct-read stage is local file IO and is not
+//      budget-covered. An su `cat` of a <100-byte marker file should cost
+//      ≪1s; 10 s leaves room for slow su spawns without pinning the UI.
+// When the budget fires the round reports UNKNOWN_UNREADABLE (or ACTIVE from
+// scopes gathered before the cut). The deadline never MANUFACTURES an
+// absence: INACTIVE after a cut can rest only on evidence gathered before
+// the cut (a fully-answered clean gateway, or complete direct reads).
+// The shared 10 s budget is spent in list order: an early hung gateway starves
+// later gateways (fail-closed; keep list order as the caller's stability
+// preference), and budget exhaustion yields UNKNOWN_UNREADABLE with no
+// forensic marker (deliberate fail-closed silence).
+internal const val HOOK_DIAGNOSIS_ROUND_BUDGET_MS = 10_000L
 
 // P1 hook diagnosis state (issue #6, 配合 #27): ACTIVE needs a readable
 // marker with a non-empty scope set; INACTIVE needs POSITIVE readable
@@ -323,16 +397,38 @@ internal fun isMalformedMarker(raw: String?): Boolean =
 // INDEPENDENT of the selected write channel: DualViewModel passes
 // probe-verified real gateways even when LSPosed/NoOp is selected, so an
 // explicit-LSPosed choice still diagnoses via any available true channel.
-// Never throws: every failure mode maps to an UNKNOWN state, never to a
-// fake active or a fake inactive.
+// Never throws for gateway/IO failures: every failure mode maps to an
+// UNKNOWN state, never to a fake active or a fake inactive. The one
+// exception is a CancellationException (parent job death, or a gateway
+// throwing one): it always propagates — cooperative cancellation is never
+// swallowed at the gateway boundary.
 //
 // Decision order:
-//  1. direct (or gateway) scopes non-empty -> ACTIVE (direct wins, no exec);
-//  2. a privileged gateway positively read ALL SIX paths with no scopes and
+//  1. the WHOLE gateway stage below runs under withTimeoutOrNull(
+//     HOOK_DIAGNOSIS_ROUND_BUDGET_MS = 10_000L): a hung/revoked-but-still-
+//     "verified" gateway can never pin the caller beyond the round budget.
+//     withTimeoutOrNull converts only timeout-triggered cancellation to a
+//     null return (deadlineExceeded = true); any other CancellationException
+//     still propagates out of this function;
+//  2. per gateway, in list order: the first timed-out / transport-unknown /
+//     truncated / throwing `cat` aborts THIS gateway only (remaining paths
+//     count as unreadable for it) and the next gateway is still attempted;
+//     once the round budget is exhausted, ALL further gateways are skipped;
+//  3. a plain CancellationException from the gateway call itself propagates
+//     (see catDetailed); it is never mapped to a verdict;
+//  4. direct (or gateway) scopes non-empty -> ACTIVE (direct wins, no exec).
+//     Gateway scopes found before a deadline/timeout cut is still ACTIVE:
+//     positive evidence already gathered is unioned, never dropped;
+//  5. a privileged gateway positively read ALL SIX paths with no scopes and
 //     no malformed content anywhere, or every direct path was positively
 //     checked with no scopes and no gateway saw malformed content -> INACTIVE;
-//  3. a gateway was attempted but nothing positively read -> UNKNOWN_UNREADABLE;
-//  4. otherwise (direct denied/missing/malformed, no usable gateway) ->
+//     a set of six positively-read BLANK markers is INACTIVE by the "blank
+//     is empty evidence" contract (not failure-derived);
+//     a gateway that transport-failed or hit the round budget proves nothing
+//     and can never feed gatewayFullyEmpty (its paths stay unreadable);
+//  6. a gateway was attempted but nothing positively read -> UNKNOWN_UNREADABLE
+//     (deadlineExceeded / transport-failure lands here);
+//  7. otherwise (direct denied/missing/malformed, no usable gateway) ->
 //     UNKNOWN_NO_DIAGNOSTIC.
 suspend fun diagnoseHookState(
     directReads: List<MarkerRead>,
@@ -350,30 +446,101 @@ suspend fun diagnoseHookState(
     var attemptedGateway = false
     var gatewayFullyEmpty = false
     var gatewayMalformed = false
-    for (gateway in diagnosticGateways) {
-        if (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT) continue
-        attemptedGateway = true
-        // One `cat` per path: a missing file exits cat non-zero and would
-        // kill a combined `cat a b c`, so the six paths are catted
-        // separately and each result arrives independently.
-        val raws = allHookMarkerFiles().map { catOrNull(gateway, it.path) }
-        if (raws.any { it != null }) {
-            val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
-            if (scopes.isNotEmpty()) {
-                return HookDiagnosis(HookStatus.ACTIVE, scopes, firstScopesRaw(raws), viaGateway = true)
+    // Round budget bookkeeping: monotonic start for the elapsed check, and
+    // deadlineExceeded for either the monotonic check tripping or the
+    // withTimeoutOrNull firing (null lambda return). Unreadable is all an
+    // unfinished round may ever claim.
+    val markerFiles = allHookMarkerFiles()
+    val budgetNanos = HOOK_DIAGNOSIS_ROUND_BUDGET_MS * 1_000_000L
+    val roundStartNanos = System.nanoTime()
+    var deadlineExceeded = false
+    // Union of everything the stage actually read (raws, nulls included) and
+    // every scope parsed off them — positive evidence survives a mid-round
+    // deadline cut. Content outcomes are accumulated as they arrive so a
+    // timeout-interrupted gateway keeps whatever it managed to read.
+    val collectedRaws = mutableListOf<String?>()
+    val collectedScopes = mutableSetOf<String>()
+    val stageResult = withTimeoutOrNull(HOOK_DIAGNOSIS_ROUND_BUDGET_MS) {
+        for (gateway in diagnosticGateways) {
+            if (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT) continue
+            if (deadlineExceeded || System.nanoTime() - roundStartNanos >= budgetNanos) {
+                // Round budget already spent: stop ALL further work, every gateway.
+                deadlineExceeded = true
+                break
             }
-            if (raws.any { isMalformedMarker(it) }) {
-                gatewayMalformed = true
-            } else if (raws.all { it != null }) {
-                gatewayFullyEmpty = true
+            attemptedGateway = true
+            // One `cat` per path: a missing file exits cat non-zero and would
+            // kill a combined `cat a b c`, so the six paths are catted
+            // separately and each result arrives independently. IN ORDER:
+            // the union across the six files is the contract, so keep going
+            // even after scopes are found.
+            val raws = mutableListOf<String?>()
+            var transportFailed = false
+            for (file in markerFiles) {
+                if (deadlineExceeded || System.nanoTime() - roundStartNanos >= budgetNanos) {
+                    deadlineExceeded = true
+                    break
+                }
+                when (val outcome = catDetailed(gateway, file.path)) {
+                    is CatOutcome.Content -> {
+                        raws += outcome.raw
+                        collectedRaws += outcome.raw
+                        if (isMalformedMarker(outcome.raw)) gatewayMalformed = true
+                        collectedScopes += HookMarker.parseScopes(outcome.raw)
+                    }
+                    CatOutcome.Unreadable -> {
+                        raws += null
+                        collectedRaws += null
+                    }
+                    CatOutcome.TransportFailed -> {
+                        // This gateway is doomed (timed out, transport lost,
+                        // or died mid-call): stop issuing further commands for
+                        // it and let the NEXT gateway try — a different channel
+                        // may still answer.
+                        transportFailed = true
+                        break
+                    }
+                }
+            }
+            // Unread/unattempted paths of this gateway (transport failure or
+            // deadline cut) count as unreadable: pad with nulls so the gateway
+            // can never claim full knowledge (never feeds gatewayFullyEmpty).
+            while (raws.size < markerFiles.size) {
+                raws += null
+                collectedRaws += null
+            }
+            // A gateway that positively read every path, with nothing scoped
+            // and nothing malformed, is positive absence for INACTIVE. A
+            // transport-failed gateway only ever contributes "not readable":
+            // if some other gateway fully answered, the normal decision path
+            // below uses it, and this one changes nothing.
+            if (!transportFailed && !deadlineExceeded && raws.all { it != null }) {
+                val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
+                if (scopes.isEmpty() && raws.none { isMalformedMarker(it) }) {
+                    gatewayFullyEmpty = true
+                }
             }
         }
+        true
+    }
+    // null from withTimeoutOrNull == the round budget fired (it converts only
+    // ITS timeout into null; foreign CancellationExceptions propagated). The
+    // unread remainder stays unreadable — the deadline can never manufacture
+    // an absence, and can never un-collect scopes gathered before the cut.
+    if (stageResult == null) deadlineExceeded = true
+    // Gateway scopes gathered before the stage finished (or before a deadline
+    // cut it short) are still ACTIVE: positive evidence, union of what was
+    // read. Deadline exceeded with no scopes falls through to the normal
+    // mapping below (it only means "not fully read").
+    if (collectedScopes.isNotEmpty()) {
+        return HookDiagnosis(HookStatus.ACTIVE, collectedScopes, firstScopesRaw(collectedRaws), viaGateway = true)
     }
     // A partial gateway read (some path unreadable, no scopes) proves
     // nothing about the unread path: stay unknown, never claim inactive.
-    // Malformed content anywhere likewise blocks an INACTIVE verdict: a
-    // safely-read but unparseable file is not positive absence.
-    if (gatewayFullyEmpty && !directMalformed) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
+    // No gateway may have observed malformed content for the gateway
+    // INACTIVE arm either: a safely-read but unparseable file is not
+    // positive absence.
+    if (gatewayFullyEmpty && !directMalformed && !gatewayMalformed) return HookDiagnosis(HookStatus.INACTIVE, viaGateway = true)
     // Positive direct evidence stands even when a gateway attempt failed: a
     // failed privileged retry cannot erase a completed direct check. A
     // malformed gateway read likewise blocks the INACTIVE verdict —
