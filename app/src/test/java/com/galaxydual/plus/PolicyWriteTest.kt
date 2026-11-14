@@ -112,6 +112,21 @@ class PolicyWriteTest {
         resetRemotePoisonForTests()
     }
 
+    // Activity finish 語義：dispose（disarm＋撤銷擁有的 PREPARING Tx＋關閉 VM 內部
+    // reconcile dispatcher）後取消 viewModelScope，與 tearDown 的釋放順序一致；
+    // coordinator（若為 app-scoped 傳入）存活。
+    private fun finishActivityStyle(vm: DualViewModel) {
+        try {
+            vm.dispose()
+        } catch (_: Exception) {
+            // Best effort：測試行程本就會丟棄。
+        }
+        try {
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("activity-finish"))
+        } catch (_: Exception) {
+        }
+    }
+
     private fun makeVm(
         policyStore: HookPolicyStore?,
         userId: Int = 0,
@@ -10193,6 +10208,162 @@ class PolicyWriteTest {
         vm.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
         await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
         assertEquals(1, fake.clearCalls)
+    }
+
+    // PR #60 r6 Phase 1 (Finding #1): VM 替換邊界——Activity 重開（同行程內新
+    // VM 實例）繼承 coordinator 持有的行程級 lastKnown 圍欄；遠端 Unknown 下
+    // 兩次點擊仍只觸發 refresh-first（fail-closed），絕不刪除。
+    @Test
+    fun s4_blindClear_vmReplacement_knownInherited_refreshFirstNeverDeletes() {
+        val coord = PolicyTxCoordinator()
+        // 自訂 store（FakePolicyStore 語義＋可阻斷 load）：VM-B 盲清 tap-2 的
+        // refresh-first 重讀會阻在 loadBlock（onIo IO 執行緒自旋），msg 停留在
+        // BLIND_CLEAR_REFRESH_FIRST。此測試鑑別的是「行程級圍欄全退回
+        // VM-local-only」的回歸（如 commit-time knownCommitFence 亦同步退回時）；
+        // 單獨還原 S4 refresh-first gate（9219）仍會被 coordinator-aware 的
+        // commit-time fence 接住（fail-closed，msg 亦為 BLIND_CLEAR_REFRESH_FIRST）
+        // ——兩層防禦互為掩護，此斷言只對「整體 rollback」確定性失手。
+        var backing: Set<String>? = setOf("com.seed")
+        var clearCalls = 0
+        val loadBlock = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                while (loadBlock.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    clearCalls++
+                    backing = emptySet()
+                } else {
+                    backing = raw
+                }
+                true
+            },
+        )
+        // VM-A：觀察過 Known → noteLastKnownDraft 同步寫入 coordinator 圍欄。
+        val vmA = makeVm(store, userId = 0, initialDraft = setOf("com.seed"), policyTxCoordinator = coord)
+        await { vmA.state.value.policyDraftKnown }
+        await(timeoutMs = 5_000L) { coord.lastKnownPolicyDraft.get() != null }
+        // 遠端轉為未知：強制重讀（state → Unknown；行程級 lastKnown 保留）。
+        backing = null
+        vmA.refreshPolicyDraft()
+        await(timeoutMs = 5_000L) { !vmA.state.value.policyDraftKnown }
+        // 模擬 Activity finish：dispose 後取消 scope（與 tearDown 同序；coordinator 存活）。
+        finishActivityStyle(vmA)
+        // VM-B：同行程新 VM（等效 Activity 重開），同一 coordinator＋未知 store。
+        val vmB = makeVm(store, userId = 0, initialDraft = null, policyTxCoordinator = coord)
+        await(timeoutMs = 5_000L) { !vmB.state.value.loading && !vmB.state.value.policyDraftKnown }
+
+        vmB.clearPolicyDraft() // tap 1：arm＋BLIND_CLEAR_FIRST
+        assertEquals(0, clearCalls)
+        assertEquals(setOf("com.seed"), coord.lastKnownPolicyDraft.get())
+
+        loadBlock.set(true) // 卡住 tap 2 的 refresh-first 重讀，使鑑別斷言確定性成立
+        try {
+            vmB.clearPolicyDraft() // tap 2：S4 refresh-first（行程級 lastKnown 繼承）→ 不刪
+            // 鑑別斷言（同步前綴）：refresh-first arm 在 clearPolicyDraft 內同步寫
+            // msg=BLIND_CLEAR_REFRESH_FIRST；回歸 bug（行程級圍欄全退回 VM-local-only、
+            // VM-B 無圍欄）則走 classic arm，此處 msg 不會是此值（且 loadBlock 卡住
+            // pre-IO 重讀）。單獨還原 S4 gate 而保留 coordinator-aware commit fence 時，
+            // 後者會 fail-closed 接管並發出相同 msg——見上方 loadBlock 說明。
+            assertEquals(
+                PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST).defaultText(),
+                vmB.state.value.msg,
+            )
+            assertTrue(vmB.state.value.policyRefreshing)
+        } finally {
+            loadBlock.set(false)
+        }
+        await(timeoutMs = 5_000L) { !vmB.state.value.policyRefreshing }
+        assertEquals(0, clearCalls)
+        assertNotNull(vmB.lastKnownPolicyDraftForTests())
+        assertFalse(vmB.state.value.policyDraftKnown)
+        assertEquals(MsgKind.CHANNEL, vmB.state.value.msgKind)
+        // 重讀恢復未知 → refresh-first 後續 settle 為 REFRESH_FAILED（fail-closed，不刪）。
+        assertEquals(
+            PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
+            vmB.state.value.msg,
+        )
+    }
+
+    // PR #60 r6 Phase 1 (Finding #1): 新行程（全新 coordinator＝escape hatch）
+    // 不繼承行程級圍欄，回復經典雙擊語義。注意：暫時性未知且 store 仍不可讀時，
+    // 經典路徑本來就在 pre-IO 重讀中止（REFRESH_FAILED、零刪除，見
+    // s4_blindClear_lastKnownNull_classicDoubleTapSemantics）；只有狀態轉為
+    // 未知期間「誰曾是 Known」不再被行程級圍欄綁住——遠端恢復可讀後的下一次
+    // 雙擊即可刪除。共享 coordinator 的 VM（見 s4_blindClear_vmReplacement_...）
+    // 在同一未知 store 場景下永遠只觸發 refresh-first。
+    // 偏離說明（r6 修正輪）：spec 原寫「same unknown store；two taps → clearCalls
+    // == 1」，但現行 fail-closed 設計（StageJ3 pre-IO 重讀閘門）下，不可讀 store
+    // 的第二次點擊絕不刪除（與 s4_blindClear_lastKnownNull_classicDoubleTapSemantics
+    // 釘住的既有語義一致）；此測試改為 tap 1-2 驗證 0 刪除＋REFRESH_FAILED，
+    // 遠端恢復可讀後 tap 3-4 完成經典雙擊刪除並斷言 clearCalls == 1。
+    @Test
+    fun s4_blindClear_newProcessCoordinator_classicDoubleTapSemantics() {
+        val coordA = PolicyTxCoordinator()
+        val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
+        // VM-A：同前測，觀察過 Known 後以 Activity finish 語義銷毀。
+        val vmA = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"), policyTxCoordinator = coordA)
+        await { vmA.state.value.policyDraftKnown }
+        await(timeoutMs = 5_000L) { coordA.lastKnownPolicyDraft.get() != null }
+        fake.saved = null
+        vmA.refreshPolicyDraft()
+        await(timeoutMs = 5_000L) { !vmA.state.value.policyDraftKnown }
+        // 模擬 Activity finish：dispose 後取消 scope（與 tearDown 同序；coordinator 存活）。
+        finishActivityStyle(vmA)
+        // VM-B：「新行程」——全新 coordinator，VM-B 不繼承任何 Known 歷史。
+        val coord = PolicyTxCoordinator()
+        val vmB = makeVm(fake.store, userId = 0, initialDraft = null, policyTxCoordinator = coord)
+        await(timeoutMs = 5_000L) { !vmB.state.value.loading && !vmB.state.value.policyDraftKnown }
+        assertNull(vmB.lastKnownPolicyDraftForTests())
+
+        vmB.clearPolicyDraft() // tap 1：arm（0 刪除）
+        assertEquals(0, fake.clearCalls)
+        // 圍欄不適用（新行程）→ 經典路徑；pre-read Unknown → REFRESH_FAILED 中止（0 刪除）
+        vmB.clearPolicyDraft() // tap 2
+        await(timeoutMs = 5_000L) {
+            vmB.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+        }
+        assertEquals(0, fake.clearCalls)
+        assertFalse(vmB.state.value.policyDraftKnown)
+        assertEquals(
+            PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
+            vmB.state.value.msg,
+        )
+
+        // 遠端恢復可讀（Known empty；state 仍 Unknown、未重讀、lastKnown==null）：
+        // 下一次雙擊走經典路徑，允許刪除。
+        vmB.clearPolicyDraft() // tap 3：重新 arm
+        fake.saved = emptySet()
+        vmB.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
+        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
+        assertEquals(1, fake.clearCalls)
+    }
+
+    // PR #60 r6 Phase 1 (Finding #1): noteLastKnownDraft 同步寫入 coordinator
+    // 持有的行程級圍欄——VM-A 丟棄（Activity finish 語義）後，coordinator 仍
+    // 保有 Known 快照的防禦性拷貝，供同行程新 VM 繼承。
+    @Test
+    fun s4_noteLastKnownDraft_writesCoordinatorFence() {
+        val coord = PolicyTxCoordinator()
+        val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
+        val vmA = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"), policyTxCoordinator = coord)
+        await { vmA.state.value.policyDraftKnown }
+        await(timeoutMs = 5_000L) { coord.lastKnownPolicyDraft.get() != null }
+        val fenced = coord.lastKnownPolicyDraft.get()
+        assertNotNull(fenced)
+        assertEquals(setOf("com.seed"), fenced)
+        // 丟棄 VM-A（Activity finish 語義）；圍欄為行程級、不隨 VM 消亡。
+        finishActivityStyle(vmA)
+        val fencedAfter = coord.lastKnownPolicyDraft.get()
+        assertNotNull(fencedAfter)
+        assertEquals(setOf("com.seed"), fencedAfter)
     }
 
     // Item 2: autoRecheckTx must stage a placeholder (!known && msg.isEmpty()) on claimForPublish,
