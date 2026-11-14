@@ -185,6 +185,11 @@ class PolicyTxCoordinator {
     // Intended for metrics export (diagnostics surface) — see KDoc there.
     val tombstoneEvictions = AtomicLong(0L)
 
+    // PR #60 C1.2 observability: tombstone rollbacks (lost pendingPublish CAS with
+    // real payload staged in dropStagedPlaceholderIfMatch). Monotonic, never reset
+    // except resetForTest. Intended for metrics export; never wired into correctness.
+    val tombstoneRollbacks = AtomicLong(0L)
+
     // O1 (synthetic-emit fence): a monotonic count of UNSTAMPED (rev == -1)
     // synthetic revision bumps — emitStaged/tryEmitSettled taking their
     // synthetic-direct branch, or tryUpdateLatestMonotonic seeing a rev == -1
@@ -283,6 +288,38 @@ class PolicyTxCoordinator {
                 claimTombstones[k] = rev
                 true
             }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    // PR #60 C1.2: value-matched tombstone rollback for the lock-free drop path.
+    // Used when dropStagedPlaceholderIfMatch loses its pendingPublish CAS and
+    // pendingPublish no longer holds the placeholder we tombstoned (a concurrent
+    // stageRealPayload staged the real payload, or a recover/retire replaced or
+    // cleared pending). Keeps the drop honest: the tombstone only fences the
+    // identity we actually dropped a placeholder for. Same access discipline as
+    // tryInsertClaimTombstone (lock-free ConcurrentHashMap, value-matched remove
+    // so a concurrently refreshed rev survives); bounded (single map op).
+    internal fun removeClaimTombstone(txId: Long, key: String, rev: Long): Boolean {
+        return try {
+            val removed = claimTombstones.remove(tombstoneKey(txId, key), rev)
+            if (removed) {
+                try {
+                    tombstoneRollbacks.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                try {
+                    logCoord(
+                        "tombstone rolled back txId=$txId rev=$rev " +
+                            "(lost pendingPublish CAS with real payload staged; truth via _latest)",
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+            removed
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
@@ -1082,10 +1119,25 @@ class PolicyTxCoordinator {
     //   outcome stands; never two winners);
     // - on a won CAS: owner cleared, orphanDropRev/Gen bumped (paired order,
     //   rev before gen) — identical to the locked drop paths.
-    // - accepted over-broad fence on a LOST CAS: the tombstone inserted above
-    //   is kept even though no drop happened (the loser is fenced as seen) —
-    //   deliberate fail-closed bias, bounded by the claim-tombstone eviction
-    //   cap; no real payload is affected (placeholders carry no truth).
+    // - on a LOST CAS: pendingPublish is re-read; if it no longer holds the
+    //   placeholder we observed (a concurrent stageRealPayload staged real
+    //   payload — placeholder→real — or a foreign/recover path cleared or
+    //   replaced pending), the tombstone inserted above is rolled back
+    //   ([claimTombstones] remove(key, rev), value-matched so a refreshed
+    //   rev survives) and the drop reports false. The tombstone is kept only
+    //   when the fence really was an over-broad placeholder drop (pending
+    //   still holds the same placeholder identity, e.g. a foreign recover
+    //   CAS-won our snapshot for a different arrangement): a stale tombstone
+    //   there is the deliberate fail-closed bias, bounded by the
+    //   claim-tombstone eviction cap.
+    //   Why rollback matters: a concurrent stageRealPayload can stage the real
+    //   payload S into _latest＋pendingPublish BEFORE our tombstone insert, so
+    //   keeping the tombstone would make emitStaged(S) see isTombstoned and S
+    //   would never reach the _settled notifier — S's truth survives only via
+    //   _latest / retireStagedRealPresentInLatestLocked (which clears pending
+    //   while preserving _latest truth for an age-gated stale real payload),
+    //   never via a successful synthetic emit. Rolling the tombstone back on a
+    //   lost-CAS-with-real-staged keeps S emittable.
     // Placeholders carry no truth (_latest untouched), so a won lock-free drop
     // can never publish or destroy a real payload.
     internal fun dropStagedPlaceholderIfMatch(txId: Long, key: String): Boolean = try {
@@ -1100,7 +1152,22 @@ class PolicyTxCoordinator {
                 // Capacity: keep the fence (STALE retry) — same as the locked path.
                 false
             } else if (!pendingPublish.compareAndSet(cur, null)) {
-                // Lost the race: another mutator won; keep tombstone, report not dropped.
+                // Lost the race. Re-read pendingPublish: if it no longer holds
+                // the placeholder we tombstoned — a concurrent stageRealPayload
+                // won placeholder→real between our read and our tombstone
+                // insert — roll the tombstone back so S stays emittable;
+                // recovery for the real payload is via _latest /
+                // retireStagedRealPresentInLatestLocked, never via a synthetic
+                // emit of a tombstoned identity. Keep the tombstone only when
+                // the lost fence really was an over-broad placeholder drop
+                // (pending still holds the same placeholder identity).
+                val curAfter = try { pendingPublish.get() } catch (_: Exception) { null }
+                val stillPlaceholder = curAfter != null &&
+                    curAfter.txId == cur.txId && curAfter.key == cur.key &&
+                    (try { !curAfter.known && curAfter.msg.isEmpty() } catch (_: Exception) { false })
+                if (!stillPlaceholder) {
+                    removeClaimTombstone(cur.txId, cur.key, cur.rev)
+                }
                 false
             } else {
                 try {
@@ -1303,6 +1370,10 @@ class PolicyTxCoordinator {
         }
         try {
             tombstoneEvictions.set(0L)
+        } catch (_: Exception) {
+        }
+        try {
+            tombstoneRollbacks.set(0L)
         } catch (_: Exception) {
         }
         try {

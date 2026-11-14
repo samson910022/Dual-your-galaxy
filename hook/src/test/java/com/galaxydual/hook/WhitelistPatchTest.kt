@@ -174,7 +174,8 @@ class WhitelistPatchTest {
     }
 
     // Simulates a hostile custom list: lands the element, then throws on the
-    // 2nd insert of the patch (one-shot; rollback re-inserts must succeed).
+    // 2nd insert of the patch (one-shot; 修復後的 rollback 走 subList 後綴
+    // 清復 + 前綴驗證, 不再重插).
     private class PartialFailList(
         private val backing: MutableList<String> = mutableListOf(),
     ) : AbstractMutableList<String>() {
@@ -196,12 +197,223 @@ class WhitelistPatchTest {
         override fun removeAt(index: Int): String = backing.removeAt(index)
     }
 
+    // Permanently add-refusing but clearable AbstractMutableList: every
+    // add() lands the element and then throws (append-then-throw, every
+    // time). The pre-fix rollback (clear()+addAll(snapshot)) would lose the
+    // originals; the subList(size0, size).clear() rollback must drop exactly
+    // the appended suffix and keep the original prefix byte-for-byte.
+    private class PermanentRefusalList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+            throw IllegalStateException("add refused")
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun clear() {
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun permanentlyAddRefusingListIsSkippedAndOriginalsPreserved() {
+        val list = PermanentRefusalList(mutableListOf("a", "z"))
+        val out = WhitelistPatch.apply(list, true, setOf("b", "c"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        assertEquals(listOf("a", "z"), list)
+    }
+
+    // Add-refusing without appending: add() throws before mutating, so the
+    // live list is never touched. The rollback must be a no-op (size == size0).
+    private class AddThrowsWithoutAppendingList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            throw IllegalStateException("add refused without appending")
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun clear() {
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun addThrowingWithoutAppendingListIsSkippedAndOriginalsPreserved() {
+        val list = AddThrowsWithoutAppendingList(mutableListOf("a", "z"))
+        val out = WhitelistPatch.apply(list, true, setOf("b", "c"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        assertEquals(listOf("a", "z"), list)
+    }
+
     @Test
     fun partialFailureLeavesOriginalUntouchedAndSkipped() {
-        val list = PartialFailList(mutableListOf("a"))
+        val list = PartialFailList(mutableListOf("a", "z"))
         val out = WhitelistPatch.apply(list, true, setOf("b", "c"), "F", "C")
         assertTrue(out is WhitelistPatch.Outcome.Skipped)
-        assertEquals(listOf("a"), list)
+        assertEquals(listOf("a", "z"), list)
+    }
+
+    // Wrong-end removeAt: removeAt(i) removes the element at backing.size - 1 - i.
+    // add() appends-then-throws. The (b) suffix drop then eats original
+    // entries, the prefix verification must catch it, and the
+    // clear()+addAll(snapshot) fallback restores the originals.
+    // (P3 ISSUE 4: verify-fail fallback coverage.)
+    private class WrongEndRemoveList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+            // Refuse only the patch extras, so the fallback re-add of the
+            // snapshot succeeds; the patch's own addAll then throws midway.
+            if (element != "a" && element != "z") throw IllegalStateException("add refused")
+        }
+        override fun removeAt(index: Int): String =
+            backing.removeAt(backing.size - 1 - index)
+        override fun clear() {
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun wrongEndRemoveAtIsCaughtByVerificationAndRestoredByFallback() {
+        val list = WrongEndRemoveList(mutableListOf("a", "z"))
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        assertEquals(listOf("a", "z"), list)
+    }
+
+    // Wrong-end removeAt AND a clear() that throws: the verification still
+    // fails, the fallback itself then throws, and the swallow must keep
+    // apply() fail-closed — Skipped is returned, no exception escapes.
+    // (Narrowed promise: list contents are not asserted here.)
+    private class WrongEndClearThrowsList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+            // Refuses patch extras (throws after the append). In THIS fixture
+            // the fallback's re-add is never reached: clear() throws first
+            // and is swallowed — the fixture pins the no-escape contract.
+            if (element != "a" && element != "z") throw IllegalStateException("add refused")
+        }
+        override fun removeAt(index: Int): String =
+            backing.removeAt(backing.size - 1 - index)
+        override fun clear() {
+            throw IllegalStateException("clear refused")
+        }
+    }
+
+    @Test
+    fun wrongEndRemoveAtWithThrowingClearReturnsSkippedWithoutEscaping() {
+        val list = WrongEndClearThrowsList(mutableListOf("a", "z"))
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+    }
+
+    // Detached-view subList: subList() returns a defensive copy, so the
+    // (b) suffix drop clears the copy and leaves the live list untouched —
+    // the prefix verification must catch size != size0 and the
+    // clear()+addAll(snapshot) fallback restores the originals.
+    // (add() refuses only the patch extras, so the fallback re-add succeeds.)
+    private class DetachedSubListList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+            if (element == "b") throw IllegalStateException("add refused")
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> =
+            ArrayList(backing.subList(fromIndex, toIndex))
+        override fun clear() {
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun detachedSubListIsCaughtByVerificationAndRestoredByFallback() {
+        val list = DetachedSubListList(mutableListOf("a", "z"))
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        assertEquals(listOf("a", "z"), list)
+    }
+
+    // size read throws: the pre-mutation guard must fail closed to Skipped
+    // before anything is attempted, leaving the list untouched.
+    // (ISSUE-3-a: the throwing-size arm of the two-tier rollback.)
+    private class SizeThrowsList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = throw IllegalStateException("size refused")
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+    }
+
+    @Test
+    fun sizeThrowingListFailsClosedToSkippedBeforeMutation() {
+        val backing = mutableListOf("a", "z")
+        val list = SizeThrowsList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        // Assert against the backing (the hostile list itself is unreadable).
+        assertEquals(listOf("a", "z"), backing)
+    }
+
+    // get() throws during the prefix verification (size stays readable and
+    // consistent): the two-tier rollback's outer catch must count that as
+    // verify-fail and fall back to clear()+addAll(snapshot), preserving the
+    // originals. add() appends-then-throws for the patch extras only.
+    // (ISSUE-3-b: the throwing-verification arm.)
+    private class VerifyGetThrowsList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        private var mutating = false
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String {
+            // Throw only once mutation of the live list could have begun
+            // (the union computation iterates via iterator(), not get()).
+            if (mutating) throw IllegalStateException("get refused")
+            return backing[index]
+        }
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            mutating = true
+            backing.add(index, element)
+            if (element != "a" && element != "z") throw IllegalStateException("add refused")
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun clear() {
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun getThrowingDuringVerificationFallsBackAndPreservesOriginals() {
+        val backing = mutableListOf("a", "z")
+        val list = VerifyGetThrowsList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        // Assert against the backing (the hostile list's get() throws).
+        assertEquals(listOf("a", "z"), backing)
     }
 
     @Test

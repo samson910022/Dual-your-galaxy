@@ -32,18 +32,26 @@ import java.lang.reflect.Modifier
 // Copy-on-write promise (list case): the union is fully computed on a plain
 // ArrayList copy; the live list sees at most ONE mutating call (addAll). If
 // that call throws after a partial append (hostile AbstractMutableList), we
-// best-effort roll back to the snapshot. Narrowed guarantee for an extreme
-// list whose clear/addAll ALSO throws during rollback: union was computed on
-// a copy and the live list got only a single addAll -- it may stay dirty.
-// That class cannot be made atomic through the in-place MutableList API.
+// roll back in two tiers and verify before returning: first drop exactly the
+// appended suffix (subList(size0, size).clear()); then verify the list is
+// back to the original size with every original element at its original
+// index; only on verification failure (or a throwing verification) do we
+// last-resort to clear() + addAll(snapshot) -- itself best-effort, and it may
+// itself keep only a prefix of the snapshot. Narrowed guarantee for an
+// extreme list whose clear/addAll ALSO throw during that last resort: union
+// was computed on a copy and the live list got only a single addAll -- it
+// may stay dirty. That class cannot be made atomic through the in-place
+// MutableList API. A list whose `size` read itself throws fails closed to
+// Skipped BEFORE any mutation is attempted.
 // Two further hostile-addAll cases are indistinguishable from success and
 // are NOT signaled: (a) a hostile addAll that returns normally but mangles
 // the list -- silently dropping original ROM entries or seeding extra ones
 // -- is logged as "+N added" while the ROM list is in fact corrupted; (b) if
-// addAll throws after partially appending, the best-effort rollback
-// (clear() + addAll(snapshot)) can itself fail, and then ORIGINAL ROM
-// whitelist entries may be lost -- fail-closed for the affected apps, but
-// data loss with no signal to the caller.
+// addAll throws after partially appending, the last-resort restore
+// (clear() + addAll(snapshot)) may itself fail or keep only a prefix of the
+// snapshot, and then ORIGINAL ROM whitelist entries may be lost --
+// fail-closed for the affected apps, but data loss with no signal to the
+// caller.
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
@@ -251,6 +259,15 @@ object WhitelistPatch {
             // (`add`, via `extra.filter { it !in snapshot }`); the live list
             // is not touched until the final addAll applies exactly that
             // precomputed delta.
+            // A hostile list whose `size` throws must not escape apply():
+            // fail closed to Skipped before any mutation is attempted.
+            val size0 = try {
+                list.size
+            } catch (t: Throwable) {
+                return Outcome.Skipped(
+                    "skip patch $fieldName on $owner: failed to read list size (${HookLog.shortEx(t)})",
+                )
+            }
             val snapshot: ArrayList<String>
             val add: List<String>
             try {
@@ -265,17 +282,48 @@ object WhitelistPatch {
             try {
                 list.addAll(add)
             } catch (t: Throwable) {
-                // Immutable view (List.of / unmodifiableList): addAll throws
-                // before mutating, so rollback is a no-op. A hostile custom
-                // list may have partially appended: best-effort restore.
+                // Two-tier rollback with pre-return verification, applied
+                // uniformly (not a one-shot subList().clear()):
+                // (b) drop exactly the appended suffix when the list grew
+                //     past size0 (a no-op for pure-throw / unmodifiable
+                //     views); any throw — including the size read itself —
+                //     counts as verify-fail and lands in the outer catch,
+                //     which routes to the fallback (d);
+                // (c) verify the list is back to the original prefix —
+                //     size == size0 and every original element at its old
+                //     index; any Throwable during verification counts as
+                //     verify-fail;
+                // (d) only on verify-fail, last-resort clear()+addAll(snapshot)
+                //     — itself best-effort (may keep only a snapshot prefix).
+                // Byte-for-byte originals preserved for lists whose add/addAll
+                // throws before or after appending only at the tail; verified
+                // before returning, otherwise best-effort fallback. Lists that
+                // shrink during add, detached-view subLists, wrong-end removal,
+                // or prefix damage are caught by the verification step, not
+                // assumed safe.
+                var rolled = false
                 try {
-                    list.clear()
-                    list.addAll(snapshot)
+                    if (list.size > size0) {
+                        try {
+                            list.subList(size0, list.size).clear()
+                        } catch (_: Throwable) {
+                            // Fall through to the verify step.
+                        }
+                    }
+                    rolled = list.size == size0 && (0 until size0).all { list[it] == snapshot[it] }
                 } catch (_: Throwable) {
-                    // Swallowed: narrowed promise applies (see header).
+                    rolled = false
+                }
+                if (!rolled) {
+                    try {
+                        list.clear()
+                        list.addAll(snapshot)
+                    } catch (_: Throwable) {
+                        // Swallowed: last-resort restore may fail too (see header).
+                    }
                 }
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $owner: list is not modifiable (${HookLog.shortEx(t)})",
+                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})",
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
