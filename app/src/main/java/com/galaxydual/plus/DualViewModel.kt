@@ -946,10 +946,20 @@ class DualViewModel(
     // observes the tx (winner, reconciler, late-join, coordinator replay)
     // derives the same pair — the entry dies with the tx, never outlives it.
     private fun repairSuccessTerminal(tx: PolicyTx): Pair<String, MsgKind> {
-        val result: RepairResult? = try {
+        var result: RepairResult? = try {
             tx.repairResult.get()
         } catch (_: Throwable) {
             null
+        }
+        if (tx.isRepair && result == null && tx.deferred.isCompleted) {
+            // 防禦性二次確認：repair 前的 set(ref) 在 resumeWith 前完成，完成後的
+            // 讀理論上必見。此處仍做一次有窮自旋重讀（sub-millisecond），以排除
+            // 任何可觀察層級的發布競態（例如完成回調與本機讀之間的競爭窗），
+            // 仍為 null 才視為異常。
+            val deadline = System.nanoTime() + 2_000_000L // 2ms
+            while (result == null && System.nanoTime() < deadline) {
+                result = try { tx.repairResult.get() } catch (_: Throwable) { null }
+            }
         }
         if (tx.isRepair && result == null) {
             // Defensive arm: repair completed ⇒ deferred completed ⇒ ref
@@ -1389,6 +1399,11 @@ class DualViewModel(
                 }
                 if (latest.txId != tx.txId || latest.key != tx.key) return
                 if (latest.known) {
+                    // 防禦性同步（與 winner 的 applyTerminal 一致）：replay 路徑把
+                    // 本 VM 翻成 Known 時，亦把行程級 lastKnown 圍欄寫入，避免
+                    // winner 於 stageRealPayload 後、applyTerminal 前死亡時，圍欄
+                    // 落後於可觀察狀態。
+                    try { noteLastKnownDraft(latest.draft) } catch (_: Exception) { }
                     try { disarmBlindClear() } catch (_: Exception) { }
                     try { disarmCorruptRepair() } catch (_: Exception) { }
                 }

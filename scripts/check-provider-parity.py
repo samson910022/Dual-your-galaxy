@@ -116,6 +116,9 @@ def parse_xmltree_text(text, source):
             stack.append((indent, element))
             continue
         match_a = A_RE.match(raw)
+        if match_a is None and raw.lstrip().startswith("A:"):
+            if "schemas.android.com/apk/res/android" in raw:
+                die(f"{source}:{lineno}: unparseable android attribute line: {raw.strip()}")
         if match_a:
             if not stack:
                 die(f"{source}:{lineno}: attribute line before any element: {raw.strip()}")

@@ -10409,7 +10409,7 @@ class PolicyWriteTest {
         // refresh-first 重讀會阻在 loadBlock（onIo IO 執行緒自旋），msg 停留在
         // BLIND_CLEAR_REFRESH_FIRST。此測試鑑別的是「行程級圍欄全退回
         // VM-local-only」的回歸（如 commit-time knownCommitFence 亦同步退回時）；
-        // 單獨還原 S4 refresh-first gate（9219）仍會被 coordinator-aware 的
+        // 單獨還原 S4 refresh-first gate（9187）仍會被 coordinator-aware 的
         // commit-time fence 接住（fail-closed，msg 亦為 BLIND_CLEAR_REFRESH_FIRST）
         // ——兩層防禦互為掩護，此斷言只對「整體 rollback」確定性失手。
         var backing: Set<String>? = setOf("com.seed")

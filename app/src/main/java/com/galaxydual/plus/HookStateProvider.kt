@@ -100,14 +100,10 @@ fun parseHookState(raw: String?): HookState {
 // single-file paths (read-compat forever). Order only matters for the
 // diagnostics raw pick (first readable non-empty wins) — the scope union is
 // order-independent.
-internal fun allHookMarkerFiles(): List<File> = listOf(
-    File(HookMarker.MARKER_PATH_SYSTEM_SERVER),
-    File(HookMarker.MARKER_PATH_DAAGENT),
-    File(HookMarker.LEGACY_MARKER_PATH_SYSTEM_SERVER),
-    File(HookMarker.LEGACY_MARKER_PATH_DAAGENT),
-    File(HookMarker.MARKER_PATH),
-    File(HookMarker.LEGACY_MARKER_PATH),
-)
+// The six marker paths every reader unions (bound by reference to the hook
+// module's single source of truth; order pinned by HookMarkerTest and
+// HookStateProviderTest).
+internal fun allHookMarkerFiles(): List<File> = HookMarker.DEFAULT_MARKER_FILES
 
 // Diagnostics pick: the first readable raw (in the fixed six-file order)
 // whose parse yields a non-empty scope set; falls back to the first non-null
