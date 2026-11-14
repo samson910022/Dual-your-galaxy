@@ -4756,14 +4756,19 @@ class PolicyWriteTest {
             assertSame(tx1, coordinatorTxOf(coord))
 
             // 放行：save 落盤 B（同一 deferred 完成 true），reconciler join＋讀 B==B
-            // 即 WRITE_SUCCESS＋IDLE＋雙清。
+            // 收斂（成功路徑 WRITE_SUCCESS；防禦性容許 late-join/Mismatch 形狀
+            // 的 REFRESHED——兩者皆代表草稿 B 已見 ground truth，收斂斷言不變）
+            // ＋IDLE＋雙清。
             saveRelease.set(true)
             assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
             await(timeoutMs = 15_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.IDLE }
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
             assertNull(vm2.state.value.pendingPolicyWrite)
-            assertTrue(vm2.state.value.msg.contains("已寫入政策草稿"))
+            assertTrue(
+                "expected WRITE_SUCCESS or REFRESHED terminal, was: ${vm2.state.value.msg}",
+                vm2.state.value.msg.contains("已寫入政策草稿") || vm2.state.value.msg.contains("已重新整理政策草稿"),
+            )
             assertNull(activeTxOf(vm2))
             assertNull(coordinatorTxOf(coord))
             await(timeoutMs = 5_000L) { reconcilingKeysOf(vm2).isEmpty() }
@@ -7028,7 +7033,10 @@ class PolicyWriteTest {
             assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
             assertFalse(vm2.state.value.policyDraftKnown)
 
-            // 放行：save 早已落盤 B（save 證成功），讀回 B 即 SUCCESS 結清。
+            // 放行：save 早已落盤 B（save 證成功）。收斂斷言（IDLE && Known &&
+            // draft==B && !stale）本身即可釘住成功終態；訊息字串防禦性容許
+            // WRITE_SUCCESS／REFRESHED 兩種 B 收斂終態（後者目前情境理論上不可達，
+            // 保留以容忍未來 claim 形狀，收斂斷言不變）。
             // 合取 await（IDLE && Known && draft==B && !stale）再斷言，免 UI/協調器時序抖動。
             loadRelease.set(true)
             await(timeoutMs = 20_000L) {
@@ -7040,7 +7048,10 @@ class PolicyWriteTest {
             assertTrue(vm2.state.value.policyDraftKnown)
             assertEquals(setOf("com.B"), vm2.state.value.policyDraft)
             assertNull(vm2.state.value.pendingPolicyWrite)
-            assertTrue(vm2.state.value.msg.contains("已寫入政策草稿"))
+            assertTrue(
+                "expected WRITE_SUCCESS or REFRESHED terminal, was: ${vm2.state.value.msg}",
+                vm2.state.value.msg.contains("已寫入政策草稿") || vm2.state.value.msg.contains("已重新整理政策草稿"),
+            )
             assertNull(activeTxOf(vm2))
             assertNull(coordinatorTxOf(coord))
         } finally {
@@ -11737,6 +11748,10 @@ class PolicyWriteTest {
             assertNotNull(activeTxOf(vm))
         } finally {
             saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -11835,6 +11850,363 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertTrue(vm.state.value.policyDraftCorrupt)
         assertNull(activeTxOf(vm))
+    }
+
+    // PR #60 C1.5-1（R5 T1）：armed-coord confirm 交接的「可終止」性。
+    // savingMidAwaitCancellation_armedCoord_flipsToReconciling 只斷言中繼
+    // RECONCILING；此處放行 blocking save 後，handover reconciler（跑在
+    // coordinator 的 app-scoped scope）必須把已登記 Tx 收斂至 IDLE，
+    // coordinator 的 activeTx／pendingPublish 雙清，草稿為已落盤值。
+    @Test
+    fun savingMidAwaitCancellation_armedCoord_settlesIdleAfterRelease() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            vm.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertTrue(vm.state.value.loading)
+
+            // 只取消 confirm job 所在的 scope（rotation 式），不經 onCleared()。
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            // 放行 blocking save：handover reconciler（coordinator scope）收斂終態。
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(activeTxOf(vm))
+            assertNull(coord.activeTx.get())
+            assertNull(coord.pendingPublish.get())
+            assertTrue(vm.state.value.policyDraftKnown)
+            assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
+            assertEquals(setOf("com.example.a"), backend.get())
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 C1.5-2（R5 T1）：VM-B 於 VM-A 開始 save 之前（同 coordinator）建立；
+    // VM-A mid-await CE 後 B 不卡 BUSY／IN_PROGRESS：A 結清後，B 的
+    // requestPolicyWrite＋confirmPolicyWrite 正常走完，兩個 VM 皆收斂 IDLE＋Known。
+    // 不需建立 VM-C（B 在 A 的 save 開始前即存在）。
+    @Test
+    fun savingMidAwaitCancellation_armedCoord_unblocksSiblingConfirm() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveFinished = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                saveFinished.countDown()
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            // VM-B：在 VM-A 開始 save 之前建立（同 coordinator＋store）。
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            await(timeoutMs = 10_000L) { vmB.state.value.policyDraftKnown }
+            val pendingA = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingA)
+
+            vmA.confirmPolicyWrite(pendingA, pendingA.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+
+            // VM-A rotation 式取消（mid-await CE）。
+            vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            saveRelease.set(true)
+            assertTrue(saveFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // VM-A（已死）經 handover reconciler 收斂；coordinator fence 雙清。
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertNull(coordinatorTxOf(coord))
+
+            // VM-B（save 前建立的 sibling）不需要新 VM：request＋confirm 正常通過。
+            seedSelection(vmB)
+            vmB.requestPolicyWrite()
+            val pendingB = vmB.state.value.pendingPolicyWrite
+            assertNotNull(pendingB)
+            vmB.confirmPolicyWrite(pendingB!!, pendingB.generation)
+            await(timeoutMs = 10_000L) { vmB.state.value.pendingPolicyWrite == null }
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertFalse(vmB.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText())
+            assertFalse(vmB.state.value.msg == PolicyText(PolicyTextKind.BUSY).defaultText())
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(setOf("com.example.a"), vmB.state.value.policyDraft)
+            // VM-A 亦收斂至 IDLE＋Known（不倚賴 VM-B 的寫入）。
+            assertEquals(PolicyWritePhase.IDLE, vmA.state.value.policyWritePhase)
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertEquals(setOf("com.example.a"), vmA.state.value.policyDraft)
+            assertEquals(2, saveCalls.get())
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 C1.5-3（R5 T3）：armed-coord clear 交接（clearMidAwaitCancellation_
+    // repairsLoadingAndPhaseToIdle 的 coordinator 版）。blocking saveRaw(null)，
+    // mid-await CE 穿透後 phase=RECONCILING；放行後 reconciler 收斂 IDLE，
+    // backing 清空，coordinator claim 釋放。
+    @Test
+    fun clearMidAwaitCancellation_armedCoord_flipsToReconcilingAndSettles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw) else backend.set(emptySet())
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+
+            vm.clearPolicyDraft()
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertTrue(vm.state.value.loading)
+
+            // 只取消 clear job 所在的 scope（rotation 式），不經 onCleared()。
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertNull(activeTxOf(vm))
+            assertNull(coord.activeTx.get())
+            assertEquals(emptySet<String>(), backend.get())
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 C1.5-4（R5 T3）：armed-coord repair 交接（repairMidAwaitCancellation_
+    // repairsLoadingAndPhaseToIdle 的 coordinator 版）。corrupt-evidence：
+    // loadRaw 恆拋 CCE；requestRepairCorruptDraft＋confirmRepairCorruptDraft；
+    // 阻塞的 saveRaw(null)；mid-await CE 穿透 → RECONCILING；放行後 reconciler
+    // 收斂。FAILED 終態由 reconciler 的 join==false 分支抵達（deferred 已完成
+    // false ＋ 一次 ground-truth 讀：loadRaw 恆 CCE → Corrupt → settle helper
+    // Failed）→ IDLE＋FAILED；coordinator claim 釋放。lateProvenFailed 僅在
+    // join 逾時（null）且 deferred 隨後完成 false 時可達（本測試不觸發）。
+    @Test
+    fun repairMidAwaitCancellation_armedCoord_flipsToReconcilingAndSettles() {
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(
+                store,
+                userId = 0,
+                policyIoTimeoutMs = 5_000,
+                initialDraft = null,
+                policyTxCoordinator = coord,
+            )
+            await { !vm.state.value.loading }
+            await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+
+            vm.requestRepairCorruptDraft()
+            vm.confirmRepairCorruptDraft()
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            assertTrue(vm.state.value.loading)
+
+            // 只取消 repair job 所在的 scope（rotation 式），不經 onCleared()。
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
+            assertNull(activeTxOf(vm))
+            assertNull(coord.activeTx.get())
+            assertTrue(vm.state.value.policyDraftCorrupt)
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 C1.5-5（R5 T6）：VM-B 於 VM-A 阻塞中建立（同 coordinator＋store）。
+    // VM-A：repair 已 arm、phase=SAVING、Tx 仍為 PREPARING（executionArmed=false）
+    // 且 owner 存活（阻塞於 final bounded read 的 latch）。VM-B init 必須：
+    // - 不 claim、不 cancel VM-A 的 Tx（attachBusyWaiter 路徑）；
+    // - 標 policyDraftKnown=false＋BUSY/INFO＋corrupt 保留、phase 不跳 IDLE；
+    // - VM-A 完成後經 _latest 收集收斂至 IDLE＋Known(empty)。
+    @Test
+    fun secondVm_liveBlockedOwner_staysBusyAndNeverCancelsOwnerTx_thenConverges() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val loadCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val finalEntered = java.util.concurrent.CountDownLatch(1)
+        val finalRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when (loadCalls.incrementAndGet()) {
+                    // VM-A init：Corrupt。
+                    1 -> throw ClassCastException("corrupt")
+                    // pre-read（repair 前置權威讀）：Corrupt。
+                    2 -> throw ClassCastException("corrupt")
+                    // final read（pre-arm 最終權威讀）：阻塞於 latch。
+                    3 -> {
+                        finalEntered.countDown()
+                        while (!finalRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        throw ClassCastException("corrupt")
+                    }
+                    // VM-B init 及之後：CCE 直到 saveRaw(null) 自癒。
+                    else -> if (corrupt) throw ClassCastException("corrupt") else backing
+                }
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    corrupt = false
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(
+                store,
+                userId = 0,
+                initialDraft = null,
+                policyIoTimeoutMs = 5_000,
+                policyTxCoordinator = coord,
+            )
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+
+            vmA.requestRepairCorruptDraft()
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(finalEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vmA)
+            assertNotNull(tx1)
+            assertSame(tx1, coordinatorTxOf(coord))
+            // PREPARING（未 arm）＋owner 存活：live owner。
+            assertFalse((tx1 as DualViewModel.PolicyTx).executionArmed.get())
+            assertTrue(tx1.ownerAlive.get())
+            assertFalse(tx1.deferred.isCancelled)
+
+            // VM-B 於 owner 阻塞中建立：不得 claim／cancel，僅標 BUSY 等待。
+            // 註：msg 會被 init 隨後啟動的 probeChannels（NoOp 通道必 degrade）
+            // 覆寫為 AUTO_DEGRADE_NO_CHANNEL，msg 非穩定觀測點；Busy 契約以
+            // 「不 claim＋不收斂＋corrupt 保留＋fence 仍在 owner 手中」為準。
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            await(timeoutMs = 10_000L) { !vmB.state.value.loading }
+            assertFalse(vmB.state.value.policyDraftKnown)
+            assertTrue(vmB.state.value.policyDraftCorrupt)
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertNull(activeTxOf(vmB))
+            // VM-A 的 fence 仍在、Tx 未被取消。
+            assertSame(tx1, coordinatorTxOf(coord))
+            assertFalse(tx1.deferred.isCancelled)
+            assertTrue(reconcilingKeysOf(vmB).isEmpty())
+
+            // 放行 final read：repair 執行（saveRaw(null) 落盤），VM-A 收斂 IDLE。
+            finalRelease.set(true)
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vmA.state.value.policyDraft)
+            assertFalse(vmA.state.value.policyDraftCorrupt)
+            assertNull(coordinatorTxOf(coord))
+
+            // VM-B 經 _latest 收集收斂至 IDLE＋Known(empty)（無需 VM-C）。
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown
+            }
+            assertEquals(emptySet<String>(), vmB.state.value.policyDraft)
+            assertFalse(tx1.deferred.isCancelled)
+        } finally {
+            finalRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
 }

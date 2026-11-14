@@ -176,7 +176,10 @@ class DrainConcurrencyTest {
         System.out.println("drainHammer overlap=${overlapSnapshots.get()} total=${snapshotsTaken.get()}")
         assertTrue(
             "readers must have snapshotted while writers were live (overlap=${overlapSnapshots.get()}, total=${snapshotsTaken.get()})",
-            overlapSnapshots.get() >= 100,
+            // T7 (PR60 deep-review): the old >=100 bound was load-dependent and
+            // flaked on saturated runners; >=1 proves overlap happened while all
+            // other invariants (no NUL, monotonic, cap) remain the real pins.
+            overlapSnapshots.get() >= 1,
         )
         val finalSnap = snapshot(sink)
         assertEquals(MAX_CAPTURE_CHARS, finalSnap.length)

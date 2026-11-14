@@ -25,6 +25,7 @@ import com.galaxydual.hook.HookMarker
 import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -1239,14 +1240,15 @@ class DualViewModel(
     // the very thread the test waits on (deadlock until gate timeout). A
     // suspending gate (e.g. Deferred.await) frees the thread instead.
     var afterClaimBeforeEmit: (suspend () -> Unit)? = null
-    // Stage F2 (P2#4)：reconciler 專用獨立讀池（per-VM 單執行緒，執行緒名
+    // Stage F2 (P2#4)：reconciler 專用獨立讀池（legacy 相容保留；per-VM 單執行緒，執行緒名
     // policyReconcile）。Binder 不可中斷：逾時讀的執行緒滯留此池（不佔共用 IO
     // 池），呼叫側計預算（withTimeout 照常到期）。per-VM 而非全域：無限阻塞測
     // 試滯留的執行緒不得堵住其他 VM 的後續核對。執行緒 lazy 啟動（無核對即無
     // 執行緒）；onCleared/dispose 盡力關閉（阻塞中執行緒仍滯留至行程結束）。
     // Stage J4 (HoL)：單執行緒池＋withTimeout 無法搶佔 binder loadRaw（無視取消
     // 續跑），第 2/3 輪重試排隊於第 1 輪滯留執行緒之後，預算被隊列耗盡。
-    // boundedReconcileRead 已改走 Dispatchers.IO 共享池（每輪獨立執行緒並行，
+    // boundedReconcileRead 已改走 Dispatchers.IO 共享池（經 coordinator 的
+    // app-scoped 域，共用 IO 池而非獨立 pool；每輪獨立執行緒並行，
     // 慢讀不阻塞後續輪），本池保留作相容（close 仍安全），不再用於核對讀。
     private val policyReconcileDispatcher: CoroutineDispatcher =
         Executors.newSingleThreadExecutor { r -> Thread(r, "policyReconcile") }
@@ -2049,7 +2051,10 @@ class DualViewModel(
     // - CE 透傳（scope 取消不吞）。
     internal fun launchLoserSync(tx: PolicyTx) {
         val coord = policyTxCoordinator ?: return
-        viewModelScope.launch {
+        // PR #60 C1.1：claim 失敗跟隨屬 handover 子樹（claimForPublish 敗者路徑），
+        // 與 reconciler 同域執行；VM 存活時與 viewModelScope 行為一致，
+        // VM 已死的 handover 則不再產生 born-cancelled job。
+        handoverScope().launch {
             val settled: PolicySettled? = try {
                 coord.awaitSettled(tx.txId, tx.key, policyIoTimeoutMs)
             } catch (e: CancellationException) {
@@ -2359,6 +2364,13 @@ class DualViewModel(
         }
     }
 
+    // PR #60 C1.1：handover 工作（auto-recheck／confirm/clear reconciler）的存活域。
+    // policyTxCoordinator.scope 為 app-scoped SupervisorJob＋Dispatchers.IO（與 app-scoped
+    // save deferred 同級），VM 被清除（viewModelScope cancel）時仍存活；無 coordinator 的
+    // 舊路徑退回 viewModelScope（既有行為不變）。既有守衛（activePolicyTx.get() === tx、
+    // coordinator CAS settle）負責去重，故改掛 app scope 不會雙發布。
+    private fun handoverScope(): CoroutineScope = policyTxCoordinator?.scope ?: viewModelScope
+
     // Stage G2：handoverTx 登記（本地＋coordinator 同組＋reconciling＋
     // deferred.invokeOnCompletion 自動重查＋reconciler 啟動）。
     // 调用方在外層 finally 調用（mutex 已釋放）。
@@ -2584,12 +2596,13 @@ class DualViewModel(
 
     // Stage G2 (P2#4#5)：deferred 完成自動重查。
     // handoverTx 登記時掛 invokeOnCompletion：若 activePolicyTx 仍為該 Tx，
-    // 啟動單次權威重查（fresh read bounded，獨立池，不耗 reconciler 預算）→走
+    // 啟動單次權威重查（fresh read bounded，Dispatchers.IO 共用池，不耗 reconciler 預算）→走
     // settle helper；讀 Unknown 保持 unresolved＋發布明確 unresolved-refresh
     // 動作（UNRESOLVED_REFRESH＋按鈕即 refreshPolicyDraft）。
     // - 單次：invokeOnCompletion 本身單次；重查內再判擁有者，併發已結即丟棄。
-    // - 有界獨立池：經 boundedReconcileRead 單次（withTimeout(policyIoTimeoutMs)
-    //   ＋policyReconcileDispatcher，不佔共用 IO 池，不耗 reconciler 三讀預算）。
+    // - 共用 IO 池：經 boundedReconcileRead 單次（withTimeout(policyIoTimeoutMs)
+    //   ＋Dispatchers.IO，跑於 coordinator 的 app-scoped 域——共用 IO 池，非獨立 pool，
+    //   不耗 reconciler 三讀預算）。
     // - settle helper：decidePolicyTxSettle（Known＋已完成才 Success/Mismatch/
     //   Failed；Unknown 一律 Unresolved 續留，不信 ack）。
     // - P2-1 防雙發布：終態（Success/Mismatch/Failed）發布前先經
@@ -2604,7 +2617,7 @@ class DualViewModel(
                     // 舊 VM 已死）→舊 handler 不啟動，待新 VM 認領後自掛。
                     return@invokeOnCompletion
                 }
-                viewModelScope.launch {
+                handoverScope().launch {
                     autoRecheckTx(tx)
                 }
             }
@@ -2613,7 +2626,8 @@ class DualViewModel(
         }
     }
 
-    // Stage G2 單次權威重查本體（viewModelScope 上跑，讀切獨立池）。
+    // Stage G2 單次權威重查本體（handoverScope 上跑，讀走共用 IO 池）。
+    // 有 coordinator 時跑在其 app-scoped 域，VM 死亡不影響收斂。
     private suspend fun autoRecheckTx(tx: PolicyTx) {
         // 擁有者再判（併發已結／被替換即丟棄，防雙發布）。
         if (activePolicyTx.get() !== tx) return
@@ -3275,17 +3289,18 @@ class DualViewModel(
             false
         }
     }
-    // Stage F2 有界讀（獨立池＋detach）：每次讀外包 withTimeout(policyIoTimeoutMs)，
+    // Stage F2 有界讀（Dispatchers.IO 共用池＋detach）：每次讀外包 withTimeout(policyIoTimeoutMs)，
     // 最多 POLICY_RECONCILE_RETRIES 次。Binder 不可中斷：loadRaw 若無視取消
     // （測試 latch/無限迴圈皆 catch InterruptedException 續跑），逾時僅放棄等待
-    // （d.cancel 盡力），執行緒滯留獨立池，呼叫側計預算（timedOut=true）。回
+    // （d.cancel 盡力），執行緒滯留共用 IO 池，呼叫側計預算（timedOut=true）。回
     // (結果，是否逾時)：逾時一律 Unknown＋true；真異常 Unknown＋false；CE 透傳。
-    // child-async（viewModelScope 子協程：VM 清除可取消；總預算/單讀逾時經手動
+    // child-async（handoverScope() 子協程：有 coordinator 時為其 app-scoped 域，
+    // VM 清除不影響；無 coordinator 時退回 viewModelScope；總預算/單讀逾時經手動
     // d.cancel 收斂，見下）。
     // Stage J4 (HoL)：改走 Dispatchers.IO 共享池（每輪獨立執行緒並行；首輪 latch
     // 無視取消滯留亦不阻塞第 2/3 輪，次輪 Known 即收斂，總預算內完成）。
     private suspend fun boundedReconcileRead(store: HookPolicyStore): Pair<LoadResult, Boolean> {
-        val d = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+        val d = handoverScope().async(Dispatchers.IO) { store.loadResult() }
         return try {
             val v: LoadResult = withTimeout(policyIoTimeoutMs) { d.await() }
             Pair(v, false)
@@ -3293,7 +3308,7 @@ class DualViewModel(
             try {
                 d.cancel()
             } catch (_: Exception) {
-                // Best effort: 執行緒滯留獨立池，呼叫側已計預算。
+                // Best effort: 執行緒滯留共用 IO 池，呼叫側已計預算。
             }
             LoadResult.Unavailable to true
         } catch (e: CancellationException) {
@@ -3618,7 +3633,7 @@ class DualViewModel(
     // through here (same idempotent body).
     // Stage D：同步 disarm blind-clear（VM 丟棄後不得殘留確認態）。
     // Stage L4: 同步 disarm corrupt-repair（同上）。
-    // Stage F2：盡力關閉獨立讀池（阻塞中執行緒仍滯留至行程結束）。
+    // Stage F2：盡力關閉 legacy 獨立讀池 policyReconcileDispatcher（阻塞中執行緒仍滯留至行程結束）。
     // Stage O1 P2#2: owner-liveness revoke — dispose marks any owned PREPARING
     // (unvalidated) Tx as abandoned (ownerAlive=false) so a later VM may abort
     // it; live VMs never touch another owner's flag. Armed/in-flight Txs keep
@@ -6803,12 +6818,13 @@ class DualViewModel(
     }
 
     // Stage A：confirm 逾時後的背景核對器（獨立 job，不持 opMutex/mutex 已釋放）。
-    // ...
+    // handoverScope 為 app-scoped coordinator 域（無 coordinator 時退回 viewModelScope）；
+    // VM 在 Tx 完成前被清除，reconciler 仍存活並把 Tx 收斂到終態。
     private fun launchConfirmReconciler(tx: PolicyTx) {
         val key = tx.key
         val store = tx.store
         val sanitized = tx.sanitized
-        viewModelScope.launch {
+        handoverScope().launch {
             // Stage N2 P1: unvalidated (PREPARING) Tx must never be joined —
             // it was cancelled before final validation/arm. Abort without any
             // store touch (cancel unstarted LAZY so it can never start) and
@@ -6833,6 +6849,23 @@ class DualViewModel(
                             throw e
                         }
                         if (join == false) {
+                            // Stale view may not claim the fence: an adopting VM's
+                            // reclaim bump already moved version/ownership past our
+                            // versionAtStart — publishing anything from this stale
+                            // window would win the claim over the fresh worker's
+                            // accurate terminal. Retain (no claim, no publish);
+                            // convergence falls to the fresh worker (VM-B
+                            // reclaim) or, failing that, late-join/new-VM
+                            // attach. (stale-generation retention — same
+                            // fail-closed bias as the other retain paths,
+                            // distinct predicate from autoRecheckTx's owner
+                            // identity re-check.)
+                            if (policyDraftVersion.get() != versionAtStart ||
+                                policyOwnershipGen.get() != ownership
+                            ) {
+                                settle = false
+                                return@withTimeout
+                            }
                             // Stage L1 P1: staged claim (placeholder) — atomic completeWithRevision
                             // under commitMutex, hook after CAS before emit.
                             if (!claimForPublish(tx)) {
@@ -7239,10 +7272,12 @@ class DualViewModel(
 
     // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
     // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
-    // 呈現；成功即 disarm；不碰 loading；子 job 可取消，見 confirm 註記）。
+    // 呈現；成功即 disarm；不碰 loading；子 job 存活於 handoverScope（app-scoped
+    // coordinator 域，無 coordinator 時退回 viewModelScope），VM 清除不影響收斂，
+    // 語義見 confirm 註記）。
     private fun launchClearReconciler(tx: PolicyTx) {
         val store = tx.store
-        viewModelScope.launch {
+        handoverScope().launch {
             if (!canJoinTx(tx)) {
                 abortUnarmedTx(tx)
                 return@launch
@@ -7259,6 +7294,23 @@ class DualViewModel(
                             throw e
                         }
                         if (join == false) {
+                            // Stale view may not claim the fence: an adopting VM's
+                            // reclaim bump already moved version/ownership past our
+                            // versionAtStart — publishing anything from this stale
+                            // window would win the claim over the fresh worker's
+                            // accurate terminal. Retain (no claim, no publish);
+                            // convergence falls to the fresh worker (VM-B
+                            // reclaim) or, failing that, late-join/new-VM
+                            // attach. (stale-generation retention — same
+                            // fail-closed bias as the other retain paths,
+                            // distinct predicate from autoRecheckTx's owner
+                            // identity re-check.)
+                            if (policyDraftVersion.get() != versionAtStart ||
+                                policyOwnershipGen.get() != ownership
+                            ) {
+                                settle = false
+                                return@withTimeout
+                            }
                             if (!claimForPublish(tx)) {
                                 settle = false
                                 return@withTimeout
