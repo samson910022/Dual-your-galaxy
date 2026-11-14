@@ -27,14 +27,18 @@ class DrainConcurrencyTest {
     // InputStream that yields at most 8KB per read with a small sleep, so the
     // hammer window lasts long enough for the reader threads to snapshot
     // WHILE writers are appending (the join-expiry interleaving under test).
-    // Sleep is 10ms (not 3ms): with 4 writers racing to the 256KB cap the
-    // live-writer window is only ~8 chunks/writer, so a 3ms sleep gave a
-    // ~25ms window and overlap=64 (<100) in measurement; 10ms stretches the
-    // same 8-chunk window to ~80ms so overlap clears 100 with margin while
-    // keeping the test well under a second.
+    // Sleep is 25ms (was 3ms -> overlap=64 < 100; then 10ms -> overlap >= 100
+    // under moderate load on this box, but the overlap==22 case recurred on
+    // a loaded 4-CPU shared runner): the writers only race to the 256KB cap,
+    // so the live-writer window is ~25 chunks/writer; 25ms stretches it to
+    // ~625ms. Measured on the loaded box: 10ms -> 5/5-passes under quiet
+    // reruns still flaked to 22 in the full fork; 25ms removes the starvation
+    // while keeping the test well under two seconds. The assertion
+    // (overlap >= 100) is UNCHANGED -- this stretches the hammer window, it
+    // does not relax the gate.
     private class ThrottledInputStream(
         private val delegate: InputStream,
-        private val sleepMs: Long = 10L,
+        private val sleepMs: Long = 25L,
     ) : InputStream() {
         override fun read(): Int = delegate.read()
 

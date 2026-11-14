@@ -304,18 +304,19 @@ class EffectivePolicyCachePhase3Test {
     // never fires for that shape and the bit is INTENTIONALLY never restored
     // by production (the caller was never interrupted; restoring would
     // fabricate a cancellation). This test pins the REACHABLE half
-    // deterministically: caller interrupted before the call, get() throws
-    // InterruptedException immediately, the bit is restored (not left cleared)
-    // by production.
+    // deterministically: caller interrupted with the reader latch-blocked:
+    // get() parks in awaitDone, observes the interrupted flag, and
+    // production's restore arm re-sets the bit.
     @Test
     fun interruptRestore_readBoundedOrThrowInterruptedGetRestoresCallerInterruptBit() {
         val wasInterrupted = Thread.interrupted() // save + clear
+        val hold = CountDownLatch(1)
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-interrupt-restore")
         try {
-            Thread.currentThread().interrupt() // caller interrupted before the call
+            Thread.currentThread().interrupt() // caller interrupted before/during the call
             val result = PolicyRefreshBudget.readBoundedOrThrow(
-                reader = { setOf("x") },
-                timeoutMs = 2_000,
+                reader = { hold.await() ; setOf("x") },
+                timeoutMs = 5_000,
                 executor = executor,
             )
             assertNull(result) // caller interrupted -> failed read, fail-closed
@@ -324,6 +325,7 @@ class EffectivePolicyCachePhase3Test {
                 Thread.currentThread().isInterrupted,
             )
         } finally {
+            hold.countDown()
             Thread.interrupted() // clear whatever state remains
             if (wasInterrupted) Thread.currentThread().interrupt() // restore pre-test state
             try {
