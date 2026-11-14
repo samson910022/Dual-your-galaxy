@@ -286,7 +286,7 @@ internal fun guardedPolicyCall(
     // Only the LSPosed binder-delivery method is ever delegated; any other
     // method name is rejected even for trusted UIDs (defense in depth).
     if (method != "SendBinder") return null
-    // 只信任 root(0)/system(1000) 或本 app;其餘 (含 shell 2000 與一般 app)
+    // 只信任 {uid 0, uid 1000, 本 app (uid == myUid),同 user appId==1000};其餘 (含 shell 2000 與一般 app)
     // 不得交付 binder。
     if (!isTrustedXposedCaller(callingUid, myUid)) return null
     return try {

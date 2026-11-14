@@ -3599,7 +3599,7 @@ class MainActivity : ComponentActivity() {
         // Phase 3：唯一真相為 state（s.policyWritePhase）；不再讀
         // vm.policyOperationInProgress / policyWriteCommitInProgress getter
         //（相容保留，見 DualViewModel）。五參：pending＋全域 loading（僅顯示用，
-        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/saving/reconciling。
+        // 不門控確認，見 syncPolicyWriteDialog）＋state 派生的 policyOp/saving/phase。
         try {
             syncPolicyWriteDialog(
                 s.pendingPolicyWrite,
@@ -3608,7 +3608,7 @@ class MainActivity : ComponentActivity() {
                 // Stage J4：拆分 SAVING（不可取消）vs RECONCILING（可取消僅 dismiss，
                 // 見 sync 內 cancelable＝!saving||reconciling；confirm 仍兩者皆禁）。
                 s.policyWritePhase == PolicyWritePhase.SAVING,
-                s.policyWritePhase == PolicyWritePhase.RECONCILING,
+                s.policyWritePhase,
             )
         } catch (e: Exception) {
             // SEC-L2: no raw exception/message in the log line — constant
@@ -4167,8 +4167,11 @@ class MainActivity : ComponentActivity() {
         globalLoading: Boolean,
         policyOp: Boolean,
         policySaving: Boolean,
-        policyReconciling: Boolean = false,
+        policyWritePhase: PolicyWritePhase = PolicyWritePhase.IDLE,
     ) {
+        // RECONCILING 相位由幀傳入（唯一真相為 state.policyWritePhase）；neutral
+        // （稍后刷新）按鈕僅此期可用，判定收斂至 JVM-pinnable 謂詞。
+        val policyReconciling = policyWriteSnoozeEnabled(policyWritePhase)
         if (isFinishing || isDestroyed) return
         if (pending == null) {
             try {
@@ -4220,7 +4223,7 @@ class MainActivity : ComponentActivity() {
             // Phase 3B：neutral（稍後刷新）僅 RECONCILING 期可用（同 positive 超限
             // 禁用之門控模式，見 policyWriteCanConfirmInspectable）；非 RECONCILING
             // 即禁用，TalkBack 播報未啟用狀態，不再靜默 no-op。
-            policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyReconciling
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyWriteSnoozeEnabled(policyWritePhase)
             policyWriteDialog?.setCancelable(cancelable)
             policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
             // queued/saving 忙碌文案：全量重建（冪等），render 每幀同步。
@@ -4509,7 +4512,7 @@ class MainActivity : ComponentActivity() {
         // Phase 5：negative 保持可點（見上 toast/本地 dismiss），Back/觸外以 cancelable 門控。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
         // Phase 3B：neutral 門控同 early-return 分支（非 RECONCILING 即禁用；RECONCILING 維持今日行為）。
-        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyReconciling
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyWriteSnoozeEnabled(policyWritePhase)
         policyWriteDialog?.setCancelable(cancelable)
         policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
         // Phase 5：初建即 SAVING 時播報一次（early-return 分支覆蓋後續翻轉）。

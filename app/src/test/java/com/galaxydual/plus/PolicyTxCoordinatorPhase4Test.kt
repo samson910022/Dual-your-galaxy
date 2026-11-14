@@ -520,4 +520,30 @@ class PolicyTxCoordinatorPhase4Test {
             coord.close()
         }
     }
+
+    // Phase3 (F3-P2#4) removed-claim rollback seam pin: removeClaimTombstone
+    // is value-matched on the exact claim rev — an exact-rev remove evicts
+    // and counts one rollback; a repeat remove is a no-op; a stale-rev remove
+    // after a fresh re-insert keeps the fresh tombstone. No full-pipeline
+    // interleaving here (the placeholder-drop success-arm tests cover the
+    // staged publish path; this pins the seam's own rev-discipline contract).
+    @Test
+    fun removeClaimTombstone_valueMatchedRemovesOnlyExactRev() {
+        val coord = PolicyTxCoordinator()
+        try {
+            val key = "policy-write-test-key-${System.nanoTime()}"
+            assertTrue(coord.tryInsertClaimTombstone(7L, key, 100L))
+            assertEquals(0L, coord.tombstoneRollbacks.get())
+            assertTrue(coord.removeClaimTombstone(7L, key, 100L)) // exact rev — removed
+            assertEquals(1L, coord.tombstoneRollbacks.get())
+            assertFalse(coord.isTombstoned(7L, key))
+            assertFalse(coord.removeClaimTombstone(7L, key, 100L)) // idempotent — gone
+            assertTrue(coord.tryInsertClaimTombstone(7L, key, 200L)) // re-insert at fresh rev
+            assertFalse(coord.removeClaimTombstone(7L, key, 100L)) // stale rev — kept
+            assertEquals(1L, coord.tombstoneRollbacks.get())
+            assertTrue(coord.isTombstoned(7L, key))
+        } finally {
+            coord.close()
+        }
+    }
 }

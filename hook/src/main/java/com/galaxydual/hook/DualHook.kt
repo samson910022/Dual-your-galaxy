@@ -153,7 +153,7 @@ class DualHook : XposedModule() {
                         return@forEach
                     }
                     try {
-                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name.take(200))) {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + HookLog.normalizeLogPart(method.name).take(200))) {
                             installed++
                         } else {
                             installFailures++
@@ -275,7 +275,7 @@ class DualHook : XposedModule() {
                     } catch (t: Throwable) {
                         try {
                             logi(
-                                "diagnose-only sweep ${shortClass(target)}#${method.name.take(200)}: " +
+                                "diagnose-only sweep ${shortClass(target)}#${HookLog.normalizeLogPart(method.name).take(200)}: " +
                                     "eligibility evaluation failed (${shortEx(t)}: ${shortMsg(t)}); " +
                                     "no hook installed (Stage 1 fail-closed)",
                             )
@@ -295,7 +295,7 @@ class DualHook : XposedModule() {
                             is WhitelistHookEligibility.Skip -> decision.reason
                         }
                         logi(
-                            "diagnose-only sweep ${shortClass(target)}#${method.name.take(200)}: " +
+                            "diagnose-only sweep ${shortClass(target)}#${HookLog.normalizeLogPart(method.name).take(200)}: " +
                                 "safety=$safety, eligibility=${reason.take(200)}; " +
                                 "no hook installed (Stage 1 fail-closed, diagnose-only)",
                         )
@@ -379,7 +379,7 @@ class DualHook : XposedModule() {
                         return@forEach
                     }
                     try {
-                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + method.name.take(200))) {
+                        if (hookWithDeoptimize(method, HOOK_ID_PREFIX + HookLog.normalizeLogPart(method.name).take(200))) {
                             classInstalled++
                         } else {
                             installFailures++

@@ -17,6 +17,21 @@ class HookLogTest {
     }
 
     @Test
+    fun normalizeLogPartStripsControlChars() {
+        // Every control char matched by [\r\n\p{Cntrl}] under java.util.regex is
+        // replaced by a single space; consecutive control chars yield
+        // consecutive spaces (no collapsing). Java's \p{Cntrl} covers C0
+        // (U+0000-U+001F) and U+007F only — the C1 byte U+0081 is NOT matched
+        // and passes through unchanged (pinned as-is, see PR report).
+        val result = HookLog.normalizeLogPart("line1\nline2\r\u001b[31mred\u007f\u0081end")
+        assertEquals("line1 line2  [31mred \u0081end", result)
+        assertFalse(result.contains("\n"))
+        assertFalse(result.contains("\r"))
+        assertFalse(Regex("[\\r\\n\\p{Cntrl}]").containsMatchIn(result))
+        assertTrue(result.length <= 200)
+    }
+
+    @Test
     fun shortExAndMsgAreTruncatedAndNeverThrow() {
         val t = RuntimeException("x".repeat(500))
         assertEquals("RuntimeException", HookLog.shortEx(t))

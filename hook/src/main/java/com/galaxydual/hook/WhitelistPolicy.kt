@@ -170,6 +170,11 @@ object WhitelistPolicy {
         val extraEmpty: Boolean = try {
             extra.isEmpty()
         } catch (_: Throwable) {
+            logBounded(onLog,
+                "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                    "extra set isEmpty threw; returning original",
+                methodDesc,
+            )
             return result
         }
         if (result is Boolean) {
@@ -213,6 +218,11 @@ object WhitelistPolicy {
             } catch (_: Throwable) {
                 // Hostile extra set (contains throws): fail closed to false
                 // (original Boolean result, which is false here).
+                logBounded(onLog,
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "extra set contains threw; returning original",
+                    methodDesc,
+                )
                 false
             }
         }
@@ -241,6 +251,11 @@ object WhitelistPolicy {
             } catch (_: Throwable) {
                 // Hostile list/extra view (any/filter/contains/+ throws):
                 // fail closed to the original (observe-only).
+                logBounded(onLog,
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "list view threw; returning original",
+                    methodDesc,
+                )
                 return result
             }
         }
@@ -277,6 +292,11 @@ object WhitelistPolicy {
                 val merged = try {
                     result.toMutableSet()
                 } catch (_: Throwable) {
+                    logBounded(onLog,
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "set toMutableSet threw; returning original",
+                        methodDesc,
+                    )
                     return result
                 }
                 try {
@@ -296,6 +316,11 @@ object WhitelistPolicy {
             } catch (_: Throwable) {
                 // Hostile result/extra view (any/contains/filter/toMutableSet
                 // throws): fail closed to the original (observe-only).
+                logBounded(onLog,
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "set view threw; returning original",
+                    methodDesc,
+                )
                 return result
             }
         }
@@ -322,6 +347,11 @@ object WhitelistPolicy {
             } catch (_: Throwable) {
                 // Hostile extra view (filter/contains throws): fail closed to
                 // the original (observe-only).
+                logBounded(onLog,
+                    "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                        "array merge threw; returning original",
+                    methodDesc,
+                )
                 result
             }
         }

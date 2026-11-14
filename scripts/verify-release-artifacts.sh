@@ -98,6 +98,30 @@ for apk in "$@"; do
   fi
   echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
 
+  # 1c. APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool
+  #     scan of the raw bytes; same check as android.yml's D3(b)). The source
+  #     gate (C4) cannot catch a manifest transform or library merge that
+  #     injects android:sharedUserId after source — the binary manifest in the
+  #     shipped APK is what runs (uid gate would admit siblings). The embedded
+  #     python prints OK or FAIL itself; exit 1 routes to fail().
+  if unzip -p "$apk" AndroidManifest.xml | python3 -c '
+import sys
+data = sys.stdin.buffer.read()
+if not data:
+    print("FAIL: APK binary AndroidManifest.xml is empty or unreadable")
+    sys.exit(1)
+t16 = data.decode("utf-16-le", errors="ignore")
+t8 = data.decode("utf-8", errors="ignore")
+if "sharedUserId" in t16 or "sharedUserId" in t8:
+    print("FAIL: sharedUserId string found in APK binary AndroidManifest.xml")
+    sys.exit(1)
+print("OK: no sharedUserId in APK binary AndroidManifest.xml")
+' ; then
+    :
+  else
+    fail "sharedUserId scan failed or matched for $apk"
+  fi
+
   # 2. ShizukuProvider survives into the released DEX (exact descriptor).
   FOUND=0
   DEX_COUNT=0

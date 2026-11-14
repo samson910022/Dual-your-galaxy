@@ -17,6 +17,8 @@ import java.lang.reflect.Modifier
 // Fail-closed rule: anything unrecognized (non-static, null, immutable,
 // wrong element type) returns Skipped and the original whitelist is left
 // untouched -- equivalent to the hook not existing.
+// (exception: the narrowed promise below — a wholly-hostile list may stay
+// dirty after the last-resort restore)
 //
 // Static-final bypass evaluation (Stage1, S24 OneUI 9): the ROM holder
 // declares `static final String[]`, so plain Field.set() cannot reassign
@@ -30,7 +32,8 @@ import java.lang.reflect.Modifier
 // stays observe-only even with a non-empty policy seeded.
 //
 // Copy-on-write promise (list case): the union is fully computed on a plain
-// ArrayList copy; the live list sees at most ONE mutating call (addAll). If
+// ArrayList copy; the live list sees at most a bounded sequence of mutating
+// calls (addAll, suffix drop, last-resort clear()+addAll). If
 // that call throws after a partial append (hostile AbstractMutableList), we
 // roll back in two tiers and verify before returning: first drop exactly the
 // appended suffix (subList(size0, size).clear()); then verify the list is
@@ -43,20 +46,24 @@ import java.lang.reflect.Modifier
 // may stay dirty. That class cannot be made atomic through the in-place
 // MutableList API. A list whose `size` read itself throws fails closed to
 // Skipped BEFORE any mutation is attempted.
-// Two further hostile-addAll cases are indistinguishable from success and
-// are NOT signaled: (a) a hostile addAll that returns normally but mangles
-// the list -- silently dropping original ROM entries or seeding extra ones
-// -- is logged as "+N added" while the ROM list is in fact corrupted; (b) if
-// addAll throws after partially appending, the last-resort restore
-// (clear() + addAll(snapshot)) may itself fail or keep only a prefix of the
-// snapshot, and then ORIGINAL ROM whitelist entries may be lost --
-// fail-closed for the affected apps, but data loss with no signal to the
-// caller.
+// Hostile-addAll cases after the post-success verification arm (see the code):
+// (a) a hostile addAll that returns normally but mangles the list -- dropping
+//     original ROM entries or seeding extras -- is now caught by the
+//     post-success integrity check and reported as Skipped (reason: "addAll
+//     returned but the resulting list failed verification (hostile/ROM
+//     bug)") with a best-effort restore;
+// (b) if addAll throws after partially appending, the last-resort restore
+//     (clear() + addAll(snapshot)) may itself fail or keep only a prefix of
+//     the snapshot; when it throws, the Skipped reason carries
+//     "; last-restore failed". If it keeps a prefix WITHOUT throwing,
+//     ORIGINAL ROM whitelist entries may be lost -- fail-closed for the
+//     affected apps, but data loss with no signal to the caller.
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
 // share the list without extra sync. The union itself is computed on an
-// ArrayList copy; only the final single addAll touches the live list.
+// ArrayList copy; only the final addAll (and, on failure arms, the bounded
+// rollback/restore sequence) touches the live list.
 object WhitelistPatch {
 
     const val OBSERVE_ONLY_MARKER = "observe-only"
@@ -71,7 +78,10 @@ object WhitelistPatch {
         // (no write needed, naturally fail-closed).
         data class Replaced(val value: Array<String>, val added: Int) : Outcome
 
-        // Leave the field untouched; [reason] is already log-ready.
+        // Leave the field as-is or best-effort restored per the narrowed promise
+        // (originals may be lost when the last-restore throws, or silently keeps
+        // only a snapshot prefix — see case (b) in the module header); the
+        // reason string is already log-ready.
         data class Skipped(val reason: String) : Outcome
 
         // Static final field: plain Field.set() cannot reassign it
@@ -314,16 +324,47 @@ object WhitelistPatch {
                 } catch (_: Throwable) {
                     rolled = false
                 }
+                var restoreFailed = false
                 if (!rolled) {
                     try {
                         list.clear()
                         list.addAll(snapshot)
                     } catch (_: Throwable) {
                         // Swallowed: last-resort restore may fail too (see header).
+                        restoreFailed = true
                     }
                 }
                 return Outcome.Skipped(
-                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})",
+                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})" +
+                        if (restoreFailed) "; last-restore failed" else "",
+                )
+            }
+            // Post-success integrity arm: a hostile AbstractMutableList may
+            // return normally from addAll while dropping originals or seeding
+            // nothing. Verify the resulting list before reporting success; on
+            // verification failure (or a throwing verification read), best-effort
+            // restore and report Skipped instead of a false "+N added" signal.
+            // (O(n) check; this is the <clinit> path, not the hot query path.)
+            val ok = try {
+                list.size == size0 + add.size &&
+                    (0 until size0).all { list[it] == snapshot[it] } &&
+                    (0 until add.size).all { list[size0 + it] == add[it] }
+            } catch (_: Throwable) {
+                false
+            }
+            if (!ok) {
+                var restoreFailed = false
+                try {
+                    list.clear()
+                    list.addAll(snapshot)
+                } catch (_: Throwable) {
+                    // Swallowed: last-resort restore may fail too (see header).
+                    restoreFailed = true
+                }
+                return Outcome.Skipped(
+                    "skip patch $fieldName on $owner: addAll returned but the resulting " +
+                        "list failed verification (hostile/ROM bug)" +
+                        if (restoreFailed) "; last-restore failed" else "",
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
