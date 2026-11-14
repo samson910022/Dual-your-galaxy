@@ -18,6 +18,7 @@ import org.junit.Assert.assertFalse
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
+import kotlinx.coroutines.CancellationException
 
 class HookPolicyStoreTest {
     // 記憶體後端:key 缺席 = 無條目 (對應 getStringSet null 預設)。
@@ -320,6 +321,114 @@ class HookPolicyStoreTest {
         )
         val result = store.repairCorrupt()
         assertTrue(result is RepairResult.ServiceUnavailable)
+    }
+
+    // Phase 3B (PR #60) repairCorrupt 失敗臂：一臂一測。斷言對外 RepairResult
+    // 變體（Repaired/RepairFailed/ServiceUnavailable），不鎖實作細節。
+
+    // (i) saveRaw(null) 擲非 CE → RepairFailed，corrupt 證據保留。
+    @Test
+    fun repairCorrupt_saveRawThrowsNonCancellation_returnsRepairFailedAndRetainsCorrupt() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { raw ->
+                if (raw == null) throw RuntimeException("binder died at clear") else true
+            },
+        )
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.RepairFailed)
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+    }
+
+    // (ii) clear 回 false 且複探（首次探針後再次 isServiceAvailable）false
+    // → ServiceUnavailable。前置探針 true、clear 失敗後複探 false。
+    @Test
+    fun repairCorrupt_clearFailsButServiceAlsoUnavailable_returnsServiceUnavailable() {
+        var probes = 0
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> false },
+            isServiceAvailable = {
+                probes++
+                probes == 1
+            },
+        )
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.ServiceUnavailable)
+    }
+
+    // (iii) post-read 擲非 CE → RepairFailed。
+    // 註：repairCorrupt 的 post-read 經 loadResult()，其 catch-all 會把非 CE
+    // 擲出吞成 Corrupt/Unavailable（永不擲出非 CE），故本態經
+    // 「after !is Known(empty)」臂落 RepairFailed；此處以 loadRaw 於 clear 後
+    // 擲 RuntimeException 複現「post-read 失敗」這一對外行為。
+    @Test
+    fun repairCorrupt_clearSucceeds_postReadLoadFails_returnsRepairFailed() {
+        var cleared = false
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (cleared) throw RuntimeException("binder died mid-repair")
+                else throw ClassCastException("corrupt")
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    cleared = true
+                    true
+                } else {
+                    true
+                }
+            },
+        )
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.RepairFailed)
+    }
+
+    // (iv) clear 回 true、post-read 仍 Corrupt（聲稱刪除成功、實則未清／
+    // 併發重植損壞值）→ RepairFailed，corrupt 證據不被 wash 掉。
+    @Test
+    fun repairCorrupt_postReadStillCorrupt_returnsRepairFailed() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> true },
+        )
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.RepairFailed)
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+    }
+
+    // (v) isServiceAvailable 自身擲非 CE → ServiceUnavailable。
+    @Test
+    fun repairCorrupt_serviceProbeThrowsNonCancellation_returnsServiceUnavailable() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { _ -> true },
+            isServiceAvailable = { throw RuntimeException("binder died at probe") },
+        )
+        val result = store.repairCorrupt()
+        assertTrue(result is RepairResult.ServiceUnavailable)
+    }
+
+    // 3.8: saveRaw(null) 擲 CancellationException → CE 原樣透傳（取消永不
+    // 被吞成 RepairFailed），corrupt 證據保留。
+    @Test
+    fun repairCorrupt_saveRawCancellation_rethrowsAndDoesNotClearCorrupt() {
+        val store = HookPolicyStore(
+            loadRaw = { throw ClassCastException("corrupt") },
+            saveRaw = { raw ->
+                if (raw == null) throw CancellationException("save cancelled") else true
+            },
+        )
+        assertTrue(store.loadResult() is LoadResult.Corrupt)
+        val thrown = try {
+            store.repairCorrupt()
+            null
+        } catch (ce: CancellationException) {
+            ce
+        }
+        assertTrue("saveRaw(null) 的 CancellationException 必須原樣透傳", thrown != null)
+        assertTrue("repairCorrupt 取消後 corrupt 證據必須保留", store.loadResult() is LoadResult.Corrupt)
     }
 
     // Phase2 #1 備份鉤子拋出仍不擋修復（best-effort）。

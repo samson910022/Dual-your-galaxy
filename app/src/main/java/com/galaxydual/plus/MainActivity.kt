@@ -4217,6 +4217,10 @@ class MainActivity : ComponentActivity() {
             // Phase 5：negative 保持可點（SAVING 中點按 toast 而非靜默 no-op）；
             // Stage J4：RECONCILING 點按為本地 dismiss（不清 VM fence）。
             policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+            // Phase 3B：neutral（稍後刷新）僅 RECONCILING 期可用（同 positive 超限
+            // 禁用之門控模式，見 policyWriteCanConfirmInspectable）；非 RECONCILING
+            // 即禁用，TalkBack 播報未啟用狀態，不再靜默 no-op。
+            policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyReconciling
             policyWriteDialog?.setCancelable(cancelable)
             policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
             // queued/saving 忙碌文案：全量重建（冪等），render 每幀同步。
@@ -4278,8 +4282,10 @@ class MainActivity : ComponentActivity() {
         val scrollView = listViews.scrollView
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // Phase 5 a11y：dialog 內容區 POLITE（TalkBack 跟隨訊息/相位變化）。
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            // Phase 3B：移除容器 POLITE live region——它觀察不到 AlertDialog 內部
+            // message TextView（不在本子樹內），且會對 packagesText 換文（Toggle 點按）
+            // 重複觸發，與既有 announceForAccessibility 重複播報。訊息/相位變化的
+            // TalkBack 播報一律由顯式 announceForAccessibility 承載。
             // Stage B P2：包名超過 POLICY_DIALOG_LIST_INLINE_MAX 項時 ScrollView 限高
             // policyDialogListMaxHeightDp（小螢幕回 SMALL，否則 NORMAL），
             // ack checkbox 永遠可見；少量時 WRAP_CONTENT 不留空。
@@ -4472,11 +4478,27 @@ class MainActivity : ComponentActivity() {
         // Stage J4：稍后刷新（RECONCILING 期手動恢復入口）：觸發一次顯式重讀
         // （reconciler 已退出 unresolved 時經 late-join 結清；否則 yielding），
         // 並本地 dismiss（不清 fence），待終態重建或保持抑制。
+        // Phase 3B：按鈕僅 RECONCILING 期啟用（兩處 isEnabled 門控）；本監聽器之
+        // live 重讀為防禦性兜底，非 RECONCILING 落入即沿 negative 的 Phase 5 模式
+        // toast 回饋，不靜默 no-op。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            // Stage J4：僅 RECONCILING 期有效（QUEUED/SAVING 點按 no-op，避免無用
-            // refresh＋SAVING commit 期併發 IO；按鈕常建、early-return 常駐，故門控在前）。
+            // Phase 3B：僅 RECONCILING 期有效；render 幀已禁用按鈕，此 live 重讀涵蓋
+            // render 與點擊之間的相位翻轉窗口。非 RECONCILING 沿 negative 的 Phase 5
+            // toast 模式給回饋（重用 policy_write_saving_announce，不另造未翻譯字串）。
             val recNow = try { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING } catch (_: Exception) { policyReconciling }
-            if (!recNow) return@setOnClickListener
+            if (!recNow) {
+                val notice = try {
+                    getString(R.string.policy_write_saving_announce)
+                } catch (_: Exception) {
+                    "政策寫入中"
+                }
+                try {
+                    Toast.makeText(this, notice, Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
+                    // Best effort: toast 失敗不影響門控。
+                }
+                return@setOnClickListener
+            }
             try { vm.refreshPolicyDraft() } catch (_: Exception) { }
             policyWriteDismissedForReconcilingGen = pending.generation
             try { policyWriteDialog?.dismiss() } catch (_: Exception) { }
@@ -4486,6 +4508,8 @@ class MainActivity : ComponentActivity() {
             policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, confirmSaving)
         // Phase 5：negative 保持可點（見上 toast/本地 dismiss），Back/觸外以 cancelable 門控。
         policyWriteDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+        // Phase 3B：neutral 門控同 early-return 分支（非 RECONCILING 即禁用；RECONCILING 維持今日行為）。
+        policyWriteDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = policyReconciling
         policyWriteDialog?.setCancelable(cancelable)
         policyWriteDialog?.setCanceledOnTouchOutside(cancelable)
         // Phase 5：初建即 SAVING 時播報一次（early-return 分支覆蓋後續翻轉）。

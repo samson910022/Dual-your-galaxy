@@ -108,7 +108,7 @@ object WhitelistPolicy {
         } catch (_: Throwable) {
             "Class"
         }
-        val computed = "$owner#${executable.name}($params)".take(200)
+        val computed = "$owner#${HookLog.normalizeLogPart(executable.name)}($params)".take(200)
         if (describeCache.size >= DESCRIBE_CACHE_MAX) {
             describeCache.keys.firstOrNull()?.let { describeCache.remove(it) }
         }
@@ -282,11 +282,15 @@ object WhitelistPolicy {
                 try {
                     merged.addAll(extra.filter { !merged.contains(it) })
                 } catch (_: Throwable) {
-                    return try {
-                        result.toMutableSet()
-                    } catch (_: Throwable) {
-                        result
-                    }
+                    // Set-union addAll threw AFTER element-type checks passed:
+                    // fail closed to the ORIGINAL set (observe-only) plus one
+                    // bounded log line — never a fresh weaker-typed copy.
+                    logBounded(onLog,
+                        "${WhitelistPatch.OBSERVE_ONLY_MARKER} $methodDesc: " +
+                            "set merge failed (addAll threw); returning original",
+                        methodDesc,
+                    )
+                    return result
                 }
                 return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
             } catch (_: Throwable) {

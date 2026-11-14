@@ -9,11 +9,12 @@
 // /data/local/tmp/galaxydual_hook.active kept read-compat only) after
 // installing hooks; this file reads it back into a HookState the LSPosed
 // picker row displays as "active (scopes)" vs "not detected". No IPC, no new
-// dependencies beyond the already-present CmdGateway abstraction: direct
-// java.io.File reads first, then (only when a SHELL/ROOT channel is ready)
-// `cat` over the gateway, plus the pure HookMarker parser shared with the
-// writer (single source of truth for the format, so reader/writer cannot
-// drift). All SIX paths are unioned everywhere: a scope recorded via any of
+// dependencies beyond the already-present CmdGateway abstraction: the legacy
+// two-state reader (readHookState) does direct java.io.File reads only (no
+// gateway stage; gateway `cat` diagnosis lives in diagnoseHookState below).
+// The pure HookMarker parser is shared with the writer (single source of
+// truth for the format, so reader/writer cannot drift).
+// All SIX paths are unioned everywhere: a scope recorded via any of
 // the six files is honored (existence evidence, never a completeness claim).
 //
 // Path rationale (REAL-DEVICE evidence, Nov 2026): the first marker revision
@@ -25,29 +26,21 @@
 // primitive); readers union all six paths (per-scope primary x2, per-scope
 // fallback x2, then the two legacy single-file paths, in that fixed order).
 //
-// Read strategy (readHookState / readHookStateWithGateway, legacy two-state):
+// Read strategy (readHookState, legacy two-state):
 //  1. direct File reads of the six paths (most likely SELinux-denied for the app
-//     uid; denial reads as absent, never as active);
-//  2. only in readHookStateWithGateway, and only when `gateway` is non-null
-//     with SHELL-or-ROOT privilege (i.e. the caller already proved the
-//     channel: DualViewModel passes its active gateway only when channelReady
-//     holds), `cat` of one file at a time over the gateway for all SIX
-//     paths (a missing file exits cat non-zero, so one `cat a b` would die
-//     whole -- each path is catted separately), unioned with the same
-//     parser. Any gateway failure (non-zero exit, blank/
-//     garbage output, throwing gateway, NONE privilege) maps to "not
-//     detected", never to active, and never throws for ordinary failures --
-//     except a CancellationException, which propagates (cooperative
-//     cancellation is never squashed here: the legacy readers and gateway
-//     reads rethrow CE ahead of their Throwable arms; the one non-suspend
-//     leaf helper, readTextOrNull, cannot receive a CE at all).
-//  Both legacy readers are DEPRECATED: they conflate unreadable / absent /
-//  malformed (all inactive), so their INACTIVE must never be used as negative
+//     uid; denial reads as absent, never as active). There is no gateway
+//     stage here; gateway-`cat` diagnosis lives in diagnoseHookState below
+//     (the legacy gateway-reader was removed in Phase 3B). CancellationException:
+//     the reader is non-suspend, so this body cannot receive a CE; its
+//     catch arms are CE-correct by construction -- the plain catch-alls can
+//     only swallow ordinary throwables, never a CE that cannot arise here.
+//  The legacy reader is DEPRECATED: it conflates unreadable / absent /
+//  malformed (all inactive), so its INACTIVE must never be used as negative
 //  evidence. Production (DualViewModel.probeChannels) reads via
 //  diagnoseHookState below, which keeps malformed/unreadable as UNKNOWN.
 //
-// P1 diagnostic split (issue #6, 沿襲 #19, 配合 #27): the legacy functions
-// above conflate "unreadable" with "absent" (both inactive), which makes an
+// P1 diagnostic split (issue #6, 沿襲 #19, 配合 #27): the legacy reader
+// above conflates "unreadable" with "absent" (both inactive), which makes an
 // explicit-LSPosed selection -- whose NoOp gateway can never `cat` --
 // permanently display "not detected" even when system_server wrote the
 // marker (false negative: the only hook signal loses observability). The new
@@ -127,7 +120,7 @@ private fun firstScopesRaw(raws: List<String?>): String? =
 // swallow ordinary throwables, never a CE that cannot arise here).
 // The markerFiles parameter exists so JVM tests can point at temp files;
 // production always uses the default six. No gateway is consulted here:
-// for the gateway-`cat` fallback see readHookStateWithGateway.
+// for the gateway-`cat` diagnosis see diagnoseHookState.
 //
 // DEPRECATED: inactive here conflates unreadable/absent/malformed (all map
 // to "not detected"), so a returned inactive is NOT negative evidence.
@@ -147,56 +140,6 @@ fun readHookState(
             val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
             HookState(active = scopes.isNotEmpty(), scopes = scopes, raw = firstScopesRaw(raws))
         }
-    } catch (ce: CancellationException) {
-        throw ce                                    // never swallowed (cooperative cancellation)
-    } catch (_: Throwable) {
-        HookState(active = false)
-    }
-}
-
-// IO, suspend: full app-side read strategy -- direct File reads first (see
-// readHookState), then, only when `gateway` is a proven SHELL/ROOT channel,
-// `cat` of all SIX marker paths over that gateway (one `cat` per file: a
-// missing file exits cat non-zero and would kill a combined command),
-// unioned with the same parser. `gateway` is an OPTIONAL injection point
-// defaulting to null, which behaves exactly like readHookState (old
-// behavior); JVM tests inject a fake CmdGateway plus temp/nonexistent files
-// and never touch real device paths (the gateway `cat`s always target the
-// six production paths, mirroring the legacy two-file behavior).
-// Production (DualViewModel.probeChannels) passes its active gateway only
-// when channelReady holds, so an unproven/NoOp channel never executes `cat`.
-// Never throws: unreadable output, non-zero exits, a throwing gateway, or a
-// NONE-privilege gateway all map to inactive ("not detected"). A
-// CancellationException is the one exception: cooperative cancellation is
-// never swallowed and always propagates.
-//
-// DEPRECATED: same conflation as readHookState -- inactive is not negative
-// evidence. Production reads via diagnoseHookState; this stays only for
-// legacy callers.
-@Deprecated(
-    message = "Legacy two-state read conflates unreadable/absent/malformed; " +
-        "its inactive is not negative evidence. Use diagnoseHookState.",
-)
-suspend fun readHookStateWithGateway(
-    gateway: CmdGateway? = null,
-    markerFiles: List<File> = allHookMarkerFiles(),
-): HookState {
-    return try {
-        val direct = readHookState(markerFiles)
-        if (direct.active) return direct
-        if (gateway == null ||
-            (gateway.privilege != Privilege.SHELL && gateway.privilege != Privilege.ROOT)
-        ) {
-            return direct
-        }
-        // Marker paths are compile-time constants with a shell-safe charset
-        // ([a-zA-Z0-9._/-], no spaces), so plain interpolation is safe; there
-        // is deliberately no caller-controlled input in these commands.
-        val raws = allHookMarkerFiles().map { catOrNull(gateway, it.path) }
-        if (raws.all { it == null }) return direct
-        val scopes = raws.fold(emptySet<String>()) { acc, raw -> acc + HookMarker.parseScopes(raw) }
-        if (scopes.isEmpty()) return direct
-        HookState(active = true, scopes = scopes, raw = firstScopesRaw(raws))
     } catch (ce: CancellationException) {
         throw ce                                    // never swallowed (cooperative cancellation)
     } catch (_: Throwable) {
@@ -240,21 +183,6 @@ private fun readTextOrNull(file: File): String? {
     }
 }
 
-// Runs `cat <absPath>` over the gateway; null on non-zero exit or any
-// failure (including a throwing gateway). Re-throws CancellationException
-// (cooperative cancellation is never swallowed); every other failure maps
-// to null.
-private suspend fun catOrNull(gateway: CmdGateway, absPath: String): String? {
-    return try {
-        val res = gateway.run("cat $absPath")
-        if (res.exit != 0) null else res.out
-    } catch (ce: CancellationException) {
-        throw ce
-    } catch (_: Throwable) {
-        null
-    }
-}
-
 // One gateway `cat` attempt. Never maps a timeout/transport loss to a
 // definite read or a definite absence.
 private sealed interface CatOutcome {
@@ -263,9 +191,9 @@ private sealed interface CatOutcome {
     object TransportFailed : CatOutcome                    // timedOut / transportUnknown / truncated / gateway threw
 }
 
-// Diagnostic-stage counterpart of catOrNull: splits "gateway could not even
-// answer" (TransportFailed) from "gateway answered, file absent/denied"
-// (Unreadable) and from a real read (Content). The Content trust boundary is
+// Diagnostic-stage counterpart of the legacy gateway-cat fallback: splits
+// "gateway could not even answer" (TransportFailed) from "gateway answered,
+// file absent/denied" (Unreadable) and from a real read (Content). The Content trust boundary is
 // explicit: timedOut / transportUnknown / truncated replies are NEVER judged
 // by exit code or content — the flags mean the reply is untrusted (a capture
 // cut short by a cap, read error, or join expiry can hide content, so it must
@@ -290,7 +218,7 @@ private suspend fun catDetailed(gateway: CmdGateway, absPath: String): CatOutcom
 }
 
 // Pure UI text for a HookState (legacy two-state; see deprecation on the
-// readers). ACTIVE keeps the same historical-marker wording as the
+// reader). ACTIVE keeps the same historical-marker wording as the
 // diagnostic text: existence+scope evidence only, never proof of a live hook.
 fun HookState.displayText(): String =
     if (active) {

@@ -3,14 +3,17 @@
 // Stage2 (hook-policy-source P1, Phase 4 hardened):app 自有的 XposedProvider 守衛。
 // (Phase 5: header kept bilingual; semantics unchanged. English: app-owned
 // guard provider replacing the libxposed exported provider at the same
-// authority; only root(0)/system(1000) or the app itself may deliver a binder.)
+// authority; only uid 0, uid 1000, the app itself (uid == myUid), or a
+// same-user system uid (callerUser == myUser && appId == 1000) may deliver
+// a binder.)
 //
 // libxposed service AAR 把自己的 XposedProvider 宣告為 exported 且無權限,
 // 任何 app 都能以 content://<applicationId>.XposedService 呼叫 SendBinder
 // 挾帶假 IBinder,劫持政策通道 (XposedServiceHelper.onBinderReceived)。
-// 這裡以同 authority 的守衛 provider 取代它:僅允許 root(0)/system(1000) 或
-// 本 app (uid == myUid) 交付 binder,其餘直接回 null。Guard 即邊界:任何
-// 未經此門控的 binder 不得進入 XposedServiceHelper。
+// 這裡以同 authority 的守衛 provider 取代它:僅允許 {uid 0, uid 1000, 本 app
+// (uid == myUid),以及同 user 的 appId == 1000 系統 uid（次級 user／工作資料夾
+// 下形如 userId*100_000 + 1000）} 交付 binder,其餘直接回
+// null。Guard 即邊界:任何未經此門控的 binder 不得進入 XposedServiceHelper。
 //
 // 注意:函式庫的 XposedProvider 是 final,無法繼承,故以委派 (composition)
 // 包裹同一個函式庫實例,call 行為與其完全一致 (只加 UID 門控 + 速率門控);
@@ -220,8 +223,10 @@ class GuardXposedProvider(
     }
 }
 
-// 信任邊界 (純函數,可 JVM 測):僅 root(0)/system(1000) 或本 app 自己
-// (uid == myUid) 受信任。Phase 4 收緊:拒絕 shell(2000) 與其他 1000..9999
+// 信任邊界 (純函數,可 JVM 測):僅 root(0)/system(1000)、本 app 自己 (uid == myUid)、
+// 或同 user 的 appId == 1000 系統 uid (callerUser == myUser && appId == 1000,
+// 次級 user／工作資料夾下形如 userId*100_000+1000) 受信任。拒絕 shell(2000)。
+// Phase 4 收緊:拒絕 shell(2000) 與其他 1000..9999
 // 特權 uid (舊碼信任整個 < FIRST_APPLICATION_UID 範圍,含 shell)。
 // 假設:LSPosed daemon 以 root/system 執行,其 callingUid 由 kernel 設定、
 // 一般 app 無法偽造。

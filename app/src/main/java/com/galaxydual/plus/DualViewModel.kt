@@ -2441,7 +2441,8 @@ class DualViewModel(
     // 語義，SAVING 下 loading 本為 true，等價且多一道防線）。lambda 內再檢一次：
     // 合法終態（phase 已被移出 SAVING）為 no-op，不誤覆寫。handedOff（htx 或 armed
     // Tx 已註冊 reconciler）→ RECONCILING 並保留 cur.msg/msgKind（交接者負責收斂、
-    // 收斂時附誠實新終態），否則 IDLE＋UNKNOWN_REFRESH。corrupt：clear/confirm
+    // 收斂時附誠實新終態；cur.msg 為空時代入 WRITE_TIMEOUT/CHANNEL，不留空白狀態列），
+    // 否則 IDLE＋UNKNOWN_REFRESH。corrupt：clear/confirm
     // 傳 false（該 arm 僅宣告 view 未知、不保留損壞語境）；repair 傳 true（store
     // 仍持損壞證據，直到 reconciler 驗證 Known(empty) 才清位）。policyEpoch 隨行
     // +1（相位變遷慣例）。best-effort：本 helper 不 rethrow；呼叫端負責
@@ -2450,6 +2451,8 @@ class DualViewModel(
     // （與 F2 siblings 一致）——否則在途 stale-Known load 可在 fail-closed flip 後
     // 落地 Known。predicate（phase==SAVING && (!requireLoading || loading)）與 lambda 內
     // 檢查一致：合法終態不 bump。RECONCILING arm 不變（handedOff==true 跳過本 bump）。
+    // (handedOff==true 時若 cur.msg 為空——SAVING 進入時會把 msg 清成 ""/MsgKind.NONE，
+    // mid-await CE unwind 後不得留給使用者一條空白狀態列——改代 WRITE_TIMEOUT/MsgKind.CHANNEL)
     private fun failClosedSavingRepairIfAbandoned(
         handedOff: Boolean,
         corrupt: Boolean,
@@ -2471,8 +2474,12 @@ class DualViewModel(
                 policyDraftKnown = false,
                 policyDraftCorrupt = corrupt,
                 policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                msg = if (handedOff) cur.msg else policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                msgKind = if (handedOff) cur.msgKind else MsgKind.CHANNEL,
+                msg = if (handedOff) {
+                    // WRITE_TIMEOUT 的文案以「政策寫入」措辭；clear/repair 路徑亦借用此字串。
+                    // 語義誠實：SAVING 未知結果＋reconciler 核對中；故意複用現有代碼，不新增在地化字串。
+                    if (cur.msg.isEmpty()) policyText(PolicyText(PolicyTextKind.WRITE_TIMEOUT)) else cur.msg
+                } else policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                msgKind = if (handedOff && cur.msg.isNotEmpty()) cur.msgKind else MsgKind.CHANNEL,
             )
         }
     }
@@ -7253,23 +7260,6 @@ class DualViewModel(
         }
     }
 
-    // F1 相容過載：舊 (key,store,sanitized) 調用轉 Tx 調用（無句柄即無 join，
-    // 直接走驗證讀；僅測試/舊路徑兜底，生產一律 Tx 路徑）。
-    private fun launchConfirmReconciler(
-        key: String,
-        store: HookPolicyStore,
-        sanitized: Set<String>,
-    ) {
-        val tx = activePolicyTx.get()?.takeIf { it.key == key }
-        if (tx != null) {
-            launchConfirmReconciler(tx)
-            return
-        }
-        // 無 Tx（不應發生）：退化為空 Tx 驗證讀，fence 仍經集合移除保終止。
-        val fallback = PolicyTx(-1L, key, kotlinx.coroutines.CompletableDeferred(true), sanitized, store, false)
-        launchConfirmReconciler(fallback)
-    }
-
     // Stage A：clear 逾時後的背景核對器（語義同 confirm，終態以 ground truth 為準：
     // Known-empty→CLEAR_SUCCESS，Known 非空（清除未生效/併發寫入）→REFRESHED 誠實
     // 呈現；成功即 disarm；不碰 loading；子 job 存活於 handoverScope（app-scoped
@@ -7710,17 +7700,6 @@ class DualViewModel(
                 }
             }
         }
-    }
-
-    // F1 相容過載：舊 (key,store) 調用轉 Tx 調用。
-    private fun launchClearReconciler(key: String, store: HookPolicyStore) {
-        val tx = activePolicyTx.get()?.takeIf { it.key == key }
-        if (tx != null) {
-            launchClearReconciler(tx)
-            return
-        }
-        val fallback = PolicyTx(-1L, key, kotlinx.coroutines.CompletableDeferred(true), emptySet(), store, true)
-        launchClearReconciler(fallback)
     }
 
     fun refreshPolicyDraft() {
@@ -8431,7 +8410,6 @@ class DualViewModel(
             var handoverTx: PolicyTx? = null
             var writeLocked = false
             var preClaimTx: PolicyTx? = null
-            var coordClaimedTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     if (isPolicyReconcilingLocked()) {
@@ -8632,7 +8610,6 @@ class DualViewModel(
                             }
                             return@withLock
                         }
-                        coordClaimedTx = tx
                         val localSet = synchronized(policySettleLock) {
                             activePolicyTx.compareAndSet(null, tx)
                         }
@@ -8651,7 +8628,6 @@ class DualViewModel(
                             } catch (_: Throwable) {
                                 try { h1Coord.tryCompleteClaim(tx) } catch (_: Exception) { }
                             }
-                            coordClaimedTx = null
                             try { lazy.cancel() } catch (_: Exception) { }
                             try { h1Coord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
@@ -8667,7 +8643,6 @@ class DualViewModel(
                         }
                         h1Deferred = lazy
                         preClaimTx = tx
-                        coordClaimedTx = null
                         var preIoAbort = false
                         policyRevisionMutex.withLock {
                             try {
@@ -9198,13 +9173,6 @@ class DualViewModel(
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                 }
-                val cc = coordClaimedTx
-                if (cc != null && cc !== preClaimTx && cc !== handoverTx) {
-                    try { cc.ownerAlive.set(false) } catch (_: Exception) { }
-                    try { cc.deferred.cancel() } catch (_: Exception) { }
-                    try { policyTxCoordinator?.tryCompleteClaim(cc) } catch (_: Exception) { }
-                    coordClaimedTx = null
-                }
                 val pcOuterSave = preClaimTx
                 if (pcOuterSave != null && !canJoinTx(pcOuterSave)) {
                     preClaimTx = null
@@ -9466,7 +9434,6 @@ class DualViewModel(
             var handoverTx: PolicyTx? = null
             var writeLocked = false
             var preClaimTx: PolicyTx? = null
-            var coordClaimedTx: PolicyTx? = null
             try {
                 opMutex.withLock {
                     // Phase 2 O3 (S4): re-check the Known fence at the commit
@@ -9684,7 +9651,6 @@ class DualViewModel(
                             }
                             return@withLock
                         }
-                        coordClaimedTx = txClear
                         val localClearSet = synchronized(policySettleLock) {
                             activePolicyTx.compareAndSet(null, txClear)
                         }
@@ -9703,7 +9669,6 @@ class DualViewModel(
                             } catch (_: Throwable) {
                                 try { h1ClearCoord.tryCompleteClaim(txClear) } catch (_: Exception) { }
                             }
-                            coordClaimedTx = null
                             try { lazyClear.cancel() } catch (_: Exception) { }
                             try { h1ClearCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
@@ -9743,7 +9708,6 @@ class DualViewModel(
                         // could land after an "aborted" report.
                         h1ClearDeferred = lazyClear
                         preClaimTx = txClear
-                        coordClaimedTx = null
                         var preIoAbortClear = false
                         policyRevisionMutex.withLock {
                             try {
@@ -10225,13 +10189,6 @@ class DualViewModel(
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                 }
-                val cc = coordClaimedTx
-                if (cc != null && cc !== preClaimTx && cc !== handoverTx) {
-                    try { cc.ownerAlive.set(false) } catch (_: Exception) { }
-                    try { cc.deferred.cancel() } catch (_: Exception) { }
-                    try { policyTxCoordinator?.tryCompleteClaim(cc) } catch (_: Exception) { }
-                    coordClaimedTx = null
-                }
                 val pcOuterClear = preClaimTx
                 if (pcOuterClear != null && !canJoinTx(pcOuterClear)) {
                     preClaimTx = null
@@ -10533,7 +10490,6 @@ class DualViewModel(
             var handoverTx: PolicyTx? = null
             var writeLocked = false
             var preClaimTx: PolicyTx? = null
-            var coordClaimedTx: PolicyTx? = null
             // P2-B：CE catch 與 outer finally 共用的 handover 登記（兩條 unwind 路徑
             // 行為一致，禁止各自重複發明；冪等、每條路徑最多真正登記一次）。登記順序
             // 先 htx（timeout handover 已就位），否則仍未登記的 armed Tx（preClaimTx、
@@ -10895,7 +10851,6 @@ class DualViewModel(
                             }
                             return@withLock
                         }
-                        coordClaimedTx = tx
                         val localRepairSet = synchronized(policySettleLock) {
                             activePolicyTx.compareAndSet(null, tx)
                         }
@@ -10914,7 +10869,6 @@ class DualViewModel(
                             } catch (_: Throwable) {
                                 try { h1RepairCoord.tryCompleteClaim(tx) } catch (_: Exception) { }
                             }
-                            coordClaimedTx = null
                             try { lazy.cancel() } catch (_: Exception) { }
                             try { h1RepairCoord.writeMutex.unlock() } catch (_: Exception) { }
                             writeLocked = false
@@ -10945,7 +10899,6 @@ class DualViewModel(
                         }
                         h1RepairDeferred = lazy
                         preClaimTx = tx
-                        coordClaimedTx = null
                         var preIoAbortRepair = false
                         policyRevisionMutex.withLock {
                             try {
@@ -11548,7 +11501,8 @@ class DualViewModel(
                 // 仍持損壞證據）。IDLE 分支再與 failClosedSavingRepairIfAbandoned 的
                 // IDLE arm 對齊：在 _state.update 之前先 bump 世代（P3-A），避免在途
                 // stale-Known load 在 flip 後落地 Known；predicate（phase==SAVING）與
-                // helper 一致——合法終態不 bump。
+                // helper 一致——合法終態不 bump。handedOff 時 cur.msg 為空亦代入
+                // WRITE_TIMEOUT（與 helper 同 idiom，不留空白狀態列）。
                 val handedOff = try { tryArmedRegister() } catch (_: Throwable) { false }
                 if (!handedOff) {
                     // 與 failClosedSavingRepairIfAbandoned 的 IDLE arm 對齊（P3-A）：
@@ -11569,8 +11523,13 @@ class DualViewModel(
                         // never wash corrupt to false here (fail-closed, matches the
                         // repair pre-IO abort which also preserves corrupt).
                         policyDraftCorrupt = true,
-                        msg = if (handedOff) cur.msg else policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
-                        msgKind = if (handedOff) cur.msgKind else MsgKind.FAILED,
+                        msg = if (handedOff) {
+                            // Repair-CE 臂的 IDLE 姊妹臂為 CORRUPT_REPAIR_FAILED＋FAILED，
+                            // 故替換訊息碼用 FAILED（與確認路徑的 CHANNEL 刻意不同；
+                            // WRITE_TIMEOUT 文案以「政策寫入」措辭，見上方 helper 註解）。
+                            if (cur.msg.isEmpty()) policyText(PolicyText(PolicyTextKind.WRITE_TIMEOUT)) else cur.msg
+                        } else policyText(PolicyText(PolicyTextKind.CORRUPT_REPAIR_FAILED)),
+                        msgKind = if (handedOff && cur.msg.isNotEmpty()) cur.msgKind else MsgKind.FAILED,
                         policyEpoch = policyPhaseEpoch.incrementAndGet(),
                     ) else cur.copy(loading = false)
                 }
@@ -11578,13 +11537,6 @@ class DualViewModel(
             } finally {
                 if (writeLocked) {
                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
-                }
-                val cc = coordClaimedTx
-                if (cc != null && cc !== preClaimTx && cc !== handoverTx) {
-                    try { cc.ownerAlive.set(false) } catch (_: Exception) { }
-                    try { cc.deferred.cancel() } catch (_: Exception) { }
-                    try { policyTxCoordinator?.tryCompleteClaim(cc) } catch (_: Exception) { }
-                    coordClaimedTx = null
                 }
                 val pcOuterRepair = preClaimTx
                 if (pcOuterRepair != null && !canJoinTx(pcOuterRepair)) {

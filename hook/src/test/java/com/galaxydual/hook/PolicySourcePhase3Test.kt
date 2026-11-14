@@ -7,6 +7,8 @@ import org.junit.Test
 
 // Phase3: sanitize traversal bound (MAX*8), truncation seed priority,
 // hostile isEmpty / iterator Error paths already pinned elsewhere.
+// Phase3A (H4): policy truncation is no longer silent — truncationDrops
+// counts the entries dropped by the caps.
 class PolicySourcePhase3Test {
 
     @Test
@@ -27,6 +29,26 @@ class PolicySourcePhase3Test {
     fun sanitizeRespectsValidCapWithinBound() {
         val many = (1..600).map { "t$it" }.toSet()
         assertEquals(512, PolicySource.sanitize(many).size)
+    }
+
+    // H4: a draft exceeding MAX_POLICY_ENTRIES yields exactly
+    // MAX_POLICY_ENTRIES entries, the drop counter advances (never throws),
+    // and effective() counts the exact seed-first extras it truncates.
+    @Test
+    fun truncationDropsCountCapOverflows() {
+        val before = PolicySource.truncationDrops.get()
+        val many = (1..600).map { "drop.pkg.$it" }.toSet()
+        val out = PolicySource.sanitize(many)
+        assertEquals(PolicySource.MAX_POLICY_ENTRIES, out.size)
+        assertTrue(PolicySource.truncationDrops.get() > before)
+        // effective(): sanitized seed (400) + sanitized remote (400) = 800
+        // merged, truncated to the cap with exactly 288 extras dropped.
+        val seed = (1..400).map { "merge.seed.$it" }.toSet()
+        val remote = (1..400).map { "merge.remote.$it" }.toSet()
+        val beforeEffective = PolicySource.truncationDrops.get()
+        val merged = PolicySource.effective(seed, remote, nonEmptyPolicyGateOpen = true)
+        assertEquals(PolicySource.MAX_POLICY_ENTRIES, merged.size)
+        assertEquals(beforeEffective + 288L, PolicySource.truncationDrops.get())
     }
 
     @Test

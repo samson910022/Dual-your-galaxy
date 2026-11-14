@@ -227,115 +227,90 @@ class HookStateProviderTest {
         }
     }
 
-    private fun absentSix(dir: File): List<File> = sixTempFiles(dir).map { File(dir, it.name + ".absent") }
-
-    // Gateway `cat` success maps to active: direct reads miss (temp paths
-    // absent), the SHELL gateway serves the two per-scope `cat` paths of the
-    // six, scopes union.
-    @Test fun gateway_catSuccessMapsToActive() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
-                when (cmd) {
-                    "cat ${HookMarker.MARKER_PATH_SYSTEM_SERVER}" ->
-                        CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L), "")
-                    "cat ${HookMarker.MARKER_PATH_DAAGENT}" ->
-                        CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 10L), "")
-                    else -> CmdResult(1, "", "not found")
-                }
+    // Gateway `cat` success maps to ACTIVE (adapted from the deleted legacy
+    // gateway-reader pins to diagnoseHookState semantics): direct reads denied,
+    // the SHELL gateway serves the two per-scope `cat` paths of the six,
+    // scopes union.
+    @Test fun diagnosis_gatewayCatSuccessMapsToActive() = runBlocking {
+        val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.MARKER_PATH_SYSTEM_SERVER}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L), "")
+                "cat ${HookMarker.MARKER_PATH_DAAGENT}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 10L), "")
+                else -> CmdResult(1, "", "not found")
             }
-            val state = readHookStateWithGateway(gw, files)
-            assertTrue(state.active)
-            assertEquals(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), state.scopes)
-        } finally {
-            dir.deleteRecursively()
         }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
     }
 
     // Gateway back-compat: per-scope paths cat-fail (e.g. pre-Phase-5
     // install, or a ROM where only the legacy file landed), and the legacy
     // single-file serves both scopes over the gateway -> still ACTIVE with
     // the union. Legacy markers stay read-compat forever.
-    @Test fun gateway_legacySingleFileBackCompatMapsToActive() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
-                when (cmd) {
-                    "cat ${HookMarker.MARKER_PATH}" ->
-                        CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), 11L), "")
-                    else -> CmdResult(1, "", "not found")
-                }
+    @Test fun diagnosis_gatewayLegacySingleFileBackCompatMapsToActive() = runBlocking {
+        val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.MARKER_PATH}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), 11L), "")
+                else -> CmdResult(1, "", "not found")
             }
-            val state = readHookStateWithGateway(gw, files)
-            assertTrue(state.active)
-            assertEquals(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), state.scopes)
-        } finally {
-            dir.deleteRecursively()
         }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertEquals(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
     }
 
-    // Gateway `cat` failure (non-zero exits on all six paths) maps to inactive,
-    // never to a fake active state and never throws.
-    @Test fun gateway_catFailureMapsToInactive() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.ROOT) { CmdResult(1, "", "No such file") }
-            val state = readHookStateWithGateway(gw, files)
-            assertFalse(state.active)
-            assertTrue(state.scopes.isEmpty())
-        } finally {
-            dir.deleteRecursively()
-        }
+    // Gateway `cat` failure (non-zero exits on all six paths) proves nothing:
+    // never a fake active and never inactive (fail-closed) — the gateway
+    // answered every path but read nothing, so the verdict is
+    // UNKNOWN_UNREADABLE, and all six cats are issued.
+    @Test fun diagnosis_gatewayCatFailureMapsToUnknownUnreadable() = runBlocking {
+        val gw = FakeCatGateway(Privilege.ROOT) { CmdResult(1, "", "No such file") }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertTrue(diagnosis.scopes.isEmpty())
+        assertEquals(6, gw.calls)
     }
 
-    // A throwing gateway maps to inactive without propagating the exception.
-    @Test fun gateway_throwingMapsToInactive() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.SHELL) { throw RuntimeException("binder died") }
-            val state = readHookStateWithGateway(gw, files)
-            assertFalse(state.active)
-        } finally {
-            dir.deleteRecursively()
-        }
+    // A throwing gateway is aborted after its first `cat`; alone it proves
+    // nothing — UNKNOWN_UNREADABLE, the exception never propagates.
+    @Test fun diagnosis_gatewayThrowingAloneMapsToUnknownUnreadable() = runBlocking {
+        val gw = FakeCatGateway(Privilege.SHELL) { throw RuntimeException("binder died") }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.UNKNOWN_UNREADABLE, diagnosis.status)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(1, gw.calls)
     }
 
     // A NONE-privilege (NoOp/unproven) gateway is never executed: no `cat`
-    // is attempted and the result stays inactive.
-    @Test fun gateway_nonePrivilegeNeverExecutes() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.NONE) { CmdResult(0, HookMarker.buildContent(setOf("x"), 1L), "") }
-            val state = readHookStateWithGateway(gw, files)
-            assertFalse(state.active)
-            assertEquals(0, gw.calls)
-        } finally {
-            dir.deleteRecursively()
-        }
+    // is attempted; with no direct evidence and no usable gateway the
+    // verdict is UNKNOWN_NO_DIAGNOSTIC.
+    @Test fun diagnosis_gatewayNonePrivilegeNeverExecutes() = runBlocking {
+        val gw = FakeCatGateway(Privilege.NONE) { CmdResult(0, HookMarker.buildContent(setOf("x"), 1L), "") }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, diagnosis.status)
+        assertEquals(0, gw.calls)
     }
 
-    // Null gateway (default) keeps the old behavior: direct reads only, and
-    // a direct hit never consults any gateway.
-    @Test fun gateway_nullGatewayIsDirectOnly() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            assertFalse(readHookStateWithGateway(null, files).active)
-            assertFalse(readHookStateWithGateway(markerFiles = files).active)
-            // Direct hit short-circuits: even a servable gateway is not called.
-            files[0].writeText(HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 5L))
-            val gw = FakeCatGateway(Privilege.SHELL) { CmdResult(1, "", "unused") }
-            val state = readHookStateWithGateway(gw, files)
-            assertTrue(state.active)
-            assertEquals(0, gw.calls)
-        } finally {
-            dir.deleteRecursively()
-        }
+    // No diagnostic gateway: direct reads only; nothing readable ->
+    // UNKNOWN_NO_DIAGNOSTIC. A direct hit short-circuits: even a servable
+    // gateway is not called.
+    @Test fun diagnosis_noGatewayIsDirectOnly() = runBlocking {
+        val noGateway = diagnoseHookState(List(6) { MarkerRead.Denied }, emptyList())
+        assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, noGateway.status)
+        val directHit = listOf(
+            MarkerRead.Readable(HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 5L)),
+        ) + List(5) { MarkerRead.Denied }
+        val gw = FakeCatGateway(Privilege.SHELL) { CmdResult(1, "", "unused") }
+        val diagnosis = diagnoseHookState(directHit, listOf(gw))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertFalse(diagnosis.viaGateway)
+        assertEquals(0, gw.calls)
     }
 
     // PR #60 r6 Phase 5 (Finding #5): the production six-path list is pinned
@@ -381,24 +356,18 @@ class HookStateProviderTest {
     // PR #60 r6 Phase 5 (Finding #5): the gateway serves ONLY the per-scope
     // daagent FALLBACK path — the six-path union still surfaces daagent via
     // gateway and all six `cat`s are issued.
-    @Test fun gateway_perScopeFallbackOnlyMapsToActive() = runBlocking {
-        val dir = Files.createTempDirectory("hookstate").toFile()
-        try {
-            val files = absentSix(dir)
-            val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
-                when (cmd) {
-                    "cat ${HookMarker.LEGACY_MARKER_PATH_DAAGENT}" ->
-                        CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 11L), "")
-                    else -> CmdResult(1, "", "not found")
-                }
+    @Test fun diagnosis_gatewayPerScopeFallbackOnlyMapsToActive() = runBlocking {
+        val gw = FakeCatGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.LEGACY_MARKER_PATH_DAAGENT}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 11L), "")
+                else -> CmdResult(1, "", "not found")
             }
-            val state = readHookStateWithGateway(gw, files)
-            assertTrue(state.active)
-            assertEquals(setOf(HookMarker.SCOPE_DAAGENT), state.scopes)
-            assertEquals(6, gw.calls)
-        } finally {
-            dir.deleteRecursively()
         }
+        val diagnosis = diagnoseHookState(List(6) { MarkerRead.Denied }, listOf(gw))
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertEquals(setOf(HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
+        assertEquals(6, gw.calls)
     }
 
     // PR #60 r6 Phase 5 (Finding #5): malformed per-scope file + valid peer ->
