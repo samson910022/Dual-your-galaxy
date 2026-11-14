@@ -8,7 +8,10 @@ import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 // JVM unit tests for the pure effective-policy cache (EffectivePolicyCache).
@@ -276,6 +279,15 @@ class EffectivePolicyCacheTest {
         assertEquals(1L, cache.failedReadSeedOnly.get())
     }
 
+    // Design-marker pin (P3-4, unreachable arm today): this test pins a state
+    // production cannot produce today — every path that sets the cache's
+    // `valid` flag to false ALSO sets `invalidated = true` (TTL expiry and
+    // invalidate() do both), so a FAILED read with hadGoodValue==true and
+    // !invalidated never occurs through the public API. The pin is kept
+    // deliberately as a design marker for the last-known-good return arm
+    // (failed read must NOT count failedReadSeedOnly when a good snapshot is
+    // legitimately returnable). If production ever creates this state,
+    // revisit this test — do not "fix" the reflection synthesized flag flip.
     // CR-O4 (negative pin): a FAILED read while hadGoodValue==true and
     // !invalidated returns the last-known-good snapshot and must NOT count
     // failedReadSeedOnly (the last-known-good return arm). The arm is not
@@ -396,7 +408,8 @@ class EffectivePolicyCacheTest {
             }
         }
         workers.forEach { it.start() }
-        workers.forEach { it.join() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
         assertEquals(threads, results.size)
         for (result in results) {
             assertTrue(result == merged || result == seed)
@@ -431,7 +444,8 @@ class EffectivePolicyCacheTest {
             }
         }
         workers.forEach { it.start() }
-        workers.forEach { it.join() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
         assertEquals(threads, results.size)
         for (result in results) {
             assertTrue(result == setOf("b") || result == emptySet<String>())
@@ -476,12 +490,89 @@ class EffectivePolicyCacheTest {
             }
         }
         workers.forEach { it.start() }
-        workers.forEach { it.join() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
         assertEquals(threads, results.size)
         for (result in results) {
             assertTrue(result == setOf("b") || result == emptySet<String>())
         }
         assertEquals(1, reads.get())
+    }
+
+    // P3-8: invalidate() wakes grace-parked followers. A follower parked in
+    // waitGrace does NOT need the leader's commit to return: invalidate()
+    // drops the in-flight single-flight claim and notifyAll() wakes every
+    // follower parked in the grace wait; the woken follower re-checks `valid`
+    // (false right after an invalidate) and falls back to seed-only instead
+    // of parking out its full grace window. The follower result here is
+    // seed-only (never the leader's would-be value, which is discarded as a
+    // loser after the generation bump anyway).
+    @Test
+    fun invalidateWakesGraceParkedFollowerPromptly() {
+        val cache = EffectivePolicyCache()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        // T-F9: failure flag set inside the reader thread, asserted on the
+        // main thread — an assertTrue() inside the reader would be swallowed
+        // by the cache's failed-read handling (Throwable -> null).
+        val leaderLatchFailed = AtomicBoolean(false)
+        val leader = Thread {
+            cache.get(emptySet(), nonEmptyPolicyGateOpen = true) {
+                leaderStarted.countDown()
+                try {
+                    if (!leaderRelease.await(5, TimeUnit.SECONDS)) leaderLatchFailed.set(true)
+                } catch (_: InterruptedException) {
+                    leaderLatchFailed.set(true)
+                }
+                setOf("leader")
+            }
+        }
+        leader.start()
+        try {
+            assertTrue("leader must enter reader", leaderStarted.await(5, TimeUnit.SECONDS))
+            // Generous grace: without a working invalidate()-notifyAll wake the
+            // follower would park the full 10s — this test joins with 2s and
+            // asserts completion, so a broken wake fails loudly instead of the
+            // follower silently parking out the window.
+            var followerResult: Set<String>? = null
+            val follower = Thread {
+                followerResult = cache.get(
+                    emptySet(),
+                    nonEmptyPolicyGateOpen = true,
+                    followerGraceMs = 10_000L,
+                ) {
+                    setOf("unexpected")
+                }
+            }
+            follower.start()
+            // Deterministic handshake: wait until the follower entered the grace
+            // wait (followerGraceHits is bumped just before waitGrace), never a
+            // fixed sleep. Bounded spin with yield — 5s cap.
+            val graceDeadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (cache.followerGraceHits.get() < 1L && System.nanoTime() < graceDeadlineNanos) {
+                Thread.yield()
+            }
+            assertEquals(1L, cache.followerGraceHits.get())
+            cache.invalidate()
+            follower.join(2_000)
+            assertFalse("invalidate() must wake the grace-parked follower promptly", follower.isAlive)
+            assertEquals(emptySet<String>(), followerResult)
+            // The woken follower fell back to seed-only via the grace arm.
+            assertEquals(1L, cache.graceExpiredSeedOnly.get())
+            leaderRelease.countDown()
+            leader.join(2_000)
+            assertFalse(leader.isAlive)
+            assertFalse("leader latch never released", leaderLatchFailed.get())
+        } finally {
+            // Best-effort force-release: an assert failure above must never leak
+            // this non-daemon leader parked in the shared JVM. Extra countDowns on
+            // a CountDownLatch are safe, and the join is best-effort.
+            leaderRelease.countDown()
+            try {
+                leader.join(5_000)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     // Stage C: gate closed short-circuits to empty with zero reader calls and

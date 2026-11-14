@@ -123,9 +123,13 @@ class EffectivePolicyDeadlineTest {
             val elapsed = (DeadlineBudget.nowNanos() - t0) / 1_000_000L
             // Prefs segment truncated by the shared total: fail-closed seed-only.
             assertEquals(emptySet<String>(), result)
-            // Hang-guard only (not a hot-path SLA): catches an unclobbered 2s
-            // stall regression; 120ms relaxes the flake-prone 80ms pin.
-            assertTrue("dual 40ms must stay under the 120ms hang-guard, elapsed=$elapsed", elapsed < 120)
+            // Hang-guard only (NOT an SLA): the budget itself enforces the
+            // real bound (prefs truncated at ~the 50ms total); this assert
+            // exists only to catch regressions that actually hang — two
+            // 40ms sleeps + dispatch. 1s leaves generous loaded-CI headroom;
+            // tightening it reintroduces flake without pinning anything
+            // the budget does not already guarantee.
+            assertTrue("dual 40ms must complete, not hang; elapsed=$elapsed (budget enforces the real bound)", elapsed < 1_000)
         } finally {
             try {
                 capExec.shutdownNow()

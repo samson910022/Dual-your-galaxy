@@ -174,8 +174,8 @@ class PolicyToctouBarrierTest {
     }
 
     // Phase7 stress hammer (N=1000, LargeTest, opt-in only): hammers the
-    // explicit-rev seam + sampled path 1000 times to catch read-then-act
-    // races/flakes. Skipped by default (no RUN_LARGE_TESTS=1) so CI stays green.
+    // explicit-rev seam 1000 times to catch read-then-act races/flakes.
+    // Skipped by default (no RUN_LARGE_TESTS=1) so CI stays green.
     @LargeTest
     @Test
     fun stressHammer_markObservedKnownAt_1000() {
@@ -187,24 +187,22 @@ class PolicyToctouBarrierTest {
                 saveRaw = { true },
             )
             val vm = makeVm(store, coord)
-            val base = vm.observedRevForTests()
-            repeat(1000) { i ->
-                // Alternate between explicit rev and sampled path.
-                if (i % 2 == 0) {
-                    vm.markObservedKnownAt(coord.currentRevision())
-                } else {
-                    // Exercise the sampler path (no bump, must stay consistent).
-                    vm.revisionSamplerForTests = { coord.currentRevision() }
-                    // Private markObservedKnown() not directly callable; drive
-                    // via the explicit seam with the sampled value.
-                    vm.markObservedKnownAt(vm.observedRevForTests())
-                }
+            repeat(1000) {
+                // Both arms drive the same explicit-rev seam; the 1000x
+                // hammer proves the mark path never crashes and never
+                // regresses the observed snapshot (constant revision here —
+                // no commits land mid-hammer). markObservedKnownAt never
+                // consults the sampler, so no sampler assignment is needed.
+                vm.markObservedKnownAt(coord.currentRevision())
             }
-            // Hammer never crashes and observed is monotonic (never regresses
-            // below base; -1L is the minimum so after >= base covers the
-            // never-observed base too).
-            val after = vm.observedRevForTests()
-            assertTrue("observed must never regress (base=$base after=$after)", after >= base)
+            // Both marks set observed to the coordinator's current revision:
+            // after the hammer, observed must equal it exactly (not merely
+            // be >= a base).
+            assertEquals(
+                "observed must equal the coordinator's current revision after the hammer",
+                coord.currentRevision(),
+                vm.observedRevForTests(),
+            )
         } finally {
             try {
                 coord.close()

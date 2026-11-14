@@ -3,6 +3,7 @@ package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
@@ -36,7 +37,8 @@ class EffectivePolicyCachePhase3Test {
         leader.start()
         assertTrue("reader must enter before invalidate", readerEntered.await(5, TimeUnit.SECONDS))
         cache.invalidate()
-        leader.join()
+        leader.join(5_000)
+        assertFalse("leader must finish under load", leader.isAlive)
         assertEquals(emptySet<String>(), leaderResult)
         // After invalidate the next read is fresh (no stale resurrection).
         assertEquals(setOf("c"), cache.get(emptySet(), true) { setOf("c") })
@@ -64,7 +66,8 @@ class EffectivePolicyCachePhase3Test {
             }
         }
         workers.forEach { it.start() }
-        workers.forEach { it.join() }
+        workers.forEach { it.join(5_000) }
+        workers.forEach { assertFalse("worker must finish under load", it.isAlive) }
         assertEquals(threads, results.size)
         assertEquals(1, reads.get())
         // At least the leader merged; followers either merged (grace hit) or
@@ -252,6 +255,82 @@ class EffectivePolicyCachePhase3Test {
             },
         )
         assertEquals(2, reads)
+    }
+
+    // P3-7 (interrupt-restore, cache arm): a reader throwing
+    // InterruptedException is a failed read (fail-closed seed-only) AND the
+    // interrupt bit must be restored on the calling thread so callers can
+    // observe cancellation. try/finally saves/restores the test thread's
+    // interrupt status so no other test in this JVM fork observes a poisoned
+    // bit.
+    @Test
+    fun interruptRestore_readerInterruptedFallsBackToSeedAndRestoresInterruptBit() {
+        val wasInterrupted = Thread.interrupted() // save + clear
+        try {
+            var reads = 0
+            val cache = EffectivePolicyCache()
+            val result = cache.get(setOf("com.seed.app"), true) {
+                reads++
+                throw InterruptedException("cut")
+            }
+            assertEquals(setOf("com.seed.app"), result)
+            assertEquals(1, reads)
+            assertFalse(cache.isCached())
+            assertTrue(
+                "interrupt bit must be restored by the cache",
+                Thread.currentThread().isInterrupted,
+            )
+        } finally {
+            Thread.interrupted() // clear the bit production restored
+            if (wasInterrupted) Thread.currentThread().interrupt() // restore pre-test state
+        }
+    }
+
+    // P3-7 (interrupt-restore, bounded-read arm): PolicyRefreshBudget
+    // .readBoundedOrThrow restores the CALLER's interrupt bit when the
+    // calling thread is interrupted while blocked in future.get().
+    //
+    // Precise scope — what this test pins: the caller-interrupted-during-get()
+    // restore arm of the OBJECT-LEVEL helper (PolicyRefreshBudget.readBoundedOrThrow).
+    // The production gate paths (PolicyRefreshGate.doSubmitOrThrow /
+    // doProbeSubmitOrThrow) share the same shape: a future.get() wrapped in
+    // catch (t: Throwable) with the interrupt bit restored iff
+    // t is InterruptedException.
+    //
+    // Honest scope note (what is NOT pinnable here): a READER throwing
+    // InterruptedException on the executor worker surfaces to the caller via
+    // FutureTask as ExecutionException(cause=InterruptedException) — NOT as
+    // InterruptedException — so the `t is InterruptedException` restore arm
+    // never fires for that shape and the bit is INTENTIONALLY never restored
+    // by production (the caller was never interrupted; restoring would
+    // fabricate a cancellation). This test pins the REACHABLE half
+    // deterministically: caller interrupted before the call, get() throws
+    // InterruptedException immediately, the bit is restored (not left cleared)
+    // by production.
+    @Test
+    fun interruptRestore_readBoundedOrThrowInterruptedGetRestoresCallerInterruptBit() {
+        val wasInterrupted = Thread.interrupted() // save + clear
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-interrupt-restore")
+        try {
+            Thread.currentThread().interrupt() // caller interrupted before the call
+            val result = PolicyRefreshBudget.readBoundedOrThrow(
+                reader = { setOf("x") },
+                timeoutMs = 2_000,
+                executor = executor,
+            )
+            assertNull(result) // caller interrupted -> failed read, fail-closed
+            assertTrue(
+                "interrupt bit must be restored by readBoundedOrThrow",
+                Thread.currentThread().isInterrupted,
+            )
+        } finally {
+            Thread.interrupted() // clear whatever state remains
+            if (wasInterrupted) Thread.currentThread().interrupt() // restore pre-test state
+            try {
+                executor.shutdownNow()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     @Test

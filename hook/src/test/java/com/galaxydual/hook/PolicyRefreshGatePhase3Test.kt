@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -32,6 +33,23 @@ class PolicyRefreshGatePhase3Test {
             value
         }
 
+    // Frozen-clock companion to the interrupt-ignoring readers (mirror of
+    // the PolicyRefreshGateProcessCapTest idiom): the rebuild arm re-probes
+    // activeCount() on the REAL scheduler at read time, so a loaded CI box
+    // that stalls the worker past the budget could flip activeCount() to 0
+    // before the frozen clock is advanced. Park (0.5ms) until the worker has
+    // actually started, with a 5s nanos deadline; assert-fail loudly on
+    // deadline instead of flaking downstream.
+    private fun awaitWorkerBusy(gate: PolicyRefreshGate, deadlineSeconds: Long = 5) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(deadlineSeconds)
+        while (gate.activeCount() < 1) {
+            if (System.nanoTime() >= deadline) {
+                fail("worker did not become busy within ${deadlineSeconds}s (activeCount stayed 0)")
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(500_000L)
+        }
+    }
+
     @Test
     fun stuckBusyBeyondThresholdRebuildsWorkerAndProbes() {
         val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-rebuild-phase3")
@@ -48,6 +66,7 @@ class PolicyRefreshGatePhase3Test {
             // Worker stays busy (ignoring reader runs 500ms).
             assertNull(gate.readBounded(ignoringReader(500), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             // Busy age beyond min(3*50=150, 200)=150 forces a rebuild.
             clock.addAndGet(200L)
             val before = gate.currentExecutorForTest()
@@ -77,6 +96,7 @@ class PolicyRefreshGatePhase3Test {
             )
             assertNull(gate.readBounded(ignoringReader(2_000), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             // Cooldown elapsed (150>=100) but below force threshold
             // min(3*100=300, 10000)=300: no rebuild, counted drop.
             clock.addAndGet(150L)
@@ -281,7 +301,8 @@ class PolicyRefreshGatePhase3Test {
             } catch (e: PolicyRefreshContentionException) {
                 // Expected.
             }
-            leader.join()
+            leader.join(5_000)
+            assertFalse("leader must finish under load", leader.isAlive)
             // Worker drains (ignoring reader runs 500ms) before invalidate —
             // bounded poll, not a wall-clock sleep.
             val drainDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
@@ -494,6 +515,7 @@ class PolicyRefreshGatePhase3Test {
             // Trip the breaker; the (original) worker stays busy.
             assertNull(gate.readBounded(ignoringReader(600), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             // Cooldown elapses and busy age exceeds the rebuild threshold:
             // the single forced rebuild fires; the half-open probe succeeds
             // on the fresh executor, closing the breaker.
@@ -505,6 +527,7 @@ class PolicyRefreshGatePhase3Test {
             // Re-stick the FRESH worker past the rebuild threshold.
             assertNull(gate.readBounded(ignoringReader(600), timeoutMs = 50))
             assertTrue(gate.isStuck())
+            awaitWorkerBusy(gate)
             assertEquals(1L, gate.consecutiveTimeouts.get())
             assertEquals(0L, gate.halfOpenFailureCount())
             val probesBefore = gate.halfOpenProbes.get()
