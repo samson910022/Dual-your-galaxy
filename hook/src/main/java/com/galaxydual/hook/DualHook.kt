@@ -472,7 +472,6 @@ class DualHook : XposedModule() {
     private fun interceptWhitelistCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
         return try {
-            val extra = effectivePolicy()
             val executable = try {
                 chain.executable
             } catch (_: Throwable) {
@@ -486,7 +485,14 @@ class DualHook : XposedModule() {
             // Defense-in-depth: installed-and-whitelist composite queries are
             // excluded in Stage 1 (install-state/userId ambiguity). Skip hook
             // install paths gate these, but keep a runtime fail-closed backstop
-            // regardless of policy.
+            // regardless of policy. Sequenced BEFORE the effectivePolicy()
+            // resolution below on purpose: composite (Stage-1-excluded)
+            // queries return the original without ever spending the 50ms
+            // policy-refresh budget. Side effect of this reorder: composite
+            // queries no longer drive the policy-refresh TTL, so poll-only
+            // freshness now relies on non-composite queries — a
+            // composite-dominated ROM stays seed-only until a non-composite
+            // query or an invalidate() occurs.
             if (methodName != null &&
                 WhitelistSignatureGuard.isInstalledWhitelistCompositeQuery(methodName)
             ) {
@@ -506,6 +512,10 @@ class DualHook : XposedModule() {
                 }
                 return result
             }
+            // Resolved AFTER the composite backstop (see above) and BEFORE
+            // the empty check: Stage-1-excluded composite queries skip the
+            // 50ms budget entirely; everyone else pays it exactly here.
+            val extra = effectivePolicy()
             if (extra.isEmpty()) {
                 return result
             }
@@ -631,7 +641,20 @@ class DualHook : XposedModule() {
         val deadlineMs: Long = if (!clockOk) {
             -1L
         } else try {
-            (t0 / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+            // Same monotonic basis as the cache's deadline clamp, sampled a
+            // few instructions AFTER t0 (a one-instant relationship, not an
+            // epoch): nanoTime milliseconds anchor the absolute deadline
+            // instead of t0 / 1e6, which can go ≤ 0 on a negative-nanotime
+            // origin and silently drop the clamp (deadlineMs > 0L gate).
+            // nowNanos() is the same clock read t0 came from, so the deadline
+            // is t0 + budget in practice (microseconds late). On supported
+            // runtimes (Linux/ART report CLOCK_MONOTONIC ≥ 0) this deadline
+            // is non-positive only when the nanoTime origin sits at or below
+            // −DEFAULT_STALL_BUDGET_MS of monotonic time — no supported
+            // clock reports such an origin, so while clockOk the value is a
+            // positive absolute deadline in practice. The −1L sentinel is
+            // reserved for the clockOk=false / exception cases above.
+            (DeadlineBudget.nowNanos() / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
         } catch (_: Throwable) {
             -1L
         }
