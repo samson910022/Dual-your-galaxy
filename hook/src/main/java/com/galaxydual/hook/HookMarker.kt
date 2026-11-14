@@ -421,7 +421,7 @@ object HookMarker {
     // its own tmp age past the staleness window and be swept by another
     // process's call. The rename then fails and the write is REFUSED (no
     // direct-write fallback — see above): the marker is unwritten and reads
-    // stays unwritten ( absence must be positively verified before anything
+    // stays unwritten (absence must be positively verified before anything
     // other than 狀態未知 is displayed — four-state rule). Fail-soft: the target file itself is
     // never deleted or truncated by the sweep — no target data loss.
     private const val ORPHAN_TMP_SWEEP_MAX = 16
