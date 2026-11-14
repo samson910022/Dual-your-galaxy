@@ -88,11 +88,15 @@ object PolicySource {
     // H4: process-lifetime count of policy entries dropped by the caps
     // (sanitize valid-entry cap / effective merged-set truncation). Never
     // drives logic; observability only, never reset. Internal for tests.
+    // Counts CUMULATIVE drop events across polls (a re-offered oversized
+    // draft is re-counted on each refresh); not distinct entries.
     // sanitize() adds raw.size - kept at the valid-cap break (hostile size =>
-    // best-effort +1); effective() adds the exact seed-first extras it
-    // truncates. The MAX_POLICY_ENTRIES*8 traversal bound is a defense for
-    // invalid-token floods, not an entry drop, and is intentionally not
-    // counted here.
+    // best-effort +1, clamped to 4096 for huge-lie sizes); effective() adds
+    // the exact seed-first extras it truncates. The MAX_POLICY_ENTRIES*8
+    // traversal bound is a defense for invalid-token floods; entries beyond
+    // the traversal bound (incl. possibly valid ones after a mixed invalid
+    // flood) are dropped without counting; the valid tail is unknowable
+    // without unbounded traversal.
     internal val truncationDrops = AtomicLong(0L)
 
     fun sanitize(raw: Set<*>): Set<String> {
@@ -123,16 +127,17 @@ object PolicySource {
                 if (seen++ >= MAX_POLICY_ENTRIES * 8) break
                 if (out.size >= MAX_POLICY_ENTRIES) {
                     // Valid entry beyond the cap: count the unkept remainder
-                // (exact for sane writers with an all-valid tail; a mixed tail
-                // over-counts, since invalid tokens that would never become
-                // policy entries are included by construction; a hostile size
-                // read best-efforts +1). Never throws.
+                    // (exact for sane writers with an all-valid tail; a mixed tail
+                    // over-counts, since invalid tokens that would never become
+                    // policy entries are included by construction; a hostile/huge-lie
+                    // size read is clamped to at least +1 and at most 4096).
+                    // Never throws.
                     val dropped = try {
                         raw.size - out.size
                     } catch (_: Throwable) {
                         1
                     }
-                    truncationDrops.addAndGet(dropped.coerceAtLeast(1).toLong())
+                    truncationDrops.addAndGet(dropped.coerceAtLeast(1).coerceAtMost(4096).toLong())
                     break
                 }
                 if (it is String &&

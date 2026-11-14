@@ -47,6 +47,7 @@ fi
 VERIFICATION_RE='Dependency verification failed|verification-metadata|artifacts? failed verification|failed verification:|checksum (verification|mismatch|failed|missing).{0,200}(verification|metadata|artifact)|artifact (verification|checksum) failed'
 
 LOG=$(mktemp "${TMPDIR:-/tmp}/ci-retry-guard.XXXXXX.log")
+[ -n "$LOG" ] || { echo "ci-retry-guard.sh: mktemp failed" >&2; exit 2; }
 trap 'rm -f "$LOG"' EXIT
 
 attempt=1

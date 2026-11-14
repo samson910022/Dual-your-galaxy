@@ -378,6 +378,42 @@ class WhitelistPatchTest {
         assertEquals(listOf("a", "z"), backing)
     }
 
+    // Like SizeThrowsList, but iterator()/isEmpty() never touch size():
+    // isEmpty() is pinned to false and iteration walks the backing directly.
+    // The element-inspection guard therefore passes (it uses the iterator,
+    // not size()), so the pre-mutation size0 guard is the first place that
+    // observes the throwing size read — exercising ISSUE-3-a's guard, which
+    // SizeThrowsList could never reach (its inherited iterator hasNext()
+    // calls size() and fails inside the element-inspection guard first).
+    private class ThrowingSizeOnlyList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        override val size: Int get() = throw IllegalStateException("size refused")
+        override fun isEmpty(): Boolean = false
+        override fun iterator(): MutableIterator<String> = backing.iterator()
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+    }
+
+    @Test
+    fun sizeThrowingOutsideIterationFailsClosedBeforeMutation() {
+        val backing = mutableListOf("a", "z")
+        val list = ThrowingSizeOnlyList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should mention the size-read guard, was: ${o.reason}",
+            o.reason.contains("failed to read list size"),
+        )
+        // Assert against the backing (the hostile list itself is unreadable).
+        assertEquals(listOf("a", "z"), backing)
+    }
+
     // get() throws during the prefix verification (size stays readable and
     // consistent): the two-tier rollback's outer catch must count that as
     // verify-fail and fall back to clear()+addAll(snapshot), preserving the

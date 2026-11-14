@@ -2617,6 +2617,13 @@ class DualViewModel(
     //   CAS 成功才發布，敗者跳過）；unresolved 不搶發布權（不碰 fence）。
     private fun attachDeferredAutoRecheck(tx: PolicyTx) {
         try {
+            // Stale-generation snapshot at attach time: the Tx may be adopted
+            // by another VM before the handler runs; policyDraftVersion moving
+            // past this value means an adopter owns convergence (implementing
+            // the same stale-generation discipline as the reconciler's
+            // join==false retain arm — the owner-identity re-check below is
+            // insufficient on its own).
+            val attachedVersion = policyDraftVersion.get()
             tx.deferred.invokeOnCompletion {
                 // 非同步交接：仍為擁有者才啟動單次重查（已結／被替換即丟棄）。
                 if (activePolicyTx.get() !== tx) {
@@ -2625,7 +2632,7 @@ class DualViewModel(
                     return@invokeOnCompletion
                 }
                 handoverScope().launch {
-                    autoRecheckTx(tx)
+                    autoRecheckTx(tx, attachedVersion)
                 }
             }
         } catch (_: Exception) {
@@ -2635,9 +2642,17 @@ class DualViewModel(
 
     // Stage G2 單次權威重查本體（handoverScope 上跑，讀走共用 IO 池）。
     // 有 coordinator 時跑在其 app-scoped 域，VM 死亡不影響收斂。
-    private suspend fun autoRecheckTx(tx: PolicyTx) {
+    private suspend fun autoRecheckTx(tx: PolicyTx, attachedVersion: Long) {
         // 擁有者再判（併發已結／被替換即丟棄，防雙發布）。
         if (activePolicyTx.get() !== tx) return
+        // Stale-generation retain (version arm only): the reconciler bumps
+        // policyOwnershipGen at its own start, which says nothing about
+        // adopters — policyDraftVersion moving past the attach-time snapshot
+        // means an adopting VM (reclaim/late-join/new settle) moved the draft,
+        // and that adopter's workers own convergence. Retain (no claim, no
+        // publish, no fence/_latest/phase touch) rather than publish from a
+        // stale window — the freshest worker wins the claim and the terminal.
+        if (policyDraftVersion.get() != attachedVersion) return
         if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
         // Stage N2 P1: unvalidated Tx must never auto-execute; abort instead.
         if (!canJoinTx(tx)) {
@@ -6843,8 +6858,10 @@ class DualViewModel(
             val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
-            // 保留＋phase 續留 RECONCILING。外部取消（CE 重拋）仍經 settle=true
-            // 清場，不殘留。
+            // 保留＋phase 續留 RECONCILING。
+            // CE unwind never settles; the fence is retained for the app-scoped
+            // handover reconciler to converge (the reconciler survives VM death
+            // on the coordinator scope).
             var settle = true
             try {
                 try {

@@ -25,7 +25,7 @@ internal object HookInstaller {
         } catch (_: Throwable) {
             "Class"
         }
-        val base = "$owner#$name($params)".take(200)
+        val base = "$owner#${HookLog.normalizeLogPart(name)}($params)".take(200)
         return try {
             if (e is Method) "$base->${HookLog.shortName(e.returnType.typeName)}".take(200) else base
         } catch (_: Throwable) {

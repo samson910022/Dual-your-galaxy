@@ -4769,6 +4769,7 @@ class PolicyWriteTest {
                 "expected WRITE_SUCCESS or REFRESHED terminal, was: ${vm2.state.value.msg}",
                 vm2.state.value.msg.contains("已寫入政策草稿") || vm2.state.value.msg.contains("已重新整理政策草稿"),
             )
+            assertFalse(vm2.state.value.msgKind == MsgKind.FAILED)
             assertNull(activeTxOf(vm2))
             assertNull(coordinatorTxOf(coord))
             await(timeoutMs = 5_000L) { reconcilingKeysOf(vm2).isEmpty() }
@@ -7052,6 +7053,7 @@ class PolicyWriteTest {
                 "expected WRITE_SUCCESS or REFRESHED terminal, was: ${vm2.state.value.msg}",
                 vm2.state.value.msg.contains("已寫入政策草稿") || vm2.state.value.msg.contains("已重新整理政策草稿"),
             )
+            assertFalse(vm2.state.value.msgKind == MsgKind.FAILED)
             assertNull(activeTxOf(vm2))
             assertNull(coordinatorTxOf(coord))
         } finally {
@@ -11910,6 +11912,75 @@ class PolicyWriteTest {
         }
     }
 
+    // PR #60 stale-worker retain：VM-A mid-await CE 交接（handover 登記於 coord，
+    // auto-recheck 以 ATTACH 時刻的世代雙快照掛載）；VM-B 以同一 coord/store 經
+    // makeVm2Direct 建立，init reclaim bump 世代三元（version/freshness/ownership）
+    // → vmB 翻 RECONCILING。saveRelease 後 VM-A 的 deferred 完成（回 false＝已證
+    // 失敗）觸發 VM-A 的 auto-recheck：世代已被 VM-B bump，stale view 必須續留
+    // （不 claim／不 publish／不丟 phase），永不發布 Failed；由 VM-B 的 reconciler
+    // （自身 baseline 正確）認領並收斂。斷言終態：vmB IDLE＋corrupt=false＋fence
+    // 雙清；vmA 仍 RECONCILING（retained）。
+    @Test
+    fun staleWorkerRetainsWhenAdopterBumpsGeneration() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { _ ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                // 回 false：已證失敗（deferred false）。stale worker（VM-A）若搶
+                // 認領即發布 Failed；retain 語義下僅 VM-B（新鮮 worker）收斂。
+                false
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pending)
+
+            vmA.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+
+            // VM-A rotation 式取消（mid-await CE）：handover 登記於 coord → RECONCILING。
+            vmA.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertNotNull(activeTxOf(vmA))
+            assertSame(activeTxOf(vmA), coordinatorTxOf(coord))
+
+            // VM-B：同一 coord＋store（makeVm2Direct，不經 makeVm 的 Known 等待）；
+            // init reclaim bump 世代三元 → RECONCILING＋Unknown＋pending 繼承。
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 5_000)
+            await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+
+            // 放行 blocking save（回 false）：VM-A 的 stale auto-recheck 續留；
+            // VM-B 的 reconciler 認領並收斂（Failed 終態，後端未變 seed）。
+            saveRelease.set(true)
+            await(timeoutMs = 15_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(PolicyWritePhase.IDLE, vmB.state.value.policyWritePhase)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            assertNull(coordinatorTxOf(coord))
+            assertNull(activeTxOf(vmB))
+            // VM-A（已死）永不發布 Failed：retained，phase 保持 RECONCILING。
+            assertEquals(PolicyWritePhase.RECONCILING, vmA.state.value.policyWritePhase)
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // PR #60 C1.5-2（R5 T1）：VM-B 於 VM-A 開始 save 之前（同 coordinator）建立；
     // VM-A mid-await CE 後 B 不卡 BUSY／IN_PROGRESS：A 結清後，B 的
     // requestPolicyWrite＋confirmPolicyWrite 正常走完，兩個 VM 皆收斂 IDLE＋Known。
@@ -12209,4 +12280,63 @@ class PolicyWriteTest {
         }
     }
 
+    // Phase3 (F3-P2#2) BLANK-MESSAGE substitution pin: mid-await CE in the
+    // armed-coord confirm path hands the armed Tx off to the coordinator.
+    // Right after the scope cancel lands (phase flips to RECONCILING, BEFORE
+    // the blocking save is released), the user-visible msg must be the
+    // non-blank WRITE_TIMEOUT text ("寫入政策逾時，結果未知，正在核對，請勿重試")
+    // at CHANNEL severity — never a stale/blank leftover from SAVING entry
+    // (which cleared msg to ""). The substitution IS the contract.
+    @Test
+    fun savingMidAwaitCancellation_armedCoord_handedOffEmptyMsgSubstitutesWriteTimeout() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveStarted.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            vm.confirmPolicyWrite(pending, pending.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // SAVING entry clears the previous msg (same atomic update that sets SAVING).
+            assertEquals("", vm.state.value.msg)
+
+            // 取消在 SAVING 態下穿透 mid-await CE；finally（最外層）負責放行 save。
+            vm.viewModelScope.cancel(kotlinx.coroutines.CancellationException("mid-await-cancel"))
+            await(timeoutMs = 2_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            // The handover must substitute a non-blank WRITE_TIMEOUT notice —
+            // asserted BEFORE releasing the backend, so the convergence path
+            // cannot race these three volatile reads.
+            assertTrue(vm.state.value.msg.isNotBlank())
+            assertTrue(vm.state.value.msg.contains("寫入政策逾時"))
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            saveRelease.set(true)
+
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }

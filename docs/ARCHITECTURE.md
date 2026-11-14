@@ -93,8 +93,8 @@ val privilege: Privilege = when {
 > `./gradlew --write-verification-metadata sha256 <tasks>` (never hand-edit hashes
 > except the aapt2 caveat below). It covers all currently-run classpaths
 > (incl. lint / debug / test); the residual is the emulator/device RUNTIME
-> path (artifacts are pinned; the on-device execution is unverified), and
-> `release.yml` remains unpinned (tracked as follow-up). Caveat: the aapt2
+> path (artifacts are pinned; the on-device execution is unverified).
+> `release.yml`'s actions are additionally pinned to commit SHAs (refs verified). Caveat: the aapt2
 > **platform-classifier** artifacts
 > (`-windows.jar`/`-osx.jar`) are not resolvable on this Linux host, so those
 > entries were added manually with sha256 hashes verified locally from Google's

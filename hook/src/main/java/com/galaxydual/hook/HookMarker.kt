@@ -495,7 +495,7 @@ object HookMarker {
                     false
                 }
                 if (!created) {
-                    safeLog(onLog, "tmp create refused for ${file.name} (pre-existing or uncreatable tmp path); marker unwritten (fail-closed)")
+                    safeLog(onLog, "tmp create refused for ${HookLog.normalizeLogPart(file.name)} (pre-existing or uncreatable tmp path); marker unwritten (fail-closed)")
                     return false
                 }
                 try {
@@ -503,7 +503,7 @@ object HookMarker {
                 } catch (t: Exception) {
                     // Tmp path failed: NO fall-through to a direct write
                     // (rename-refusal semantics — see KDoc above).
-                    safeLog(onLog, "tmp write failed for ${file.name} (${HookLog.shortEx(t)}); marker unwritten (fail-closed)")
+                    safeLog(onLog, "tmp write failed for ${HookLog.normalizeLogPart(file.name)} (${HookLog.shortEx(t)}); marker unwritten (fail-closed)")
                     return false
                 }
                 if (tmp.renameTo(file)) return true
@@ -516,12 +516,12 @@ object HookMarker {
                 // block), log, return false. The marker is best-effort; a
                 // missing marker can surface as 未偵測到 only under
                 // positively-verified absence (four-state rule).
-                safeLog(onLog, "rename refused for ${file.name}; marker unwritten (fail-closed)")
+                safeLog(onLog, "rename refused for ${HookLog.normalizeLogPart(file.name)}; marker unwritten (fail-closed)")
                 return false
             }
             // No tmp sibling could be allocated: without the atomic rename
             // path there is no write this contract allows.
-            safeLog(onLog, "no tmp sibling for ${file.name}; marker unwritten (fail-closed)")
+            safeLog(onLog, "no tmp sibling for ${HookLog.normalizeLogPart(file.name)}; marker unwritten (fail-closed)")
             return false
         } catch (_: Exception) {
             false
