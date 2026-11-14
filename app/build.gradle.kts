@@ -24,6 +24,17 @@ val isCiBuild = System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS")
 // via the requested task names so :app:assembleDebug / lint / test on CI
 // are never blocked by a missing release key.
 val requestedTaskNames = gradle.startParameter.taskNames
+// Explicit, narrow allowlist for the release *manifest-merge-only* CI step
+// (workflow passes ALLOW_RELEASE_MANIFEST_MERGE=1). Only tasks that merge
+// manifests WITHOUT packaging/signing may run under this flag; any other
+// release-flavored task is still governed by requestsReleasePackaging.
+val allowReleaseManifestMerge = System.getenv("ALLOW_RELEASE_MANIFEST_MERGE") == "1" &&
+    requestedTaskNames.isNotEmpty() &&
+    requestedTaskNames.all { taskName ->
+        val simple = taskName.substringAfterLast(":")
+        listOf("processReleaseMainManifest", "processReleaseManifest", "processReleaseResources")
+            .any { it.equals(simple, ignoreCase = true) }
+    }
 val requestsReleasePackaging = requestedTaskNames.any { taskName ->
     taskName.contains("Release", ignoreCase = true) ||
         taskName.equals("assemble", ignoreCase = true) ||
@@ -116,7 +127,7 @@ android {
             isMinifyEnabled = false
             if (releaseSigningReady) {
                 signingConfig = signingConfigs.getByName("release")
-            } else if (isCiBuild && requestsReleasePackaging) {
+            } else if (isCiBuild && requestsReleasePackaging && !allowReleaseManifestMerge) {
                 throw GradleException(
                     "Release signing key missing in CI: set SIGN_STORE_FILE " +
                         "(restored from SIGN_STORE_BASE64), SIGN_STORE_PASSWORD, " +

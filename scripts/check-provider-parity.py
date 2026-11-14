@@ -5,19 +5,29 @@
 # of `aapt2 dump xmltree <apk> --file AndroidManifest.xml` (--aapt2-xmltree)
 # and asserts the packaging contract for the app-owned GuardXposedProvider:
 #
-#   * exactly one <provider> element whose android:name ends with
-#     "GuardXposedProvider" AND whose android:authorities EXACTLY equals the
-#     expected --authority (name and authority must live on the SAME element —
-#     counting occurrences anywhere in the file is how the old grep gate was
-#     bypassed by an <activity> plus an unrelated <provider>);
+#   * exactly one <provider> element whose android:name is EXACTLY
+#     "com.galaxydual.plus.GuardXposedProvider" (case-sensitive) AND whose
+#     android:authorities EXACTLY equals the expected --authority (name and
+#     authority must live on the SAME element — counting occurrences anywhere
+#     in the file is how the old grep gate was bypassed by an <activity> plus
+#     an unrelated <provider>; an endswith-match likewise admits substituted
+#     foreign providers such as com.example.FakeGuardXposedProvider carrying
+#     the pinned authority);
 #   * that element pins android:exported="true" (string compare);
 #   * that element carries NO android:permission attribute;
+#   * that element carries NO android:readPermission / android:writePermission
+#     attributes;
+#   * that element has android:enabled absent or EXACTLY "true" (string compare);
+#   * NO <application> element carries android:permission (a component-level
+#     default would be inherited by the provider as well);
 #   * zero elements of ANY tag whose android:name contains "XposedProvider"
 #     other than the pinned GuardXposedProvider itself (covers the libxposed
 #     service io.github.libxposed.service.XposedProvider);
 #   * zero GuardXposedProvider-named elements that are NOT a <provider>
 #     (wrong-element name occurrences fail closed);
-#   * total <provider> elements whose name ends with GuardXposedProvider is 1
+#   * any android:name that contains "GuardXposedProvider" but is not EXACTLY
+#     the pinned FQN fails closed as an impostor;
+#   * total <provider> elements whose name is exactly the pinned FQN is 1
 #     (explicit form of the first rule).
 #
 # ShizukuProvider is exempt by design (not this script's concern) and is never
@@ -38,8 +48,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
+EXPECTED_PROVIDER = "com.galaxydual.plus.GuardXposedProvider"
 
-E_RE = re.compile(r"^(\s*)(?:\d+\s*)?E: ([A-Za-z0-9_.\-]+)")
+E_RE = re.compile(r"^(\s*)(?:\d+\s*)?E: ([^\s()]+)")
+ELEMENT_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 A_RE = re.compile(
     r"^\s*A: http://schemas\.android\.com/apk/res/android:"
     r"([A-Za-z_][A-Za-z0-9_]*)\(0x[0-9a-fA-F]+\)=(.+)$"
@@ -62,10 +74,18 @@ def parse_merged_xml(path):
     for el in tree.getroot().iter():
         # Framework elements in a merged manifest are UNnamespaced. A tag
         # carrying any namespace (evil:provider) must never satisfy the
-        # contract, so it matches nothing (fail closed).
-        tag = el.tag
-        if not isinstance(tag, str) or "}" in tag:
-            tag = ""
+        # contract; die fail-closed (mirroring aapt2-xmltree mode, which dies
+        # on namespace-qualified element tokens). Non-string tags (comments,
+        # PIs) iterate as non-str and are ignored below.
+        raw_tag = el.tag
+        if not isinstance(raw_tag, str):
+            raw_tag = ""
+        if "}" in raw_tag:
+            die(f"{path}: namespace-qualified element {raw_tag} (refusing to parse)")
+        tag = raw_tag
+        local = raw_tag
+        if ":" in local:
+            local = local.rsplit(":", 1)[-1]
         # Only attributes in the android namespace are honored; bare or
         # tools: attributes must NOT satisfy (or shadow) the android contract.
         attrs = {}
@@ -75,7 +95,7 @@ def parse_merged_xml(path):
             ns, _, ln = key[1:].partition("}")
             if ns == ANDROID_NS:
                 attrs[ln] = value
-        elements.append({"tag": tag, "attrs": attrs})
+        elements.append({"tag": tag, "local": local, "attrs": attrs})
     if not elements:
         die(f"merged-xml parse produced no elements: {path}")
     return elements
@@ -109,12 +129,24 @@ def parse_xmltree_text(text, source):
         match_e = E_RE.match(raw)
         if match_e:
             indent = len(match_e.group(1))
-            element = {"tag": match_e.group(2), "attrs": {}, "line": lineno}
+            token = match_e.group(2)
+            # Fail closed on a namespace-qualified element token (e.g.
+            # `E: urn:evil:provider`): legitimate manifests never carry
+            # namespaced elements in aapt2 output (tools: metadata is
+            # stripped by the merger before packaging). Die BEFORE the token
+            # could be silently truncated or mistaken for a framework element.
+            if ":" in token:
+                die(f"{source}:{lineno}: namespace-qualified element token '{token}' (refusing to parse)")
+            if not ELEMENT_TOKEN_RE.fullmatch(token):
+                die(f"{source}:{lineno}: unrecognized element token '{token}' (refusing to parse)")
+            element = {"tag": token, "local": token, "attrs": {}, "line": lineno}
             while stack and stack[-1][0] >= indent:
                 stack.pop()
             elements.append(element)
             stack.append((indent, element))
             continue
+        if re.match(r"^\s*(?:\d+\s*)?E:", raw):
+            die(f"{source}:{lineno}: unparseable element line: {raw.strip()}")
         match_a = A_RE.match(raw)
         if match_a is None and raw.lstrip().startswith("A:"):
             if "schemas.android.com/apk/res/android" in raw:
@@ -148,26 +180,28 @@ def check_elements(elements, authority):
     errors = []
 
     providers = [e for e in elements if e["tag"] == "provider"]
-    guard_providers = [p for p in providers if element_name(p).endswith("GuardXposedProvider")]
+    pinned = [p for p in providers if element_name(p) == EXPECTED_PROVIDER]
 
-    # Explicit node count: exactly one GuardXposedProvider <provider>.
-    if len(guard_providers) != 1:
+    # Explicit node count: exactly one <provider> named exactly the pinned
+    # FQN (case-sensitive). A foreign or fake provider with a similar name
+    # never satisfies this rule.
+    if len(pinned) != 1:
         errors.append(
-            f"expected exactly 1 <provider> whose name ends with GuardXposedProvider, "
-            f"found {len(guard_providers)}"
+            f"expected exactly 1 <provider> with android:name exactly "
+            f"'{EXPECTED_PROVIDER}', found {len(pinned)}"
         )
 
     # Name AND authority on the SAME element, exactly once.
-    matching = [p for p in guard_providers if p["attrs"].get("authorities") == authority]
+    matching = [p for p in pinned if p["attrs"].get("authorities") == authority]
     if len(matching) != 1:
-        present = ", ".join(sorted({p["attrs"].get("authorities", "<absent>") for p in guard_providers})) or "none"
+        present = ", ".join(sorted({p["attrs"].get("authorities", "<absent>") for p in pinned})) or "none"
         errors.append(
             f"expected exactly 1 GuardXposedProvider <provider> whose authorities exactly equal "
             f"'{authority}', found {len(matching)} (GuardXposedProvider provider authorities present: {present})"
         )
 
     # exported=true (string compare) on the pinned element.
-    target = matching[0] if len(matching) == 1 else (guard_providers[0] if guard_providers else None)
+    target = matching[0] if len(matching) == 1 else (pinned[0] if pinned else None)
     if target is not None:
         exported = target["attrs"].get("exported")
         if exported != "true":
@@ -186,23 +220,62 @@ def check_elements(elements, authority):
                 f"GuardXposedProvider <provider> must NOT carry android:permission "
                 f"(pinned: absent), found '{permission}'"
             )
+        # android:readPermission / android:writePermission must be ABSENT too;
+        # a read/write restriction is a permission split, not a permission pin.
+        for attr in ("readPermission", "writePermission"):
+            value = target["attrs"].get(attr)
+            if value is not None:
+                errors.append(
+                    f"GuardXposedProvider <provider> must NOT carry android:{attr} "
+                    f"(pinned: absent), found '{value}'"
+                )
+        # android:enabled must be ABSENT or exactly "true" (string compare);
+        # a disabled provider silently voids the contract without breaking builds.
+        enabled = target["attrs"].get("enabled")
+        if enabled is not None and enabled != "true":
+            errors.append(
+                f'GuardXposedProvider <provider> android:enabled must be "true" '
+                f"when present, found '{enabled}'"
+            )
 
-    # Zero libxposed (or any other) XposedProvider references anywhere.
+    # An <application>-level android:permission is inherited by EVERY component
+    # of the app (including the provider); it pins nothing yet restricts all.
+    # Namespace-qualified elements already died in parse_merged_xml /
+    # parse_xmltree_text; the localName check stays as belt and braces.
+    for element in elements:
+        if element.get("local", element["tag"]) != "application":
+            continue
+        permission = element["attrs"].get("permission")
+        if permission is not None:
+            errors.append(
+                f"<application> android:permission is inherited by all components "
+                f"incl. GuardXposedProvider (pinned: absent), found '{permission}'"
+            )
+
+    # Impostor rule: any android:name that is not EXACTLY the pinned FQN but
+    # carries the GuardXposedProvider marker (or the libxposed XposedProvider
+    # marker) fails closed, regardless of tag or element shape.
     for element in elements:
         name = element_name(element)
-        if name and "xposedprovider" in name.lower() and not name.lower().endswith("guardxposedprovider"):
+        if not name:
+            continue
+        low = name.lower()
+        if name == EXPECTED_PROVIDER:
+            if element["tag"] != "provider":
+                errors.append(
+                    f"GuardXposedProvider-named element <{element['tag']}> is not a <provider> "
+                    f"(name=\"{name}\")"
+                )
+            continue
+        if "guardxposedprovider" in low:
+            errors.append(
+                f"<{element['tag']}> android:name unexpected GuardXposedProvider FQN '{name}' "
+                f"(only exactly {EXPECTED_PROVIDER} is allowed)"
+            )
+        elif "xposedprovider" in low:
             errors.append(
                 f"<{element['tag']}> android:name contains XposedProvider "
                 f"(libxposed service provider must not ship): '{name}'"
-            )
-
-    # Zero GuardXposedProvider-named elements that are NOT a <provider>.
-    for element in elements:
-        name = element_name(element)
-        if name.endswith("GuardXposedProvider") and element["tag"] != "provider":
-            errors.append(
-                f"GuardXposedProvider-named element <{element['tag']}> is not a <provider> "
-                f"(name=\"{name}\")"
             )
 
     return errors
