@@ -8100,7 +8100,7 @@ class PolicyWriteTest {
     // ground-truth Known(empty) converge must surface REPAIRED_NO_BACKUP with
     // CHANNEL kind (deletion happened; evidence NOT preserved), and the
     // backupFailureCount observable must increase. This pins the repair-outcome
-    // plumbing through the timeout/reconciler path (repairOutcomes map).
+    // plumbing through the timeout/reconciler path (shared tx.repairResult carrier).
     @Test
     fun m2_repairTimeout_backupFailure_convergesToRepairedNoBackupChannel() {
         var corrupt = true
@@ -8170,6 +8170,195 @@ class PolicyWriteTest {
             )
             assertEquals(1, deleteCalls.get())
             assertNull(activeTxOf(vmA))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                deleteRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 r6 Phase 2 (Finding #2): the same repair-timeout scenario, but the
+    // owning VM-A is destroyed (Activity finish semantics) while the delete is
+    // blocked past the IO deadline. The repair deferred is app-scoped and
+    // survives; VM-B (same coordinator) inherits the Tx and must settle with
+    // the typed outcome carried ON THE TX — REPAIRED_NO_BACKUP/CHANNEL — not
+    // the generic CORRUPT_REPAIRED/INFO. This pins the cross-VM carrier (the
+    // per-VM outcome map used to lose it for inherited VMs).
+    @Test
+    fun m2_repairTimeout_backupFailure_disposeVmA_vmBSettlesRepairedNoBackupChannel() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val deleteEntered = java.util.concurrent.CountDownLatch(1)
+        val deleteRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    deleteEntered.countDown()
+                    while (!deleteRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        // 備份必失敗（如讀回不一致）：刪除仍發生，backupFailureCount 須遞增。
+        store.setBackupHook { BackupOutcome.Failed }
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val backupFailuresBefore = backupFailureCount.get()
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(deleteEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIR_TIMEOUT).defaultText(),
+                vmA.state.value.msg,
+            )
+
+            // Activity finish 語義銷毀 VM-A（coordinator＋repair deferred 存活）；
+            // VM-B 於同一 coordinator 繼承同一 repair Tx。
+            finishActivityStyle(vmA)
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+
+            // Late delete finishes after the deadline; VM-B converges.
+            deleteRelease.set(true)
+            await(timeoutMs = 20_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vmB.state.value.policyDraft)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            // 誠實揭露（跨 VM）：REPAIRED_NO_BACKUP（CHANNEL），不得是 CORRUPT_REPAIRED。
+            assertEquals(
+                PolicyText(PolicyTextKind.REPAIRED_NO_BACKUP).defaultText(),
+                vmB.state.value.msg,
+            )
+            assertEquals(MsgKind.CHANNEL, vmB.state.value.msgKind)
+            assertTrue(
+                "backupFailureCount must increase when the backup hook reports Failed",
+                backupFailureCount.get() >= backupFailuresBefore + 1L,
+            )
+            assertEquals(1, deleteCalls.get())
+            // coordinator.latest 亦須帶出誠實終態（replay=1 晚到 VM 可見）。
+            assertTrue(coord.latest.value?.known == true)
+            assertEquals(MsgKind.CHANNEL, coord.latest.value?.msgKind)
+            assertEquals(emptySet<String>(), coord.latest.value?.draft)
+            // 例外自由不變量：repair Tx 的 deferred 先 set outcome 再 complete，
+            // Success 決議後 repairResult 必非 null → defensive arm 不得觸發。
+            assertEquals(0L, vmB.repairOutcomeMissingCount.get())
+            assertNull(activeTxOf(vmB))
+            assertNull(coordinatorTxOf(coord))
+        } finally {
+            try {
+                deleteRelease.set(true)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #60 r6 Phase 2 (Finding #2): as above, but the backup hook reports
+    // Written. The inherited VM-B must settle with CORRUPT_REPAIRED/INFO and
+    // the corrupt bit cleared — the Written outcome rides the Tx the same way.
+    @Test
+    fun m2_repairTimeout_backupWritten_disposeVmA_vmBSettlesRepairedInfo() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val deleteEntered = java.util.concurrent.CountDownLatch(1)
+        val deleteRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deleteCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                if (corrupt) throw ClassCastException("corrupt") else backing
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    deleteCalls.incrementAndGet()
+                    deleteEntered.countDown()
+                    while (!deleteRelease.get()) {
+                        try {
+                            Thread.sleep(10)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    true
+                }
+            },
+        )
+        store.setBackupHook { BackupOutcome.Written }
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+            val backupFailuresBefore = backupFailureCount.get()
+
+            vmA.requestRepairCorruptDraft()
+            assertTrue(vmA.isCorruptRepairArmed())
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(deleteEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIR_TIMEOUT).defaultText(),
+                vmA.state.value.msg,
+            )
+
+            // Activity finish 語義銷毀 VM-A（coordinator＋repair deferred 存活）；
+            // VM-B 於同一 coordinator 繼承同一 repair Tx。
+            finishActivityStyle(vmA)
+            val vmB = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+
+            // Late delete finishes after the deadline; VM-B converges.
+            deleteRelease.set(true)
+            await(timeoutMs = 20_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertTrue(vmB.state.value.policyDraftKnown)
+            assertEquals(emptySet<String>(), vmB.state.value.policyDraft)
+            assertFalse(vmB.state.value.policyDraftCorrupt)
+            // Written ⇒ CORRUPT_REPAIRED（INFO），跨 VM 同終態。
+            assertEquals(
+                PolicyText(PolicyTextKind.CORRUPT_REPAIRED).defaultText(),
+                vmB.state.value.msg,
+            )
+            assertEquals(MsgKind.INFO, vmB.state.value.msgKind)
+            // Written 不得遞增 backupFailureCount。
+            assertEquals(backupFailuresBefore, backupFailureCount.get())
+            assertEquals(1, deleteCalls.get())
+            assertTrue(coord.latest.value?.known == true)
+            assertEquals(MsgKind.INFO, coord.latest.value?.msgKind)
+            assertEquals(emptySet<String>(), coord.latest.value?.draft)
+            // 例外自由不變量：Written 終態同樣必帶 outcome（ref 先於 deferred complete 設定）。
+            assertEquals(0L, vmB.repairOutcomeMissingCount.get())
+            assertNull(activeTxOf(vmB))
             assertNull(coordinatorTxOf(coord))
         } finally {
             try {
