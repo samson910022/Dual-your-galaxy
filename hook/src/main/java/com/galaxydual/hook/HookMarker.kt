@@ -14,7 +14,9 @@ import java.util.concurrent.atomic.AtomicLong
 // Cross-process signal WITHOUT any IPC dependency: after DualHook installs at
 // least one hook in system_server (scope "system_server") or in the daagent
 // process (scope "daagent"), it best-effort writes this marker file so the
-// app UI can show "LSPosed Hook: active (scopes)" vs "not detected". The app
+// app UI can show "LSPosed Hook: active (scopes)" vs "not detected" (today the
+// app renders four states — see app HookDiagnosis/displayText: absence-only
+// yields 未偵測到, unreadable yields 狀態未知). The app
 // side reads it via HookStateProvider (which reuses parseScopes below, so
 // writer and reader can never disagree on the format).
 //
@@ -89,7 +91,8 @@ import java.util.concurrent.atomic.AtomicLong
 //   it is deliberately NOT implemented here (no fake freshness).
 // - SELinux: whether the app uid can directly read any of the paths on a
 //   given ROM is unverified (a direct read is likely denied); an unreadable
-//   file reads as "not detected", never as active. When a SHELL/ROOT channel
+//   file reads as inactive under the legacy two-state view (the four-state
+//   diagnosis surfaces 狀態未知 instead), never as active. When a SHELL/ROOT channel
 //   is ready the app additionally retries via `cat` over the gateway (see
 //   HookStateProvider.readHookStateWithGateway); that path is equally
 //   unverified on-device.
@@ -316,7 +319,8 @@ object HookMarker {
     }
 
     // Best-effort read: missing/unreadable/garbage files -> emptySet()
-    // (caller maps that to "not detected"). Reads the given files (default:
+    // (legacy callers map the union to "not detected"; the four-state
+    // diagnosis shows 狀態未知 instead). Reads the given files (default:
     // the six production paths — per-scope primary ×2, per-scope fallback ×2,
     // legacy single-file ×2) and returns the UNION, so a scope recorded via
     // any write path is honored. Garbage/unreadable files are ignored.
@@ -346,7 +350,9 @@ object HookMarker {
 
     // Null when the file is absent or unreadable (SELinux denial included);
     // never throws. Silent by design (readScopes/diagnose paths treat an
-    // unreadable file as "not detected", never as active, never as an error).
+    // unreadable file as unreadable — legacy unions render it as "not
+    // detected", the four-state diagnosis shows 狀態未知; never as active,
+    // never as an error).
     // Bounded read: reads at most MAX_MARKER_BYTES + 1 bytes from the stream
     // via a plain read(2)-style loop (works on every Android API level; no
     // InputStream.readNBytes, which is only API 33+) and decodes only the
@@ -388,10 +394,11 @@ object HookMarker {
     // sticky-bit EPERM when the fallback path is a pre-planted attacker-owned
     // symlink in the 1777 /data/local/tmp), there is NO fall-through to a
     // direct write: the tmp is deleted, the refusal is logged, and false is
-    // returned. rename-refusal ⇒ marker unwritten ⇒ "not detected" — the
-    // marker is best-effort by contract and a missing marker reads as
-    // "not detected" (fail-closed; never worse than the on-device EACCES
-    // reality). The former non-atomic direct write (file.writeText, which
+    // returned. rename-refusal ⇒ marker unwritten. The marker is
+    // best-effort by contract; an unwritten marker can surface as 未偵測到
+    // only under positively-checked absence (docs/HOOK.md §1.5 four-state
+    // rule — EACCES paths show 狀態未知 instead). Never worse than the
+    // on-device EACCES reality. The former non-atomic direct write (file.writeText, which
     // follows symlinks and would truncate the symlink target with
     // system_server/daagent privileges) no longer exists.
     // CR-N3: a process that dies between the tmp write and the rename leaves
@@ -414,7 +421,8 @@ object HookMarker {
     // its own tmp age past the staleness window and be swept by another
     // process's call. The rename then fails and the write is REFUSED (no
     // direct-write fallback — see above): the marker is unwritten and reads
-    // as "not detected" (fail-closed). Fail-soft: the target file itself is
+    // stays unwritten ( absence must be positively verified before anything
+    // other than 狀態未知 is displayed — four-state rule). Fail-soft: the target file itself is
     // never deleted or truncated by the sweep — no target data loss.
     private const val ORPHAN_TMP_SWEEP_MAX = 16
     private const val ORPHAN_TMP_STALE_MS = 60_000L
@@ -501,7 +509,8 @@ object HookMarker {
                 // TRUNCATE the symlink target with system_server/daagent
                 // privileges. Fail closed instead: delete the tmp (finally
                 // block), log, return false. The marker is best-effort; a
-                // missing marker reads as "not detected".
+                // missing marker can surface as 未偵測到 only under
+                // positively-verified absence (four-state rule).
                 safeLog(onLog, "rename refused for ${file.name}; marker unwritten (fail-closed)")
                 return false
             }

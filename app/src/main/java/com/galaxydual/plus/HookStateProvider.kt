@@ -38,8 +38,9 @@
 //     garbage output, throwing gateway, NONE privilege) maps to "not
 //     detected", never to active, and never throws for ordinary failures --
 //     except a CancellationException, which propagates (cooperative
-//     cancellation is never squashed here: every legacy catch rethrows CE
-//     before its Throwable arm).
+//     cancellation is never squashed here: the legacy readers and gateway
+//     reads rethrow CE ahead of their Throwable arms; the one non-suspend
+//     leaf helper, readTextOrNull, cannot receive a CE at all).
 //  Both legacy readers are DEPRECATED: they conflate unreadable / absent /
 //  malformed (all inactive), so their INACTIVE must never be used as negative
 //  evidence. Production (DualViewModel.probeChannels) reads via
@@ -121,7 +122,9 @@ private fun firstScopesRaw(raws: List<String?>): String? =
 // unioned via the shared parser. Missing, unreadable, or unparseable files
 // yield inactive. Never throws: every failure mode maps to
 // HookState(active=false) -- except CancellationException, which propagates
-// (this reader suspends, and CE is rethrown end-to-end).
+// (readHookState itself is non-suspend, so this body cannot receive a CE; its
+// catch arms are CE-correct by construction -- the plain catch-alls can only
+// swallow ordinary throwables, never a CE that cannot arise here).
 // The markerFiles parameter exists so JVM tests can point at temp files;
 // production always uses the default six. No gateway is consulted here:
 // for the gateway-`cat` fallback see readHookStateWithGateway.
@@ -394,8 +397,10 @@ private fun readMarkerTextNio(file: File): String {
     // Absence is POSITIVE evidence only when checked with the same NOFOLLOW
     // semantics: notExists(NOFOLLOW) is true exclusively for a missing link;
     // a symlink to a missing target still "exists" and falls through to the
-    // not-regular refusal below. A stat that itself fails still throws, and
-    // readDirectMarker maps it to Denied (fail-closed, never abs).
+    // not-regular refusal below. When existence is undetermined (stat denied),
+    // Files.notExists returns false and the not-regular refusal below fires
+    // (Denied, fail-closed, never absence). Only SecurityException exits
+    // notExists itself by throwing, and readDirectMarker maps it to Denied.
     if (Files.notExists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
         throw NoSuchFileException(file.path)
     }
