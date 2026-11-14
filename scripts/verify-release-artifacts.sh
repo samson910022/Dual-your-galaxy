@@ -47,9 +47,10 @@ for apk in "$@"; do
   fi
 
   # 1b. Packaged manifest provisions exactly one GuardXposedProvider and ZERO
-  #     references to the libxposed service XposedProvider. aapt2 dump text is
-  #     grepped name-wise (a provider's android:name appears exactly once per
-  #     provider node). Loud hard-fail, never a skip: CI has the SDK, and a
+  #     references to the libxposed service XposedProvider. The name count
+  #     below matches only the interpreted `name(...)="FQN"` attribute line
+  #     (exactly one per provider node); the accompanying Raw duplicate on
+  #     the same attribute does not match this pattern. Loud hard-fail, never a skip: CI has the SDK, and a
   #     silent pass here would mask a manifest-merge regression shipping the
   #     unguarded (exported, no-permission) provider. Variant handling: PR CI
   #     invokes this on the debug APK (debug applicationIdSuffix=.debug), so the
@@ -63,7 +64,9 @@ for apk in "$@"; do
   if [ -z "$MANIFEST_DUMP" ]; then
     fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
   fi
-  guard_nodes="$(printf '%s\n' "$MANIFEST_DUMP" | grep -o 'GuardXposedProvider' | wc -l | tr -d ' ' || true)"
+  # aapt2 prints each attribute twice (interpreted + Raw), so count only the
+  # interpreted `name(...)="FQN"` lines: exactly one per provider node.
+  guard_nodes="$(printf '%s\n' "$MANIFEST_DUMP" | grep -oE 'name\([^)]*\)="com\.galaxydual\.plus\.GuardXposedProvider"' | wc -l | tr -d ' ' || true)"
   if [ "${guard_nodes:-0}" -ne 1 ]; then
     fail "expected exactly one GuardXposedProvider node in packaged manifest of $apk, found ${guard_nodes:-0}"
   fi
