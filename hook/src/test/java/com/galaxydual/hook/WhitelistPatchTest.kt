@@ -264,85 +264,112 @@ class WhitelistPatchTest {
     }
 
     // Wrong-end removeAt: removeAt(i) removes the element at backing.size - 1 - i.
-    // add() appends-then-throws. The (b) suffix drop then eats original
-    // entries, the prefix verification must catch it, and the
-    // clear()+addAll(snapshot) fallback restores the originals.
-    // (P3 ISSUE 4: verify-fail fallback coverage.)
+    // add() appends-then-throws. The ours-drop (subList(size0, size).clear(),
+    // via removeRange → wrong-end removeAt) eats an ORIGINAL entry; the
+    // re-verify must catch it, and NO whole-list restore runs (prefix-intact
+    // entry, failed drop → no further mutator invoked; the list is left as
+    // the drop left it).
+    // (P3 ISSUE 4: verify-fail coverage. NEW contract.)
     private class WrongEndRemoveList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
+        var cleared = 0
         override val size: Int get() = backing.size
         override fun get(index: Int): String = backing[index]
         override fun set(index: Int, element: String): String = backing.set(index, element)
         override fun add(index: Int, element: String) {
             backing.add(index, element)
-            // Refuse only the patch extras, so the fallback re-add of the
-            // snapshot succeeds; the patch's own addAll then throws midway.
+            // Refuse only the patch extras, so a hypothetical restore re-add
+            // of the snapshot would succeed; the patch's own addAll throws midway.
             if (element != "a" && element != "z") throw IllegalStateException("add refused")
         }
         override fun removeAt(index: Int): String =
             backing.removeAt(backing.size - 1 - index)
         override fun clear() {
+            cleared++
             backing.clear()
         }
     }
 
     @Test
-    fun wrongEndRemoveAtIsCaughtByVerificationAndRestoredByFallback() {
+    fun wrongEndRemoveAtFailedDropInvokesNoMutator() {
         val list = WrongEndRemoveList(mutableListOf("a", "z"))
         val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
-        assertEquals(listOf("a", "z"), list)
         val o = out as WhitelistPatch.Outcome.Skipped
+        // The wrong-end drop ate the original 'a' (backing was [a, z, b],
+        // drop of index 2 removed index 0); re-verification failed, so NO
+        // further mutator runs — the whole-list restore is refused on this
+        // prefix-intact entry. The list is left as the drop left it.
+        assertEquals(listOf("z", "b"), list)
+        assertEquals(0, list.cleared)
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(
+            "reason should carry the honest dropFailedOutcome marker (originals may be lost / no further mutator invoked), was: ${o.reason}",
+            o.reason.contains("originals may be lost") && o.reason.contains("no further mutator invoked"),
+        )
         assertTrue(!o.reason.contains("last-restore failed"))
         assertTrue(!o.reason.contains("restore unverified"))
         assertTrue(!o.reason.contains("restore incomplete"))
     }
 
-    // Wrong-end removeAt AND a clear() that throws: the verification still
-    // fails, the fallback itself then throws, and the swallow must keep
-    // apply() fail-closed — Skipped is returned, no exception escapes.
-    // (Narrowed promise: list contents are not asserted here.)
+    // Wrong-end removeAt AND a clear() that throws: the ours-drop corrupts
+    // the list (wrong-end removeAt), the re-verify fails, and NO whole-list
+    // restore runs — so the throwing clear() is never invoked and the
+    // swallow contract still keeps apply() fail-closed (Skipped, no
+    // exception escapes). NEW contract.
     private class WrongEndClearThrowsList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
+        var clearCalls = 0
         override val size: Int get() = backing.size
         override fun get(index: Int): String = backing[index]
         override fun set(index: Int, element: String): String = backing.set(index, element)
         override fun add(index: Int, element: String) {
             backing.add(index, element)
-            // Refuses patch extras (throws after the append). In THIS fixture
-            // the fallback's re-add is never reached: clear() throws first
-            // and is swallowed — the fixture pins the no-escape contract.
+            // Refuses patch extras (throws after the append). The restore is
+            // never reached under the new contract: the failed ours-drop
+            // routes to the no-mutator Skipped, so clear() must not run.
             if (element != "a" && element != "z") throw IllegalStateException("add refused")
         }
         override fun removeAt(index: Int): String =
             backing.removeAt(backing.size - 1 - index)
         override fun clear() {
+            clearCalls++
             throw IllegalStateException("clear refused")
         }
     }
 
     @Test
-    fun wrongEndRemoveAtWithThrowingClearReturnsSkippedWithoutEscaping() {
+    fun wrongEndRemoveAtFailedDropNeverReachesThrowingClear() {
         val list = WrongEndClearThrowsList(mutableListOf("a", "z"))
         val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
         val o = out as WhitelistPatch.Outcome.Skipped
         assertTrue(
-            "reason should report the failed last-resort restore, was: ${o.reason}",
-            o.reason.contains("last-restore failed"),
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
         )
+        // The failing ours-drop must NOT escalate to the whole-list restore:
+        // the throwing clear() is never invoked.
+        assertEquals(0, list.clearCalls)
+        assertTrue(!o.reason.contains("last-restore failed"))
     }
 
     // Detached-view subList: subList() returns a defensive copy, so the
-    // (b) suffix drop clears the copy and leaves the live list untouched —
-    // the prefix verification must catch size != size0 and the
-    // clear()+addAll(snapshot) fallback restores the originals.
-    // (add() refuses only the patch extras, so the fallback re-add succeeds.)
+    // ours-drop clears the copy and leaves the live list holding ours.
+    // The re-verify catches the size not shrinking, and NO whole-list
+    // restore runs (prefix-intact entry, failed drop → no further mutator
+    // invoked). add() refuses only the patch extras, so a hypothetical
+    // restore re-add of the snapshot would succeed — it must not run.
+    // NEW contract.
     private class DetachedSubListList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
+        var cleared = 0
         override val size: Int get() = backing.size
         override fun get(index: Int): String = backing[index]
         override fun set(index: Int, element: String): String = backing.set(index, element)
@@ -354,27 +381,35 @@ class WhitelistPatchTest {
         override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> =
             ArrayList(backing.subList(fromIndex, toIndex))
         override fun clear() {
+            cleared++
             backing.clear()
         }
     }
 
     @Test
-    fun detachedSubListIsCaughtByVerificationAndRestoredByFallback() {
+    fun detachedSubListRefusedDropInvokesNoRestore() {
         val list = DetachedSubListList(mutableListOf("a", "z"))
         val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
-        assertEquals(listOf("a", "z"), list)
         val o = out as WhitelistPatch.Outcome.Skipped
+        // The detached subList swallowed the ours-drop; the live list keeps
+        // ours; the re-verify fails; no further mutator runs.
+        assertEquals(listOf("a", "z", "b"), list)
+        assertEquals(0, list.cleared)
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
         assertTrue(!o.reason.contains("last-restore failed"))
         assertTrue(!o.reason.contains("restore unverified"))
         assertTrue(!o.reason.contains("restore incomplete"))
     }
 
-    // subList() throws instead of returning a view: the (b) suffix drop then
-    // throws and is swallowed, the prefix verification fails (size 3 != 2),
-    // and the clear()+addAll(snapshot) fallback restores the originals.
-    // add() appends-then-throws for the patch extras only, so the fallback
-    // re-add of the snapshot succeeds (size/get/set/removeAt passthrough).
+    // subList() throws instead of returning a view: the ours-drop throws and
+    // is swallowed, the re-verify fails (size unchanged), and NO whole-list
+    // restore runs — clear() is never invoked. add() appends-then-throws for
+    // the patch extras only, so a hypothetical restore re-add of the
+    // snapshot would succeed — it must not run. NEW contract.
     private class SubListThrowsList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
@@ -398,25 +433,34 @@ class WhitelistPatchTest {
     }
 
     @Test
-    fun subListThrowsFallsBackToClearRestore() {
+    fun subListThrowsDropFailsAndNoRestoreRuns() {
         val list = SubListThrowsList(mutableListOf("a", "z"))
         val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
-        assertEquals(listOf("a", "z"), list)
-        assertEquals(1, list.cleared)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // The subList() threw; the ours-drop never landed; the live list
+        // keeps ours; the re-verify fails; no further mutator runs.
+        assertEquals(listOf("a", "z", "b"), list)
+        assertEquals(0, list.cleared)
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore unverified"))
+        assertTrue(!o.reason.contains("restore incomplete"))
     }
 
     // Detached-view subList AND a restore that keeps only the FIRST snapshot
     // element: the patch's addAll lands the extra then throws (arm (b)); the
-    // suffix drop clears the detached copy, so the live list keeps the
-    // extras (the "refused drop"); verification fails; the fallback clear()
-    // works, but addAll(snapshot) keeps only the first snapshot element and
-    // returns true; the re-verify must report the kept prefix with
-    // "kept 1 of 2 original entries".
+    // ours-drop clears the detached copy, so the live list keeps the
+    // extras; the re-verify must fail — and NO whole-list restore runs
+    // (prefix-intact entry, failed drop → no further mutator invoked).
     private class DetachedSubListPrefixKeepList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
         private var calls = 0
+        var cleared = 0
         override val size: Int get() = backing.size
         override fun get(index: Int): String = backing[index]
         override fun set(index: Int, element: String): String = backing.set(index, element)
@@ -431,6 +475,7 @@ class WhitelistPatchTest {
         override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> =
             ArrayList(backing.subList(fromIndex, toIndex))
         override fun clear() {
+            cleared++
             backing.clear()
         }
         override fun addAll(elements: Collection<String>): Boolean {
@@ -438,7 +483,9 @@ class WhitelistPatchTest {
             // First call is the patch's addAll: apply (partially) and throw
             // via the default addAll path, landing in arm (b).
             if (calls == 1) return super.addAll(elements)
-            // Fallback re-add: keep only the FIRST snapshot element, return true.
+            // Hypothetical restore re-add: keep only the FIRST snapshot
+            // element, return true. Under the new contract this must run
+            // ZERO times (no whole-list restore on a prefix-intact entry).
             val it = elements.iterator()
             if (it.hasNext()) add(it.next())
             return true
@@ -446,17 +493,24 @@ class WhitelistPatchTest {
     }
 
     @Test
-    fun detachedSubListRestoreKeepingOnlyPrefixReportsIncomplete() {
+    fun detachedSubListRefusedDropKeepsListAndNoRestoreRuns() {
         val list = DetachedSubListPrefixKeepList(mutableListOf("com.a", "com.b"))
         val out = WhitelistPatch.apply(list, true, setOf("com.example.extra"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
         assertTrue("must not report success; was: $out", out !is WhitelistPatch.Outcome.PatchedInPlace)
         val o = out as WhitelistPatch.Outcome.Skipped
-        assertEquals(listOf("com.a"), list)
+        // The detached subList swallowed the ours-drop; the live list keeps
+        // ours; the re-verify fails; no further mutator runs — the prefix-
+        // keeping restore must NOT run.
+        assertEquals(listOf("com.a", "com.b", "com.example.extra"), list)
+        assertEquals(0, list.cleared)
         assertTrue(
-            "reason should report the kept prefix, was: ${o.reason}",
-            o.reason.contains("restore incomplete (kept 1 of 2"),
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
         )
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+        assertTrue(!o.reason.contains("last-restore failed"))
     }
 
     // size read throws: the pre-mutation guard must fail closed to Skipped
@@ -521,14 +575,17 @@ class WhitelistPatchTest {
     }
 
     // get() throws during the prefix verification (size stays readable and
-    // consistent): the two-tier rollback's outer catch must count that as
-    // verify-fail and fall back to clear()+addAll(snapshot), preserving the
-    // originals. add() appends-then-throws for the patch extras only.
-    // (ISSUE-3-b: the throwing-verification arm.)
+    // consistent): the unified ownership-contract settle sees an unreadable
+    // list at its entry probe (matchesPrefixLen returns -1) and must invoke
+    // NO mutator at all — the list is left exactly as addAll left it. (add()
+    // appends-then-throws for the patch extras only. ISSUE-3-b: the
+    // throwing-verification arm. NEW contract: no whole-list restore runs
+    // on an unreadable list — that was the H-A fail-open.)
     private class VerifyGetThrowsList(
         private val backing: MutableList<String>,
     ) : AbstractMutableList<String>() {
         private var mutating = false
+        var cleared = 0
         override val size: Int get() = backing.size
         override fun get(index: Int): String {
             // Throw only once mutation of the live list could have begun
@@ -544,23 +601,32 @@ class WhitelistPatchTest {
         }
         override fun removeAt(index: Int): String = backing.removeAt(index)
         override fun clear() {
+            cleared++
             backing.clear()
         }
     }
 
     @Test
-    fun getThrowingDuringVerificationFallsBackAndPreservesOriginals() {
+    fun getThrowingDuringVerificationInvokesNoMutator() {
         val backing = mutableListOf("a", "z")
         val list = VerifyGetThrowsList(backing)
         val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
         val o = out as WhitelistPatch.Outcome.Skipped
         assertTrue(
-            "reason should mention the unverifiable restore, was: ${o.reason}",
-            o.reason.contains("restore unverified"),
+            "reason should report the unverifiable list, was: ${o.reason}",
+            o.reason.contains("verification could not read the list (get threw)"),
+        )
+        assertTrue(
+            "reason should report no mutator invoked, was: ${o.reason}",
+            o.reason.contains("no mutator invoked"),
         )
         // Assert against the backing (the hostile list's get() throws).
-        assertEquals(listOf("a", "z"), backing)
+        assertEquals(listOf("a", "z", "b"), backing)
+        assertEquals(0, list.cleared)
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore unverified"))
+        assertTrue(!o.reason.contains("restore incomplete"))
     }
 
     @Test
@@ -735,13 +801,16 @@ class WhitelistPatchTest {
 
     // Patch addAll super-appends the real delta and THEN appends hostile
     // junk after it, and returns true. Stateful: only the FIRST addAll call
-    // mangles; the fallback's re-add behaves normally so the restore can
-    // succeed. The post-success verification's size leg (4 != 2 + 1) fails;
-    // the prefix leg passes (first 2 entries untouched) and the suffix leg
-    // passes (element at index 2 == the delta; the out-of-bounds index 3 is
-    // never read) — only the size leg catches this fixture. That is what
-    // makes this fixture unique: deleting the size leg from the post-success
-    // check flips this scenario to a false PatchedInPlace(1).
+    // mangles; subsequent calls behave normally. The post-success
+    // verification's size leg fails (4 != 2 + 1) — the post-success
+    // ok-expression never reads index 3 (its legs are size/prefix/full
+    // delta). At settle time the suffix probe (index 3 == "com.hostile.tail",
+    // not the delta) fails and the front-aligned probe (index 2 == the
+    // delta) passes — ours dropped, foreign tail retained. That is what makes
+    // this fixture unique: deleting the size leg from the post-success
+    // check flips this scenario to a false PatchedInPlace(1). NEW contract
+    // (ownership-drop arm): the ours delta is front-aligned at the snapshot
+    // boundary, so ONLY it is dropped; the foreign tail survives.
     private class TrailingJunkAfterDeltaList(contents: Collection<String>) : ArrayList<String>(contents) {
         private var first = true
         override fun addAll(elements: Collection<String>): Boolean {
@@ -756,22 +825,34 @@ class WhitelistPatchTest {
     }
 
     @Test
-    fun trailingJunkAfterDeltaIsCaughtAndRestored() {
+    fun trailingForeignSuffixIsRetainedWithOursDropped() {
         val list = TrailingJunkAfterDeltaList(listOf("com.samsung.seed", "com.samsung.region"))
         val out = WhitelistPatch.apply(list, true, setOf("com.example.extra"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
         assertTrue("must not report success; was: $out", out !is WhitelistPatch.Outcome.PatchedInPlace)
-        assertEquals(listOf("com.samsung.seed", "com.samsung.region"), list)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // NEW contract: ours (front-aligned at the snapshot boundary) are
+        // rolled back; the foreign tail after them is RETAINED.
+        assertEquals(listOf("com.samsung.seed", "com.samsung.region", "com.hostile.tail"), list)
+        assertTrue(
+            "reason should report ours rolled back with the foreign tail retained, was: ${o.reason}",
+            o.reason.contains("appended-ours") && o.reason.contains("foreign entries retained"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore unverified"))
+        assertTrue(!o.reason.contains("restore incomplete"))
     }
 
     // Patch addAll appends hostile junk at the tail instead of the real
-    // delta, and returns true. Stateful: only the FIRST addAll call mangles;
-    // the fallback's re-add behaves normally so the restore can succeed.
+    // delta, and returns true. Stateful: only the FIRST addAll call mangles.
     // The post-success verification's size leg (3 == 2 + 1) and prefix leg
     // both PASS — only the suffix leg fails (element at index 2 ==
     // "com.hostile.fake", not the delta). That is what makes this fixture
     // unique: deleting the suffix leg from the post-success check flips this
-    // scenario to a false PatchedInPlace(1).
+    // scenario to a false PatchedInPlace(1). NEW contract: prefix intact,
+    // ours NOT locatable (addAll appended non-ours bytes) — NO mutator runs,
+    // the junk tail is left in place (no whole-list restore on a
+    // prefix-intact path).
     private class WrongSuffixDeltaList(contents: Collection<String>) : ArrayList<String>(contents) {
         private var first = true
         override fun addAll(elements: Collection<String>): Boolean {
@@ -785,12 +866,26 @@ class WhitelistPatchTest {
     }
 
     @Test
-    fun wrongSuffixDeltaIsCaughtAndRestored() {
+    fun wrongSuffixDeltaIsNotRestoredAndForeignJunkRetained() {
         val list = WrongSuffixDeltaList(listOf("com.samsung.seed", "com.samsung.region"))
         val out = WhitelistPatch.apply(list, true, setOf("com.example.extra"), "F", "C")
         assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
         assertTrue("must not report success; was: $out", out !is WhitelistPatch.Outcome.PatchedInPlace)
-        assertEquals(listOf("com.samsung.seed", "com.samsung.region"), list)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // NEW contract: ours are not locatable anywhere in the tail, so NO
+        // mutator runs and the list keeps exactly what addAll left there.
+        assertEquals(listOf("com.samsung.seed", "com.samsung.region", "com.hostile.fake"), list)
+        assertTrue(
+            "reason should report ours could not be located, was: ${o.reason}",
+            o.reason.contains("could not be located"),
+        )
+        assertTrue(
+            "reason should report no mutator invoked, was: ${o.reason}",
+            o.reason.contains("no mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore unverified"))
+        assertTrue(!o.reason.contains("restore incomplete"))
     }
 
     // Post-success mirror of VerifyGetThrowsList: add() is the same
@@ -1113,6 +1208,120 @@ class WhitelistPatchTest {
         assertTrue(!o.reason.contains("restore unverified"))
     }
 
+    // Like PoisonSizeList, but size() reports a negative garbage value from
+    // then on (never throws) while get() stays readable. isEmpty()/iterator()
+    // are pinned so nothing before the throw-arm trips on the size read
+    // prematurely (size is read at the pre-mutation guard BEFORE the patch's
+    // addAll runs, while the list is still healthy — the stateful fixture
+    // presents 2 until addAll is called, then -1 forever). The addAll
+    // override throws WITHOUT appending anything and arms the garbage-size
+    // state, so the settle path is reached with size reporting -1: a
+    // negative size is indeterminate garbage — it must never be treated as
+    // a readable short list (which would mis-route into the prefix-damaged
+    // restore arm and clear() the originals), and must land in the
+    // no-mutator Skipped arm.
+    private class NegativeGarbageSizeList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        private var armed = false
+        var cleared = 0
+        var addAllCalls = 0
+        var subListCalls = 0
+        override val size: Int
+            get() {
+                if (armed) return -1
+                return backing.size
+            }
+        override fun isEmpty(): Boolean = backing.isEmpty()
+        override fun iterator(): MutableIterator<String> = backing.iterator()
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            armed = true
+            throw IllegalStateException("addAll refused without appending")
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun negativeGarbageSizeRoutesToNoMutatorAndPreservesOriginals() {
+        val backing = mutableListOf("a", "b")
+        val list = NegativeGarbageSizeList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("c"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report the unreadable list size, was: ${o.reason}",
+            o.reason.contains("verification could not read the list size"),
+        )
+        assertTrue(
+            "reason should report no mutator invoked, was: ${o.reason}",
+            o.reason.contains("no mutator invoked"),
+        )
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertEquals(0, list.subListCalls)
+        assertEquals(listOf("a", "b"), backing)
+    }
+
+    // Like NegativeGarbageSizeList, but size() reports a negative garbage
+    // value at ALL times (no arming/state flags) — the pre-mutation guard
+    // must fail closed on the FIRST size read, before the union snapshot is
+    // even computed and long before addAll is reached. addAll would return
+    // true having landed nothing, so it must never be reached: a negative
+    // size0 is not a readable empty list (`(0 until -1).all{}` would be
+    // vacuously true) and must skip before any mutator runs.
+    private class NegativeFromFirstReadList(
+        initial: List<String>,
+    ) : ArrayList<String>(initial) {
+        var cleared = 0
+        var addAllCalls = 0
+        var subListCalls = 0
+        override val size: Int
+            get() = -1
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            return true
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            super.clear()
+        }
+    }
+
+    @Test
+    fun negativeSizeFromFirstReadRoutesToNoMutator() {
+        val backing = mutableListOf("a", "b")
+        val list = NegativeFromFirstReadList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("c"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report the failed list size read, was: ${o.reason}",
+            o.reason.contains("failed to read list size"),
+        )
+        assertEquals(0, list.addAllCalls)
+        assertEquals(0, list.cleared)
+        assertEquals(0, list.subListCalls)
+        assertEquals(listOf("a", "b"), backing)
+    }
+
     // Patch addAll seeds a FOREIGN entry BEFORE applying the real delta and
     // returns true: backing becomes [seed, region, foreign, alpha, beta]
     // (5 elements — both originals, the foreign entry, then ours). The
@@ -1306,5 +1515,253 @@ class WhitelistPatchTest {
             listOf("com.samsung.seed", "com.samsung.region", "com.foreign.entry"),
             backing,
         )
+    }
+
+    // Hostile list whose addAll throws BEFORE mutating (the live list is
+    // untouched) and whose get() throws from then on, with size() still
+    // readable — the unreadable branch of the unified ownership-contract
+    // settle is reached via matchesPrefixLen returning -1. The restore
+    // (clear()+addAll(snapshot)) would throw on this fixture if it were
+    // ever attempted; clear() is counted so the test can pin ZERO mutator
+    // invocations beyond the original addAll.
+    private class PoisonAddAllThrowsBeforeMutatingList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        private var armed = false
+        var cleared = 0
+        var addAllCalls = 0
+        var subListCalls = 0
+        override val size: Int get() = backing.size
+        override fun isEmpty(): Boolean = backing.isEmpty()
+        override fun iterator(): MutableIterator<String> = backing.iterator()
+        override fun get(index: Int): String {
+            if (armed) throw IllegalStateException("get refused")
+            return backing[index]
+        }
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            armed = true
+            throw IllegalStateException("addAll refused before mutating")
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun throwArmHostileUnreadableListInvokesNoMutatorAndPreservesOriginals() {
+        val backing = mutableListOf("com.samsung.seed", "com.samsung.region")
+        val list = PoisonAddAllThrowsBeforeMutatingList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("b"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        assertTrue("must not report success; was: $out", out !is WhitelistPatch.Outcome.PatchedInPlace)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report the unverifiable list, was: ${o.reason}",
+            o.reason.contains("verification could not read the list (get threw)"),
+        )
+        assertTrue(
+            "reason should report no mutator invoked, was: ${o.reason}",
+            o.reason.contains("no mutator invoked"),
+        )
+        // The restore path (clear()+addAll(snapshot)) must NOT run — the
+        // verification reads are unverifiable, so no mutator may be invoked.
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertEquals(0, list.subListCalls)
+        assertEquals(listOf("com.samsung.seed", "com.samsung.region"), backing)
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
+    // Hostile list whose addAll lands EXACTLY ONE delta element and then
+    // throws (the landed-prefix case: extra == 1 < add.size). The
+    // ownership check must prove the landed entry is ours (matchesRange
+    // front-aligned at size0) and roll back ONLY it; the originals stay
+    // byte-for-byte and the whole-list clear() never runs.
+    private class PartialAppendThenThrowList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        private var addAllCalls = 0
+        var cleared = 0
+        var subListCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.add("com.example.alpha") // land exactly one delta element
+                throw IllegalStateException("addAll refused after a partial append")
+            }
+            return backing.addAll(elements)
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun partialAppendThenThrowRollsBackOnlyLandedPrefix() {
+        val backing = mutableListOf("com.samsung.seed", "com.samsung.region")
+        val list = PartialAppendThenThrowList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report the partial roll-back, was: ${o.reason}",
+            o.reason.contains("partially appended ours rolled back"),
+        )
+        // Originals intact byte-for-byte; the landed delta element dropped.
+        assertEquals(listOf("com.samsung.seed", "com.samsung.region"), backing)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.subListCalls)
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
+    // Hostile list whose addAll interleaves ours and foreign entries and
+    // then throws: [originals, ours1, foreign, ours2]. Ours are NOT
+    // locatable as a contiguous ownable range (suffix fails, front-aligned
+    // fails on the foreign at size0+1, extra == add.size so the landed
+    // prefix arm does not apply), so NO mutator runs — the list is left
+    // exactly as addAll left it.
+    private class InterleavedOursThrowList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        private var addAllCalls = 0
+        var cleared = 0
+        var subListCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.add("com.example.alpha") // ours
+                backing.add("com.foreign.entry") // foreign, threaded between ours
+                backing.add("com.example.beta")  // ours
+                throw IllegalStateException("addAll refused after interleaving ours and foreign")
+            }
+            return backing.addAll(elements)
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun interleavedOursAndForeignInThrowArmInvokesNoMutator() {
+        val backing = mutableListOf("com.samsung.seed", "com.samsung.region")
+        val list = InterleavedOursThrowList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report ours could not be located, was: ${o.reason}",
+            o.reason.contains("could not be located"),
+        )
+        assertTrue(
+            "reason should report no mutator invoked, was: ${o.reason}",
+            o.reason.contains("no mutator invoked"),
+        )
+        // clear() must NOT run and the list is left exactly as addAll left it.
+        assertEquals(0, list.cleared)
+        assertEquals(0, list.subListCalls)
+        assertEquals(
+            listOf(
+                "com.samsung.seed",
+                "com.samsung.region",
+                "com.example.alpha",
+                "com.foreign.entry",
+                "com.example.beta",
+            ),
+            backing,
+        )
+    }
+
+    // Normal-return arm, front-aligned mixed case: addAll appends the delta
+    // and THEN a foreign entry and returns true:
+    // [seed, region, extra, com.foreign.entry]. Post-success verification
+    // fails on the size leg (4 != 2 + 1); the suffix check mismatches
+    // (tail is the foreign entry); the ours entry is FRONT-ALIGNED at the
+    // snapshot boundary, so ONLY it is dropped; the foreign entry at the
+    // very end is retained.
+    private class FrontAlignedMixedForeignList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        var cleared = 0
+        var subListCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            backing.addAll(elements)
+            backing.add("com.foreign.entry") // foreign AFTER ours
+            return true
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            return super.subList(fromIndex, toIndex)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun frontAlignedOursWithForeignAfterDropsOnlyOursInNormalReturnArm() {
+        val backing = mutableListOf("com.samsung.seed", "com.samsung.region")
+        val list = FrontAlignedMixedForeignList(backing)
+        val out = WhitelistPatch.apply(list, true, setOf("com.example.extra"), "F", "C")
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        assertTrue(
+            "reason should report ours rolled back with the foreign entry retained, was: ${o.reason}",
+            o.reason.contains("appended-ours") && o.reason.contains("foreign entries retained"),
+        )
+        // Ours was dropped; the foreign entry at the very end survives.
+        assertEquals(listOf("com.samsung.seed", "com.samsung.region", "com.foreign.entry"), backing)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.subListCalls)
     }
 }

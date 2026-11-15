@@ -18,8 +18,11 @@ import java.lang.reflect.Modifier
 // Fail-closed rule: anything unrecognized (non-static, null, immutable,
 // wrong element type) returns Skipped and the original whitelist is left
 // untouched -- equivalent to the hook not existing.
-// (exception: the narrowed promise below — a wholly-hostile list may stay
-// dirty after the last-resort restore)
+// (exception: the narrowed promise below — an unreadable list is left dirty by
+// design, a prefix-intact ours-drop that fails its re-verify never whole-list
+// restores (the drop's damage stands, foreign entries are retained by design),
+// and the prefix-damaged last-resort restore itself may fail or keep
+// only a prefix of the snapshot)
 //
 // Static-final bypass evaluation (Stage1, S24 OneUI 9): the ROM holder
 // declares `static final String[]`, so plain Field.set() cannot reassign
@@ -34,81 +37,117 @@ import java.lang.reflect.Modifier
 //
 // Copy-on-write promise (list case): the union is fully computed on a plain
 // ArrayList copy; the live list sees at most a bounded sequence of mutating
-// calls (addAll, suffix drop, last-resort clear()+addAll). If
-// that call throws after a partial append (hostile AbstractMutableList), we
-// roll back in two tiers and verify before returning: first drop exactly our
-// appended suffix — ownership-checked: the tail must byte-match the delta
-// (either the landed prefix of it, or its trailing entries at the very end),
-// otherwise the drop is skipped entirely; then verify the list is
-// back to the original size with every original element at its original
-// index; only on verification failure (or a throwing verification) do we
-// last-resort to clear() + addAll(snapshot) -- itself best-effort, and it may
-// itself keep only a prefix of the snapshot. The restore is now RE-VERIFIED
-// with explicit failure vocabulary: a normally-returning no-op restore is NOT
-// proof of success, so after clear()+addAll(snapshot) completes we re-check
-// byte-for-byte and the Skipped reason carries one of the explicit markers
-// ("; restore incomplete (kept N of M original entries)" when the re-verify
-// mismatches, "; restore unverified" when the re-verify read throws,
-// "; last-restore failed" when the restore itself threw). If verification
-// fails but the live list is byte-for-byte the snapshot (an unmodified-list
-// early return), Skipped is returned with NO mutator invoked at all -- no
-// clear(), no addAll. Narrowed guarantee for an
-// extreme list whose clear/addAll ALSO throw during that last resort: union
-// was computed on a copy and the live list got only a single addAll -- it
-// may stay dirty. That class cannot be made atomic through the in-place
-// MutableList API. A list whose `size` read itself throws fails closed to
-// Skipped BEFORE any mutation is attempted.
-// Hostile-addAll cases after the post-success verification arm (see the code):
-// (a) a hostile addAll that returns normally but mangles the list -- dropping
-//     original ROM entries or seeding extras -- is now caught by the
-//     post-success integrity check and reported as Skipped (reason: "addAll
-//     returned but the resulting list failed verification (hostile/ROM
-//     bug)"). Decision tree, in order: byte-for-byte snapshot match ->
-//     Skipped with NO mutator invoked (same unmodified-list marker as
-//     always); verification could not read the list (size or get throws) ->
-//     Skipped with an explicit "verification could not read ... no mutator
-//     invoked" marker and NO mutator at all -- the list is left exactly as
-//     addAll left it, because its mutation cannot be established;
-//     original prefix provably damaged (matchesPrefixLen != size0) ->
-//     clear()+addAll(snapshot) restore attempted and re-verified (see
-//     below); prefix intact but a tail present -> only OUR appended
-//     entries (the last add.size elements, dropped solely when they
-//     byte-match the delta AND the drop removes exactly add.size entries —
-//     a no-op hostile drop falls through to the restore path) are rolled
-//     back, foreign entries are retained, and the re-verify tolerates foreign
-//     extras (Skipped with an explicit "appended-ours entries rolled back,
-//     originals preserved, foreign entries retained" marker); a suffix that does
-//     not match is left for the restore path below; an unreadable suffix
-//     (probed get) is reported as "verification could not read the list
-//     suffix ... no mutator invoked" with NO mutator at all;
-// (b) if addAll throws after partially appending, the appended entries are
-//     dropped only after an ownership decision tree proves them ours:
-//     ours sitting at the VERY END (suffix byte-match of the last add.size
-//     elements), ours front-aligned at size0 (full-delta byte-match at the
-//     snapshot boundary, foreign extras AFTER ours at the very end tolerated
-//     and retained), or a landed prefix of the delta (front-aligned at
-//     size0, when addAll threw before the whole delta landed). Our entries
-//     are dropped and foreign entries wherever they sit are RETAINED; when
-//     the drop leaves the original prefix byte-for-byte intact, Skipped
-//     carries the "appended-ours entries rolled back, originals preserved,
-//     foreign entries retained" marker. If the tail is not verifiably ours
-//     — or the size read itself threw (ownership check skipped) — the
-//     drop is skipped entirely; verification (matchesSnapshot) fails
-//     internally and the restore path below runs. The last-resort restore
-//     (clear() + addAll(snapshot)) may itself fail or keep only a prefix of
-//     the snapshot; when it throws, the Skipped reason carries
-//     "; last-restore failed". When the restore returns normally but fails
-//     re-verification, the reason carries "; restore unverified" (list
-//     unreadable) or "; restore incomplete (kept N of M original entries)"
-//     (prefix-only restore) -- a normally-returning no-op restore is NOT
-//     proof of success. ORIGINAL ROM whitelist entries may be lost --
-//     fail-closed for the affected apps, and the reason now signals it.
-//
+// calls (addAll, plus — on the failure arms only — an ownership-checked
+// ours-only drop or, when the ORIGINAL PREFIX IS PROVABLY DAMAGED BUT
+// READABLE at the settle helper's ENTRY PROBE, a last-resort
+// clear()+addAll(snapshot) restore). BOTH failure
+// arms (list.addAll(add) threw, or the post-success integrity verification
+// failed) settle through one ownership-contract helper
+// (settleTailOrSkipMutator) and verify before returning:
+// (a) UNREADABLE at the entry probe — list.size throws or reports a
+//     negative garbage size (list.size < 0), or the prefix read
+//     throws (matchesPrefixLen returns -1): Skipped with an explicit
+//     "verification could not read ... no mutator invoked" marker and NO
+//     mutator at all, in BOTH arms. The list is left exactly as addAll
+//     left it, because its mutation cannot be established. (The settle
+//     helper's unified sizeNow < 0 probe lands here too: a throwing size read is
+//     probed first and routes straight to this arm — no drop is attempted.)
+//     A boundary get() that throws during the matcher evaluation of cases
+//     (i)–(iii) routes to the (iv) bucket with the not-locatable marker
+//     instead — no mutator is invoked there either.
+// (b) ORIGINAL PREFIX PROVABLY DAMAGED but readable (matchesPrefixLen <
+//     size0) AT THE ENTRY PROBE: the ONLY remaining whole-list restore case —
+//     clear()+addAll(snapshot), itself best-effort (it may itself keep only
+//     a prefix of the snapshot, or throw). The restore runs ONLY when the
+//     damage is detected here, at the entry probe — damage detected in
+//     dropOursAndSettle AFTER an ours-drop was attempted never runs the
+//     whole-list restore (it would also delete foreign entries;
+//     foreign-retained by design). The restore is RE-VERIFIED with
+//     explicit failure vocabulary: a normally-returning no-op restore is NOT
+//     proof of success, so after clear()+addAll(snapshot) completes we
+//     re-check byte-for-byte and the Skipped reason carries one of the
+//     explicit markers ("; restore incomplete (kept N of M original
+//     entries)" when the re-verify mismatches, "; restore unverified" when
+//     the re-verify read throws, "; last-restore failed" when the restore
+//     itself threw). Restore is attempted ONLY here at the entry probe — it
+//     never runs after an ours-drop attempt (damage that drop causes is
+//     loss mode (2) and is never restored).
+// (c) PREFIX INTACT (matchesPrefixLen == size0): never a whole-list
+//     clear(). If sizeNow == size0 (tail empty; throw-arm reachable — no
+//     unmodified-list early return there), Skipped with the "the list is
+//     unchanged" marker and no mutator. Otherwise the tail is handled by
+//     ownership evidence, dropping ONLY provably-ours entries via
+//     subList().clear() (ours-only, bounded to add.size elements — the
+//     instructed ranges never address indices < size0; and an
+//     instruction-level whole-list delete cannot occur — a hostile
+//     subList view may clear more than its range (the re-verify detects
+//     that loss but does not prevent it; escalation to a whole-list
+//     restore is refused after any drop attempt)) and re-verifying
+//     (matchesPrefixLen == size0 AND
+//     list.size == sizeNow - dropLen) before returning:
+//     (i)   ours at the VERY END (sizeNow >= size0 + add.size AND the last
+//           add.size elements byte-match the delta — suffix byte-match):
+//           drop subList(sizeNow - add.size, sizeNow);
+//     (ii)  ours FRONT-ALIGNED at size0 (byte-match at the snapshot
+//           boundary, foreign extras AFTER ours at the very end tolerated
+//           and retained): drop subList(size0, size0 + add.size);
+//     (i)/(ii) on success return Skipped with "appended-ours tail entries
+//           rolled back, originals preserved, foreign entries retained".
+//           On a failed drop (hostile no-op subList, throwing clear, or a
+//           re-verify read that fails) there is NO escalation to a
+//           whole-list restore — Skipped with an explicit "no further
+//           mutator invoked (no whole-list restore)" marker, list left as
+//           the drop left it;
+//     (iii) a LANDED PREFIX of the delta front-aligned at size0 (addAll
+//           threw before the whole delta landed; extra = sizeNow - size0
+//           in 1 until add.size AND matchesRange byte-match): drop
+//           subList(size0, size0 + extra); re-verify; Skipped with a
+//           "partially appended ours rolled back ..." marker;
+//     (iv)  ours NOT LOCATABLE (interleaved ours/foreign — e.g.
+//           [ours1, foreign, ours2]; a foreign tail with ours elsewhere;
+//           or an addAll that returned normally while appending non-ours
+//           bytes/garbage; or a boundary get() that threw during the
+//           matcher evaluation): NO mutator; Skipped with "appended-ours
+//           entries could not be located (or verification could not read them);
+//           original prefix intact; list
+//           left as addAll left it; foreign entries retained; no mutator
+//           invoked".
+//     FOREIGN entries wherever they sit are RETAINED on every (i)–(iv)
+//     path; only provably-ours entries are ever dropped.
+// ORIGINAL ROM whitelist entries may be lost in exactly THREE loss modes:
+// (1) ORIGINAL PREFIX DAMAGED, reads readable at the entry probe (case
+//     (b)): the last-resort clear()+addAll(snapshot) restore runs —
+//     best-effort; it may keep only a prefix of the snapshot or throw,
+//     and the reason signals it via the markers above ("; restore
+//     incomplete (kept N of M original entries)" / "; restore unverified" /
+//     "; last-restore failed"). Restore is attempted ONLY here at the entry
+//     probe — it never runs after an ours-drop attempt (damage that drop
+//     causes is loss mode (2) and is never restored).
+// (2) PREFIX-INTACT ours-drop fails its re-verify (adversarial drop view —
+//     wrong-end removeAt, mis-targeting subList, a detached view with a
+//     failed/no-op drop): NO whole-list restore runs — it would also
+//     delete foreign entries the prefix-intact paths must retain. The
+//     original loss stands; the appended ours may remain as the drop left
+//     them; the reason carries the
+//     "no further mutator invoked (no whole-list restore)" marker; this damage
+//     is detected in dropOursAndSettle (after a drop attempt), never at the
+//     entry probe; see loss mode (1) for the complement.
+// (3) LIST UNREADABLE (list.size/list[i] throws, or size reports a
+//     negative garbage value): NO mutator is ever invoked by the patch on
+//     this path; the list is left exactly as addAll left it — preservation of
+//     originals depends on what addAll itself did, and its contents cannot be
+//     established.
+// On every prefix-intact path, given size0 >= 0 (enforced at the pre-probe),
+// the originals are preserved byte-for-byte
+// EXCEPT loss mode (2) — where a failed ours-drop's wrong-end/mis-targeting
+// view already ate an original — and every Skipped reason states exactly
+// what happened via an explicit marker.
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
 // share the list without extra sync. The union itself is computed on an
-// ArrayList copy; only the final addAll (and, on failure arms, the bounded
-// rollback/restore sequence) touches the live list.
+// ArrayList copy; only the final addAll (and, on the failure arms, the
+// bounded ours-drop / prefix-damaged restore sequence) touches the live
+// list.
 object WhitelistPatch {
 
     const val OBSERVE_ONLY_MARKER = "observe-only"
@@ -197,40 +236,249 @@ object WhitelistPatch {
     }
 
     // Byte-for-byte snapshot equality. Any Throwable (size/get read) => false.
+    // A negative (garbage) [size0] is indeterminate too — never a readable
+    // empty snapshot: `(0 until -1).all{}` would be vacuously true, so a
+    // negative size0 is refused explicitly before the try body.
     private fun matchesSnapshot(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Boolean =
-        try { list.size == size0 && (0 until size0).all { list[it] == snapshot[it] } } catch (_: Throwable) { false }
+        if (size0 < 0) false else try { list.size == size0 && (0 until size0).all { list[it] == snapshot[it] } } catch (_: Throwable) { false }
 
     // Longest matching prefix length against the snapshot. Returns -1 when a
-    // read throws (list unreadable); a shrunk list yields the in-bounds
-    // prefix length (0 when nothing matches).
-    private fun matchesPrefixLen(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Int =
+    // read throws (list unreadable) or when the list reports a negative
+    // (garbage) size — a negative size is indeterminate, never treated as a
+    // readable short list; a shrunk list yields the in-bounds prefix length
+    // (0 when nothing matches).
+    private fun matchesPrefixLen(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Int {
         try {
-            val n = minOf(list.size, size0)
+            val s = try { list.size } catch (_: Throwable) { return -1 }
+            if (s < 0) return -1
+            if (size0 < 0) return -1
+            val n = minOf(s, size0)
             var i = 0
             while (i < n && list[i] == snapshot[i]) i++
-            i
+            return i
         } catch (_: Throwable) {
-            -1
+            return -1
         }
+    }
 
     // Last [add.size] elements byte-match [add]? False on any read throw.
+    // A negative (garbage) sizeNow is not readable either — refused explicitly
+    // even though add.size >= 1 makes `sizeNow >= add.size` imply it.
     // The caller must additionally require sizeNow >= size0 + add.size so the
     // matched range starts at or past the end of the snapshot prefix (the
-    // suffix drop must never touch original entries).
+    // instructed range never addresses indices < size0; the effect of a
+    // hostile subList view is bounded by the re-verify, not by the range
+    // instruction).
     private fun suffixMatchesAdd(list: MutableList<String>, add: List<String>, sizeNow: Int): Boolean =
         try {
-            sizeNow >= add.size && (0 until add.size).all { list[sizeNow - add.size + it] == add[it] }
+            sizeNow >= add.size && sizeNow >= 0 && (0 until add.size).all { list[sizeNow - add.size + it] == add[it] }
         } catch (_: Throwable) {
             false
         }
 
     // Our byte-range match at [offset, offset + count). Any read throw => false.
-    private fun bytesEqualAt(list: MutableList<String>, add: List<String>, offset: Int, count: Int = add.size): Boolean =
+    private fun matchesRange(list: MutableList<String>, add: List<String>, offset: Int, count: Int = add.size): Boolean =
         try { (0 until count).all { i -> list[offset + i] == add[i] } } catch (_: Throwable) { false }
 
-    // Front-aligned match limited to a landed prefix of ours (count < add.size). Any read throw => false.
-    private fun matchesRange(list: MutableList<String>, add: List<String>, offset: Int, count: Int): Boolean =
-        try { (0 until count).all { i -> list[offset + i] == add[i] } } catch (_: Throwable) { false }
+    // Ownership-contract settle helper — the SINGLE decision tree for both
+    // failure arms (the list.addAll(add)-threw arm and the post-success
+    // verification-failed arm). Called ONLY after one of those two arms
+    // declares failure; never on the success path. Returns the Skipped
+    // outcome; NEVER whole-list clear()s on a prefix-intact path — the only
+    // clear() this helper may run is the prefix-damaged last-resort restore.
+    //
+    // [failurePrefix] is the arm-specific reason prefix (already log-ready,
+    // without a trailing marker); the helper appends the precise outcome
+    // marker. Cases, in order:
+    // (a) the entry probe is unreadable (size throws or reports a negative
+    //     garbage size, or matchesPrefixLen returns -1): Skipped with an
+    //     explicit "verification could not read ... no mutator invoked"
+    //     marker — NO mutator at all. Boundary get() throws during the
+    //     matcher evaluation of cases (i)–(iii) route to the (iv) bucket
+    //     with the not-locatable marker instead — no mutator is invoked
+    //     there either;
+    // (b) prefix provably damaged but readable (prefixLen < size0): the
+    //     ONLY remaining whole-list case — clear()+addAll(snapshot),
+    //     re-verified, with the existing "; restore unverified" /
+    //     "; restore incomplete (kept N of M original entries)" /
+    //     "; last-restore failed" markers. The restore runs ONLY when the
+    //     damage is detected here, at the entry probe — damage detected in
+    //     dropOursAndSettle AFTER an ours-drop was attempted never
+    //     whole-list restores (foreign entries would be deleted;
+    //     foreign-retained by design);
+    // (c) prefix intact: tail-empty -> "the list is unchanged" Skipped, no
+    //     mutator; tail present -> drop ONLY provably-ours entries, by
+    //     ownership evidence: (i) ours at the very end (suffix byte-match),
+    //     (ii) ours front-aligned at size0 (foreign extras AFTER ours
+    //     retained), (iii) a landed prefix of the delta (front-aligned at
+    //     size0, addAll threw early). On success: "appended-ours tail
+    //     entries rolled back ..." (i)/(ii) or "partially appended ours
+    //     rolled back ..." (iii), original prefix re-verified. On a failed
+    //     drop: Skipped with "no further mutator invoked ... list left as
+    //     the drop left it" — NOT an escalation to a whole-list restore.
+    //     Ours not locatable at all (interleaved ours/foreign, or a
+    //     normally-returning addAll that appended non-ours bytes/garbage):
+    //     NO mutator; "could not be located ... no mutator invoked".
+    // Foreign entries wherever they sit are retained on every (i)-(iv) path.
+    private fun settleTailOrSkipMutator(
+        list: MutableList<String>,
+        snapshot: ArrayList<String>,
+        size0: Int,
+        add: List<String>,
+        failurePrefix: String,
+    ): Outcome.Skipped {
+        // (a) Entry probe unreadable -> NO mutator at all. The list is left
+        // exactly as addAll left it: its mutation cannot be established.
+        // (The settle helper's unified sizeNow < 0 probe lands here — the
+        // size read is probed FIRST, before any drop is attempted. A negative
+        // garbage size is not readable either: it is indeterminate, never a
+        // short readable list, and never routed to the prefix-damaged restore
+        // arm — NO mutator is invoked.)
+        val sizeNow = try {
+            list.size
+        } catch (_: Throwable) {
+            -1
+        }
+        if (sizeNow < 0) {
+            return Outcome.Skipped(
+                "$failurePrefix; verification could not read the list size (hostile/ROM bug); " +
+                    "list left untouched, no mutator invoked",
+            )
+        }
+        val prefixLen = matchesPrefixLen(list, snapshot, size0)
+        if (prefixLen == -1) {
+            return Outcome.Skipped(
+                "$failurePrefix; verification could not read the list (get threw); " +
+                    "list left untouched, no mutator invoked",
+            )
+        }
+        // (b) Prefix provably damaged but readable: the ONLY whole-list
+        // restore case — clear()+addAll(snapshot), then re-verify.
+        if (prefixLen < size0) {
+            var restoreFailed = false
+            var restoreNote: String? = null
+            try {
+                list.clear()
+                list.addAll(snapshot)
+            } catch (_: Throwable) {
+                // Swallowed: last-resort restore may fail too (see header).
+                restoreFailed = true
+            }
+            if (!restoreFailed) {
+                // Normally-returning no-op restore is NOT proof; verify it.
+                if (!matchesSnapshot(list, snapshot, size0)) {
+                    restoreFailed = true
+                    val kept = matchesPrefixLen(list, snapshot, size0)
+                    restoreNote = if (kept < 0) {
+                        "; restore unverified"
+                    } else {
+                        "; restore incomplete (kept $kept of $size0 original entries)"
+                    }
+                }
+            }
+            return Outcome.Skipped(
+                failurePrefix + when {
+                    restoreNote != null -> restoreNote
+                    restoreFailed -> "; last-restore failed"
+                    else -> ""
+                },
+            )
+        }
+        // (c) Prefix intact — never a whole-list clear() from here on.
+        if (sizeNow == size0) {
+            // Tail empty (this arm is reachable from the THROW arm — no
+            // unmodified-list early return there; on the post-success arm the
+            // early return subsumes it in practice).
+            return Outcome.Skipped(
+                "$failurePrefix; the list is unchanged since the snapshot — originals preserved, no restore attempted",
+            )
+        }
+        val extra = sizeNow - size0
+        // (i) ours at the VERY END (suffix byte-match of the last add.size
+        // elements) and (ii) ours FRONT-ALIGNED at size0 (foreign extras
+        // AFTER ours at the very end tolerated and retained). Only entered
+        // when the whole delta fits at/after the snapshot boundary — the
+        // instructed range never addresses indices < size0 (a hostile subList
+        // view's effect is bounded by the re-verify, not by the instruction).
+        if (sizeNow >= size0 + add.size) {
+            if (suffixMatchesAdd(list, add, sizeNow)) {
+                return dropOursAndSettle(list, snapshot, size0, sizeNow, sizeNow - add.size, add.size,
+                    failurePrefix, partial = false)
+            }
+            if (matchesRange(list, add, size0)) {
+                return dropOursAndSettle(list, snapshot, size0, sizeNow, size0, add.size,
+                    failurePrefix, partial = false)
+            }
+        }
+        // (iii) a LANDED PREFIX of the delta front-aligned at size0
+        // (addAll threw before the whole delta landed).
+        if (extra in 1 until add.size && matchesRange(list, add, size0, extra)) {
+            return dropOursAndSettle(list, snapshot, size0, sizeNow, size0, extra,
+                failurePrefix, partial = true)
+        }
+        // (iv) Ours not locatable (interleaved ours/foreign, or a
+        // normally-returning addAll that appended non-ours bytes/garbage, or
+        // a matcher that could not read the bytes — a boundary get() that
+        // threw lands here too): NO mutator. The list is left exactly as
+        // addAll left it.
+        return Outcome.Skipped(
+            "$failurePrefix; appended-ours entries could not be located (or verification could not read them); " +
+                "original prefix intact; list left as addAll left it; foreign entries retained; no mutator invoked",
+        )
+    }
+
+    // Drop [len] entries at [from] (ours), then re-verify: the original
+    // prefix must be byte-for-byte intact AND the drop must have removed
+    // exactly [len] elements. On success: Skipped with the (i)/(ii) or
+    // (iii) rolled-back marker. On a failed drop (hostile no-op subList,
+    // throwing clear, detached view, or a re-verify read that fails):
+    // NO escalation to a whole-list restore — Skipped with the explicit
+    // "no further mutator invoked" marker; the list is left as the drop
+    // left it. Foreign entries wherever they sit survive.
+    private fun dropOursAndSettle(
+        list: MutableList<String>,
+        snapshot: ArrayList<String>,
+        size0: Int,
+        sizeNow: Int,
+        from: Int,
+        len: Int,
+        failurePrefix: String,
+        partial: Boolean,
+    ): Outcome.Skipped {
+        try {
+            list.subList(from, from + len).clear()
+        } catch (_: Throwable) {
+            return dropFailedOutcome(failurePrefix)
+        }
+        val prefixOk = matchesPrefixLen(list, snapshot, size0) == size0
+        val sizeOk = try {
+            list.size == sizeNow - len
+        } catch (_: Throwable) {
+            false
+        }
+        if (prefixOk && sizeOk) {
+            return Outcome.Skipped(
+                failurePrefix + if (partial) {
+                    "; partially appended ours rolled back, originals preserved, foreign entries retained"
+                } else {
+                    "; appended-ours tail entries rolled back, originals preserved, foreign entries retained"
+                },
+            )
+        }
+        return dropFailedOutcome(failurePrefix)
+    }
+
+    // (i)/(ii)/(iii) drop-failure outcome: the ours-only drop (or its
+    // re-verification) failed — nothing was dropped, the drop removed the
+    // wrong entries, or re-verification could not read the list. A whole-list
+    // restore is NOT attempted here — it would delete foreign entries the
+    // prefix-intact paths must retain.
+    private fun dropFailedOutcome(failurePrefix: String): Outcome.Skipped =
+        Outcome.Skipped(
+            "$failurePrefix; appended-ours drop or its re-verification failed; " +
+                "no further mutator invoked (no whole-list restore); list left as the drop left it — " +
+                "originals may be lost and appended ours may remain",
+        )
 
     // Outcome of attempting to merge [extra] into a static field value.
     sealed interface Outcome {
@@ -244,11 +492,12 @@ object WhitelistPatch {
 
         // Leave the field as-is or best-effort restored per the narrowed promise.
         // Originals are guaranteed intact when the list is unchanged since snapshot,
-        // or when restore re-verify passes; otherwise originals may be partially
-        // lost and the reason carries an explicit marker (last-restore failed /
-        // restore unverified / restore incomplete (kept N of M)) — see case (a)
-        // in the module header (restore-failure markers are emitted in the (a)
-        // restore path too). The reason string is already log-ready.
+        // or when restore re-verify passes (restore path runs only when the
+        // original prefix is provably damaged but readable); otherwise the
+        // reason carries an explicit marker (restore incomplete (kept N of M) /
+        // restore unverified / last-restore failed / no mutator invoked markers)
+        // — see cases (a), (b) and (c) in the module header. The reason string
+        // is already log-ready.
         data class Skipped(val reason: String) : Outcome
 
         // Static final field: plain Field.set() cannot reassign it
@@ -455,6 +704,7 @@ object WhitelistPatch {
                     "skip patch $fieldName on $owner: failed to read list size (${HookLog.shortEx(t)})",
                 )
             }
+            if (size0 < 0) return Outcome.Skipped("skip patch $fieldName on $owner: failed to read list size (hostile/ROM bug: negative size)")
             val snapshot: ArrayList<String>
             val add: List<String>
             try {
@@ -469,103 +719,31 @@ object WhitelistPatch {
             try {
                 list.addAll(add)
             } catch (t: Throwable) {
-                // Two-tier rollback with pre-return verification, applied
-                // uniformly (not a one-shot subList().clear()):
-                // (b) drop exactly OUR appended entries — ownership-checked:
-                //     the tail must byte-match the precomputed delta (ours at
-                //     the very end via suffix match, ours front-aligned at
-                //     size0, or a landed prefix of the delta when addAll
-                //     threw early); otherwise the drop is skipped entirely so
-                //     a foreign entry threaded in alongside ours is NOT
-                //     deleted; if the size read itself threw, the ownership
-                //     check is skipped (sizeNowRb == -1), matchesSnapshot
-                //     returns false internally, and the restore path runs
-                //     normally (clear()+addAll(snapshot));
-                // (c) verify the list is back to the original prefix —
-                //     size == size0 and every original element at its old
-                //     index (foreign extras before ours, if any, also fail
-                //     this and route to the fallback); any Throwable during
-                //     verification counts as verify-fail;
-                // (d) only on verify-fail, last-resort clear()+addAll(snapshot)
-                //     — itself best-effort (may keep only a snapshot prefix).
-                // Byte-for-byte originals preserved for lists whose add/addAll
-                // throws before or after appending only at the tail; verified
-                // before returning, otherwise best-effort fallback. Lists that
-                // shrink during add, detached-view subLists, wrong-end removal,
-                // or prefix damage are caught by the verification step, not
-                // assumed safe.
-                var rolled = false
-                try {
-                    val sizeNowRb = try { list.size } catch (_: Throwable) { -1 }
-                    if (sizeNowRb != -1 && sizeNowRb >= size0) {
-                        val extra = sizeNowRb - size0
-                        var oursFrom = -1
-                        var dropLen = 0
-                        if (extra >= add.size) {
-                            if (suffixMatchesAdd(list, add, sizeNowRb)) {
-                                oursFrom = sizeNowRb - add.size; dropLen = add.size   // ours at the very end
-                            } else if (bytesEqualAt(list, add, size0)) {
-                                oursFrom = size0; dropLen = add.size                   // ours front-aligned, foreign at very end
-                            }
-                        } else if (extra >= 1) {
-                            if (matchesRange(list, add, size0, extra)) { oursFrom = size0; dropLen = extra } // partial landed prefix
-                        }
-                        if (oursFrom != -1) {
-                            // Drop ONLY our entries; foreign entries wherever they sit must survive.
-                            try { list.subList(oursFrom, oursFrom + dropLen).clear() } catch (_: Throwable) { }
-                            if (matchesPrefixLen(list, snapshot, size0) == size0 &&
-                                (try { list.size == sizeNowRb - dropLen } catch (_: Throwable) { false })
-                            ) {
-                                return Outcome.Skipped(
-                                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)}); " +
-                                        "appended-ours tail entries rolled back, originals preserved, foreign entries retained",
-                                )
-                            }
-                            // drop did not restore originals (hostile no-op subList or throw): fall through to restore
-                        }
-                        // else: skip the drop entirely (tail not verifiably ours); fall through to verify/restore
-                    }
-                    rolled = matchesSnapshot(list, snapshot, size0)
-                } catch (_: Throwable) {
-                    rolled = false
-                }
-                var restoreFailed = false
-                var restoreNote: String? = null
-                if (!rolled) {
-                    try {
-                        list.clear()
-                        list.addAll(snapshot)
-                    } catch (_: Throwable) {
-                        // Swallowed: last-resort restore may fail too (see header).
-                        restoreFailed = true
-                    }
-                    if (!restoreFailed) {
-                        // Normally-returning no-op restore is NOT proof; verify it.
-                        if (!matchesSnapshot(list, snapshot, size0)) {
-                            restoreFailed = true
-                            val kept = matchesPrefixLen(list, snapshot, size0)
-                            restoreNote = if (kept < 0) {
-                                "; restore unverified"
-                            } else {
-                                "; restore incomplete (kept $kept of $size0 original entries)"
-                            }
-                        }
-                    }
-                }
-                return Outcome.Skipped(
-                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})" +
-                        when {
-                            restoreNote != null -> restoreNote
-                            restoreFailed -> "; last-restore failed"
-                            else -> ""
-                        },
+                // Settle through the SAME ownership-contract helper as the
+                // post-success verification-failed arm (see module header,
+                // cases (a)-(c)). The helper probes size FIRST — a throwing
+                // size read short-circuits straight to the
+                // "verification could not read ... no mutator invoked" arm
+                // with NO drop attempted and NO whole-list restore. A
+                // readable-but-damaged prefix routes to the last-resort
+                // restore; an intact prefix routes to the ours-only drop
+                // ownership tree; verification reads that throw route to
+                // the no-mutator Skipped. Foreign entries are retained on
+                // every intact-prefix path.
+                return settleTailOrSkipMutator(
+                    list,
+                    snapshot,
+                    size0,
+                    add,
+                    "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})",
                 )
             }
             // Post-success integrity arm: a hostile AbstractMutableList may
             // return normally from addAll while dropping originals or seeding
             // nothing. Verify the resulting list before reporting success; on
-            // verification failure (or a throwing verification read), best-effort
-            // restore and report Skipped instead of a false "+N added" signal.
+            // verification failure (or a throwing verification read), settle
+            // through the SAME ownership-contract helper as the throw-arm and
+            // report Skipped instead of a false "+N added" signal.
             // (O(n) check; this is the <clinit> path, not the hot query path.)
             val ok = try {
                 // Prefix leg via matchesPrefixLen == size0: byte-for-byte
@@ -590,111 +768,22 @@ object WhitelistPatch {
                             "originals preserved, no restore attempted",
                     )
                 }
-                // Verification READS throw (indexed get/size): the post-write
-                // state is unverifiable, so NO mutator may be invoked — the
-                // list is left exactly as addAll left it (its mutation cannot
-                // be established; see header (a)).
-                val sizeNow = try { list.size } catch (_: Throwable) { -1 }
-                if (sizeNow == -1) {
-                    return Outcome.Skipped(
-                        "skip patch $fieldName on $owner: addAll returned but verification could not read " +
-                            "the list size (hostile/ROM bug); list left untouched, no mutator invoked",
-                    )
-                }
-                val prefixLen = matchesPrefixLen(list, snapshot, size0)
-                if (prefixLen == -1) {
-                    return Outcome.Skipped(
-                        "skip patch $fieldName on $owner: addAll returned but verification could not read " +
-                            "the list (get threw); list left untouched, no mutator invoked",
-                    )
-                }
-                if (prefixLen == size0 && sizeNow == size0) {
-                    // Unreachable in practice: the matchesSnapshot early return
-                    // above (marker "the list is unchanged since the snapshot")
-                    // subsumes this case; kept as an explicit arm so the
-                    // decision tree reads end-to-end.
-                    return Outcome.Skipped(
-                        "skip patch $fieldName on $owner: addAll returned but the resulting list " +
-                            "failed verification (hostile/ROM bug); the list is unchanged since the snapshot — " +
-                            "originals preserved, no restore attempted",
-                    )
-                }
-                // Prefix intact + a tail present: the tail may hold OUR entries
-                // plus foreign ones. Drop ONLY our entries (the last add.size
-                // elements, when they byte-match the delta) and retain any
-                // foreign entries before them; the re-verify requires BOTH an
-                // intact original prefix AND the drop having removed exactly
-                // add.size entries (a no-op hostile drop falls through to the
-                // restore path).
-                if (prefixLen == size0 && sizeNow > size0 && sizeNow >= size0 + add.size) {
-                    // A suffix that does not byte-match may be a genuine mismatch
-                    // (fall through to the restore path) or an unreadable suffix
-                    // (NO mutator may run). Distinguish them by probing the first
-                    // suffix index: if the probe throws, the suffix cannot be
-                    // read and the list's post-addAll state cannot be established.
-                    val suffixMismatch = !suffixMatchesAdd(list, add, sizeNow)
-                    val suffixUnreadable = suffixMismatch &&
-                        try { list[sizeNow - add.size]; false } catch (_: Throwable) { true }
-                    if (suffixMismatch && suffixUnreadable) {
-                        return Outcome.Skipped(
-                            "skip patch $fieldName on $owner: addAll returned but verification could not read " +
-                                "the list suffix (get threw); list left untouched, no mutator invoked",
-                        )
-                    }
-                    if (!suffixMismatch) {
-                        var oursRolledBack = false
-                        try {
-                            list.subList(sizeNow - add.size, sizeNow).clear()
-                            if (matchesPrefixLen(list, snapshot, size0) == size0) {
-                                oursRolledBack = try { list.size == sizeNow - add.size } catch (_: Throwable) { false }
-                            } else {
-                                oursRolledBack = false
-                            }
-                        } catch (_: Throwable) {
-                            // subList/clear/read threw: fall through to the restore path.
-                            oursRolledBack = false
-                        }
-                        if (oursRolledBack) {
-                            return Outcome.Skipped(
-                                "skip patch $fieldName on $owner: addAll returned but the resulting list " +
-                                    "failed verification (hostile/ROM bug); appended-ours tail entries rolled back, " +
-                                    "originals preserved, foreign entries retained",
-                            )
-                        }
-                        // else: fall through to the restore path.
-                    }
-                }
-                // else (prefix damaged, or unreachable-size, or the suffix is
-                // not ours): fall through to the existing restore path.
-                var restoreFailed = false
-                var restoreNote: String? = null
-                try {
-                    list.clear()
-                    list.addAll(snapshot)
-                } catch (_: Throwable) {
-                    // Swallowed: last-resort restore may fail too (see header).
-                    restoreFailed = true
-                }
-                if (!restoreFailed) {
-                    // Normally-returning no-op restore is NOT proof; verify it.
-                    if (!matchesSnapshot(list, snapshot, size0)) {
-                        restoreFailed = true
-                        val kept = matchesPrefixLen(list, snapshot, size0)
-                        restoreNote = if (kept < 0) {
-                            "; restore unverified"
-                        } else {
-                            "; restore incomplete (kept $kept of $size0 original entries)"
-                        }
-                    }
-                }
-                return Outcome.Skipped(
-                    "skip patch $fieldName on $owner: addAll returned but the resulting " +
-                        "list failed verification (hostile/ROM bug)" +
-                        when {
-                            restoreNote != null -> restoreNote
-                            restoreFailed -> "; last-restore failed"
-                            else -> ""
-                        },
+                // Verification failed and the list changed: settle through
+                // the SAME ownership-contract helper as the throw-arm (see
+                // module header, cases (a)-(c)). Unreadable probes route to
+                // the no-mutator Skipped; a readable-but-damaged prefix
+                // routes to the last-resort restore; an intact prefix routes
+                // to the ours-only drop ownership tree (exact suffix,
+                // front-aligned, or landed partial); ours not locatable —
+                // or a failed drop — routes to the no-mutator Skipped,
+                // NEVER to a whole-list restore.
+                return settleTailOrSkipMutator(
+                    list,
+                    snapshot,
+                    size0,
+                    add,
+                    "skip patch $fieldName on $owner: addAll returned but the resulting list " +
+                        "failed verification (hostile/ROM bug)",
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
