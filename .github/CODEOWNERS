@@ -16,6 +16,7 @@
 # (noise defeats review). Branch-protection pairing requirement remains.
 /app/src/main/java/com/galaxydual/plus/GuardXposedProvider.kt @samson910022
 /scripts/check-provider-parity.py @samson910022
+/scripts/check-exported-components.py @samson910022
 /scripts/verify-release-artifacts.sh @samson910022
 /scripts/verify-release-artifacts.test.sh @samson910022
 /gradle/verification-metadata.xml @samson910022
@@ -33,4 +34,5 @@
 /gradlew.bat @samson910022
 /scripts/parse-apksigner-output.sh @samson910022
 /scripts/check-provider-parity.test.sh @samson910022
+/scripts/check-exported-components.test.sh @samson910022
 /scripts/fixtures/ @samson910022

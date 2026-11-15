@@ -216,6 +216,22 @@ PY
     fail "ShizukuProvider element-scoped manifest gate failed for $apk"
   fi
 
+  # 1d. Packaged manifest exports ONLY the allowlisted components (inventory
+  #     gate / new-surface tripwire). Step 1 above pins the ShizukuProvider
+  #     element-scoped, step 1b pins the GuardXposedProvider (name + authority
+  #     parity) — but NEITHER sees an ADDITIONAL exported <provider>/<service>/
+  #     <receiver>/<activity> at an unpinned authority/name, and neither
+  #     sees a weakened GuardXposedProvider.kt (that remains with human
+  #     review + CODEOWNERS). Enforced here by parsing the SAME
+  #     $MANIFEST_DUMP_FILE (aapt2 mode; scripts/check-exported-components.py,
+  #     fixtures and the checker's regression net run via
+  #     scripts/check-exported-components.test.sh (wired into android.yml build
+  #     job next to the provider-parity self-test); keep the two in sync in the
+  #     same change.). Loud hard-fail, never a skip.
+  if ! python3 "$SCRIPT_DIR/check-exported-components.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE"; then
+    fail "exported-components inventory gate failed for $apk"
+  fi
+
   # 1b. Packaged manifest provisions exactly one GuardXposedProvider at the
   #     expected authority — name and authority on the SAME <provider>
   #     element, exported=true, no android:permission, zero libxposed
