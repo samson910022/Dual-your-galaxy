@@ -1000,10 +1000,23 @@ class DualHook : XposedModule() {
     // The original whitelist is never shrunk.
     //
     // Empty policy (STATIC_SEED is empty and the remote draft is not yet
-    // persisted / not yet proven end-to-end): returns before touching
-    // reflection, so behavior stays observe-only and unaffected by the
+    // persisted / not yet proven end-to-end): returns after the shape probe
+    // (no policy IPC), so behavior stays observe-only and unaffected by the
     // final-field / dual-field handling below.
     private fun patchWhitelistField(target: Class<*>) {
+        // Reflection FIRST (pre-IPC fast-out): on a ROM where every candidate
+        // field is static final (or absent/wrong-shaped) the patch goes
+        // ObserveOnly and the policy IPC through the cache/gate would be
+        // discarded — skip it entirely. A non-empty policy still cannot make
+        // a final field patchable, so no policy signal is lost by probing
+        // before consulting it.
+        if (!WhitelistPatch.hasPatchableFieldShape(target, WHITELIST_FIELD_CANDIDATES)) {
+            logi(
+                "skip patch on ${shortClass(target)}: no patchable field shape on device " +
+                    "(${WhitelistPatch.OBSERVE_ONLY_MARKER})",
+            )
+            return
+        }
         val extra = effectivePolicy()
         if (extra.isEmpty()) {
             logi(

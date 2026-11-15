@@ -184,14 +184,18 @@ class EffectivePolicyCache(
         // Phase 4: lock only for state check + generation snapshot. The
         // reader() IPC/sanitize runs OUTSIDE the lock (hot-path fix: every
         // whitelist query previously held the lock across binder IPC).
-        // nowMs() throwing fails closed to cached/seed (no clock, no retry).
+        // nowMs() throwing fails closed to the seed (no clock, no TTL, no
+        // retry): the timeout/grace arms rely on the clock, so with no clock
+        // TTL cannot be enforced and the cached value must not be served
+        // unbounded-stale. Mirrors the sibling broken-clock arms, which
+        // degrade to seed/0.
         val now0: Long = try {
             nowMs()
         } catch (_: Throwable) {
-            synchronized(lock) {
-                return if (valid) cached
-                else PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
-            }
+            // H9: seed-only fallback, routed like the sibling broken-clock
+            // degrades (a no-op log when the clock is dead).
+            noteSeedOnlyFallback("clock")
+            return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
         }
         val gen0: Long
         var isFollower = false

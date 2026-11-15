@@ -45,6 +45,86 @@ class WhitelistPatchReflectTest {
         var ARR: Array<String> = arrayOf("a")
     }
 
+    // --- H4 fixtures for WhitelistPatch.hasPatchableFieldShape (pre-IPC probe) ---
+
+    // ROM shape: both candidate fields static final -> probe must find no
+    // patchable shape (patch goes ObserveOnly; policy IPC would be discarded).
+    object FinalCandidateHolder {
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES: Array<String> = arrayOf("a")
+
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA: Array<String> = arrayOf("a")
+    }
+
+    // Non-final MutableList candidate -> patchable shape.
+    object NonFinalListHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Non-final String[] candidate -> patchable shape.
+    object NonFinalArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: Array<String> = arrayOf("a")
+    }
+
+    // Declared as read-only List but holds a MutableList at runtime ->
+    // patchFields CAN patch it, so the probe must stay permissive (the
+    // loose direction: never skip a real patch).
+    object ListTypedHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: List<String> = mutableListOf("a")
+    }
+
+    // Covariant array storage: declared CharSequence[] (component type a
+    // supertype of String) but holding a String[] at runtime -> patchFields
+    // patches via its runtime javaClass check, so the probe must count it
+    // patchable (Java arrays are covariant).
+    object CovariantArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: Array<out CharSequence> = arrayOf("a")
+    }
+
+    // Static NON-FINAL field of a FINAL non-container declared type (String):
+    // the declared type proves no String[]/MutableList runtime value, so the
+    // probe must return false.
+    object FinalTypedNonFinalHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: String = "x"
+    }
+
+    // Static non-final IntArray: component type is primitive -> not patchable.
+    object IntArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: IntArray = intArrayOf(1)
+    }
+
+    // Static non-final primitive int -> not patchable.
+    object PrimitiveIntHolder {
+        @JvmField
+        var COUNT: Int = 1
+    }
+
+    // Static FINAL MutableList: field-final precedence — the field-final skip
+    // runs before the type arms, so the probe must return false.
+    object FinalMutableListHolder {
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Non-static candidate -> not patchable.
+    class InstanceCandidateHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Superclass-declared candidate (static, non-final) -> counted by the
+    // probe's hierarchy walk (a superset of patchFields's target-only
+    // resolution; the safe direction). Fixture lives in Java because Kotlin
+    // has no static-in-regular-class syntax.
+    object SubclassWithSuperclassField : SuperclassStaticListBase()
+
     // Hostile ROM list whose iterator() throws: the field-loop entry point
     // must still evaluate the SIBLING candidate field (sibling isolation;
     // one hostile field may never deny the other its outcome entry).
@@ -283,5 +363,139 @@ class WhitelistPatchReflectTest {
         assertFalse(single is WhitelistPatch.Outcome.Replaced)
         assertFalse(single is WhitelistPatch.Outcome.PatchedInPlace)
         assertEquals(listOf("a"), NonPublicStaticHolder.peekFinalArr().toList())
+    }
+
+    // --- H4: WhitelistPatch.hasPatchableFieldShape (pre-IPC probe) ---
+
+    @Test
+    fun probeReturnsFalseForAllFinalCandidateRomShape() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalCandidateHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES", "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForNonFinalMutableListCandidate() {
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalListHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForNonFinalStringArrayCandidate() {
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForCovariantStringSupertypeArrayCandidate() {
+        // Companion sanity: the field really is declared CharSequence[] yet
+        // holds a String[] at runtime (array covariance).
+        val field = CovariantArrayHolder::class.java.getDeclaredField("DUAL_APP_WHITELIST_PACKAGES")
+        assertEquals(CharSequence::class.java, field.type.componentType)
+        assertEquals(String::class.java, field.get(null)!!.javaClass.componentType)
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                CovariantArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForFinalTypedNonFinalCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalTypedNonFinalHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForIntArrayCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                IntArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForPrimitiveIntCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                PrimitiveIntHolder::class.java,
+                listOf("COUNT"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForStaticFinalMutableListCandidate() {
+        // Field-final precedence: the field-final skip runs before the type
+        // arms, so even a MutableList-typed field is not counted.
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalMutableListHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForListTypedFieldHoldingMutableList() {
+        // Declared read-only List, runtime MutableList: patchFields CAN
+        // patch it, so the probe must not fail-closed on the declaration.
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                ListTypedHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForInstanceCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                InstanceCandidateHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseWhenNoCandidateExists() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalArrayHolder::class.java,
+                listOf("NO_SUCH_FIELD"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeCountsSuperclassDeclaredCandidate() {
+        // Documented superset: the probe walks the hierarchy; patchFields
+        // resolves target-only and would report "field not found" — the
+        // safe direction (at most one discarded policy IPC).
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                SubclassWithSuperclassField::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
     }
 }

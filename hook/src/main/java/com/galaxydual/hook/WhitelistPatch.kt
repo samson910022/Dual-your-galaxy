@@ -113,6 +113,89 @@ object WhitelistPatch {
 
     const val OBSERVE_ONLY_MARKER = "observe-only"
 
+    // Pure shape probe for the pre-IPC fast-out in DualHook.patchWhitelistField.
+    //
+    // Purpose: answer "could [patchFields] patch anything at all on this
+    // target?" without reading field VALUES, without mutation, without
+    // logging content — so the caller can skip the policy IPC entirely on an
+    // all-static-final (or absent/wrong-shaped) ROM, where the patch goes
+    // ObserveOnly and the IPC would be discarded.
+    //
+    // Direction of approximation (H4 safety): this probe is conservative in
+    // the FALSE direction — probe == false must imply patchFields cannot
+    // patch any candidate. Probe == true is the LOOSE direction: it may
+    // pass a field patchFields later fails on (a non-final non-MutableList
+    // type holding nothing patchable, a hierarchy-only match invisible to
+    // patchFields, a MutableList<Int>, a setAccessible-refusing field) —
+    // that costs at most one discarded policy IPC, never a lost patch. Fail
+    // direction: any Throwable during probing fails closed to false.
+    //
+    // Per candidate name the field is resolved by walking the class
+    // hierarchy from [target] upward (a field declared on a superclass is
+    // counted — a strict superset of patchFields, which resolves
+    // target.getDeclaredField only; noted here and in the PR report). For
+    // each resolved field: skip non-static, skip FINAL (static final cannot
+    // be reassigned via plain Field.set — matches the patchFields ObserveOnly
+    // arm), and count as patchable any declared type that could hold a
+    // MutableList or String[] at runtime — i.e. a reference-declared array
+    // whose component type is String or a supertype of String (arrays are
+    // covariant, so a CharSequence[]/Object[]/Serializable[]/Comparable[]/
+    // Array<out Any> field may hold a String[] at runtime — matching
+    // patchFields's runtime javaClass check), a type assignable to
+    // MutableList, or ANY non-final/abstract/interface type
+    // (List/Object/Any/etc.). Only primitives, arrays whose component type
+    // is not assignable from String (primitive component types such as Int;
+    // final container-exclusion types such as Integer), and final
+    // non-MutableList classes (e.g. String) are excluded as provably
+    // non-container — patchFields cannot patch them either.
+    //
+    // NO field.get(), NO setAccessible, NO mutation, NO content inspection,
+    // NO logging of content (element types of a MutableList are NOT shape;
+    // patchFields fails closed on a MutableList<Int> — the safe direction).
+    //
+    // Equivalence note: if patchFields later grows new patchable shapes,
+    // this probe must be updated to match (keep this note current); if
+    // patchFields grows hierarchy resolution, the superset gap closes to
+    // exact equivalence.
+    fun hasPatchableFieldShape(target: Class<*>, fieldNames: List<String>): Boolean {
+        try {
+            for (name in fieldNames) {
+                var klass: Class<*>? = target
+                var field: Field? = null
+                while (klass != null && field == null) {
+                    field = try {
+                        klass.getDeclaredField(name)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    klass = klass.superclass
+                }
+                if (field == null) continue
+                if (!Modifier.isStatic(field.modifiers)) continue
+                if (Modifier.isFinal(field.modifiers)) continue
+                val type = try {
+                    field.type
+                } catch (_: Throwable) {
+                    continue
+                }
+                if (type.isArray) {
+                    val ct = type.componentType
+                    if (ct != null && !ct.isPrimitive && ct.isAssignableFrom(String::class.java)) return true
+                    continue
+                }
+                if (type.isPrimitive) continue
+                if (MutableList::class.java.isAssignableFrom(type)) return true
+                // Non-final/abstract/interface declared types may hold a
+                // MutableList at runtime; only FINAL non-container classes
+                // (String, Int holders, ...) are provably not patchable.
+                if (!Modifier.isFinal(type.modifiers)) return true
+            }
+            return false
+        } catch (_: Throwable) {
+            return false
+        }
+    }
+
     // Byte-for-byte snapshot equality. Any Throwable (size/get read) => false.
     private fun matchesSnapshot(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Boolean =
         try { list.size == size0 && (0 until size0).all { list[it] == snapshot[it] } } catch (_: Throwable) { false }

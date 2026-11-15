@@ -417,6 +417,24 @@ class PolicyRefreshGatePhase3Test {
         }
     }
 
+    // H5 pin: a plain (non-busy-worker) timeout that TRIPS the breaker is a
+    // lost refresh like any other and must count droppedRefreshCount exactly
+    // once — the !trip arm used to be the only drop counter for
+    // accountDrop = true callers, leaking a drop on the trip edge.
+    @Test
+    fun plainTimeoutTripEdgeCountsDrop() {
+        val executor = PolicyRefreshBudget.newPolicyRefreshExecutor("test-trip-drop")
+        try {
+            val gate = PolicyRefreshGate(executor = executor, maxConsecutiveTimeouts = 1)
+            val dropsBefore = gate.droppedRefreshCount.get()
+            assertNull(gate.readBounded(ignoringReader(80), timeoutMs = 50))
+            assertTrue(gate.isStuck())
+            assertEquals(dropsBefore + 1, gate.droppedRefreshCount.get())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
     // T-F7(b): half-open probe arm — a get() that waits below the 5ms
     // GET_TIMEOUT_FLOOR is busy-contention ("thin-get"), NOT a probe failure:
     // no streak increment, no backoff renewal. NB: a real 1ms budget can
