@@ -201,17 +201,20 @@ class PolicyRefreshGateNestedTest {
             // a REAL-TIME window measured from the first rejection in the call
             // (MIN_ELAPSED_BEFORE_FAILFAST_MS, capped at min(timeoutMs, 2ms));
             // with the 2s budget it fires long before the budget is exhausted —
-            // the deadline re-check is a separate backstop, not the floor's
-            // trigger. Honest starvation handling: an iteration that hits
+            // the deadline re-check is a separate backstop, not the floor's — and
+            // on a loaded runner a fail-fast trip CAN legitimately increment
+            // droppedRefreshCount (seen 3/300 at load average ~6-8). Honest
+            // starvation handling: an iteration that hits
             // PolicyRefreshContentionException is retried at most 2 extra times
             // (same call, same budget), and at most 10 contention retries are
             // tolerated across the whole test — beyond that the handoff is
-            // genuinely broken and the test fails loudly. Note the tolerance is
-            // also backstopped by the final droppedRefreshCount == 0 assert:
-            // every gate escape increments that counter, so in practice a
-            // persistent regression cannot ship green regardless of retries.
-            // No fixed sleeps; a starvation event longer than the 2ms floor can
-            // still fail this test on a pathologically loaded runner.
+            // genuinely broken and the test fails loudly. The tolerance is
+            // backstopped by the final droppedRefreshCount <= 10 assert:
+            // a serial-reuse regression would consume the budget every iteration
+            // and fail far below the tolerated ceiling — a persistent bug cannot
+            // ship green. No fixed sleeps; a starvation event longer than the
+            // 2ms floor can still fail this test on a pathologically loaded
+            // runner.
             var contentionRetries = 0
             repeat(300) { i ->
                 var r: Set<String>? = null

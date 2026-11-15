@@ -465,7 +465,7 @@ object HookMarker {
         // rename another writer's half-written tmp over the target. (Each
         // hook process now writes its own per-scope file, but the tmp name is
         // unique regardless, so a stray tmp can never alias a peer's write.)
-        val tmp: File? = try {
+        var tmp: File? = try {
             file.parentFile?.let {
                 File(it, file.name + ".tmp-" + System.nanoTime() + "-" + Thread.currentThread().id)
             }
@@ -494,8 +494,13 @@ object HookMarker {
                 } catch (_: Throwable) {
                     false
                 }
+                // Track whether THIS call created the tmp so only an owned
+                // tmp is ever deleted below: a refusals path (createNewFile
+                // returns false or throws) leaves a pre-existing foreign file
+                // at the same path, which must not be unlinked.
                 if (!created) {
                     safeLog(onLog, "tmp create refused for ${HookLog.normalizeLogPart(file.name)} (pre-existing or uncreatable tmp path); marker unwritten (fail-closed)")
+                    tmp = null  // foreign file — never delete in finally
                     return false
                 }
                 try {

@@ -26,6 +26,10 @@
   exported `XposedProvider` is replaced by the app-owned `GuardXposedProvider`.
 - `libxposed/interface` — Apache-2.0 — Transitive Xposed service interface AAR;
   linked into the app APK.
+- `libxposed/api` — Apache-2.0 — Transitive Xposed API AAR; linked into the
+  app APK (type surface: `XposedModule`, `Hooker`, `Param`).
+- `libxposed/annotation` — Apache-2.0 — Transitive Xposed annotation AAR
+  (compile-time-only retention); compiled into classes.dex.
 - `RikkaApps/Shizuku` — Apache-2.0 — Shizuku API/provider AARs linked into the
   app APK for the shell fallback channel.
 
