@@ -6,6 +6,8 @@ plugins {
 
 import java.io.File
 import java.util.Properties
+import org.gradle.api.Action
+import org.gradle.api.execution.TaskExecutionGraph
 
 // Release signing (Phase E1, issue #5): credentials are injected via
 // environment / CI secrets and NEVER committed (see docs/KEY_MANAGEMENT.md).
@@ -79,6 +81,34 @@ val releaseSigningReady =
     releaseSigningProps.isNotEmpty() &&
         releaseSigningProps.values.all { it.isNotEmpty() } &&
         File(releaseSigningProps.getValue("storeFile")).isFile
+
+// Execution-time backstop for the configuration-time gate above: Gradle's
+// camelCase task-name abbreviation matching (e.g. `:app:asmRel` resolving to
+// assembleRelease) bypasses the raw-name requestsReleasePackaging check.
+// Re-evaluate the RESOLVED task graph right before execution and fail with
+// the same policy as the usage site below (same env predicate — isCiBuild,
+// same allowReleaseManifestMerge opt-out, same fail-vs-warn: throw — same
+// exception type and message, suffixed "(task-graph backstop)") when a
+// release packaging task is present in the graph and no release signing key
+// is available. Differs from the configuration-time gate ONLY in the
+// trigger: resolved release tasks instead of the raw requested names.
+gradle.taskGraph.whenReady(Action<TaskExecutionGraph> {
+    val resolved = allTasks.map { it.path }
+    val hitRelease = resolved.any { path ->
+        val simple = path.substringAfterLast(":")
+        simple.equals("assembleRelease", ignoreCase = true) ||
+            simple.equals("bundleRelease", ignoreCase = true) ||
+            simple.equals("packageRelease", ignoreCase = true)
+    }
+    if (!releaseSigningReady && isCiBuild && hitRelease && !allowReleaseManifestMerge) {
+        throw GradleException(
+            "Release signing key missing in CI: set SIGN_STORE_FILE " +
+                "(restored from SIGN_STORE_BASE64), SIGN_STORE_PASSWORD, " +
+                "SIGN_KEY_ALIAS and SIGN_KEY_PASSWORD secrets; refusing unsigned release build. " +
+                "(task-graph backstop)"
+        )
+    }
+})
 
 // Application-specific Android configuration.
 android {

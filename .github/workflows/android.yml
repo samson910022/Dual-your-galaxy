@@ -163,7 +163,7 @@ jobs:
         run: |
           set -e
           echo "== android:sharedUserId attribute forbidden (uid gate would admit siblings) =="
-          if grep -rE --include='*.xml' 'android:sharedUserId[[:space:]]*=' app/src/main; then echo "FAIL: android:sharedUserId attribute found (uid gate would admit siblings)"; exit 1; fi
+          if grep -riE --include='*.xml' 'android:sharedUserId[[:space:]]*=' app/src/main; then echo "FAIL: android:sharedUserId attribute found (uid gate would admit siblings)"; exit 1; fi
           grep -F 'Do NOT add android:sharedUserId' app/src/main/AndroidManifest.xml
           echo "PASS: no sharedUserId attribute (warning comment present)"
       # D3: enforce the same invariant on the shipping artifacts (merged manifest + binary APK).
@@ -224,7 +224,7 @@ jobs:
           fi
           MERGED="$MERGED_FILES"
           echo "merged manifest: $MERGED"
-          if grep -E 'android:sharedUserId[[:space:]]*=' "$MERGED"; then echo "FAIL: android:sharedUserId attribute found in merged manifest $MERGED (uid gate would admit siblings)"; exit 1; fi
+          if grep -iE 'android:sharedUserId[[:space:]]*=' "$MERGED"; then echo "FAIL: android:sharedUserId attribute found in merged manifest $MERGED (uid gate would admit siblings)"; exit 1; fi
           echo "== (b) APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool scan) =="
           APK="app/build/outputs/apk/debug/app-debug.apk"
           if [ ! -f "$APK" ]; then
@@ -237,9 +237,9 @@ jobs:
           if not data:
               print("FAIL: APK binary AndroidManifest.xml is empty")
               sys.exit(1)
-          t16 = data.decode("utf-16-le", errors="ignore")
-          t8 = data.decode("utf-8", errors="ignore")
-          if "sharedUserId" in t16 or "sharedUserId" in t8:
+          t16 = data.decode("utf-16-le", errors="ignore").lower()
+          t8 = data.decode("utf-8", errors="ignore").lower()
+          if "shareduserid" in t16 or "shareduserid" in t8:
               print("FAIL: sharedUserId string found in APK binary AndroidManifest.xml")
               sys.exit(1)
           print("OK: no sharedUserId in APK binary AndroidManifest.xml")
@@ -491,6 +491,14 @@ jobs:
       # authority, and the debug/release authority pair).
       - name: Provider parity checker self-test
         run: bash scripts/check-provider-parity.test.sh
+      # Artifact-verifier self-test: pins verify-release-artifacts.sh's
+      # fail-fast versionName gate (K4/F-1 regression — fail() must be defined
+      # before its first call) so the release/PR artifact gate fails closed.
+      - name: Test verify-release-artifacts self-test
+        run: |
+          set -e
+          chmod +x scripts/verify-release-artifacts.test.sh
+          ./scripts/verify-release-artifacts.test.sh
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |
@@ -593,6 +601,17 @@ jobs:
           fi
           echo "PASS: GPL containment"
       # Run :app + :core + :hook unit tests. Failures fail the job.
+      # F-7: pin the compileSdk catalog entry to 34. AGP 8.5.2 cannot consume
+      # the compileSdk 37 AAR metadata from io.github.libxposed (gradle.properties
+      # suppresses the AAR minCompileSdk metadata check project-wide — the
+      # documented, accepted risk). If libs.versions.toml drifts off 34 without
+      # the matching AGP/compileSdk upgrade window landing, the build silently
+      # pairs a compileSdk this toolchain cannot verify with those AARs.
+      # Remove this guard together with the gradle.properties suppression in
+      # the AGP/compileSdk 37 window (see gradle.properties note).
+      - name: compileSdk catalog pin (34 — AGP-37 window)
+        run: |
+          grep -E '^compileSdk[[:space:]]*=[[:space:]]*"34"' gradle/libs.versions.toml || { echo 'FAIL: compileSdk drifted from catalog 34 — see gradle.properties note'; exit 1; }
       - name: Unit tests (app, core, hook debug)
         run: |
           chmod +x ./gradlew
