@@ -15,6 +15,10 @@
 # the supply-chain review findings; do not widen it to cover everything
 # (noise defeats review). Branch-protection pairing requirement remains.
 /app/src/main/java/com/galaxydual/plus/GuardXposedProvider.kt @samson910022
+/hook/src/main/java/com/galaxydual/hook/ @samson910022
+/app/src/main/java/com/galaxydual/plus/SuCmdGateway.kt @samson910022
+/app/src/main/java/com/galaxydual/plus/ShizukuCmdGateway.kt @samson910022
+/app/src/main/AndroidManifest.xml @samson910022
 /scripts/check-provider-parity.py @samson910022
 /scripts/check-exported-components.py @samson910022
 /scripts/verify-release-artifacts.sh @samson910022
@@ -35,4 +39,8 @@
 /scripts/parse-apksigner-output.sh @samson910022
 /scripts/check-provider-parity.test.sh @samson910022
 /scripts/check-exported-components.test.sh @samson910022
+/scripts/check-shizuku-provider.py @samson910022
+/scripts/check-shizuku-provider.test.sh @samson910022
+/scripts/verify-release-sha256sums.sh @samson910022
+/scripts/verify-release-sha256sums.test.sh @samson910022
 /scripts/fixtures/ @samson910022

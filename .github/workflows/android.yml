@@ -143,6 +143,40 @@ jobs:
                   ok = False
           sys.exit(0 if ok else 1)
           PY
+      # Parity-checker fixture self-test: every fail-* fixture must exit 1 and
+      # every pass-* fixture must exit 0, proving the provider-node gate fails
+      # closed (wrong-element names, split name/authority, exported=false, an
+      # unexpected android:permission, a foreign provider claiming the pinned
+      # authority, and the debug/release authority pair).
+      - name: Provider parity checker self-test
+        run: bash scripts/check-provider-parity.test.sh
+      - name: Exported-components checker self-test
+        run: |
+          set -e
+          bash scripts/check-exported-components.test.sh
+      # Artifact-verifier self-test: pins verify-release-artifacts.sh's
+      # fail-fast versionName gate (K4/F-1 regression — fail() must be defined
+      # before its first call) so the release/PR artifact gate fails closed.
+      - name: Test verify-release-artifacts self-test
+        run: |
+          set -e
+          chmod +x scripts/verify-release-artifacts.test.sh
+          ./scripts/verify-release-artifacts.test.sh
+      # Shizuku-provider checker self-test: every fail-* fixture must exit 1 and
+      # every pass-* fixture must exit 0, proving the element-scoped
+      # ShizukuProvider gate fails closed (wrong authority, missing/wrong
+      # permission, wrong exported, missing provider).
+      - name: Shizuku-provider checker self-test
+        run: |
+          set -e
+          bash scripts/check-shizuku-provider.test.sh
+      # Release-publish integrity self-test: pins verify-release-sha256sums.sh
+      # (SHA256SUMS.txt verification + attachment-set equality) so the publish
+      # job fails closed before any file is attached to a release.
+      - name: Verify-release-sha256sums self-test
+        run: |
+          set -e
+          bash scripts/verify-release-sha256sums.test.sh
       # Compile all modules (app APK + hook/core AARs). No swallow-echo fallback here:
       # any compilation failure must propagate a nonzero exit code and fail the job.
       # Phase A2: wrapper is committed, so always use ./gradlew (pinned Gradle 8.7).
@@ -503,25 +537,6 @@ jobs:
       # signature regex is caught here, not in a gradle invocation.
       - name: CI retry guard self-test
         run: bash scripts/ci-retry-guard.test.sh
-      # Parity-checker fixture self-test: every fail-* fixture must exit 1 and
-      # every pass-* fixture must exit 0, proving the provider-node gate fails
-      # closed (wrong-element names, split name/authority, exported=false, an
-      # unexpected android:permission, a foreign provider claiming the pinned
-      # authority, and the debug/release authority pair).
-      - name: Provider parity checker self-test
-        run: bash scripts/check-provider-parity.test.sh
-      - name: Exported-components checker self-test
-        run: |
-          set -e
-          bash scripts/check-exported-components.test.sh
-      # Artifact-verifier self-test: pins verify-release-artifacts.sh's
-      # fail-fast versionName gate (K4/F-1 regression — fail() must be defined
-      # before its first call) so the release/PR artifact gate fails closed.
-      - name: Test verify-release-artifacts self-test
-        run: |
-          set -e
-          chmod +x scripts/verify-release-artifacts.test.sh
-          ./scripts/verify-release-artifacts.test.sh
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |
@@ -634,7 +649,7 @@ jobs:
       # the AGP/compileSdk 37 window (see gradle.properties note).
       - name: compileSdk catalog pin (34 — AGP-37 window)
         run: |
-          grep -E '^compileSdk[[:space:]]*=[[:space:]]*"34"' gradle/libs.versions.toml || { echo 'FAIL: compileSdk drifted from catalog 34 — see gradle.properties note'; exit 1; }
+          grep -E "^compileSdk[[:space:]]*=[[:space:]]*[\"']34[\"']" gradle/libs.versions.toml || { echo 'FAIL: compileSdk drifted from catalog 34 — see gradle.properties note'; exit 1; }
       - name: Unit tests (app, core, hook debug)
         run: |
           chmod +x ./gradlew

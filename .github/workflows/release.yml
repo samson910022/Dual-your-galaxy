@@ -334,6 +334,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Check out the repository: the publish gate below re-runs
+      # scripts/verify-release-sha256sums.sh from the repo (pinned wrapper of
+      # the inline check this job used to carry), so the tree must be present.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Download verified APKs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -344,13 +348,7 @@ jobs:
       # here with the APKs); re-verify the bytes about to be attached to the
       # release so a corrupted or tampered artifact never reaches it.
       - name: Verify SHA256SUMS before publish
-        run: |
-          set -euo pipefail
-          cd release-publish
-          sha256sum -c SHA256SUMS.txt
-          extra="$(comm -13 <(awk '{print $NF}' SHA256SUMS.txt | sort -u) <(ls -A | sort) | grep -Fvx 'SHA256SUMS.txt' || true)"
-          if [ -n "$extra" ]; then echo "::error::unlisted file(s) staged for release: $extra"; exit 1; fi
-          echo "PASS: release-publish holds exactly the SHA256SUMS-listed files + SHA256SUMS.txt"
+        run: bash scripts/verify-release-sha256sums.sh
       # Publish a GitHub Release with verified APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

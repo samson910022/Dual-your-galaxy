@@ -1487,6 +1487,28 @@ class PolicyWriteTest {
         await { !vm.state.value.loading }
     }
 
+    // Phase 5 (p24)：live pending 存在時 requestPolicyWrite 被 BUSY 拒絕——
+    // pending 保留（不覆寫）、msg 為 BUSY(INFO)、在途集合不變、store 零觸碰。
+    @Test
+    fun p24_requestPolicyWrite_livePending_isInadmissibleBusy() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        val pending = PendingPolicyWrite(
+            setOf("com.example.a"),
+            System.currentTimeMillis(),
+        )
+        setPendingPolicyWrite(vm, pending)
+        val inFlightBefore = inFlightKeysOf(vm).size
+
+        vm.requestPolicyWrite()
+
+        assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(inFlightBefore, inFlightKeysOf(vm).size)
+        assertEquals(0, fake.saveCalls)
+    }
+
     // Phase 5：harness 已改以 Known 為準（見 makeVm），此處鎖定 Known 載入的
     // 終態：Known＋草稿內容一致（非僅 harness 起步即真）。
     @Test
