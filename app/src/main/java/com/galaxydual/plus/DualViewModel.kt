@@ -1684,15 +1684,20 @@ class DualViewModel(
     // the same way as a success. revBefore == null keeps completeWithRevision
     // (legacy/exempt — see claimForPublish KDoc).
     // Verdict variant: REV_GATE_REJECTED (rev moved before CAS — no claim
-    // consumed; settle as stage-rejected) and CAS_LOSS (a live winner consumed
-    // the claim — loser handling applied here) are distinguished from
-    // inside the commitMutex lock, so callers never re-read committedRevision
-    // to guess why the claim failed. REV_GATE_REJECTED deliberately skips the
-    // loser-follow (no winner exists to follow).
+    // consumed; settle as stage-rejected; the bumping foreign commit is the
+    // "winner" for sync purposes but never identity-matches THIS Tx, so no
+    // useful terminal exists for this claim to follow) and CAS_LOSS (a live
+    // winner consumed the claim — loser handling applied here) are
+    // distinguished from inside the commitMutex lock, so callers never
+    // re-read committedRevision to guess why the claim failed.
+    // REV_GATE_REJECTED deliberately skips the loser-follow: following the
+    // foreign winner's terminal via _latest is possible if it was emitted,
+    // but awaitSettled on THIS Tx would never complete, so it is split out.
     // Stage P2 (PR #60 NEW finding #2): EPOCH_STALE means an ADOPTER exists and
-    // owns convergence — unlike REV_GATE_REJECTED there IS a winner to follow,
-    // so the verdict joins the CAS_LOSS arm: no claim is consumed (no CAS, no
-    // rev bump, no stage) and the loser-follow (SAVING→RECONCILING flip +
+    // owns this Tx's convergence — unlike REV_GATE_REJECTED there IS a
+    // winner here to follow, so the verdict joins the CAS_LOSS arm: no
+    // claim is consumed (no CAS, no rev bump, no stage) and the loser-follow
+    // (SAVING→RECONCILING flip +
     // launchLoserSync → applyAuthoritativeSettled on the adopter's identity-
     // matched terminal) converges this VM read-only. Mapping EPOCH_STALE to the
     // REV_GATE_REJECTED arm stranded live dual-active losers in RECONCILING
@@ -1725,12 +1730,13 @@ class DualViewModel(
             PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
         }
         if (verdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
-            // No claim consumed, no winner to follow — the caller settles the
-            // terminal as stage-rejected. Loser-follow (SAVING→RECONCILING +
-            // launchLoserSync) would wait on a winner that does not exist.
+            // No claim consumed; the foreign commit that bumped the rev is
+            // "a winner" only in rev space — no identity-matched terminal
+            // exists for THIS Tx, so a loser-follow (awaitSettled on this
+            // txId) would wait forever. Settle as stage-rejected instead.
             // EPOCH_STALE deliberately does NOT take this arm: an adopter IS
-            // a winner to follow (identity-matched, read-only), so it falls
-            // through to the CAS_LOSS arm below.
+            // a winner here to follow (identity-matched, read-only), so it
+            // falls through to the CAS_LOSS arm below.
             return verdict
         }
         if (verdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
@@ -4056,19 +4062,19 @@ class DualViewModel(
                         markPolicyUnknownLocked()
                         // Stage P2 (PR #60 NEW finding #2): adoption epoch bump.
                         // This arm is NOT inside commitMutex (init cannot suspend;
-                        // the init tryLock snapshot is released before this CAS),
-                        // so best-effort mutex-ordering here: try commitMutex
+                        // the init tryLock snapshot is released before this CAS).
+                        // Best-effort mutex ordering here: try commitMutex
                         // tryLock — when free, the bump is totally ordered against
                         // every claim's epoch check. When momentarily held, fall
-                        // back to the unlocked bump (still fences every claim that
-                        // linearizes after it, but a claim ALREADY inside
-                        // commitMutex may pass its epoch check before this bump
-                        // lands — the one residual interleaving on this arm,
-                        // fail-open for the stale worker; the coordinator CAS
-                        // still arbitrates ownership, i.e. its publish is lost
-                        // when this VM adopted first. Documented honestly; the
-                        // async locked arm and the busy-waiter arm do order the
-                        // bump inside commitMutex.)
+                        // back to the unlocked bump. Residual interleaving on this
+                        // arm, accurately described: a claim that passed its epoch
+                        // check BEFORE this bump lands still linearizes first and
+                        // may publish — i.e. fail-open for the stale worker in
+                        // that narrow window; the coordinator CAS still arbitrates
+                        // ownership, so the stale worker's publish is nonetheless
+                        // legal under the claim-CAS linearization rule. Documented
+                        // honestly; the async locked arm and the busy-waiter arm
+                        // do order the bump inside commitMutex.)
                         try {
                             if (coordInit.commitMutex.tryLock()) {
                                 try { tx.adoptionEpoch.incrementAndGet() } finally {

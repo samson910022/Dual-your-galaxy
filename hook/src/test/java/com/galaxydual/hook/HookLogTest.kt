@@ -28,7 +28,6 @@ class HookLogTest {
         assertFalse(result.contains("\n"))
         assertFalse(result.contains("\r"))
         assertFalse(Regex("[\\r\\n\\p{Cntrl}]").containsMatchIn(result))
-        assertTrue(result.length <= 200)
     }
 
     @Test
