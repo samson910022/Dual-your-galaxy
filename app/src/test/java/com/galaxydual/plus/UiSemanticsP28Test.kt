@@ -14,6 +14,7 @@
 //   繁中（scope-limited，非全量雙語）。
 package com.galaxydual.plus
 
+import androidx.lifecycle.viewModelScope
 import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.DualRepository
@@ -24,6 +25,7 @@ import com.galaxydual.core.SuElevator
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -39,6 +41,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class UiSemanticsP28Test {
     private lateinit var testDispatcher: TestDispatcher
+    private val vms = mutableListOf<DualViewModel>()
 
     @Before
     fun setUp() {
@@ -48,6 +51,18 @@ class UiSemanticsP28Test {
 
     @After
     fun tearDown() {
+        // CI #306: cancel VM scopes, then drain before Main is reset
+        // (resetMain must stay LAST). The drain pumps the test scheduler on
+        // each poll so Main-bound children resume with CancellationException.
+        for (vm in vms) {
+            try {
+                vm.viewModelScope.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
+        TestDrainSupport.drainBeforeResetMain(vms, pump = { testDispatcher.scheduler.advanceUntilIdle() })
+        vms.clear()
         Dispatchers.resetMain()
     }
 
@@ -91,7 +106,7 @@ class UiSemanticsP28Test {
         hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
         hookDiagnosticGateways = { emptyList() },
         blockText = zhTestBlockText(),
-    )
+    ).also { vms.add(it) }
 
     // writeBlockReason 分支：預設（未就緒 NoOp 回退）——回傳資源鍵。
     @Test
@@ -231,7 +246,7 @@ class UiSemanticsP28Test {
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             blockText = zhTestBlockText(),
-        )
+        ).also { vms.add(it) }
         pumpUntil { !vm.state.value.loading }
         vm.clone("com.example.z")
         pumpUntil { !vm.state.value.loading && vm.state.value.msg.isNotEmpty() }

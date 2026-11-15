@@ -59,6 +59,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -75,6 +76,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DualViewModelTest {
     private lateinit var testDispatcher: TestDispatcher
+    private val vms = mutableListOf<DualViewModel>()
 
     @Before
     fun setUp() {
@@ -84,6 +86,18 @@ class DualViewModelTest {
 
     @After
     fun tearDown() {
+        // CI #306: cancel VM scopes, then drain before Main is reset
+        // (resetMain must stay LAST). The drain pumps the test scheduler on
+        // each poll so Main-bound children resume with CancellationException.
+        for (vm in vms) {
+            try {
+                vm.viewModelScope.cancel()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+        }
+        TestDrainSupport.drainBeforeResetMain(vms, pump = { testDispatcher.scheduler.advanceUntilIdle() })
+        vms.clear()
         Dispatchers.resetMain()
     }
 
@@ -195,7 +209,7 @@ class DualViewModelTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             persistPreference = persist,
-        )
+        ).also { vms.add(it) }
 
     private fun readOnlyVm(fake: FakeGateway, repo: DualRepository): DualViewModel =
         DualViewModel(
@@ -210,7 +224,7 @@ class DualViewModelTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null), MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             blockText = zhTestBlockText(),
-        )
+        ).also { vms.add(it) }
 
     // Select-test rig: fake-backed channel assembly through the
     // assembleChannelFn seam, so select probes run on gatable fakes (see
@@ -265,6 +279,7 @@ class DualViewModelTest {
             persistPreference = persisted::add,
             assembleChannelFn = assemble,
         )
+        vms.add(vm)
         return SelectRig(rootFake, shizukuFake, persisted, vm)
     }
 
@@ -628,6 +643,7 @@ class DualViewModelTest {
             persistPreference = persisted::add,
             assembleChannelFn = assemble,
         )
+        vms.add(vm)
         pumpUntil { vm.state.value.channelReady }
         // F8 same-pref skips the rebuild, so park on a different channel
         // first: the blocking ROOT assembly below is only consulted on a

@@ -207,6 +207,8 @@ class DiagnoseFreshnessPhase5Test {
             } catch (_: Exception) {
             }
         }
+        // CI #306: drain outstanding viewModelScope children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms)
         vms.clear()
         Dispatchers.resetMain()
     }

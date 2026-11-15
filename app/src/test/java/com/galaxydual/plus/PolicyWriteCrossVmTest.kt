@@ -34,6 +34,7 @@ import org.junit.Test
 
 class PolicyWriteCrossVmTest {
     private val vms = mutableListOf<DualViewModel>()
+    private val coords = mutableListOf<PolicyTxCoordinator>()
 
     @Before
     fun setUp() {
@@ -52,9 +53,12 @@ class PolicyWriteCrossVmTest {
             try { vm.dispose() } catch (_: Exception) { }
             try { vm.viewModelScope.cancel() } catch (_: Exception) { }
         }
+        // CI #306: drain outstanding viewModelScope/coordinator children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms, coords)
         vms.clear()
-        Dispatchers.resetMain()
+        coords.clear()
         resetRemotePoisonForTests()
+        Dispatchers.resetMain()
     }
 
     private fun await(timeoutMs: Long = 5_000L, cond: () -> Boolean) {
@@ -132,6 +136,7 @@ class PolicyWriteCrossVmTest {
             policyTxCoordinator = policyTxCoordinator,
         )
         vms.add(vm)
+        if (policyTxCoordinator != null && !coords.contains(policyTxCoordinator)) coords.add(policyTxCoordinator)
         if (policyStore != null && initialDraft != null) {
             await { vm.state.value.policyDraftKnown }
         }
@@ -168,6 +173,7 @@ class PolicyWriteCrossVmTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm2)
+        if (!coords.contains(coord)) coords.add(coord)
         return vm2
     }
 
@@ -589,6 +595,7 @@ class PolicyWriteCrossVmTest {
                 policyTxCoordinator = coord,
             )
             vms.add(vm)
+            if (!coords.contains(coord)) coords.add(coord)
             await { vm.state.value.policyDraftKnown }
             await { !vm.state.value.loading }
             vm.setSourceCatalog(listOf(SourceAppEntry("com.B", "B", 0, false)))

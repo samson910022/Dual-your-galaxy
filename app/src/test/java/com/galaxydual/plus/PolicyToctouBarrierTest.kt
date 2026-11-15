@@ -35,6 +35,7 @@ import org.junit.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PolicyToctouBarrierTest {
     private val vms = mutableListOf<DualViewModel>()
+    private val coords = mutableListOf<PolicyTxCoordinator>()
 
     @Before
     fun setUp() {
@@ -54,9 +55,12 @@ class PolicyToctouBarrierTest {
             } catch (_: Exception) {
             }
         }
+        // CI #306: drain outstanding viewModelScope/coordinator children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms, coords)
         vms.clear()
-        Dispatchers.resetMain()
+        coords.clear()
         resetRemotePoisonForTests()
+        Dispatchers.resetMain()
     }
 
     private fun await(timeoutMs: Long = 5_000L, cond: () -> Boolean) {
@@ -89,6 +93,7 @@ class PolicyToctouBarrierTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm)
+        if (!coords.contains(coord)) coords.add(coord)
         // The init load's loadRaw blocks up to 5 s on releaseIo before the
         // backend answers; the previous 5 s await raced the IO unblock
         // (losing on saturated runners). Give the same condition generous

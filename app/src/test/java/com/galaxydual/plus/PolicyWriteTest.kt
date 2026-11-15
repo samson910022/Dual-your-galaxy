@@ -103,13 +103,15 @@ class PolicyWriteTest {
                 // Best effort: test process is discarded anyway.
             }
         }
+        // CI #306: drain outstanding viewModelScope/coordinator children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms, coords)
         vms.clear()
         for (c in coords) {
             try { c.close() } catch (_: Exception) { }
         }
         coords.clear()
-        Dispatchers.resetMain()
         resetRemotePoisonForTests()
+        Dispatchers.resetMain()
     }
 
     // Activity finish 語義：dispose（disarm＋撤銷擁有的 PREPARING Tx＋關閉 VM 內部
@@ -4569,6 +4571,7 @@ class PolicyWriteTest {
                 policyTxCoordinator = coord,
             )
             vms.add(vm2)
+            if (!coords.contains(coord)) coords.add(coord)
             // 認領 fence：RECONCILING＋pending(B)＋Unknown，不被 init load 覆寫。
             await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
@@ -4677,6 +4680,7 @@ class PolicyWriteTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm2)
+        if (!coords.contains(coord)) coords.add(coord)
         return vm2
     }
 
@@ -6306,6 +6310,7 @@ class PolicyWriteTest {
                 policyTxCoordinator = coord,
             )
             vms.add(vm)
+            if (!coords.contains(coord)) coords.add(coord)
             await { vm.state.value.policyDraftKnown }
             await { !vm.state.value.loading }
             assertNull(activeTxOf(vm))
@@ -6801,6 +6806,7 @@ class PolicyWriteTest {
                 policyTxCoordinator = coord,
             )
             vms.add(vmA)
+            if (!coords.contains(coord)) coords.add(coord)
             await { vmA.state.value.policyDraftKnown }
             await { !vmA.state.value.loading }
             val vmB = makeVm(store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
@@ -7030,6 +7036,7 @@ class PolicyWriteTest {
                 policyTxCoordinator = coord,
             )
             vms.add(vm2)
+            if (!coords.contains(coord)) coords.add(coord)
             await(timeoutMs = 10_000L) { vm2.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
             assertEquals(pendingB, vm2.state.value.pendingPolicyWrite)
             assertFalse(vm2.state.value.policyDraftKnown)

@@ -38,6 +38,8 @@ class PolicyPhase2Test {
         for (vm in vms) {
             try { vm.viewModelScope.cancel() } catch (_: Throwable) { }
         }
+        // CI #306: drain outstanding viewModelScope/coordinator children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms, coords)
         vms.clear()
         for (coord in coords) {
             try { coord.close() } catch (_: Throwable) { }
@@ -81,7 +83,7 @@ class PolicyPhase2Test {
             policyTxCoordinator = coord,
         )
         vms.add(vm)
-        coords.add(coord)
+        if (!coords.contains(coord)) coords.add(coord)
         await { !vm.state.value.loading }
         if (awaitKnown) {
             await { vm.state.value.policyDraftKnown }
