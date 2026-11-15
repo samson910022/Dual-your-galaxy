@@ -1074,7 +1074,7 @@ class DualViewModel(
             try {
                 System.err.println(
                     "[DualViewModel] policy revision sample failed with an authoritative source attached; " +
-                        "failing closed (UNKNOWN_REFRESH) until a verified sample succeeds",
+                        "failing closed / retaining the unresolved terminal until a verified sample succeeds",
                 )
             } catch (_: Throwable) {
             }
@@ -1818,17 +1818,23 @@ class DualViewModel(
     // coordinator present, legacy CAS when null). Call-sites use this so
     // CAS+revision bump+pendingPublish stage atomically under commitMutex,
     // emit happens later via emitTxSettledSnapshot/emitStaged after release.
-    // A3-3 (exemption note): this unconditional form is INTENTIONALLY kept for
-    // call sites that cannot name a base revision (reconciler/late-join terminals
-    // where no revision was observed at IO entry — e.g. adopted cross-VM Txs,
-    // pre-arm aborts). It is safe there because those payloads are non-Known
-    // terminals, or Known terminals backed by a fresh ground-truth read taken
-    // under/after the revision-move gates (revMovedRefresh/staleOutside/
-    // revUnverifiableRefresh) — never an unobserved/stale read — and peers
-    // converge fail-closed (they treat !known/empty payloads as "not truth" and
-    // re-read). Any call site that DID observe a base revision for its IO must
-    // pass it as revBefore via claimForPublishCheckedVerdict so a foreign commit
-    // mid-IO bumps the rev and the terminal is gated exactly like a success.
+    // A3-3 (success-side rev gate): revBefore != null gates the claim on the
+    // revision the caller's IO was authorized against, in the SAME commitMutex
+    // critical section as the CAS (see tryClaimStagedVerdict) — exactly like the
+    // FAILED-terminal arms (claimForPublishCheckedVerdict). A foreign B commit
+    // landing between the caller's IO and this claim bumps committedRevision →
+    // REV_GATE_REJECTED: no claim is consumed, NO loser-follow is applied (no
+    // identity-matched winner exists for THIS Tx), and the caller MUST retain
+    // (Unresolved, no fence clear, no publish; converge via late-join/refresh).
+    // CAS_LOSS/EPOCH_STALE keep the pre-existing loser-follow handling inside
+    // tryClaimStagedVerdict (SAVING→RECONCILING flip + launchLoserSync /
+    // clearObsoleteLocalTx). A false result therefore means EITHER case now —
+    // any caller that skips publishing on false is correct under both, but
+    // callers must NOT claim the rejection is necessarily a CAS loss.
+    // Exceptions (deliberately un-gated): resolveObserverFallback — its read is
+    // ground-truth guarded by the revMovedFb discard and latestForTx replay in
+    // its caller, and threading a revision there would double-gate an
+    // already-retain arm; every other success-side claim site MUST pass revBefore.
     // Stage P2 (PR #60 NEW finding #2): expectedEpoch threads the attach-time
     // Tx.adoptionEpoch snapshot into the claim's commitMutex critical section;
     // a mismatch consumes NOTHING (EPOCH_STALE → false here; inside
@@ -1841,9 +1847,10 @@ class DualViewModel(
     private suspend fun claimForPublish(
         tx: PolicyTx,
         expectedEpoch: Long? = null,
+        revBefore: Long? = null,
     ): Boolean {
         val coord = policyTxCoordinator
-        return if (coord != null) tryClaimPlaceholder(tx, null, expectedEpoch) else tryClaimCoordinatorPublish(tx)
+        return if (coord != null) tryClaimPlaceholder(tx, revBefore, expectedEpoch) else tryClaimCoordinatorPublish(tx)
     }
 
     // A3-3: rev-gated sibling of claimForPublish for FAILED terminals whose IO
@@ -2764,6 +2771,32 @@ class DualViewModel(
         // 終態發布權以 settle-CAS 先行仲裁（見 claimForPublish），此處
         // 僅做擁有者預檢；同一 Tx 被新 VM 認領時舊 handler 與新 handler 競爭發布權，
         // 首個 CAS 成功者勝出發布，敗者跳過（不覆寫勝者 fence）。
+        // A3-3 (success-side rev gate): pre-read revision snapshot — the reads
+        // below are authorized against this rev. A foreign B commit landing mid-read
+        // (before the claim) bumps committedRevision → REV_GATE_REJECTED → every
+        // Success/Mismatch/Failed claim below retains (Unresolved, no fence clear,
+        // no publish); convergence falls to late-join/refresh. -1L with no
+        // authoritative source (legacy null-coordinator) keeps the rev gate opted
+        // out, same convention as the reconciler attach-time snapshots (with
+        // an authoritative source attached a failed sample fail-closes — see
+        // the guard below).
+        // Attach-time sampling may reject a claim whose post-commit Known read
+        // would have been honest ground truth (a foreign commit landing before
+        // our read still rejects) — intentional fail-closed bias; convergence
+        // via refresh/late-join.
+        val revBeforeAutoRecheck = sampledCurrentRevision()
+        // P2-3 (fail-closed broken-sampler guard): an authoritative source is
+        // attached (policyTxCoordinator != null || revisionSamplerForTests != null)
+        // but the sample failed/yielded -1L —
+        // never claim un-gated. Matches the P2-2 broken-sampler precedent
+        // (authoritativeRevisionSample, which aborts fail-closed). -1L only
+        // reaches the verdict call as "gate skipped" (never as a comparison),
+        // so this guard is the complete fix for the hole. The AutoRecheck arm's
+        // unwind is a bare return (fence retained for refresh/late-join).
+        if ((policyTxCoordinator != null || revisionSamplerForTests != null) && revBeforeAutoRecheck == -1L) {
+            noteRevisionSampleFailure()
+            return
+        }
         val read: LoadResult = try {
             val (r, _) = boundedReconcileRead(tx.store)
             r
@@ -2816,7 +2849,12 @@ class DualViewModel(
                     successMsg,
                     tx.isClear,
                 )
-                if (!claimForPublish(tx, attachedEpoch)) return
+                // Success-side rev gate: a foreign B committing mid-IO is
+                // rejected as REV_GATE_REJECTED (nothing consumed, no loser-follow)
+                // — retain, no publish; CAS_LOSS/EPOCH_STALE loses the CAS but
+                // loser-follow already ran inside the claim. Either way: no publish;
+                // converge via late-join/refresh.
+                if (!claimForPublish(tx, attachedEpoch, revBeforeAutoRecheck)) return
                 winnerPublish(tx, successPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
@@ -2861,7 +2899,12 @@ class DualViewModel(
                     tx.txId, tx.key, decision.packages, true, MsgKind.INFO,
                     policyText(PolicyText(PolicyTextKind.REFRESHED)), tx.isClear,
                 )
-                if (!claimForPublish(tx, attachedEpoch)) return
+                // Success-side rev gate: a foreign B committing mid-IO is
+                // rejected as REV_GATE_REJECTED (nothing consumed, no loser-follow)
+                // — retain, no publish; CAS_LOSS/EPOCH_STALE loses the CAS but
+                // loser-follow already ran inside the claim. Either way: no publish;
+                // converge via late-join/refresh.
+                if (!claimForPublish(tx, attachedEpoch, revBeforeAutoRecheck)) return
                 winnerPublish(tx, mismatchPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
@@ -2894,7 +2937,12 @@ class DualViewModel(
                     failedMsg,
                     tx.isClear,
                 )
-                if (!claimForPublish(tx, attachedEpoch)) return
+                // Success-side rev gate: a foreign B committing mid-IO is
+                // rejected as REV_GATE_REJECTED (nothing consumed, no loser-follow)
+                // — retain, no publish; CAS_LOSS/EPOCH_STALE loses the CAS but
+                // loser-follow already ran inside the claim. Either way: no publish;
+                // converge via late-join/refresh.
+                if (!claimForPublish(tx, attachedEpoch, revBeforeAutoRecheck)) return
                 winnerPublish(tx, failedPayload, bump = false) {
                     markPolicyUnknownLocked()
                     _state.update { cur ->
@@ -6996,6 +7044,24 @@ class DualViewModel(
         // adopter's bump consumes as EPOCH_STALE.
         val versionAtStart = policyDraftVersion.get()
         val epochAtStart = tx.adoptionEpoch.get()
+        // Stage L1 P1 / A3-3 (Phase 4): attach-time revision snapshot for
+        // every claim below — taken at launch call time alongside the epoch
+        // snapshot (NOT at coroutine resumption, and NOT re-sampled after the
+        // reconcile reads): a VM dispatched late must not claim with a revision
+        // sampled after another VM's commit. The claim's commitMutex critical
+        // section re-checks committedRevision == revAtAttach; a mismatch
+        // (foreign B committed before/during A's reconcile IO) is rejected as
+        // REV_GATE_REJECTED — no claim consumed, no loser-follow applied —
+        // and this arm retains (settle=false, NO fence clear, NO publish);
+        // convergence falls to late-join/refresh. -1L with no authoritative
+        // source (legacy null-coordinator) keeps the rev gate opted out, same
+        // convention as the epoch snapshot; with a coordinator attached a failed
+        // sample fail-closes (see the guard inside withTimeout).
+        // Attach-time sampling may reject a claim whose post-commit Known read
+        // would have been honest ground truth (a foreign commit landing before
+        // our read still rejects) — intentional fail-closed bias; convergence
+        // via refresh/late-join.
+        val revAtAttach = sampledCurrentRevision()
         handoverScope().launch {
             // Stage N2 P1: unvalidated (PREPARING) Tx must never be joined —
             // it was cancelled before final validation/arm. Abort without any
@@ -7015,6 +7081,21 @@ class DualViewModel(
             try {
                 try {
                     withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS) {
+                        // P2-3 (fail-closed broken-sampler guard): an authoritative
+                        // source is attached (policyTxCoordinator != null ||
+                        // revisionSamplerForTests != null) but the attach-time
+                        // sample failed/yielded -1L — never claim un-gated. Matches
+                        // the P2-2 broken-sampler precedent (authoritativeRevisionSample,
+                        // which aborts fail-closed). -1L only reaches the verdict call
+                        // as "gate skipped" (never as a comparison), so this guard is
+                        // the complete fix for the hole. settle=false = honest
+                        // unresolved: fence/pending/RECONCILING retained, converge via
+                        // late-join/refresh.
+                        if ((policyTxCoordinator != null || revisionSamplerForTests != null) && revAtAttach == -1L) {
+                            noteRevisionSampleFailure()
+                            settle = false
+                            return@withTimeout
+                        }
                         // F1 先 join：已證失敗即短路 FAILED+Unknown（不讀）。
                         val join: Boolean? = try {
                             joinPolicyTxBounded(tx)
@@ -7046,7 +7127,12 @@ class DualViewModel(
                             }
                             // Stage L1 P1: staged claim (placeholder) — atomic completeWithRevision
                             // under commitMutex, hook after CAS before emit.
-                            if (!claimForPublish(tx, epochAtStart)) {
+                            // Success-side rev gate: foreign commit mid-IO →
+                            // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                            // RETAIN (settle=false, no fence clear, no publish);
+                            // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                            // the claim. Either way: no publish; late-join/refresh converges.
+                            if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7171,7 +7257,12 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
-                            if (!claimForPublish(tx, epochAtStart)) {
+                            // Success-side rev gate: foreign commit mid-IO →
+                            // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                            // RETAIN (settle=false, no fence clear, no publish);
+                            // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                            // the claim. Either way: no publish; late-join/refresh converges.
+                            if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7246,7 +7337,12 @@ class DualViewModel(
                                 }
                                 settle = false
                             } else {
-                                if (!claimForPublish(tx, epochAtStart)) {
+                                // Success-side rev gate: foreign commit mid-IO →
+                                // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                                // RETAIN (settle=false, no fence clear, no publish);
+                                // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                                // the claim. Either way: no publish; late-join/refresh converges.
+                                if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                     settle = false
                                     return@withTimeout
                                 }
@@ -7448,6 +7544,24 @@ class DualViewModel(
         // adopter's bump consumes as EPOCH_STALE.
         val versionAtStart = policyDraftVersion.get()
         val epochAtStart = tx.adoptionEpoch.get()
+        // Stage L1 P1 / A3-3 (Phase 4): attach-time revision snapshot for
+        // every claim below — taken at launch call time alongside the epoch
+        // snapshot (NOT at coroutine resumption, and NOT re-sampled after the
+        // reconcile reads): a VM dispatched late must not claim with a revision
+        // sampled after another VM's commit. The claim's commitMutex critical
+        // section re-checks committedRevision == revAtAttach; a mismatch
+        // (foreign B committed before/during A's reconcile IO) is rejected as
+        // REV_GATE_REJECTED — no claim consumed, no loser-follow applied —
+        // and this arm retains (settle=false, NO fence clear, NO publish);
+        // convergence falls to late-join/refresh. -1L with no authoritative
+        // source (legacy null-coordinator) keeps the rev gate opted out, same
+        // convention as the epoch snapshot; with a coordinator attached a failed
+        // sample fail-closes (see the guard inside withTimeout).
+        // Attach-time sampling may reject a claim whose post-commit Known read
+        // would have been honest ground truth (a foreign commit landing before
+        // our read still rejects) — intentional fail-closed bias; convergence
+        // via refresh/late-join.
+        val revAtAttach = sampledCurrentRevision()
         handoverScope().launch {
             if (!canJoinTx(tx)) {
                 abortUnarmedTx(tx)
@@ -7458,6 +7572,21 @@ class DualViewModel(
             try {
                 try {
                     withTimeout(POLICY_RECONCILE_TOTAL_BUDGET_MS) {
+                        // P2-3 (fail-closed broken-sampler guard): an authoritative
+                        // source is attached (policyTxCoordinator != null ||
+                        // revisionSamplerForTests != null) but the attach-time
+                        // sample failed/yielded -1L — never claim un-gated. Matches
+                        // the P2-2 broken-sampler precedent (authoritativeRevisionSample,
+                        // which aborts fail-closed). -1L only reaches the verdict call
+                        // as "gate skipped" (never as a comparison), so this guard is
+                        // the complete fix for the hole. settle=false = honest
+                        // unresolved: fence/pending/RECONCILING retained, converge via
+                        // late-join/refresh.
+                        if ((policyTxCoordinator != null || revisionSamplerForTests != null) && revAtAttach == -1L) {
+                            noteRevisionSampleFailure()
+                            settle = false
+                            return@withTimeout
+                        }
                         val join: Boolean? = try {
                             joinPolicyTxBounded(tx)
                         } catch (e: CancellationException) {
@@ -7486,7 +7615,12 @@ class DualViewModel(
                                 settle = false
                                 return@withTimeout
                             }
-                            if (!claimForPublish(tx, epochAtStart)) {
+                            // Success-side rev gate: foreign commit mid-IO →
+                            // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                            // RETAIN (settle=false, no fence clear, no publish);
+                            // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                            // the claim. Either way: no publish; late-join/refresh converges.
+                            if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7615,7 +7749,12 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
-                            if (!claimForPublish(tx, epochAtStart)) {
+                            // Success-side rev gate: foreign commit mid-IO →
+                            // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                            // RETAIN (settle=false, no fence clear, no publish);
+                            // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                            // the claim. Either way: no publish; late-join/refresh converges.
+                            if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7692,7 +7831,12 @@ class DualViewModel(
                                 }
                                 settle = false
                             } else {
-                                if (!claimForPublish(tx, epochAtStart)) {
+                                // Success-side rev gate: foreign commit mid-IO →
+                                // REV_GATE_REJECTED (nothing consumed, no loser-follow) →
+                                // RETAIN (settle=false, no fence clear, no publish);
+                                // CAS_LOSS/EPOCH_STALE → loser-follow already applied inside
+                                // the claim. Either way: no publish; late-join/refresh converges.
+                                if (!claimForPublish(tx, epochAtStart, revAtAttach)) {
                                     settle = false
                                     return@withTimeout
                                 }
@@ -7977,10 +8121,13 @@ class DualViewModel(
                             }
                             return@launch
                         }
-                        if (!claimForPublish(txSnap, epochSnap)) {
-                            // Claim failed — lost the CAS to a concurrent winner, or
-                            // EPOCH_STALE (the Tx was adopted after this snapshot):
-                            // nothing consumed; the adopter owns convergence.
+                        // Phase 4 (success-side rev gate): a foreign B commit landing
+                        // between the revMovedRefresh sample and this claim (e.g. inside
+                        // the lateJoinOk await above) is rejected as REV_GATE_REJECTED —
+                        // nothing consumed, no loser-follow applied. CAS_LOSS/EPOCH_STALE
+                        // keep the pre-existing handling: loser-follow inside the claim
+                        // (or the adopter owns convergence). Either way: no publish.
+                        if (!claimForPublish(txSnap, epochSnap, revBeforeRefresh)) {
                             return@launch
                         }
                     } else if (activePolicyTx.get() !== txSnap) {
@@ -9204,18 +9351,30 @@ class DualViewModel(
                                 return@withLock
                             }
                             val pcFast = preClaimTx
-                            if (pcFast != null && !claimForPublish(pcFast)) {
+                            if (pcFast != null && !claimForPublish(pcFast, null, pendingAtCall.baseCoordinatorRevision)) {
                                 try { ackJob.cancel() } catch (_: Exception) { }
                                 preClaimTx = null
                                 if (writeLocked) {
                                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                     writeLocked = false
                                 }
-                                // 成功側 claimForPublish 的 revBefore=null 恆為 unconditional
-                                // CAS；reject 只可能是 CAS-loss＝有 live winner 消費了 claim
-                                // —— loser handling（SAVING→RECONCILING＋launchLoserSync）
-                                // 已在 tryClaimStagedVerdict 內完成，本 VM 跟隨 winner 收斂即可，
-                                // 不得在此 abort 至 UNKNOWN_REFRESH（會蓋掉 winner 終態）。
+                                // Phase 4：成功側 claimForPublish 的 revBefore 為
+                                // pendingAtCall.baseCoordinatorRevision（save IO 開始時
+                                // 已再驗證 committedRevision == base）——save IO 期間有外來 B
+                                // 落盤會 bump committedRevision → REV_GATE_REJECTED（不消費
+                                // claim、無 loser-follow）；reject 亦可能是 CAS_LOSS/
+                                // EPOCH_STALE（有 live winner，loser handling——SAVING→
+                                // RECONCILING＋launchLoserSync——已在 tryClaimStagedVerdict
+                                // 內完成，本 VM 跟隨 winner 收斂）。兩者皆不可在此 publish。
+                                // On REV_GATE_REJECTED the claim consumes nothing;
+                                // local + coordinator fences are retained (activePolicyTx /
+                                // coord.activeTx untouched), the shared fail-closed finally
+                                // removes this op's keys (inFlightWrites/policyWriteSaving)
+                                // and stamps Unknown/IDLE (UNKNOWN_REFRESH), and the retained
+                                // fence converges via refresh late-join or the next refresh.
+                                // On CAS_LOSS/EPOCH_STALE, loser-follow inside the claim already
+                                // converged (fence cleared or RECONCILING + loser-follow); do not
+                                // add handling here. No publish happens.
                                 return@withLock
                             }
                             val isRefresh = policyRevisionStale.get() ||
@@ -9445,9 +9604,14 @@ class DualViewModel(
     // deleted by design — this is an explicit user delete, not a blind write,
     // and rev-gating the clear against the pre-IO base would wedge permanently
     // under dual-app sync (the other app keeps advancing committedRevision).
-    // The rev gate exists only on the FAILED placeholder terminals
-    // (confirm/clear/repair) and the repair success claim; the clear/
-    // save success side is intentionally unrev-gated. See docs/ARCHITECTURE.md
+    // Since Phase 4 this success side IS rev-gated: the save fast path claims
+    // with pendingAtCall.baseCoordinatorRevision and the clear fast path with
+    // clearRevBefore; autoRecheck, both reconcilers (attach-time samples),
+    // the refresh late-join claim and the repair success arm with
+    // repairRevBefore are likewise gated.
+    // resolveObserverFallback is the sole remaining deliberately-exempt
+    // success-side claim (spec carve-out) — see the claimForPublish KDoc.
+    // See docs/ARCHITECTURE.md
     // §政策寫入流程 and the A3-3 claim sites.
     // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／freshGen
     // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
@@ -10194,17 +10358,28 @@ class DualViewModel(
                             return@withLock
                         }
                         val pcClearFast = preClaimTx
-                        if (pcClearFast != null && !claimForPublish(pcClearFast)) {
+                        if (pcClearFast != null && !claimForPublish(pcClearFast, null, clearRevBefore)) {
                             try { ackJob.cancel() } catch (_: Exception) { }
                             preClaimTx = null
                             if (writeLocked) {
                                 try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                 writeLocked = false
                             }
-                            // 成功側 claimForPublish 的 revBefore=null 恆為 unconditional
-                            // CAS；reject 只可能是 CAS-loss＝live winner 消費 claim
-                            // （loser handling 已在 tryClaimStagedVerdict 內完成）—— 跟隨
-                            // winner 收斂，不得 abort 至 UNKNOWN_REFRESH。
+                            // Phase 4：成功側 claimForPublish 的 revBefore 為 clearRevBefore
+                            // （clear IO 開始前的權威修訂；與 FAILED arm 同一取樣值）——clear IO
+                            // 期間有外來 B 落盤會 bump committedRevision → REV_GATE_REJECTED
+                            // （不消費 claim、無 loser-follow）；reject 亦可能是 CAS_LOSS/
+                            // EPOCH_STALE（有 live winner，loser handling 已在
+                            // tryClaimStagedVerdict 內完成）。兩者皆不可在此 publish。
+                            // On REV_GATE_REJECTED the claim consumes nothing;
+                            // local + coordinator fences are retained (activePolicyTx /
+                            // coord.activeTx untouched), the shared fail-closed finally
+                            // removes this op's keys (inFlightWrites/policyWriteSaving)
+                            // and stamps Unknown/IDLE (UNKNOWN_REFRESH), and the retained
+                            // fence converges via refresh late-join or the next refresh.
+                            // On CAS_LOSS/EPOCH_STALE, loser-follow inside the claim already
+                            // converged (fence cleared or RECONCILING + loser-follow); do not
+                            // add handling here. No publish happens.
                             return@withLock
                         }
                         val finalDraft = if (ackRead is LoadResult.Known && ackRead.packages.isNotEmpty()) {
@@ -11507,7 +11682,12 @@ class DualViewModel(
                                         PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
                                     }
                                 } else {
-                                    if (claimForPublish(pcFast)) {
+                                    // Legacy null-coordinator path: no authoritative revision
+                                    // exists, so the rev gate is a documented no-op here
+                                    // (claimForPublish ignores revBefore without a coordinator);
+                                    // the coordinator path above rev-gates directly via
+                                    // completeWithRevisionCheckedVerdict(..., repairRevBefore).
+                                    if (claimForPublish(pcFast, null, repairRevBefore)) {
                                         PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
                                     } else {
                                         PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS

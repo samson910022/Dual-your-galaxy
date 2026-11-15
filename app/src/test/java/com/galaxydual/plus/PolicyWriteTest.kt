@@ -13783,4 +13783,288 @@ class PolicyWriteTest {
             }
         }
     }
+
+    // Phase 4 (A3-3 success-side rev gate): a foreign B commit landing between
+    // A's ground-truth read and A's Success claim MUST reject the claim on the
+    // rev gate — A consumed nothing, `_latest` never carries A's stale payload,
+    // and A retains RECONCILING (converge via late-join/refresh) instead of
+    // publishing over B. `coord.bumpRevisionForTests()` models B's concurrent
+    // commit (same seam the TOCTOU barrier tests use).
+    //
+    // Deterministic landing spot: the armed confirm reconciler runs FIRST and
+    // exits RETAIN before the save completes (GATE_PARK parks every read; with
+    // the deferred incomplete its read budget is spent → unresolved outside →
+    // REFRESH_FAILED retain). Only then do we complete the save → the armed
+    // Tx's deferred completes → attachDeferredAutoRecheck's invokeOnCompletion
+    // fires autoRecheckTx, whose single boundedReconcileRead parks at
+    // GATE_FB_PARK with revBeforeAutoRecheck already sampled (=0L). Just before
+    // releasing that read we bump the revision (foreign B); A's read then
+    // returns Known("com.B") == sanitized with the deferred complete → the
+    // Success arm builds its real payload and attempts claimForPublish, which
+    // must now be REJECTED as REV_GATE_REJECTED (revBefore 0L != committed 1L,
+    // observed inside the claim's commitMutex critical section). The reconciler
+    // is provably dead at this point, so autoRecheckTx's Success arm is the
+    // ONLY live claimant — the test pins that arm specifically.
+    @Test
+    fun v1_successClaim_foreignRevMoveBeforeClaim_claimRetained_neverPublishesStaleSuccess() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val unresolvedRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fbReadEntered = java.util.concurrent.CountDownLatch(1)
+        val fbReadRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val readGate = java.util.concurrent.atomic.AtomicInteger(GATE_OPEN)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when {
+                    // Unresolved window: park every read until the reconciler's
+                    // budget is spent and it exits RETAIN.
+                    readGate.get() == GATE_PARK -> {
+                        while (!unresolvedRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    // autoRecheck window: the armed Tx's ground-truth read parks;
+                    // releasing it yields Known("com.B") — the pre-foreign-B-commit
+                    // ground truth — to the Success decision.
+                    readGate.get() == GATE_FB_PARK -> {
+                        fbReadEntered.countDown()
+                        while (!fbReadRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    else -> backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCount.incrementAndGet()
+                saveStarted.countDown()
+                // Blocking save (f2-style): never lands until the test releases it.
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 2_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(
+                setOf("com.B"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vmA, pendingB)
+            readGate.set(GATE_PARK)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // The save never lands within policyIoTimeoutMs → handover: VM-A goes
+            // RECONCILING with the fence held and the confirm reconciler armed.
+            await(timeoutMs = 15_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+            }
+            val txA = activeTxOf(vmA)
+            assertNotNull(txA)
+            assertSame(txA, coordinatorTxOf(coord))
+            // Reads stay parked; the deferred never completes while the save is
+            // blocked → the reconciler spends its read budget with the deferred
+            // incomplete → unresolved outside → RETAIN with REFRESH_FAILED.
+            await(timeoutMs = 15_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    vmA.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText() &&
+                    !vmA.state.value.policyDraftKnown
+            }
+            // Reconciler is dead; let any straggler parked threads return (their
+            // values are discarded by their callers).
+            unresolvedRelease.set(true)
+            // Park the autoRecheck read (the only live reader now, modulo straggler parks, which pass through on release).
+            readGate.set(GATE_FB_PARK)
+            // Complete the save: backend persists com.B, the armed Tx's deferred
+            // completes, and attachDeferredAutoRecheck's invokeOnCompletion fires.
+            saveRelease.set(true)
+            assertTrue(fbReadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val samplePoint = coord.currentRevision()
+            assertEquals(0L, samplePoint) // rev gate base: A sampled revBeforeAutoRecheck == 0L
+            // Foreign B commits before A's claim lands (bump committedRevision
+            // without a Tx — the same seam the TOCTOU barrier tests use).
+            assertEquals(1L, coord.bumpRevisionForTests())
+            // Release A's ground-truth read: Known(com.B) == sanitized, deferred
+            // completes, ok == true → Success decision → claim attempt.
+            fbReadRelease.set(true)
+            // Negative window (direction-safe: a regression — A publishes — lands
+            // inside this window and fails the asserts below; absence proofs have
+            // no signal to await).
+            Thread.sleep(500)
+            // A consumed nothing: the rev gate fired before any CAS/bump/stage.
+            assertEquals(1L, coord.currentRevision())
+            // The arm never stages, so this returns instantly; the bounded await
+            // fences the invariant instead of a bare assert.
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
+            // _latest never carries A's stale Success payload.
+            assertNull(coord.latest.value)
+            // A retained RECONCILING with the fence held (autoRecheckTx's retain
+            // arm — no settle, no publish, no fence clear).
+            assertEquals(PolicyWritePhase.RECONCILING, vmA.state.value.policyWritePhase)
+            assertEquals(PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(), vmA.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+            assertSame(txA, activeTxOf(vmA)) // local fence held, identity unchanged
+            assertSame(txA, coordinatorTxOf(coord)) // coordinator fence still ours — claim never consumed
+            assertTrue(
+                "RECONCILING fence must stay registered for the retained Tx",
+                reconcilingKeysOf(vmA).any { it.startsWith("policy-write:") },
+            )
+            assertEquals(1, saveCount.get())
+        } finally {
+            saveRelease.set(true)
+            unresolvedRelease.set(true)
+            fbReadRelease.set(true)
+            readGate.set(GATE_OPEN)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+    // Phase 4 (P2-3 fail-closed broken-sampler guard, confirm reconciler
+    // attach-time guard): a NON-NULL coordinator whose revision source cannot
+    // be sampled (throws) makes the confirm reconciler attach-time snapshot
+    // unverifiable. The guard fires at the reconciler prologue INSIDE
+    // withTimeout (revAtAttach == -1L with an authoritative source attached is
+    // unverifiable, NOT rev-gate-opt-out): settle=false and an immediate
+    // return — before any read, before any claim. The blocking save never
+    // lands, so the deferred never completes and the RECONCILING fence stays
+    // held (no publish, no settle, no fence clear); pending stays; the phase
+    // stays RECONCILING. This pins the fail-closed GUARD, NOT the rev gate —
+    // the guard never reaches the read loop, so the v1-style REFRESH_FAILED
+    // terminal is never stamped (msg keeps the confirm-timeout CHANNEL text).
+    // Discriminator: with the guard missing, the reconciler proceeds past its
+    // prologue and first performs joinPolicyTxBounded(tx) — withTimeout(policyIoTimeoutMs)
+    // on the never-completing deferred (~500ms at the 500ms timeout this VM is built
+    // with) — then POLICY_RECONCILE_INITIAL_DELAY_MS (500ms), and only then issues its
+    // first boundedReconcileRead (≈launch+1000ms, comfortably inside the 2000ms negative
+    // window below). The discriminator is valid because the join + delay sum (~1s at
+    // 500ms) elapses inside that window, so `calls` would move past 1 — direction-safe
+    // window, the regression lands inside it. (At the pre-fix 2000ms timeout the join
+    // alone closed the negative window ~480ms before the first read could fire, so the
+    // assert could not discriminate.)
+    // Sampler install site mirrors the PolicyRepairAbortTest P2-2 precedent
+    // (after the VM is built and Known, before the action — never before
+    // construction, or init's own samples fail closed and RECONCILING is
+    // never reached).
+    @Test
+    fun v1_successClaim_brokenSampler_attachGuardRetains_neverPublishes() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val saveStarted = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Pass-through reads (no parking gate needed): RECONCILING stability
+        // comes from the blocking save's incomplete deferred, not from blocking
+        // reads — the attach-guard returns before the read loop, so no read is
+        // ever issued on the retained path.
+        val store = HookPolicyStore(
+            loadRaw = {
+                calls.incrementAndGet()
+                backend.get()
+            },
+            saveRaw = { raw ->
+                saveCount.incrementAndGet()
+                saveStarted.countDown()
+                // Blocking save (f2-style): never lands until the test releases it.
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        var vmA: DualViewModel? = null
+        try {
+            vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 500, policyTxCoordinator = coord)
+            await { vmA!!.state.value.policyDraftKnown }
+            // Go unverifiable at the reconciler-attach point (P2-2 precedent).
+            // The confirm pre-IO probes read committedRevision directly (never
+            // the sampler) and the blocking save parks, so RECONCILING is still
+            // reachable; only the attach-time sample and the guard observe the
+            // broken source.
+            vmA!!.revisionSamplerForTests = { throw IllegalStateException("sampler down") }
+            val pendingB = PendingPolicyWrite(
+                setOf("com.B"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vmA!!, pendingB)
+            vmA!!.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // The save never lands within policyIoTimeoutMs → handover: VM-A goes
+            // RECONCILING with the fence held and the confirm reconciler armed.
+            // revAtAttach (sampled at launchConfirmReconciler call time) is -1L;
+            // the attach-time guard inside withTimeout fires at the prologue.
+            await(timeoutMs = 15_000L) {
+                vmA!!.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+            }
+            val txA = activeTxOf(vmA!!)
+            assertNotNull(txA)
+            assertSame(txA, coordinatorTxOf(coord))
+            // Negative window: with the guard missing, the reconciler spends
+            // joinPolicyTxBounded (policyIoTimeoutMs = 500ms) + the initial 500ms
+            // delay, landing its first boundedReconcileRead at ≈launch+1000ms —
+            // comfortably inside this 2000ms window (direction-safe — the
+            // regression lands inside it; at the pre-fix 2000ms timeout the join
+            // alone outlasted the window and the assert could not discriminate).
+            Thread.sleep(2_000)
+            // The guard fired at the prologue: the reconciler never issued a read.
+            assertEquals(1, calls.get())
+            // A consumed nothing: no claim, no publish, rev never bumped.
+            assertEquals(0L, coord.currentRevision())
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
+            // _latest never carries A's Success payload.
+            assertNull(coord.latest.value)
+            // A retained RECONCILING with the fence held (the attach-guard's
+            // retain: settle=false — no settle, no fence clear, no publish).
+            assertEquals(PolicyWritePhase.RECONCILING, vmA!!.state.value.policyWritePhase)
+            assertEquals(MsgKind.CHANNEL, vmA!!.state.value.msgKind)
+            assertFalse(vmA!!.state.value.policyDraftKnown)
+            assertEquals(pendingB, vmA!!.state.value.pendingPolicyWrite)
+            assertSame(txA, activeTxOf(vmA!!)) // local fence held, identity unchanged
+            assertSame(txA, coordinatorTxOf(coord)) // coordinator fence still ours — claim never consumed
+            assertTrue(
+                "RECONCILING fence must stay registered for the retained Tx",
+                reconcilingKeysOf(vmA!!).any { it.startsWith("policy-write:") },
+            )
+            assertEquals(1, saveCount.get())
+        } finally {
+            saveRelease.set(true)
+            try {
+                // Reset the seam before tearDown drains (the suite's drain
+                // convention): the released save completes the deferred and
+                // fires the autoRecheck arm, whose samples must not fail closed
+                // while the test process tears down.
+                vmA?.revisionSamplerForTests = null
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
 }
