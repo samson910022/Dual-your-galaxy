@@ -2666,7 +2666,7 @@ class MainActivity : ComponentActivity() {
                             MAX_CLONED_ROWS,
                         )
                     } catch (_: Exception) {
-                        "…等共 ${s.cloned.size} 項，僅顯示前 $MAX_CLONED_ROWS 項"
+                        "…等共 ${s.cloned.size} 項，僅顯示前 $MAX_CLONED_ROWS 項" // JVM-test seam (keys exist in all 3 locales); production reads resources
                     }
                     textSize = 12f
                     setTextColor(getColor(R.color.oneui_text_secondary))
@@ -4240,7 +4240,7 @@ class MainActivity : ComponentActivity() {
                     val announce = try {
                         getString(R.string.policy_write_saving_announce)
                     } catch (_: Exception) {
-                        "政策寫入中"
+                        "政策寫入中" // JVM-test seam (keys exist in all 3 locales); production reads resources
                     }
                     policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
                 } catch (_: Exception) {
@@ -4458,7 +4458,7 @@ class MainActivity : ComponentActivity() {
                 val denied = try {
                     getString(R.string.policy_write_cancel_denied)
                 } catch (_: Exception) {
-                    "寫入中，無法取消"
+                    "寫入中，無法取消" // JVM-test seam (keys exist in all 3 locales); production reads resources
                 }
                 try {
                     Toast.makeText(this, denied, Toast.LENGTH_SHORT).show()
@@ -4493,7 +4493,7 @@ class MainActivity : ComponentActivity() {
                 val notice = try {
                     getString(R.string.policy_write_saving_announce)
                 } catch (_: Exception) {
-                    "政策寫入中"
+                    "政策寫入中" // JVM-test seam (keys exist in all 3 locales); production reads resources
                 }
                 try {
                     Toast.makeText(this, notice, Toast.LENGTH_SHORT).show()
@@ -4502,7 +4502,9 @@ class MainActivity : ComponentActivity() {
                 }
                 return@setOnClickListener
             }
-            try { vm.refreshPolicyDraft() } catch (_: Exception) { }
+            try { vm.refreshPolicyDraft() } catch (e: Exception) {
+                Log.w(TAG, "neutral refresh failed: " + HookLog.shortEx(e))
+            }
             policyWriteDismissedForReconcilingGen = pending.generation
             try { policyWriteDialog?.dismiss() } catch (_: Exception) { }
             policyWriteDialog = null; shownPolicyWrite = null; shownPolicyWriteSaving = false
@@ -4521,7 +4523,7 @@ class MainActivity : ComponentActivity() {
                 val announce = try {
                     getString(R.string.policy_write_saving_announce)
                 } catch (_: Exception) {
-                    "政策寫入中"
+                    "政策寫入中" // JVM-test seam (keys exist in all 3 locales); production reads resources
                 }
                 policyWriteDialog?.window?.decorView?.announceForAccessibility(announce)
             } catch (_: Exception) {
@@ -4593,7 +4595,7 @@ class MainActivity : ComponentActivity() {
                     shown.size,
                 )
             } catch (_: Exception) {
-                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項"
+                "…等共 ${sorted.size} 項，僅顯示前 ${shown.size} 項" // JVM-test seam (keys exist in all 3 locales); production reads resources
             }
             lines.add(more)
         }
@@ -4681,7 +4683,7 @@ class MainActivity : ComponentActivity() {
                 pending.packages.size,
             )
         } catch (_: Exception) {
-            "政策寫入（${pending.packages.size} 項）"
+            "政策寫入（${pending.packages.size} 項）" // JVM-test seam (keys exist in all 3 locales); production reads resources
         }
         if (pending.droppedCount > 0) {
             val droppedSuffix = try {
@@ -4691,7 +4693,7 @@ class MainActivity : ComponentActivity() {
                     pending.droppedCount,
                 )
             } catch (_: Exception) {
-                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選" // JVM-test seam (keys exist in all 3 locales); production reads resources
             }
             message += "\n$droppedSuffix"
         }
@@ -6662,9 +6664,9 @@ internal fun policyDialogShouldBeCancelable(saving: Boolean, reconciling: Boolea
 internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
     storedGeneration != pendingGeneration
 
-internal fun policyWriteBusySuffix(policyOp: Boolean, policySaving: Boolean): String = when {
-    policySaving -> "\n（寫入中…）"
-    policyOp -> "\n（等待中…）"
+internal fun policyWriteBusySuffix(policyOp: Boolean, policySaving: Boolean): String = when { // JVM-test seam (keys exist in all 3 locales); production reads resources
+    policySaving -> "\n（寫入中…）" // JVM-test seam (keys exist in all 3 locales); production reads resources
+    policyOp -> "\n（等待中…）" // JVM-test seam (keys exist in all 3 locales); production reads resources
     else -> ""
 }
 
@@ -6700,34 +6702,34 @@ internal fun policyWriteVisibleList(
 internal fun policyWriteExpandedShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
     storedGeneration != pendingGeneration
 
-internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean): String =
+internal fun policyWriteListCdFallback(total: Int, shown: Int, expanded: Boolean): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
     // Stage L4: 超限展開仍視截斷（display≡inspectability：expanded 僅 200，
     // 不得謊稱完整）。expanded 僅 total<=200 才回完整，否則一律截斷。
-    if ((expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shown) "政策包名列表，共 $total 項"
-    else "政策包名列表，共 $total 項，僅顯示前 $shown 項"
+    if ((expanded && total <= POLICY_DIALOG_DISPLAY_MAX) || total <= shown) "政策包名列表，共 $total 項" // JVM-test seam (keys exist in all 3 locales); production reads resources
+    else "政策包名列表，共 $total 項，僅顯示前 $shown 項" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
-internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String =
+internal fun policyWriteToggleLabelFallback(expanded: Boolean, total: Int, shown: Int): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
     // display≡inspectability：收合態超限不得謊稱「顯示全部」，複用 capped 語義。
     if (!expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteShowAllCappedFallback(total, shown)
-    else if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）"
+    else if (expanded) "收合（僅顯示前 $shown 項）" else "顯示全部（共 $total 項）" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
-internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String =
+internal fun policyWriteToggleAnnounceFallback(expanded: Boolean, total: Int, shown: Int): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
     // display≡inspectability：展開態超限不得謊稱「完整清單」，複用 capped 語義。
     if (expanded && total > POLICY_DIALOG_DISPLAY_MAX) policyWriteExpandedAnnounceCappedFallback(total, shown)
-    else if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項"
+    else if (expanded) "已展開完整清單，共 $total 項" else "已收合，僅顯示前 $shown 項" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
 // Stage L4 capped variants fallback（超限時 Toggle/播報複用收合語義）：
 // - show_all_capped：收合按鈕超限文案（共 N 項，僅示前 200，超限須縮減；寫入整組取代）。
 // - expanded_announce_capped：展開播報超限文案（已展開前 200，共 N，超限須縮減；寫入整組取代）。
 // - over_cap_warning：dialog 超限警告（共 N，僅示前 200，單次 ≤200；寫入整組取代、不合併）。
-internal fun policyWriteShowAllCappedFallback(total: Int, shown: Int): String =
-    "顯示前 $shown 項（共 $total 項，超限須縮減；寫入整組取代）"
+internal fun policyWriteShowAllCappedFallback(total: Int, shown: Int): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
+    "顯示前 $shown 項（共 $total 項，超限須縮減；寫入整組取代）" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
-internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): String =
-    "已展開前 $shown 項，共 $total 項，超限須縮減；寫入整組取代"
+internal fun policyWriteExpandedAnnounceCappedFallback(total: Int, shown: Int): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
+    "已展開前 $shown 項，共 $total 項，超限須縮減；寫入整組取代" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
-internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String =
-    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤$shown 項，以確保逐項可檢視確認"
+internal fun policyWriteOverCapWarningFallback(total: Int, shown: Int): String = // JVM-test seam (keys exist in all 3 locales); production reads resources
+    "超出單次可檢視上限（共 $total 項，僅顯示前 $shown 項）。每次寫入皆整組取代草稿（不合併累加）：請將單次政策控制在 ≤$shown 項，以確保逐項可檢視確認" // JVM-test seam (keys exist in all 3 locales); production reads resources
 
 // Stage L4 fix(a) 修復模式標籤：Corrupt 下按鈕重貼 repair 文案＋CD。
 // 路由 single source 已移至 DualViewModel.kt

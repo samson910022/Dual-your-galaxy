@@ -6901,6 +6901,13 @@ class DualViewModel(
     // 此處以前置寬鬆文法過濾顯示/寫入快照，真正消毒仍由 confirm sanitizeHookPolicy
     // 兜底），非法 token 計入 dropped（與 catalog 缺失同口徑），不連坐整包。
     private fun selectedPackagesForPolicy(): Pair<Set<String>, Int> {
+        // 套件粒度（package-granularity）為刻意設計：白名單本身就是以 packageName
+        // 為粒度，同一包名可由兩個 serial 各自被勾選（serial:foo ×2），經 mapNotNull
+        // 後於 toSet() 靜默塌縮為一個 foo —— 此塌縮是語意本身，不是遺漏計數。
+        // 因此「塌縮掉幾個」刻意不另計數、也不對使用者呈現：droppedCount 的語意是
+        // 「因 catalog 缺失／非法文法而未寫入的勾選項」，若把同包跨 serial 塌縮
+        // 也算進去會複製 droppedCount 的語意、造成雙重扣項。此資訊不具使用者行動
+        // 價值（寫入結果與刪除包清單無差異），刻意不 surface（非 user-facing）。
         val catalog = _state.value.sourceCatalog
         val byKey = catalog.associateBy { it.appKey }
         val byPackageFirst = catalog.groupBy { it.packageName }
@@ -8436,6 +8443,16 @@ class DualViewModel(
 
     // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。
     fun requestPolicyWrite() {
+        // pending 的確認寫入排隊中時不得靜默 supersede 它 —— 明確拒絕
+        // （BUSY），與 clear 的 A3-5 對稱門控同形：狀態保持（pending 保留，
+        // 待使用者確認或取消後再建新 pending），避免覆蓋活躍 QUEUED pending 的
+        // ack 綁定（request 不得干擾已展示的確認對話框）。
+        if (_state.value.pendingPolicyWrite != null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
         // 5.1.1:不再以全域 loading 旗標阻擋新請求 (refresh/其他操作進行中
         // 仍可開啟確認對話框),但若政策寫入 confirm 正在進行中則拒絕,避免
         // 併發寫入造成 UI/store 不一致 (opMutex 之外仍有 inFlight 去重)。
@@ -9174,6 +9191,23 @@ class DualViewModel(
                             return@withLock
                         }
                     }
+                    // QUEUED→SAVING flip（confirmPolicyWrite）：關於「QUEUED 相位
+                    // 滯留且 VM 隨即死亡」為何不可達——
+                    // 1) confirmPolicyWrite 由使用者在對話框上按「確認寫入」同步觸發，
+                    //    其 coroutine 跑在 viewModelScope；該 scope 的取消唯一發生在
+                    //    ViewModel.onCleared()（Activity/Fragment 銷毀時）。
+                    // 2) 若 scope 恰於此處（QUEUED、尚未翻 SAVING）被取消，本 coroutine
+                    //    直接在掛起點消失；此時 VM 實例已進入銷毀流程，其 _state 不再
+                    //    可達於任何畫面（Activity 已 finish，Compose 不再觀察），
+                    //    故「滯留 QUEUED」不會被任何使用者路徑觀察到。
+                    // 3) 活著的 VM 不會在此處殘留無法恢復的 QUEUED：任何出口要嘛經此 flip
+                    //    進 SAVING、要嘛在 lock 內走 mismatch/abort 分支落到 IDLE、要嘛
+                    //    對話框/cancel 自救（phase==QUEUED 之 cancel）。
+                    // 4) failClosedSavingRepairIfAbandoned 的述詞刻意只含 SAVING：
+                    //    QUEUED 階段尚無 store IO（save 未開始），in-flight key
+                    //    已登記用於去重但無外部寫入；policyWriteSaving 僅 flip 內登記；
+                    //    SAVING-only 為刻意收窄，擴寬前請先重新論證上述不可達性，
+                    //    勿隨意擴充。
                     synchronized(policySettleLock) {
                         _state.update {
                             it.copy(
