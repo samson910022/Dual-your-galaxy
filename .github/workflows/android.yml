@@ -27,6 +27,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Supply-chain gate: verify the committed wrapper shim matches the
+      # official Gradle 8.13 wrapper jar (see gradle/wrapper/README.md and
+      # scripts/verify-wrapper.sh). Runs before any ./gradlew invocation.
+      - name: Verify gradle-wrapper.jar integrity
+        run: bash scripts/verify-wrapper.sh
       - name: Set up JDK 17
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
@@ -82,6 +87,11 @@ jobs:
     steps:
       # Check out the repository.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Supply-chain gate: verify the committed wrapper shim matches the
+      # official Gradle 8.13 wrapper jar (see gradle/wrapper/README.md and
+      # scripts/verify-wrapper.sh). Runs before any ./gradlew invocation.
+      - name: Verify gradle-wrapper.jar integrity
+        run: bash scripts/verify-wrapper.sh
       # Provision JDK 17 required by AGP 8.x and Kotlin 2.x.
       - name: Set up JDK 17
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
@@ -105,7 +115,7 @@ jobs:
       # Validate all workflow YAML files with python + PyYAML (installed below, deterministic).
       - name: YAML syntax check (python)
         run: |
-          python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2' || python3 -m pip install --quiet 'pyyaml==6.0.2'
+          python3 -m pip install --quiet --break-system-packages --require-hashes -r ./scripts/ci-pyyaml-reqs.txt
           python3 - <<'PY'
           import glob, sys
           try:
@@ -568,6 +578,7 @@ jobs:
       # (API 29 emulator) on every PR. connectedCheck in this job stays a
       # compile gate only (see locale-instrumentation job for execution).
       - name: Compile androidTest (no device needed)
+        if: ${{ !cancelled() }}
         run: |
           chmod +x ./gradlew
           bash scripts/ci-retry-guard.sh 3 20 "compile androidTest" -- ./gradlew :app:assembleDebugAndroidTest --no-daemon
@@ -586,6 +597,7 @@ jobs:
       # Android Lint task built into AGP. If the `lint` task ever stops existing,
       # Gradle exits nonzero and this step fails the job (no silent fallback).
       - name: Android Lint (AGP built-in)
+        if: ${{ !cancelled() }}
         run: |
           chmod +x ./gradlew
           # Two-phase: Phase 1 warms lint dependencies (lintChecksClasspath) with
@@ -619,6 +631,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Supply-chain gate: verify the committed wrapper shim matches the
+      # official Gradle 8.13 wrapper jar (see gradle/wrapper/README.md and
+      # scripts/verify-wrapper.sh). Runs before any ./gradlew invocation.
+      - name: Verify gradle-wrapper.jar integrity
+        run: bash scripts/verify-wrapper.sh
       - name: Set up JDK 17
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
