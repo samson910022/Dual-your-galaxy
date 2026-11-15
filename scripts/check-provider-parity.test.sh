@@ -28,6 +28,18 @@ if [ ! -d "$FIXTURE_DIR" ]; then
   exit 1
 fi
 
+# Fixture-count pin: the suite's summary is only meaningful when the fixture
+# corpus is exactly the reviewed set. A silently added or deleted fixture
+# changes what "PASS summary" means, so fail closed on drift. Single source of
+# truth for the expected count; bump only together with fixture review.
+EXPECTED_FIXTURE_COUNT=49
+shopt -s nullglob
+pinned_fixtures=("$FIXTURE_DIR"/*.merged.xml "$FIXTURE_DIR"/*.xmltree.txt)
+if [ "${#pinned_fixtures[@]}" -ne "$EXPECTED_FIXTURE_COUNT" ]; then
+  echo "::error::fixture count drift: expected $EXPECTED_FIXTURE_COUNT fixtures (*.merged.xml + *.xmltree.txt) in $FIXTURE_DIR, found ${#pinned_fixtures[@]} — update EXPECTED_FIXTURE_COUNT only with fixture review" >&2
+  exit 1
+fi
+
 # Required ::error:: substring per fail fixture (pass-* fixtures expect
 # "PASS:"). No substring mapping => mismatch (forces reason pins for new
 # fail fixtures).

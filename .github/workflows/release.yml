@@ -327,7 +327,6 @@ jobs:
           path: release-publish/
           if-no-files-found: error
           retention-days: 1
-          overwrite: true
   publish:
     needs: release
     runs-on: ubuntu-latest
@@ -340,6 +339,18 @@ jobs:
         with:
           name: release-publish
           path: release-publish/
+      # F-3: fail-closed integrity gate before publishing. SHA256SUMS.txt was
+      # written next to the verified bytes at sign time (and is downloaded
+      # here with the APKs); re-verify the bytes about to be attached to the
+      # release so a corrupted or tampered artifact never reaches it.
+      - name: Verify SHA256SUMS before publish
+        run: |
+          set -euo pipefail
+          cd release-publish
+          sha256sum -c SHA256SUMS.txt
+          extra="$(comm -13 <(awk '{print $NF}' SHA256SUMS.txt | sort -u) <(ls -A | sort) | grep -Fvx 'SHA256SUMS.txt' || true)"
+          if [ -n "$extra" ]; then echo "::error::unlisted file(s) staged for release: $extra"; exit 1; fi
+          echo "PASS: release-publish holds exactly the SHA256SUMS-listed files + SHA256SUMS.txt"
       # Publish a GitHub Release with verified APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
