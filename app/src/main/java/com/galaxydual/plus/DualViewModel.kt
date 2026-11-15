@@ -1011,6 +1011,15 @@ class DualViewModel(
     // the repair lambda sets it before completing). Mirrors revisionGapCount;
     // intentionally not wired into a diagnostics dump (no dump exists for it).
     internal val repairOutcomeMissingCount = AtomicLong(0L)
+    // V3: busy-waiter expiration observability — incremented exactly when a
+    // Busy waiter exhausts its bounded rounds with the PREPARING owner still
+    // wedged (or the Tx still joinable but un-adoptable), i.e. the waiter
+    // escalates instead of stranding the write BUSY process-wide with no
+    // convergence path. counts 4-round exhaustion (not final unresolved
+    // state; a round-5 convergence still reports 1; counts across separate
+    // attachBusyWaiter calls for the same Tx are not deduped).
+    // JVM-readable; intentionally not wired into a UI dump.
+    internal val busyWaiterExpirations = AtomicInteger(0)
     private val policyRevisionStale = AtomicBoolean(false)
     // Stage O1 P1#1 (consent): authoritatively observed policy revision.
     // The coordinator committedRevision sampled at the moment this VM's current
@@ -2571,11 +2580,26 @@ class DualViewModel(
     // - claim joinable (armed/started) => reclaim like the normal inherit path;
     // - claim gone (settled, activeTx==null/different) => return (the _latest
     //   collector converges this VM, no local action needed).
-    // Capped iterations (bounded 4 rounds; explicitly cancelled in
-    // dispose()/onCleared() via busyWaiterJob, NOT via viewModelScope alone —
-    // dispose() does not cancel the scope in tests) so a truly live
-    // owner never spins forever; the _latest collector (observeRevisionUpdates)
-    // remains the convergence backstop after the bounded rounds expire.
+    // Capped iterations (bounded 4 rounds + ONE bounded re-arm at 4x backoff;
+    // explicitly cancelled in dispose()/onCleared() via busyWaiterJob, NOT via
+    // viewModelScope alone — dispose() does not cancel the scope in tests) so
+    // a truly live owner never spins forever; the _latest collector
+    // (observeRevisionUpdates) remains the convergence backstop after the
+    // bounded rounds expire.
+    // V3 (bounded honest escalation, NOT abortion): when the 4 rounds exhaust
+    // with the waiter still outstanding (owner live but wedged, or Tx joinable
+    // but un-adoptable), the waiter does ALL of: (1) one bounded System.err
+    // diagnostic (class-name-only hygiene; tx.key is an internal opaque key,
+    // safe to print), (2) bump busyWaiterExpirations, (3) ONE bounded re-arm
+    // with a 4x longer backoff (delay(policyIoTimeoutMs * 4)) running the same
+    // decision logic a single last time, then exits. It does NOT re-arm again
+    // and never aborts a live owner's fence (aborting a live PREPARING owner
+    // would destroy a claim that may still commit); if the owner never
+    // converges, the _latest collector (observeRevisionUpdates) is the
+    // convergence backstop and busyWaiterExpirations makes the wedge
+    // observable. Re-arming was chosen over immediate exit because a single
+    // extra 4x window is still strictly bounded and covers the common case
+    // (a slow-but-alive owner); infinite re-arm is explicitly rejected.
     private fun attachBusyWaiter(tx: PolicyTx) {
         try {
             try { busyWaiterJob?.cancel() } catch (_: Exception) { }
@@ -2583,9 +2607,13 @@ class DualViewModel(
                 try {
                     val coord = policyTxCoordinator ?: return@launch
                     var rounds = 0
-                    while (rounds < 4) {
+                    var maxRounds = 4
+                    var reArmed = false
+                    while (rounds < maxRounds) {
                         rounds += 1
-                        try { kotlinx.coroutines.delay(policyIoTimeoutMs) } catch (e: CancellationException) { throw e } catch (_: Exception) { return@launch }
+                        // V3: the single re-armed round waits 4x longer.
+                        val backoffMs = if (reArmed) (policyIoTimeoutMs.coerceAtMost(Long.MAX_VALUE / 4) * 4).coerceAtLeast(policyIoTimeoutMs) else policyIoTimeoutMs
+                        try { kotlinx.coroutines.delay(backoffMs) } catch (e: CancellationException) { throw e } catch (_: Exception) { return@launch }
                         if (activePolicyTx.get() != null) return@launch
                         var action = 0 // 0=keep waiting, 1=abort, 2=reclaim, -1=done
                         try {
@@ -2685,7 +2713,47 @@ class DualViewModel(
                             }
                             return@launch
                         }
+                        // V3 (bounded honest escalation, NOT abortion): reached
+                        // only when this round ended unresolved. When the 4
+                        // bounded rounds have just exhausted with the waiter
+                        // still outstanding (owner live but wedged, or Tx
+                        // joinable but un-adoptable — activePolicyTx empty,
+                        // action == 0), do: (1) one bounded System.err
+                        // diagnostic (class-name-only hygiene; tx.key is an
+                        // internal opaque key and safe to print), (2) bump
+                        // busyWaiterExpirations, (3) re-arm ONCE with 4x
+                        // backoff (maxRounds = 5; the loop's next delay uses
+                        // policyIoTimeoutMs * 4). After that single re-armed
+                        // round the loop exits bounded — never an infinite
+                        // re-arm; a wedged owner is never aborted from here
+                        // (its fence stays intact); the _latest collector
+                        // (observeRevisionUpdates) is the convergence
+                        // backstop.
+                        if (!reArmed && rounds >= 4) {
+                            try {
+                                System.err.println(
+                                    "[DualViewModel] busyWaiterExpiration: owner still wedged or Tx un-adoptable after $rounds bounded rounds (txId=${tx.txId} key=${tx.key}); re-arming once with 4x backoff",
+                                )
+                            } catch (_: Exception) { }
+                            try { busyWaiterExpirations.incrementAndGet() } catch (_: Exception) { }
+                            reArmed = true
+                            maxRounds = 5
+                        }
                     }
+                    // R4: the single re-armed round ended unresolved (loop
+                    // exit is reachable only via the re-armed path — rounds
+                    // 1-3 either return@launch or fall through to the next round; round 4 escalates). One bounded
+                    // diagnostic; best-effort, class-name-only hygiene.
+                    if (reArmed) {
+                        try {
+                            System.err.println(
+                                "[DualViewModel] busy-waiter re-armed round exited unresolved (txId=${tx.txId}); convergence delegated to _latest",
+                            )
+                        } catch (_: Exception) { }
+                    }
+                    // If the single re-armed round also ends unresolved, the loop
+                    // exits here: the escalation was already logged and counted;
+                    // the job ends bounded instead of spinning or exiting silently.
                 } catch (e: CancellationException) { throw e } catch (_: Exception) { }
             }
         } catch (_: Exception) {

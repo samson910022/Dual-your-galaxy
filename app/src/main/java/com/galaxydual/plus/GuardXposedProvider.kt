@@ -84,7 +84,18 @@ class GuardXposedProvider(
     private val rateWindows = LinkedHashMap<Int, Pair<Long, Int>>(16, 0.75f, true)
     // Once-per-process telemetry for the fail-open clock fallback (diagnosability).
     private val clockFallbackLogged = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val rejectionLogs = AtomicInteger(0)
+    // SEC-5: カテゴリ別の拒绝诊断予算（per-category budget）。untrusted UID の
+    // 洪水がグローバル予算を食い潰して trusted UID の異常診断まで盲目化するのを
+    // 防ぐため、uidRejectionCategory の有限集合（privileged/shell/negative/app）
+    // ごとに MAX_REJECT_LOGS までの枠を持つ。異なるカテゴリのバジェットは独立。
+    // カテゴリは静的 allowlist（ALLOWED_REJECT_CATEGORIES）で固定する: 実際に
+    // ミントされるカテゴリは uidRejectionCategory のリテラル集合
+    // （privileged/shell/negative/app）と shouldLogRejection のデフォルト引数
+    // "unknown" のみであり、動的な size 上限判定は不要かつ競合で新規カテゴリを
+    // 誤拒否しうるため使わない（allowlist 外のカテゴリは log せず、map はこの
+    // 5 キーに静的に有界）。
+    private val ALLOWED_REJECT_CATEGORIES = setOf("privileged", "shell", "negative", "app", "unknown")
+    private val rejectionLogsPerCategory = java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>()
 
     private fun isRateLimited(uid: Int): Boolean {
         val now = try {
@@ -158,14 +169,15 @@ class GuardXposedProvider(
             // 速率門控先於信任門控:洪水 uid 直接回 null,不耗委派。
             if (isRateLimited(callingUid)) return null
             // 信任門控拒絕時 rate-limited 診斷：只記 uid 類別（見
-            // uidRejectionCategory），絕不記 binder 內容/arg/extras；沿用
-            // unexpectedArgs 8 次封頂模式（見 shouldLogRejection），防 log 洪水。
+            // uidRejectionCategory），絕不記 binder 內容/arg/extras；カテゴリ別
+            // 8 次封頂模式（見 shouldLogRejection），一カテゴリの洪水が他を盲目化しない。
             if (!isTrustedXposedCaller(callingUid, myUid)) {
-                if (shouldLogRejection()) {
+                val category = uidRejectionCategory(callingUid, myUid)
+                if (shouldLogRejection(category)) {
                     try {
                         onRejectLog(
                             "GuardXposedProvider reject " +
-                                "uidCategory=${uidRejectionCategory(callingUid, myUid)}",
+                                "uidCategory=$category",
                         )
                     } catch (_: Throwable) {
                         // Best effort: 診斷不得影響門控。
@@ -173,6 +185,14 @@ class GuardXposedProvider(
                 }
                 return null
             }
+            // SEC-6: 非 owner 進程（userId != 0，例如 work profile）は SendBinder を
+            // 受け付けない。libxposed provider は受け取った binder を消費者なしの
+            // cache に stash し、XposedServiceHelper のリスナーは userId == 0 の
+            // プロセスにしか登録されない（ GalaxyApp.onCreate 参照）。非 owner では
+            // 誰も消費せず linkToDeath も張られないため、cache が緩やかに肥大し続ける。
+            // CRUD メソッドは元々 inert なので SendBinder だけを拒否する（非 SendBinder
+            // はここで遮断しない）。順序: rate-limit → UID gate → owner check → delegate。
+            if (method == "SendBinder" && !isOwnerUser(myUid)) return null
             return guardedPolicyCall(method, arg, extras, callingUid, myUid) { m, a, e ->
                 dispatch(m, a, e)
             }
@@ -181,14 +201,36 @@ class GuardXposedProvider(
         }
     }
 
-    // 拒絕診斷速率門：每行程至多前 N 次拒絕記一筆（與 WhitelistPolicy 的
-    // unexpectedArgs 8 次封頂同模式），後續靜默計數不記 log，防惡意 app
-    // 洪水刷爆 log。計數本身經 rejectionLogCount() 可觀測（測試鎖定）。
-    internal fun shouldLogRejection(): Boolean =
-        rejectionLogs.incrementAndGet() <= MAX_REJECT_LOGS
+    // SEC-6: owner-user 判定。GalaxyApp.onCreate が XposedServiceHelper を
+    // 登録するゲートと同じ userIdFromUid(myUid) == 0 判定を再利用する
+    // （userIdFromUid は MainActivity.kt の internal 純関数 — AOSP user-range shift、
+    // userId*100_000 + appId）。myUid は本 provider の myUidProvider seam の値
+    // （本番では Process.myUid(); テストでは注入値）。失敗・例外は fail-closed
+    // （非 owner 扱い）。
+    private fun isOwnerUser(myUid: Int): Boolean = try {
+        userIdFromUid(myUid) == 0
+    } catch (_: Throwable) {
+        false
+    }
 
-    // 已發生的拒絕診斷筆數（單調計數，含被封頂靜默者；供測試鎖定不爆 log）。
-    internal fun rejectionLogCount(): Int = rejectionLogs.get()
+    // 拒絕診斷速率門（カテゴリ別）：カテゴリは静的 allowlist
+    // （ALLOWED_REJECT_CATEGORIES — uidRejectionCategory のリテラル集合
+    // privileged/shell/negative/app に shouldLogRejection のデフォルト引数
+    // "unknown" を加えた 5 つだけ。それ以外のカテゴリは log しない
+    // —— map はこの 5 キーに静的に有界）。allowlist 内のカテゴリごとに毎行程至多
+    // MAX_REJECT_LOGS 筆まで記一筆
+    // （WhitelistPolicy の unexpectedArgs 8 次封頂と同パターンをカテゴリ単位に適用）、
+    // 後續靜默計數不記 log。untrusted UID の洪水が trusted UID の異常診断枠を
+    // 食い潰すことはない。
+    // 計數本身經 rejectionLogCount() 可觀測（全カテゴリ合算、測試鎖定）。
+    internal fun shouldLogRejection(category: String = "unknown"): Boolean =
+        category in ALLOWED_REJECT_CATEGORIES &&
+            rejectionLogsPerCategory.computeIfAbsent(category) { AtomicInteger(0) }
+                .incrementAndGet() <= MAX_REJECT_LOGS
+
+    // 已發生的拒絕診斷筆數（全カテゴリ合算の單調計數，含被封頂靜默者；供測試鎖定不爆 log）。
+    internal fun rejectionLogCount(): Int =
+        rejectionLogsPerCategory.values.sumOf { it.get() }
 
     // CRUD 在函式庫為 inert (null/0),直接回 null/0,不委派。
     override fun query(
@@ -216,13 +258,46 @@ class GuardXposedProvider(
         // 固定窗口 1s,每 uid 上限 20 次 call。正常握手遠低於此,洪水則節流。
         internal const val RATE_WINDOW_MS = 1_000L
         internal const val RATE_LIMIT_MAX = 20
-        // 拒絕診斷封頂（與 WhitelistPolicy unexpectedArgs 同 8 次模式）。
+        // 拒絕診斷封頂（與 WhitelistPolicy unexpectedArgs 同 8 次模式）。カテゴリ単位。
         internal const val MAX_REJECT_LOGS = 8
         // 速率窗口表有界上限（見 rateWindows 註解）。
         internal const val RATE_WINDOWS_MAX = 512
     }
 }
 
+// SEC-2 (comment-only; behavior unchanged): 100_000 這個字面值的推導與性質。
+// 推導（AOSP user-range shift）: 実機の uid は uid = userId * PER_USER_RANGE +
+// appId という形で詰められる（frameworks/base の UserHandle.PER_USER_RANGE;
+// @hide のため公開 SDK からは引用できず、ここでは字面 100_000 を直書きする —
+// ShizukuCmdGateway.kt の UID_PER_USER_RANGE と MainActivity.userIdFromUid も同根）。
+// % 100_000 で appId、/ 100_000 で userId を取る。
+// fail-closed 性質は方向依存であり、対称でも無条件でもない（どちらの方向も
+// 「無条件に fail-closed」とは主張できない）:
+//   - 過大 shift（shift が大きすぎて分解が縮退する、極端には shift ≥ 対象 uid）の
+//     場合: callerUser/myUser/appId が実機とずれ、appId == 1000 の席の判定は
+//     事実上 uid == 1000 の等価判定へ縮退する（callerUser == myUser && appId ==
+//     1000 を満たすのは uid == 1000 のみ）。一般 app が席へ昇格することはなく、
+//     fail-closed が成り立つ。ただし「拒否」は次級 user の system uid
+//     （userId*100_000+1000）をも拒むため、可用性損失として現れる
+//     —— 信頼境界を広げはしないが、壊れてよいわけでもない。
+//   - 過小 shift、あるいは一般 app の appId が 0..9999 に落ちるような任意の shift
+//     の場合: 一般 app の uid が appId' == 1000 の席へ再入しうる。例: S' = 10_000
+//     では appId ≡ 1000 (mod 10_000) の一般 app（例: appId = 11000）が
+//     appId' == 1000 かつ callerUser' == myUser' を満たし、同 user の system uid
+//     を装って受入側へ昇格する。すなわち 100_000 の字面はこの方向で load-bearing
+//     であり、この方向の fail-closed ではない —— 字面の誤りは非対称な安全性質の
+//     一方側を直接破壊する。
+//   - root path（callingUid == 0）と self path（callingUid == myUid）は shift を
+//     一切使わないので、shift がどう誤っていても影響を受けない（callingUid ==
+//     1000 の等価パスも同様に shift 無関係）。
+// DEVICE-UNVERIFIED: user-range shift 前提（特に多用戶配下の callingUid/myUid）は
+// 実機検証が保留中 —— on-device assertion（実機で callingUid / Process.myUid() を
+// 採取し PER_USER_RANGE 仮定を確認する）が未了であり、それまでは DEVICE-UNVERIFIED。
+// これは儀礼的な但し書きではない（NOT pro forma）：上記の方向依存性は未検証の前提に
+// 依存しており、実機採取で確認が済むまで「どちらの方向も無条件に fail-closed」とは
+// 主張できない。とりわけ過小 shift 側は信頼境界を広げうるため、DEVICE-UNVERIFIED の
+// 解消（on-device assertion）が安全性主張の前提であり、但し書きの付記で免責される
+// ものではない。
 // 信任邊界 (純函數,可 JVM 測):僅 root(0)/system(1000)、本 app 自己 (uid == myUid)、
 // 或同 user 的 appId == 1000 系統 uid (callerUser == myUser && appId == 1000,
 // 次級 user／工作資料夾下形如 userId*100_000+1000) 受信任。拒絕 shell(2000)。
@@ -256,6 +331,7 @@ internal fun isTrustedXposedCaller(callingUid: Int, myUid: Int): Boolean {
 // 特權 uid 歸 privileged；負數歸 negative；其餘一律 app（含一般 app 與
 // FIRST_APPLICATION_UID 邊界）。多用戶（secondary user / work profile）下
 // UID 高位帶有 userId * 100_000，取 appId = callingUid % 100_000 正規化。
+// （同じ user-range shift の仮定 — 導出と方向依存の fail-closed 分析は isTrustedXposedCaller 上の SEC-2 コメント参照）
 // self 不會走到拒絕分支（受信），故無 self 類別。
 internal fun uidRejectionCategory(callingUid: Int, myUid: Int): String {
     if (callingUid < 0) return "negative"

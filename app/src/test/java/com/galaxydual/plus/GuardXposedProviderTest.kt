@@ -349,6 +349,60 @@ class GuardXposedProviderTest {
         assertSame(delegateCall.result, provider.call("SendBinder", null, Bundle()))
     }
 
+    // SEC-6: 非 owner 進程（myUid の userId != 0，例: user 10 の work profile）は
+    // SendBinder を委派しない（libxposed provider が消費者なしの cache に binder を
+    // stash するのを防ぐ）。信任門控（同 user system uid）を通る callingUid でも
+    // null になることを固定する。順序は rate-limit → UID gate → owner check → delegate。
+    @Test
+    fun nonOwnerProcessSendBinderIsNotDelegated() {
+        val delegateCall = RecordingDelegateCall()
+        delegateCall.result = Bundle()
+        val provider = GuardXposedProvider(
+            callingUidProvider = { 1001000 },   // user 10 の system uid（同 user、受信）
+            myUidProvider = { 1010123 },         // user 10 の本 app（非 owner）
+            delegateCall = delegateCall,
+        )
+        assertNull(provider.call("SendBinder", null, Bundle()))
+        assertEquals(0, delegateCall.calls)
+    }
+
+    // SEC-6 対照: owner 進程（myUid の userId == 0）は従来どおり SendBinder を委派する。
+    @Test
+    fun ownerProcessSendBinderIsDelegated() {
+        val delegateCall = RecordingDelegateCall()
+        delegateCall.result = Bundle()
+        val provider = GuardXposedProvider(
+            callingUidProvider = { 0 },
+            myUidProvider = { myUid },           // 10123 → userId 0（owner）
+            delegateCall = delegateCall,
+        )
+        assertSame(delegateCall.result, provider.call("SendBinder", null, Bundle()))
+        assertEquals(1, delegateCall.calls)
+    }
+
+    // SEC-5: カテゴリ別の拒絕診斷予算 — 一カテゴリの洪水が別カテゴリの枠を食い潰さない。
+    // app カテゴリで 20 回拒絕して log 8 筆を消費したあと、shell カテゴリの拒絕は
+    // 未消費のカテゴリ別枠で記録される（グローバル予算なら 9 筆目は捨てられる）。
+    // rejectionLogCount() は全カテゴリ合算であることも固定する。
+    @Test
+    fun rejectionBudgetIsPerCategoryNotGlobal() {
+        val logs = mutableListOf<String>()
+        var callingUid = 10124                        // app カテゴリ
+        val provider = GuardXposedProvider(
+            callingUidProvider = { callingUid },
+            myUidProvider = { myUid },
+            delegateCall = RecordingDelegateCall(),
+            onRejectLog = { logs.add(it) },
+        )
+        repeat(20) { provider.call("SendBinder", null, Bundle()) }
+        assertEquals(GuardXposedProvider.MAX_REJECT_LOGS, logs.size)
+        callingUid = 2000                             // shell カテゴリ
+        assertNull(provider.call("SendBinder", null, Bundle()))
+        assertEquals(GuardXposedProvider.MAX_REJECT_LOGS + 1, logs.size)
+        assertEquals("GuardXposedProvider reject uidCategory=shell", logs.last())
+        assertEquals(21, provider.rejectionLogCount())
+    }
+
     // 拒絕診斷 rate-limited：只記 uid 類別（不記 binder 內容/arg/extras），
     // 20 次拒絕僅前 8 筆記 log（與 unexpectedArgs 封頂同模式），不爆 log 洪水。
     @Test

@@ -27,6 +27,15 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         // S2: hook 只讀 user 0；非 owner 進程（如 work profile）即使註冊 binder
         // 也只會讀寫到非本人的草稿通道，永遠不會生效 —— 不註冊（fail-closed，
         // 也省一個跨進程監聽器）。uid 拆解失敗一律視為非 owner（fail-closed）。
+        // SEC-2: 這裡的 userIdFromUid 分解依賴 AOSP user-range shift
+        // （userId*100_000 + appId，100_000 為 @hide 的 UserHandle.PER_USER_RANGE
+        // 字面）。fail-closed 性質是方向依存的，並非無條件：shift 誤差下
+        // 過大 shift 會把 / 100_000 分解縮退為 userId 0（owner 判定放寬給次級
+        // user——fail-closed ではない）；過小 shift 則可能把 owner 誤判為非 owner
+        // （可用性損失）。uid==0 與（trust gate 的）uid==myUid 等価路徑不受 shift
+        // 影響。詳述與 DEVICE-UNVERIFIED 狀態（on-device assertion 保留中、非儀礼
+        // 但書，不主張無條件 fail-closed）見
+        // GuardXposedProvider.isTrustedXposedCaller 上的 SEC-2 コメント。
         val owner = try {
             userIdFromUid(Process.myUid()) == 0
         } catch (t: Throwable) {

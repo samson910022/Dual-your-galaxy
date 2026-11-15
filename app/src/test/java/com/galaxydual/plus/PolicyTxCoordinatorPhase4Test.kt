@@ -597,4 +597,103 @@ class PolicyTxCoordinatorPhase4Test {
             coord.close()
         }
     }
+
+    // Lost-CAS arm, stage-won rollback: the stage won (real payload is in
+    // pendingPublish and _latest carries the same identity), so a drop of the
+    // stale placeholder must NOT leave a tombstone behind — the real payload
+    // stays emittable. Expect FALSE (drop rejected: the stage-won flip beat
+    // our placeholder snapshot inside the get→CAS window), pending keeps the
+    // real identity, exactly one tombstone rollback is counted, and no
+    // tombstone survives. Driven deterministically via the
+    // beforeDropCasSeamForTests hook (mirrors beforeClaimCasSeamForTests):
+    // the seam flips pendingPublish to the staged real payload inside the
+    // window, forcing the lost-CAS arm with realHandOff evidence.
+    @Test
+    fun dropStagedPlaceholder_stageWon_rollsBackTombstone() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val tx = placeholderTx(coord, "phase4-lostcas-stagewon", completedOwner = true)
+            coord.activeTx.set(tx)
+            val placeholder = PolicySettled(
+                tx.txId, tx.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false,
+            )
+            assertTrue(coord.completeWithRevision(tx, placeholder))
+            val stagedPlaceholder = coord.pendingPublish.get()!!
+            val realPayload = PolicySettled(
+                tx.txId, tx.key, setOf("com.p2"), true, MsgKind.INFO, "r2", false, rev = -1L,
+            )
+            val staged = coord.stageRealPayload(realPayload)
+            assertNotNull(staged)
+            assertTrue(coord.pendingPublish.get()!!.known)
+            // How the interleaving actually works: the stage has ALREADY won
+            // before dropStagedPlaceholderIfMatch is called (pendingPublish
+            // holds the real payload). The re-arm below swaps pendingPublish
+            // back to the staged placeholder so the drop's entry snapshot
+            // observes it, and the seam re-applies the placeholder→real flip
+            // INSIDE the get→CAS window to deterministically force the
+            // lost-CAS arm — the stage winning is simulated, not observed.
+            coord.pendingPublish.set(stagedPlaceholder)
+            coord.beforeDropCasSeamForTests = { coord.pendingPublish.set(staged!!) }
+            assertFalse(coord.dropStagedPlaceholderIfMatch(tx.txId, tx.key))
+            val pending = coord.pendingPublish.get()
+            assertNotNull(pending)
+            assertEquals(tx.txId, pending!!.txId)
+            assertEquals(tx.key, pending.key)
+            assertTrue(pending.known)
+            assertEquals(1L, coord.tombstoneRollbacks.get())
+            assertFalse(coord.isTombstoned(tx.txId, tx.key))
+        } finally {
+            try { coord.beforeDropCasSeamForTests = null } catch (_: Exception) { }
+            coord.close()
+        }
+    }
+
+    // Lost-CAS arm, locked path wins: the locked recover path already
+    // tombstoned this exact placeholder identity (tombstone inserted first,
+    // pending cleared). A subsequent lock-free drop must NOT roll that
+    // tombstone back — the locked-path-keep guarantee applies — so the
+    // tombstone survives and no rollback is counted. The drop's get→CAS
+    // window is forced deterministically via beforeDropCasSeamForTests: the
+    // pendingPublish is white-box re-armed with a fresh placeholder (same
+    // identity) so the entry snapshot observes it, and the seam simulates the
+    // locked path winning INSIDE the window — it flips pendingPublish to null
+    // before the drop's CAS. The null re-read + _latest non-match path then
+    // keeps the tombstone (the locked-path keep guarantee; indistinguishable
+    // from a locked recover/discard having already tombstoned the identity).
+    // This is the actual V2 bug this guards: a rollback there would re-open
+    // the tombstoned identity for the isTombstoned fast-reject in
+    // emitStaged/tryEmitSettled.
+    @Test
+    fun dropStagedPlaceholder_lockedPathKept_tombstoneStays() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val tx = placeholderTx(coord, "phase6b-lockedpath-keep", completedOwner = true)
+            stagePlaceholder(coord, tx)
+            // Locked path: completed owner + stale age (threshold=0) drops the
+            // placeholder and tombstones the identity; owner-fence removed.
+            val dropped = coord.recoverStalePendingLocked(System.nanoTime(), 0)
+            assertNotNull(dropped)
+            assertNull(coord.pendingPublish.get())
+            assertTrue(coord.isTombstoned(tx.txId, tx.key))
+            assertEquals(0L, coord.tombstoneRollbacks.get())
+            // White-box re-arm: pendingPublish is re-set to a fresh placeholder
+            // carrying the same identity. completeWithRevision is NOT used here
+            // (it rev-gates); the drop's entry snapshot just needs to observe
+            // this placeholder, mirroring Test A's re-arm.
+            coord.pendingPublish.set(
+                PolicySettled(
+                    tx.txId, tx.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false,
+                ),
+            )
+            // The locked "winner" clears pending inside the get→CAS window.
+            coord.beforeDropCasSeamForTests = { coord.pendingPublish.set(null) }
+            assertFalse(coord.dropStagedPlaceholderIfMatch(tx.txId, tx.key))
+            assertTrue(coord.isTombstoned(tx.txId, tx.key))
+            assertEquals(0L, coord.tombstoneRollbacks.get())
+            assertNull(coord.pendingPublish.get())
+        } finally {
+            try { coord.beforeDropCasSeamForTests = null } catch (_: Exception) { }
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
 }
