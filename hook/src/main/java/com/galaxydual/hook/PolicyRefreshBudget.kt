@@ -648,7 +648,7 @@ class PolicyRefreshGate(
                 }
                 try {
                     if (!stuckOpen) {
-                        return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+                        return doSubmitOrThrow(reader, timeoutMs)
                     }
                     if (!isExecutorBusy()) {
                         halfOpenProbes.incrementAndGet()
@@ -685,7 +685,7 @@ class PolicyRefreshGate(
             }
             try {
                 if (!stuckOpen) {
-                    return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+                    return doSubmitOrThrow(reader, timeoutMs)
                 }
                 halfOpenProbes.incrementAndGet()
                 return doProbeSubmitOrThrow(reader, timeoutMs, now)
@@ -708,7 +708,7 @@ class PolicyRefreshGate(
                 throttledLog("policy refresh stuck short-circuit (timeouts=${consecutiveTimeouts.get()})")
                 throw PolicyRefreshContentionException("stuck")
             }
-            return doSubmitOrThrow(reader, timeoutMs, isProbe = false)
+            return doSubmitOrThrow(reader, timeoutMs)
         } finally {
             try {
                 outstanding.release()
@@ -718,8 +718,8 @@ class PolicyRefreshGate(
     }
 
     // Shared submit body for the normal (non-half-open) path. Caller holds the
-    // at-most-one guard. isProbe is always false here; the half-open probe has
-    // its own body (doProbeSubmitOrThrow) so probe outcomes update backoff.
+    // at-most-one guard; the half-open probe has its own body
+    // (doProbeSubmitOrThrow) so probe outcomes update backoff.
     // Handoff result for the deadline-bounded SynchronousQueue retry below:
     // success carries the future + the time left for get(); failure carries
     // the cause for the caller's drop/contention accounting (never a timeout:
@@ -869,11 +869,8 @@ class PolicyRefreshGate(
     private fun doSubmitOrThrow(
         reader: () -> Set<String>?,
         timeoutMs: Long,
-        isProbe: Boolean,
     ): Set<String>? {
         if (timeoutMs <= 0L) return null
-        @Suppress("UNUSED_PARAMETER")
-        val _probe = isProbe
         val handoff = submitHandoffRetry(reader, timeoutMs)
         val future = handoff.future
         if (future == null) {

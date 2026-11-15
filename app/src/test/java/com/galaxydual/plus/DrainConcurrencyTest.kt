@@ -31,13 +31,16 @@ class DrainConcurrencyTest {
     // >=100 gate; then 10ms -> overlap>=100 on this box but still flaked to
     // 22 in the full fork): the writers only race to the 256KB cap,
     // so the live-writer window is ~25 chunks/writer; 25ms stretches it to
-    // ~625ms. The gate is, however, NOT unchanged: under sustained 4-core
-    // CI saturation the >=100 bound was unattainable (measured 74 in the
-    // full-suite fork), so the bounded-overlap FLOOR was removed and replaced
-    // by overlap>=1 plus the other invariants (no NUL, monotonic length,
-    // cap, all-'x' alphabet, final-buffer sanity, threads joined, errors
-    // empty) which are the actual correctness pins; overlap>=100 was a
-    // load-dependent magnitude check, not a non-tearing invariant.
+    // ~625ms. Under sustained 4-core CI saturation the >=100 bound proved
+    // flaky (a pre-restore fork measured 74 in the full-suite run), so the
+    // floor was weakened to >=1 in an earlier revision and has since been
+    // restored to overlap>=8 (bounded-overlap floor for PR #60 deep-review
+    // hygiene): comfortably above the zero-writer-head-start failure mode
+    // while far below measured overlap (≈1145 locally; ≈1153/1089 on CI
+    // runners). The other invariants (no NUL, monotonic length, cap,
+    // all-'x' alphabet, final-buffer sanity, threads joined, errors empty)
+    // remain the actual correctness pins; overlap>=8 rules out a reader-
+    // before-writer head start without a sleep-based guarantee.
     private class ThrottledInputStream(
         private val delegate: InputStream,
         private val sleepMs: Long = 25L,
@@ -176,15 +179,25 @@ class DrainConcurrencyTest {
         assertTrue("hammer threads must not throw, got: ${errors.firstOrNull()}", errors.isEmpty())
         assertTrue("readers must have taken snapshots during the hammer, got ${snapshotsTaken.get()}", snapshotsTaken.get() >= 50)
         System.out.println("drainHammer overlap=${overlapSnapshots.get()} total=${snapshotsTaken.get()}")
-        // T7 (PR60 deep-review): the old >=100 bound was unattainable on the
-        // 4-core CI runner under full-suite parallel load (measured 74 over a
-        // 25ms window). The floor is REMOVED, not relaxed: the invariant pins
-        // that matter (no-NUL, monotonic length, MAX_CAPTURE_CHARS cap,
-        // all-'x' alphabet, final-buffer sanity) remain; cross-thread overlap
-        // is now only asserted to be non-zero (overlapSnapshots >= 1).
+        // Floor restored per PR60 deep-review hygiene: overlapSnapshots must
+        // prove live-writer concurrency, so >= 1 (any single sample) is not a
+        // defensible bound. The measured reality behind the choice of 8:
+        // the original >= 100 bound was unattainable on the 4-core CI runner
+        // under full-suite parallel load (measured 74 over a ~25ms window),
+        // and the window itself is the problem — overlap counts only
+        // snapshots taken while a writer was mid-drain, a window bounded by
+        // scheduling quantum rather than by anything the test controls, so
+        // any high fixed floor is hostage to runner load and cannot be made
+        // deterministic by a sleep (that would serialize, not prove). A floor
+        // of 8 keeps the assertion load-bearing — it rules out a
+        // reader-before-writer head start or a writersActive.set(true) that
+        // never lands — while staying attainable under CI saturation without
+        // a sleep-based guarantee. The safety invariants that DO need no
+        // floor (no-NUL, monotonic length, MAX_CAPTURE_CHARS cap, all-'x'
+        // alphabet) remain asserted above.
         assertTrue(
             "readers must have snapshotted while writers were live (overlap=${overlapSnapshots.get()}, total=${snapshotsTaken.get()})",
-            overlapSnapshots.get() >= 1,
+            overlapSnapshots.get() >= 8,
         )
         val finalSnap = snapshot(sink)
         assertEquals(MAX_CAPTURE_CHARS, finalSnap.length)

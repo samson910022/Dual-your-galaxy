@@ -339,6 +339,16 @@ object WhitelistPatch {
             val current = try {
                 field.get(null)
             } catch (t: Throwable) {
+                if (isFinal) {
+                    // Mirror the apply() isFinal arm's vocabulary: a private/
+                    // protected static final field is not reassigned either —
+                    // the read itself was refused. Not a patch failure; observe-only.
+                    results[name] = Outcome.ObserveOnly(
+                        "$OBSERVE_ONLY_MARKER $name on $targetShort: static final field, " +
+                            "not reassigned (read access refused; no force-write; ART unverified)",
+                    )
+                    continue
+                }
                 results[name] = Outcome.Skipped(
                     "skip patch $name on $targetShort: read failed (${HookLog.shortEx(t)})",
                 )

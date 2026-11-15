@@ -1767,6 +1767,15 @@ class ObserverFallbackTest {
                     assertFalse(reconcilingHas(vmR, "r2-own-latest-res-$iter"))
                 } finally {
                     try { vmR.dispose() } catch (_: Exception) { }
+                    // Cancel + bounded join-drain this iteration's VM and
+                    // coordinator in-loop instead of deferring all collector
+                    // teardown to tearDown (cancel-all at once maximizes Main
+                    // resume at resetMain). Dispose alone does not cancel
+                    // viewModelScope; without the drain the collectors stay
+                    // live until every iteration's VM is torn down together.
+                    // Idempotent with tearDown's own drain (cancel/close are
+                    // idempotent, joins on completed jobs return fast).
+                    TestDrainSupport.drainBeforeResetMain(listOf(vmR), listOf(coordR))
                     try { coordR.close() } catch (_: Exception) { }
                 }
             }

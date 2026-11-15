@@ -18,13 +18,29 @@ class GalaxyAppTest {
             isAccessible = true
         }
         val paramType = ctor.parameterTypes[0]
+        // Returning null from a Proxy for a method with a primitive (or
+        // String-typed) return triggers an NPE at the call site's unboxing /
+        // cast, long before the test's assertion runs — so answer with a
+        // benign default per return type instead. Reference (non-String)
+        // returns stay null, matching prior fake behavior.
         val proxy = Proxy.newProxyInstance(
             paramType.classLoader,
             arrayOf(paramType),
         ) { _, method, _ ->
             when (method.name) {
                 "asBinder" -> null
-                else -> null
+                else -> when (method.returnType) {
+                    java.lang.Boolean.TYPE -> false
+                    java.lang.Integer.TYPE -> 0
+                    java.lang.Long.TYPE -> 0L
+                    java.lang.Float.TYPE -> 0f
+                    java.lang.Double.TYPE -> 0.0
+                    java.lang.Short.TYPE -> 0.toShort()
+                    java.lang.Byte.TYPE -> 0.toByte()
+                    java.lang.Character.TYPE -> '\u0000'
+                    String::class.java -> ""
+                    else -> null
+                }
             }
         }
         return ctor.newInstance(proxy) as XposedService

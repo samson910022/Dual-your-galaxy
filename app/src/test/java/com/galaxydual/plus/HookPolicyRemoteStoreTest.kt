@@ -16,6 +16,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 
@@ -28,7 +29,7 @@ class HookPolicyRemoteStoreTest {
         testIdentityCheckHook = null
     }
 
-    @org.junit.After
+    @After
     fun tearDown() {
         resetRemotePoisonForTests()
         testIdentityCheckHook = null

@@ -24,7 +24,9 @@ class EffectivePolicyCache(
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
     private val onLog: (String) -> Unit = {},
 ) {
-    private val lock = Any()
+    // lock is a plain monitor guard for synchronized(lock); wait/notify need
+    // the java.lang.Object surface, which kotlin.Any does not expose.
+    private val lock = java.lang.Object()
     private var cached: Set<String> = emptySet()
     private var valid = false
 
@@ -126,15 +128,13 @@ class EffectivePolicyCache(
     private val lastFallbackLogMs = AtomicLong(Long.MIN_VALUE)
     private val FALLBACK_LOG_THROTTLE_MS = 5_000L
 
-    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private fun waitGrace(timeoutMs: Long) {
         if (timeoutMs <= 0L) return
-        (lock as java.lang.Object).wait(timeoutMs)
+        lock.wait(timeoutMs)
     }
 
-    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private fun notifyFollowers() {
-        (lock as java.lang.Object).notifyAll()
+        lock.notifyAll()
     }
 
     // H9: one throttled failure line per FALLBACK_LOG_THROTTLE_MS across all

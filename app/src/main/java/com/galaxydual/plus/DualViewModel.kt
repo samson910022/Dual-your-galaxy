@@ -6941,6 +6941,7 @@ class DualViewModel(
     //   pending；bump 會無辜丟棄併發的正常 refresh。
     // - null-store bump 刻意保留以求統一、終態不變（null-store 下 load 恆為
     //   Unknown，本就無 Known 可 fence；bump 只為統一寫入路徑語意）。
+    // One-line alias for bumpPolicyGenerations() (kept for call-site readability/back-compat).
     private fun markPolicyUnknownLocked() {
         bumpPolicyGenerations()
     }
@@ -9487,7 +9488,10 @@ class DualViewModel(
                                         // foreign-known-settle handler). markObservedKnown() is
                                         // deliberately NOT called here. When stamped != null,
                                         // observedSnapshot was already set to stamped.rev inside
-                                        // emitTxSettledStageOnly (no sampling race), so a mark
+                                        // emitTxSettledStageOnly (no sampling race — the
+                                        // stamped.rev snapshot (claim rev, re-stamped at stage time
+                                        // under commitMutex) is the same token the settle path wrote
+                                        // into observedSnapshot), so a mark
                                         // would be redundant AND could overshoot observed to an
                                         // unseen FOREIGN B commit. When stamped == null (no staged
                                         // payload): (a) coord==null legacy → sampledCurrentRevision()
@@ -10487,7 +10491,10 @@ class DualViewModel(
                                     // foreign-known-settle handler). markObservedKnown() is
                                     // deliberately NOT called here. When stamped != null,
                                     // observedSnapshot was already set to stamped.rev inside
-                                    // emitTxSettledStageOnly (no sampling race), so a mark
+                                    // emitTxSettledStageOnly (no sampling race — the
+                                    // stamped.rev snapshot (claim rev, re-stamped at stage time
+                                    // under commitMutex) is the same token the settle path wrote
+                                    // into observedSnapshot), so a mark
                                     // would be redundant AND could overshoot observed to an
                                     // unseen FOREIGN B commit. When stamped == null (no staged
                                     // payload): (a) coord==null legacy → sampledCurrentRevision()

@@ -180,6 +180,22 @@ class PolicyTxCoordinatorPhase4Test {
         }
     }
 
+    // Phase 7 N3 pin: re-recording an already-tombstoned identity refreshes
+    // its rev in place and keeps the table size invariant (documented
+    // contract — the rev-refresh half of tryInsertClaimTombstone).
+    @Test
+    fun reRecordingTombstonedIdentityRefreshesRevKeepsSize() {
+        val coord = PolicyTxCoordinator()
+        try {
+            assertTrue(coord.tryInsertClaimTombstone(7L, "refresh:me", 100L))
+            assertTrue(coord.tryInsertClaimTombstone(7L, "refresh:me", 200L))
+            assertEquals(1, coord.claimTombstones.size)
+            assertEquals(200L, coord.claimTombstones[coord.tombstoneKey(7L, "refresh:me")])
+        } finally {
+            coord.close()
+        }
+    }
+
     // A2-1 reject fallback: when every tombstone in the full table is NOT
     // strictly older than the incoming rev, the drop keeps the fence and the
     // caller retries STALE (fail-closed) — eviction never kicks out a fence
