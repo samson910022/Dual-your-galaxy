@@ -283,6 +283,14 @@ class PolicyRefreshGate(
     private val halfOpenInitialMs: Long = PolicyRefreshBudget.HALF_OPEN_INITIAL_MS,
     private val halfOpenMaxMs: Long = PolicyRefreshBudget.HALF_OPEN_MAX_MS,
     private val log: (String) -> Unit = {},
+    // PR#60 r2 (K3/T-P2-11): injected factory for forced executor
+    // replacements (forced rebuild and dead-pool reclaim alike). Defaults
+    // to the production zero-queue factory — production behavior is
+    // byte-identical. Tests inject a counting/throwing factory to exercise
+    // the fresh-construction-before-shutdown contract. The replaced
+    // executor is always swapped in only after successful construction.
+    private val executorFactory: (String) -> ThreadPoolExecutor =
+        { PolicyRefreshBudget.newPolicyRefreshExecutor(it) },
 ) {
     companion object {
         // Epoch budget (recovery throttle): at most MAX_WORKER_REBUILDS
@@ -393,6 +401,13 @@ class PolicyRefreshGate(
     // was REFUSED because the process-lifetime abandoned-worker budget was
     // exhausted. Never reset. One AtomicLong increment per denial (cheap).
     internal val processCapDenials = AtomicLong(0L)
+    // Dead-pool reclaim sequence suffix (lspd forensics): fresh pools from
+    // the drained-but-shutdown arm are named
+    // "GalaxyDual-policy-refresh-reclaimed-$n" so they are distinguishable
+    // in thread dumps. incrementAndGet() before naming keeps the suffix
+    // deterministic (the first reclaimed pool is ...-reclaimed-1). Never
+    // reset; naming only — no budget semantics.
+    private val deadPoolReclaims = AtomicLong(0)
     private val halfOpenFailures = AtomicLong(0L)
     private val lastStuckOpenMs = AtomicLong(Long.MIN_VALUE)
 
@@ -455,11 +470,22 @@ class PolicyRefreshGate(
     // uninterruptible Binder read is still occupying the single thread, so a
     // probe would only hit RejectedExecutionException — keep short-circuiting
     // unless the busy age exceeds the rebuild threshold (see below).
-    // Custom ExecutorService (non-ThreadPoolExecutor): queueDepth/activeCount
-    // return -1 and busy is always false (fail-closed probe allowed).
+    // SCOPE (PR#60 review fix): the "a shutdown pool is never healthy; it
+    // never reaches the probe path" guarantee applies ONLY to
+    // ThreadPoolExecutor — the only executor kind the gate itself builds
+    // (production zero-queue factory), rebuilds, and reclaims. For a TPE, a
+    // shutdown pool is dead: it reports busy here, routes to the
+    // drained-but-shutdown arm of tryRebuildStuckWorker (free swap via
+    // executorFactory, no budget consumed — and even there, a factory that
+    // returns an ALREADY-SHUTDOWN fresh pool is refused and shut down instead
+    // of installed, leaving the dead pool in place), and is never submitted
+    // to. Custom non-ThreadPoolExecutor executors keep the pre-existing
+    // documented fail-closed probe posture: they are invisible to this check
+    // (isExecutorBusy()==false → half-open probe → fail-closed backoff
+    // renewal).
     private fun isExecutorBusy(): Boolean = try {
         val e = executor as? ThreadPoolExecutor ?: return false
-        e.activeCount > 0
+        e.isShutdown || e.activeCount > 0
     } catch (_: Throwable) {
         false
     }
@@ -485,10 +511,25 @@ class PolicyRefreshGate(
     // drains, so a stuck-open breaker with a permanently busy worker would
     // short-circuit forever (observe-only lock-in). When the busy age exceeds
     // rebuildThresholdMs(cooldown) (3*cooldown capped at HALF_OPEN_MAX_MS),
-    // shutdown the stuck worker best-effort and atomically replace the gate's
-    // executor reference with a fresh zero-queue single-thread executor.
+    // the fresh replacement pool is constructed BEFORE the stuck worker is
+    // shut down; if construction throws (OOM / thread-limit), the shutdown is
+    // never attempted and the old (still-alive, still-installed) pool is left
+    // untouched for a later retry. On success the gate atomically replaces
+    // its executor reference with the fresh zero-queue single-thread executor.
     // Custom executors cannot be rebuilt (unknown factory) — counted/logged
     // only. Caller must hold the outstanding guard.
+    //
+    // PR#60 r2 (K3/T-P2-11) dead-pool handling: a SHUTDOWN pool can never
+    // legitimately accept work, so it is never endorsed as "drained" and
+    // never reaches the probe path as a healthy worker. Instead a
+    // drained-but-shutdown arm (activeCount <= 0 && isShutdown) swaps in a
+    // fresh pool via executorFactory WITHOUT consuming the epoch or process
+    // budgets (same free-reclaim semantics as draining — no worker is being
+    // abandoned), while the busy arm constructs the fresh pool first and
+    // only then shuts the old one down. Fresh-construction-first means a
+    // factory failure leaves `executor` referencing the untouched old pool
+    // (busy arm: still alive; dead arm: still dead but consistent, retryable
+    // on a later attempt) — never a half-swapped or missing reference.
     //
     // Leak bound is TWO independent bounds (PR#60 r6, Finding #3):
     // (1) EPOCH budget MAX_WORKER_REBUILDS per invalidate-epoch — a recovery
@@ -506,7 +547,10 @@ class PolicyRefreshGate(
     //     recovery beyond the cap short of a process restart — documented,
     //     not implemented; a completed read recovers via the half-open
     //     probe without consuming the budget.
-    // Fresh thread names carry the rebuild count suffix for lspd forensics.
+    // Fresh thread names carry the rebuild count suffix for lspd forensics
+    // (busy/abandon arm: "-rebuilt-$n"; dead-pool reclaim arm:
+    // "GalaxyDual-policy-refresh-reclaimed-$n", so the two replacement paths
+    // are distinguishable in thread dumps).
     private fun tryRebuildStuckWorker(): Boolean {
         synchronized(rebuildLock) {
             // Re-check under rebuild lock: a peer may have rebuilt or the
@@ -514,24 +558,65 @@ class PolicyRefreshGate(
             try {
                 val cur = executor as? ThreadPoolExecutor ?: return false
                 // Drained probe FIRST (before the workerRebuilds budget and
-                // the process-cap/abandonedWorkerRebuilds gates): a worker
-                // that drained while we waited on rebuildLock is reclaimable
-                // and must short-circuit to "true" — never consume or be
-                // refused by budget that a real abandon would need. (H6: this
-                // ordering was previously after the budget gates, making the
-                // drained check unreachable in the rebuildLock interleave it
-                // exists for.)
-                if (cur.activeCount <= 0) return true
+                // the process-cap/abandonedWorkerRebuilds gates): a healthy,
+                // merely-idle worker that drained while we waited on
+                // rebuildLock is reclaimable and must short-circuit to "true"
+                // — never consume or be refused by budget that a real abandon
+                // would need. (H6: this ordering was previously after the
+                // budget gates, making the drained check unreachable in the
+                // rebuildLock interleave it exists for.) PR#60 r2: a SHUTDOWN
+                // pool is never endorsed as drained here — it is routed to
+                // the dead-pool arm below instead.
+                if (cur.activeCount <= 0 && !cur.isShutdown) return true
+                // PR#60 r2 (K3/T-P2-11): drained-but-shutdown arm. A dead
+                // pool (shutdown, nothing active) can never legitimately
+                // accept work, but it also holds no abandoned worker, so the
+                // swap consumes NO budget (same free-reclaim semantics as the
+                // drained probe above): the epoch and process budgets, the
+                // cap denials, and abandonedWorkerRebuilds are all left
+                // untouched. The fresh pool is constructed BEFORE the swap;
+                // on factory failure `executor` is left referencing the
+                // still-dead pool (untouched, consistent — a later rebuild
+                // attempt can retry the swap), no budget is consumed, and no
+                // abandon is recorded. A factory that returns an
+                // ALREADY-SHUTDOWN fresh pool is never installed: the pool is
+                // shut down best-effort, the dead pool is left in place, and
+                // no budget is consumed (retryable on a later attempt).
+                if (cur.activeCount <= 0 && cur.isShutdown) {
+                    val fresh = try {
+                        executorFactory("GalaxyDual-policy-refresh-reclaimed-${deadPoolReclaims.incrementAndGet()}")
+                    } catch (_: Throwable) {
+                        throttledLog("policy refresh executor factory failed; old pool retained; will retry on next eligible half-open probe")
+                        return false
+                    }
+                    if (fresh.isShutdown) {
+                        try {
+                            fresh.shutdownNow()
+                        } catch (_: Throwable) {
+                        }
+                        throttledLog("policy refresh executor factory returned an already-shutdown pool; reclaim refused")
+                        return false
+                    }
+                    executor = fresh
+                    throttledLog(
+                        "policy refresh dead (shutdown) worker pool replaced with a fresh pool" +
+                            " (no rebuild budget consumed)",
+                        force = true,
+                    )
+                    return true
+                }
                 if (workerRebuilds.get() >= MAX_WORKER_REBUILDS) return false
                 // PR#60 r6 (Finding #3): hard process-lifetime residency
-                // bound for the still-busy worker (the drained probe above
-                // has already short-circuited by now, so a refusal here is
-                // never misread as a drained worker). This consumes no
+                // bound for the still-busy worker (the drained probe and the
+                // dead-pool arm above have already short-circuited by now,
+                // so a refusal here is never misread as a drained or dead
+                // worker). This consumes no
                 // budget by itself (only the real-abandon path below
                 // increments abandonedWorkerRebuilds). A drained worker
-                // (activeCount <= 0) is handled by the probe above and
-                // consumes nothing; when the cap is exhausted the refusal
-                // fires here, fail-closed, for a still-busy worker (only the
+                // (activeCount <= 0, not shutdown) is handled by the probe
+                // above and a drained-but-shutdown worker by the dead-pool
+                // arm; both consume nothing. When the cap is exhausted the
+                // refusal fires here, fail-closed, for a still-busy worker (only the
                 // still-busy case is restart-bound; a completed read recovers
                 // via the half-open probe without consuming this budget).
                 if (abandonedWorkerRebuilds.get() >= MAX_PROCESS_ABANDONED_WORKER_REBUILDS) {
@@ -548,17 +633,31 @@ class PolicyRefreshGate(
                     }
                     return false
                 }
+                // Busy arm (activeCount > 0, or shutdown-but-active — only
+                // reachable for a pool that is both shutdown AND still has a
+                // running worker): construct the fresh pool BEFORE shutting
+                // down the old one. On factory failure (OOM / thread-limit)
+                // `executor` is left referencing the untouched, still-alive
+                // `cur` — no shutdown was attempted, no budget is consumed,
+                // and a later rebuild attempt can retry.
+                val n = workerRebuilds.get() + 1L
+                val fresh = try {
+                    executorFactory("GalaxyDual-policy-refresh-rebuilt-$n")
+                } catch (_: Throwable) {
+                    throttledLog("policy refresh executor factory failed; old pool retained; will retry on next eligible half-open probe")
+                    return false
+                }
+                if (fresh.isShutdown) {
+                    try {
+                        fresh.shutdownNow()
+                    } catch (_: Throwable) {
+                    }
+                    throttledLog("policy refresh executor factory returned an already-shutdown pool; rebuild refused")
+                    return false
+                }
                 try {
                     cur.shutdownNow()
                 } catch (_: Throwable) {
-                }
-                val n = workerRebuilds.get() + 1L
-                val fresh = try {
-                    PolicyRefreshBudget.newPolicyRefreshExecutor(
-                        "GalaxyDual-policy-refresh-rebuilt-$n",
-                    )
-                } catch (_: Throwable) {
-                    return false
                 }
                 executor = fresh
                 workerRebuilds.incrementAndGet()
