@@ -429,6 +429,12 @@ jobs:
             exit 1
           fi
           echo "PASS: release policy provider parity"
+      # Retry-guard fixture self-test: pins ci-retry-guard.sh's fail-fast semantics
+      # (verification-failure signatures exit 1 immediately with no retry; transient
+      # failures retry up to the cap and exit 1 there) so a future weakening of the
+      # signature regex is caught here, not in a gradle invocation.
+      - name: CI retry guard self-test
+        run: bash scripts/ci-retry-guard.test.sh
       # Parity-checker fixture self-test: every fail-* fixture must exit 1 and
       # every pass-* fixture must exit 0, proving the provider-node gate fails
       # closed (wrong-element names, split name/authority, exported=false, an
