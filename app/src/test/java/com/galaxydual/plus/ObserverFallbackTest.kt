@@ -1775,6 +1775,7 @@ class ObserverFallbackTest {
                     // live until every iteration's VM is torn down together.
                     // Idempotent with tearDown's own drain (cancel/close are
                     // idempotent, joins on completed jobs return fast).
+                    // In-loop strict drain (inter-iteration): incomplete drain throws before any resetMain; a throw here in the finally masks any in-flight assertion (JUnit4 semantics) — intended fail-fast; keep this site's children unwindable.
                     TestDrainSupport.drainBeforeResetMain(listOf(vmR), listOf(coordR))
                     try { coordR.close() } catch (_: Exception) { }
                 }
