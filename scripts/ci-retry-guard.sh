@@ -39,12 +39,22 @@ fi
 
 # Fail-fast signatures (case-insensitive, extended grep). 'Dependency
 # verification failed' and 'verification-metadata' are the observed CI #304
-# signatures and stay as-is. The checksum branch requires co-occurrence with
-# verification context on the same line (grep -E is line-based) so a proxy-504
-# body containing 'checksum mismatch' WITHOUT verification wording does NOT
-# hard-fail the guard; the 'artifacts? failed verification' and 'failed
-# verification:' branches cover the other observed wordings.
-VERIFICATION_RE='Dependency verification failed|verification-metadata|artifacts? failed verification|failed verification:|checksum (verification|mismatch|failed|missing).{0,200}(verification|metadata|artifact)|artifact (verification|checksum) failed'
+# signatures and stay as-is; the `verification[ -]metadata` branch additionally
+# matches the spaced 'Verification metadata' wording (grep -E alternation is
+# byte-based, so the hyphen class keeps 'verification-metadata' intact). The
+# checksum branch requires co-occurrence with verification context on the same
+# line (grep -E is line-based) so a proxy-504 body containing 'checksum
+# mismatch' WITHOUT verification wording does NOT hard-fail the guard; the
+# 'artifacts? failed verification' and 'failed verification:' branches cover the
+# other observed wordings. The signature-verification branch covers the PGP
+# failure detail Gradle emits ('Signature verification failed: ...'). The bare 'checksum verification failed' branch
+# covers the standalone wording with no trailing verification/metadata/artifact
+# context (the legacy checksum branch requires that trailing context and would
+# miss a bare line). Any of these wordings appearing in a FAILED run is a
+# deterministic dependency-verification failure — retrying only hides it. Note:
+# the legacy checksum branch STILL requires the trailing context; keep the
+# bare alternative in sync when touching it.
+VERIFICATION_RE='Dependency verification failed|verification[ -]metadata|artifacts? failed verification|failed verification:|checksum (verification|mismatch|failed|missing).{0,200}(verification|metadata|artifact)|artifact (verification|checksum) failed|signature verification (failed|failure|error|exception)|checksum verification failed'
 
 LOG=$(mktemp "${TMPDIR:-/tmp}/ci-retry-guard.XXXXXX.log")
 [ -n "$LOG" ] || { echo "ci-retry-guard.sh: mktemp failed" >&2; exit 2; }

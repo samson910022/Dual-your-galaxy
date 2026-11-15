@@ -78,7 +78,7 @@ jobs:
           path: |
             app/build/reports/androidTests/
             app/build/outputs/androidTest-results/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
   build:
@@ -172,17 +172,26 @@ jobs:
           set -e
           set -o pipefail
           echo "== (a) merged manifest has no android:sharedUserId attribute =="
-          # Prefer the new AGP 8.x `merged_manifest` (processDebugMainManifest)
-          # layout; fall back to the legacy `merged_manifests` layout ONLY when
-          # the new-layout root does not exist at all. If the new-layout root
-          # exists but yields zero debug manifests, FAIL — never fall back to
-          # the legacy tree (a stale legacy manifest would silently weaken the
-          # gate). Scope to the debug variant (path component exactly 'debug')
-          # and require EXACTLY ONE merged manifest in the chosen layout — zero
-          # means the merge task did not run; more than one means an unexpected
-          # variant is present, and grepping an arbitrary pick would silently
-          # weaken the gate. `|| true` keeps a missing legacy root from
-          # aborting the step under set -e/pipefail.
+          # AGP 8.5.2 (gradle/libs.versions.toml) is the version that emits the
+          # merged manifest, and it writes the NEW `merged_manifest` layout
+          # (debug: app/build/intermediates/merged_manifest/debug/
+          # processDebugMainManifest/AndroidManifest.xml) — verified locally in
+          # this checkout (the file exists, byte-identical to the legacy
+          # `merged_manifests/...` copy from the same build). The legacy plural
+          # tree cannot be told from a fresh artifact, so when the new-layout
+          # root is absent we FAIL rather than validate a possibly stale
+          # manifest. No workflow in .github/workflows relies on the legacy
+          # path (grep: merged_manifests yields only these gates), and every
+          # consumer runs :app:assembleDebug first, which under AGP 8.5.2
+          # always produces the new-layout root — including under
+          # workflow_dispatch. If the new-layout root exists but yields zero
+          # debug manifests, FAIL — never fall back to the legacy tree (a
+          # stale legacy manifest would silently weaken the gate). Scope to the
+          # debug variant (path component exactly 'debug') and require EXACTLY
+          # ONE merged manifest — zero means the merge task did not run; more
+          # than one means an unexpected variant is present, and grepping an
+          # arbitrary pick would silently weaken the gate. `|| true` keeps a
+          # find failure from aborting the step under set -e/pipefail.
           if [ -d app/build/intermediates/merged_manifest ]; then
             LAYOUT="app/build/intermediates/merged_manifest (processDebugMainManifest)"
             MERGED_FILES=$(find app/build/intermediates/merged_manifest -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
@@ -191,11 +200,16 @@ jobs:
               exit 1
             fi
           else
-            LAYOUT="app/build/intermediates/merged_manifests (legacy processDebugManifest)"
-            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
+            # CI-8: the legacy plural `merged_manifests` tree is only emitted by
+            # pre-AGP-8 merge tasks. A file there cannot be distinguished from
+            # a stale manifest left by a previous build, and no CI path relies
+            # on it (AGP 8.5.2's assembleDebug produces the new layout). Fail
+            # closed instead of validating an ambiguous stale file.
+            echo "FAIL: new-layout merged manifest root app/build/intermediates/merged_manifest is absent after :app:assembleDebug; refusing to fall back to the legacy merged_manifests tree — a stale legacy manifest is indistinguishable from a fresh one (AGP 8.5.2 emits the new layout). Re-run :app:assembleDebug and ensure processDebugMainManifest ran."
+            exit 1
           fi
           if [ -z "$MERGED_FILES" ]; then
-            echo "FAIL: no merged debug AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest missing and legacy app/build/intermediates/merged_manifests yielded zero files matching '*/debug/*'; run :app:assembleDebug first)"
+            echo "FAIL: no merged debug AndroidManifest.xml under app/build/intermediates/merged_manifest despite the layout checks passing — refusing to continue (this is unreachable unless find raced the filesystem)"
             exit 1
           fi
           MERGED_COUNT=$(printf '%s\n' "$MERGED_FILES" | wc -l)
@@ -328,15 +342,25 @@ jobs:
           grep -F -A1 'android:name="io.github.libxposed.service.XposedProvider"' "$MAN" | grep -F 'tools:node="remove"'
           grep -F -A1 'android:name=".GuardXposedProvider"' "$MAN" | grep -F 'android:authorities="${applicationId}.XposedService"'
           echo "== merged manifest =="
-          # Prefer the new AGP 8.x `merged_manifest` (processDebugMainManifest)
-          # layout — when the new-layout root exists it is authoritative: zero
-          # debug manifests under it means the merge task did not run, and
-          # falling back to the legacy tree could validate a stale artifact.
-          # Scope to the debug variant (a literal `debug` path component) and
-          # require EXACTLY ONE merged manifest — more than one means an
-          # unexpected variant is present, and grepping an arbitrary pick would
-          # silently weaken the gate. `|| true` keeps a missing root from
-          # aborting the step under set -e/pipefail.
+          # CI-8: the new AGP 8.x `merged_manifest` (processDebugMainManifest)
+          # layout is the ONLY accepted layout. Zero debug manifests under it
+          # means the merge task did not run; the legacy plural `merged_manifests`
+          # tree is pre-AGP-8 and indistinguishable from a stale artifact and is
+          # never consulted; absence of the new-layout root (or zero manifests
+          # under it) fails closed below.
+          # CI-8: the legacy plural `merged_manifests` tree cannot be told from
+          # a fresh artifact (AGP 8.5.2 in gradle/libs.versions.toml emits the
+          # new layout; verified locally in this checkout — the file exists,
+          # byte-identical to the legacy copy from the same build). When the
+          # new-layout root is absent, FAIL instead of trusting the ambiguous
+          # legacy file; no workflow in .github/workflows relies on the legacy
+          # path, and :app:assembleDebug (run before this step) always produces
+          # the new-layout root under AGP 8.5.2 — including under
+          # workflow_dispatch. Scope to the debug variant (a literal `debug`
+          # path component) and require EXACTLY ONE merged manifest — more
+          # than one means an unexpected variant is present, and grepping an
+          # arbitrary pick would silently weaken the gate. `|| true` keeps a
+          # find failure from aborting the step under set -e/pipefail.
           if [ -d app/build/intermediates/merged_manifest ]; then
             MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
             if [ -z "$MERGED_NEW" ]; then
@@ -346,11 +370,11 @@ jobs:
             LAYOUT="app/build/intermediates/merged_manifest (processDebugMainManifest)"
             MERGED_FILES="$MERGED_NEW"
           else
-            LAYOUT="app/build/intermediates/merged_manifests (legacy processDebugManifest)"
-            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/debug/*' -name AndroidManifest.xml 2>/dev/null || true)
+            echo "FAIL: new-layout merged manifest root app/build/intermediates/merged_manifest is absent after :app:assembleDebug; refusing to fall back to the legacy merged_manifests tree — a stale legacy manifest is indistinguishable from a fresh one (AGP 8.5.2 emits the new layout). Re-run :app:assembleDebug and ensure processDebugMainManifest ran."
+            exit 1
           fi
           if [ -z "$MERGED_FILES" ]; then
-            echo "FAIL: no merged debug AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest absent and legacy tree yielded zero files matching '*/debug/*'; run :app:assembleDebug first)"
+            echo "FAIL: no merged debug AndroidManifest.xml under app/build/intermediates/merged_manifest despite the layout checks passing — refusing to continue (this is unreachable unless find raced the filesystem)"
             exit 1
           fi
           MERGED_COUNT=$(printf '%s\n' "$MERGED_FILES" | wc -l)
@@ -394,15 +418,26 @@ jobs:
           set -o pipefail
           echo "== release merged manifest =="
           ALLOW_RELEASE_MANIFEST_MERGE=1 ./gradlew :app:processReleaseMainManifest --no-daemon
-          # Prefer the new AGP 8.x `merged_manifest` (processReleaseMainManifest)
-          # layout — when the new-layout root exists it is authoritative: zero
-          # release manifests under it means the merge task did not run, and
-          # falling back to the legacy tree could validate a stale artifact.
-          # Scope to the release variant (a literal `release` path component)
-          # and require EXACTLY ONE merged manifest — more than one means an
-          # unexpected variant is present, and grepping an arbitrary pick would
-          # silently weaken the gate. `|| true` keeps a missing root from
-          # aborting the step under set -e/pipefail.
+          # CI-8: the new AGP 8.x `merged_manifest` (processReleaseMainManifest)
+          # layout is the ONLY accepted layout. Zero release manifests under it
+          # means the merge task did not run; the legacy plural `merged_manifests`
+          # tree is pre-AGP-8 and indistinguishable from a stale artifact and is
+          # never consulted; absence of the new-layout root (or zero manifests
+          # under it) fails closed below.
+          # CI-8: the legacy plural `merged_manifests` tree cannot be told from
+          # a fresh artifact (AGP 8.5.2 in gradle/libs.versions.toml emits the
+          # new layout; verified locally in this checkout — the file exists,
+          # byte-identical to the legacy copy from the same build). When the
+          # new-layout root is absent, FAIL instead of trusting the ambiguous
+          # legacy file; no workflow in .github/workflows relies on the legacy
+          # path, and :app:processReleaseMainManifest (run just above) always
+          # produces the new-layout root under AGP 8.5.2 — including under
+          # workflow_dispatch. Scope to the release variant (a literal
+          # `release` path component) and require EXACTLY ONE merged
+          # manifest — more than one means an unexpected variant is present,
+          # and grepping an arbitrary pick would silently weaken the gate.
+          # `|| true` keeps a find failure from aborting the step under
+          # set -e/pipefail.
           if [ -d app/build/intermediates/merged_manifest ]; then
             MERGED_NEW=$(find app/build/intermediates/merged_manifest -path '*/release/*' -name AndroidManifest.xml 2>/dev/null || true)
             if [ -z "$MERGED_NEW" ]; then
@@ -412,11 +447,11 @@ jobs:
             LAYOUT="app/build/intermediates/merged_manifest (processReleaseMainManifest)"
             MERGED_FILES="$MERGED_NEW"
           else
-            LAYOUT="app/build/intermediates/merged_manifests (legacy processReleaseManifest)"
-            MERGED_FILES=$(find app/build/intermediates/merged_manifests -path '*/release/*' -name AndroidManifest.xml 2>/dev/null || true)
+            echo "FAIL: new-layout merged manifest root app/build/intermediates/merged_manifest is absent after :app:processReleaseMainManifest; refusing to fall back to the legacy merged_manifests tree — a stale legacy manifest is indistinguishable from a fresh one (AGP 8.5.2 emits the new layout). Re-run :app:processReleaseMainManifest and ensure processReleaseMainManifest ran."
+            exit 1
           fi
           if [ -z "$MERGED_FILES" ]; then
-            echo "FAIL: no merged release AndroidManifest.xml found (new-layout root app/build/intermediates/merged_manifest absent and legacy tree yielded zero files matching '*/release/*'; run :app:processReleaseMainManifest first)"
+            echo "FAIL: no merged release AndroidManifest.xml under app/build/intermediates/merged_manifest despite the layout checks passing — refusing to continue (this is unreachable unless find raced the filesystem)"
             exit 1
           fi
           if [ "$(printf '%s\n' "$MERGED_FILES" | wc -l)" != "1" ]; then
@@ -571,7 +606,7 @@ jobs:
           path: |
             **/build/reports/tests/
             **/build/test-results/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       # Phase P29 (issue #29): the build job only compiles androidTest here;
       # the full harness executes on the locale-instrumentation job above
@@ -590,7 +625,7 @@ jobs:
           path: |
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/androidTest/debug/*.apk
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       # NOTE: no ktlint plugin is applied in this repo (see gradle/libs.versions.toml),
       # so the old `ktlintCheck` placeholder step is replaced with the zero-dependency
@@ -614,7 +649,7 @@ jobs:
           path: |
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
   # Phase P29 (issue #29): instrumentation manual profile (API 34, matches
