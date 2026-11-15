@@ -55,6 +55,30 @@ case "$mode" in
   verify-metadata-checksum)
     echo 'verification-metadata: checksum mismatch'
     exit 1 ;;
+  verify-verification-metadata-prefix)
+    # 'Verification-metadata ...' prefix wording (pre-existing hyphen branch
+    # pinned as a wording variant; still matched by the old regex).
+    echo 'Verification-metadata could not be parsed; see gradle/verification-metadata.xml'
+    exit 1 ;;
+  verify-verification-metadata-space)
+    # Spaced 'Verification metadata' wording (CI-5) — deliberately NO hyphenated
+    # path or hyphenated 'verification-metadata' anywhere on the line, so this
+    # pin fires on the `verification[ -]metadata` class alone (the pre-existing
+    # hyphen branch does not match this line).
+    echo 'Verification metadata failed to verify'
+    exit 1 ;;
+  verify-signature-verification)
+    # Bare PGP wording (CI-5) — matches no pre-existing branch (no 'artifact',
+    # no trailing 'failed verification:'); pins the 'signature verification'
+    # alternative alone.
+    echo 'Signature verification failed'
+    exit 1 ;;
+  verify-checksum-verification-failed)
+    # Bare checksum wording (CI-5) — the legacy checksum branch requires
+    # trailing verification/metadata/artifact context, so this pins the new
+    # standalone 'checksum verification failed' alternative alone.
+    echo 'Checksum verification failed'
+    exit 1 ;;
   http-504)
     echo 'FAILURE: Could not GET https://repo.example.com/org/junit/junit-bom/5.9.2/junit-bom-5.9.2.pom. Received status code 504 from server: Gateway Timeout'
     exit 1 ;;
@@ -140,6 +164,18 @@ run_guard 'verification signature: failed verification:' \
 run_guard 'verification signature: verification-metadata checksum mismatch' \
   1 1 verify-metadata-checksum \
   3 0 "test verification-metadata" -- "$FAKE_GRADLE"
+run_guard 'verification signature: Verification-metadata prefix (could not be parsed)' \
+  1 1 verify-verification-metadata-prefix \
+  3 0 "test verification-metadata-prefix" -- "$FAKE_GRADLE"
+run_guard 'verification signature: Verification metadata (spaced wording)' \
+  1 1 verify-verification-metadata-space \
+  3 0 "test verification-metadata-space" -- "$FAKE_GRADLE"
+run_guard 'verification signature: Signature verification failed' \
+  1 1 verify-signature-verification \
+  3 0 "test signature-verification" -- "$FAKE_GRADLE"
+run_guard 'verification signature: Checksum verification failed (bare)' \
+  1 1 verify-checksum-verification-failed \
+  3 0 "test checksum-verification-failed" -- "$FAKE_GRADLE"
 
 # --- (b)/(f) transient transport failures: retried up to the cap, rc 1 --------
 run_guard 'transient HTTP 504 retried up to cap (invocations == cap)' \
@@ -189,7 +225,7 @@ run_guard 'argument validation: missing sleep' \
 # --- regex pin: the VERIFICATION_RE assignment line must stay exactly this -----
 # A future weakening of the script's signature regex (removed alternative,
 # loosened context requirement) changes this line and fails the fixture.
-EXPECTED_RE_LINE="VERIFICATION_RE='Dependency verification failed|verification-metadata|artifacts? failed verification|failed verification:|checksum (verification|mismatch|failed|missing).{0,200}(verification|metadata|artifact)|artifact (verification|checksum) failed'"
+EXPECTED_RE_LINE="VERIFICATION_RE='Dependency verification failed|verification[ -]metadata|artifacts? failed verification|failed verification:|checksum (verification|mismatch|failed|missing).{0,200}(verification|metadata|artifact)|artifact (verification|checksum) failed|signature verification (failed|failure|error|exception)|checksum verification failed'"
 ACTUAL_RE_LINE="$(grep -E '^VERIFICATION_RE=' "$GUARD" || true)"
 total=$((total + 1))
 if [ "$ACTUAL_RE_LINE" = "$EXPECTED_RE_LINE" ]; then
