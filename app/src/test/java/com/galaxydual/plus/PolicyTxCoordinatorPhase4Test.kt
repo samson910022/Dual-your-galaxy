@@ -546,4 +546,55 @@ class PolicyTxCoordinatorPhase4Test {
             coord.close()
         }
     }
+
+    // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption-epoch fence at the
+    // coordinator claim. An adoption bump (simulated here inside commitMutex,
+    // mirroring the reclaim arms) moves Tx.adoptionEpoch; a claim that linearizes
+    // after it must observe EPOCH_STALE — no CAS consumption, no rev bump, no
+    // stage. A claim with the post-adoption snapshot then succeeds.
+    @Test
+    fun completeWithRevisionCheckedVerdict_epochStale_consumesNothing_thenClaims() = runBlocking {
+        val coord = PolicyTxCoordinator()
+        try {
+            val tx = placeholderTx(coord, "epoch-fence", completedOwner = true)
+            coord.activeTx.set(tx)
+            val ph = PolicySettled(tx.txId, tx.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false)
+            val attachedEpoch = tx.adoptionEpoch.get()
+            assertEquals(0L, attachedEpoch)
+
+            // Cross-VM adoption inside commitMutex (mirrors the reclaim arms).
+            coord.withCommitLock { tx.adoptionEpoch.incrementAndGet() }
+            assertEquals(1L, tx.adoptionEpoch.get())
+
+            // Stale snapshot: EPOCH_STALE — nothing consumed.
+            val stale = coord.completeWithRevisionCheckedVerdict(tx, ph, -1L, attachedEpoch)
+            assertEquals(PolicyTxCoordinator.ClaimStagedVerdict.EPOCH_STALE, stale)
+            assertSame(tx, coord.activeTx.get())
+            assertEquals(0L, coord.committedRevision.get())
+            assertNull(coord.pendingPublish.get())
+
+            // Direct completeWithRevision with a stale expectedEpoch also consumes nothing.
+            assertFalse(coord.completeWithRevision(tx, ph, attachedEpoch))
+            assertSame(tx, coord.activeTx.get())
+            assertEquals(0L, coord.committedRevision.get())
+            assertNull(coord.pendingPublish.get())
+
+            // Correct (post-adoption) snapshot: claims and stages the placeholder.
+            val claimed = coord.completeWithRevisionCheckedVerdict(tx, ph, -1L, tx.adoptionEpoch.get())
+            assertEquals(PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED, claimed)
+            assertEquals(1L, coord.committedRevision.get())
+            assertNull(coord.activeTx.get())
+            assertNotNull(coord.pendingPublish.get())
+
+            // Legacy skip (-1L) still claims unconditionally — same-VM/fast-path compatibility.
+            val tx2 = placeholderTx(coord, "epoch-fence-legacy", completedOwner = true)
+            coord.activeTx.set(tx2)
+            val ph2 = PolicySettled(tx2.txId, tx2.key, setOf("com.p"), false, MsgKind.CHANNEL, "", false)
+            coord.withCommitLock { tx2.adoptionEpoch.incrementAndGet() }
+            assertTrue(coord.completeWithRevision(tx2, ph2, -1L))
+            assertEquals(2L, coord.committedRevision.get())
+        } finally {
+            coord.close()
+        }
+    }
 }

@@ -939,6 +939,10 @@ class DualViewModel(
         // terminals derive msg+msgKind from this — on any VM that observes
         // the tx (winner, reconciler, late-join, coordinator replay).
         val repairResult: AtomicReference<RepairResult?> = AtomicReference(null),
+        // Stage P2 (PR #60 NEW finding #2): Tx 級共享所有權世代——唯一跨 VM 的所有權 token。
+        // 領養（跨 VM 接收該 Tx）處於 coordinator commitMutex 內 bump；attach 時快照；
+        // claim 時在同一 mutex 內比對（fence）。Bump 單調遞增、永不 reset。
+        val adoptionEpoch: AtomicLong = AtomicLong(0L),
     )
     // Stage I1：無 coordinator 舊測試路徑的回退發號器（有 coordinator 一律經
     // 其 nextTxId() 全域發號，見四處建 Tx 點；本計數器僅 null-coordinator 用）。
@@ -1685,16 +1689,32 @@ class DualViewModel(
     // inside the commitMutex lock, so callers never re-read committedRevision
     // to guess why the claim failed. REV_GATE_REJECTED deliberately skips the
     // loser-follow (no winner exists to follow).
+    // Stage P2 (PR #60 NEW finding #2): EPOCH_STALE means an ADOPTER exists and
+    // owns convergence — unlike REV_GATE_REJECTED there IS a winner to follow,
+    // so the verdict joins the CAS_LOSS arm: no claim is consumed (no CAS, no
+    // rev bump, no stage) and the loser-follow (SAVING→RECONCILING flip +
+    // launchLoserSync → applyAuthoritativeSettled on the adopter's identity-
+    // matched terminal) converges this VM read-only. Mapping EPOCH_STALE to the
+    // REV_GATE_REJECTED arm stranded live dual-active losers in RECONCILING
+    // forever (h2_dualActive_loserSyncsToIdle / h2_loserRefresh_doesNotOverwriteWinner
+    // — existing pinned contract: losers follow winners).
     private suspend fun tryClaimStagedVerdict(
         tx: PolicyTx,
         payload: PolicySettled,
         revBefore: Long? = null,
+        expectedEpoch: Long? = null,
     ): PolicyTxCoordinator.ClaimStagedVerdict {
         val coord = policyTxCoordinator
             ?: return PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
         val verdict: PolicyTxCoordinator.ClaimStagedVerdict = try {
-            if (revBefore != null) coord.completeWithRevisionCheckedVerdict(tx, payload, revBefore)
-            else if (coord.completeWithRevision(tx, payload)) {
+            if (revBefore != null || expectedEpoch != null) {
+                coord.completeWithRevisionCheckedVerdict(
+                    tx,
+                    payload,
+                    revBefore ?: -1L,
+                    expectedEpoch ?: -1L,
+                )
+            } else if (coord.completeWithRevision(tx, payload)) {
                 PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
             } else {
                 PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
@@ -1708,6 +1728,9 @@ class DualViewModel(
             // No claim consumed, no winner to follow — the caller settles the
             // terminal as stage-rejected. Loser-follow (SAVING→RECONCILING +
             // launchLoserSync) would wait on a winner that does not exist.
+            // EPOCH_STALE deliberately does NOT take this arm: an adopter IS
+            // a winner to follow (identity-matched, read-only), so it falls
+            // through to the CAS_LOSS arm below.
             return verdict
         }
         if (verdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
@@ -1764,6 +1787,7 @@ class DualViewModel(
     private suspend fun tryClaimPlaceholderVerdict(
         tx: PolicyTx,
         revBefore: Long? = null,
+        expectedEpoch: Long? = null,
     ): PolicyTxCoordinator.ClaimStagedVerdict {
         val placeholder = PolicySettled(
             tx.txId, tx.key, tx.sanitized, false, MsgKind.CHANNEL, "", tx.isClear,
@@ -1774,11 +1798,15 @@ class DualViewModel(
             // the old `?: return true` here for standalone callers.
             return PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
         }
-        return tryClaimStagedVerdict(tx, placeholder, revBefore)
+        return tryClaimStagedVerdict(tx, placeholder, revBefore, expectedEpoch)
     }
 
-    private suspend fun tryClaimPlaceholder(tx: PolicyTx, revBefore: Long? = null): Boolean =
-        tryClaimPlaceholderVerdict(tx, revBefore) == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+    private suspend fun tryClaimPlaceholder(
+        tx: PolicyTx,
+        revBefore: Long? = null,
+        expectedEpoch: Long? = null,
+    ): Boolean =
+        tryClaimPlaceholderVerdict(tx, revBefore, expectedEpoch) == PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
 
     // Stage L1 P1: reconciler/fast-path uniform entry (placeholder staged when
     // coordinator present, legacy CAS when null). Call-sites use this so
@@ -1795,9 +1823,21 @@ class DualViewModel(
     // re-read). Any call site that DID observe a base revision for its IO must
     // pass it as revBefore via claimForPublishCheckedVerdict so a foreign commit
     // mid-IO bumps the rev and the terminal is gated exactly like a success.
-    private suspend fun claimForPublish(tx: PolicyTx): Boolean {
+    // Stage P2 (PR #60 NEW finding #2): expectedEpoch threads the attach-time
+    // Tx.adoptionEpoch snapshot into the claim's commitMutex critical section;
+    // a mismatch consumes NOTHING (EPOCH_STALE → false here; inside
+    // tryClaimStagedVerdict the verdict joins the CAS_LOSS arm — no CAS, no
+    // rev bump, no publish, but a read-only loser-follow on the adopter's
+    // terminal so the dual-active loser still converges). null keeps the
+    // legacy unconditional claim (fast-path arms, same-VM handover).
+    // -1L sentinel is reserved for the coordinator-level "no snapshot" case
+    // and is never produced by this lambda (null → gate skipped).
+    private suspend fun claimForPublish(
+        tx: PolicyTx,
+        expectedEpoch: Long? = null,
+    ): Boolean {
         val coord = policyTxCoordinator
-        return if (coord != null) tryClaimPlaceholder(tx) else tryClaimCoordinatorPublish(tx)
+        return if (coord != null) tryClaimPlaceholder(tx, null, expectedEpoch) else tryClaimCoordinatorPublish(tx)
     }
 
     // A3-3: rev-gated sibling of claimForPublish for FAILED terminals whose IO
@@ -1806,6 +1846,14 @@ class DualViewModel(
     // between the failed IO and this claim bumps committedRevision → the claim is
     // rejected and the terminal (non-Known) is never staged — peers stay converged
     // on B either via _latest or via the UNKNOWN_REFRESH gate.
+    // Exemption for omitted epoch fences (Stage P2 fast-path arms): these FAILED
+    // payloads are correct to leave at expectedEpoch=null PROVIDED they remain
+    // non-Known terminals built from a fresh in-flight state (never a
+    // pre-adoption snapshot). The documented alternative — threading the
+    // snapshot epoch from the owner's attach point — is deliberately NOT done
+    // here so the owner-handover hot path is not re-fenced into starvation;
+    // any future change that makes these payloads carry a pre-adoption snapshot
+    // MUST thread the epoch or the claim would republish the finding-#2 pattern.
     // Verdict variant for the FAILED-terminal claim path: REV_GATE_REJECTED →
     // caller settles as stage-rejected; CAS_LOSS → a live winner consumed the
     // claim (loser handling already applied inside tryClaimStagedVerdict) and
@@ -1813,9 +1861,10 @@ class DualViewModel(
     private suspend fun claimForPublishCheckedVerdict(
         tx: PolicyTx,
         revBefore: Long,
+        expectedEpoch: Long? = null,
     ): PolicyTxCoordinator.ClaimStagedVerdict {
         val coord = policyTxCoordinator
-        return if (coord != null) tryClaimPlaceholderVerdict(tx, revBefore) else if (tryClaimCoordinatorPublish(tx)) {
+        return if (coord != null) tryClaimPlaceholderVerdict(tx, revBefore, expectedEpoch) else if (tryClaimCoordinatorPublish(tx)) {
             PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
         } else {
             PolicyTxCoordinator.ClaimStagedVerdict.CAS_LOSS
@@ -2523,6 +2572,19 @@ class DualViewModel(
                                     return@withCommitLock
                                 }
                                 if (canJoinTx(tx)) {
+                                    // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption
+                                    // epoch bump — this VM is about to ADOPT the Tx (cross-VM
+                                    // adoption arm). The bump is ordered against the claim's
+                                    // epoch check by the SAME commitMutex critical section
+                                    // (claims re-check the epoch inside commitMutex before
+                                    // their CAS), so an in-flight claim that linearizes
+                                    // after this point observes the new epoch and retains
+                                    // (defer convergence to this adopter).
+                                    // Over-fencing on a lost local race (the post-lock
+                                    // CAS below fails) is fail-closed and safe: the old
+                                    // worker retains rather than risk publishing a
+                                    // pre-adoption terminal.
+                                    try { tx.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
                                     action = 2
                                     return@withCommitLock
                                 }
@@ -2615,15 +2677,19 @@ class DualViewModel(
     // - P2-1 防雙發布：終態（Success/Mismatch/Failed）發布前先經
     //   tryClaimCoordinatorPublish 做 settle-CAS 先行、勝者才發布（coordinator
     //   CAS 成功才發布，敗者跳過）；unresolved 不搶發布權（不碰 fence）。
+    // Stage P2 (PR #60 NEW finding #2): attach-time Tx-scoped adoption-epoch
+    // snapshot (alongside the draft-version snapshot). The Tx may be adopted by
+    // another VM before the handler runs; its adoption bump moves
+    // Tx.adoptionEpoch past this snapshot, which means the adopter's workers
+    // own convergence. The version snapshot catches the same race at entry
+    // (reconciler-style discipline); the adoptionEpoch snapshot additionally
+    // arms the entry-time fence and the claim-time fence inside commitMutex
+    // (see autoRecheckTx / claimForPublish) — policyDraftVersion alone is not
+    // ordered against in-flight claims.
     private fun attachDeferredAutoRecheck(tx: PolicyTx) {
         try {
-            // Stale-generation snapshot at attach time: the Tx may be adopted
-            // by another VM before the handler runs; policyDraftVersion moving
-            // past this value means an adopter owns convergence (implementing
-            // the same stale-generation discipline as the reconciler's
-            // join==false retain arm — the owner-identity re-check below is
-            // insufficient on its own).
             val attachedVersion = policyDraftVersion.get()
+            val attachedEpoch = tx.adoptionEpoch.get()
             tx.deferred.invokeOnCompletion {
                 // 非同步交接：仍為擁有者才啟動單次重查（已結／被替換即丟棄）。
                 if (activePolicyTx.get() !== tx) {
@@ -2632,7 +2698,7 @@ class DualViewModel(
                     return@invokeOnCompletion
                 }
                 handoverScope().launch {
-                    autoRecheckTx(tx, attachedVersion)
+                    autoRecheckTx(tx, attachedVersion, attachedEpoch)
                 }
             }
         } catch (_: Exception) {
@@ -2642,7 +2708,17 @@ class DualViewModel(
 
     // Stage G2 單次權威重查本體（handoverScope 上跑，讀走共用 IO 池）。
     // 有 coordinator 時跑在其 app-scoped 域，VM 死亡不影響收斂。
-    private suspend fun autoRecheckTx(tx: PolicyTx, attachedVersion: Long) {
+    // Stage P2 (PR #60 NEW finding #2): attachedEpoch is the Tx-scoped adoption
+    // epoch snapshot taken at attach time. Entry-time fence: a mismatch means
+    // another VM adopted the Tx — retain (no claim, no publish, no fence touch)
+    // and defer convergence to the adopter. Claim-time fence (belt-and-braces):
+    // every claim below passes attachedEpoch into claimForPublish, whose
+    // commitMutex critical section re-checks Tx.adoptionEpoch — a claim that
+    // linearizes after the adopter's bump is consumed as EPOCH_STALE (no CAS,
+    // no rev bump, no stage). Linearization point = the claim CAS inside
+    // commitMutex; the adoption bump is ordered against it by the same mutex
+    // (see the adoption sites).
+    private suspend fun autoRecheckTx(tx: PolicyTx, attachedVersion: Long, attachedEpoch: Long) {
         // 擁有者再判（併發已結／被替換即丟棄，防雙發布）。
         if (activePolicyTx.get() !== tx) return
         // Stale-generation retain (version arm only): the reconciler bumps
@@ -2651,8 +2727,12 @@ class DualViewModel(
         // means an adopting VM (reclaim/late-join/new settle) moved the draft,
         // and that adopter's workers own convergence. Retain (no claim, no
         // publish, no fence/_latest/phase touch) rather than publish from a
-        // stale window — the freshest worker wins the claim and the terminal.
+        // stale window.
         if (policyDraftVersion.get() != attachedVersion) return
+        // Adoption-epoch retain (entry-time fence): another VM adopted the Tx
+        // since attach — defer convergence to it (the claim-time fence in
+        // commitMutex covers the window between this check and the claim).
+        if (tx.adoptionEpoch.get() != attachedEpoch) return
         if (policyTxCoordinator != null && policyTxCoordinator.activeTx.get() !== tx) return
         // Stage N2 P1: unvalidated Tx must never auto-execute; abort instead.
         if (!canJoinTx(tx)) {
@@ -2714,7 +2794,7 @@ class DualViewModel(
                     successMsg,
                     tx.isClear,
                 )
-                if (!claimForPublish(tx)) return
+                if (!claimForPublish(tx, attachedEpoch)) return
                 winnerPublish(tx, successPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
@@ -2759,7 +2839,7 @@ class DualViewModel(
                     tx.txId, tx.key, decision.packages, true, MsgKind.INFO,
                     policyText(PolicyText(PolicyTextKind.REFRESHED)), tx.isClear,
                 )
-                if (!claimForPublish(tx)) return
+                if (!claimForPublish(tx, attachedEpoch)) return
                 winnerPublish(tx, mismatchPayload, bump = true) {
                     disarmBlindClear()
                     if (tx.isRepair) disarmCorruptRepair()
@@ -2792,7 +2872,7 @@ class DualViewModel(
                     failedMsg,
                     tx.isClear,
                 )
-                if (!claimForPublish(tx)) return
+                if (!claimForPublish(tx, attachedEpoch)) return
                 winnerPublish(tx, failedPayload, bump = false) {
                     markPolicyUnknownLocked()
                     _state.update { cur ->
@@ -2825,6 +2905,9 @@ class DualViewModel(
                     }
                 }
             }
+            // Unresolved arm: no publish, no claim, no epoch fence needed —
+            // nothing is consumed or emitted; the observer rides out on the
+            // adopter's terminal (_latest) exactly like any other retain path.
             is PolicyTxSettle.Unresolved -> {
                 synchronized(policySettleLock) {
                     if (activePolicyTx.get() !== tx) return
@@ -3074,6 +3157,11 @@ class DualViewModel(
         }
         val versionAtStart = policyDraftVersion.get()
         val ownershipSnap = policyOwnershipGen.get()
+        // Stage P2 (PR #60 NEW finding #2): reconciler/fallback-entry Tx-scoped
+        // adoption-epoch snapshot — passed to the claim below; the claim's
+        // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim that
+        // linearizes after an adopter's bump consumes as EPOCH_STALE (no CAS, no publish).
+        val epochSnap = tx.adoptionEpoch.get()
         if (timedOut) {
             retainUnresolvedReconciling(tx)
             return
@@ -3126,8 +3214,10 @@ class DualViewModel(
             }
             val coordNow = try { coord.activeTx.get() } catch (_: Exception) { null }
             if (coordNow === tx) {
-                if (!claimForPublish(tx)) {
-                    // Lost coordinator claim to concurrent winner; claimForPublish already handled loser sync/cleanup.
+                if (!claimForPublish(tx, epochSnap)) {
+                    // Lost coordinator claim to concurrent winner (or EPOCH_STALE:
+                    // the Tx was adopted after this snapshot — nothing consumed);
+                    // claimForPublish already handled loser sync/cleanup.
                     return
                 }
                 claimedCoord = true
@@ -3860,6 +3950,15 @@ class DualViewModel(
                                 val heldJoin = synchronized(policySettleLock) {
                                     if (activePolicyTx.compareAndSet(null, txAsync)) {
                                         try { policyReconciling.add(txAsync.key) } catch (_: Exception) { }
+                                        // Stage P2 (PR #60 NEW finding #2): adoption epoch
+                                        // bump — this VM adopted the Tx. Nested inside
+                                        // coordInit.withCommitLock { ... }, so the bump is
+                                        // totally ordered against the claim's epoch check
+                                        // (same commitMutex critical section discipline):
+                                        // any claim that linearizes after this observes the
+                                        // new epoch and retains. Same critical section as
+                                        // the adoption CAS + markPolicyUnknownLocked().
+                                        try { txAsync.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
                                         try { markPolicyUnknownLocked() } catch (_: Exception) { }
                                         _state.update { cur ->
                                             cur.copy(
@@ -3955,6 +4054,32 @@ class DualViewModel(
                     } else {
                         policyReconciling.add(tx.key)
                         markPolicyUnknownLocked()
+                        // Stage P2 (PR #60 NEW finding #2): adoption epoch bump.
+                        // This arm is NOT inside commitMutex (init cannot suspend;
+                        // the init tryLock snapshot is released before this CAS),
+                        // so best-effort mutex-ordering here: try commitMutex
+                        // tryLock — when free, the bump is totally ordered against
+                        // every claim's epoch check. When momentarily held, fall
+                        // back to the unlocked bump (still fences every claim that
+                        // linearizes after it, but a claim ALREADY inside
+                        // commitMutex may pass its epoch check before this bump
+                        // lands — the one residual interleaving on this arm,
+                        // fail-open for the stale worker; the coordinator CAS
+                        // still arbitrates ownership, i.e. its publish is lost
+                        // when this VM adopted first. Documented honestly; the
+                        // async locked arm and the busy-waiter arm do order the
+                        // bump inside commitMutex.)
+                        try {
+                            if (coordInit.commitMutex.tryLock()) {
+                                try { tx.adoptionEpoch.incrementAndGet() } finally {
+                                    try { coordInit.commitMutex.unlock() } catch (_: Exception) { }
+                                }
+                            } else {
+                                try { tx.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
+                            }
+                        } catch (_: Exception) {
+                            try { tx.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
+                        }
                         _state.update { cur ->
                             cur.copy(
                                 pendingPolicyWrite = tx.pending ?: cur.pendingPolicyWrite,
@@ -6857,6 +6982,11 @@ class DualViewModel(
             }
             val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
+            // Stage P2 (PR #60 NEW finding #2): reconciler-start Tx-scoped
+            // adoption-epoch snapshot — passed to every claim below; the claim's
+            // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim
+            // that linearizes after an adopter's bump consumes as EPOCH_STALE.
+            val epochAtStart = tx.adoptionEpoch.get()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
             // 保留＋phase 續留 RECONCILING。
             // CE unwind never settles; the fence is retained for the app-scoped
@@ -6883,7 +7013,12 @@ class DualViewModel(
                             // attach. (stale-generation retention — same
                             // fail-closed bias as the other retain paths,
                             // distinct predicate from autoRecheckTx's owner
-                            // identity re-check.)
+                            // identity re-check.) The claim site independently
+                            // fences on the Tx-scoped adoption epoch line
+                            // (belt-and-suspenders: epochAtStart is threaded into
+                            // claimForPublish, whose commitMutex critical section
+                            // re-checks Tx.adoptionEpoch — a claim that linearizes
+                            // after an adopter's bump is EPOCH_STALE, no CAS).
                             if (policyDraftVersion.get() != versionAtStart ||
                                 policyOwnershipGen.get() != ownership
                             ) {
@@ -6892,7 +7027,7 @@ class DualViewModel(
                             }
                             // Stage L1 P1: staged claim (placeholder) — atomic completeWithRevision
                             // under commitMutex, hook after CAS before emit.
-                            if (!claimForPublish(tx)) {
+                            if (!claimForPublish(tx, epochAtStart)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7017,7 +7152,7 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
-                            if (!claimForPublish(tx)) {
+                            if (!claimForPublish(tx, epochAtStart)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7092,7 +7227,7 @@ class DualViewModel(
                                 }
                                 settle = false
                             } else {
-                                if (!claimForPublish(tx)) {
+                                if (!claimForPublish(tx, epochAtStart)) {
                                     settle = false
                                     return@withTimeout
                                 }
@@ -7291,6 +7426,11 @@ class DualViewModel(
             }
             val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
+            // Stage P2 (PR #60 NEW finding #2): reconciler-start Tx-scoped
+            // adoption-epoch snapshot — passed to every claim below; the claim's
+            // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim
+            // that linearizes after an adopter's bump consumes as EPOCH_STALE.
+            val epochAtStart = tx.adoptionEpoch.get()
             var settle = true
             try {
                 try {
@@ -7311,14 +7451,19 @@ class DualViewModel(
                             // attach. (stale-generation retention — same
                             // fail-closed bias as the other retain paths,
                             // distinct predicate from autoRecheckTx's owner
-                            // identity re-check.)
+                            // identity re-check.) The claim site independently
+                            // fences on the Tx-scoped adoption epoch line
+                            // (belt-and-suspenders: epochAtStart is threaded into
+                            // claimForPublish, whose commitMutex critical section
+                            // re-checks Tx.adoptionEpoch — a claim that linearizes
+                            // after an adopter's bump is EPOCH_STALE, no CAS).
                             if (policyDraftVersion.get() != versionAtStart ||
                                 policyOwnershipGen.get() != ownership
                             ) {
                                 settle = false
                                 return@withTimeout
                             }
-                            if (!claimForPublish(tx)) {
+                            if (!claimForPublish(tx, epochAtStart)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7447,7 +7592,7 @@ class DualViewModel(
                             policyDraftVersion.get() == versionAtStart &&
                             policyOwnershipGen.get() == ownership
                         ) {
-                            if (!claimForPublish(tx)) {
+                            if (!claimForPublish(tx, epochAtStart)) {
                                 settle = false
                                 return@withTimeout
                             }
@@ -7524,7 +7669,7 @@ class DualViewModel(
                                 }
                                 settle = false
                             } else {
-                                if (!claimForPublish(tx)) {
+                                if (!claimForPublish(tx, epochAtStart)) {
                                     settle = false
                                     return@withTimeout
                                 }
@@ -7757,6 +7902,9 @@ class DualViewModel(
                     revBeforeRefresh != -1L && sampledCurrentRevision() != revBeforeRefresh
                 } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { true }
                 val txSnap = activePolicyTx.get()
+                // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption epoch snapshot —
+                // passed to the late-join claim below; claim-time commitMutex check.
+                val epochSnap = txSnap?.adoptionEpoch?.get()
                 val lateJoinOk: Boolean? = if (txSnap != null &&
                     txBeforeRead === txSnap &&
                     txCompletedBeforeRead &&
@@ -7793,7 +7941,10 @@ class DualViewModel(
                             }
                             return@launch
                         }
-                        if (!claimForPublish(txSnap)) {
+                        if (!claimForPublish(txSnap, epochSnap)) {
+                            // Claim failed — lost the CAS to a concurrent winner, or
+                            // EPOCH_STALE (the Tx was adopted after this snapshot):
+                            // nothing consumed; the adopter owns convergence.
                             return@launch
                         }
                     } else if (activePolicyTx.get() !== txSnap) {

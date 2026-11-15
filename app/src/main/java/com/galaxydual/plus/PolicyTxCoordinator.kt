@@ -480,13 +480,27 @@ class PolicyTxCoordinator {
     // Stage L3: stamp rev (= committedRevision) into pending placeholder; _latest
     // 不寫 placeholder（非終態），終態經 stageRealPayload 寫入。
     // Placeholder-only invariant: payload must be (!known && msg.isEmpty()).
-    suspend fun completeWithRevision(tx: DualViewModel.PolicyTx, payload: PolicySettled): Boolean {
+    // Stage P2 (PR #60 NEW finding #2): expectedEpoch != -1L fences the claim on
+    // the shared Tx.adoptionEpoch (the Tx-scoped cross-VM ownership token,
+    // bumped inside commitMutex at every cross-VM adoption site, snapshotted at
+    // attach); a mismatch consumes NOTHING (no CAS, no rev bump, no stage).
+    // -1L = legacy/exempt (skip the epoch gate, e.g. same-VM handover /
+    // fast-path claims).
+    suspend fun completeWithRevision(
+        tx: DualViewModel.PolicyTx,
+        payload: PolicySettled,
+        expectedEpoch: Long = -1L,
+    ): Boolean {
         require(!payload.known && payload.msg.isEmpty()) {
             "completeWithRevision only accepts placeholder payloads (!known && msg.isEmpty())"
         }
         var ok = false
         commitMutex.withLock {
             try {
+                if (expectedEpoch != -1L && tx.adoptionEpoch.get() != expectedEpoch) {
+                    // EPOCH_STALE: no claim consumed — the adopter owns convergence.
+                    return@withLock
+                }
                 if (activeTx.compareAndSet(tx, null)) {
                     val rev = committedRevision.incrementAndGet()
                     val stamped = try {
@@ -519,7 +533,14 @@ class PolicyTxCoordinator {
     // unknown), never publish; CAS_LOSS = the CAS to activeTx failed with the
     // rev gate satisfied — a live winner consumed the claim (loser handling
     // already applied inside the caller); the rev gate carries no information.
-    enum class ClaimStagedVerdict { CLAIMED, REV_GATE_REJECTED, CAS_LOSS }
+    // Stage P2 (PR #60 NEW finding #2): EPOCH_STALE = the Tx was ADOPTED by
+    // another VM mid-IO (Tx.adoptionEpoch moved past expectedEpoch, observed
+    // inside the same commitMutex critical section) so NO claim was consumed —
+    // no CAS, no rev bump, no stage. Unlike REV_GATE_REJECTED an adopter IS a
+    // live winner, so the dual-active caller maps EPOCH_STALE to the CAS_LOSS
+    // arm (read-only loser-follow on the adopter's identity-matched terminal),
+    // never publishes.
+    enum class ClaimStagedVerdict { CLAIMED, REV_GATE_REJECTED, CAS_LOSS, EPOCH_STALE }
 
     // P1-1 repair atomic claim: rev re-check merged into the SAME commitMutex
     // critical section as the CAS+bump+stage (no withCommitLock suspension
@@ -527,10 +548,17 @@ class PolicyTxCoordinator {
     // when committedRevision != revBefore (concurrent B committed mid-IO),
     // so the repair success below can never publish a stale Known(empty) over
     // unseen B. revBefore==-1L (legacy/no-coordinator) skips the rev gate.
+    // Stage P2 (PR #60 NEW finding #2): expectedEpoch != -1L adds the Tx-scoped
+    // adoption-epoch fence INSIDE the same critical section, alongside the rev
+    // gate — an adopter that bumped Tx.adoptionEpoch after this worker's
+    // attach-time snapshot makes the claim return EPOCH_STALE (consumes
+    // nothing; the dual-active caller maps it to the CAS_LOSS/loser-follow
+    // arm — no CAS, no rev bump, no publish). -1L skips the epoch gate.
     suspend fun completeWithRevisionCheckedVerdict(
         tx: DualViewModel.PolicyTx,
         payload: PolicySettled,
         revBefore: Long,
+        expectedEpoch: Long = -1L,
     ): ClaimStagedVerdict {
         require(!payload.known && payload.msg.isEmpty()) {
             "completeWithRevisionChecked only accepts placeholder payloads (!known && msg.isEmpty())"
@@ -538,6 +566,10 @@ class PolicyTxCoordinator {
         var verdict = ClaimStagedVerdict.CAS_LOSS
         commitMutex.withLock {
             try {
+                if (expectedEpoch != -1L && tx.adoptionEpoch.get() != expectedEpoch) {
+                    verdict = ClaimStagedVerdict.EPOCH_STALE
+                    return@withLock
+                }
                 if (revBefore != -1L && committedRevision.get() != revBefore) {
                     verdict = ClaimStagedVerdict.REV_GATE_REJECTED
                     return@withLock
@@ -574,8 +606,9 @@ class PolicyTxCoordinator {
         tx: DualViewModel.PolicyTx,
         payload: PolicySettled,
         revBefore: Long,
+        expectedEpoch: Long = -1L,
     ): Boolean =
-        completeWithRevisionCheckedVerdict(tx, payload, revBefore) == ClaimStagedVerdict.CLAIMED
+        completeWithRevisionCheckedVerdict(tx, payload, revBefore, expectedEpoch) == ClaimStagedVerdict.CLAIMED
 
     // Stage M3 (P2#5 orphan fence) + N3 P1#3 hardening: coordinator-scoped
     // finalizer for PLACEHOLDERS ONLY. Never infer death from age alone and
