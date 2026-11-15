@@ -868,6 +868,7 @@ class HookPolicyRemoteStoreTest {
         // 放行讀：即使底層是 B，也必須 Unknown（讀後再驗證作廢毒讀）。
         readRelease.set(true)
         reader.join(5_000)
+        assertFalse(reader.isAlive)
         assertTrue(loadResult is LoadResult.Unknown)
     }
 
@@ -902,6 +903,7 @@ class HookPolicyRemoteStoreTest {
 
             prefs.release()
             writer.join(5_000)
+            assertFalse(writer.isAlive)
             assertEquals(false, saveResult)
             // 放行後仍 Unknown (毒未解),直到成功重同步。
             assertTrue(storeB.loadResult() is LoadResult.Unknown)
@@ -946,6 +948,7 @@ class HookPolicyRemoteStoreTest {
 
             prefs.release()
             writer.join(5_000)
+            assertFalse(writer.isAlive)
             assertEquals(true, clearResult)
             val ra = storeA.loadResult()
             assertTrue(ra is LoadResult.Known)
@@ -1028,6 +1031,7 @@ class HookPolicyRemoteStoreTest {
             // 放行讀:即使底層是 B,也必須 Unknown。
             readRelease.set(true)
             reader.join(5_000)
+            assertFalse(reader.isAlive)
             assertTrue(loadResult is LoadResult.Unknown)
             assertTrue(storeA.loadResult() is LoadResult.Unknown)
             assertTrue(storeB.loadResult() is LoadResult.Unknown)

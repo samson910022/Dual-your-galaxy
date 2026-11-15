@@ -1163,7 +1163,7 @@ class WhitelistPatchTest {
         val o = out as WhitelistPatch.Outcome.Skipped // cast asserts it is not PatchedInPlace/Replaced
         assertTrue(
             "reason should report the ours-only rollback, was: ${o.reason}",
-            o.reason.contains("appended-ours entries rolled back"),
+            o.reason.contains("tail entries") && o.reason.contains("appended-ours"),
         )
         assertTrue(
             "reason should report the retained foreign entry, was: ${o.reason}",
@@ -1288,7 +1288,7 @@ class WhitelistPatchTest {
         )
         assertTrue(
             "reason should report the ours-only rollback with foreign retained, was: ${o.reason}",
-            o.reason.contains("appended-ours entries rolled back"),
+            o.reason.contains("tail entries") && o.reason.contains("appended-ours"),
         )
         assertTrue(
             "reason should report the retained foreign entry, was: ${o.reason}",

@@ -27,8 +27,12 @@
 #     tokenizes it), so the foreign rule compares per-TOKEN: any ';'-separated
 #     token that strips to exactly --authority counts as a claim;
 #   * <provider> elements nested under <queries> are NOT claimants (a <queries>
-#     block declares package visibility, never claims an authority) and are
-#     skipped by every rule above in both parser modes;
+#     block declares package visibility, never claims an authority); merged-xml
+#     mode skips them when counting and checking expected providers. NOTE: the
+#     impostor-name rule below deliberately does NOT skip <queries> elements —
+#     that direction is fail-closed (if a future legitimate queries entry ever
+#     names the libxposed XposedProvider, the gate reds out and the entry is
+#     reviewed);
 #   * zero elements of ANY tag whose android:name contains "XposedProvider"
 #     other than the pinned GuardXposedProvider itself (covers the libxposed
 #     service io.github.libxposed.service.XposedProvider);

@@ -76,15 +76,30 @@ import kotlinx.coroutines.withTimeoutOrNull
  *               must not block.
  *
  * On timeout (either join phase) or an internal drain error, one line is
- * printed to System.err and the drain returns normally; it never throws.
+ * printed to System.err and the drain returns normally by default; a caller
+ * that can tolerate a bounded failure may pass failOnIncomplete=true and
+ * the drain will throw IllegalStateException instead, so a CI runner
+ * cannot go silently green with orphaned Main children.
+ *
+ * The [timeouts] counter tallies every phase-timeout observed anywhere in
+ * the process, for diagnostics and cross-suite assertions.
  */
 internal object TestDrainSupport {
+
+    val timeouts: java.util.concurrent.atomic.AtomicInteger = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun assertNoTimeouts() {
+        check(timeouts.get() == 0) {
+            "[TestDrainSupport] ${timeouts.get()} drain timeout(s) observed before resetMain()"
+        }
+    }
 
     fun drainBeforeResetMain(
         vms: List<DualViewModel>,
         coords: List<PolicyTxCoordinator> = emptyList(),
         timeoutMs: Long = 2_000,
         pump: (() -> Unit)? = null,
+        failOnIncomplete: Boolean = false,
     ) {
         // 1) Best-effort cancel of every VM scope (idempotent).
         for (vm in vms) {
@@ -96,7 +111,10 @@ internal object TestDrainSupport {
         }
         // 2) Bounded join of VM scope jobs.
         val vmJobs = vms.mapNotNull { it.viewModelScope.coroutineContext[Job] }
+        var incomplete = false
         joinBounded(vmJobs, timeoutMs, pump)?.let { reason ->
+            timeouts.incrementAndGet()
+            incomplete = true
             System.err.println(
                 "[TestDrainSupport] drain did not complete before resetMain() ($reason; ${vmJobs.count { !it.isCompleted }} job(s) still pending)"
             )
@@ -111,8 +129,15 @@ internal object TestDrainSupport {
         }
         val coordJobs = coords.mapNotNull { it.scope.coroutineContext[Job] }
         joinBounded(coordJobs, timeoutMs, pump)?.let { reason ->
+            timeouts.incrementAndGet()
+            incomplete = true
             System.err.println(
                 "[TestDrainSupport] drain did not complete before resetMain() ($reason; ${coordJobs.count { !it.isCompleted }} job(s) still pending)"
+            )
+        }
+        if (incomplete && failOnIncomplete) {
+            throw IllegalStateException(
+                "[TestDrainSupport] drain timed out; ${vmJobs.count { !it.isCompleted }} VM job(s) and ${coordJobs.count { !it.isCompleted }} coordinator job(s) still pending"
             )
         }
     }

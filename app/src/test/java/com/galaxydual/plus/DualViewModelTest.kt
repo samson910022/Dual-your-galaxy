@@ -96,7 +96,11 @@ class DualViewModelTest {
                 // Best effort.
             }
         }
-        TestDrainSupport.drainBeforeResetMain(vms, pump = { testDispatcher.scheduler.advanceUntilIdle() })
+        TestDrainSupport.drainBeforeResetMain(
+            vms,
+            pump = { testDispatcher.scheduler.advanceUntilIdle() },
+            failOnIncomplete = true,
+        )
         vms.clear()
         Dispatchers.resetMain()
     }
