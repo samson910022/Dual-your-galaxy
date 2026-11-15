@@ -384,6 +384,13 @@ class PolicyTxCoordinator {
 
     internal var commitLockFailForTests: (() -> Throwable)? = null
 
+    // Test-only seam, mirrors DualViewModel's internal test hooks: invoked
+    // INSIDE commitMutex immediately AFTER the epoch + revision checks and
+    // BEFORE the activeTx CAS. Production never sets it. JVM tests use it to
+    // pin the linearization order of a claim against a concurrent adoption
+    // bump. Keep null in production builds.
+    internal var beforeClaimCasSeamForTests: (() -> Unit)? = null
+
     suspend fun <T> withCommitLock(block: suspend () -> T): T {
         commitLockFailForTests?.let { throw it() }
         return commitMutex.withLock { block() }
@@ -501,6 +508,8 @@ class PolicyTxCoordinator {
                     // EPOCH_STALE: no claim consumed — the adopter owns convergence.
                     return@withLock
                 }
+                // Seam exceptions are swallowed; a seam throwing Error maps to CAS_LOSS/no-consume upstream (fail-closed), never to a publish.
+                try { beforeClaimCasSeamForTests?.invoke() } catch (_: Exception) { }
                 if (activeTx.compareAndSet(tx, null)) {
                     val rev = committedRevision.incrementAndGet()
                     val stamped = try {
@@ -574,6 +583,8 @@ class PolicyTxCoordinator {
                     verdict = ClaimStagedVerdict.REV_GATE_REJECTED
                     return@withLock
                 }
+                // Seam exceptions are swallowed; a seam throwing Error maps to CAS_LOSS/no-consume upstream (fail-closed), never to a publish.
+                try { beforeClaimCasSeamForTests?.invoke() } catch (_: Exception) { }
                 if (activeTx.compareAndSet(tx, null)) {
                     val rev = committedRevision.incrementAndGet()
                     val stamped = try {

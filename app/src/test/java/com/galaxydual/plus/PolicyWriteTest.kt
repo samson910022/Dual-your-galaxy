@@ -13269,7 +13269,7 @@ class PolicyWriteTest {
             assertEquals(1L, latest.rev)
             assertTrue(latest.msg.contains("已寫入政策草稿"))
             assertFalse(latest.msg.contains("已重新整理政策草稿"))
-            assertNull(coord.pendingPublish.get())
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
             assertNull(coordinatorTxOf(coord))
             assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
             assertEquals(1, saveCalls.get())
@@ -13417,6 +13417,364 @@ class PolicyWriteTest {
             readGate.set(GATE_OPEN)
             try {
                 fbScope?.cancel()
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage P3 (PR #60 master-review finding A3): the sync-init joinable
+    // adoption arm no longer adopts inline — the init tryLock snapshot is
+    // advisory only, and the adoption (local CAS + Tx.adoptionEpoch bump +
+    // RECONCILING fence flip) is linearized inside commitMutex via the shared
+    // async arm (launchReclaimAsync), strictly ordered against every claim's
+    // epoch check. Claims re-check the epoch INSIDE the same critical section
+    // before their CAS; this seam (beforeClaimCasSeamForTests) fires inside
+    // that critical section, between the checks and the CAS, so a claim can
+    // be parked there deterministically while a sibling VM attempts adoption.
+    // Pin 1 (aClaimWins_bNeverAdopts): B cannot linearize an adoption ahead of a parked claim — B's
+    // init tryLock fails (claim holds the mutex), B's async adoption queues
+    // behind it, and by the time the claim releases, activeTx == null so B
+    // converges read-only WITHOUT adopting (no bump, no epoch movement). Any
+    // adoption that would have won against a claim can lose this way, and
+    // that is the correct linearization: adoption never jumps ahead of an
+    // in-flight claim; loser-follow keeps the losing VM converged.
+    @Test
+    fun p3_syncInitAdopt_claimParkedInSeam_aClaimWins_bNeverAdopts() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveEntered = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveEntered.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        val seamEntered = java.util.concurrent.CountDownLatch(1)
+        val seamHold = java.util.concurrent.CountDownLatch(1)
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 10_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // Arm the seam AFTER the save parks but BEFORE releasing it: any
+            // claim that passes its epoch check parks between the check and
+            // the CAS — inside commitMutex.
+            coord.beforeClaimCasSeamForTests = {
+                seamEntered.countDown()
+                try {
+                    seamHold.await()
+                } catch (_: Exception) {
+                }
+            }
+            saveRelease.set(true)
+            // A's deferred completes; A's claim (whichever path claims first)
+            // passes its epoch check and parks at the seam — inside commitMutex.
+            assertTrue(seamEntered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            val claimTx = coordinatorTxOf(coord)
+            assertNotNull(claimTx)
+            // B is created while A's claim holds commitMutex: B's init tryLock
+            // cannot succeed, so B takes the async reclaim arm — and the async
+            // adoption cannot linearize until A's claim releases. B must NOT
+            // have adopted (no local fence, no epoch bump) while the claim is
+            // parked.
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 10_000)
+            assertEquals(0L, (claimTx as DualViewModel.PolicyTx).adoptionEpoch.get())
+            assertNull(activeTxOf(vmB))
+            // Release the claim: A CAS-claims against an untouched epoch
+            // (B never adopted) and publishes SUCCESS.
+            seamHold.countDown()
+            await(timeoutMs = 20_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.policyDraft == setOf("com.B")
+            }
+            // B's queued async adoption then runs, reads activeTx == null
+            // (A claimed) and returns WITHOUT adopting: no local fence, no
+            // epoch bump, no reconciler. B converges read-only to A's terminal.
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown &&
+                    vmB.state.value.policyDraft == setOf("com.B")
+            }
+            Thread.sleep(300) // let B's queued async arm settle — epoch must stay 0L
+            assertEquals(0L, (claimTx as DualViewModel.PolicyTx).adoptionEpoch.get())
+            assertEquals(1L, coord.currentRevision())
+            assertEquals(1, saveCalls.get())
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertEquals(MsgKind.INFO, latest.msgKind)
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertNull(coordinatorTxOf(coord))
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
+            assertNull(activeTxOf(vmA))
+            assertNull(activeTxOf(vmB))
+        } finally {
+            saveRelease.set(true)
+            seamHold.countDown()
+            try {
+                coord.beforeClaimCasSeamForTests = null
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage P3 pin 2 (claimLinearizesFirst_bAdoptsNothing_readOnlyConverges, same fix, the mirror order): with a no-op seam, A's
+    // claim linearizes immediately after its checks — the mutex orders it
+    // ahead of anything B could do. B is created only AFTER the claim has
+    // linearized; B finds coordinator activeTx == null and therefore adopts
+    // NOTHING: adoptionEpoch stays 0L for that Tx forever, rev stays 1L, A
+    // publishes SUCCESS, and B converges read-only. Note this test also pins
+    // the deliberate consequence of the fix: B-adopts-FIRST is no longer
+    // reachable in this interleaving — ANY adoption is serialized behind an
+    // in-flight commitMutex claim, because the sync adoption arm now funnels
+    // through the same mutex. That is the intended outcome; the honest pin of
+    // it is the `adoptionEpoch == 0L` assert on A's captured Tx below (captured
+    // in SAVING before the claim linearizes, asserted after the final awaits).
+    @Test
+    fun p3_syncInitAdopt_claimLinearizesFirst_bAdoptsNothing_readOnlyConverges() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveEntered = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveEntered.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        val seamEntered = java.util.concurrent.CountDownLatch(1)
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 10_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 10_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // Capture A's in-flight Tx here (it exists in SAVING): B never
+            // adopts it in this interleaving, so its adoptionEpoch must
+            // stay 0L through the end of the test.
+            val txA = activeTxOf(vmA)!!
+            // No-op seam: the claim linearizes as soon as its checks pass —
+            // the order the mutex guarantees; this test pins that order.
+            coord.beforeClaimCasSeamForTests = { seamEntered.countDown() }
+            saveRelease.set(true)
+            // A's claim (epoch check → seam → CAS) runs to completion before
+            // B is even constructed.
+            assertTrue(seamEntered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            // B created after A's claim linearized: coordinator activeTx is
+            // null, so B's init reclaim finds nothing to adopt (and B's own
+            // load already observes com.B).
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 10_000)
+            await(timeoutMs = 20_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.policyDraft == setOf("com.B")
+            }
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown &&
+                    vmB.state.value.policyDraft == setOf("com.B")
+            }
+            Thread.sleep(300) // let B's init/settle paths settle — epoch must stay 0L
+            assertEquals(0L, (txA as DualViewModel.PolicyTx).adoptionEpoch.get())
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertEquals(MsgKind.INFO, latest.msgKind)
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertEquals(1L, coord.currentRevision())
+            assertEquals(1, saveCalls.get())
+            assertNull(coordinatorTxOf(coord))
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
+            assertNull(activeTxOf(vmA))
+            assertNull(activeTxOf(vmB))
+        } finally {
+            saveRelease.set(true)
+            try {
+                coord.beforeClaimCasSeamForTests = null
+            } catch (_: Exception) {
+            }
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // Stage P3 pin 3 (forcedTryLockMiss_bAdopts_staleClaimFenced_noDoublePublish, the tryLock-miss shape): the test thread holds
+    // coord.withCommitLock { }; vmB's init tryLock MISSES and B's async
+    // adoption queues behind the held lock. While the lock is held, B has
+    // adopted NOTHING: epoch stays 0L and B holds no local fence. After the
+    // lock is released B's adoption linearizes inside commitMutex: A never
+    // claimed (A's reads timed out as Unavailable → A went
+    // unresolved-RECONCILING, and Unresolved never claims), so B's CAS
+    // succeeds, the epoch goes 0 → 1 in the same critical section as the
+    // adoption CAS + fence flip, and B alone publishes SUCCESS. A converges
+    // read-only. rev == 1L (single claim consumed), adoptionEpoch == 1L —
+    // exactly one bump, exactly one publish.
+    @Test
+    fun p3_syncInitAdopt_forcedTryLockMiss_bAdopts_staleClaimFenced_noDoublePublish() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val saveEntered = java.util.concurrent.CountDownLatch(1)
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val readBlock = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                while (readBlock.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                backend.get()
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                saveEntered.countDown()
+                while (!saveRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        val lockEntered = java.util.concurrent.CountDownLatch(1)
+        val holdLatch = java.util.concurrent.CountDownLatch(1)
+        // Wrap the suspending withCommitLock in a plain daemon thread (tests
+        // are non-suspend); the test releases via holdLatch. Started only
+        // AFTER vmA is parked in SAVING so vmA's own pre-IO gate never queues
+        // behind this lock (the save itself holds no mutex).
+        var holder: Thread? = null
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            // Block A's reconciler reads so A deterministically times out into
+            // unresolved-RECONCILING (Unresolved never claims).
+            readBlock.set(true)
+            // Start the holder now: the test thread takes commitMutex while A
+            // is parked in the save (which holds no mutex). vmB's init tryLock
+            // then misses and B's async adoption queues behind this lock.
+            holder = kotlin.concurrent.thread(start = true, isDaemon = true) {
+                runBlocking {
+                    try {
+                        coord.withCommitLock {
+                            lockEntered.countDown()
+                            holdLatch.await()
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            assertTrue(lockEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 200)
+            Thread.sleep(300) // let vmB's init complete and its async arm queue
+            val queuedTx = coordinatorTxOf(coord) as? DualViewModel.PolicyTx
+            assertNotNull(queuedTx)
+            // The tryLock miss produced NO synchronous adoption: no epoch
+            // bump, no local fence on B.
+            assertEquals(0L, queuedTx!!.adoptionEpoch.get())
+            assertNull(activeTxOf(vmB))
+            // Release A's reads and the held lock; B's adoption linearizes
+            // inside commitMutex (A's Unresolved path never claims, so B's
+            // CAS succeeds). B flips RECONCILING in that critical section.
+            readBlock.set(false)
+            holdLatch.countDown()
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+            }
+            assertEquals(1L, queuedTx.adoptionEpoch.get())
+            // Let A's save finish: the deferred completes; A's late claim is
+            // fenced by the adoption epoch fence (exact inner verdict not
+            // directly observable from outside; what this test pins is:
+            // exactly one rev consumed by B, no double publish, both VMs
+            // converge read-only on B's terminal, epoch 0→1 exactly once).
+            saveRelease.set(true)
+            await(timeoutMs = 20_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown &&
+                    vmB.state.value.policyDraft == setOf("com.B")
+            }
+            await(timeoutMs = 20_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.policyDraft == setOf("com.B")
+            }
+            Thread.sleep(300) // A's late claim is fenced by the adoption epoch fence — rev must stay 1L (epoch 0→1 exactly once)
+            assertEquals(1L, queuedTx.adoptionEpoch.get())
+            assertEquals(1L, coord.currentRevision())
+            assertEquals(1, saveCalls.get())
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertEquals(MsgKind.INFO, latest.msgKind)
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertNull(coordinatorTxOf(coord))
+            await(timeoutMs = 10_000L) { coord.pendingPublish.get() == null }
+            assertNull(activeTxOf(vmA))
+            assertNull(activeTxOf(vmB))
+        } finally {
+            saveRelease.set(true)
+            readBlock.set(false)
+            holdLatch.countDown()
+            try {
+                holder?.join(2_000)
+            } catch (_: Exception) {
+            }
+            try {
+                coord.beforeClaimCasSeamForTests = null
             } catch (_: Exception) {
             }
             try {
