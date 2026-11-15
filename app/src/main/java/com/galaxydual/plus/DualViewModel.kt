@@ -3117,6 +3117,133 @@ class DualViewModel(
             }
         }
     }
+    // Stage O1 extra: tryLock missed => async locked reclaim (delayed retry).
+    // Guarantees every activeTx value is eventually claimed by some live VM.
+    // P3 (master-review A3): extracted verbatim from the init `!lockedInit`
+    // arm so the SYNC adoption arm can call the same linearized path — every
+    // cross-VM adoption now runs under commitMutex with the Tx.adoptionEpoch
+    // bump in the SAME critical section as the adoption CAS (never outside
+    // the mutex). Do not inline this back into init, and never bump the
+    // adoption epoch outside commitMutex here — the sync arm relies on this
+    // for claim-vs-adoption linearization.
+    private fun launchReclaimAsync(coordInit: PolicyTxCoordinator) {
+        try {
+            viewModelScope.launch {
+                try {
+                    coordInit.withCommitLock {
+                        val txAsync = try { coordInit.activeTx.get() } catch (_: Exception) { null }
+                            ?: return@withCommitLock
+                        if (activePolicyTx.get() != null) return@withCommitLock
+                        if (!canJoinTx(txAsync)) {
+                            // Stage O1 P2#2: live owner => never cancel.
+                            // P2-4: single-snapshot liveness — this block already
+                            // holds commitMutex, so read active/owner/deferred/
+                            // pending/age inline (the former torn-read helpers
+                            // are deleted; inline is the single source).
+                            val liveAsync = run {
+                                val curA = try { coordInit.activeTx.get() } catch (_: Exception) { null }
+                                if (curA !== txAsync) return@run false
+                                val aliveA = try { txAsync.ownerAlive.get() } catch (_: Exception) { false }
+                                if (!aliveA) return@run false
+                                val doneA = try { txAsync.deferred.isCompleted || txAsync.deferred.isCancelled } catch (_: Exception) { false }
+                                if (!doneA) return@run true
+                                val pendA = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
+                                if (pendA == null || pendA.txId != txAsync.txId || pendA.key != txAsync.key) return@run false
+                                val stagedAtA = try { coordInit.pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
+                                if (stagedAtA == 0L) return@run false
+                                val nowA = try { System.nanoTime() } catch (_: Exception) { 0L }
+                                if (nowA < stagedAtA) return@run true
+                                val ageA = try { (nowA - stagedAtA) / 1_000_000L } catch (_: Exception) { 0L }
+                                ageA < policyIoTimeoutMs
+                            }
+                            if (liveAsync) {
+                                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                _state.update { cur ->
+                                    cur.copy(
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = txAsync.isRepair,
+                                        msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                                        msgKind = MsgKind.INFO,
+                                    )
+                                }
+                                // P2-4: Busy must not strand forever if the owner
+                                // dies right after this snapshot (no re-estimate, no
+                                // timeout, no adopt). Attach a light waiter that
+                                // rechecks under commitMutex and aborts/reclaims
+                                // once the claim is abandoned.
+                                try { attachBusyWaiter(txAsync) } catch (_: Exception) { }
+                                return@withCommitLock
+                            }
+                            // P2-4 fix: only abort a Tx we actually hold locally.
+                            // CAS null->txAsync first; failure means another
+                            // VM/op claimed locally concurrently — return
+                            // without aborting someone else's fence.
+                            val heldAbandoned = synchronized(policySettleLock) {
+                                try { activePolicyTx.compareAndSet(null, txAsync) } catch (_: Exception) { false }
+                            }
+                            if (!heldAbandoned) return@withCommitLock
+                            try { abortUnarmedTx(txAsync) } catch (ce: CancellationException) { throw ce } catch (_: Exception) { }
+                            return@withCommitLock
+                        }
+                        // P2-4 fix: joinable reclaim must also CAS (never blind
+                        // set). Failure => local race lost (either this VM lost to a
+                        // sibling adopter, or a concurrent same-VM claim won); in both
+                        // cases converge via _latest / loser-follow (never overwrite).
+                        // Note: sibling VMs may all locally adopt the same Tx
+                        // (coordinator.activeTx is NOT consumed by adoption); exactly-once
+                        // publication is guaranteed by the epoch fence + the claim's
+                        // commitMutex re-check, not by the adoption CAS.
+                        val heldJoin = synchronized(policySettleLock) {
+                            if (activePolicyTx.compareAndSet(null, txAsync)) {
+                                try { policyReconciling.add(txAsync.key) } catch (_: Exception) { }
+                                // Stage P2 (PR #60 NEW finding #2): adoption epoch
+                                // bump — this VM adopted the Tx. Nested inside
+                                // coordInit.withCommitLock { ... }, so the bump is
+                                // totally ordered against the claim's epoch check
+                                // (same commitMutex critical section discipline):
+                                // any claim that linearizes after this observes the
+                                // new epoch and retains. Same critical section as
+                                // the adoption CAS + markPolicyUnknownLocked().
+                                try { txAsync.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
+                                try { markPolicyUnknownLocked() } catch (_: Exception) { }
+                                _state.update { cur ->
+                                    cur.copy(
+                                        pendingPolicyWrite = txAsync.pending ?: cur.pendingPolicyWrite,
+                                        policyWritePhase = PolicyWritePhase.RECONCILING,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = txAsync.isRepair,
+                                        loading = false,
+                                        msg = policyText(
+                                            PolicyText(
+                                                if (txAsync.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
+                                                else if (txAsync.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
+                                            ),
+                                        ),
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        if (!heldJoin) return@withCommitLock
+                        try { attachDeferredAutoRecheck(txAsync) } catch (_: Exception) { }
+                        if (txAsync.isClear) launchClearReconciler(txAsync) else launchConfirmReconciler(txAsync)
+                        observeSettledFor(txAsync)
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+        }
+    }
+
     private suspend fun decidePolicyTxSettle(tx: PolicyTx, read: LoadResult): PolicyTxSettle {
         // Stage N2 P1: never start/await an unvalidated job (see canJoinTx).
         if (!canJoinTx(tx)) return PolicyTxSettle.Unresolved
@@ -3845,14 +3972,20 @@ class DualViewModel(
     }
 
     init {
-        // Stage G2：跨 VM 認領（同步， ран於 probe/load 續發）。
+        // Stage G2：跨 VM 認領（init 決策同步、認領本身線性化於 commitMutex（晚於或與 probe/load 入隊並行，終態 fail-closed 不變））。
         // coordinator 仍有在途 Tx（舊 VM handover 後未結清、onCleared 刻意不清除）
         // 即認領：繼承 fence＋RECONCILING＋pending＋Unknown＋啟動 reconciler join
         // 同一 deferred；終態防雙發布經 tryClaimCoordinatorPublish 做 settle-CAS
         // 先行、勝者才發布（認領沿用同一 Tx 物件；舊 VM 殘留 handler 以 coordinator
         // CAS 判定丟棄，敗者不發布）。
-        // 認領同步 bump version/freshness/ownership，晚到的 init load 因世代失配被
-        // 丟棄（不覆寫 fence）；state 同步翻 RECONCILING＋Unknown＋pending。
+        // P3 (master-review A3) 誠實契約：init 內的 commitMutex tryLock 快照僅為
+        // 「建議性」觀察（非掛起式 init 無法 suspend 等鎖）；joinable 認領（本地
+        // CAS＋Tx.adoptionEpoch bump＋RECONCILING fence flip）一律經
+        // launchReclaimAsync 於 commitMutex 內線性化——與 claim 的 epoch check
+        // 共用同一個 mutex，嚴格有序。tryLock 未中時 init 路徑不做任何 bump。
+        // 認領 bump 版／freshness／ownership 並於同一 critical
+        // section 翻 RECONCILING＋Unknown＋pending；晚到的 init load 因世代失配被
+        // 丟棄（不覆寫 fence）。
         // Stage L1 P1: init-reclaim checks committedRevision/pendingPublish under
         // commitMutex (tryLock, non-suspend init; order
         // opMutex→writeMutex→policyRevisionMutex→commitMutex).
@@ -3916,116 +4049,7 @@ class DualViewModel(
             // Stage O1 extra: tryLock missed => async locked reclaim (delayed retry).
             // Guarantees every activeTx value is eventually claimed by some live VM.
             if (!lockedInit) {
-                try {
-                    viewModelScope.launch {
-                        try {
-                            coordInit.withCommitLock {
-                                val txAsync = try { coordInit.activeTx.get() } catch (_: Exception) { null }
-                                    ?: return@withCommitLock
-                                if (activePolicyTx.get() != null) return@withCommitLock
-                                if (!canJoinTx(txAsync)) {
-                                    // Stage O1 P2#2: live owner => never cancel.
-                                    // P2-4: single-snapshot liveness — this block already
-                                    // holds commitMutex, so read active/owner/deferred/
-                                    // pending/age inline (the former torn-read helpers
-                                    // are deleted; inline is the single source).
-                                    val liveAsync = run {
-                                        val curA = try { coordInit.activeTx.get() } catch (_: Exception) { null }
-                                        if (curA !== txAsync) return@run false
-                                        val aliveA = try { txAsync.ownerAlive.get() } catch (_: Exception) { false }
-                                        if (!aliveA) return@run false
-                                        val doneA = try { txAsync.deferred.isCompleted || txAsync.deferred.isCancelled } catch (_: Exception) { false }
-                                        if (!doneA) return@run true
-                                        val pendA = try { coordInit.pendingPublish.get() } catch (_: Exception) { null }
-                                        if (pendA == null || pendA.txId != txAsync.txId || pendA.key != txAsync.key) return@run false
-                                        val stagedAtA = try { coordInit.pendingPublishAtNanos.get() } catch (_: Exception) { 0L }
-                                        if (stagedAtA == 0L) return@run false
-                                        val nowA = try { System.nanoTime() } catch (_: Exception) { 0L }
-                                        if (nowA < stagedAtA) return@run true
-                                        val ageA = try { (nowA - stagedAtA) / 1_000_000L } catch (_: Exception) { 0L }
-                                        ageA < policyIoTimeoutMs
-                                    }
-                                    if (liveAsync) {
-                                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
-                                        _state.update { cur ->
-                                            cur.copy(
-                                                policyDraftKnown = false,
-                                                policyDraftCorrupt = txAsync.isRepair,
-                                                msg = policyText(PolicyText(PolicyTextKind.BUSY)),
-                                                msgKind = MsgKind.INFO,
-                                            )
-                                        }
-                                        // P2-4: Busy must not strand forever if the owner
-                                        // dies right after this snapshot (no re-estimate, no
-                                        // timeout, no adopt). Attach a light waiter that
-                                        // rechecks under commitMutex and aborts/reclaims
-                                        // once the claim is abandoned.
-                                        try { attachBusyWaiter(txAsync) } catch (_: Exception) { }
-                                        return@withCommitLock
-                                    }
-                                    // P2-4 fix: only abort a Tx we actually hold locally.
-                                    // CAS null->txAsync first; failure means another
-                                    // VM/op claimed locally concurrently — return
-                                    // without aborting someone else's fence.
-                                    val heldAbandoned = synchronized(policySettleLock) {
-                                        try { activePolicyTx.compareAndSet(null, txAsync) } catch (_: Exception) { false }
-                                    }
-                                    if (!heldAbandoned) return@withCommitLock
-                                    try { abortUnarmedTx(txAsync) } catch (ce: CancellationException) { throw ce } catch (_: Exception) { }
-                                    return@withCommitLock
-                                }
-                                // P2-4 fix: joinable reclaim must also CAS (never blind
-                                // set). Failure => local race lost; re-read and let
-                                // the _latest collector converge (never overwrite).
-                                val heldJoin = synchronized(policySettleLock) {
-                                    if (activePolicyTx.compareAndSet(null, txAsync)) {
-                                        try { policyReconciling.add(txAsync.key) } catch (_: Exception) { }
-                                        // Stage P2 (PR #60 NEW finding #2): adoption epoch
-                                        // bump — this VM adopted the Tx. Nested inside
-                                        // coordInit.withCommitLock { ... }, so the bump is
-                                        // totally ordered against the claim's epoch check
-                                        // (same commitMutex critical section discipline):
-                                        // any claim that linearizes after this observes the
-                                        // new epoch and retains. Same critical section as
-                                        // the adoption CAS + markPolicyUnknownLocked().
-                                        try { txAsync.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
-                                        try { markPolicyUnknownLocked() } catch (_: Exception) { }
-                                        _state.update { cur ->
-                                            cur.copy(
-                                                pendingPolicyWrite = txAsync.pending ?: cur.pendingPolicyWrite,
-                                                policyWritePhase = PolicyWritePhase.RECONCILING,
-                                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                                policyDraftKnown = false,
-                                                policyDraftCorrupt = txAsync.isRepair,
-                                                loading = false,
-                                                msg = policyText(
-                                                    PolicyText(
-                                                        if (txAsync.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
-                                                        else if (txAsync.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
-                                                    ),
-                                                ),
-                                                msgKind = MsgKind.CHANNEL,
-                                            )
-                                        }
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                                if (!heldJoin) return@withCommitLock
-                                try { attachDeferredAutoRecheck(txAsync) } catch (_: Exception) { }
-                                if (txAsync.isClear) launchClearReconciler(txAsync) else launchConfirmReconciler(txAsync)
-                                observeSettledFor(txAsync)
-                            }
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (_: Exception) {
-                        }
-                    }
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                }
+                launchReclaimAsync(coordInit)
                 return@run
             }
             val tx = reclaimedTx ?: return@run
@@ -4072,70 +4096,31 @@ class DualViewModel(
                     abortUnarmedTx(tx)
                     return@run
                 }
-                // P2-4 fix: joinable reclaim must also CAS (never blind set).
-                // Failure => local race lost; re-read and let _latest converge.
-                // Hold-check first: if we already hold this exact Tx (e.g. async
-                // reclaim won before sync), proceed (CAS null->tx would fail
-                // spuriously on same-identity).
-                val heldJoinSync = synchronized(policySettleLock) {
-                    val curLocalJoin = try { activePolicyTx.get() } catch (_: Exception) { null }
-                    if (curLocalJoin !== tx && !try { activePolicyTx.compareAndSet(null, tx) } catch (_: Exception) { false }) {
-                        false
-                    } else {
-                        policyReconciling.add(tx.key)
-                        markPolicyUnknownLocked()
-                        // Stage P2 (PR #60 NEW finding #2): adoption epoch bump.
-                        // This arm is NOT inside commitMutex (init cannot suspend;
-                        // the init tryLock snapshot is released before this CAS).
-                        // Best-effort mutex ordering here: try commitMutex
-                        // tryLock — when free, the bump is totally ordered against
-                        // every claim's epoch check. When momentarily held, fall
-                        // back to the unlocked bump. Residual interleaving on this
-                        // arm, accurately described: a claim that passed its epoch
-                        // check BEFORE this bump lands still linearizes first and
-                        // may publish — i.e. fail-open for the stale worker in
-                        // that narrow window; the coordinator CAS still arbitrates
-                        // ownership, so the stale worker's publish is nonetheless
-                        // legal under the claim-CAS linearization rule. Documented
-                        // honestly; the async locked arm and the busy-waiter arm
-                        // do order the bump inside commitMutex.)
-                        try {
-                            if (coordInit.commitMutex.tryLock()) {
-                                try { tx.adoptionEpoch.incrementAndGet() } finally {
-                                    try { coordInit.commitMutex.unlock() } catch (_: Exception) { }
-                                }
-                            } else {
-                                try { tx.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
-                            }
-                        } catch (_: Exception) {
-                            try { tx.adoptionEpoch.incrementAndGet() } catch (_: Exception) { }
-                        }
-                        _state.update { cur ->
-                            cur.copy(
-                                pendingPolicyWrite = tx.pending ?: cur.pendingPolicyWrite,
-                                policyWritePhase = PolicyWritePhase.RECONCILING,
-                                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                policyDraftKnown = false,
-                                policyDraftCorrupt = tx.isRepair,
-                                loading = false,
-                                msg = policyText(
-                                    PolicyText(
-                                        if (tx.isRepair) PolicyTextKind.CORRUPT_REPAIR_TIMEOUT
-                                        else if (tx.isClear) PolicyTextKind.CLEAR_TIMEOUT else PolicyTextKind.WRITE_TIMEOUT,
-                                    ),
-                                ),
-                                msgKind = MsgKind.CHANNEL,
-                            )
-                        }
-                        true
-                    }
-                }
-                if (!heldJoinSync) return@run
-                attachDeferredAutoRecheck(tx)
-                if (tx.isClear) launchClearReconciler(tx) else launchConfirmReconciler(tx)
-                // Stage H2：init/認領後訂閱 settled（同一 txId 即應用本地 IDLE 終態，
-                // replay=1 晚到仍可見；與 reconciler 敗者跟隨同 helper，冪等）。
-                observeSettledFor(tx)
+                // P3 (master-review A3): the joinable adoption NO LONGER happens
+                // here inline. The init tryLock snapshot is advisory only — it
+                // decides joinability, but the adoption itself (local CAS +
+                // Tx.adoptionEpoch bump + RECONCILING fence flip) is linearized
+                // by commitMutex via the shared async arm (launchReclaimAsync),
+                // strictly ordered against every claim's epoch check. The nested
+                // tryLock/out-of-mutex fallback is GONE (kotlinx Mutex is
+                // non-reentrant, so whenever a claim held commitMutex the
+                // tryLock always missed and the adoption epoch bump had to land
+                // outside the mutex — a claim that passed its epoch check before
+                // that bump still CAS-won afterwards, breaking the shared-mutex
+                // ordering contract this arm's comment used to claim).
+                // Anything this sync path would have won against a claim, the
+                // async adoption can lose LEGITIMATELY: the claim publishes its
+                // terminal and this VM converges read-only via loser-follow
+                // (_latest / the settled subscription inside the async arm).
+                // That IS the correct linearization — adoption never jumps
+                // ahead of an in-flight claim. The async arm re-reads activeTx
+                // / canJoinTx under the lock, so a genuinely live owner is
+                // never cancelled, a settled Tx is never resurrected, and an
+                // adoption that lost the local CAS publishes nothing. The arm
+                // is idempotent; busy/abort above keep their original order
+                // (canJoinTx false-paths first, then adoption).
+                launchReclaimAsync(coordInit)
+                return@run
             }
         }
         // Stage I2：每 VM init 常駐收集 settled（不限認領單一 txId；replay=1 晚到
