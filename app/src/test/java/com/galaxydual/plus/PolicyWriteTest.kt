@@ -32,6 +32,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
+// Read-gate used by the Stage P2 epoch-fence refresh / observer-fallback
+// tests' Store fakes: every non-cold-start read is parked until the test
+// advances the gate —
+//   GATE_OPEN     = 0: reads return instantly (backend.get()),
+//   GATE_PARK     = 1: reads park (interrupt-ignoring) until unresolvedRelease
+//                      (the unresolved-window hold; the reconciler exits
+//                      RETAIN with Unavailable reads before this releases),
+//   GATE_FB_PARK  = 2: reads park until fb/refresh release (the parked
+//                      refresh/fallback read — with the reconciler dead, the
+//                      parks below are attributed to A's parked read (B does
+//                      not exist yet / B's adopted reads may also park
+//                      harmlessly — bounded by B's policyIoTimeoutMs)).
+private const val GATE_OPEN = 0
+private const val GATE_PARK = 1
+private const val GATE_FB_PARK = 2
+
 // Class-level testing convention: this file contains ~40 direction-safe
 // negative-window Thread.sleep(...) calls of ≥200ms (see the grep of
 // `Thread.sleep(` below; the ≈10/20/50ms ones are mostly latch polls inside
@@ -12986,6 +13002,423 @@ class PolicyWriteTest {
             assertEquals(1L, (txA as DualViewModel.PolicyTx).adoptionEpoch.get())
         } finally {
             release.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Stage P2 (PR #60 NEW finding #2) cont.: refresh / observer-fallback
+    // late-join arms — VM-A parked mid-read while VM-B adopts the Tx.
+    //
+    // PIN NOTE (honesty, deviation from the original Phase-B plan): in the
+    // two-VM park-mid-read interleavings below, the fail-closed outer gates
+    // of the refresh late-join arm (revMovedRefresh / staleOutside) and of
+    // the observer fallback (revMovedFb short-circuit / the authoritative
+    // latestForTx replay) retain or converge BEFORE any claim is attempted —
+    // by the time A wakes, B's adoption has bumped the version
+    // triple (markPolicyUnknownLocked) and B's claim has landed committedRev=1L,
+    // both strictly earlier than A's wake (the tests release A's park only
+    // after vmB fully settles, which is what makes the interleaving
+    // deterministic). The attach-time epoch snapshot only takes effect inside
+    // the claim (EPOCH_STALE), which these tests never reach. The attach-time
+    // epoch fence fixed in this change is
+    // therefore belt-and-suspenders for these arms (it closes the residual
+    // window where a version/ownership bump lands BETWEEN A's outer checks and
+    // A's claim inside commitMutex — that window's total order comes from the
+    // mutex itself). These tests pin the end-to-end CONTRACT (single winner:
+    // B claims rev==1L with the SUCCESS terminal, A never claims/publishes,
+    // A converges read-only to B's terminal), not which inner gate fires. The
+    // claim-time EPOCH_STALE verdict itself is pinned by the handoverA_* tests.
+    //
+    // Determinism design (read gate): EVERY non-cold-start read is parked by
+    // the store fake while the gate holds it shut; the test advances the gate
+    // in lockstep with what is alive, so the parked reader at each stage is
+    // uniquely identified:
+    //   GATE_PARK  — unresolved window (VM-A's reconciler/autoRecheck/verify
+    //                reads park; the deferred's save already completed, so the
+    //                mid-await handoff flips vmA to RECONCILING+CHANNEL within
+    //                ~policyIoTimeoutMs and the reconciler exits RETAIN
+    //                (REFRESH_FAILED) once its read budget is spent);
+    //   GATE_FB_PARK — fallback window (vmA's fallback read parks; with the
+    //                reconciler dead, the parks below are attributed to A's
+    //                parked read (B does not exist yet / B's adopted reads may
+    //                also park harmlessly — bounded by B's policyIoTimeoutMs));
+    //   GATE_OPEN  — instant reads (used once VM-B exists and must settle).
+    // ────────────────────────────────────────────────────────────────────────
+
+    // T4. refresh_inFlight_bAdoptsMidRead_aConvergesReadOnly_bSettles — VM-A's refreshPolicyDraft()
+    // parks inside its IO read (no withTimeout on this path); VM-B adopts the Tx
+    // during the park (init adoption bumps Tx.adoptionEpoch inside commitMutex);
+    // release happens only after vmB fully settles, so A's revMovedRefresh is
+    // deterministically 1L != 0L and A converges via loser-follow — never claiming.
+    @Test
+    fun p2_refresh_inFlight_bAdoptsMidRead_aConvergesReadOnly_bSettles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val readGate = java.util.concurrent.atomic.AtomicInteger(GATE_PARK)
+        val unresolvedRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val refreshEntered = java.util.concurrent.CountDownLatch(1)
+        val refreshRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                val n = calls.incrementAndGet()
+                when {
+                    // Cold start: instant (any VM).
+                    n == 1 -> backend.get()
+                    // Unresolved window: park until the reconciler exits RETAIN
+                    // (the read's caller times out at policyIoTimeoutMs anyway;
+                    // a late return is discarded by the caller).
+                    readGate.get() == GATE_PARK -> {
+                        while (!unresolvedRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    // Fallback/late-join window: the parked refresh/fallback read
+                    // (with the reconciler dead, the parks below are attributed
+                    // to A's parked read (B does not exist yet / B's adopted
+                    // reads may also park harmlessly — bounded by B's
+                    // policyIoTimeoutMs)).
+                    readGate.get() == GATE_FB_PARK -> {
+                        refreshEntered.countDown()
+                        while (!refreshRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    // GATE_OPEN: instant reads.
+                    else -> backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            // The save commits instantly; every read parks (GATE_PARK), so the
+            // mid-await handoff flips vmA to RECONCILING+CHANNEL within
+            // ~policyIoTimeoutMs and the reconciler exits RETAIN once its read
+            // budget is spent (deterministic ~4.3s, bounded by 15s timeout).
+            await(timeoutMs = 15_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val txA = activeTxOf(vmA)
+            assertNotNull(txA)
+            assertSame(txA, coordinatorTxOf(coord))
+            // Let the stranded parked threads return (values discarded by their
+            // callers); the reconciler is dead (RETAIN already happened).
+            unresolvedRelease.set(true)
+
+            // A's refresh read is now the only live reader; it parks at GATE_FB_PARK.
+            // viewModelScope is Main=Unconfined, so the call runs inline until the
+            // parked IO read.
+            readGate.set(GATE_FB_PARK)
+            vmA.refreshPolicyDraft()
+            assertTrue(refreshEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // B adopts the Tx synchronously in its init (heldJoin CAS + epoch
+            // bump under commitMutex); its post-adoption reads park at
+            // GATE_FB_PARK, so B stays RECONCILING deterministically.
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 200)
+            await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertSame(txA, activeTxOf(vmB))
+            assertEquals(1L, (txA as DualViewModel.PolicyTx).adoptionEpoch.get())
+
+            // Open reads: B's parked autoRecheck/reconciler reads return
+            // Known(B) and B settles via its own claim (rev 0L -> 1L).
+            readGate.set(GATE_OPEN)
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown
+            }
+            // Release A's parked read: A wakes strictly after B's claim landed
+            // (committedRev=1L), so A's revMovedRefresh is deterministically true;
+            // A skips the Known late-join path entirely and converges via
+            // loser-follow on B's terminal — A never reaches claimForPublish.
+            refreshRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown
+            }
+            // Single winner: exactly B claimed; rev stayed 1L.
+            assertEquals(1L, coord.currentRevision()) // Single-winner tripwire: any A-side claim would bump rev to 2L
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertEquals(MsgKind.INFO, latest.msgKind)
+            // The adopter's SUCCESS terminal published — not a REFRESHED.
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertNull(coord.pendingPublish.get())
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(1, saveCalls.get())
+            // A never claimed/published; it converged read-only to the adopter's
+            // SUCCESS terminal via loser-follow (A's own msg is B's SUCCESS).
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertTrue(vmA.state.value.msg.contains("已寫入政策草稿"))
+            assertFalse(vmA.state.value.msg.contains("已重新整理政策草稿"))
+            assertNull(activeTxOf(vmA))
+            assertNull(activeTxOf(vmB))
+            assertEquals(1L, coord.currentRevision())
+        } finally {
+            refreshRelease.set(true)
+            unresolvedRelease.set(true)
+            readGate.set(GATE_OPEN)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // T5. refresh_bAdoptsBeforeRefresh_aConvergesReadOnly (reverse order): B adopts AND
+    // settles BEFORE vmA.refreshPolicyDraft() is called (fresh read; A's attach
+    // epoch is already stale by exactly one adoption). A's refresh finds
+    // coordinator.activeTx == null (B's claim CAS'd it) → launchLoserSync →
+    // A converges read-only to B's terminal; A never claims; rev unchanged.
+    @Test
+    fun p2_refresh_bAdoptsBeforeRefresh_aConvergesReadOnly() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val readGate = java.util.concurrent.atomic.AtomicInteger(GATE_PARK)
+        val unresolvedRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                val n = calls.incrementAndGet()
+                when {
+                    n == 1 -> backend.get() // Cold start: instant.
+                    readGate.get() == GATE_PARK -> {
+                        while (!unresolvedRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    else -> backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 200, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            await(timeoutMs = 15_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val txA = activeTxOf(vmA)
+            assertNotNull(txA)
+            unresolvedRelease.set(true)
+            readGate.set(GATE_OPEN)
+
+            // B adopts and settles BEFORE A's refresh is even called.
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 200)
+            assertEquals(1L, (txA as DualViewModel.PolicyTx).adoptionEpoch.get())
+            await(timeoutMs = 10_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown
+            }
+            assertEquals(1L, coord.currentRevision()) // Single-winner tripwire: any A-side claim would bump rev to 2L
+
+            vmA.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown
+            }
+            // A never claimed: rev unchanged; B's terminal is the only one.
+            assertEquals(1L, coord.currentRevision())
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertNull(coord.pendingPublish.get())
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+            assertEquals(1, saveCalls.get())
+            assertNull(activeTxOf(vmA))
+        } finally {
+            unresolvedRelease.set(true)
+            readGate.set(GATE_OPEN)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // T6. observerFallback_inFlight_bAdoptsMidRead_aConvergesReadOnly_bSettles — the
+    // observer-fallback arm parks inside boundedReconcileRead (whose read is
+    // handoverScope().async(Dispatchers.IO)); VM-B adopts during the park; the
+    // release happens only after vmB settles. A deterministically converges
+    // read-only (authoritative latestForTx replay) to B's terminal — A never
+    // claims. vmA uses policyIoTimeoutMs = 10_000 (deviation from "same setup as
+    // the refresh test"): boundedReconcileRead's withTimeout budget must outlive
+    // the adopt+settle window — at 200ms the parked fallback read would time out
+    // and retain Unresolved before B's adoption happened, pinning nothing.
+    @Test
+    fun p2_observerFallback_inFlight_bAdoptsMidRead_aConvergesReadOnly_bSettles() {
+        val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val readGate = java.util.concurrent.atomic.AtomicInteger(GATE_PARK)
+        val unresolvedRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fbEntered = java.util.concurrent.CountDownLatch(1)
+        val fbRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = {
+                val n = calls.incrementAndGet()
+                when {
+                    n == 1 -> backend.get() // Cold start: instant.
+                    readGate.get() == GATE_PARK -> {
+                        while (!unresolvedRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    readGate.get() == GATE_FB_PARK -> {
+                        // A's parked boundedReconcileRead (with the reconciler
+                        // dead, the parks below are attributed to A's parked
+                        // read (B does not exist yet / B's adopted reads may
+                        // also park harmlessly — bounded by B's
+                        // policyIoTimeoutMs)).
+                        fbEntered.countDown()
+                        while (!fbRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        backend.get()
+                    }
+                    else -> backend.get()
+                }
+            },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                if (raw != null) backend.set(raw)
+                true
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        var fbScope: CoroutineScope? = null
+        try {
+            val vmA = makeVm(store, userId = 0, policyIoTimeoutMs = 10_000, policyTxCoordinator = coord)
+            await { vmA.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(setOf("com.B"), System.currentTimeMillis())
+            setPendingPolicyWrite(vmA, pendingB)
+            vmA.confirmPolicyWrite(pendingB, pendingB.generation)
+            // Bounded (~15s at the 15s reconcile total budget — policyIoTimeoutMs = 10_000 overshoots it, so the outer budget fires first; within the 25s await).
+            await(timeoutMs = 25_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
+                    !vmA.state.value.policyDraftKnown &&
+                    vmA.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
+            }
+            val txA = activeTxOf(vmA)
+            assertNotNull(txA)
+            assertSame(txA, coordinatorTxOf(coord))
+            unresolvedRelease.set(true)
+
+            // A's fallback read is now the only live reader; it parks at GATE_FB_PARK.
+            readGate.set(GATE_FB_PARK)
+            val scope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
+            fbScope = scope
+            val fb = scope.launch { vmA.runObserverFallback(txA as DualViewModel.PolicyTx, coord) }
+            assertTrue(fbEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // B adopts synchronously in its init (epoch bump under commitMutex);
+            // its post-adoption reads park at GATE_FB_PARK, so B stays
+            // RECONCILING deterministically.
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 200)
+            await(timeoutMs = 10_000L) { vmB.state.value.policyWritePhase == PolicyWritePhase.RECONCILING }
+            assertSame(txA, activeTxOf(vmB))
+            assertEquals(1L, (txA as DualViewModel.PolicyTx).adoptionEpoch.get())
+
+            // Open reads: B's parked autoRecheck/reconciler reads return
+            // Known(B) and B settles via its own claim (rev 0L -> 1L).
+            readGate.set(GATE_OPEN)
+            await(timeoutMs = 15_000L) {
+                vmB.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmB.state.value.policyDraftKnown
+            }
+            // Release A's parked read: Known(B) returns; A deterministically takes
+            // the latestForTx (identity-matched authoritative terminal) path in
+            // runObserverFallback and converges read-only — A never claims.
+            fbRelease.set(true)
+            runBlocking { fb.join() }
+            await(timeoutMs = 10_000L) {
+                vmA.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vmA.state.value.policyDraftKnown
+            }
+            assertEquals(1L, coord.currentRevision()) // Single-winner tripwire: any A-side claim would bump rev to 2L
+            val latest = coord.latest.value
+            assertNotNull(latest)
+            assertTrue(latest!!.known)
+            assertEquals(setOf("com.B"), latest.draft)
+            assertEquals(1L, latest.rev)
+            assertEquals(MsgKind.INFO, latest.msgKind)
+            assertTrue(latest.msg.contains("已寫入政策草稿"))
+            assertFalse(latest.msg.contains("已重新整理政策草稿"))
+            assertNull(coord.pendingPublish.get())
+            assertNull(coordinatorTxOf(coord))
+            assertEquals(1, saveCalls.get())
+            // A converged read-only to the adopter's SUCCESS terminal; A never
+            // claimed/published.
+            assertEquals(setOf("com.B"), vmA.state.value.policyDraft)
+            assertTrue(vmA.state.value.policyDraftKnown)
+            assertTrue(vmA.state.value.msg.contains("已寫入政策草稿"))
+            assertFalse(vmA.state.value.msg.contains("已重新整理政策草稿"))
+            assertNull(activeTxOf(vmA))
+            assertNull(activeTxOf(vmB))
+            assertEquals(1L, coord.currentRevision())
+        } finally {
+            fbRelease.set(true)
+            unresolvedRelease.set(true)
+            readGate.set(GATE_OPEN)
+            try {
+                fbScope?.cancel()
+            } catch (_: Exception) {
+            }
             try {
                 coord.close()
             } catch (_: Exception) {

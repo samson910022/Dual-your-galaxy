@@ -1973,6 +1973,22 @@ class DualViewModel(
     // 4. Delegate to resolveObserverFallback when no revision movement occurred.
     @androidx.annotation.VisibleForTesting
     internal suspend fun runObserverFallback(tx: PolicyTx, coord: PolicyTxCoordinator) {
+        // Stage P2 (PR #60 NEW finding #2): attach-time Tx-scoped adoption-epoch
+        // snapshot for the authoritative fallback read below — taken synchronously
+        // at fallback entry (before any store touch, hence before
+        // boundedReconcileRead) and threaded into every resolveObserverFallback
+        // call site as the claim-time fence. Sampling instead AFTER the read would
+        // let a VM parked mid-read, woken after another VM adopted the Tx, claim
+        // with the adopter's fresh epoch (expectedEpoch matches the shared epoch
+        // inside commitMutex) and publish from a stale window.
+        //
+        // Placement note (honest): the sibling reconciler/late-join arms sample at
+        // their own pre-read capture points; this snapshot is taken at function
+        // entry rather than at the revBeforeFb sample point because one call site
+        // (the !tx.deferred.isCompleted retain below) runs BEFORE the revBeforeFb
+        // point and must be threaded too. Entry is strictly earlier than any read
+        // performed below, so the fence semantics hold unchanged.
+        val epochBeforeFb = tx.adoptionEpoch.get()
         val curLocalFb = try { activePolicyTx.get() } catch (_: Exception) { null }
         val curCoordFb = try { coord.activeTx.get() } catch (_: Exception) { null }
         if (curLocalFb != null && curLocalFb !== tx) {
@@ -1989,7 +2005,7 @@ class DualViewModel(
         }
         // PR #2: NEVER run authoritative terminal read before tx.deferred has completed.
         if (!tx.deferred.isCompleted) {
-            resolveObserverFallback(tx, LoadResult.Unavailable, true)
+            resolveObserverFallback(tx, LoadResult.Unavailable, true, epochBeforeFb)
             return
         }
         val revBeforeFb = try { sampledCurrentRevision() } catch (e: CancellationException) {
@@ -2048,7 +2064,7 @@ class DualViewModel(
                 if (afterClaim != null) {
                     applyAuthoritativeSettled(tx, afterClaim)
                 } else {
-                    resolveObserverFallback(tx, LoadResult.Unavailable, true)
+                    resolveObserverFallback(tx, LoadResult.Unavailable, true, epochBeforeFb)
                 }
                 return
             }
@@ -2087,10 +2103,10 @@ class DualViewModel(
                 return
             }
             // Revision moved mid-read without matching terminal: discard fbRead, stay Unresolved.
-            resolveObserverFallback(tx, LoadResult.Unavailable, true)
+            resolveObserverFallback(tx, LoadResult.Unavailable, true, epochBeforeFb)
             return
         }
-        resolveObserverFallback(tx, fbRead, fbTimedOut)
+        resolveObserverFallback(tx, fbRead, fbTimedOut, epochBeforeFb)
     }
 
     // Stage H2：敗者跟隨＋init 認領訂閱共用（冪等：同一 txId 多次 refresh 觸發的
@@ -3156,6 +3172,7 @@ class DualViewModel(
         tx: PolicyTx,
         read: LoadResult,
         timedOut: Boolean,
+        epochOverride: Long? = null,
     ) {
         if (!canJoinTx(tx)) {
             abortUnarmedTx(tx)
@@ -3163,11 +3180,18 @@ class DualViewModel(
         }
         val versionAtStart = policyDraftVersion.get()
         val ownershipSnap = policyOwnershipGen.get()
-        // Stage P2 (PR #60 NEW finding #2): reconciler/fallback-entry Tx-scoped
-        // adoption-epoch snapshot — passed to the claim below; the claim's
-        // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim that
-        // linearizes after an adopter's bump consumes as EPOCH_STALE (no CAS, no publish).
-        val epochSnap = tx.adoptionEpoch.get()
+        // Stage P2 (PR #60 NEW finding #2): attach-time Tx-scoped adoption-epoch
+        // snapshot for the claim below. runObserverFallback threads the snapshot
+        // it took BEFORE boundedReconcileRead (the pre-read/attach-time point — a
+        // VM parked mid-read, woken after another VM adopted the Tx, must NOT
+        // claim with the adopter's fresh epoch); out-of-band callers passing no
+        // epochOverride keep the legacy behavior and re-sample at resolver entry
+        // (after the fallback read — a strictly wider window, unchanged by this
+        // fix and fail-closed only in combination with the claim-time re-check).
+        // Either way the claim's commitMutex critical section re-checks
+        // Tx.adoptionEpoch, so a claim that linearizes after an adopter's bump
+        // consumes as EPOCH_STALE (no CAS, no publish).
+        val epochSnap = epochOverride ?: tx.adoptionEpoch.get()
         if (timedOut) {
             retainUnresolvedReconciling(tx)
             return
@@ -6977,6 +7001,16 @@ class DualViewModel(
         val key = tx.key
         val store = tx.store
         val sanitized = tx.sanitized
+        // Stage P2 (PR #60 NEW finding #2): attach-time Tx-scoped adoption-epoch
+        // snapshot, taken synchronously at launch call time (the scheduling point),
+        // NOT at coroutine resumption — a VM whose reconciler job is dispatched
+        // late would otherwise attach AFTER another VM adopted the Tx mid-park and
+        // observe the adopter's fresh epoch, publishing from a stale window.
+        // Passed to every claim below; the claim's commitMutex critical section
+        // re-checks Tx.adoptionEpoch, so a claim that linearizes after an
+        // adopter's bump consumes as EPOCH_STALE.
+        val versionAtStart = policyDraftVersion.get()
+        val epochAtStart = tx.adoptionEpoch.get()
         handoverScope().launch {
             // Stage N2 P1: unvalidated (PREPARING) Tx must never be joined —
             // it was cancelled before final validation/arm. Abort without any
@@ -6986,13 +7020,7 @@ class DualViewModel(
                 abortUnarmedTx(tx)
                 return@launch
             }
-            val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
-            // Stage P2 (PR #60 NEW finding #2): reconciler-start Tx-scoped
-            // adoption-epoch snapshot — passed to every claim below; the claim's
-            // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim
-            // that linearizes after an adopter's bump consumes as EPOCH_STALE.
-            val epochAtStart = tx.adoptionEpoch.get()
             // settle=false＝誠實 unresolved：保留 fence（late-join 可見）＋pending
             // 保留＋phase 續留 RECONCILING。
             // CE unwind never settles; the fence is retained for the app-scoped
@@ -7425,18 +7453,22 @@ class DualViewModel(
     // 語義見 confirm 註記）。
     private fun launchClearReconciler(tx: PolicyTx) {
         val store = tx.store
+        // Stage P2 (PR #60 NEW finding #2): attach-time Tx-scoped adoption-epoch
+        // snapshot, taken synchronously at launch call time (the scheduling point),
+        // NOT at coroutine resumption — a VM whose reconciler job is dispatched
+        // late would otherwise attach AFTER another VM adopted the Tx mid-park and
+        // observe the adopter's fresh epoch, publishing from a stale window.
+        // Passed to every claim below; the claim's commitMutex critical section
+        // re-checks Tx.adoptionEpoch, so a claim that linearizes after an
+        // adopter's bump consumes as EPOCH_STALE.
+        val versionAtStart = policyDraftVersion.get()
+        val epochAtStart = tx.adoptionEpoch.get()
         handoverScope().launch {
             if (!canJoinTx(tx)) {
                 abortUnarmedTx(tx)
                 return@launch
             }
-            val versionAtStart = policyDraftVersion.get()
             val ownership = policyOwnershipGen.incrementAndGet()
-            // Stage P2 (PR #60 NEW finding #2): reconciler-start Tx-scoped
-            // adoption-epoch snapshot — passed to every claim below; the claim's
-            // commitMutex critical section re-checks Tx.adoptionEpoch, so a claim
-            // that linearizes after an adopter's bump consumes as EPOCH_STALE.
-            val epochAtStart = tx.adoptionEpoch.get()
             var settle = true
             try {
                 try {
@@ -7885,6 +7917,15 @@ class DualViewModel(
                 val txBeforeRead = activePolicyTx.get()
                 val txCompletedBeforeRead = txBeforeRead != null &&
                     canJoinTx(txBeforeRead) && txBeforeRead.deferred.isCompleted
+                // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption-epoch
+                // snapshot captured at IO-entry alongside revBeforeRefresh (the
+                // attach-time observation, before the read) — NOT re-sampled
+                // after it. A VM parked mid-read, woken after another VM adopted
+                // the Tx, must not claim with the adopter's fresh epoch; passing
+                // the pre-read epoch means the late-join claim below linearizes
+                // against the claim-time commitMutex re-check exactly like the
+                // reconciler's epochAtStart fence.
+                val epochBeforeRead = txBeforeRead?.adoptionEpoch?.get()
                 val result = if (store == null) {
                     LoadResult.Unavailable
                 } else try {
@@ -7908,9 +7949,13 @@ class DualViewModel(
                     revBeforeRefresh != -1L && sampledCurrentRevision() != revBeforeRefresh
                 } catch (ce: CancellationException) { throw ce } catch (_: Throwable) { true }
                 val txSnap = activePolicyTx.get()
-                // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption epoch snapshot —
-                // passed to the late-join claim below; claim-time commitMutex check.
-                val epochSnap = txSnap?.adoptionEpoch?.get()
+                // Stage P2 (PR #60 NEW finding #2): Tx-scoped adoption-epoch snapshot,
+                // captured at IO-entry alongside revBeforeRefresh — NOT re-sampled
+                // after the read: a VM parked mid-read whose Tx another VM adopted
+                // mid-read would otherwise consume the adopter's fresh epoch at claim
+                // time and publish from a stale window. The claim-time commitMutex
+                // re-check is unchanged (belt-and-suspenders).
+                val epochSnap = epochBeforeRead
                 val lateJoinOk: Boolean? = if (txSnap != null &&
                     txBeforeRead === txSnap &&
                     txCompletedBeforeRead &&
