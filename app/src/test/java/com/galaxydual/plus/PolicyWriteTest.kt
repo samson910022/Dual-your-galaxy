@@ -12303,6 +12303,91 @@ class PolicyWriteTest {
         }
     }
 
+    // V3 (bounded honest escalation): VM-B の Busy waiter が 4 ラウンド経過後も
+    // owner が wedged（PREPARING・owner 生存・latch で永久ブロック）のままなら、
+    // (1) System.err 診断 (2) busyWaiterExpirations インクリメント (3) 4x バックオフ
+    // の単一 bounded re-arm、の順で escalate し、無限には loop しない・
+    // owner の fence を abort もしない。owner は latch 中のまま。
+    @Test
+    fun secondVm_busyWaiter_wedgedOwner_escalatesBoundedAndCountsExpiration() {
+        var corrupt = true
+        var backing: Set<String>? = null
+        val loadCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val finalEntered = java.util.concurrent.CountDownLatch(1)
+        val finalRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val store = HookPolicyStore(
+            loadRaw = {
+                when (loadCalls.incrementAndGet()) {
+                    1 -> throw ClassCastException("corrupt")
+                    2 -> throw ClassCastException("corrupt")
+                    3 -> {
+                        finalEntered.countDown()
+                        while (!finalRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        throw ClassCastException("corrupt")
+                    }
+                    else -> if (corrupt) throw ClassCastException("corrupt") else backing
+                }
+            },
+            saveRaw = { raw ->
+                if (raw == null) {
+                    corrupt = false
+                    backing = emptySet()
+                    true
+                } else {
+                    backing = raw
+                    corrupt = false
+                    true
+                }
+            },
+        )
+        val coord = PolicyTxCoordinator()
+        try {
+            val vmA = makeVm(
+                store,
+                userId = 0,
+                initialDraft = null,
+                policyIoTimeoutMs = 5_000,
+                policyTxCoordinator = coord,
+            )
+            await { !vmA.state.value.loading }
+            await(timeoutMs = 5_000L) { vmA.state.value.policyDraftCorrupt }
+
+            vmA.requestRepairCorruptDraft()
+            vmA.confirmRepairCorruptDraft()
+            assertTrue(finalEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            await(timeoutMs = 5_000L) { vmA.state.value.policyWritePhase == PolicyWritePhase.SAVING }
+            val tx1 = activeTxOf(vmA)
+            assertNotNull(tx1)
+            tx1 as DualViewModel.PolicyTx
+            assertSame(tx1, coordinatorTxOf(coord))
+            assertTrue(tx1.ownerAlive.get())
+            assertFalse(tx1.executionArmed.get())
+
+            // VM-B: ごく小さい policyIoTimeoutMs で waiter が早く expire するようにする。
+            // owner は latch 中のまま（wedged）。4 ラウンド + 1 回の bounded re-arm
+            // （4x backoff）後に waiter は終了し、busyWaiterExpirations が 1 になるはず。
+            val vmB = makeVm2Direct(store, coord, policyIoTimeoutMs = 50)
+            await(timeoutMs = 10_000L) { !vmB.state.value.loading }
+            await(timeoutMs = 10_000L) { vmB.busyWaiterExpirations.get() == 1 }
+            // fence は owner のまま・Tx は cancel されていない・VM-B は claim していない。
+            assertSame(tx1, coordinatorTxOf(coord))
+            assertFalse(tx1.deferred.isCancelled)
+            assertNull(activeTxOf(vmB))
+            assertEquals(1, vmB.busyWaiterExpirations.get())
+        } finally {
+            finalRelease.set(true)
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Phase3 (F3-P2#2) BLANK-MESSAGE substitution pin: mid-await CE in the
     // armed-coord confirm path hands the armed Tx off to the coordinator.
     // Right after the scope cancel lands (phase flips to RECONCILING, BEFORE

@@ -6801,6 +6801,17 @@ internal fun buildBatchConfirmMessage(
 // owner-user 門控用:由 uid 拆出 userId。
 // uid = userId * UserHandle.PER_USER_RANGE + appId (AOSP 公式);
 // PER_USER_RANGE 為 @hide,公開 SDK 無法引用,故 100_000 字面單點存放在此。
+// SEC-2: 導出（AOSP user-range shift）與方向依存的 fail-closed 分析の詳述は
+// GuardXposedProvider.isTrustedXposedCaller 上の SEC-2 コメントに集約。要點:
+// fail-closed は方向依存であり、対称でも無条件でもない。過大 shift（分解が縮退する
+// 極端では shift ≥ uid）では appId ∈ 0..9999 の席の判定は uid == 1000 の等価判定へ
+// 縮退し、同 user system uid が拒否される（可用性損失；信頼境界は広がらない）。
+// 過小 shift、あるいは一般 app の appId が 0..9999 に落ちる任意の shift では、
+// 一般 app が appId == 1000 の席へ再入しうる —— 100_000 の字面はこの方向で
+// load-bearing であり、この方向の fail-closed ではない。uid == 0（root）と
+// uid == myUid（self）の等価 path は shift 無関係（uid == 1000 の等価 path も同様）。
+// DEVICE-UNVERIFIED: on-device assertion 保留中。これは儀礼的な但し書きではない
+// （NOT pro forma）—— どちらの方向も無条件に fail-closed とは主張できない。
 // Phase 4:負值守衛 (<0 回 -1):Process.myUid() 恆非負,負值僅出現在測試/
 // 異常路徑;舊碼整數除法向零截斷會把負值誤判為 user 0 (owner),直接 fail-open,
 // 故顯式回 -1 拒絕。

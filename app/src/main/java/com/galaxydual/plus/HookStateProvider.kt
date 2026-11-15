@@ -129,7 +129,7 @@ private fun firstScopesRaw(raws: List<String?>): String? =
     message = "Legacy two-state read conflates unreadable/absent/malformed; " +
         "its inactive is not negative evidence. Use diagnoseHookState.",
 )
-fun readHookState(
+internal fun readHookState(
     markerFiles: List<File> = allHookMarkerFiles(),
 ): HookState {
     return try {
@@ -183,6 +183,31 @@ private fun readTextOrNull(file: File): String? {
     }
 }
 
+// catDetailed が gateway に渡す marker path の許可リスト。
+// HookMarker.DEFAULT_MARKER_FILES が marker path の信頼できる唯一のソースであり、
+// この正規表現は 6 つのコンパイル時定数 marker path
+// （/data/system/galaxydual_hook.active,
+//  /data/system/galaxydual_hook.active.system_server,
+//  /data/system/galaxydual_hook.active.daagent,
+//  /data/local/tmp/galaxydual_hook.active,
+//  /data/local/tmp/galaxydual_hook.active.system_server,
+//  /data/local/tmp/galaxydual_hook.active.daagent）に EXACT にだけ一致する:
+// matches exactly the six compile-time marker paths listed above; the
+// charset/prefix contract is not a superset — the boundary is exact; shell
+// metacharacters, slashes, whitespace and any other suffix are rejected.
+// 将来 catDetailed がパラメータ化された場合でも、シェルメタ文字が
+// `cat $absPath` に紛れ込むのをフェイルクローズで防ぐための防御線。
+// String.matches は両端アンカー（full-match; ^...$ 相当）なので、
+// アンカーはパターンには書かない。
+// 6 つの DEFAULT_MARKER_FILES パスは全てこれに一致し、これ以外のパスは
+// 一致しない（検証済み: 6 パス全て matches、suffix 付き等は全て不一致）。
+private const val ABSOLUTE_MARKER_PATH =
+    "/data/(system|local/tmp)/galaxydual_hook\\.active(\\.(system_server|daagent))?"
+
+// ABSOLUTE_MARKER_PATH のコンパイル済み Regex。クラス（ファイル）レベルで
+// 一度だけ読む（呼び出しごとに再コンパイルしない）。
+private val MARKER_PATH_RE = Regex(ABSOLUTE_MARKER_PATH)
+
 // One gateway `cat` attempt. Never maps a timeout/transport loss to a
 // definite read or a definite absence.
 private sealed interface CatOutcome {
@@ -203,6 +228,21 @@ private sealed interface CatOutcome {
 // cancellation); any other gateway failure maps to TransportFailed, which
 // callers treat as "this gateway is doomed for the rest of the round".
 private suspend fun catDetailed(gateway: CmdGateway, absPath: String): CatOutcome {
+    // absPath は HookMarker.DEFAULT_MARKER_FILES（marker path の信頼できる
+    // ソース）由来のコンパイル時定数であり、シェルメタ文字を含まない。
+    // それでも `cat $absPath` の展開を将来のパラメータ化バグから守るため、
+    // MARKER_PATH_RE（6 つのコンパイル時 marker path に EXACT 一致；charset/prefix
+    // の上位集合ではなく境界は exact）に対する full-match に失敗した場合は
+    // フェイルクローズで TransportFailed（呼び出し側は「ゲートウェイ使用不能」として
+    // 扱う既存の経路）を返す。
+    if (!absPath.matches(MARKER_PATH_RE)) {
+        try {
+            // クラス名のみの診断（path 内容はログに出さない）。
+            System.err.println("[HookStateProvider] catDetailed: marker path failed allowlist; reporting gateway unusable")
+        } catch (_: Throwable) {
+        }
+        return CatOutcome.TransportFailed
+    }
     return try {
         val res = gateway.run("cat $absPath")
         when {

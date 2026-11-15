@@ -391,6 +391,18 @@ class PolicyTxCoordinator {
     // bump. Keep null in production builds.
     internal var beforeClaimCasSeamForTests: (() -> Unit)? = null
 
+    // Phase7 test seam (mirrors beforeClaimCasSeamForTests): invoked INSIDE
+    // dropStagedPlaceholderIfMatch immediately AFTER the entry snapshot of
+    // pendingPublish is read and BEFORE the placeholder check / tombstone
+    // insert / pendingPublish CAS — JVM tests use it to pin the lost-CAS arm
+    // deterministically against a concurrent placeholder→real (stage-won)
+    // hand-off linearizing inside the drop's get→CAS window. Production never
+    // sets it (null in production builds). Exceptions thrown by the seam are
+    // swallowed; an Error is not (the outer catch in
+    // dropStagedPlaceholderIfMatch is Exception-only) and propagates to the
+    // caller.
+    internal var beforeDropCasSeamForTests: (() -> Unit)? = null
+
     suspend fun <T> withCommitLock(block: suspend () -> T): T {
         commitLockFailForTests?.let { throw it() }
         return commitMutex.withLock { block() }
@@ -1163,29 +1175,46 @@ class PolicyTxCoordinator {
     //   outcome stands; never two winners);
     // - on a won CAS: owner cleared, orphanDropRev/Gen bumped (paired order,
     //   rev before gen) — identical to the locked drop paths.
-    // - on a LOST CAS: pendingPublish is re-read; if it no longer holds the
-    //   placeholder we observed (a concurrent stageRealPayload staged real
-    //   payload — placeholder→real — or a foreign/recover path cleared or
-    //   replaced pending), the tombstone inserted above is rolled back
-    //   ([claimTombstones] remove(key, rev), value-matched so a refreshed
-    //   rev survives) and the drop reports false. The tombstone is kept only
-    //   when the fence really was an over-broad placeholder drop (pending
-    //   still holds the same placeholder identity, e.g. a foreign recover
-    //   CAS-won our snapshot for a different arrangement): a stale tombstone
-    //   there is the deliberate fail-closed bias, bounded by the
-    //   claim-tombstone eviction cap.
-    //   Why rollback matters: a concurrent stageRealPayload can stage the real
-    //   payload S into _latest＋pendingPublish BEFORE our tombstone insert, so
-    //   keeping the tombstone would make emitStaged(S) see isTombstoned and S
-    //   would never reach the _settled notifier — S's truth survives only via
-    //   _latest / retireStagedRealPresentInLatestLocked (which clears pending
-    //   while preserving _latest truth for an age-gated stale real payload),
-    //   never via a successful synthetic emit. Rolling the tombstone back on a
-    //   lost-CAS-with-real-staged keeps S emittable.
+    // - on a LOST CAS: pendingPublish is re-read and _latest is sampled. The
+    //   tombstone inserted above is rolled back ONLY on positive evidence that
+    //   the placeholder→real hand-off won:
+    //   (a) pendingPublish now holds a REAL payload (not placeholder shape:
+    //       known || msg non-empty) with the same identity (txId/key/rev); or
+    //   (b) _latest currently carries the same (txId, key, rev).
+    //   A stage-won or _latest-matched rollback restores emit-ability. Why it
+    //   matters: a concurrent stageRealPayload can stage the real payload S
+    //   into _latest＋pendingPublish BEFORE our tombstone insert, so keeping
+    //   the tombstone would make emitStaged(S) / tryEmitSettled(S) reject S as
+    //   tombstoned and S would never reach the _settled notifier — S's truth
+    //   would survive only via _latest / retireStagedRealPresentInLatestLocked
+    //   (which clears pending while preserving _latest truth for an age-gated
+    //   stale real payload), never via a successful synthetic emit.
+    //   A null re-read keeps the tombstone unless _latest positively carries
+    //   the same (txId,key,rev) — that combination is reachable only when the
+    //   stage won and the real payload was subsequently retired (retire never
+    //   tombstones), so rolling back our own insert is safe; the locked-path-
+    //   keep guarantee applies when _latest does not match. A null re-read
+    //   with a non-matching _latest is indistinguishable from a locked path
+    //   (recoverStalePendingLocked /
+    //   discardOverrunPlaceholder) having ALREADY tombstoned the identity —
+    //   rolling back there would re-open it for the isTombstoned fast-reject
+    //   in emitStaged/tryEmitSettled. A locked-path tombstone MUST stay. The
+    //   stillPlaceholder arm likewise keeps the tombstone (an over-broad fence
+    //   is the deliberate fail-closed bias, bounded by the claim-tombstone
+    //   eviction cap); only the two positive-evidence arms roll back.
+    //   latestMatches deliberately does not require curAfter != null for that
+    //   reason.
+    //   Rollback is a claimTombstones remove(key, rev), value-matched so a
+    //   concurrently refreshed rev survives.
     // Placeholders carry no truth (_latest untouched), so a won lock-free drop
     // can never publish or destroy a real payload.
     internal fun dropStagedPlaceholderIfMatch(txId: Long, key: String): Boolean = try {
         val cur = try { pendingPublish.get() } catch (_: Exception) { null }
+        // Phase7 test seam: invoked after the entry snapshot is read and
+        // before any tombstone/CAS decision — models a concurrent
+        // placeholder→real flip linearizing inside the get→CAS window (the
+        // lost-CAS arm's reason for existing). Production never sets it.
+        try { beforeDropCasSeamForTests?.invoke() } catch (_: Exception) { }
         if (cur == null || cur.txId != txId || cur.key != key) {
             false
         } else {
@@ -1196,20 +1225,39 @@ class PolicyTxCoordinator {
                 // Capacity: keep the fence (STALE retry) — same as the locked path.
                 false
             } else if (!pendingPublish.compareAndSet(cur, null)) {
-                // Lost the race. Re-read pendingPublish: if it no longer holds
-                // the placeholder we tombstoned — a concurrent stageRealPayload
-                // won placeholder→real between our read and our tombstone
-                // insert — roll the tombstone back so S stays emittable;
-                // recovery for the real payload is via _latest /
-                // retireStagedRealPresentInLatestLocked, never via a synthetic
-                // emit of a tombstoned identity. Keep the tombstone only when
-                // the lost fence really was an over-broad placeholder drop
-                // (pending still holds the same placeholder identity).
+                // Lost the race. Roll the tombstone back ONLY on positive
+                // evidence the placeholder→real hand-off won: (a) pendingPublish
+                // now holds a REAL payload (not placeholder shape) with the same
+                // (txId,key,rev), or (b) _latest carries the same (txId,key,rev).
+                // A null re-read keeps the tombstone unless _latest positively
+                // carries the same (txId,key,rev) — that combination is reachable
+                // only when the stage won and the real payload was subsequently
+                // retired (retire never tombstones), so rolling back our own
+                // insert is safe; the locked-path-keep guarantee applies when
+                // _latest does not match. A null re-read with a non-matching
+                // _latest is indistinguishable from a locked path
+                // (recoverStalePendingLocked/discardOverrunPlaceholder) that
+                // ALREADY tombstoned this identity — rolling back there would
+                // re-open it for the isTombstoned fast-reject, so the tombstone
+                // stays. The stillPlaceholder arm likewise keeps it (over-broad
+                // fence; deliberate fail-closed bias). A stage-won or
+                // _latest-matched rollback restores emit-ability so the real
+                // payload can still reach the _settled notifier.
+                // latestMatches deliberately does not require curAfter != null
+                // for that reason.
                 val curAfter = try { pendingPublish.get() } catch (_: Exception) { null }
                 val stillPlaceholder = curAfter != null &&
                     curAfter.txId == cur.txId && curAfter.key == cur.key &&
                     (try { !curAfter.known && curAfter.msg.isEmpty() } catch (_: Exception) { false })
-                if (!stillPlaceholder) {
+                val realHandOff = !stillPlaceholder && curAfter != null &&
+                    curAfter.txId == cur.txId && curAfter.key == cur.key &&
+                    curAfter.rev == cur.rev &&
+                    (try { curAfter.known || curAfter.msg.isNotEmpty() } catch (_: Exception) { false })
+                val latestMatches = !stillPlaceholder && (try {
+                    val lat = _latest.value
+                    lat != null && lat.txId == cur.txId && lat.key == cur.key && lat.rev == cur.rev
+                } catch (_: Exception) { false })
+                if (realHandOff || latestMatches) {
                     removeClaimTombstone(cur.txId, cur.key, cur.rev)
                 }
                 false
@@ -1331,6 +1379,8 @@ class PolicyTxCoordinator {
     fun emitSettledAsync(s: PolicySettled) {
         try {
             emitStaged(s)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Exception) {
             // Best effort.
         }
