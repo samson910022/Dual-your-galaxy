@@ -239,6 +239,7 @@
     <string name="hook_mode_title">Hook 模式：LSPosed（%1$s）</string>
     <string name="hook_mode_subtitle">需 LSPosed Hook 生效後（待實機驗證），方可解除官方雙開限制並注入第三方應用至原生 Dual App 白名單，無需 Knox / 安全資料夾；寫入需 Auto／Root／Shizuku 特權通道；政策預設為空，hooks 預設 observe-only（只觀察、不改變行為，草稿效果未經實機驗證，不保證生效）。</string>
     <string name="hook_mode_subtitle_ops">當前特權通道（Auto／Root／Shizuku）可直接在已驗證分身中建立／移除分身，無需 Hook；LSPosed 僅用於更深度的三星白名單與原生介面整合。</string>
+    <!-- D-9 siblings: hook_badge_sec_hook / hook_badge_sec_pm / engine_status_active / status_hook_injected_active / telemetry_status_active / engine_diag_all_normal — gate-pending live claims; default GONE behind hookLiveProven (hard-false today); re-qualify when boot-fresh lands. -->
     <string name="hook_badge_sec_hook">已注入 SecPackageHook</string>
     <string name="hook_badge_sec_pm">SecPackageManager 攔截中</string>
     <string name="hook_badge_uid_sandbox">獨立 UID 沙盒</string>
@@ -251,6 +252,7 @@
     <string name="section_pending_apps">可用已安裝應用</string>
     <string name="section_pending_apps_hint">勾選後請用「批次建立」寫入分身（勾選本身不寫入）</string>
     <string name="section_advanced_manual">進階手動包名注入</string>
+    <!-- D-9: gate-pending live claim; default GONE behind hookLiveProven (hard-false today); re-qualify when boot-fresh lands. -->
     <string name="status_hook_daemon_running">原生 Dual Messenger 核心 Hook 運作中</string>
     <string name="status_hook_daemon_desc">Hook 已安裝（僅存在性證據，未確認攔截生效）</string>
     <string name="engine_status_title">底層注入狀態</string>

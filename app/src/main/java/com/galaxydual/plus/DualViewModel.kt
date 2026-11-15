@@ -3242,7 +3242,7 @@ class DualViewModel(
         }
     }
     // Stage O1 extra: tryLock missed => async locked reclaim (delayed retry).
-    // Guarantees every activeTx value is eventually claimed by some live VM.
+    // Guarantees every activeTx value is eventually claimed by some live VM (bounded re-arm; this does NOT abort live owners and does not prove liveness — see launchReclaimAsync).
     // P3 (master-review A3): extracted verbatim from the init `!lockedInit`
     // arm so the SYNC adoption arm can call the same linearized path — every
     // cross-VM adoption now runs under commitMutex with the Tx.adoptionEpoch
@@ -4171,7 +4171,7 @@ class DualViewModel(
                 }
             }
             // Stage O1 extra: tryLock missed => async locked reclaim (delayed retry).
-            // Guarantees every activeTx value is eventually claimed by some live VM.
+            // Guarantees every activeTx value is eventually claimed by some live VM (bounded re-arm; this does NOT abort live owners and does not prove liveness — see launchReclaimAsync).
             if (!lockedInit) {
                 launchReclaimAsync(coordInit)
                 return@run
