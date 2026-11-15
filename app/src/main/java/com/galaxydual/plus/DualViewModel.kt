@@ -1844,6 +1844,14 @@ class DualViewModel(
     // ground-truth guarded by the revMovedFb discard and latestForTx replay in
     // its caller, and threading a revision there would double-gate an
     // already-retain arm; every other success-side claim site MUST pass revBefore.
+    // Success-side fast-path claims (confirm/clear/repair SAVING arms) are also
+    // deliberately left at expectedEpoch=null so the owner-handover hot path is
+    // not re-fenced into starvation; the pre-adoption-snapshot concern that gates
+    // the FAILED arms does not apply to success terminals (the payload is built
+    // from a fresh in-flight ack read) — the leftover risk is dual-active winner
+    // publishing a pre-adoption Success, which is benign by construction (the
+    // adopter loses the CAS and follows read-only). REV_GATE_REJECTED is handled
+    // there identically to the FAILED arms (stage-rejected terminal, no publish).
     // Stage P2 (PR #60 NEW finding #2): expectedEpoch threads the attach-time
     // Tx.adoptionEpoch snapshot into the claim's commitMutex critical section;
     // a mismatch consumes NOTHING (EPOCH_STALE → false here; inside
@@ -9420,30 +9428,36 @@ class DualViewModel(
                                 return@withLock
                             }
                             val pcFast = preClaimTx
-                            if (pcFast != null && !claimForPublish(pcFast, null, pendingAtCall.baseCoordinatorRevision)) {
+                            val pcFastVerdict = if (pcFast != null) {
+                                claimForPublishCheckedVerdict(pcFast, pendingAtCall.baseCoordinatorRevision)
+                            } else {
+                                PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+                            }
+                            if (pcFastVerdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
                                 try { ackJob.cancel() } catch (_: Exception) { }
+                                if (pcFastVerdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+                                    // Rev-gate rejection: no claim consumed, no winner exists —
+                                    // settle as stage-rejected (helper completes the coordinator
+                                    // claim, clears keys, stamps Unknown/IDLE).
+                                    if (writeLocked) {
+                                        try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                        writeLocked = false
+                                    }
+                                    synchronized(policySettleLock) {
+                                        applyStageRejectedUnderLock(pcFast!!, key)
+                                        preClaimTx = null
+                                    }
+                                    return@withLock
+                                }
+                                // CAS_LOSS/EPOCH_STALE: a live winner consumed the claim — loser
+                                // handling (SAVING→RECONCILING + launchLoserSync /
+                                // clearObsoleteLocalTx) already ran inside tryClaimStagedVerdict;
+                                // do not add handling here (no fabricated fence clears).
                                 preClaimTx = null
                                 if (writeLocked) {
                                     try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                     writeLocked = false
                                 }
-                                // Phase 4：成功側 claimForPublish 的 revBefore 為
-                                // pendingAtCall.baseCoordinatorRevision（save IO 開始時
-                                // 已再驗證 committedRevision == base）——save IO 期間有外來 B
-                                // 落盤會 bump committedRevision → REV_GATE_REJECTED（不消費
-                                // claim、無 loser-follow）；reject 亦可能是 CAS_LOSS/
-                                // EPOCH_STALE（有 live winner，loser handling——SAVING→
-                                // RECONCILING＋launchLoserSync——已在 tryClaimStagedVerdict
-                                // 內完成，本 VM 跟隨 winner 收斂）。兩者皆不可在此 publish。
-                                // On REV_GATE_REJECTED the claim consumes nothing;
-                                // local + coordinator fences are retained (activePolicyTx /
-                                // coord.activeTx untouched), the shared fail-closed finally
-                                // removes this op's keys (inFlightWrites/policyWriteSaving)
-                                // and stamps Unknown/IDLE (UNKNOWN_REFRESH), and the retained
-                                // fence converges via refresh late-join or the next refresh.
-                                // On CAS_LOSS/EPOCH_STALE, loser-follow inside the claim already
-                                // converged (fence cleared or RECONCILING + loser-follow); do not
-                                // add handling here. No publish happens.
                                 return@withLock
                             }
                             val isRefresh = policyRevisionStale.get() ||
@@ -10430,28 +10444,36 @@ class DualViewModel(
                             return@withLock
                         }
                         val pcClearFast = preClaimTx
-                        if (pcClearFast != null && !claimForPublish(pcClearFast, null, clearRevBefore)) {
+                        val pcClearVerdict = if (pcClearFast != null) {
+                            claimForPublishCheckedVerdict(pcClearFast, clearRevBefore)
+                        } else {
+                            PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED
+                        }
+                        if (pcClearVerdict != PolicyTxCoordinator.ClaimStagedVerdict.CLAIMED) {
                             try { ackJob.cancel() } catch (_: Exception) { }
+                            if (pcClearVerdict == PolicyTxCoordinator.ClaimStagedVerdict.REV_GATE_REJECTED) {
+                                // Rev-gate rejection: no claim consumed, no winner exists —
+                                // settle as stage-rejected (helper completes the coordinator
+                                // claim, clears keys, stamps Unknown/IDLE).
+                                if (writeLocked) {
+                                    try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
+                                    writeLocked = false
+                                }
+                                synchronized(policySettleLock) {
+                                    applyStageRejectedUnderLock(pcClearFast!!, key)
+                                    preClaimTx = null
+                                }
+                                return@withLock
+                            }
+                            // CAS_LOSS/EPOCH_STALE: a live winner consumed the claim — loser
+                            // handling (SAVING→RECONCILING + launchLoserSync /
+                            // clearObsoleteLocalTx) already ran inside tryClaimStagedVerdict;
+                            // do not add handling here (no fabricated fence clears).
                             preClaimTx = null
                             if (writeLocked) {
                                 try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
                                 writeLocked = false
                             }
-                            // Phase 4：成功側 claimForPublish 的 revBefore 為 clearRevBefore
-                            // （clear IO 開始前的權威修訂；與 FAILED arm 同一取樣值）——clear IO
-                            // 期間有外來 B 落盤會 bump committedRevision → REV_GATE_REJECTED
-                            // （不消費 claim、無 loser-follow）；reject 亦可能是 CAS_LOSS/
-                            // EPOCH_STALE（有 live winner，loser handling 已在
-                            // tryClaimStagedVerdict 內完成）。兩者皆不可在此 publish。
-                            // On REV_GATE_REJECTED the claim consumes nothing;
-                            // local + coordinator fences are retained (activePolicyTx /
-                            // coord.activeTx untouched), the shared fail-closed finally
-                            // removes this op's keys (inFlightWrites/policyWriteSaving)
-                            // and stamps Unknown/IDLE (UNKNOWN_REFRESH), and the retained
-                            // fence converges via refresh late-join or the next refresh.
-                            // On CAS_LOSS/EPOCH_STALE, loser-follow inside the claim already
-                            // converged (fence cleared or RECONCILING + loser-follow); do not
-                            // add handling here. No publish happens.
                             return@withLock
                         }
                         val finalDraft = if (ackRead is LoadResult.Known && ackRead.packages.isNotEmpty()) {
@@ -11781,7 +11803,7 @@ class DualViewModel(
                                             writeLocked = false
                                         }
                                         synchronized(policySettleLock) {
-                                            applyStageRejectedUnderLock(pcFast, key)
+                                            applyStageRejectedUnderLock(pcFast!!, key)
                                             preClaimTx = null
                                         }
                                         return@withLock

@@ -25,6 +25,8 @@ jobs:
   locale-instrumentation:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Supply-chain gate: verify the committed wrapper shim matches the
@@ -84,6 +86,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       # Check out the repository.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -126,7 +130,7 @@ jobs:
           files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
           if not files:
               print("no workflow yaml files found")
-              sys.exit(0)
+              sys.exit(1)
           ok = True
           for f in files:
               try:

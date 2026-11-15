@@ -19,6 +19,12 @@ APP_VER=""
 if [ -f "app/build.gradle.kts" ]; then
   APP_VER="$(sed -n 's/.*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1 | tr -d ' \r' || true)"
 fi
+if [ -z "$APP_VER" ]; then
+  # The module.prop version sync check below is the only guard against shipping
+  # an app bundle whose versionName disagrees with the xposed module.prop.
+  # Fail closed when it cannot be run — never silently degrade.
+  fail "unable to parse versionName from app/build.gradle.kts (wrong CWD, or the file is missing/malformed)"
+fi
 
 AAPT2=""
 if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/build-tools" ]; then

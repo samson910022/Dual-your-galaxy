@@ -202,15 +202,20 @@ class EffectivePolicyCache(
         synchronized(lock) {
             // TTL expiry: fail closed to the seed on the next read (invalidated
             // true), so a stale cached value is never resurrected after expiry.
-            if (valid && now0 - lastRefreshMs >= maxCacheAgeMs) {
+            // A backwards clock (now0 < lastRefreshMs, e.g. a device time jump
+            // between refreshes) makes the subtraction negative forever and
+            // would otherwise never expire — treat skew as expired.
+            if (valid && (now0 - lastRefreshMs >= maxCacheAgeMs || now0 - lastRefreshMs < 0L)) {
                 valid = false
                 invalidated = true
             }
             if (valid) return cached
             // During the cooldown, do not retry the reader; return the cache/seed.
-            // Phase 5: comment language unified to English (was Chinese).
+            // A negative delta means the clock moved backwards since the last
+            // failure record; treat as expired cooldown (fail open to retrying,
+            // never toward serving a stale cache).
             val lf = lastFailureMs
-            if (lf != null && now0 - lf < failureCooldownMs) {
+            if (lf != null && now0 - lf < failureCooldownMs && now0 - lf >= 0L) {
                 // After an explicit invalidation, never resurrect a stale
                 // pre-invalidation cached value: fall back to the seed alone.
                 if (hadGoodValue && !invalidated) return cached

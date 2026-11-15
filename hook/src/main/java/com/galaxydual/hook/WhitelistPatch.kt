@@ -518,7 +518,7 @@ object WhitelistPatch {
                             ) {
                                 return Outcome.Skipped(
                                     "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)}); " +
-                                        "appended-ours entries rolled back, originals preserved, foreign entries retained",
+                                        "appended-ours tail entries rolled back, originals preserved, foreign entries retained",
                                 )
                             }
                             // drop did not restore originals (hostile no-op subList or throw): fall through to restore
@@ -657,7 +657,7 @@ object WhitelistPatch {
                         if (oursRolledBack) {
                             return Outcome.Skipped(
                                 "skip patch $fieldName on $owner: addAll returned but the resulting list " +
-                                    "failed verification (hostile/ROM bug); appended-ours entries rolled back, " +
+                                    "failed verification (hostile/ROM bug); appended-ours tail entries rolled back, " +
                                     "originals preserved, foreign entries retained",
                             )
                         }

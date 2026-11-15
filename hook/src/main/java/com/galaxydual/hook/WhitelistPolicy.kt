@@ -246,7 +246,14 @@ object WhitelistPolicy {
                     )
                     return result
                 }
-                val merged = result + extra.filter { !result.contains(it) }
+                // Never invoke a hostile ROM's member operator `+`: a subclass
+                // declaring `operator fun plus(Iterable<String>)` would be
+                // dispatched ahead of the stdlib extension and can return an
+                // unverified container. Build the merged view explicitly.
+                val merged = ArrayList<String>(result.size + extra.size).apply {
+                    result.forEach { add(it as String) }
+                    extra.filter { it !in result && !contains(it) }.forEach { add(it) }
+                }
                 return compatibleOrOriginal(merged, declaredReturnType, result, methodDesc, onLog)
             } catch (_: Throwable) {
                 // Hostile list/extra view (any/filter/contains/+ throws):

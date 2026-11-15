@@ -658,7 +658,11 @@ class DualHook : XposedModule() {
             // clock reports such an origin, so while clockOk the value is a
             // positive absolute deadline in practice. The −1L sentinel is
             // reserved for the clockOk=false / exception cases above.
-            (DeadlineBudget.nowNanos() / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+            // A broken clock reports NO_START_NANOS; do not fabricate a
+            // small positive "deadline" from that sentinel.
+            val n = DeadlineBudget.nowNanos()
+            if (n == DeadlineBudget.NO_START_NANOS) -1L
+            else (n / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
         } catch (_: Throwable) {
             -1L
         }

@@ -189,7 +189,11 @@ class RemoveConfirmTest {
         }
         // CI #306: drain outstanding viewModelScope children before Main is
         // reset, pumping any test-local schedulers registered by tests.
-        TestDrainSupport.drainBeforeResetMain(vms, pump = { extraSchedulers.forEach { it.advanceUntilIdle() } })
+        TestDrainSupport.drainBeforeResetMain(
+            vms,
+            pump = { extraSchedulers.forEach { it.advanceUntilIdle() } },
+            failOnIncomplete = true,
+        )
         extraSchedulers.clear()
         vms.clear()
         Dispatchers.resetMain()

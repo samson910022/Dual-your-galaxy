@@ -215,6 +215,18 @@ class PolicyRefreshGateNestedTest {
             // ship green. No fixed sleeps; a starvation event longer than the
             // 2ms floor can still fail this test on a pathologically loaded
             // runner.
+            // Uncontended fast path: a single call on an idle gate at startup
+            // must drop NOTHING — this pins the handoff in its clean state;
+            // a serial-reuse regression would fail right here.
+            run {
+                val r = try {
+                    gate.readBoundedOrThrow(reader = { setOf("com.example.app") }, timeoutMs = 2_000)
+                } catch (_: PolicyRefreshContentionException) {
+                    fail("cold serial-reuse call must not contend")
+                }
+                assertEquals(setOf("com.example.app"), r)
+                assertEquals(0L, gate.droppedRefreshCount.get())
+            }
             var contentionRetries = 0
             repeat(300) { i ->
                 var r: Set<String>? = null
