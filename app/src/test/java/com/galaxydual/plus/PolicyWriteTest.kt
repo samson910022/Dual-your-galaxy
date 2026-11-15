@@ -10194,6 +10194,291 @@ class PolicyWriteTest {
         }
     }
 
+    // PR #60 round 2 (Phase 4, T-P1-9): p19/p20 SUCCESS fast-path REV_GATE_REJECTED —
+    // confirm op. A foreign committedRevision bump lands INSIDE the blocking save,
+    // strictly BEFORE the confirm's success-terminal claim
+    // (claimForPublishCheckedVerdict(pcFast, pendingAtCall.baseCoordinatorRevision));
+    // the claim must settle the Tx as stage-rejected: keys removed, coordinator claim
+    // completed (claim never consumed — the rejection fires before the CAS), local fence
+    // CAS(tx,null) decided by the helper, Unknown + UNKNOWN_REFRESH stamped, phase IDLE,
+    // pending dropped, corrupt NOT set (not a repair). The refusal must not wedge the
+    // write path: after a refresh clears the stale gate, a follow-up confirm's claim
+    // succeeds and reaches its full success terminal (asserted below).
+    @Test
+    fun p20_confirm_revGateRejected_foreignBumpMidSave_settlesStageRejected() {
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val saveStarted = java.util.concurrent.CountDownLatch(1)
+            val saveCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val store = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { raw ->
+                    val n = saveCount.incrementAndGet()
+                    if (n == 1) {
+                        saveStarted.countDown()
+                        // Blocking save (f2-style): park until the test releases; the
+                        // foreign bump lands INSIDE the save — strictly before the
+                        // confirm's success-terminal claim (the rev gate must reject it).
+                        while (!saveRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        // Bump gated to the first save: the follow-up claim re-reads
+                        // base == current and CLAIMs — pins the full success terminal,
+                        // not merely store reachability.
+                        coord.bumpRevisionForTests()
+                    }
+                    if (raw != null) backend.set(raw)
+                    true
+                },
+            )
+            // policyIoTimeoutMs=30_000: wide bound for the parked save; release is prompt
+            val vm = makeVm(store, userId = 0, initialDraft = setOf("com.seed"), policyIoTimeoutMs = 30_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val pendingB = PendingPolicyWrite(
+                setOf("com.B"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vm, pendingB)
+            vm.confirmPolicyWrite(pendingB, pendingB.generation)
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            saveRelease.set(true) // release promptly — well within the IO timeout
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            assertFalse(vm.state.value.loading)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertFalse(vm.state.value.policyDraftCorrupt)
+            assertTrue(revisionStaleOf(vm))
+            assertTrue("policy-write keys must be cleared: " + savingKeysOf(vm), savingKeysOf(vm).isEmpty())
+            assertTrue("policy-write keys must be cleared: " + inFlightKeysOf(vm), inFlightKeysOf(vm).none { it.startsWith("policy-") })
+            assertTrue("policy-write keys must be cleared: " + reconcilingKeysOf(vm), reconcilingKeysOf(vm).isEmpty())
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            // Behavioral unlock pin: the refusal did not wedge the write path.
+            // refreshPolicyDraft() clears the stale gate via a fresh Known read; the
+            // follow-up confirm's claim re-reads base == current and CLAIMs, and the
+            // test asserts the resulting full success terminal (Known + IDLE + msg),
+            // not merely that the store was reached.
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown && !revisionStaleOf(vm) }
+            val pending2 = PendingPolicyWrite(
+                setOf("com.example.a"),
+                System.currentTimeMillis(),
+                baseCoordinatorRevision = coord.currentRevision(),
+            )
+            setPendingPolicyWrite(vm, pending2)
+            vm.confirmPolicyWrite(pending2, pending2.generation)
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(2, saveCount.get())
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertTrue(vm.state.value.policyDraftKnown)
+            // Save #2 actually landed: backend was setOf("com.B") by save #1 and is now com.example.a.
+            assertEquals(setOf("com.example.a"), backend.get())
+            // Claim passed (base re-sampled at this call), full success terminal published.
+            assertEquals(PolicyText(PolicyTextKind.WRITE_SUCCESS, 1).defaultText(), vm.state.value.msg)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(savingKeysOf(vm).isEmpty())
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+        } finally {
+            saveRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 round 2 (Phase 4, T-P1-9): same rev-gate rejection — clear op. The foreign
+    // bump lands INSIDE the blocking delete (saveRaw(null)), strictly BEFORE the clear's
+    // success-terminal rev-gated claim (claimForPublishCheckedVerdict(pcClearFast,
+    // clearRevBefore)); settle as stage-rejected: Unknown/IDLE, keys cleared, no fences.
+    // The fake backend is never mutated by raw==null saves, so
+    // assertEquals(setOf("com.seed"), backend.get()) holds even after the clear returns true.
+    // NOTE: the post-delete verification read then observes stale non-empty content
+    // (backend unchanged), so the second clear's success terminal is REFRESHED (INFO),
+    // not CLEAR_SUCCESS — the VM honestly reports it did not see an empty store.
+    // Behavioral unlock pin: after a fresh Known read clears the stale gate, the
+    // follow-up clear's claim passes and the full terminal is asserted.
+    @Test
+    fun p20_clear_revGateRejected_foreignBumpMidClear_settlesStageRejected() {
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(setOf("com.seed"))
+            val saveStarted = java.util.concurrent.CountDownLatch(1)
+            val saveCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val store = HookPolicyStore(
+                loadRaw = { backend.get() },
+                saveRaw = { raw ->
+                    val n = saveCount.incrementAndGet()
+                    if (n == 1) {
+                        saveStarted.countDown()
+                        // Blocking save (f2-style): park until the test releases; the foreign
+                        // bump lands INSIDE the delete — strictly before the clear's
+                        // success-terminal claim (the rev gate must reject it).
+                        while (!saveRelease.get()) {
+                            try {
+                                Thread.sleep(10)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        // Bump gated to the first save: the follow-up claim re-reads
+                        // base == current and CLAIMs — pins the full success terminal,
+                        // not merely store reachability.
+                        coord.bumpRevisionForTests()
+                    }
+                    if (raw != null) backend.set(raw)
+                    // raw == null (clear): backend untouched — delete never persists here
+                    true
+                },
+            )
+            val vm = makeVm(store, userId = 0, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            vm.clearPolicyDraft()
+            assertTrue(saveStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            assertFalse(vm.state.value.loading)
+            assertFalse(vm.state.value.policyDraftKnown)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertFalse(vm.state.value.policyDraftCorrupt)
+            assertTrue(revisionStaleOf(vm))
+            assertTrue(savingKeysOf(vm).isEmpty())
+            assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            // The blocked clear never landed a delete: backend keeps the seed value.
+            assertEquals(setOf("com.seed"), backend.get())
+            // Behavioral unlock pin: the refusal did not wedge the write path.
+            // refreshPolicyDraft() clears the stale gate via a fresh Known read; the
+            // follow-up clear's claim re-samples clearRevBefore == current and CLAIMs,
+            // and the test asserts the resulting terminal (Known + IDLE + msg) below.
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyDraftKnown && !revisionStaleOf(vm) }
+            vm.clearPolicyDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(2, saveCount.get())
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertTrue(vm.state.value.policyDraftKnown)
+            // The fake backend is never mutated by raw==null saves.
+            assertEquals(setOf("com.seed"), backend.get())
+            // The claim passed and the terminal is published; the post-delete
+            // verification read observed the (never mutated) seed and the VM honestly
+            // reports REFRESHED rather than CLEAR_SUCCESS.
+            assertEquals(PolicyText(PolicyTextKind.REFRESHED).defaultText(), vm.state.value.msg)
+        } finally {
+            saveRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
+    // PR #60 round 2 (Phase 4, T-P1-9): same rev-gate rejection — repair op. The foreign
+    // bump lands INSIDE the blocking delete (saveRaw(null)), strictly BEFORE the repair's
+    // ok==true rev-gated claim (completeWithRevisionCheckedVerdict(pcFast, ph,
+    // repairRevBefore)); settle as stage-rejected and RETAIN the corrupt bit (tx.isRepair —
+    // never washed, fail-closed). Discriminator: the store must look Healed(empty) AFTER
+    // the delete (post-read Known(empty) ⇒ RepairResult.Repaired ⇒ ok==true) while the
+    // pre/final repair reads still see Corrupt — the CCE flag flips inside the blocking
+    // save, after the bump, so the VM's pre/final reads can never see the healed backend.
+    // Behavioral unlock pin: a follow-up two-tap repair reaches saveRaw again
+    // (repairSaveCount 1→2). It cannot run with the stale gate stamped by the settle nor
+    // with a healed backend (the authoritative pre-read would Known-abort), so the test
+    // re-poisons the backend (CCE again) and clears the stale flag — the settle happened
+    // before the arm, so the second repair samples a fresh baseline (no rejection) and
+    // reaches the claim arm with CLAIMED.
+    @Test
+    fun p20_repair_revGateRejected_foreignBumpMidRepair_settlesStageRejected() {
+        val saveRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val coord = PolicyTxCoordinator()
+        try {
+            val backend = java.util.concurrent.atomic.AtomicReference<Set<String>?>(emptySet())
+            val repairStarted = java.util.concurrent.CountDownLatch(1)
+            val repairSaveCount = java.util.concurrent.atomic.AtomicInteger(0)
+            var corrupt = true
+            val store = HookPolicyStore(
+                loadRaw = {
+                    if (corrupt) throw ClassCastException("corrupt")
+                    backend.get()
+                },
+                saveRaw = { raw ->
+                    if (raw == null) {
+                        val n = repairSaveCount.incrementAndGet()
+                        if (n == 1) {
+                            repairStarted.countDown()
+                            // Blocking delete (f2-style): park until the test releases;
+                            // the foreign bump lands INSIDE the delete. The backend is
+                            // healed here so the repair's post-read sees Known(empty) ⇒
+                            // RepairResult.Repaired ⇒ ok==true ⇒ the ok==true rev-gated
+                            // claim arm runs (and must be REV_GATE_REJECTED).
+                            while (!saveRelease.get()) {
+                                try {
+                                    Thread.sleep(10)
+                                } catch (_: InterruptedException) {
+                                }
+                            }
+                            coord.bumpRevisionForTests()
+                        }
+                        corrupt = false
+                        backend.set(emptySet())
+                    }
+                    true
+                },
+            )
+            // policyIoTimeoutMs=30_000: wide bound for the parked save; release is prompt
+            val vm = makeVm(store, userId = 0, initialDraft = null, policyIoTimeoutMs = 30_000, policyTxCoordinator = coord)
+            await { !vm.state.value.loading }
+            await(timeoutMs = 5_000L) { vm.state.value.policyDraftCorrupt }
+            // Repair is a two-tap flow: the first tap arms (CORRUPT_REPAIR_FIRST), the
+            // second executes.
+            vm.requestRepairCorruptDraft()
+            vm.confirmRepairCorruptDraft()
+            assertTrue(repairStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            saveRelease.set(true)
+            await(timeoutMs = 10_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE
+            }
+            assertFalse(vm.state.value.loading)
+            assertFalse(vm.state.value.policyDraftKnown)
+            // The stage-rejected repair arm retains the corrupt evidence.
+            assertTrue(vm.state.value.policyDraftCorrupt)
+            assertTrue("stage-rejected repair must stamp stale=true", revisionStaleOf(vm))
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertTrue(savingKeysOf(vm).isEmpty())
+            assertTrue(inFlightKeysOf(vm).none { it.startsWith("policy-") })
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            // Behavioral unlock pin: the settle stamped policyRevisionStale=true (the
+            // fail-closed gate every op funnels through) — clear it (earlyStaleAbort
+            // precedent) and re-poison the backend (CCE throwing again). A two-tap
+            // repair must then reach saveRaw again (repairSaveCount 1→2) instead of
+            // wedging the repair path.
+            setRevisionStaleForRepairTest(vm, false)
+            corrupt = true
+            vm.requestRepairCorruptDraft()
+            vm.confirmRepairCorruptDraft()
+            await(timeoutMs = 10_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+            assertEquals(2, repairSaveCount.get())
+        } finally {
+            saveRelease.set(true)
+            try { coord.close() } catch (_: Exception) { }
+        }
+    }
+
     // PR #60 (Phase 2 / R1(b)): dropStagedPlaceholderIfMatch — 僅 exact identity 的
     // placeholder 可丟；外來 identity／已 stage 的 real payload 一律不動。
     @Test
