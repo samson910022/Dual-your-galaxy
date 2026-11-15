@@ -28,6 +28,29 @@ class PolicyRefreshGateBusyWorkerTest {
     // T-F10: AlwaysRejectingExecutor comes from TestExecutors.kt (shared
     // with PolicyRefreshGatePhase3Test).
 
+    // H5 (trip edge, busy-worker arm): with MAX=1 the very first busy-worker
+    // rejection trips the breaker. The busy-worker arm pre-increments the
+    // drop count and calls onTimeout with accountDrop = false, so the
+    // trip-edge arm of onTimeout must NOT increment droppedRefreshCount
+    // again — pin exactly-one drop at the edge (deleting the trip-arm
+    // `if (accountDrop)` guard turns this red with dropsBefore + 2).
+    @Test
+    fun busyWorkerTripEdgeExactlyOneDrop() {
+        val executor = AlwaysRejectingExecutor()
+        try {
+            val gate = PolicyRefreshGate(executor = executor, maxConsecutiveTimeouts = 1)
+            val dropsBefore = gate.droppedRefreshCount.get()
+            assertThrows(PolicyRefreshBusyWorkerException::class.java) {
+                gate.readBoundedOrThrow({ setOf("x") }, timeoutMs = 50)
+            }
+            assertEquals(1L, gate.consecutiveTimeouts.get())
+            assertTrue("breaker must open on the first busy-worker rejection at MAX=1", gate.isStuck())
+            assertEquals(dropsBefore + 1, gate.droppedRefreshCount.get())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
     // T-F11: the H2 fail-fast is now a real-time TIME FLOOR (>=2ms of
     // continuous rejections since the first rejection in the call, effective
     // floor capped at timeoutMs), so busy calls are bounded by the budget

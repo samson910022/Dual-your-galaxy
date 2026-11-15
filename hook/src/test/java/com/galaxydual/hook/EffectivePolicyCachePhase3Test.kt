@@ -336,9 +336,24 @@ class EffectivePolicyCachePhase3Test {
     }
 
     @Test
-    fun nowMsThrowingFailsClosedToCachedOrSeed() {
+    fun nowMsThrowingFailsClosedToSeed() {
         val cache = EffectivePolicyCache(nowMs = { throw IllegalStateException("clock") })
         // No cached value + broken clock -> seed-only, no throw.
         assertEquals(setOf("s"), cache.get(setOf("s"), true) { setOf("r") })
+    }
+
+    // H2 pin: with a primed good cache, a broken clock must fail closed to the
+    // SEED, never resurrect the cached (unbounded-stale) snapshot — the
+    // timeout/grace arms rely on the clock, so with no clock TTL cannot be
+    // enforced.
+    @Test
+    fun nowMsThrowingAfterGoodValueFailsClosedToSeed() {
+        var broken = false
+        val cache = EffectivePolicyCache(nowMs = { if (broken) throw IllegalStateException("clock") else 1_000L })
+        // Prime a good cached value.
+        assertEquals(setOf("r"), cache.get(emptySet(), nonEmptyPolicyGateOpen = true) { setOf("r") })
+        broken = true
+        // Broken clock: TTL unenforceable -> seed alone, not the stale cached value.
+        assertEquals(setOf("s"), cache.get(setOf("s"), nonEmptyPolicyGateOpen = true) { setOf("r2") })
     }
 }

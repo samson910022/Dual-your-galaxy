@@ -317,13 +317,16 @@ class PolicyRefreshGate(
          * of such stuck daemons this gate can leave resident.
          *
          * At rebuild time an `activeCount <= 0` probe consumes NOTHING from
-         * this budget — when budget remains the gate reports "drained" and
-         * consumes nothing (the worker provably drained; the executor is
-         * reclaimable). Only a REAL abandon (activeCount > 0 and a fresh
-         * executor is created) consumes one unit.
+         * this budget — the gate reports "drained" and consumes nothing (the
+         * worker provably drained; the executor is reclaimable). Only a REAL
+         * abandon (activeCount > 0 and a fresh executor is created) consumes
+         * one unit.
          *
-         * Beyond the cap a forced rebuild is REFUSED (checked before the
-         * activeCount() probe): the caller fail-closes (drop + bounded log +
+         * Beyond the cap a forced rebuild is REFUSED (a still-busy worker is
+         * checked against the cap; the drained probe runs BEFORE either the
+         * epoch budget or this cap, so a worker that drained while rebuildLock
+         * was contended is reported drained, never refused): the caller
+         * fail-closes (drop + bounded log +
          * half-open backoff renewal) and no new worker thread is created.
          * While the abandoned worker remains BUSY there is no forced
          * replacement and the gate stays fail-closed until a process restart.
@@ -509,19 +512,28 @@ class PolicyRefreshGate(
             // Re-check under rebuild lock: a peer may have rebuilt or the
             // worker may have drained while we acquired the guard.
             try {
-                if (workerRebuilds.get() >= MAX_WORKER_REBUILDS) return false
                 val cur = executor as? ThreadPoolExecutor ?: return false
+                // Drained probe FIRST (before the workerRebuilds budget and
+                // the process-cap/abandonedWorkerRebuilds gates): a worker
+                // that drained while we waited on rebuildLock is reclaimable
+                // and must short-circuit to "true" — never consume or be
+                // refused by budget that a real abandon would need. (H6: this
+                // ordering was previously after the budget gates, making the
+                // drained check unreachable in the rebuildLock interleave it
+                // exists for.)
+                if (cur.activeCount <= 0) return true
+                if (workerRebuilds.get() >= MAX_WORKER_REBUILDS) return false
                 // PR#60 r6 (Finding #3): hard process-lifetime residency
-                // bound, checked BEFORE the activeCount() probe so a refusal
-                // is never misread as a drained worker. This consumes no
+                // bound for the still-busy worker (the drained probe above
+                // has already short-circuited by now, so a refusal here is
+                // never misread as a drained worker). This consumes no
                 // budget by itself (only the real-abandon path below
-                // increments abandonedWorkerRebuilds). When budget remains,
-                // a drained worker (activeCount <= 0) still returns "true"
-                // below and consumes nothing; when the cap is exhausted the
-                // refusal fires here, fail-closed, even if the worker just
-                // drained (only the still-busy case is restart-bound; a
-                // completed read recovers via the half-open probe without
-                // consuming this budget).
+                // increments abandonedWorkerRebuilds). A drained worker
+                // (activeCount <= 0) is handled by the probe above and
+                // consumes nothing; when the cap is exhausted the refusal
+                // fires here, fail-closed, for a still-busy worker (only the
+                // still-busy case is restart-bound; a completed read recovers
+                // via the half-open probe without consuming this budget).
                 if (abandonedWorkerRebuilds.get() >= MAX_PROCESS_ABANDONED_WORKER_REBUILDS) {
                     val denial = processCapDenials.incrementAndGet()
                     if (denial <= 4L) {
@@ -536,7 +548,6 @@ class PolicyRefreshGate(
                     }
                     return false
                 }
-                if (cur.activeCount <= 0) return true
                 try {
                     cur.shutdownNow()
                 } catch (_: Throwable) {
@@ -1122,12 +1133,19 @@ class PolicyRefreshGate(
         // Note: when trip && already stuckOpen (a probe timeout racing the
         // normal path, or consecutive timeouts beyond the trip), the probe
         // path owns lastStuckOpenMs/backoff via onProbeFail; the normal path
-        // must not clobber the half-open schedule, so it only counts drops
-        // when NOT tripping.
+        // must not clobber the half-open schedule. Drop accounting still
+        // applies on the trip edge (H5): a plain timeout that trips counts
+        // its drop here, guarded by accountDrop so the busy-worker path
+        // (which pre-increments and passes accountDrop = false) keeps its
+        // exactly-one-drop contract.
         if (trip) {
             // Count the tripping timeout itself as a short-circuit too so
             // stuckShortCircuits is non-zero whenever the breaker is open.
             stuckShortCircuits.incrementAndGet()
+            // H5: the trip edge is a lost refresh like any other — count it
+            // (the plain timeout arm otherwise leaks a drop; the busy-worker
+            // arm pre-increments and is suppressed via accountDrop).
+            if (accountDrop) droppedRefreshCount.incrementAndGet()
         }
     }
 
