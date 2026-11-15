@@ -247,8 +247,11 @@ class PolicyTxCoordinator {
         }
         return try {
             val k = tombstoneKey(txId, key)
-            if (claimTombstones.containsKey(k)) {
-                claimTombstones[k] = rev
+            // Single atomic lookup: if the identity is already tombstoned,
+            // refresh its rev in place (same as the old containsKey+put, one
+            // map traversal instead of two). putIfAbsent alone could not
+            // refresh the rev, so computeIfPresent carries the refresh.
+            if (claimTombstones.computeIfPresent(k) { _, _ -> rev } != null) {
                 true
             } else if (claimTombstones.size >= CLAIM_TOMBSTONE_MAX) {
                 val oldest = try {
@@ -922,6 +925,14 @@ class PolicyTxCoordinator {
                         else payload
                     } catch (_: Exception) {
                         payload
+                    }
+                    // Tagging invariant: a terminal staged into _latest/pendingPublish
+                    // must carry the claim's rev. The catch arm above passes the raw
+                    // payload through; without this check an unstamped terminal could
+                    // flow untagged (fail-closed via the outer catch — never publishes
+                    // untagged).
+                    require(stamped.rev == rev) {
+                        "stageRealPayload: staged payload rev ${stamped.rev} != claim rev $rev (txId=${payload.txId})"
                     }
                     val canSetLatest = try {
                         tryUpdateLatestMonotonic(stamped)

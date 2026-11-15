@@ -348,8 +348,10 @@ class WhitelistPatchReflectTest {
     }
 
     // The non-public static FINAL counterpart is never force-written:
-    // ObserveOnly when readable, Skipped when even the read is denied --
-    // either way the value is untouched and no Replaced/PatchedInPlace.
+    // ObserveOnly either way — with the read-refused vocabulary when the
+    // private read is denied (plain get without setAccessible throws), or the
+    // isFinal-arm vocabulary when the read succeeds. Either way the value is
+    // untouched and no Replaced/PatchedInPlace.
     @Test
     fun nonPublicStaticFinalArrayIsNeverForceWritten() {
         val field = NonPublicStaticHolder::class.java.getDeclaredField("FINAL_ARR")
@@ -362,6 +364,18 @@ class WhitelistPatchReflectTest {
         val single = out.getValue("FINAL_ARR")
         assertFalse(single is WhitelistPatch.Outcome.Replaced)
         assertFalse(single is WhitelistPatch.Outcome.PatchedInPlace)
+        // H7 pin: a private static final field whose plain read is refused
+        // must record ObserveOnly with the read-access-refused reason, not
+        // Skipped("read failed ...").
+        assertTrue("private final read-refused field should be ObserveOnly, was: $single",
+            single is WhitelistPatch.Outcome.ObserveOnly)
+        val reason = (single as WhitelistPatch.Outcome.ObserveOnly).reason
+        assertTrue("reason should mention static final field, was: $reason",
+            reason.contains("static final field"))
+        assertTrue("reason should carry the read-access-refused fragment, was: $reason",
+            reason.contains("read access refused"))
+        assertTrue("reason should carry the observe-only marker, was: $reason",
+            reason.contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
         assertEquals(listOf("a"), NonPublicStaticHolder.peekFinalArr().toList())
     }
 

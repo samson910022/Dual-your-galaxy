@@ -31,6 +31,20 @@ class HookLogTest {
     }
 
     @Test
+    fun normalizeLogPartStripsBidiAndFormatChars() {
+        // Hostile scope string shaped like HookMarker's unknown-scope want=
+        // line: bidi embeddings/overrides (U+202A-U+202E), isolates
+        // (U+2066-U+2069), word-joiner range (U+2060), BOM/ZWNBSP (U+FEFF) and
+        // a private-use-area code point (U+E000). All are \p{Cf}/\p{Co} and
+        // must be replaced by single spaces before any .take() truncation.
+        val hostile = "sys\u202Aserver\u202E \u2066daagent\u2069 \u2060ok\uFEFF \uE000end"
+        val result = HookLog.normalizeLogPart(hostile)
+        assertEquals("sys server   daagent   ok   end", result)
+        assertFalse(result.any { it == '\u202A' || it == '\u202E' || it == '\u2066' || it == '\u2069' || it == '\u2060' || it == '\uFEFF' || it == '\uE000' })
+        assertFalse(Regex("[\\p{Cf}\\p{Co}]").containsMatchIn(result))
+    }
+
+    @Test
     fun shortExAndMsgAreTruncatedAndNeverThrow() {
         val t = RuntimeException("x".repeat(500))
         assertEquals("RuntimeException", HookLog.shortEx(t))

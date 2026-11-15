@@ -18,7 +18,6 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Assume
 import org.junit.Before
 import org.junit.Test
 
@@ -28,7 +27,10 @@ import org.junit.Test
 // currentRevision with call counting + mid-IO bump): a concurrent B commit
 // landing between revBefore and revMoved must discard the Known (stay
 // Unknown, fail closed) and must NOT advance authoritativeObservedRev.
-// The explicit-rev seam markObservedKnownAt(rev) is covered by the hammer.
+// (The former N=1000 stressHammer_markObservedKnownAt_1000 test was removed:
+// it drove a single AtomicReference.set with a constant revision, so it
+// could never exercise the read-then-act interleaving it claimed to stress —
+// the deterministic mid-IO barrier below is the honest pin for that race.)
 //
 // Refresh is the representative pinned path; init and repair share the same
 // sampledCurrentRevision()/markObservedKnownAt() helpers.
@@ -174,44 +176,6 @@ class PolicyToctouBarrierTest {
             // Latch discipline: the 2nd read observed the bump (revMoved true);
             // the 3rd read gate stayed closed (no release needed, no hang).
             assertTrue(coord.currentRevision() != observedBefore || observedBefore == -1L)
-        } finally {
-            try {
-                coord.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    // Phase7 stress hammer (N=1000, LargeTest, opt-in only): hammers the
-    // explicit-rev seam 1000 times to catch read-then-act races/flakes.
-    // Skipped by default (no RUN_LARGE_TESTS=1) so CI stays green.
-    @LargeTest
-    @Test
-    fun stressHammer_markObservedKnownAt_1000() {
-        Assume.assumeTrue(System.getenv("RUN_LARGE_TESTS") == "1")
-        val coord = PolicyTxCoordinator()
-        try {
-            val store = HookPolicyStore(
-                loadRaw = { setOf("com.seed") },
-                saveRaw = { true },
-            )
-            val vm = makeVm(store, coord)
-            repeat(1000) {
-                // Both arms drive the same explicit-rev seam; the 1000x
-                // hammer proves the mark path never crashes and never
-                // regresses the observed snapshot (constant revision here —
-                // no commits land mid-hammer). markObservedKnownAt never
-                // consults the sampler, so no sampler assignment is needed.
-                vm.markObservedKnownAt(coord.currentRevision())
-            }
-            // Both marks set observed to the coordinator's current revision:
-            // after the hammer, observed must equal it exactly (not merely
-            // be >= a base).
-            assertEquals(
-                "observed must equal the coordinator's current revision after the hammer",
-                coord.currentRevision(),
-                vm.observedRevForTests(),
-            )
         } finally {
             try {
                 coord.close()
