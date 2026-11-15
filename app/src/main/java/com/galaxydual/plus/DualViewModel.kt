@@ -189,8 +189,7 @@ private val removeGeneration = java.util.concurrent.atomic.AtomicLong()
 //
 // 由 requestPolicyWrite() 建立 (當下已勾選映射出的包名集合)，confirmPolicyWrite()
 // 執行寫入 HookPolicyStore，cancelPolicyWrite() 丟棄 (取消≠寫入≠安裝)。
-// 世代單調唯一 (policyWriteGeneration)，跨請求覆寫即舊世代失效 (與
-// PendingRemove 同式)。
+// 世代單調唯一 (policyWriteGeneration)；既有 pending 存在時新請求被 BUSY 拒絕（不再有覆寫路徑），與 PendingRemove 同式。
 private val policyWriteGeneration = java.util.concurrent.atomic.AtomicLong()
 
 // Stage2 (hook-policy-source P2 #5):政策草稿版本號，避免晚到的 init/refresh

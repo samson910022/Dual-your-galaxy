@@ -451,6 +451,317 @@ class WhitelistPatchTest {
         assertTrue(!o.reason.contains("restore incomplete"))
     }
 
+    // Wrong-target subList view, front-aligned (ii) arm: the patch's ours-drop
+    // instructs subList(size0, size0 + add.size) = [1,3) — ours at the snapshot
+    // boundary. The hostile view shifts EVERY index by +2, so its clear()
+    // wipes [3,5) — the foreign tail appended after ours — leaving ours fully
+    // in place. prefixOk/sizeOk pass, but ours were never removed; the
+    // post-drop ours-detection must find a surviving ours element at an index
+    // >= size0 and route to the no-mutator marker, never to the "rolled back"
+    // success marker.
+    private class WrongTargetClearFrontList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        var cleared = 0
+        var subListCalls = 0
+        var addAllCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.addAll(elements)           // ours ...
+                backing.add("com.foreign.a")        // ... then the foreign tail (normal return)
+                backing.add("com.foreign.b")
+                return true                        // verification fails on the size leg
+            }
+            return backing.addAll(elements)        // the restore re-add must never run
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            // Wrong-target view: instructed [from, to) is served as
+            // [from + 2, to + 2) — clearing [1,3) actually wipes [3,5).
+            return super.subList(fromIndex + 2, toIndex + 2)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun wrongTargetClearFrontViewWipingForeignTailInvokesNoMutator() {
+        val backing = mutableListOf("com.samsung.seed")
+        val list = WrongTargetClearFrontList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        // addAll returned normally but appended ours + a foreign tail, so
+        // post-success verification fails and settle runs; the hostile view
+        // then clears the foreign tail instead of ours.
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // The wrong-target drop removed the foreign tail; ours at the snapshot
+        // boundary all remain; the original prefix is untouched.
+        assertEquals(listOf("com.samsung.seed", "com.example.alpha", "com.example.beta"), backing)
+        assertEquals(listOf("com.samsung.seed"), backing.subList(0, 1))
+        assertEquals(1, list.subListCalls)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertTrue(
+            "reason must not claim a rolled-back success, was: ${o.reason}",
+            !o.reason.contains("rolled back"),
+        )
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
+    // Wrong-target subList view, suffix (i) arm: the patch's ours-drop
+    // instructs subList(sizeNow - add.size, sizeNow) = [3,5) — ours at the
+    // very end (behind the foreign bytes appended ahead of them). The hostile
+    // view shifts EVERY index by −2, so its clear() wipes [1,3) — the foreign
+    // lead — leaving ours fully in place. prefixOk/sizeOk pass (prefix intact;
+    // 5−2=3) and ours are all still present at offset 1; the post-drop delta
+    // re-verify must find them there and route to the no-mutator marker,
+    // never to the "rolled back" success marker.
+    private class WrongTargetClearSuffixList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        var cleared = 0
+        var subListCalls = 0
+        var addAllCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.add("com.foreign.a")        // foreign bytes FIRST ...
+                backing.add("com.foreign.b")
+                backing.addAll(elements)            // ... then ours at the very end → suffix arm
+                return true                        // verification fails on the size leg
+            }
+            return backing.addAll(elements)        // the restore re-add must never run
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            // Wrong-target view: instructed [from, to) is served as
+            // [from − 2, to − 2) — clearing [3,5) actually wipes [1,3).
+            return super.subList(fromIndex - 2, toIndex - 2)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun wrongTargetClearSuffixViewWipingForeignLeadInvokesNoMutator() {
+        val backing = mutableListOf("com.samsung.seed")
+        val list = WrongTargetClearSuffixList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        // addAll returned normally but appended the foreign lead + ours, so
+        // post-success verification fails and settle runs; the hostile view
+        // then clears the foreign lead instead of ours.
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // The wrong-target drop removed the foreign lead; ours all remain;
+        // the original prefix is untouched.
+        assertEquals(listOf("com.samsung.seed", "com.example.alpha", "com.example.beta"), backing)
+        assertEquals(listOf("com.samsung.seed"), backing.subList(0, 1))
+        assertEquals(1, list.subListCalls)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertTrue(
+            "reason must not claim a rolled-back success, was: ${o.reason}",
+            !o.reason.contains("rolled back"),
+        )
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
+    // Wrong-target subList view, front-aligned (ii) arm, OVERLAPPING equal-
+    // count window with a SINGLE foreign entry: backing [seed, alpha, beta, F].
+    // addAll appends ours then the foreign tail; the patch's ours-drop
+    // instructs subList(size0, size0 + add.size) = [1,3) — ours at the
+    // snapshot boundary. The hostile view shifts EVERY index by +1, so its
+    // clear() wipes [2,4) — [beta, F], one ours element plus the foreign
+    // entry — instead of [1,3) ([alpha, beta]). alpha survives at the
+    // snapshot boundary. prefixOk/sizeOk pass (prefix intact; 4−2=2), and no
+    // 2-element add-prefix of [alpha, beta] occurs anywhere in [seed,
+    // alpha] — the old prefix-scan miss left k = 1 (0 < k < len) ours
+    // behind, producing a FALSE "rolled back" marker with alpha retained.
+    // The membership re-verify must catch the surviving alpha and route to
+    // the no-mutator marker, never to "rolled back".
+    private class WrongTargetOverlapFrontArmList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        var cleared = 0
+        var subListCalls = 0
+        var addAllCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.addAll(elements)           // ours ...
+                backing.add("com.foreign.a")        // ... then the foreign tail (normal return)
+                return true                        // verification fails on the size leg
+            }
+            return backing.addAll(elements)        // the restore re-add must never run
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            // Wrong-target view: instructed [from, to) is served as
+            // [from + 1, to + 1) — clearing [1,3) actually wipes [2,4)
+            // ([beta, F]); alpha (one ours element) survives.
+            return super.subList(fromIndex + 1, toIndex + 1)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun wrongTargetOverlapFrontArmSingleForeign() {
+        val backing = mutableListOf("com.samsung.seed")
+        val list = WrongTargetOverlapFrontArmList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        // addAll returned normally but appended ours + the foreign tail, so
+        // post-success verification fails and settle runs; the hostile view
+        // then clears [beta, F] instead of [alpha, beta] — alpha survives.
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // The wrong-target drop removed [beta, F]; alpha remains at the
+        // snapshot boundary; the original prefix is untouched.
+        assertEquals(listOf("com.samsung.seed", "com.example.alpha"), backing)
+        assertEquals(listOf("com.samsung.seed"), backing.subList(0, 1))
+        assertEquals(1, list.subListCalls)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertTrue(
+            "reason must not claim a rolled-back success, was: ${o.reason}",
+            !o.reason.contains("rolled back"),
+        )
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
+    // Wrong-target subList view, suffix (i) arm, OVERLAPPING equal-count
+    // window with a SINGLE foreign entry: backing [seed, F, alpha, beta].
+    // addAll appends the foreign lead F then ours at the very end; the
+    // patch's ours-drop instructs subList(sizeNow - add.size, sizeNow) =
+    // [2,4) — ours at the very end (behind F). The hostile view shifts
+    // EVERY index by −1, so its clear() wipes [1,3) — [F, alpha], the
+    // foreign lead plus one ours element — instead of [2,4) ([alpha,
+    // beta]). beta survives at the tail. prefixOk/sizeOk pass (prefix
+    // intact; 4−2=2), and no 2-element add-prefix of [alpha, beta] occurs
+    // anywhere in [seed, beta] — the old prefix-scan miss left k = 1
+    // (0 < k < len) ours behind, producing a FALSE "rolled back" marker
+    // with alpha eaten and beta retained. The membership re-verify must
+    // catch the surviving beta and route to the no-mutator marker, never
+    // to "rolled back".
+    private class WrongTargetOverlapSuffixArmList(
+        private val backing: MutableList<String>,
+    ) : AbstractMutableList<String>() {
+        var cleared = 0
+        var subListCalls = 0
+        var addAllCalls = 0
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun addAll(elements: Collection<String>): Boolean {
+            addAllCalls++
+            if (addAllCalls == 1) {
+                backing.add("com.foreign.a")        // foreign bytes FIRST ...
+                backing.addAll(elements)            // ... then ours at the very end → suffix arm
+                return true                        // verification fails on the size leg
+            }
+            return backing.addAll(elements)        // the restore re-add must never run
+        }
+        override fun subList(fromIndex: Int, toIndex: Int): MutableList<String> {
+            subListCalls++
+            // Wrong-target view: instructed [from, to) is served as
+            // [from − 1, to − 1) — clearing [2,4) actually wipes [1,3)
+            // ([F, alpha]); beta (one ours element) survives.
+            return super.subList(fromIndex - 1, toIndex - 1)
+        }
+        override fun clear() {
+            cleared++
+            backing.clear()
+        }
+    }
+
+    @Test
+    fun wrongTargetOverlapSuffixArmSingleForeign() {
+        val backing = mutableListOf("com.samsung.seed")
+        val list = WrongTargetOverlapSuffixArmList(backing)
+        val out = WhitelistPatch.apply(
+            list, true, setOf("com.example.alpha", "com.example.beta"), "F", "C",
+        )
+        // addAll returned normally but appended the foreign lead + ours, so
+        // post-success verification fails and settle runs; the hostile view
+        // then clears [F, alpha] instead of [alpha, beta] — beta survives.
+        assertTrue("apply() must not throw; was: $out", out is WhitelistPatch.Outcome.Skipped)
+        val o = out as WhitelistPatch.Outcome.Skipped
+        // The wrong-target drop removed [F, alpha]; beta remains at the
+        // tail; the original prefix is untouched.
+        assertEquals(listOf("com.samsung.seed", "com.example.beta"), backing)
+        assertEquals(listOf("com.samsung.seed"), backing.subList(0, 1))
+        assertEquals(1, list.subListCalls)
+        assertEquals(0, list.cleared)
+        assertEquals(1, list.addAllCalls)
+        assertTrue(
+            "reason must not claim a rolled-back success, was: ${o.reason}",
+            !o.reason.contains("rolled back"),
+        )
+        assertTrue(
+            "reason should report no further mutator invoked, was: ${o.reason}",
+            o.reason.contains("no further mutator invoked"),
+        )
+        assertTrue(!o.reason.contains("last-restore failed"))
+        assertTrue(!o.reason.contains("restore incomplete"))
+        assertTrue(!o.reason.contains("restore unverified"))
+    }
+
     // Detached-view subList AND a restore that keeps only the FIRST snapshot
     // element: the patch's addAll lands the extra then throws (arm (b)); the
     // ours-drop clears the detached copy, so the live list keeps the
@@ -1372,7 +1683,7 @@ class WhitelistPatchTest {
         val o = out as WhitelistPatch.Outcome.Skipped // cast asserts it is not PatchedInPlace/Replaced
         assertTrue(
             "reason should report the ours-only rollback, was: ${o.reason}",
-            o.reason.contains("tail entries") && o.reason.contains("appended-ours"),
+            o.reason.contains("appended-ours entries rolled back"),
         )
         assertTrue(
             "reason should report the retained foreign entry, was: ${o.reason}",
@@ -1497,7 +1808,7 @@ class WhitelistPatchTest {
         )
         assertTrue(
             "reason should report the ours-only rollback with foreign retained, was: ${o.reason}",
-            o.reason.contains("tail entries") && o.reason.contains("appended-ours"),
+            o.reason.contains("appended-ours entries rolled back"),
         )
         assertTrue(
             "reason should report the retained foreign entry, was: ${o.reason}",

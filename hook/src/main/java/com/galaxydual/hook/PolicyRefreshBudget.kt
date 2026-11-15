@@ -404,9 +404,15 @@ class PolicyRefreshGate(
     // Dead-pool reclaim sequence suffix (lspd forensics): fresh pools from
     // the drained-but-shutdown arm are named
     // "GalaxyDual-policy-refresh-reclaimed-$n" so they are distinguishable
-    // in thread dumps. incrementAndGet() before naming keeps the suffix
-    // deterministic (the first reclaimed pool is ...-reclaimed-1). Never
-    // reset; naming only — no budget semantics.
+    // in thread dumps. The number is consumed only on install: the name is
+    // derived from a non-incrementing read (get() + 1) and the increment
+    // runs under the same rebuildLock critical section, immediately before
+    // the swap, once the alive-check has passed — so the naming thread
+    // sees the SAME number it installed. Uniqueness is preserved because
+    // swaps serialize under rebuildLock. A factory failure or an
+    // already-shutdown fresh pool consumes nothing. (The first reclaimed
+    // pool is ...-reclaimed-1.) Never reset; naming only — no budget
+    // semantics.
     private val deadPoolReclaims = AtomicLong(0)
     private val halfOpenFailures = AtomicLong(0L)
     private val lastStuckOpenMs = AtomicLong(Long.MIN_VALUE)
@@ -584,7 +590,10 @@ class PolicyRefreshGate(
                 // no budget is consumed (retryable on a later attempt).
                 if (cur.activeCount <= 0 && cur.isShutdown) {
                     val fresh = try {
-                        executorFactory("GalaxyDual-policy-refresh-reclaimed-${deadPoolReclaims.incrementAndGet()}")
+                        // Non-incrementing read: the number is consumed only
+                        // on install (after the alive-check, right before
+                        // the swap), never on factory failure or refusal.
+                        executorFactory("GalaxyDual-policy-refresh-reclaimed-${deadPoolReclaims.get() + 1}")
                     } catch (_: Throwable) {
                         throttledLog("policy refresh executor factory failed; old pool retained; will retry on next eligible half-open probe")
                         return false
@@ -597,6 +606,12 @@ class PolicyRefreshGate(
                         throttledLog("policy refresh executor factory returned an already-shutdown pool; reclaim refused")
                         return false
                     }
+                    // Consume the number only now — the pool passed the
+                    // alive-check and is about to be swapped in, under the
+                    // same rebuildLock critical section the name was
+                    // derived in, so the installed pool's suffix is always
+                    // the number this thread just consumed.
+                    deadPoolReclaims.incrementAndGet()
                     executor = fresh
                     throttledLog(
                         "policy refresh dead (shutdown) worker pool replaced with a fresh pool" +

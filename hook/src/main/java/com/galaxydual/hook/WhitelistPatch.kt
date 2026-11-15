@@ -84,16 +84,23 @@ import java.lang.reflect.Modifier
 //     that loss but does not prevent it; escalation to a whole-list
 //     restore is refused after any drop attempt)) and re-verifying
 //     (matchesPrefixLen == size0 AND
-//     list.size == sizeNow - dropLen) before returning:
+//     list.size == sizeNow - dropLen AND no element of the dropped ours
+//     slice occurs at any index >= size0 — a correct drop removes ALL
+//     ours; an equal-count wrong-target hostile subList view that
+//     cleared foreign entries instead is caught here, including an
+//     overlapping view that cleared a mix of ours and foreign — such a
+//     view passes prefixOk/sizeOk while leaving k (0 < k < dropLen) ours
+//     behind) before returning:
 //     (i)   ours at the VERY END (sizeNow >= size0 + add.size AND the last
 //           add.size elements byte-match the delta — suffix byte-match):
 //           drop subList(sizeNow - add.size, sizeNow);
 //     (ii)  ours FRONT-ALIGNED at size0 (byte-match at the snapshot
 //           boundary, foreign extras AFTER ours at the very end tolerated
 //           and retained): drop subList(size0, size0 + add.size);
-//     (i)/(ii) on success return Skipped with "appended-ours tail entries
+//     (i)/(ii) on success return Skipped with "appended-ours entries
 //           rolled back, originals preserved, foreign entries retained".
-//           On a failed drop (hostile no-op subList, throwing clear, or a
+//           On a failed drop (hostile no-op subList, throwing clear,
+//           equal-count wrong-target subList view, or a
 //           re-verify read that fails) there is NO escalation to a
 //           whole-list restore — Skipped with an explicit "no further
 //           mutator invoked (no whole-list restore)" marker, list left as
@@ -124,8 +131,11 @@ import java.lang.reflect.Modifier
 //     probe — it never runs after an ours-drop attempt (damage that drop
 //     causes is loss mode (2) and is never restored).
 // (2) PREFIX-INTACT ours-drop fails its re-verify (adversarial drop view —
-//     wrong-end removeAt, mis-targeting subList, a detached view with a
-//     failed/no-op drop): NO whole-list restore runs — it would also
+//     wrong-end removeAt, mis-targeting subList — the ours-detection catches
+//     any surviving ours element, overlapping wrong-target views included;
+//     a detached view with a failed/no-op drop; a throwing subList.clear()
+//     lands here identically, without reaching the re-verify): NO
+//     whole-list restore runs — it would also
 //     delete foreign entries the prefix-intact paths must retain. The
 //     original loss stands; the appended ours may remain as the drop left
 //     them; the reason carries the
@@ -280,6 +290,37 @@ object WhitelistPatch {
     private fun matchesRange(list: MutableList<String>, add: List<String>, offset: Int, count: Int = add.size): Boolean =
         try { (0 until count).all { i -> list[offset + i] == add[i] } } catch (_: Throwable) { false }
 
+    // True if ANY element of add[0 until count] occurs at an index >= from
+    // in [list]. Used after an ours-drop: correct drops remove ALL ours —
+    // any occurrence means ours remain (e.g. an overlapping equal-count
+    // wrong-target hostile subList view that cleared foreign entries
+    // instead of ours; or partially hit ours). add is filtered against the
+    // snapshot (extras not present in it), so no snapshot-filtered add
+    // element can appear in the byte-intact prefix; a foreign entry
+    // byte-equal to ours would flip this
+    // to "drop failed" — the safe, already-preferred failure direction.
+    // Read failures count as PRESENT (fail-closed).
+    private fun anyOursElementAtOrAfter(
+        list: MutableList<String>,
+        add: List<String>,
+        count: Int,
+        from: Int,
+    ): Boolean {
+        try {
+            val ours = HashSet<String>(count)
+            for (i in 0 until count) ours.add(add[i])
+            val n = list.size
+            var i = from
+            while (i < n) {
+                if (list[i] in ours) return true
+                i++
+            }
+            return false
+        } catch (_: Throwable) {
+            return true
+        }
+    }
+
     // Ownership-contract settle helper — the SINGLE decision tree for both
     // failure arms (the list.addAll(add)-threw arm and the post-success
     // verification-failed arm). Called ONLY after one of those two arms
@@ -311,7 +352,7 @@ object WhitelistPatch {
     //     ownership evidence: (i) ours at the very end (suffix byte-match),
     //     (ii) ours front-aligned at size0 (foreign extras AFTER ours
     //     retained), (iii) a landed prefix of the delta (front-aligned at
-    //     size0, addAll threw early). On success: "appended-ours tail
+    //     size0, addAll threw early). On success: "appended-ours
     //     entries rolled back ..." (i)/(ii) or "partially appended ours
     //     rolled back ..." (iii), original prefix re-verified. On a failed
     //     drop: Skipped with "no further mutator invoked ... list left as
@@ -342,14 +383,14 @@ object WhitelistPatch {
         if (sizeNow < 0) {
             return Outcome.Skipped(
                 "$failurePrefix; verification could not read the list size (hostile/ROM bug); " +
-                    "list left untouched, no mutator invoked",
+                    "list left as addAll left it, no mutator invoked",
             )
         }
         val prefixLen = matchesPrefixLen(list, snapshot, size0)
         if (prefixLen == -1) {
             return Outcome.Skipped(
                 "$failurePrefix; verification could not read the list (get threw); " +
-                    "list left untouched, no mutator invoked",
+                    "list left as addAll left it, no mutator invoked",
             )
         }
         // (b) Prefix provably damaged but readable: the ONLY whole-list
@@ -403,18 +444,18 @@ object WhitelistPatch {
         if (sizeNow >= size0 + add.size) {
             if (suffixMatchesAdd(list, add, sizeNow)) {
                 return dropOursAndSettle(list, snapshot, size0, sizeNow, sizeNow - add.size, add.size,
-                    failurePrefix, partial = false)
+                    failurePrefix, partial = false, add = add)
             }
             if (matchesRange(list, add, size0)) {
                 return dropOursAndSettle(list, snapshot, size0, sizeNow, size0, add.size,
-                    failurePrefix, partial = false)
+                    failurePrefix, partial = false, add = add)
             }
         }
         // (iii) a LANDED PREFIX of the delta front-aligned at size0
         // (addAll threw before the whole delta landed).
         if (extra in 1 until add.size && matchesRange(list, add, size0, extra)) {
             return dropOursAndSettle(list, snapshot, size0, sizeNow, size0, extra,
-                failurePrefix, partial = true)
+                failurePrefix, partial = true, add = add)
         }
         // (iv) Ours not locatable (interleaved ours/foreign, or a
         // normally-returning addAll that appended non-ours bytes/garbage, or
@@ -429,10 +470,17 @@ object WhitelistPatch {
 
     // Drop [len] entries at [from] (ours), then re-verify: the original
     // prefix must be byte-for-byte intact AND the drop must have removed
-    // exactly [len] elements. On success: Skipped with the (i)/(ii) or
-    // (iii) rolled-back marker. On a failed drop (hostile no-op subList,
-    // throwing clear, detached view, or a re-verify read that fails):
-    // NO escalation to a whole-list restore — Skipped with the explicit
+    // exactly [len] elements AND no element of the dropped ours slice
+    // (add[0 until len]) may occur at an index >= size0 afterwards — a
+    // correct drop removes ALL ours; an equal-count wrong-target hostile
+    // subList view that cleared foreign entries instead (prefixOk and
+    // sizeOk pass while ours were never removed), including an overlapping
+    // view that cleared a mix of ours and foreign leaving k (0 < k < len)
+    // ours behind, is caught here. On success: Skipped
+    // with the (i)/(ii) or (iii) rolled-back marker. On a failed drop
+    // (hostile no-op subList, throwing clear, detached view, equal-count
+    // wrong-target subList view, or a re-verify read that fails): NO
+    // escalation to a whole-list restore — Skipped with the explicit
     // "no further mutator invoked" marker; the list is left as the drop
     // left it. Foreign entries wherever they sit survive.
     private fun dropOursAndSettle(
@@ -444,6 +492,7 @@ object WhitelistPatch {
         len: Int,
         failurePrefix: String,
         partial: Boolean,
+        add: List<String>,
     ): Outcome.Skipped {
         try {
             list.subList(from, from + len).clear()
@@ -456,12 +505,12 @@ object WhitelistPatch {
         } catch (_: Throwable) {
             false
         }
-        if (prefixOk && sizeOk) {
+        if (prefixOk && sizeOk && !anyOursElementAtOrAfter(list, add, len, size0)) {
             return Outcome.Skipped(
                 failurePrefix + if (partial) {
                     "; partially appended ours rolled back, originals preserved, foreign entries retained"
                 } else {
-                    "; appended-ours tail entries rolled back, originals preserved, foreign entries retained"
+                    "; appended-ours entries rolled back, originals preserved, foreign entries retained"
                 },
             )
         }
