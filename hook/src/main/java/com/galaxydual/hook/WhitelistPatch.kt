@@ -40,7 +40,16 @@ import java.lang.reflect.Modifier
 // back to the original size with every original element at its original
 // index; only on verification failure (or a throwing verification) do we
 // last-resort to clear() + addAll(snapshot) -- itself best-effort, and it may
-// itself keep only a prefix of the snapshot. Narrowed guarantee for an
+// itself keep only a prefix of the snapshot. The restore is now RE-VERIFIED
+// with explicit failure vocabulary: a normally-returning no-op restore is NOT
+// proof of success, so after clear()+addAll(snapshot) completes we re-check
+// byte-for-byte and the Skipped reason carries one of the explicit markers
+// ("; restore incomplete (kept N of M original entries)" when the re-verify
+// mismatches, "; restore unverified" when the re-verify read throws,
+// "; last-restore failed" when the restore itself threw). If verification
+// fails but the live list is byte-for-byte the snapshot (an unmodified-list
+// early return), Skipped is returned with NO mutator invoked at all -- no
+// clear(), no addAll. Narrowed guarantee for an
 // extreme list whose clear/addAll ALSO throw during that last resort: union
 // was computed on a copy and the live list got only a single addAll -- it
 // may stay dirty. That class cannot be made atomic through the in-place
@@ -51,13 +60,18 @@ import java.lang.reflect.Modifier
 //     original ROM entries or seeding extras -- is now caught by the
 //     post-success integrity check and reported as Skipped (reason: "addAll
 //     returned but the resulting list failed verification (hostile/ROM
-//     bug)") with a best-effort restore;
+//     bug)"). If the list is unchanged since the snapshot, Skipped is
+//     returned with NO mutator invoked; otherwise a restore is attempted and
+//     re-verified (see below);
 // (b) if addAll throws after partially appending, the last-resort restore
 //     (clear() + addAll(snapshot)) may itself fail or keep only a prefix of
 //     the snapshot; when it throws, the Skipped reason carries
-//     "; last-restore failed". If it keeps a prefix WITHOUT throwing,
-//     ORIGINAL ROM whitelist entries may be lost -- fail-closed for the
-//     affected apps, but data loss with no signal to the caller.
+//     "; last-restore failed". When the restore returns normally but fails
+//     re-verification, the reason carries "; restore unverified" (list
+//     unreadable) or "; restore incomplete (kept N of M original entries)"
+//     (prefix-only restore) -- a normally-returning no-op restore is NOT
+//     proof of success. ORIGINAL ROM whitelist entries may be lost --
+//     fail-closed for the affected apps, and the reason now signals it.
 //
 // Threading note: PatchedInPlace mutates the live list exactly like the
 // pre-H2 code did; <clinit> runs under the class-init lock, but later readers
@@ -67,6 +81,23 @@ import java.lang.reflect.Modifier
 object WhitelistPatch {
 
     const val OBSERVE_ONLY_MARKER = "observe-only"
+
+    // Byte-for-byte snapshot equality. Any Throwable (size/get read) => false.
+    private fun matchesSnapshot(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Boolean =
+        try { list.size == size0 && (0 until size0).all { list[it] == snapshot[it] } } catch (_: Throwable) { false }
+
+    // Longest matching prefix length against the snapshot. Returns -1 when a
+    // read throws (list unreadable); a shrunk list yields the in-bounds
+    // prefix length (0 when nothing matches).
+    private fun matchesPrefixLen(list: MutableList<String>, snapshot: ArrayList<String>, size0: Int): Int =
+        try {
+            val n = minOf(list.size, size0)
+            var i = 0
+            while (i < n && list[i] == snapshot[i]) i++
+            i
+        } catch (_: Throwable) {
+            -1
+        }
 
     // Outcome of attempting to merge [extra] into a static field value.
     sealed interface Outcome {
@@ -78,10 +109,12 @@ object WhitelistPatch {
         // (no write needed, naturally fail-closed).
         data class Replaced(val value: Array<String>, val added: Int) : Outcome
 
-        // Leave the field as-is or best-effort restored per the narrowed promise
-        // (originals may be lost when the last-restore throws, or silently keeps
-        // only a snapshot prefix — see case (b) in the module header); the
-        // reason string is already log-ready.
+        // Leave the field as-is or best-effort restored per the narrowed promise.
+        // Originals are guaranteed intact when the list is unchanged since snapshot,
+        // or when restore re-verify passes; otherwise originals may be partially
+        // lost and the reason carries an explicit marker (last-restore failed /
+        // restore unverified / restore incomplete (kept N of M)) — see case (b)
+        // in the module header. The reason string is already log-ready.
         data class Skipped(val reason: String) : Outcome
 
         // Static final field: plain Field.set() cannot reassign it
@@ -320,11 +353,12 @@ object WhitelistPatch {
                             // Fall through to the verify step.
                         }
                     }
-                    rolled = list.size == size0 && (0 until size0).all { list[it] == snapshot[it] }
+                    rolled = matchesSnapshot(list, snapshot, size0)
                 } catch (_: Throwable) {
                     rolled = false
                 }
                 var restoreFailed = false
+                var restoreNote: String? = null
                 if (!rolled) {
                     try {
                         list.clear()
@@ -333,10 +367,26 @@ object WhitelistPatch {
                         // Swallowed: last-resort restore may fail too (see header).
                         restoreFailed = true
                     }
+                    if (!restoreFailed) {
+                        // Normally-returning no-op restore is NOT proof; verify it.
+                        if (!matchesSnapshot(list, snapshot, size0)) {
+                            restoreFailed = true
+                            val kept = matchesPrefixLen(list, snapshot, size0)
+                            restoreNote = if (kept < 0) {
+                                "; restore unverified"
+                            } else {
+                                "; restore incomplete (kept $kept of $size0 original entries)"
+                            }
+                        }
+                    }
                 }
                 return Outcome.Skipped(
                     "skip patch $fieldName on $owner: list addAll failed (${HookLog.shortEx(t)})" +
-                        if (restoreFailed) "; last-restore failed" else "",
+                        when {
+                            restoreNote != null -> restoreNote
+                            restoreFailed -> "; last-restore failed"
+                            else -> ""
+                        },
                 )
             }
             // Post-success integrity arm: a hostile AbstractMutableList may
@@ -346,14 +396,30 @@ object WhitelistPatch {
             // restore and report Skipped instead of a false "+N added" signal.
             // (O(n) check; this is the <clinit> path, not the hot query path.)
             val ok = try {
+                // Prefix leg via matchesPrefixLen == size0: byte-for-byte
+                // prefix match without the helper's list.size == size0 check
+                // (the post-success list is size0 + add.size by construction).
                 list.size == size0 + add.size &&
-                    (0 until size0).all { list[it] == snapshot[it] } &&
+                    matchesPrefixLen(list, snapshot, size0) == size0 &&
                     (0 until add.size).all { list[size0 + it] == add[it] }
             } catch (_: Throwable) {
                 false
             }
             if (!ok) {
+                // Early unmodified-list return: verification failed but the
+                // live list is byte-for-byte the snapshot (e.g. a hostile
+                // addAll that returns normally without touching the list).
+                // No mutator is invoked -- the originals are intact and
+                // there is nothing to restore.
+                if (matchesSnapshot(list, snapshot, size0)) {
+                    return Outcome.Skipped(
+                        "skip patch $fieldName on $owner: addAll returned but the resulting list " +
+                            "failed verification (hostile/ROM bug); the list is unchanged since the snapshot — " +
+                            "originals preserved, no restore attempted",
+                    )
+                }
                 var restoreFailed = false
+                var restoreNote: String? = null
                 try {
                     list.clear()
                     list.addAll(snapshot)
@@ -361,10 +427,26 @@ object WhitelistPatch {
                     // Swallowed: last-resort restore may fail too (see header).
                     restoreFailed = true
                 }
+                if (!restoreFailed) {
+                    // Normally-returning no-op restore is NOT proof; verify it.
+                    if (!matchesSnapshot(list, snapshot, size0)) {
+                        restoreFailed = true
+                        val kept = matchesPrefixLen(list, snapshot, size0)
+                        restoreNote = if (kept < 0) {
+                            "; restore unverified"
+                        } else {
+                            "; restore incomplete (kept $kept of $size0 original entries)"
+                        }
+                    }
+                }
                 return Outcome.Skipped(
                     "skip patch $fieldName on $owner: addAll returned but the resulting " +
                         "list failed verification (hostile/ROM bug)" +
-                        if (restoreFailed) "; last-restore failed" else "",
+                        when {
+                            restoreNote != null -> restoreNote
+                            restoreFailed -> "; last-restore failed"
+                            else -> ""
+                        },
                 )
             }
             return Outcome.PatchedInPlace(added = add.size)
