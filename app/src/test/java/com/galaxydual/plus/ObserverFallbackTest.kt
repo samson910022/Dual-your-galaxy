@@ -59,13 +59,15 @@ class ObserverFallbackTest {
             try { vm.dispose() } catch (_: Exception) { }
             try { vm.viewModelScope.cancel() } catch (_: Exception) { }
         }
+        // CI #306: drain outstanding viewModelScope/coordinator children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms, coords)
         vms.clear()
         for (c in coords) {
             try { c.close() } catch (_: Exception) { }
         }
         coords.clear()
-        Dispatchers.resetMain()
         resetRemotePoisonForTests()
+        Dispatchers.resetMain()
     }
 
     private fun await(timeoutMs: Long = 5_000L, cond: () -> Boolean) {
@@ -103,7 +105,7 @@ class ObserverFallbackTest {
             policyTxCoordinator = coord,
         )
         vms.add(vm)
-        coords.add(coord)
+        if (!coords.contains(coord)) coords.add(coord)
         await { !vm.state.value.loading }
         if (awaitKnown) {
             await { vm.state.value.policyDraftKnown }

@@ -169,6 +169,10 @@ class RemoveConfirmTest {
 
     private val vms = mutableListOf<DualViewModel>()
 
+    // Tests that point Main at a local StandardTestDispatcher must register
+    // their scheduler here so tearDown can pump it during the drain.
+    private val extraSchedulers = mutableListOf<TestCoroutineScheduler>()
+
     @Before
     fun setUp() {
         Dispatchers.setMain(Dispatchers.Unconfined)
@@ -183,6 +187,10 @@ class RemoveConfirmTest {
                 // Best effort: test process is discarded anyway.
             }
         }
+        // CI #306: drain outstanding viewModelScope children before Main is
+        // reset, pumping any test-local schedulers registered by tests.
+        TestDrainSupport.drainBeforeResetMain(vms, pump = { extraSchedulers.forEach { it.advanceUntilIdle() } })
+        extraSchedulers.clear()
         vms.clear()
         Dispatchers.resetMain()
     }
@@ -489,6 +497,7 @@ class RemoveConfirmTest {
         awaitVm(vm) { vm.state.value.pendingRemove?.let { it.generation != old.generation } == true && !vm.state.value.loading }
         val replacement = vm.state.value
         val scheduler = TestCoroutineScheduler()
+        extraSchedulers.add(scheduler)
         Dispatchers.setMain(StandardTestDispatcher(scheduler))
         vm.confirmRemove(old)
         vm.cancelRemove(old)
@@ -507,6 +516,7 @@ class RemoveConfirmTest {
         awaitVm(vm) { vm.state.value.pendingRemove != null && !vm.state.value.loading }
         val old = vm.state.value.pendingRemove!!
         val scheduler = TestCoroutineScheduler()
+        extraSchedulers.add(scheduler)
         Dispatchers.setMain(StandardTestDispatcher(scheduler))
         vm.confirmRemove()
         // Simulate a replacement published before the queued coroutine runs.
