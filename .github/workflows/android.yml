@@ -225,6 +225,15 @@ jobs:
           MERGED="$MERGED_FILES"
           echo "merged manifest: $MERGED"
           if grep -iE 'android:sharedUserId[[:space:]]*=' "$MERGED"; then echo "FAIL: android:sharedUserId attribute found in merged manifest $MERGED (uid gate would admit siblings)"; exit 1; fi
+          # Exported-components inventory gate (merged debug manifest): the
+          # sharedUserId check above and the provider-parity gate below enforce
+          # NOTHING about an ADDITIONAL exported <provider>/<service>/<receiver>/
+          # <activity> at an unpinned authority or name — this gate fails closed
+          # on anything exported that is not in the allowlist
+          # (scripts/check-exported-components.py; fixtures in
+          # scripts/fixtures/exported-components/).
+          if ! python3 scripts/check-exported-components.py --merged-xml "$MERGED"; then echo "FAIL: exported-components inventory gate failed for $MERGED (anything exported must be in the allowlist)"; exit 1; fi
+          echo "PASS: exported components limited to the allowlist (debug merged manifest)"
           echo "== (b) APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool scan) =="
           APK="app/build/outputs/apk/debug/app-debug.apk"
           if [ ! -f "$APK" ]; then
@@ -465,6 +474,16 @@ jobs:
           fi
           MERGED="$MERGED_FILES"
           echo "merged release manifest: $MERGED"
+          # Exported-components inventory gate (merged release manifest): the
+          # provider-parity gate below enforces ONLY the pinned
+          # GuardXposedProvider authority — nothing stops an ADDITIONAL
+          # exported <provider>/<service>/<receiver>/<activity> at an
+          # unpinned authority or name. Fail closed on anything exported
+          # that is not in the allowlist
+          # (scripts/check-exported-components.py; fixtures in
+          # scripts/fixtures/exported-components/).
+          if ! python3 scripts/check-exported-components.py --merged-xml "$MERGED"; then echo "FAIL: exported-components inventory gate failed for $MERGED (anything exported must be in the allowlist)"; exit 1; fi
+          echo "PASS: exported components limited to the allowlist (release merged manifest)"
           # Provider-node parse gate: exactly one <provider> with the
           # GuardXposedProvider name AND the release (unsuffixed) authority on
           # the SAME element, exported=true, no android:permission, NO foreign
@@ -491,6 +510,10 @@ jobs:
       # authority, and the debug/release authority pair).
       - name: Provider parity checker self-test
         run: bash scripts/check-provider-parity.test.sh
+      - name: Exported-components checker self-test
+        run: |
+          set -e
+          bash scripts/check-exported-components.test.sh
       # Artifact-verifier self-test: pins verify-release-artifacts.sh's
       # fail-fast versionName gate (K4/F-1 regression — fail() must be defined
       # before its first call) so the release/PR artifact gate fails closed.
