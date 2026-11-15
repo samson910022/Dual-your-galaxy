@@ -94,7 +94,7 @@ val privilege: Privilege = when {
 > except the aapt2 caveat below). It covers all currently-run classpaths
 > (incl. lint / debug / test); the residual is the emulator/device RUNTIME
 > path (artifacts are pinned; the on-device execution is unverified).
-> `release.yml`'s actions are additionally pinned to commit SHAs (refs verified). Caveat: the aapt2
+> all workflow actions in both android.yml and release.yml are SHA-pinned; each SHA re-verified against its git tag (2026-11-16 audit): actions/checkout 11d5960 v4.4.0, setup-java cf277c60 v4.9.1, setup-gradle d9c87d48 v3.5.0, upload-artifact ea165f8 v4.6.2, download-artifact d3f86a10 v4.3.0, action-gh-release 3bb1273 v2.6.2, android-emulator-runner a421e438 v2.38.0. Caveat: the aapt2
 > **platform-classifier** artifacts
 > (`-windows.jar`/`-osx.jar`) are not resolvable on this Linux host, so those
 > entries were added manually with sha256 hashes verified locally from Google's

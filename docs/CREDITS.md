@@ -3,7 +3,8 @@
 > License: MIT — Copyright (c) 2026 samson910022. See [../LICENSE](../LICENSE).
 > This project contains **only original code** under MIT license.
 > The projects below are **idea-level references only**, except for the
-> Apache-2.0 AARs listed under "Binary dependencies", which are linked into the
+> Apache-2.0 AARs listed under "Binary dependencies" (`libxposed/service`,
+> `libxposed/interface` and `RikkaApps/Shizuku`), which are linked into the
 > APK. No source code was copied from GPL-licensed projects.
 
 ## References (idea-level only)
@@ -26,12 +27,15 @@
   exported `XposedProvider` is replaced by the app-owned `GuardXposedProvider`.
 - `libxposed/interface` — Apache-2.0 — Transitive Xposed service interface AAR;
   linked into the app APK.
-- `libxposed/api` — Apache-2.0 — Transitive Xposed API AAR; linked into the
-  app APK (type surface: `XposedModule`, `Hooker`, `Param`).
-- `libxposed/annotation` — Apache-2.0 — Transitive Xposed annotation AAR
-  (compile-time-only retention); compiled into classes.dex.
+- `libxposed/api` — Apache-2.0 — Xposed API AAR; `:hook` `compileOnly`
+  — provided by the LSPosed framework at runtime; NOT packaged in the app APK.
+- `libxposed/annotation` — Apache-2.0 — Xposed annotation AAR
+  (compile-time annotation retention); `:hook` `compileOnly` — NOT packaged in
+  the app APK / not compiled into classes.dex.
 - `RikkaApps/Shizuku` — Apache-2.0 — Shizuku API/provider AARs linked into the
   app APK for the shell fallback channel.
+
+Honesty note (2026-11-16): constructor-scoped attribution corrected — api/annotation were previously stated as linked into the APK; they are compileOnly, runtime-provided by LSPosed, never packaged.
 
 ## License Statement (MIT)
 
