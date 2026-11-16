@@ -1047,6 +1047,18 @@ class DualViewModel(
     // completeWithRevisionChecked rev gate under commitMutex.
     internal var revisionSamplerForTests: (() -> Long)? = null
 
+    // Phase7 (PR#60 round-3 finding #3) test seam: invoked in requestPolicyWrite
+    // AFTER the early BUSY fast-path gates and the sanitized snapshot computation,
+    // and IMMEDIATELY BEFORE the final atomic check-and-install _state.update
+    // (the load-bearing pending re-check happens inside that update's CAS retry
+    // loop — the early gate only filters the fast path). JVM tests use it to
+    // park two concurrent requesters at the install boundary so the atomic
+    // check-and-install decides the winner deterministically ("live pending
+    // never superseded"). Production never sets it (null in production builds);
+    // the field is internal, nullable and never invoked when null. Keep null in
+    // production builds.
+    internal var beforePolicyPendingInstallSeamForTests: (() -> Unit)? = null
+
     private fun sampledCurrentRevision(): Long = try {
         val sampler = revisionSamplerForTests
         if (sampler != null) {
@@ -8579,22 +8591,49 @@ class DualViewModel(
         // showing stale A, letting confirm overwrite unseen B. obs==-1 於上方 S8 門
         // 已拒絕（coordinator+store 皆在時）；此處僅 legacy/null-coordinator 路徑
         // 才會讀到 -1（confirm 跳過 rev 檢查）。
-        _state.update {
-            it.copy(
-                pendingPolicyWrite = PendingPolicyWrite(
-                    packages = sanitized,
-                    requestedAtMs = nowMonoMs(),
-                    droppedCount = dropped,
-                    baseDraftVersion = policyDraftVersion.get(),
-                    baseCoordinatorRevision = try {
-                        observedSnapshot.get().rev
-                    } catch (_: Exception) {
-                        -1L
-                    },
-                ),
-                policyWritePhase = PolicyWritePhase.QUEUED,
-                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-            )
+        // Test-only seam: park callers at the install boundary so tests can pin
+        // the race between two concurrent requesters. Never set in production.
+        beforePolicyPendingInstallSeamForTests?.let { it() }
+        // Hoist the epoch increment OUT of the update lambda: incrementAndGet
+        // inside a CAS-retried StateFlow.update would be a side effect subject
+        // to retry (retry-unsafe even when the outcome is idempotent in count).
+        // The atomic update below is a pure check-and-install: a concurrent
+        // caller may have installed a live pending after this VM passed the
+        // early BUSY gate (the gate only filters the fast path — it cannot
+        // see other threads' updates). Losing that race lands in the
+        // pending-branch: report BUSY and keep the winner's pending intact —
+        // never supersede.
+        val epoch = policyPhaseEpoch.incrementAndGet()
+        val generation = policyWriteGeneration.incrementAndGet()
+        _state.update { cur ->
+            if (cur.pendingPolicyWrite != null) {
+                // Atomic re-check: a concurrent caller may have installed a live
+                // pending after this VM passed the early BUSY gate (the gate only
+                // filters the fast path — it cannot see other threads' updates).
+                // Losing the race lands us here: report BUSY and keep the winner's
+                // pending intact — never supersede.
+                cur.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                    msgKind = MsgKind.INFO,
+                )
+            } else {
+                cur.copy(
+                    pendingPolicyWrite = PendingPolicyWrite(
+                        packages = sanitized,
+                        requestedAtMs = nowMonoMs(),
+                        generation = generation,
+                        droppedCount = dropped,
+                        baseDraftVersion = policyDraftVersion.get(),
+                        baseCoordinatorRevision = try {
+                            observedSnapshot.get().rev
+                        } catch (_: Exception) {
+                            -1L
+                        },
+                    ),
+                    policyWritePhase = PolicyWritePhase.QUEUED,
+                    policyEpoch = epoch,
+                )
+            }
         }
     }
 

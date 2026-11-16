@@ -1509,6 +1509,67 @@ class PolicyWriteTest {
         assertEquals(0, fake.saveCalls)
     }
 
+    // Phase 7 (PR#60 round-3 finding #3)：兩個並發 requestPolicyWrite 皆通過
+    // early BUSY gate（雙方都觀察到 pending==null），在 install 邊界（seam）
+    // 相撞；原子 check-and-install 至多安裝一個 live pending —— CAS 落敗者重試後
+    // 看到 pending != null，報 BUSY(INFO) 而非 supersede；policyEpoch 單調推進。
+    @Test
+    fun p24_requestPolicyWrite_concurrentCallers_installAtMostOnePending() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { !vm.state.value.loading }
+        seedSelection(vm)
+        val ready = java.util.concurrent.CountDownLatch(2)
+        val installErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        // 自同步 rendezvous：兩個 caller 都在 seam 報到後才放行
+        // （輪詢 CountDownLatch.count 至 0，5s 上限，無盲等；兩個 thread 皆被
+        // 擋在最終 atomic update 之前，一起進入 check-and-install）。
+        vm.beforePolicyPendingInstallSeamForTests = {
+            ready.countDown()
+            val deadline = System.currentTimeMillis() + 5_000L
+            while (ready.count > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(1)
+            }
+        }
+        val threadA = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                installErrors.compareAndSet(null, t)
+            }
+        }
+        val threadB = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                installErrors.compareAndSet(null, t)
+            }
+        }
+        try {
+            threadA.start()
+            threadB.start()
+            threadA.join(5_000L)
+            threadB.join(5_000L)
+            assertFalse("threadA 未於 5s 內結束", threadA.isAlive)
+            assertFalse("threadB 未於 5s 內結束", threadB.isAlive)
+            installErrors.get()?.let { throw it }
+            await(timeoutMs = 5_000L) { vm.state.value.pendingPolicyWrite != null }
+            assertEquals(setOf("com.example.a"), vm.state.value.pendingPolicyWrite?.packages)
+            assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+            // CAS 落敗者重試後看到 pending != null → BUSY(INFO)；勝出者的 install
+            // copy 不設 msg。兩個 update 皆落地後，最終 msg 確定為 BUSY。
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.clearCalls)
+            assertTrue(inFlightKeysOf(vm).isEmpty())
+        } finally {
+            vm.beforePolicyPendingInstallSeamForTests = null
+            if (threadA.isAlive) threadA.interrupt()
+            if (threadB.isAlive) threadB.interrupt()
+        }
+    }
+
     // Phase 5：harness 已改以 Known 為準（見 makeVm），此處鎖定 Known 載入的
     // 終態：Known＋草稿內容一致（非僅 harness 起步即真）。
     @Test
