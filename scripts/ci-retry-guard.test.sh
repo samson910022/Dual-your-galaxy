@@ -12,13 +12,19 @@
 # extra byte — exactly one, even for CRLF, because CR bytes are dropped), so a
 # proxy-504 body with 'checksum mismatch' but no verification|metadata|artifact
 # wording within the budget still does NOT hard-fail — pinned below by the
-# proxy-504 fixture. A signature SPLIT ACROSS LINES (including across a CRLF
+# proxy-504 fixture. Its substring mirror image — 'artifact' present only as
+# a substring of 'artifactory' inside the budget, with no verification|metadata
+# wording anywhere in the body — DOES hard-fail, pinned below by the
+# artifactory-in-budget fixture. A signature SPLIT ACROSS LINES (including across a CRLF
 # boundary) is caught by the fallback and fails fast — pinned below. Also
 # pinned below: a split whose collapsed gap exceeds the 200-byte budget is NOT
 # matched and is retried up to the cap (overbudget-split-signature), a
 # CRLF-wrapped signature fails fast (split-crlf-signature), and the fallback
 # reprint is bounded to 3 `matched:` lines even when more matches exist
-# (split-signatures-many + standalone count check at the end). NUL-gap
+# (split-signatures-many + standalone count check at the end). Argument
+# validation: labels carrying control characters (CR, LF) are rejected with
+# exit 2 before the wrapped command runs ('label containing CR rejected',
+# 'label containing LF rejected'; invocations == 0, the [[:cntrl:]] class pin). NUL-gap
 # fixtures pin the `-a` flag that lets GNU grep's `.` span \x00: a NUL byte in
 # the co-occurrence gap fails fast on a single line (nul-gap-singleline,
 # line-based pass) and across a line boundary (nul-gap-split-signature,
@@ -132,6 +138,14 @@ case "$mode" in
     # co-occurrence budget shared by both passes, so this does NOT
     # hard-fail and is retried up to the cap.
     printf 'FAILURE: Could not GET https://repo.example.com/org/junit/junit-bom/5.9.2/junit-bom-5.9.2.pom. Received status code 504 from server: Gateway Timeout; checksum mismatch while relaying the response body through the proxy and the mirror kept the connection open and streamed ordinary payload bytes that carry no repository policy wording at all and the client simply saw a truncated body before the artifact download eventually resumed from a different mirror host\n'
+    exit 1 ;;
+  artifactory-in-budget)
+    # Substring trade-off pin: 'checksum mismatch' followed 17 bytes later
+    # by 'artifact' (only as a substring of 'artifactory'), with NO
+    # verification|metadata wording anywhere in the line, so the legacy
+    # checksum branch's co-occurrence budget matches — the guard fails fast
+    # (accepted substring trade-off pinned here).
+    printf 'FAILURE: Could not GET https://repo.example.com/x/y.pom. Received status code 504 from server: Gateway Timeout; checksum mismatch relayed through artifactory proxy for org.example:lib-marker\n'
     exit 1 ;;
   split-signatures-many)
     # Five wrapped verification signatures; the line-based pass cannot match
@@ -255,6 +269,9 @@ run_guard 'proxy-504 checksum mismatch NOT within 200-byte budget is retried (in
 run_guard 'overbudget split signature (collapsed gap > 200 bytes) is retried to cap (invocations == cap)' \
   1 3 overbudget-split-signature \
   3 0 "test overbudget-split-signature" -- "$FAKE_GRADLE"
+run_guard 'artifactory-in-budget pins substring match fails fast (exit 1, 1 invocation)' \
+  1 1 artifactory-in-budget \
+  3 0 "test artifactory-in-budget" -- "$FAKE_GRADLE"
 
 # --- (c) silent failure then success on the 2nd attempt ------------------------
 run_guard 'silent failure then success on 2nd attempt (exits 0, invocations 2)' \
@@ -313,6 +330,12 @@ run_guard 'argument validation: missing command' \
 run_guard 'argument validation: missing sleep' \
   2 0 ok \
   3
+run_guard 'argument validation: label containing CR rejected' \
+  2 0 ok \
+  3 0 $'test\rlabel' -- "$FAKE_GRADLE"
+run_guard 'argument validation: label containing LF rejected' \
+  2 0 ok \
+  3 0 $'test\nlabel' -- "$FAKE_GRADLE"
 
 # --- regex pin: the VERIFICATION_RE assignment line must stay exactly this -----
 # A future weakening of the script's signature regex (removed alternative,

@@ -47,3 +47,6 @@
 /scripts/verify-release-sha256sums.sh @samson910022
 /scripts/verify-release-sha256sums.test.sh @samson910022
 /scripts/fixtures/ @samson910022
+/scripts/ci-retry-guard.sh @samson910022
+/scripts/ci-retry-guard.test.sh @samson910022
+/scripts/ci-pyyaml-reqs.txt @samson910022

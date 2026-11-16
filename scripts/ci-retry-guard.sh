@@ -37,7 +37,7 @@ if ! [[ "$2" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 MAX_ATTEMPTS="$1"; SLEEP_SECONDS="$2"; LABEL="$3"; shift 3
-case "$LABEL" in *$'\n'*|*$'\r'*) echo "ci-retry-guard.sh: <label> must not contain CR or LF" >&2; exit 2;; esac
+case "$LABEL" in *[[:cntrl:]]*) echo "ci-retry-guard.sh: <label> must not contain control characters" >&2; exit 2;; esac
 if [ "${1:-}" = "--" ]; then
   shift
 fi
@@ -100,7 +100,8 @@ while true; do
   # boundaries anywhere in the log (still bounded to 200 collapsed bytes; the
   # anchor must still precede the context word), and `artifact` matches as a
   # substring (e.g. `artifactory`) — accepted trade-off, pinned by the
-  # proxy-504 fixture. A proxy-504 body with 'checksum mismatch' but no
+  # `artifactory-in-budget` fixture; the over-budget direction is pinned by
+  # proxy-504-checksum-no-context and overbudget-split-signature. A proxy-504 body with 'checksum mismatch' but no
   # verification/metadata/artifact wording within the budget STILL does not
   # match. Full attempt output is already teed to the console; print the
   # matched signature(s) bounded (head -n 3), not the whole collapsed log.
