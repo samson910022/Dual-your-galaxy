@@ -154,7 +154,13 @@ jobs:
         run: |
           set -e
           bash scripts/check-exported-components.test.sh
+      # SDK arm builds/signs a throwaway-key APK with current tooling and
+      # asserts the publish signer gate accepts it; REQUIRE=1 so a runner
+      # image without the Android SDK fails LOUDLY instead of silently
+      # skipping.
       - name: Verify-release-apk-signers self-test
+        env:
+          PR60_SIGNER_TEST_REQUIRE_SDK: "1"
         run: |
           set -e
           bash scripts/verify-release-apk-signers.test.sh
@@ -166,6 +172,13 @@ jobs:
           set -e
           chmod +x scripts/verify-release-artifacts.test.sh
           ./scripts/verify-release-artifacts.test.sh
+      # Shared apksigner-output parser self-test: pins the multi-scheme digest-line
+      # rule (V2/V3.x/…/legacy Signer #1) used by BOTH the sign job and the
+      # publish signer gate.
+      - name: parse-apksigner-output self-test
+        run: |
+          set -e
+          bash scripts/parse-apksigner-output.test.sh
       # Shizuku-provider checker self-test: every fail-* fixture must exit 1 and
       # every pass-* fixture must exit 0, proving the element-scoped
       # ShizukuProvider gate fails closed (wrong authority, missing/wrong
