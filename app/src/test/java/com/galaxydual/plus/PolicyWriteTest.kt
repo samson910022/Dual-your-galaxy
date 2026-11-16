@@ -1695,6 +1695,190 @@ class PolicyWriteTest {
         }
     }
 
+    // R5-1 (PR#60 round-5)：request 已先安裝 pending（QUEUED）後，clear 必須以
+    // BUSY 拒絕，且不得觸碰 request 擁有的 pending／phase／store／epoch ——
+    // request 的安裝與 clear 的權威重判都在 policySettleLock 的同一臨界區語義
+    // 下互斥，安裝後 pending!=null 必然對 clear 的鎖內重判可見，clear 不註冊
+    // 任何 key、不翻相位、不呼叫 store.clear。
+    // 說明：本測試 pin 的是「request 先贏」的排序——這條路徑在 pre-fix 也會通過
+    // （clear 早期 pending 門本就會以 BUSY 拒絕），此處固定的是修復後的鎖排序
+    // 契約，而非重現 pre-fix 紅燈。
+    @Test
+    fun p43_clearVsRequest_requestInstallsFirst_clearBusyLeavesPendingAndPhaseIntact() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        seedSelection(vm)
+        val epochBefore = vm.state.value.policyEpoch
+        val seamHit = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        // 讓 requester 停在 install 邊界（guard 皆已通過），主執行緒放行後
+        // 先等 pending 落地，再進行 clear。
+        vm.beforePolicyPendingInstallSeamForTests = {
+            seamHit.countDown()
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val installErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val requester = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                installErrors.compareAndSet(null, t)
+            }
+        }
+        try {
+            requester.start()
+            assertTrue(seamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 先放行 requester：request 先安裝 pending（第二次 emission QUEUED 翻相位）。
+            release.countDown()
+            await { vm.state.value.pendingPolicyWrite != null }
+            val epochAfterRequest = vm.state.value.policyEpoch
+            assertTrue("install 必須推進 policyEpoch（monotonic）", epochAfterRequest > epochBefore)
+            requester.join(5_000L)
+            assertFalse("requester 未於 5s 內結束", requester.isAlive)
+            installErrors.get()?.let { throw it }
+            // request 已安裝（pending 持有 com.example.a、phase=QUEUED）：clear 必須 BUSY 拒絕。
+            vm.clearPolicyDraft()
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(setOf("com.example.a"), vm.state.value.pendingPolicyWrite?.packages)
+            assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.clearCalls)
+            assertEquals(epochAfterRequest, vm.state.value.policyEpoch)
+        } finally {
+            vm.beforePolicyPendingInstallSeamForTests = null
+            release.countDown()
+            if (requester.isAlive) {
+                requester.join(1_000L)
+                if (requester.isAlive) requester.interrupt()
+            }
+        }
+    }
+
+    // R5-1 (PR#60 round-5)：clear 在「key 已註冊、phase 尚未翻轉」的縫隙中被
+    // park（此時 clear 持有 policySettleLock），與 request 的 final check-and-
+    // install CAS 互斥：
+    //  - 雙停泊期間：不得出現 pending、phase 必須保持 IDLE、epoch 不變；
+    //  - 先放行 requester：A 醒來後會在 policySettleLock monitor 上等待
+    //    （B 在縫隙中持鎖，A 的 CAS 根本進不了臨界區——這正是本修復的語義）；
+    //  - 放行 clear：B 翻 QUEUED（epoch+1）、退出臨界區並 launch 清除協程；
+    //  - A 隨後進入 CAS：B 的 key 尚在（B 的協程要經 Dispatchers.IO 一整輪才
+    //    會移除 key），掃描命中 → BUSY、不安裝；或 B 已完整結清、key 已移除
+    //    → 合法安裝（pending!=null 且 phase=QUEUED）。兩種結局皆相干，終態
+    //    斷言以分流方式覆蓋兩者；
+    //  - 不得出現 pending!=null && phase==IDLE（R5-1 原始破壞），也不得出現
+    //    pending!=null && in-flight policy-clear key 並存。
+    // 說明：本測試 pin 的是 scan→CAS 窗口在共享 lock 下不撕裂的相干性契約，
+    // 不是重現 pre-fix 紅燈。pre-fix 缺的是兩資料結構間的共享臨界區，無法以
+    // 現有 seam 確定性重現「A 讀到空集合、B 隨後 add、A 才 CAS 提交」的內層
+    // 時序（需要第三個生產期 seam，對 P3 屬過度工程）；reviewer 要求的
+    // 「pause real clear immediately after key registration + interleave the
+    // request's final predicate/CAS boundary」即由本測試的雙停泊結構提供。
+    @Test
+    fun p43_clearVsRequest_clearInFlightBeforeRequestCAS_requestBusyAndNoPending() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        seedSelection(vm)
+        val epochBefore = vm.state.value.policyEpoch
+        val requestSeamHit = java.util.concurrent.CountDownLatch(1)
+        val requestRelease = java.util.concurrent.CountDownLatch(1)
+        vm.beforePolicyPendingInstallSeamForTests = {
+            requestSeamHit.countDown()
+            requestRelease.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val clearSeamHit = java.util.concurrent.CountDownLatch(1)
+        val releaseClear = java.util.concurrent.CountDownLatch(1)
+        // 讓 clear 停在「key 已註冊、phase 翻轉前」的縫隙（locked block 內部）。
+        vm.beforePolicyClearPhaseAssignSeamForTests = {
+            clearSeamHit.countDown()
+            releaseClear.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val requestErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val clearErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val requester = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                requestErrors.compareAndSet(null, t)
+            }
+        }
+        val clearer = Thread {
+            try {
+                vm.clearPolicyDraft()
+            } catch (t: Throwable) {
+                clearErrors.compareAndSet(null, t)
+            }
+        }
+        try {
+            requester.start()
+            assertTrue(requestSeamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            clearer.start()
+            // clear 通過早期門（pending==null、inFlight 空），進入鎖內權威重判
+            // 與註冊，停在 phase-assign 縫隙。
+            assertTrue(clearSeamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(inFlightKeysOf(vm).any { it.startsWith("policy-clear:") })
+            // 雙停泊且 B 尚未登記 pending、尚未翻相位：無 pending、phase=IDLE、epoch 不變。
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
+            // 先放行 requester：A 醒來後在 policySettleLock 上等待（B 持鎖）。
+            requestRelease.countDown()
+            // 放行 clear：B 翻 QUEUED（epoch+1）、退出臨界區並 launch 清除協程。
+            releaseClear.countDown()
+            clearer.join(5_000L)
+            assertFalse("clearer 未於 5s 內結束", clearer.isAlive)
+            clearErrors.get()?.let { throw it }
+            // B 釋放出 critical section 之後 A 才進 CAS（monitor 互斥的直接結果）。
+            requester.join(5_000L)
+            assertFalse("requester 未於 5s 內結束", requester.isAlive)
+            requestErrors.get()?.let { throw it }
+            // 等 clear 完成（store.clear 的 ack 先翻 clearCalls，狀態更新隨後）。
+            await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
+            // 終態相干性（兩種合法結局皆相干，不可假設誰贏）：
+            //  (a) A 在 clear 完全結清（key 已移除）後才進 CAS → 安裝 pending，
+            //      phase 必為 QUEUED、packages 為 com.example.a；
+            //  (b) A 在 key 仍在時進 CAS → BUSY 拒絕，pending==null，
+            //      phase 經 clear 結清回 IDLE。
+            // 不得出現 pending!=null && phase==IDLE（R5-1 的原始破壞）。
+            await(timeoutMs = 5_000L) {
+                vm.state.value.policyWritePhase == PolicyWritePhase.IDLE ||
+                    vm.state.value.pendingPolicyWrite != null
+            }
+            val st = vm.state.value
+            if (st.pendingPolicyWrite != null) {
+                assertEquals(PolicyWritePhase.QUEUED, st.policyWritePhase)
+                assertEquals(setOf("com.example.a"), st.pendingPolicyWrite?.packages)
+            } else {
+                assertEquals(PolicyWritePhase.IDLE, st.policyWritePhase)
+            }
+            // FakePolicyStore 語義：saveRaw(null)（clear 走的就是這個）也計入 saveCalls；
+            // 因此此處必須恰為 1（= clear 那一次），不得有任何 saveRaw(內容) 呼叫。
+            assertEquals(1, fake.saveCalls)
+            assertEquals(1, fake.clearCalls)
+            // FakePolicyStore 文件語義：clear 成功後端為 Known 空集。
+            assertEquals(emptySet<String>(), fake.saved)
+            // clear 的 key 不得殘留（clear 結清後 inFlightWrites 不得再含 policy-* key）。
+            await(timeoutMs = 5_000L) {
+                inFlightKeysOf(vm).none { it.startsWith("policy-") }
+            }
+        } finally {
+            vm.beforePolicyPendingInstallSeamForTests = null
+            vm.beforePolicyClearPhaseAssignSeamForTests = null
+            requestRelease.countDown()
+            releaseClear.countDown()
+            if (requester.isAlive) {
+                requester.join(1_000L)
+                if (requester.isAlive) requester.interrupt()
+            }
+            if (clearer.isAlive) {
+                clearer.join(1_000L)
+                if (clearer.isAlive) clearer.interrupt()
+            }
+        }
+    }
+
     // Phase 5：harness 已改以 Known 為準（見 makeVm），此處鎖定 Known 載入的
     // 終態：Known＋草稿內容一致（非僅 harness 起步即真）。
     @Test

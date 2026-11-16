@@ -1060,6 +1060,16 @@ class DualViewModel(
     // production builds.
     internal var beforePolicyPendingInstallSeamForTests: (() -> Unit)? = null
 
+    // R5-1 (PR#60 round-5) test seam: invoked in clearPolicyDraft INSIDE the
+    // policySettleLock critical section, AFTER the clear's in-flight key is
+    // registered and BEFORE the QUEUED phase flip. Lets JVM tests pin the
+    // scan→CAS window between a concurrent request's final check-and-install
+    // and the clear's key registration (both now serialize on the same leaf
+    // monitor). Production never sets it (null in production builds); the
+    // field is internal, nullable and never invoked when null. Keep null in
+    // production builds.
+    internal var beforePolicyClearPhaseAssignSeamForTests: (() -> Unit)? = null
+
     private fun sampledCurrentRevision(): Long = try {
         val sampler = revisionSamplerForTests
         if (sampler != null) {
@@ -1572,11 +1582,21 @@ class DualViewModel(
             ) {
                 cur
             } else {
-                cur.copy(
+                val requestOwnsPhase = tx.isClear && !tx.isRepair &&
+                    cur.pendingPolicyWrite != null &&
+                    (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                        cur.policyWritePhase == PolicyWritePhase.SAVING)
+                val base = if (!requestOwnsPhase) {
+                    cur.copy(
+                        policyWritePhase = PolicyWritePhase.IDLE,
+                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                    )
+                } else {
+                    cur
+                }
+                base.copy(
                     loading = false,
                     pendingPolicyWrite = if (tx.isClear && !tx.isRepair) cur.pendingPolicyWrite else null,
-                    policyWritePhase = PolicyWritePhase.IDLE,
-                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
                     policyDraftKnown = false,
                     policyDraftCorrupt = tx.isRepair,
                     msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
@@ -8595,7 +8615,16 @@ class DualViewModel(
         // Test-only seam: park callers at the install boundary so tests can pin
         // the race between two concurrent requesters. Never set in production.
         beforePolicyPendingInstallSeamForTests?.let { it() }
-        // Final atomic check-and-install: re-validate the CURRENT guards
+        // Final atomic check-and-install: this block is the REQUEST half of the
+        // shared reservation critical section (policySettleLock) that pairs the
+        // in-flight scan against clear's key registration / phase transition in
+        // clearPolicyDraft() and confirmRepairCorruptDraft() — the scan and the
+        // CAS are totally ordered w.r.t. clear's and repair's registration (both hold
+        // the same leaf monitor); confirm's `policy-write:*` add remains outside the
+        // monitor but is fenced by the pending invariant (branch 1).
+        // policySettleLock is a re-entrant leaf JVM monitor: no I/O, no
+        // suspension — safe to hold across the CAS.
+        // The CAS re-validates the CURRENT guards
         // against `cur` inside the CAS. A background writer (Dispatchers.IO
         // refresh / reconciler) can flip this VM to Unknown / RECONCILING /
         // revision-stale or register an in-flight policy op AFTER the early
@@ -8617,6 +8646,7 @@ class DualViewModel(
         // Revision staleness is re-covered by policyRevisionStale.get() and
         // by the confirm-time checks (unchanged).
         val generation = policyWriteGeneration.incrementAndGet()
+        synchronized(policySettleLock) {
         _state.update { cur ->
             if (cur.pendingPolicyWrite != null) {
                 // Atomic re-check: a concurrent caller may have installed a live
@@ -8676,6 +8706,7 @@ class DualViewModel(
                     policyEpoch = policyPhaseEpoch.incrementAndGet(),
                 )
             }
+        }
         }
     }
 
@@ -9961,9 +9992,11 @@ class DualViewModel(
                 policyWriteSaving.remove(key)
                 disarmBlindClear()
                 _state.update { cur ->
-                    val base = if (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                    // R5-1：phase 僅在無 request 擁有之（無 pending）時才重置——
+                    // request 已安裝 pending 時由 request 擁有 QUEUED/SAVING。
+                    val base = if (cur.pendingPolicyWrite == null && activePolicyTx.get() == null && (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
                         cur.policyWritePhase == PolicyWritePhase.SAVING
-                    ) {
+                    )) {
                         cur.copy(
                             loading = false,
                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -9980,18 +10013,39 @@ class DualViewModel(
             }
             try { refreshPolicyDraft() } catch (_: Throwable) { }
         }
+        // R5-1：註冊鍵＋相位翻轉與 request 的 final CAS 同一臨界區（policySettleLock）；
+        // 早前的 BUSY 快路徑門是無鎖預過濾，此處為權威重判。
         val key = "policy-clear:${clearGeneration.incrementAndGet()}"
         // A2-4: 鍵由 clearGeneration 單調遞增保證唯一，add 必成功；舊 BUSY
         // 帶不可達死分支，改為單純簿記（其餘 policy-* 觀測者用）。
-        inFlightWrites.add(key)
-        // Phase 3：clear 在途亦經 QUEUED→SAVING→IDLE（dialog 以 pending==null
-        // 關閉，phase 供 positive/negative 門控與「進行中請稍候」守衛觀測）。
-        _state.update { cur ->
-            if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
-            cur.copy(
-                policyWritePhase = PolicyWritePhase.QUEUED,
-                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-            )
+        synchronized(policySettleLock) {
+            // 權威重判（鎖內）：任一命中即 BUSY 拒絕，不註冊鍵、不動相位。
+            if (_state.value.pendingPolicyWrite != null) {
+                _state.update { cur ->
+                    cur.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+                }
+                return
+            }
+            if (inFlightWrites.any { it.startsWith("policy-") } || isPolicyReconcilingLocked()) {
+                _state.update { cur ->
+                    cur.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+                }
+                return
+            }
+            inFlightWrites.add(key)
+            // Test-only seam: park the clear after key registration but before
+            // the phase flip so tests can pin the scan→CAS window against a
+            // concurrent request's final check-and-install. Never set in production.
+            beforePolicyClearPhaseAssignSeamForTests?.let { it() }
+            // Phase 3：clear 在途亦經 QUEUED→SAVING→IDLE（dialog 以 pending==null
+            // 關閉，phase 供 positive/negative 門控與「進行中請稍候」守衛觀測）。
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
+                cur.copy(
+                    policyWritePhase = PolicyWritePhase.QUEUED,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                )
+            }
         }
         viewModelScope.launch {
             // Stage A：逾時交接槽（見 confirm）。
@@ -10018,7 +10072,10 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
+                                // R5-1：phase 僅在「無 request 擁有之」時才重置——
+                                // 已安裝 pending 或 activeTx 由 request 側擁有，
+                                // clear 的防禦性 abort 不得把 QUEUED 打回 IDLE。
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null && cur.pendingPolicyWrite == null) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -10050,7 +10107,10 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
+                                // R5-1：phase 僅在「無 request 擁有之」時才重置——
+                                // 已安裝 pending 或 activeTx 由 request 側擁有，
+                                // clear 的防禦性 abort 不得把 QUEUED 打回 IDLE。
+                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null && cur.pendingPolicyWrite == null) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -10111,7 +10171,9 @@ class DualViewModel(
                                         if (preCorrupt) PolicyText(PolicyTextKind.CORRUPT_DETECTED)
                                         else PolicyText(PolicyTextKind.REFRESH_FAILED),
                                     )
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    // R5-1：phase 僅在無 request 擁有之（無 pending）時才重置——
+                                    // request 已安裝 pending 時由 request 擁有 QUEUED/SAVING。
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyDraftKnown = false,
@@ -10146,7 +10208,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -10200,7 +10262,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -10246,7 +10308,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -10406,9 +10468,9 @@ class DualViewModel(
                                 preClaimTx = null
                                 markPolicyUnknownLocked()
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                                    if (cur.pendingPolicyWrite == null && (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
                                         cur.policyWritePhase == PolicyWritePhase.SAVING
-                                    ) {
+                                    )) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -10688,9 +10750,9 @@ class DualViewModel(
                                 preClaimTx = null
                                 disarmBlindClear()
                                 _state.update { cur ->
-                                    val base = if (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                                    val base = if (cur.pendingPolicyWrite == null && (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
                                         cur.policyWritePhase == PolicyWritePhase.SAVING
-                                    ) {
+                                    )) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -11059,17 +11121,32 @@ class DualViewModel(
         val armedRepairVersion = corruptRepairArmedVersion.get()
         val armedRepairFreshGen = corruptRepairArmedFreshGen.get()
         val armedRepairBaseRev = corruptRepairArmedBaseRev.get()
-        disarmCorruptRepair()
         val key = "policy-repair:${clearGeneration.incrementAndGet()}"
-        // A2-4: 鍵由 clearGeneration 單調遞增保證唯一，add 必成功；舊 BUSY
-        // 帶不可達死分支，改為單純簿記（其餘 policy-* 觀測者用）。
-        inFlightWrites.add(key)
-        _state.update { cur ->
-            if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
-            cur.copy(
-                policyWritePhase = PolicyWritePhase.QUEUED,
-                policyEpoch = policyPhaseEpoch.incrementAndGet(),
-            )
+        // R5-1（p43 對稱）：註冊鍵＋相位翻轉與 request 的 final CAS、clear 的權威
+        // 重判同屬一臨界區（policySettleLock）；早前 early gate 為無鎖預過濾，此處為
+        // 權威重判——pending／其他政策鍵／reconciling 任一命中即 BUSY 拒絕、不消费 arm；
+        // 與 confirm/clear/repair 的失敗語義一致（defer 保留 arm，待使用者再 tap）。
+        synchronized(policySettleLock) {
+            if (_state.value.pendingPolicyWrite != null ||
+                inFlightWrites.any { it.startsWith("policy-") } ||
+                isPolicyReconcilingLocked()
+            ) {
+                _state.update { cur ->
+                    cur.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+                }
+                return
+            }
+            disarmCorruptRepair()
+            // A2-4: 鍵由 clearGeneration 單調遞增保證唯一，add 必成功；舊 BUSY
+            // 帶不可達死分支，改為單純簿記（其餘 policy-* 觀測者用）。
+            inFlightWrites.add(key)
+            _state.update { cur ->
+                if (cur.policyWritePhase != PolicyWritePhase.IDLE) return@update cur
+                cur.copy(
+                    policyWritePhase = PolicyWritePhase.QUEUED,
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                )
+            }
         }
         viewModelScope.launch {
             // Stage M1 P1: repair is a first-class destructive PolicyTx (same
@@ -11129,7 +11206,7 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED && activePolicyTx.get() == null) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11156,7 +11233,7 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11187,7 +11264,7 @@ class DualViewModel(
                             inFlightWrites.remove(key)
                             policyWriteSaving.remove(key)
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11214,7 +11291,7 @@ class DualViewModel(
                             policyWriteSaving.remove(key)
                             markPolicyUnknownLocked()
                             _state.update { cur ->
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11267,7 +11344,7 @@ class DualViewModel(
                             markPolicyUnknownLocked()
                             _state.update { cur ->
                                 val knownMsg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH))
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11302,7 +11379,7 @@ class DualViewModel(
                             markPolicyUnknownLocked()
                             _state.update { cur ->
                                 val preMsg = policyText(PolicyText(PolicyTextKind.REFRESH_FAILED))
-                                if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                     cur.copy(
                                         loading = false,
                                         policyWritePhase = PolicyWritePhase.IDLE,
@@ -11341,7 +11418,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -11397,7 +11474,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -11468,7 +11545,7 @@ class DualViewModel(
                                 inFlightWrites.remove(key)
                                 policyWriteSaving.remove(key)
                                 _state.update { cur ->
-                                    if (cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
                                         cur.copy(
                                             loading = false,
                                             policyWritePhase = PolicyWritePhase.IDLE,
@@ -11623,9 +11700,9 @@ class DualViewModel(
                                     preClaimTx = null
                                     markPolicyUnknownLocked()
                                     _state.update { cur ->
-                                        if (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
+                                        if (cur.pendingPolicyWrite == null && (cur.policyWritePhase == PolicyWritePhase.QUEUED ||
                                             cur.policyWritePhase == PolicyWritePhase.SAVING
-                                        ) {
+                                        )) {
                                             cur.copy(
                                                 loading = false,
                                                 policyWritePhase = PolicyWritePhase.IDLE,
