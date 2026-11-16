@@ -338,6 +338,8 @@ jobs:
       # scripts/verify-release-sha256sums.sh from the repo (pinned wrapper of
       # the inline check this job used to carry), so the tree must be present.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Download verified APKs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -349,6 +351,15 @@ jobs:
       # release so a corrupted or tampered artifact never reaches it.
       - name: Verify SHA256SUMS before publish
         run: bash scripts/verify-release-sha256sums.sh
+      # F-4: re-verify the pinned release signer certificate against the APKs
+      # about to be attached, after the checksum gate. SHA256SUMS alone
+      # cannot catch a coherently substituted artifact (APKs + co-located
+      # sums replaced between signing and publish); the signer pin can. Same
+      # pin and same parser as the sign job — keep the two in sync.
+      - name: Re-verify release APK signer certificates
+        env:
+          EXPECTED_CERT_SHA256: "608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3"
+        run: bash scripts/verify-release-apk-signers.sh
       # Publish a GitHub Release with verified APKs + SHA256.
       - name: Publish Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

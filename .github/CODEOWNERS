@@ -41,6 +41,7 @@
 /scripts/check-exported-components.test.sh @samson910022
 /scripts/check-shizuku-provider.py @samson910022
 /scripts/check-shizuku-provider.test.sh @samson910022
+/scripts/verify-release-apk-signers.sh @samson910022
 /scripts/verify-release-sha256sums.sh @samson910022
 /scripts/verify-release-sha256sums.test.sh @samson910022
 /scripts/fixtures/ @samson910022
