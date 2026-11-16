@@ -1570,6 +1570,131 @@ class PolicyWriteTest {
         }
     }
 
+    // Phase 7 (PR#60 round-4 finding #p39 / R4-1)：背景寫入者（Dispatchers.IO 的
+    // refresh）在 guard 評估後、install 前把同一 VM 翻為 Unknown
+    //（policyDraftKnown=false）時，final check-and-install 必須 fail-closed：
+    // 不安裝 QUEUED pending、phase 保持 IDLE、msg 為 UNKNOWN_REFRESH(CHANNEL)、
+    // store 零觸碰；且 policyEpoch 不得回退（單調相位計數契約）。
+    @Test
+    fun p39_requestPolicyWrite_backgroundUnknownTransition_abortsInstallAndKeepsEpochMonotonic() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        seedSelection(vm)
+        val seamHit = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        // 讓 requester 停在 install 邊界（guard 皆已通過），主執行緒隨後觸發
+        // 背景 Unknown 轉換，再放行 requester 進入原子 check-and-install。
+        vm.beforePolicyPendingInstallSeamForTests = {
+            seamHit.countDown()
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val installErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val requester = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                installErrors.compareAndSet(null, t)
+            }
+        }
+        try {
+            requester.start()
+            assertTrue(seamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 背景轉換：store 變不可讀 → refresh → VM 翻 Unknown（政策草稿未知）。
+            fake.saved = null
+            vm.refreshPolicyDraft()
+            await(timeoutMs = 5_000L) { !vm.state.value.policyDraftKnown }
+            val epochAfterUnknown = vm.state.value.policyEpoch
+            release.countDown()
+            requester.join(5_000L)
+            assertFalse("requester 未於 5s 內結束", requester.isAlive)
+            installErrors.get()?.let { throw it }
+
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(
+                PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+                vm.state.value.msg,
+            )
+            assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.clearCalls)
+            // 單調相位計數：中止路徑不改寫 policyEpoch（abort 分支不執行
+            // incrementAndGet），故 policyEpoch 必須等於 Unknown 轉換後的值。
+            assertEquals(epochAfterUnknown, vm.state.value.policyEpoch)
+        } finally {
+            vm.beforePolicyPendingInstallSeamForTests = null
+            release.countDown()
+            if (requester.isAlive) requester.interrupt()
+        }
+    }
+
+    // Phase 7 (PR#60 round-4 code review, Optional)：requestPolicyWrite 在
+    // install 邊界若政策寫入 op 已在途（inFlightWrites 含 "policy-" 前綴 key），
+    // final check-and-install 必須 fail-closed：不安裝 QUEUED pending、phase 保持
+    // IDLE、msg 為 BUSY(INFO)、store 零觸碰、policyEpoch 不變。此 pin 鎖定新
+    // ladder 的 branch 3（install 邊界的 in-flight 政策操作分支）——p24 與原
+    // p39 測試皆未 pin 此分支。
+    @Test
+    fun p39_requestPolicyWrite_policyOpInFlightAtSeam_reportsBusyWithoutPending() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        seedSelection(vm)
+        val epochBefore = vm.state.value.policyEpoch
+        val seamHit = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        // 讓 requester 停在 install 邊界（guard 皆已通過），主執行緒隨後以反射
+        // 向 VM 私有 inFlightWrites 註冊合成在途政策 op key（newKeySet<String>，
+        // key 形如 "policy-test"），再放行 requester 進入原子 check-and-install。
+        vm.beforePolicyPendingInstallSeamForTests = {
+            seamHit.countDown()
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val installErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val requester = Thread {
+            try {
+                vm.requestPolicyWrite()
+            } catch (t: Throwable) {
+                installErrors.compareAndSet(null, t)
+            }
+        }
+        try {
+            requester.start()
+            assertTrue(seamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // 以反射註冊合成在途政策 op key（同 blindClear_busy_preservesArm 的
+            // 反射注入手法；不經 mutex，同步可觀測）。
+            val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            val inFlightKeys = f.get(vm) as MutableSet<String>
+            inFlightKeys.add("policy-test")
+            release.countDown()
+            requester.join(5_000L)
+            assertFalse("requester 未於 5s 內結束", requester.isAlive)
+            installErrors.get()?.let { throw it }
+
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.clearCalls)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
+        } finally {
+            vm.beforePolicyPendingInstallSeamForTests = null
+            // 移除合成在途 key（反射），避免跨測試污染；seam 亦一併清掉。
+            try {
+                val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                (f.get(vm) as MutableSet<String>).remove("policy-test")
+            } catch (_: Exception) {
+                // 反射失敗不得掩蓋原始斷言失敗。
+            }
+            release.countDown()
+            if (requester.isAlive) requester.interrupt()
+        }
+    }
+
     // Phase 5：harness 已改以 Known 為準（見 makeVm），此處鎖定 Known 載入的
     // 終態：Known＋草稿內容一致（非僅 harness 起步即真）。
     @Test
@@ -2976,10 +3101,24 @@ class PolicyWriteTest {
         return (f.get(vm) as MutableSet<String>).toSet()
     }
 
+    // 反射讀在途集合（Stage A review 補測：斷言無殘留）。
+    // 注意：直接對 live ConcurrentHashMap.newKeySet 的 keySet 做 toSet() 時，
+    // JDK 的 KeyIterator 在並發移除下可能拋 NoSuchElementException（CHM
+    // KeySetView iterator 的已知 hazard）。此處改以 HashSet 快照 + 有界重試
+    //（至多 3 次嘗試），仍全部失敗才 rethrow。
     private fun inFlightKeysOf(vm: DualViewModel): Set<String> {
         val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
         @Suppress("UNCHECKED_CAST")
-        return (f.get(vm) as MutableSet<String>).toSet()
+        val live = f.get(vm) as MutableSet<String>
+        var lastError: NoSuchElementException? = null
+        repeat(3) {
+            try {
+                return HashSet(live)
+            } catch (e: NoSuchElementException) {
+                lastError = e
+            }
+        }
+        throw lastError!!
     }
 
     private fun savingKeysOf(vm: DualViewModel): Set<String> {

@@ -1050,8 +1050,9 @@ class DualViewModel(
     // Phase7 (PR#60 round-3 finding #3) test seam: invoked in requestPolicyWrite
     // AFTER the early BUSY fast-path gates and the sanitized snapshot computation,
     // and IMMEDIATELY BEFORE the final atomic check-and-install _state.update
-    // (the load-bearing pending re-check happens inside that update's CAS retry
-    // loop — the early gate only filters the fast path). JVM tests use it to
+    // (the load-bearing pending/Unknown/in-flight re-checks happen inside that
+    // update's CAS retry loop — the early gate only filters the fast path).
+    // JVM tests use it to
     // park two concurrent requesters at the install boundary so the atomic
     // check-and-install decides the winner deterministically ("live pending
     // never superseded"). Production never sets it (null in production builds);
@@ -8594,16 +8595,27 @@ class DualViewModel(
         // Test-only seam: park callers at the install boundary so tests can pin
         // the race between two concurrent requesters. Never set in production.
         beforePolicyPendingInstallSeamForTests?.let { it() }
-        // Hoist the epoch increment OUT of the update lambda: incrementAndGet
-        // inside a CAS-retried StateFlow.update would be a side effect subject
-        // to retry (retry-unsafe even when the outcome is idempotent in count).
-        // The atomic update below is a pure check-and-install: a concurrent
-        // caller may have installed a live pending after this VM passed the
-        // early BUSY gate (the gate only filters the fast path — it cannot
-        // see other threads' updates). Losing that race lands in the
-        // pending-branch: report BUSY and keep the winner's pending intact —
-        // never supersede.
-        val epoch = policyPhaseEpoch.incrementAndGet()
+        // Final atomic check-and-install: re-validate the CURRENT guards
+        // against `cur` inside the CAS. A background writer (Dispatchers.IO
+        // refresh / reconciler) can flip this VM to Unknown / RECONCILING /
+        // revision-stale or register an in-flight policy op AFTER the early
+        // gates above ran but BEFORE this update commits — installing a
+        // QUEUED pending then would violate the Known-gate and could commit
+        // a regressed policyEpoch. The re-checks are pure reads (concurrent-
+        // set scan / re-entrant policySettleLock around pure reads /
+        // AtomicBoolean.get) — one deliberate exception:
+        // policyPhaseEpoch.incrementAndGet() re-allocates per CAS retry.
+        // That is load-bearing, NOT retry-unsafe: monotonicity requires the
+        // committed value to be fresh on every attempt — a hoisted allocation
+        // commits a stale, possibly regressed epoch (the exact race this
+        // closes). Matches the ~100 other call sites in this file.
+        // Abort branches report BUSY / UNKNOWN_REFRESH (CORRUPT_DETECTED when
+        // corrupt), never touch the store, never install a pending — confirm
+        // stays the only writer on the policy-write path.
+        // NOTE: checkOrphanDropAndRevisionStaleLocked() must NOT run here —
+        // it marks Unknown / bumps generations (not side-effect-free).
+        // Revision staleness is re-covered by policyRevisionStale.get() and
+        // by the confirm-time checks (unchanged).
         val generation = policyWriteGeneration.incrementAndGet()
         _state.update { cur ->
             if (cur.pendingPolicyWrite != null) {
@@ -8612,6 +8624,33 @@ class DualViewModel(
                 // filters the fast path — it cannot see other threads' updates).
                 // Losing the race lands us here: report BUSY and keep the winner's
                 // pending intact — never supersede.
+                cur.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.BUSY)),
+                    msgKind = MsgKind.INFO,
+                )
+            } else if (hookPolicyStore != null && !cur.policyDraftKnown) {
+                // Background transition to Unknown/Corrupt after the early gates
+                // (e.g. refresh found the store unreadable): fail closed, same
+                // wording as the early unknown gate. Store untouched; draft /
+                // phase left as-is — abort never installs a pending.
+                cur.copy(
+                    msg = policyText(
+                        PolicyText(
+                            if (cur.policyDraftCorrupt) PolicyTextKind.CORRUPT_DETECTED
+                            else PolicyTextKind.UNKNOWN_REFRESH,
+                        ),
+                    ),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            } else if (
+                inFlightWrites.any { it.startsWith("policy-") } ||
+                isPolicyReconcilingLocked() ||
+                policyRevisionStale.get()
+            ) {
+                // Policy op in flight, reconciler holds the settle lock, or an
+                // unseen revision was detected since the early gates: BUSY.
+                // All three are side-effect-free reads (re-entrant lock around
+                // pure reads / concurrent-set scan / AtomicBoolean.get).
                 cur.copy(
                     msg = policyText(PolicyText(PolicyTextKind.BUSY)),
                     msgKind = MsgKind.INFO,
@@ -8631,7 +8670,10 @@ class DualViewModel(
                         },
                     ),
                     policyWritePhase = PolicyWritePhase.QUEUED,
-                    policyEpoch = epoch,
+                    // Allocated INSIDE the CAS lambda on purpose: the monotonic
+                    // policyEpoch contract requires a fresh value per retry.
+                    // Do NOT hoist this out of the update lambda.
+                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
                 )
             }
         }
