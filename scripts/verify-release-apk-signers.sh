@@ -8,13 +8,16 @@
 # gate alone proves byte-integrity against the sums file; this gate proves
 # the bytes were signed by the pinned release key. Fail-closed, in order:
 #
-#   1. Usage/environment validation: an explicit publish directory argument
-#      (default: release-publish/, a missing default is a usage error),
-#      ANDROID_HOME pointing at an SDK with build-tools (the same assumption
-#      the sign job makes — ubuntu-latest provides build-tools), and
+#   1. Usage/staged-set validation: an explicit publish directory argument
+#      (default: release-publish/, a missing default is a usage error), the
+#      staged set must contain ONLY SHA256SUMS.txt and *.apk (any letter
+#      case) as REGULAR non-symlink files, and there must be at least one
+#      APK — all checked before any SDK/tool is needed.
+#   2. ANDROID_HOME/build-tools resolution (the same assumption the sign
+#      job makes — ubuntu-latest provides build-tools) and
 #      EXPECTED_CERT_SHA256 (64 hex chars, the same pin hardcoded in the
 #      sign job) — all checked before any APK is read.
-#   2. For every *.apk in the publish directory: `apksigner verify
+#   3. For every *.apk in the publish directory: `apksigner verify
 #      --verbose --print-certs` must succeed, and its output is fed to
 #      scripts/parse-apksigner-output.sh — the EXACT parser and EXACT pin
 #      the sign job uses — which enforces a single signer and the pinned
@@ -59,6 +62,39 @@ if [ ! -d "$EXPECT_DIR" ]; then
   exit 2
 fi
 
+# Extension allowlist, no SDK required: the staged set may contain ONLY
+# SHA256SUMS.txt and *.apk (any letter case), as REGULAR non-symlink files.
+# (The sums gate accepts case-insensitive .apk extensions; a case-sensitivity
+# mismatch here would publish a cert-unverified APK — this check is the
+# belt-and-braces guard for that class.)
+unexpected=()
+while IFS= read -r f; do
+  base="$(basename "$f")"
+  case "$base" in
+    SHA256SUMS.txt|*.[aA][pP][kK]) ;;
+    *) unexpected+=("$base"); ;;
+  esac
+done < <(find "$EXPECT_DIR" -mindepth 1 -maxdepth 1 -print)
+if [ "${#unexpected[@]}" -gt 0 ]; then
+  echo "::error::unexpected file(s) staged for release (only SHA256SUMS.txt and *.apk allowed): ${unexpected[*]}" >&2
+  exit 1
+fi
+
+shopt -s nullglob nocaseglob
+apks=("$EXPECT_DIR"/*.apk)
+if [ "${#apks[@]}" -eq 0 ]; then
+  echo "::error::No release APKs found in $EXPECT_DIR; refusing to publish an empty release." >&2
+  exit 1
+fi
+for apk in "${apks[@]}"; do
+  if [ ! -f "$apk" ] || [ -L "$apk" ]; then
+    echo "::error::not a regular file (or a symlink): $apk" >&2
+    exit 1
+  fi
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Same ANDROID_HOME/build-tools assumption as the sign job on ubuntu-latest.
 if [ -z "${ANDROID_HOME:-}" ] || [ ! -d "$ANDROID_HOME/build-tools" ]; then
   echo "::error::ANDROID_HOME build-tools missing; cannot verify signatures." >&2
@@ -85,15 +121,6 @@ if ! [[ "$EXPECTED_RAW" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-shopt -s nullglob
-apks=("$EXPECT_DIR"/*.apk)
-if [ "${#apks[@]}" -eq 0 ]; then
-  echo "::error::No release APKs found in $EXPECT_DIR; refusing to publish an empty release." >&2
-  exit 1
-fi
-
 count=0
 for apk in "${apks[@]}"; do
   verify_output="$("$apksigner" verify --verbose --print-certs "$apk" 2>&1)" || {
@@ -102,8 +129,7 @@ for apk in "${apks[@]}"; do
     exit 1
   }
   if ! EXPECTED_CERT_SHA256="$EXPECTED_CERT_SHA256" bash "$SCRIPT_DIR/parse-apksigner-output.sh" <<< "$verify_output"; then
-    printf '%s
-' "$verify_output"
+    printf '%s\n' "$verify_output"
     echo "::error::Signer/certificate check FAILED for $apk; refusing to publish." >&2
     exit 1
   fi
