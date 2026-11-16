@@ -1823,8 +1823,14 @@ class PolicyWriteTest {
             assertNull(vm.state.value.pendingPolicyWrite)
             assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
             assertEquals(epochBefore, vm.state.value.policyEpoch)
-            // 先放行 requester：A 醒來後在 policySettleLock 上等待（B 持鎖）。
+            // Release request first, then prove it actually reached the monitor and
+            // BLOCKED behind clear's reservation. This removes the scheduler
+            // ambiguity that previously made the ordering assertion vacuous.
             requestRelease.countDown()
+            await(timeoutMs = 5_000L) { requester.state == Thread.State.BLOCKED }
+            assertNull("request must not install while clear owns reservation", vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
             // 放行 clear：B 翻 QUEUED（epoch+1）、退出臨界區並 launch 清除協程。
             releaseClear.countDown()
             clearer.join(5_000L)
@@ -1875,6 +1881,73 @@ class PolicyWriteTest {
             if (clearer.isAlive) {
                 clearer.join(1_000L)
                 if (clearer.isAlive) clearer.interrupt()
+            }
+        }
+    }
+
+    // Post-merge R5-1 regression: a second clear arriving after the first clear
+    // registered its key, but BEFORE the first clear projects QUEUED, must be
+    // refused without allocating a second operation or advancing the phase epoch.
+    // The first clear is parked under policySettleLock, so this checks the
+    // otherwise easily missed IDLE + in-flight reservation window directly.
+    @Test
+    fun p44_clearReservation_secondClearBusyDoesNotAllocateOrAdvanceEpoch() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        val epochBefore = vm.state.value.policyEpoch
+        val registered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val error = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        vm.beforePolicyClearPhaseAssignSeamForTests = {
+            registered.countDown()
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        val first = Thread {
+            try {
+                vm.clearPolicyDraft()
+            } catch (t: Throwable) {
+                error.compareAndSet(null, t)
+            }
+        }
+        try {
+            first.start()
+            assertTrue("first clear must register before phase assignment", registered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val keysBefore = inFlightKeysOf(vm).filter { it.startsWith("policy-clear:") }.toSet()
+            assertEquals("exactly one clear reservation", 1, keysBefore.size)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
+
+            // The second clear takes the early BUSY gate. It must not enter
+            // the locked phase-update path, touch the store, or register a key.
+            vm.clearPolicyDraft()
+            assertEquals(keysBefore, inFlightKeysOf(vm).filter { it.startsWith("policy-clear:") }.toSet())
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(0, fake.clearCalls)
+
+            release.countDown()
+            first.join(5_000L)
+            assertFalse("first clear did not finish registration", first.isAlive)
+            error.get()?.let { throw it }
+            await(timeoutMs = 5_000L) {
+                fake.clearCalls == 1 &&
+                    vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    inFlightKeysOf(vm).none { it.startsWith("policy-") }
+            }
+            assertEquals("a BUSY second clear must not delete again", 1, fake.clearCalls)
+            assertEquals(1, fake.saveCalls)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertTrue(vm.state.value.policyEpoch > epochBefore)
+        } finally {
+            vm.beforePolicyClearPhaseAssignSeamForTests = null
+            release.countDown()
+            if (first.isAlive) {
+                first.join(1_000L)
+                if (first.isAlive) first.interrupt()
             }
         }
     }
