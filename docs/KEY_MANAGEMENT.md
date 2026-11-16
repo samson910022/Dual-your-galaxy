@@ -42,6 +42,43 @@ CI / Release:
   Push tags `v*` trigger the same workflow; re-verify on first real `v*`
   or after rotation/workflow change. Green non-tag CI does not prove the
   tag path (dry-run tag/Release cleaned per #5).
+- Pre-release signer gate (PR #60 round 4):
+  - What PR CI now proves (round 4): the shared apksigner-output parser
+    (`scripts/parse-apksigner-output.sh`, the exact parser and pin the sign
+    job and the publish gate use) accepts the current apksigner output
+    family — one certificate SHA-256 digest line per verified scheme
+    (`V2 Signer:`, `V2.0 Signer:`, `V3 Signer:`, `V3.0 Signer:`,
+    `V3.1 Signer:`, `V3.2 Signer:`, `V4 Signer:`, legacy `Signer #1 `)
+    — the `V2.0`/`V3.1`/`V3.2`/`V4` shapes are pinned by synthetic cases
+    in the parser self-test (verified locally); `V2` and `V3.0` are also
+    verified end-to-end against real build-tools-37 apksigner output —
+    all carrying the same certificate — and rejects conflicting digests
+    across scheme lines and multiple signers. The publish signer gate
+    (`scripts/verify-release-apk-signers.sh`) is additionally exercised
+    end-to-end against a REAL throwaway-key-signed APK built and signed in
+    the PR CI job itself (aapt2 build, `keytool` throwaway key, `apksigner
+    sign`): the gate accepts the throwaway-key APK with the matching pin
+    and rejects an identical APK signed with a different throwaway key
+    (`PR60_SIGNER_TEST_REQUIRE_SDK=1` is set in PR CI so a runner image
+    without an Android SDK fails loudly instead of silently skipping).
+    Neither arm uses or proves the real release key — PR CI says nothing
+    about the release fingerprint's presence in the release keystore.
+  - What remains REQUIRED before any real `v*` release (NOT proven by PR CI):
+    - a controlled dry-run tag/Release pushed through BOTH jobs
+      (sign, then publish);
+    - download the published assets and re-verify them against
+      `SHA256SUMS.txt` and the pinned certificate fingerprint
+      (`60:8E:67:4F:CC:D2:35:C1:D7:AB:93:BE:E8:7F:A1:C8:FB:76:1D:EB:7C:3A:8D:00:60:A0:7D:48:89:86:61:E3`
+      -> `608e674fccd235c1d7ab93bee87fa1c8fb761deb7c3a8d0060a07d48898661e3`);
+    - confirm `softprops/action-gh-release` attached EXACTLY the staged
+      assets (no extra, no missing);
+    - confirm the publish job's apksigner/build-tools resolution on the
+      runner used.
+  - The signer gate fails closed if `EXPECTED_CERT_SHA256` is unset/malformed
+    or build-tools are absent — by design; do not weaken it to make a dry
+    run green. None of the remaining items above are done merely because
+    PR CI is green, and they must not be claimed done until a dry run has
+    actually verified them.
 - Local sign (complete — pass alias and both passwords explicitly):
 
   ```bash
