@@ -1,0 +1,52 @@
+# CODEOWNERS — supply-chain-critical paths (single maintainer).
+#
+# Why this file exists: these paths define what the build runs and what CI
+# verifies about the shipped APKs — the provider guard source, the parity
+# checker and artifact verifier (and their self-tests), the dependency
+# verification metadata and version catalog, the Gradle wrapper, and the
+# entire CI/workflow surface. A malicious or accidental change to any of
+# them reaches every release, so they are all routed to the maintainer for
+# review.
+#
+# Single maintainer note: this repository has exactly one maintainer, so
+# CODEOWNERS requests their review but cannot enforce approval on its own —
+# it must be paired with branch protection (required review / do-not-merge
+# without owner review) for the guard to hold. Keep this list in sync with
+# the supply-chain review findings; do not widen it to cover everything
+# (noise defeats review). Branch-protection pairing requirement remains.
+/app/src/main/java/com/galaxydual/plus/GuardXposedProvider.kt @samson910022
+/hook/src/main/java/com/galaxydual/hook/ @samson910022
+/app/src/main/java/com/galaxydual/plus/SuCmdGateway.kt @samson910022
+/app/src/main/java/com/galaxydual/plus/ShizukuCmdGateway.kt @samson910022
+/app/src/main/AndroidManifest.xml @samson910022
+/scripts/check-provider-parity.py @samson910022
+/scripts/check-exported-components.py @samson910022
+/scripts/verify-release-artifacts.sh @samson910022
+/scripts/verify-release-artifacts.test.sh @samson910022
+/gradle/verification-metadata.xml @samson910022
+/gradle/libs.versions.toml @samson910022
+/gradle/wrapper/gradle-wrapper.jar @samson910022
+/gradle/wrapper/gradle-wrapper.properties @samson910022
+/.github/workflows/ @samson910022
+/.github/CODEOWNERS @samson910022
+/app/build.gradle.kts @samson910022
+/gradle.properties @samson910022
+/settings.gradle.kts @samson910022
+/build.gradle.kts @samson910022
+/scripts/verify-wrapper.sh @samson910022
+/gradlew @samson910022
+/gradlew.bat @samson910022
+/scripts/parse-apksigner-output.sh @samson910022
+/scripts/parse-apksigner-output.test.sh @samson910022
+/scripts/check-provider-parity.test.sh @samson910022
+/scripts/check-exported-components.test.sh @samson910022
+/scripts/check-shizuku-provider.py @samson910022
+/scripts/check-shizuku-provider.test.sh @samson910022
+/scripts/verify-release-apk-signers.sh @samson910022
+/scripts/verify-release-apk-signers.test.sh @samson910022
+/scripts/verify-release-sha256sums.sh @samson910022
+/scripts/verify-release-sha256sums.test.sh @samson910022
+/scripts/fixtures/ @samson910022
+/scripts/ci-retry-guard.sh @samson910022
+/scripts/ci-retry-guard.test.sh @samson910022
+/scripts/ci-pyyaml-reqs.txt @samson910022

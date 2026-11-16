@@ -4,7 +4,18 @@
 # release workflow (release.yml, release APKs) to avoid drift.
 #
 # Usage: verify-release-artifacts.sh <apk> [<apk>...]
+# NOTE: run from the repository root — several checks read repo-relative
+# paths (app/build.gradle.kts). The checker path itself is resolved via the
+# script's location, so this script works from any CWD; the repo-root
+# assumption is only for repo files.
 set -euo pipefail
+
+# fail() is defined before its first use (the versionName gate below calls it).
+# Body is byte-identical to the historical definition.
+fail() {
+  echo "::error::$*" >&2
+  exit 1
+}
 
 if [ "$#" -eq 0 ]; then
   echo "::error::usage: $0 <apk>..." >&2
@@ -14,6 +25,12 @@ fi
 APP_VER=""
 if [ -f "app/build.gradle.kts" ]; then
   APP_VER="$(sed -n 's/.*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1 | tr -d ' \r' || true)"
+fi
+if [ -z "$APP_VER" ]; then
+  # The module.prop version sync check below is the only guard against shipping
+  # an app bundle whose versionName disagrees with the xposed module.prop.
+  # Fail closed when it cannot be run — never silently degrade.
+  fail "unable to parse versionName from app/build.gradle.kts (wrong CWD, or the file is missing/malformed)"
 fi
 
 AAPT2=""
@@ -28,10 +45,9 @@ if [ -z "$AAPT2" ] || [ ! -x "$AAPT2" ]; then
   exit 1
 fi
 
-fail() {
-  echo "::error::$*" >&2
-  exit 1
-}
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROVIDER_PARITY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/provider-parity.XXXXXX")"
+trap 'rm -rf "$PROVIDER_PARITY_TMP"' EXIT
 
 for apk in "$@"; do
   if [ ! -f "$apk" ]; then
@@ -39,11 +55,137 @@ for apk in "$@"; do
   fi
   echo "=== verifying $apk ==="
 
-  # 1. Packaged manifest declares ShizukuProvider (not just source).
-  if [ "$("$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml 2>/dev/null | grep -Fc "rikka.shizuku.ShizukuProvider" || true)" -gt 0 ]; then
-    echo "FOUND ShizukuProvider in packaged manifest"
+  # APK package + manifest dump, shared by step 1 (ShizukuProvider
+  # element-scope gate) and step 1b (GuardXposedProvider parity). Derived once
+  # from the APK itself (aapt2 dump packagename), never from the filename — a
+  # renamed *-debug*.apk built from release code must not slip the debug
+  # authority past the release gate. The mapping is exact and anything else
+  # fails closed: com.galaxydual.plus.debug -> debug authorities;
+  # com.galaxydual.plus -> release authorities (everything else: hard fail).
+  if ! APK_PACKAGE="$("$AAPT2" dump packagename "$apk" 2>/dev/null)"; then
+    fail "aapt2 dump packagename failed for $apk"
+  fi
+  APK_PACKAGE="$(printf '%s' "$APK_PACKAGE" | tr -d '[:space:]')"
+  case "$APK_PACKAGE" in
+    com.galaxydual.plus.debug)
+      EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService"
+      EXPECTED_AUTHORITY_SHIZUKU="com.galaxydual.plus.debug.shizuku" ;;
+    com.galaxydual.plus)
+      EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService"
+      EXPECTED_AUTHORITY_SHIZUKU="com.galaxydual.plus.shizuku" ;;
+    *) fail "unsupported APK package name '$APK_PACKAGE' in $apk (expected exactly 'com.galaxydual.plus.debug' or 'com.galaxydual.plus')" ;;
+  esac
+  MANIFEST_DUMP_FILE="$PROVIDER_PARITY_TMP/$(basename -- "$apk").xmltree.txt"
+  if ! "$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml > "$MANIFEST_DUMP_FILE" 2>/dev/null; then
+    fail "aapt2 dump of AndroidManifest.xml failed for $apk"
+  fi
+  if [ ! -s "$MANIFEST_DUMP_FILE" ]; then
+    fail "aapt2 dump of AndroidManifest.xml produced no output for $apk"
+  fi
+
+  # 1. Packaged manifest declares exactly one ShizukuProvider <provider> with
+  #    the full element-scoped contract (all five on the SAME element):
+  #      android:name EXACTLY "rikka.shizuku.ShizukuProvider"
+  #      android:authorities EXACTLY "<applicationId>.shizuku"
+  #        (debug: com.galaxydual.plus.debug.shizuku; release:
+  #         com.galaxydual.plus.shizuku — derived from the actual
+  #         applicationId, same way EXPECTED_AUTHORITY is derived; the debug
+  #         authority shows up verbatim in the merged debug manifest)
+  #      android:exported="true"
+  #      android:multiprocess="false"
+  #      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+  #    Parsed from the aapt2 xmltree dump by scripts/check-shizuku-provider.py
+  #    (the element/attribute idiom is shared with scripts/check-provider-parity.py:
+  #    an `E:` line sets the current element; `A: .../android:<name>(0x<hex>)=<value>`
+  #    lines set fields on it). An unanchored substring match would also admit
+  #    the class name inside an unrelated attribute value, and attribute lines
+  #    alone say nothing about WHICH element carries them. Fails closed
+  #    (::error:: + exit 1) on: a missing provider, a wrong
+  #    authority/exported/multiprocess/permission, or any parse oddity.
+  #    Division of labor: this step pins the ShizukuProvider element-scoped
+  #    (name+authority+exported+multiprocess+permission) on the packaged
+  #    manifest; step 1b pins the GuardXposedProvider (name+authority parity,
+  #    via scripts/check-provider-parity.py); step 2 pins the ShizukuProvider
+  #    class in the DEX. ShizukuProvider is not a trust boundary for
+  #    GalaxyExecService (see the sharedUserId note in AndroidManifest.xml).
+  #    Fixtures in scripts/fixtures/shizuku-provider/ run via
+  #    scripts/check-shizuku-provider.test.sh (wired into android.yml build job
+  #    next to the provider-parity self-test); keep the two in sync in the
+  #    same change.
+  if ! python3 "$SCRIPT_DIR/check-shizuku-provider.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE" --authority "$EXPECTED_AUTHORITY_SHIZUKU"; then
+    fail "ShizukuProvider element-scoped manifest gate failed for $apk"
+  fi
+
+  # 1d. Packaged manifest exports ONLY the allowlisted components (inventory
+  #     gate / new-surface tripwire). Step 1 above pins the ShizukuProvider
+  #     element-scoped, step 1b pins the GuardXposedProvider (name + authority
+  #     parity) — but NEITHER sees an ADDITIONAL exported <provider>/<service>/
+  #     <receiver>/<activity> at an unpinned authority/name, and neither
+  #     sees a weakened GuardXposedProvider.kt (that remains with human
+  #     review + CODEOWNERS). Enforced here by parsing the SAME
+  #     $MANIFEST_DUMP_FILE (aapt2 mode; scripts/check-exported-components.py,
+  #     fixtures and the checker's regression net run via
+  #     scripts/check-exported-components.test.sh (wired into android.yml build
+  #     job next to the provider-parity self-test); keep the two in sync in the
+  #     same change.). Loud hard-fail, never a skip.
+  if ! python3 "$SCRIPT_DIR/check-exported-components.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE"; then
+    fail "exported-components inventory gate failed for $apk"
+  fi
+
+  # 1b. Packaged manifest provisions exactly one GuardXposedProvider at the
+  #     expected authority — name and authority on the SAME <provider>
+  #     element, exported=true, no android:permission, zero libxposed
+  #     XposedProvider nodes anywhere, and zero wrong-element occurrences of
+  #     the GuardXposedProvider name (e.g. an <activity>). APK_PACKAGE /
+  #     EXPECTED_AUTHORITY / MANIFEST_DUMP_FILE were derived above (shared
+  #     with step 1). Enforced by parsing the aapt2 xmltree dump
+  #     (scripts/check-provider-parity.py; fixtures in
+  #     scripts/fixtures/provider-parity/ run via scripts/check-provider-parity.test.sh).
+  #     Loud hard-fail, never a skip: CI has the SDK, and a
+  #     silent pass here would mask a manifest-merge regression shipping the
+  #     unguarded (exported, no-permission) provider. Variant handling: the
+  #     expected authority is derived from the APK's ACTUAL applicationId
+  #     (aapt2 dump packagename), never from the APK filename — a renamed
+  #     *-debug*.apk built from release code must not slip the debug
+  #     authority past the release gate (PR CI invokes this on the debug
+  #     APK, whose applicationIdSuffix=.debug; the release APK carries
+  #     com.galaxydual.plus, no .debug). The mapping is exact and anything
+  #     else fails closed: com.galaxydual.plus.debug -> debug authority;
+  #     com.galaxydual.plus -> release authority (and only a release-
+  #     expected APK carrying the .debug authority fails the leak guard).
+  if ! python3 "$SCRIPT_DIR/check-provider-parity.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE" --authority "$EXPECTED_AUTHORITY"; then
+    fail "GuardXposedProvider provider parity check failed for $apk"
+  fi
+  if [ "$EXPECTED_AUTHORITY" = "com.galaxydual.plus.XposedService" ] \
+    && grep -qF 'com.galaxydual.plus.debug.XposedService' "$MANIFEST_DUMP_FILE"; then
+    fail "release-expected APK carries the debug authority (com.galaxydual.plus.debug.XposedService): $apk"
+  fi
+  echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
+
+  # 1c. APK binary manifest has no sharedUserId (UTF-16LE + UTF-8 string-pool
+  #     scan of the raw bytes; same check as android.yml's D3(b)). The source
+  #     gate (C4) cannot catch a manifest transform or library merge that
+  #     injects android:sharedUserId after source — the binary manifest in the
+  #     shipped APK is what runs (uid gate would admit siblings). The embedded
+  #     python prints OK or FAIL itself; exit 1 routes to fail(). Decoded
+  #     strings are lowercased and matched against 'shareduserid' so the scan
+  #     is case-insensitive (same check as android.yml's D3(b)).
+  if unzip -p "$apk" AndroidManifest.xml | python3 -c '
+import sys
+data = sys.stdin.buffer.read()
+if not data:
+    print("FAIL: APK binary AndroidManifest.xml is empty or unreadable")
+    sys.exit(1)
+t16 = data.decode("utf-16-le", errors="ignore").lower()
+t8 = data.decode("utf-8", errors="ignore").lower()
+if "shareduserid" in t16 or "shareduserid" in t8:
+    print("FAIL: sharedUserId string found in APK binary AndroidManifest.xml")
+    sys.exit(1)
+print("OK: no sharedUserId in APK binary AndroidManifest.xml")
+' ; then
+    :
   else
-    fail "ShizukuProvider not found in packaged manifest of $apk"
+    fail "sharedUserId scan failed or matched for $apk"
   fi
 
   # 2. ShizukuProvider survives into the released DEX (exact descriptor).

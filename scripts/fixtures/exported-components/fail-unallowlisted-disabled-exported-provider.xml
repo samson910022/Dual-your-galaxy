@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- fail-unallowlisted-disabled-exported-provider: the 4 allowlisted
+     components PLUS an exported+disabled <provider> (com.example.QuietProvider,
+     android:enabled="false"). android:enabled is only the install-time default
+     and can be flipped at runtime with PackageManager.setComponentEnabledSetting(),
+     so the gate must treat it exactly like an enabled exported component:
+     not in the allowlist ⇒ the gate must fail. Regression tripwire for
+     "add it disabled, enable it at runtime" bypasses. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.galaxydual.plus.debug">
+    <application android:label="Galaxy Dual Plus">
+        <activity android:name="com.galaxydual.plus.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <provider android:name="com.example.QuietProvider"
+            android:authorities="com.example.quiet"
+            android:exported="true"
+            android:enabled="false" />
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.galaxydual.plus.debug.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <provider
+            android:name="com.galaxydual.plus.GuardXposedProvider"
+            android:authorities="com.galaxydual.plus.debug.XposedService"
+            android:exported="true" />
+        <receiver
+            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

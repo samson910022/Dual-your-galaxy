@@ -38,16 +38,30 @@ class HookDiagnosisTest {
         }
     }
 
+    // Six-command stub table (one `cat` per marker path): serves the
+    // system_server per-scope file and the daagent legacy single-file;
+    // the other four paths exit 1. The union yields both scopes.
     private fun servingGateway(privilege: Privilege): FakeCatGateway =
         FakeCatGateway(privilege) { cmd ->
             when (cmd) {
-                "cat ${HookMarker.MARKER_PATH}" ->
+                "cat ${HookMarker.MARKER_PATH_SYSTEM_SERVER}" ->
                     CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER), 9L), "")
                 "cat ${HookMarker.LEGACY_MARKER_PATH}" ->
                     CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 10L), "")
                 else -> CmdResult(1, "", "not found")
             }
         }
+
+    // The six production marker paths as File objects (used by the
+    // production-overload tests).
+    private fun sixProductionPaths(): List<File> = listOf(
+        File(HookMarker.MARKER_PATH_SYSTEM_SERVER),
+        File(HookMarker.MARKER_PATH_DAAGENT),
+        File(HookMarker.LEGACY_MARKER_PATH_SYSTEM_SERVER),
+        File(HookMarker.LEGACY_MARKER_PATH_DAAGENT),
+        File(HookMarker.MARKER_PATH),
+        File(HookMarker.LEGACY_MARKER_PATH),
+    )
 
     // (a) Marker exists but direct reads are denied (app-uid EACCES) and no
     // true channel is available: UNKNOWN_NO_DIAGNOSTIC, never INACTIVE --
@@ -73,6 +87,28 @@ class HookDiagnosisTest {
         assertFalse(diagnosis.active)
     }
 
+    // PR #60 r6 Phase 5 (Finding #5): gateway full back-compat — every
+    // per-scope `cat` fails, only the LEGACY single-file serves BOTH scopes.
+    // The union must still surface both; viaGateway=true; all six cats issued.
+    @Test fun diagnosis_gatewayLegacySingleFileServesBothScopesIsActive() = runBlocking {
+        val legacyOnlyGateway = FakeCatGateway(Privilege.SHELL) { cmd ->
+            when (cmd) {
+                "cat ${HookMarker.LEGACY_MARKER_PATH}" ->
+                    CmdResult(0, HookMarker.buildContent(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), 12L), "")
+                else -> CmdResult(1, "", "not found")
+            }
+        }
+        val diagnosis = diagnoseHookState(
+            List(6) { MarkerRead.Denied },
+            listOf(legacyOnlyGateway),
+        )
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertTrue(diagnosis.active)
+        assertTrue(diagnosis.viaGateway)
+        assertEquals(setOf(HookMarker.SCOPE_SYSTEM_SERVER, HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
+        assertEquals(6, legacyOnlyGateway.calls)
+    }
+
     // (b) A SHIZUKU diagnostic gateway that can `cat` the marker yields
     // ACTIVE even though direct reads failed (the explicit-LSPosed case:
     // diagnosis rides the true channel, not the selected NoOp gateway).
@@ -90,7 +126,7 @@ class HookDiagnosisTest {
         )
     }
 
-    // (c) Positively-read absence (both paths checked, nothing there) with
+    // (c) Positively-read absence (all six paths checked, nothing there) with
     // no gateway needed reads as INACTIVE with the legacy "not detected" text.
     @Test fun diagnosis_readableButMissingIsInactive() = runBlocking {
         val diagnosis = diagnoseHookState(
@@ -125,8 +161,8 @@ class HookDiagnosisTest {
         }
     }
 
-    // A usable gateway was attempted but nothing could be read (both `cat`
-    // paths failed): UNKNOWN_UNREADABLE -- a path existed, reading failed.
+    // A usable gateway was attempted but nothing could be read (all six
+    // `cat`s failed): UNKNOWN_UNREADABLE -- a path existed, reading failed.
     @Test fun diagnosis_failedGatewayAttemptIsUnreadable() = runBlocking {
         val failing = FakeCatGateway(Privilege.SHELL) { CmdResult(1, "", "denied") }
         val diagnosis = diagnoseHookState(
@@ -152,6 +188,55 @@ class HookDiagnosisTest {
         assertEquals(0, noop.calls)
     }
 
+    // Legacy back-compat: a per-scope primary readable-but-blank plus a
+    // legacy single-file containing daagent still surfaces daagent (blank
+    // is empty evidence, not malformed; legacy files stay read-compat).
+    @Test fun diagnosis_perScopeBlankLegacyStillSurfacesScope() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            listOf(
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(""),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(HookMarker.buildContent(setOf(HookMarker.SCOPE_DAAGENT), 4L)),
+            ),
+            emptyList(),
+        )
+        assertEquals(HookStatus.ACTIVE, diagnosis.status)
+        assertEquals(setOf(HookMarker.SCOPE_DAAGENT), diagnosis.scopes)
+    }
+
+    // All six direct paths denied (app-uid EACCES), no gateway:
+    // UNKNOWN_NO_DIAGNOSTIC — absence cannot be claimed.
+    @Test fun diagnosis_allSixDeniedWithoutGatewayIsUnknownNoDiagnostic() = runBlocking {
+        val diagnosis = diagnoseHookState(
+            List(6) { MarkerRead.Denied },
+            emptyList(),
+        )
+        assertEquals(HookStatus.UNKNOWN_NO_DIAGNOSTIC, diagnosis.status)
+        assertFalse(diagnosis.active)
+    }
+
+    // Malformed ANYWHERE blocks INACTIVE even with five positively-absent
+    // paths and six gateway cats failing: UNKNOWN_UNREADABLE, never INACTIVE.
+    @Test fun diagnosis_malformedAnywhereBlocksInactive() = runBlocking {
+        val failing = FakeCatGateway(Privilege.ROOT) { CmdResult(1, "", "denied") }
+        val diagnosis = diagnoseHookState(
+            listOf(
+                MarkerRead.Readable("garbage\n"),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+                MarkerRead.Readable(null),
+            ),
+            listOf(failing),
+        )
+        assertNotEquals(HookStatus.INACTIVE, diagnosis.status)
+        assertFalse(diagnosis.active)
+    }
+
     // A direct hit short-circuits: no gateway `cat` is attempted.
     @Test fun diagnosis_directHitShortCircuitsGateway() = runBlocking {
         val gateway = FakeCatGateway(Privilege.SHELL) { CmdResult(1, "", "unused") }
@@ -172,7 +257,7 @@ class HookDiagnosisTest {
     // reproduce an un-traversable parent dir with chmod, so a chmod-based
     // test would be flaky by construction.
     @Test fun readDirectMarker_accessDeniedReaderMapsToDenied() {
-        val file = File("/data/system/galaxydual_hook.active")
+        val file = File(HookMarker.MARKER_PATH)
         val read = readDirectMarker(file) { throw AccessDeniedException(it.path) }
         assertEquals(MarkerRead.Denied, read)
     }
@@ -180,7 +265,7 @@ class HookDiagnosisTest {
     // Other denial spellings (SecurityManager/SELinux, generic EIO) are
     // likewise unknown, never positive absence.
     @Test fun readDirectMarker_denialVariantsMapToDenied() {
-        val file = File("/data/system/galaxydual_hook.active")
+        val file = File(HookMarker.MARKER_PATH)
         assertEquals(MarkerRead.Denied, readDirectMarker(file) { throw SecurityException("SELinux") })
         assertEquals(MarkerRead.Denied, readDirectMarker(file) { throw IOException("EIO") })
     }
@@ -190,8 +275,7 @@ class HookDiagnosisTest {
     // gateway) must stay UNKNOWN -- never INACTIVE, never "未偵測到".
     @Test fun diagnosis_productionOverloadDeniedWithoutGatewayIsUnknown() = runBlocking {
         val diagnosis = diagnoseHookState(
-            File("/data/system/galaxydual_hook.active"),
-            File("/data/local/tmp/galaxydual_hook.active"),
+            sixProductionPaths(),
             emptyList(),
             reader = { throw AccessDeniedException(it.path) },
         )
@@ -209,15 +293,15 @@ class HookDiagnosisTest {
         assertEquals(MarkerRead.Readable(null), readDirectMarker(missing))
     }
 
-    // ... and two truly-missing files through the production overload still
-    // diagnose INACTIVE (positive absence, legacy "not detected" text).
+    // ... and six truly-missing files through the production overload
+    // still diagnose INACTIVE (positive absence, legacy "not detected" text).
     @Test fun diagnosis_productionOverloadMissingBothIsInactive() = runBlocking {
         fun missingTemp(): File {
             val f = File.createTempFile("galaxydual-marker-missing", ".active")
             assertTrue(f.delete())
             return f
         }
-        val diagnosis = diagnoseHookState(missingTemp(), missingTemp(), emptyList())
+        val diagnosis = diagnoseHookState(List(6) { missingTemp() }, emptyList())
         assertEquals(HookStatus.INACTIVE, diagnosis.status)
         assertEquals("未偵測到", diagnosis.displayText())
     }

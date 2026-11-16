@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- pass-disabled-exported-allowlisted: every allowlisted component declared
+     android:exported="true" android:enabled="false". Runtime
+     PackageManager.setComponentEnabledSetting() can flip the manifest default
+     at runtime, so enabled="false" is NOT an allowlist exemption — these must
+     PASS because they are allowlisted and carry the pinned permissions; the
+     gate must NOT need the enabled state to keep shipping surface honest. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.galaxydual.plus">
+    <application android:label="Galaxy Dual Plus">
+        <activity android:name="com.galaxydual.plus.MainActivity"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <receiver android:name="androidx.profileinstaller.ProfileInstallReceiver"
+            android:enabled="false"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+        <provider android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.galaxydual.plus.shizuku"
+            android:enabled="false"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <provider android:name="com.galaxydual.plus.GuardXposedProvider"
+            android:authorities="com.galaxydual.plus.XposedService"
+            android:enabled="false"
+            android:exported="true" />
+    </application>
+</manifest>

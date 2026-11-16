@@ -207,6 +207,7 @@ object ShizukuExecProtocol {
 // android.os.Process.FIRST_APPLICATION_UID (AID_APP_START) is 10000,
 // android.os.Process.LAST_APPLICATION_UID (AID_APP_LAST) is 19999.
 // Full uid = userId * UID_PER_USER_RANGE + appId.
+// (see the SEC-2 comment at GuardXposedProvider.isTrustedXposedCaller for the direction-dependent fail-closed analysis)
 internal const val UID_PER_USER_RANGE = 100_000
 internal const val AID_APP_START = 10_000
 // Phase D2 (P2 appId upper bound): SDK sandbox (20000-29999) and isolated

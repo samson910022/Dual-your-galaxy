@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.galaxydual.plus.debug">
+    <application android:label="Galaxy Dual Plus">
+        <activity android:name="com.galaxydual.plus.MainActivity" android:exported="true" />
+        <provider
+            tools:name="com.galaxydual.plus.GuardXposedProvider"
+            tools:authorities="com.galaxydual.plus.debug.XposedService"
+            tools:exported="true" />
+    </application>
+</manifest>
