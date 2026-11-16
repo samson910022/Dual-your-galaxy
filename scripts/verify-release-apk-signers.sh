@@ -71,6 +71,7 @@ unexpected=()
 while IFS= read -r f; do
   base="$(basename "$f")"
   case "$base" in
+    .*) unexpected+=("$base"); ;;  # no legitimate release asset is a dotfile; fail closed
     SHA256SUMS.txt|*.[aA][pP][kK]) ;;
     *) unexpected+=("$base"); ;;
   esac
@@ -80,7 +81,8 @@ if [ "${#unexpected[@]}" -gt 0 ]; then
   exit 1
 fi
 
-shopt -s nullglob nocaseglob
+shopt -s nullglob nocaseglob dotglob
+# dotglob so a leading-dot APK is discovered and cert-verified too (defense-in-depth; the allowlist above rejects dotfiles unconditionally)
 apks=("$EXPECT_DIR"/*.apk)
 if [ "${#apks[@]}" -eq 0 ]; then
   echo "::error::No release APKs found in $EXPECT_DIR; refusing to publish an empty release." >&2

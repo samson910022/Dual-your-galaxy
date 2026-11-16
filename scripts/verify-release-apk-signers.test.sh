@@ -28,7 +28,7 @@ fi
 # corpus is exactly the reviewed set. A silently added or deleted fixture
 # changes what "PASS summary" means, so fail closed on drift. Single source
 # of truth for the expected count; bump only together with fixture review.
-EXPECTED_FIXTURE_COUNT=3
+EXPECTED_FIXTURE_COUNT=4
 shopt -s nullglob
 pinned_fixtures=("$FIXTURE_DIR"/fail-*/)
 if [ "${#pinned_fixtures[@]}" -ne "$EXPECTED_FIXTURE_COUNT" ]; then
@@ -48,6 +48,8 @@ expected_reason() {
       printf 'not a regular file (or a symlink)' ;;
     fail-empty)
       printf 'No release APKs found' ;;
+    fail-dotfile-apk)
+      printf 'unexpected file(s) staged for release' ;;
     *)
       printf '' ;;
   esac
