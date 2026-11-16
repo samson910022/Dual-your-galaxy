@@ -77,18 +77,21 @@ fi
 # remove colons/spaces/CR (CRLF-tolerant), lowercase. \r is stripped here
 # because \r is NOT hex and would otherwise corrupt the digest; the pin
 # check remains the security envelope.
-# The normalised stream is captured ONCE into cert_lines and consumed
-# twice (distinct-count check, then cert pick).
+# The normalised stream is captured ONCE into cert_lines for the cert pick
+# below; the distinct-count check re-runs the normaliser on the raw stream
+# instead (command substitution would strip a trailing empty digest line).
 normalize_certs() {
   printf '%s\n' "$digest_lines" \
     | sed -E 's/^(Signer #1 |V[0-9]+(\.[0-9]+)* Signer: )certificate SHA-256 digest:[[:space:]]*//' \
     | tr -d ' :\r' | tr 'A-F' 'a-f'
 }
-# Count ALL normalised lines (including empty ones): an empty digest line is
-# not "the same digest" and must not be silently ignored. sort consumes all
-# input, so this pipeline is immune to early-close SIGPIPE.
+# Count ALL normalised lines INCLUDING trailing empty ones. Do NOT round-trip
+# through command substitution here (it strips trailing newlines and would
+# silently drop a trailing empty digest line from the count: [real, empty]
+# would look like one digest). sort drains all input, so no early-close
+# SIGPIPE; the cert pick below may use the captured stream (line 1 is intact).
 cert_lines="$(normalize_certs)"
-distinct_count="$(printf '%s\n' "$cert_lines" | sort -u | wc -l | tr -d '[:space:]')"
+distinct_count="$(normalize_certs | sort -u | wc -l | tr -d '[:space:]')"
 if [ "$distinct_count" -ne 1 ]; then
   echo "::error::certificate digest lines disagree (found $distinct_count distinct digests; all verified signing schemes must carry the same certificate)." >&2
   exit 1

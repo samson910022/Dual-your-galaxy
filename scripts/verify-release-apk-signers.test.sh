@@ -271,16 +271,19 @@ MANIFEST
   fi
 fi
 
-total=$((pass_count + mismatch))
-if [ "$sdk_arms_total" -eq 0 ]; then
-  sdk_note="0 sdk arms (skipped)"
-else
-  sdk_note="$sdk_arms_total sdk arms, $sdk_arms_pass passed"
+# SDK-arm note line (the >0 case formerly embedded in the fused summary):
+# reports how many sdk arms ran and passed, as a standalone line. The 0-arm
+# (SDK missing / skipped) case is already announced by sdk_skip_or_fail's
+# SKIP line and by "sdk arms 0/0 passed" in the summary below. No fused
+# fixture+sdk-arm total is printed: fixture and sdk-arm failures are
+# counted and reported separately.
+if [ "$sdk_arms_total" -gt 0 ]; then
+  echo "note: $sdk_arms_total sdk arms, $sdk_arms_pass passed"
 fi
 if [ "$mismatch" -ne 0 ]; then
   echo "----"
-  echo "summary: $total fixtures + $sdk_note, $pass_count fixtures as expected, $mismatch mismatched" >&2
+  echo "summary: fixtures $pass_count/$EXPECTED_FIXTURE_COUNT as expected, sdk arms $sdk_arms_pass/$sdk_arms_total passed, $mismatch mismatched" >&2
   exit 1
 fi
 echo "----"
-echo "summary: $total fixtures + $sdk_note, $pass_count fixtures as expected, 0 mismatched"
+echo "summary: fixtures $pass_count/$EXPECTED_FIXTURE_COUNT as expected, sdk arms $sdk_arms_pass/$sdk_arms_total passed, 0 mismatched"

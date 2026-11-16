@@ -7,7 +7,8 @@
 #   - CRLF line endings are tolerated (pins parser item: \r stripping);
 #   - conflicting digests across scheme lines, multiple signers, zero digest
 #     lines, malformed signer prefixes, an extra "Signer #2+" entry smuggled
-#     past a forged "Number of signers: 1", and pin mismatches FAIL closed;
+#     past a forged "Number of signers: 1", pin mismatches, and a trailing
+#     empty digest line (trailing-empty digest rejection) FAIL closed;
 #   - --parse-only skips the pin check;
 #   - uppercase/colon-separated digests normalise to lowercase.
 #
@@ -78,6 +79,15 @@ V2 Signer: certificate DN: CN=PR60 Test
 V2 Signer: certificate SHA-256 digest: $DIGEST_A
 V3.0 Signer: certificate DN: CN=PR60 Other
 V3.0 Signer: certificate SHA-256 digest: $DIGEST_B
+EOF
+
+cat > "$work_dir/trailing-empty-digest.txt" <<EOF
+Verifies
+Verified using v2 scheme (APK Signature Scheme v2): true
+Number of signers: 1
+V2 Signer: certificate DN: CN=PR60 Test
+V2 Signer: certificate SHA-256 digest: $DIGEST_A
+V2 Signer: certificate SHA-256 digest:
 EOF
 
 cat > "$work_dir/two-signers.txt" <<EOF
@@ -213,6 +223,7 @@ assert_case "pass-v3-signer (bare V3 Signer digest line)" 0 "$work_dir/v3-only.t
 assert_case "pass-v3.0-only (round-4 defect output)" 0 "$work_dir/v3.0-only.txt" "PASS: signer count and certificate pin verified." "$DIGEST_A" pin "$DIGEST_A"
 assert_case "pass-v2+v3.0 identical certs (two digest lines)" 0 "$work_dir/v2-plus-v3.0-identical.txt" "" "$DIGEST_A" pin "$DIGEST_A"
 assert_case "fail-conflicting-digests" 1 "$work_dir/conflicting-digests.txt" "certificate digest lines disagree" "" pin "$DIGEST_A"
+assert_case "fail-trailing-empty-digest" 1 "$work_dir/trailing-empty-digest.txt" "certificate digest lines disagree" "" pin "$DIGEST_A"
 assert_case "fail-two-signers" 1 "$work_dir/two-signers.txt" "Expected exactly one signer" "" pin "$DIGEST_A"
 assert_case "fail-no-digest-lines (DN lines only)" 1 "$work_dir/dn-only.txt" "no certificate SHA-256 digest line" "" pin "$DIGEST_A"
 assert_case "fail-malformed-signer-prefix" 1 "$work_dir/malformed-prefix.txt" "no certificate SHA-256 digest line" "" pin "$DIGEST_A"
