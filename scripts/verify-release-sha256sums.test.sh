@@ -31,7 +31,7 @@ fi
 # corpus is exactly the reviewed set. A silently added or deleted fixture
 # changes what "PASS summary" means, so fail closed on drift. Single source of
 # truth for the expected count; bump only together with fixture review.
-EXPECTED_FIXTURE_COUNT=5
+EXPECTED_FIXTURE_COUNT=18
 shopt -s nullglob
 pinned_fixtures=("$FIXTURE_DIR"/pass-*/ "$FIXTURE_DIR"/fail-*/)
 if [ "${#pinned_fixtures[@]}" -ne "$EXPECTED_FIXTURE_COUNT" ]; then
@@ -45,14 +45,40 @@ expected_reason() {
   case "$1" in
     pass-listed-ok)
       printf 'PASS: release-publish holds exactly' ;;
+    pass-spaced-name)
+      printf 'PASS: release-publish holds exactly' ;;
+    fail-crlf)
+      printf 'CRLF' ;;
+    fail-backslash)
+      printf 'backslash not allowed in entry name' ;;
+    fail-nul)
+      printf 'NUL' ;;
+    fail-symlink-listed)
+      printf 'symlink' ;;
     fail-extra-file)
       printf 'unlisted file(s) staged for release' ;;
     fail-missing-file)
-      printf 'FAILED' ;;
+      printf 'gone.apk' ;;
     fail-forged-sums)
       printf 'FAILED' ;;
     fail-empty)
       printf 'SHA256SUMS.txt' ;;
+    fail-path-traversal)
+      printf 'path traversal' ;;
+    fail-absolute-path)
+      printf 'absolute path' ;;
+    fail-subdirectory)
+      printf 'separator' ;;
+    fail-symlink)
+      printf 'symlink' ;;
+    fail-no-apk)
+      printf 'no *.apk' ;;
+    fail-ghost-listed)
+      printf 'ghost.apk' ;;
+    fail-duplicate-record)
+      printf 'duplicate' ;;
+    fail-directory)
+      printf 'director' ;;
     *)
       printf '' ;;
   esac
