@@ -290,6 +290,8 @@ class AutoDegradeTest {
             } catch (_: Exception) {
             }
         }
+        // CI #306: drain outstanding viewModelScope children before Main is reset.
+        TestDrainSupport.drainBeforeResetMain(vms)
         vms.clear()
         Dispatchers.resetMain()
     }
@@ -1354,7 +1356,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suOld,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             // Null = tracking (production): candidates follow rebuilds.
             hookDiagnosticGateways = null,
             assembleChannelFn = rebuildFactory,
@@ -1483,7 +1485,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.ROOT,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = reuseFactory,
         )
@@ -1587,7 +1589,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.ROOT,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = reuseFactory,
         )
@@ -2228,7 +2230,7 @@ class AutoDegradeTest {
                 shizukuGateway = shizukuFake,
                 activeGateway = NoOpGateway(),
                 currentChannel = ResolvedChannel.NOOP,
-                hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+                hookDirectReads = { List(6) { MarkerRead.Denied } },
                 hookDiagnosticGateways = { emptyList() },
                 blockText = zhTestBlockText(),
             )
@@ -2283,7 +2285,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = rebuildFactory,
         )
@@ -2413,7 +2415,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = rebuildFactory,
         )
@@ -2519,7 +2521,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = rebuildFactory,
         )
@@ -2633,7 +2635,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = rebuildFactory,
         )
@@ -2706,8 +2708,8 @@ class AutoDegradeTest {
         assertEquals("fresh Shizuku must never be `cat`ed", 0, newShizuku.catCalls.get())
 
         // The dedicated consented entry is allowed exactly one controlled
-        // diagnosis attempt (primary + fallback `cat` paths = two execs on
-        // the single retained instance), which fails under revoke:
+        // diagnosis attempt (SIX `cat`s, one per marker path, on the single
+        // retained instance), which fails under revoke:
         // UNKNOWN_* + slot cleared.
         val catBeforeConsented = suFake.catCalls.get()
         vm.requestHookRedDiagnosis()
@@ -2715,8 +2717,8 @@ class AutoDegradeTest {
         Thread.sleep(300)
         await { !vm.state.value.loading }
         assertEquals(
-            "consented diagnosis must attempt exactly one proving diagnosis (primary + fallback `cat`)",
-            catBeforeConsented + 2,
+            "consented diagnosis must attempt exactly one proving diagnosis (six per-path `cat`s)",
+            catBeforeConsented + 6,
             suFake.catCalls.get(),
         )
         assertTrue(
@@ -2746,7 +2748,7 @@ class AutoDegradeTest {
         )
         assertEquals(
             "cleared slot: exactly one proving diagnosis total since revoke",
-            suBase + 2,
+            suBase + 6,
             suExecTotal(),
         )
         assertFalse(vm.state.value.writeReady)
@@ -2796,7 +2798,7 @@ class AutoDegradeTest {
                     // sequencing bug turns red instead of hanging.
                     gate.tryAcquire(5, TimeUnit.SECONDS)
                 }
-                listOf(MarkerRead.Denied, MarkerRead.Denied)
+                List(6) { MarkerRead.Denied }
             },
             hookDiagnosticGateways = null,
             assembleChannelFn = reuseFactory,
@@ -2880,7 +2882,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
         )
         await { !vm.state.value.loading && vm.state.value.writeReady }
@@ -2923,7 +2925,7 @@ class AutoDegradeTest {
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
             preference = ChannelPreference.AUTO,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = reuseFactory,
         )
@@ -3059,7 +3061,7 @@ class AutoDegradeTest {
             shizukuAuth = true,
             initialChannel = ResolvedChannel.ROOT,
             initialGateway = suFake,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = null,
             assembleChannelFn = reuseFactory,
         )
@@ -3172,7 +3174,7 @@ class AutoDegradeTest {
             shizukuGateway = shizukuFake,
             activeGateway = suFake,
             currentChannel = ResolvedChannel.ROOT,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = { emptyList() },
         )
         vms.add(vm)
@@ -3259,7 +3261,7 @@ class AutoDegradeTest {
             activeGateway = suFake,
             currentChannel = ResolvedChannel.ROOT,
             assembleChannelFn = failingFactory,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = { emptyList() },
         )
         vms.add(vm)
@@ -3353,7 +3355,7 @@ class AutoDegradeTest {
             activeGateway = suFake,
             currentChannel = ResolvedChannel.ROOT,
             assembleChannelFn = reuseFactory,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = { emptyList() },
         )
         vms.add(vm)
@@ -3398,7 +3400,7 @@ class AutoDegradeTest {
             shizukuGateway = shizukuFake,
             activeGateway = suFake,
             currentChannel = ResolvedChannel.ROOT,
-            hookDirectReads = { listOf(MarkerRead.Denied, MarkerRead.Denied) },
+            hookDirectReads = { List(6) { MarkerRead.Denied } },
             hookDiagnosticGateways = { listOf(staleSu) },
         )
         vms.add(vm)

@@ -6,6 +6,8 @@ plugins {
 
 import java.io.File
 import java.util.Properties
+import org.gradle.api.Action
+import org.gradle.api.execution.TaskExecutionGraph
 
 // Release signing (Phase E1, issue #5): credentials are injected via
 // environment / CI secrets and NEVER committed (see docs/KEY_MANAGEMENT.md).
@@ -24,6 +26,17 @@ val isCiBuild = System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS")
 // via the requested task names so :app:assembleDebug / lint / test on CI
 // are never blocked by a missing release key.
 val requestedTaskNames = gradle.startParameter.taskNames
+// Explicit, narrow allowlist for the release *manifest-merge-only* CI step
+// (workflow passes ALLOW_RELEASE_MANIFEST_MERGE=1). Only tasks that merge
+// manifests WITHOUT packaging/signing may run under this flag; any other
+// release-flavored task is still governed by requestsReleasePackaging.
+val allowReleaseManifestMerge = System.getenv("ALLOW_RELEASE_MANIFEST_MERGE") == "1" &&
+    requestedTaskNames.isNotEmpty() &&
+    requestedTaskNames.all { taskName ->
+        val simple = taskName.substringAfterLast(":")
+        listOf("processReleaseMainManifest", "processReleaseManifest", "processReleaseResources")
+            .any { it.equals(simple, ignoreCase = true) }
+    }
 val requestsReleasePackaging = requestedTaskNames.any { taskName ->
     taskName.contains("Release", ignoreCase = true) ||
         taskName.equals("assemble", ignoreCase = true) ||
@@ -68,6 +81,34 @@ val releaseSigningReady =
     releaseSigningProps.isNotEmpty() &&
         releaseSigningProps.values.all { it.isNotEmpty() } &&
         File(releaseSigningProps.getValue("storeFile")).isFile
+
+// Execution-time backstop for the configuration-time gate above: Gradle's
+// camelCase task-name abbreviation matching (e.g. `:app:asmRel` resolving to
+// assembleRelease) bypasses the raw-name requestsReleasePackaging check.
+// Re-evaluate the RESOLVED task graph right before execution and fail with
+// the same policy as the usage site below (same env predicate — isCiBuild,
+// same allowReleaseManifestMerge opt-out, same fail-vs-warn: throw — same
+// exception type and message, suffixed "(task-graph backstop)") when a
+// release packaging task is present in the graph and no release signing key
+// is available. Differs from the configuration-time gate ONLY in the
+// trigger: resolved release tasks instead of the raw requested names.
+gradle.taskGraph.whenReady(Action<TaskExecutionGraph> {
+    val resolved = allTasks.map { it.path }
+    val hitRelease = resolved.any { path ->
+        val simple = path.substringAfterLast(":")
+        simple.equals("assembleRelease", ignoreCase = true) ||
+            simple.equals("bundleRelease", ignoreCase = true) ||
+            simple.equals("packageRelease", ignoreCase = true)
+    }
+    if (!releaseSigningReady && isCiBuild && hitRelease && !allowReleaseManifestMerge) {
+        throw GradleException(
+            "Release signing key missing in CI: set SIGN_STORE_FILE " +
+                "(restored from SIGN_STORE_BASE64), SIGN_STORE_PASSWORD, " +
+                "SIGN_KEY_ALIAS and SIGN_KEY_PASSWORD secrets; refusing unsigned release build. " +
+                "(task-graph backstop)"
+        )
+    }
+})
 
 // Application-specific Android configuration.
 android {
@@ -116,7 +157,7 @@ android {
             isMinifyEnabled = false
             if (releaseSigningReady) {
                 signingConfig = signingConfigs.getByName("release")
-            } else if (isCiBuild && requestsReleasePackaging) {
+            } else if (isCiBuild && requestsReleasePackaging && !allowReleaseManifestMerge) {
                 throw GradleException(
                     "Release signing key missing in CI: set SIGN_STORE_FILE " +
                         "(restored from SIGN_STORE_BASE64), SIGN_STORE_PASSWORD, " +
@@ -161,6 +202,11 @@ dependencies {
     // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    // Stage2 (hook-policy-source P1): module-app side of the LSPosed remote
+    // preferences channel. The service AAR contributes XposedProvider
+    // (authority ${applicationId}.XposedService) via manifest merge; GalaxyApp
+    // registers XposedServiceHelper to obtain the XposedService binder.
+    implementation(libs.libxposed.service)
     // Phase F2 (issue #6): observable state (StateFlow + viewModelScope) and
     // lifecycle-aware collection in MainActivity (lifecycleScope/viewModels).
     implementation(libs.coroutines.android)

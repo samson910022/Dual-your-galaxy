@@ -45,11 +45,119 @@ class WhitelistPatchReflectTest {
         var ARR: Array<String> = arrayOf("a")
     }
 
+    // --- H4 fixtures for WhitelistPatch.hasPatchableFieldShape (pre-IPC probe) ---
+
+    // ROM shape: both candidate fields static final -> probe must find no
+    // patchable shape (patch goes ObserveOnly; policy IPC would be discarded).
+    object FinalCandidateHolder {
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES: Array<String> = arrayOf("a")
+
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA: Array<String> = arrayOf("a")
+    }
+
+    // Non-final MutableList candidate -> patchable shape.
+    object NonFinalListHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Non-final String[] candidate -> patchable shape.
+    object NonFinalArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: Array<String> = arrayOf("a")
+    }
+
+    // Declared as read-only List but holds a MutableList at runtime ->
+    // patchFields CAN patch it, so the probe must stay permissive (the
+    // loose direction: never skip a real patch).
+    object ListTypedHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: List<String> = mutableListOf("a")
+    }
+
+    // Covariant array storage: declared CharSequence[] (component type a
+    // supertype of String) but holding a String[] at runtime -> patchFields
+    // patches via its runtime javaClass check, so the probe must count it
+    // patchable (Java arrays are covariant).
+    object CovariantArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: Array<out CharSequence> = arrayOf("a")
+    }
+
+    // Static NON-FINAL field of a FINAL non-container declared type (String):
+    // the declared type proves no String[]/MutableList runtime value, so the
+    // probe must return false.
+    object FinalTypedNonFinalHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: String = "x"
+    }
+
+    // Static non-final IntArray: component type is primitive -> not patchable.
+    object IntArrayHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: IntArray = intArrayOf(1)
+    }
+
+    // Static non-final primitive int -> not patchable.
+    object PrimitiveIntHolder {
+        @JvmField
+        var COUNT: Int = 1
+    }
+
+    // Static FINAL MutableList: field-final precedence — the field-final skip
+    // runs before the type arms, so the probe must return false.
+    object FinalMutableListHolder {
+        @JvmField
+        val DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Non-static candidate -> not patchable.
+    class InstanceCandidateHolder {
+        @JvmField
+        var DUAL_APP_WHITELIST_PACKAGES: MutableList<String> = mutableListOf("a")
+    }
+
+    // Superclass-declared candidate (static, non-final) -> counted by the
+    // probe's hierarchy walk (a superset of patchFields's target-only
+    // resolution; the safe direction). Fixture lives in Java because Kotlin
+    // has no static-in-regular-class syntax.
+    object SubclassWithSuperclassField : SuperclassStaticListBase()
+
+    // Hostile ROM list whose iterator() throws: the field-loop entry point
+    // must still evaluate the SIBLING candidate field (sibling isolation;
+    // one hostile field may never deny the other its outcome entry).
+    object HostileDualListHolder {
+        @JvmField
+        var BAD: MutableList<String> = HostileIteratorList()
+
+        @JvmField
+        var GOOD: MutableList<String> = mutableListOf("a")
+    }
+
+    // Mirrors the ROM holder shape for the hostile-list fixture: a
+    // MutableList whose iterator() throws IllegalStateException.
+    private class HostileIteratorList : AbstractMutableList<String>() {
+        private val backing: MutableList<String> = mutableListOf("a")
+        override val size: Int get() = backing.size
+        override fun get(index: Int): String = backing[index]
+        override fun set(index: Int, element: String): String = backing.set(index, element)
+        override fun add(index: Int, element: String) {
+            backing.add(index, element)
+        }
+        override fun removeAt(index: Int): String = backing.removeAt(index)
+        override fun iterator(): MutableIterator<String> =
+            throw IllegalStateException("injected iterator failure")
+    }
+
     @Before
     fun reset() {
         MutableHolder.ARR = arrayOf("a")
         DualHolder.DUAL_APP_WHITELIST_PACKAGES = arrayOf("a")
         DualHolder.DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA = arrayOf("a")
+        HostileDualListHolder.BAD = HostileIteratorList()
+        HostileDualListHolder.GOOD = mutableListOf("a")
     }
 
     @Test
@@ -194,6 +302,30 @@ class WhitelistPatchReflectTest {
         assertTrue((single as WhitelistPatch.Outcome.Skipped).reason.contains("not static"))
     }
 
+    // Sibling isolation: field 1's list throws from iterator(); the field
+    // loop must record Skipped for field 1 and still evaluate field 2 —
+    // its outcome appears in the results map, patched in place.
+    @Test
+    fun hostileFieldDoesNotDenySiblingField() {
+        val out = WhitelistPatch.patchFields(
+            HostileDualListHolder::class.java,
+            listOf("BAD", "GOOD"),
+            setOf("b"),
+        )
+        assertEquals(2, out.size)
+        val bad = out.getValue("BAD")
+        assertTrue("BAD should be Skipped, was: $bad", bad is WhitelistPatch.Outcome.Skipped)
+        assertTrue(
+            "BAD Skipped reason should mention element inspection failure, was: " +
+                (bad as WhitelistPatch.Outcome.Skipped).reason,
+            bad.reason.contains("element inspection failed"),
+        )
+        val good = out.getValue("GOOD")
+        assertTrue("GOOD should be PatchedInPlace, was: $good", good is WhitelistPatch.Outcome.PatchedInPlace)
+        assertEquals(1, (good as WhitelistPatch.Outcome.PatchedInPlace).added)
+        assertEquals(listOf("a", "b"), HostileDualListHolder.GOOD)
+    }
+
     // P2 regression (PR #20): a non-public static NON-FINAL field (ROM
     // variant shape) must still patch via controlled setAccessible --
     // plain get(null) alone would report "read failed" on it.
@@ -216,8 +348,10 @@ class WhitelistPatchReflectTest {
     }
 
     // The non-public static FINAL counterpart is never force-written:
-    // ObserveOnly when readable, Skipped when even the read is denied --
-    // either way the value is untouched and no Replaced/PatchedInPlace.
+    // ObserveOnly either way — with the read-refused vocabulary when the
+    // private read is denied (plain get without setAccessible throws), or the
+    // isFinal-arm vocabulary when the read succeeds. Either way the value is
+    // untouched and no Replaced/PatchedInPlace.
     @Test
     fun nonPublicStaticFinalArrayIsNeverForceWritten() {
         val field = NonPublicStaticHolder::class.java.getDeclaredField("FINAL_ARR")
@@ -230,6 +364,152 @@ class WhitelistPatchReflectTest {
         val single = out.getValue("FINAL_ARR")
         assertFalse(single is WhitelistPatch.Outcome.Replaced)
         assertFalse(single is WhitelistPatch.Outcome.PatchedInPlace)
+        // H7 pin: a private static final field whose plain read is refused
+        // must record ObserveOnly with the read-access-refused reason, not
+        // Skipped("read failed ...").
+        assertTrue("private final read-refused field should be ObserveOnly, was: $single",
+            single is WhitelistPatch.Outcome.ObserveOnly)
+        val reason = (single as WhitelistPatch.Outcome.ObserveOnly).reason
+        assertTrue("reason should mention static final field, was: $reason",
+            reason.contains("static final field"))
+        assertTrue("reason should carry the read-access-refused fragment, was: $reason",
+            reason.contains("read access refused"))
+        assertTrue("reason should carry the observe-only marker, was: $reason",
+            reason.contains(WhitelistPatch.OBSERVE_ONLY_MARKER))
         assertEquals(listOf("a"), NonPublicStaticHolder.peekFinalArr().toList())
+    }
+
+    // --- H4: WhitelistPatch.hasPatchableFieldShape (pre-IPC probe) ---
+
+    @Test
+    fun probeReturnsFalseForAllFinalCandidateRomShape() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalCandidateHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES", "DUAL_APP_WHITELIST_PACKAGES_FOR_CHINA"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForNonFinalMutableListCandidate() {
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalListHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForNonFinalStringArrayCandidate() {
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForCovariantStringSupertypeArrayCandidate() {
+        // Companion sanity: the field really is declared CharSequence[] yet
+        // holds a String[] at runtime (array covariance).
+        val field = CovariantArrayHolder::class.java.getDeclaredField("DUAL_APP_WHITELIST_PACKAGES")
+        assertEquals(CharSequence::class.java, field.type.componentType)
+        assertEquals(String::class.java, field.get(null)!!.javaClass.componentType)
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                CovariantArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForFinalTypedNonFinalCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalTypedNonFinalHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForIntArrayCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                IntArrayHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForPrimitiveIntCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                PrimitiveIntHolder::class.java,
+                listOf("COUNT"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForStaticFinalMutableListCandidate() {
+        // Field-final precedence: the field-final skip runs before the type
+        // arms, so even a MutableList-typed field is not counted.
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                FinalMutableListHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsTrueForListTypedFieldHoldingMutableList() {
+        // Declared read-only List, runtime MutableList: patchFields CAN
+        // patch it, so the probe must not fail-closed on the declaration.
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                ListTypedHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseForInstanceCandidate() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                InstanceCandidateHolder::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeReturnsFalseWhenNoCandidateExists() {
+        assertFalse(
+            WhitelistPatch.hasPatchableFieldShape(
+                NonFinalArrayHolder::class.java,
+                listOf("NO_SUCH_FIELD"),
+            ),
+        )
+    }
+
+    @Test
+    fun probeCountsSuperclassDeclaredCandidate() {
+        // Documented superset: the probe walks the hierarchy; patchFields
+        // resolves target-only and would report "field not found" — the
+        // safe direction (at most one discarded policy IPC).
+        assertTrue(
+            WhitelistPatch.hasPatchableFieldShape(
+                SubclassWithSuperclassField::class.java,
+                listOf("DUAL_APP_WHITELIST_PACKAGES"),
+            ),
+        )
     }
 }

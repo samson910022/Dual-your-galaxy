@@ -24,8 +24,9 @@
 //   the marker signal is display-only evidence, see HookMarker, and must
 //   never grant privilege without on-device verification).
 // - LSPOSED explicitly selected resolves to LSPOSED_PLACEHOLDER, which still
-//   builds a NoOp gateway (whitelist policy branch pending -- writes refused
-//   with the reason stated, never executed).
+//   builds a NoOp gateway (the whitelist policy source is wired, end-to-end
+//   DEVICE-UNVERIFIED, but the LSPosed execution channel remains a NoOp
+//   placeholder -- writes refused with the reason stated, never executed).
 package com.galaxydual.plus
 
 import android.content.SharedPreferences
@@ -42,6 +43,11 @@ enum class ChannelPreference {
 }
 
 // Gateway actually built for a preference after Auto resolution.
+// - NOOP is the fail-closed read-only fallback gateway (never a menu entry).
+// - LSPOSED_PLACEHOLDER is the explicit-LSPosed resolution: intentionally a
+//   NoOp as well (not a second gateway kind). Both build NoOpGateway today;
+//   they differ only in reason metadata (placeholder vs no-channel), so the
+//   ViewModel can refuse writes with the accurate copy. See buildGatewayForChannel.
 enum class ResolvedChannel {
     ROOT,
     SHIZUKU,
@@ -77,14 +83,19 @@ fun channelPreferenceFromStored(raw: String?): ChannelPreference =
 // Reads the persisted choice (default AUTO). Thin wrapper over the pure
 // mapping above; never called on JVM tests (Android stub would throw).
 // Corrupt-data policy: a stored value of the wrong type (or any other read
-// failure) is treated as unrecoverable and falls back to AUTO (fail-closed),
-// rather than propagating ClassCastException to the caller. This keeps a
-// mistyped platform entry from crashing startup; the entry itself is left
-// untouched (no self-clear) because the type cannot be safely rewritten here.
+// failure, including Error) is treated as unrecoverable and falls back to
+// AUTO (fail-closed), rather than propagating ClassCastException to the
+// caller. This keeps a mistyped platform entry from crashing startup; the
+// entry itself is left untouched (no self-clear) because the type cannot be
+// safely rewritten here. Phase7: catches Throwable (hostile prefs impl may
+// throw Error); CancellationException is re-thrown (cancellation is never
+// swallowed as AUTO).
 fun loadChannelPreference(prefs: SharedPreferences): ChannelPreference =
     try {
         channelPreferenceFromStored(prefs.getString(CHANNEL_PREF_KEY, null))
-    } catch (_: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
         ChannelPreference.AUTO
     }
 
@@ -170,11 +181,15 @@ fun resolveAutoProbe(
 
 // Builds the gateway for a resolved channel. Constructor-only, no I/O, so
 // JVM-constructible (same pattern as GatewayAssemblyTest). LSPosed builds
-// NoOp by policy until the whitelist branch lands (F4b-P2): the placeholder
-// must never be mistaken for an executable channel -- DualViewModel refuses
-// writes under it with the reason stated.
-// TODO(hook-channel): return the real LSPosed hook gateway for
-// LSPOSED_PLACEHOLDER once the whitelist policy branch is verified on-device.
+// NoOp by policy (the whitelist policy source is wired, end-to-end
+// DEVICE-UNVERIFIED, but the LSPosed execution channel remains a NoOp
+// placeholder, F4b-P2): the placeholder must never be mistaken for an
+// executable channel -- DualViewModel refuses writes under it with the reason
+// stated.
+// Intentionally NoOp (no hook-channel TODO kept): returning a real LSPosed
+// hook gateway for LSPOSED_PLACEHOLDER requires on-device verification of the
+// execution channel (see docs/HOOK.md); until then this stays NoOp by design,
+// not by omission.
 fun buildGatewayForChannel(channel: ResolvedChannel, packageName: String): CmdGateway =
     when (channel) {
         ResolvedChannel.ROOT -> SuCmdGateway()
@@ -212,8 +227,10 @@ fun assembleChannel(
     val gateway: CmdGateway = when (channel) {
         ResolvedChannel.ROOT -> suGateway
         ResolvedChannel.SHIZUKU -> shizukuGateway
-        // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only) until the
-        // whitelist policy branch is verified on-device; see TODO above.
+        // F4b-P2: LSPOSED_PLACEHOLDER still builds NoOp (read-only); the
+        // whitelist policy source is wired (end-to-end DEVICE-UNVERIFIED) but
+        // the LSPosed execution channel remains an intentionally-NoOp
+        // placeholder (see buildGatewayForChannel above).
         ResolvedChannel.NOOP,
         ResolvedChannel.LSPOSED_PLACEHOLDER,
         -> NoOpGateway()
