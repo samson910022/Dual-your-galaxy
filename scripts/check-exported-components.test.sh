@@ -46,7 +46,7 @@ fi
 expected_reason() {
   case "$1" in
     pass-*.xml|pass-*.xmltree.txt)
-      printf 'PASS:' ;;
+      printf 'PASS: exported components limited to the allowlist' ;;
     fail-unallowlisted-service.xml|fail-unallowlisted-receiver.xml|fail-unallowlisted-provider.xml|fail-unallowlisted-activity.xml)
       printf 'not in the allowlist' ;;
     fail-unallowlisted-disabled-exported-provider.xml|fail-unallowlisted-disabled-exported-service.xml|fail-unallowlisted-disabled-exported-receiver.xml|fail-unallowlisted-disabled-exported.xmltree.txt)
