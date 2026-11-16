@@ -64,17 +64,19 @@ class PolicyWriteTest {
     // 假政策 store:記錄 save/clear 呼叫,並保有可重讀的記憶體後端。
     private class FakePolicyStore(initialDraft: Set<String> = setOf("com.seed")) {
         var saved: Set<String>? = initialDraft
-        var saveCalls = 0
-        var clearCalls = 0
+        // 跨執行緒可見性：counters 由 store-IO 執行緒寫入、測試線程讀取，一律 AtomicInteger。
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val clearCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val loadCalls = java.util.concurrent.atomic.AtomicInteger(0)
         // 測試開關:模擬 save/clear 失敗 (既有測試預設成功,行為不變)。
         var saveSucceeds = true
         var clearSucceeds = true
         val store: HookPolicyStore = HookPolicyStore(
-            loadRaw = { saved },
+            loadRaw = { loadCalls.incrementAndGet(); saved },
             saveRaw = { raw ->
-                saveCalls++
+                saveCalls.incrementAndGet()
                 if (raw == null) {
-                    clearCalls++
+                    clearCalls.incrementAndGet()
                     // Stage J3:成功清除後端為確認空（Known empty），非 Unknown。
                     // 真實綁定中 prefs 非空＋key 缺席即 Known 空；Fake 以 emptySet
                     // 精確建模，使快徑 read-after-ack 能以 ground truth 驗證
@@ -281,8 +283,8 @@ class PolicyWriteTest {
             vm.state.value.msg,
         )
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertEquals(0, fake.saveCalls)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(0, fake.clearCalls.get())
     }
 
     // 門控優先級:空勾選 + 非 owner 時,owner 訊息必須壓過「未勾選任何應用」。
@@ -336,7 +338,7 @@ class PolicyWriteTest {
         assertEquals(200, fake.saved!!.size)
 
         assertTrue(fake.store.save(second))
-        assertEquals(2, fake.saveCalls)
+        assertEquals(2, fake.saveCalls.get())
         assertEquals(second, fake.saved)
         assertEquals(112, fake.saved!!.size)
     }
@@ -354,10 +356,10 @@ class PolicyWriteTest {
 
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
 
         vm.clearPolicyDraft()
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertEquals(
             "政策草稿必須由主用戶（owner user）操作，否則 hook 讀不到",
             vm.state.value.msg,
@@ -378,8 +380,8 @@ class PolicyWriteTest {
             setOf("com.example.a"),
             vm.state.value.pendingPolicyWrite?.packages,
         )
-        assertEquals(0, fake.saveCalls)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(0, fake.clearCalls.get())
     }
 
     // confirm 的 store saveRaw 回 false:fail-closed 清 pending、回報 FAILED,
@@ -402,7 +404,7 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("寫入政策失敗"))
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         // fail-closed:saveRaw 只被呼叫一次,不得重試或改寫草稿。
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
         assertFalse(vm.state.value.loading)
         assertFalse(vm.state.value.policyDraftKnown)
     }
@@ -420,7 +422,7 @@ class PolicyWriteTest {
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("清除草稿失敗"))
         // fail-closed:saveRaw(null) 只被呼叫一次,且草稿不得被偷偷清空。
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         assertFalse(vm.state.value.policyDraftKnown)
     }
@@ -435,7 +437,7 @@ class PolicyWriteTest {
         // 等 VM 的 state 更新 (clearCalls 在 store 端先翻,狀態更新在其後)。
         await { vm.state.value.policyDraft.isEmpty() }
 
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
         assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
     }
@@ -452,8 +454,8 @@ class PolicyWriteTest {
         vm.cancelPolicyWrite()
 
         assertNull(vm.state.value.pendingPolicyWrite)
-        assertEquals(0, fake.saveCalls)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(0, fake.clearCalls.get())
         assertTrue(vm.state.value.msg.contains("已取消寫入政策"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
     }
@@ -474,7 +476,7 @@ class PolicyWriteTest {
 
         vm.confirmPolicyWrite(pending, pending.generation)
 
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertNull(vm.state.value.pendingPolicyWrite)
     }
 
@@ -492,7 +494,7 @@ class PolicyWriteTest {
 
         // A3-5: pending 排隊中 clear → BUSY、零 store 觸碰、pending 保留。
         vm.clearPolicyDraft()
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("進行中"))
@@ -500,7 +502,7 @@ class PolicyWriteTest {
         // pending 未被丟棄：confirm 仍然正常執行。
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
     }
 
@@ -597,7 +599,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -606,7 +608,7 @@ class PolicyWriteTest {
                     }
                 }
                 if (raw == null) {
-                    fake.clearCalls++
+                    fake.clearCalls.incrementAndGet()
                     fake.saved = null
                 } else {
                     fake.saved = raw
@@ -635,7 +637,7 @@ class PolicyWriteTest {
         await { !vm.state.value.loading }
 
         // 釋放後寫入成功完成。
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
         assertTrue(vm.state.value.msg.contains("已寫入政策草稿"))
@@ -781,7 +783,7 @@ class PolicyWriteTest {
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals("勾選的應用已不在來源清單，請重選", vm.state.value.msg)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // 無捨去時不應顯示 info 警告。
@@ -816,7 +818,7 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("確認已逾時"))
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
         assertNull(vm.state.value.pendingPolicyWrite)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // 4.1 #2 世代不匹配：不寫入，pending 保持 B。
@@ -831,7 +833,7 @@ class PolicyWriteTest {
 
         vm.confirmPolicyWrite(pendingA, pendingA.generation)
 
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
     }
 
@@ -853,14 +855,14 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 勾選後重試（帶出勾選時綁定的世代：ack 綁定到本 pending）：正常寫入。
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
     }
 
@@ -881,14 +883,14 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 正確世代：正常寫入。
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
     }
 
@@ -1274,7 +1276,7 @@ class PolicyWriteTest {
         assertEquals(MsgKind.FAILED, vm.state.value.msgKind)
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
     }
 
     // Stage A mismatch 變體：reconciler 以 ground truth 為準（不謊稱寫入成功）。
@@ -1351,7 +1353,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -1360,7 +1362,7 @@ class PolicyWriteTest {
                     }
                 }
                 if (raw == null) {
-                    fake.clearCalls++
+                    fake.clearCalls.incrementAndGet()
                     fake.saved = null
                 } else {
                     fake.saved = raw
@@ -1378,7 +1380,7 @@ class PolicyWriteTest {
         // 第二個 confirm 在 in-flight 期間到達，應被去重。
         vm.confirmPolicyWrite(pending, pending.generation)
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
-        assertEquals(1, fake.saveCalls)
+        assertEquals(1, fake.saveCalls.get())
 
         saveRelease.set(true)
         await { !vm.state.value.loading }
@@ -1449,7 +1451,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -1458,7 +1460,7 @@ class PolicyWriteTest {
                     }
                 }
                 if (raw == null) {
-                    fake.clearCalls++
+                    fake.clearCalls.incrementAndGet()
                     fake.saved = null
                 } else {
                     fake.saved = raw
@@ -1506,7 +1508,7 @@ class PolicyWriteTest {
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(inFlightBefore, inFlightKeysOf(vm).size)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // Phase 7 (PR#60 round-3 finding #3)：兩個並發 requestPolicyWrite 皆通過
@@ -1560,8 +1562,8 @@ class PolicyWriteTest {
             // copy 不設 msg。兩個 update 皆落地後，最終 msg 確定為 BUSY。
             assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
             assertEquals(MsgKind.INFO, vm.state.value.msgKind)
-            assertEquals(0, fake.saveCalls)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.saveCalls.get())
+            assertEquals(0, fake.clearCalls.get())
             assertTrue(inFlightKeysOf(vm).isEmpty())
         } finally {
             vm.beforePolicyPendingInstallSeamForTests = null
@@ -1617,8 +1619,8 @@ class PolicyWriteTest {
                 vm.state.value.msg,
             )
             assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-            assertEquals(0, fake.saveCalls)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.saveCalls.get())
+            assertEquals(0, fake.clearCalls.get())
             // 單調相位計數：中止路徑不改寫 policyEpoch（abort 分支不執行
             // incrementAndGet），故 policyEpoch 必須等於 Unknown 轉換後的值。
             assertEquals(epochAfterUnknown, vm.state.value.policyEpoch)
@@ -1677,8 +1679,8 @@ class PolicyWriteTest {
             assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
             assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
             assertEquals(MsgKind.INFO, vm.state.value.msgKind)
-            assertEquals(0, fake.saveCalls)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.saveCalls.get())
+            assertEquals(0, fake.clearCalls.get())
             assertEquals(epochBefore, vm.state.value.policyEpoch)
         } finally {
             vm.beforePolicyPendingInstallSeamForTests = null
@@ -1743,8 +1745,8 @@ class PolicyWriteTest {
             assertEquals(MsgKind.INFO, vm.state.value.msgKind)
             assertEquals(setOf("com.example.a"), vm.state.value.pendingPolicyWrite?.packages)
             assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
-            assertEquals(0, fake.saveCalls)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.saveCalls.get())
+            assertEquals(0, fake.clearCalls.get())
             assertEquals(epochAfterRequest, vm.state.value.policyEpoch)
         } finally {
             vm.beforePolicyPendingInstallSeamForTests = null
@@ -1784,16 +1786,22 @@ class PolicyWriteTest {
         val epochBefore = vm.state.value.policyEpoch
         val requestSeamHit = java.util.concurrent.CountDownLatch(1)
         val requestRelease = java.util.concurrent.CountDownLatch(1)
+        val requestSeamExpired = java.util.concurrent.atomic.AtomicBoolean(false)
         vm.beforePolicyPendingInstallSeamForTests = {
             requestSeamHit.countDown()
-            requestRelease.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (!requestRelease.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                requestSeamExpired.set(true)
+            }
         }
         val clearSeamHit = java.util.concurrent.CountDownLatch(1)
         val releaseClear = java.util.concurrent.CountDownLatch(1)
+        val clearSeamExpired = java.util.concurrent.atomic.AtomicBoolean(false)
         // 讓 clear 停在「key 已註冊、phase 翻轉前」的縫隙（locked block 內部）。
         vm.beforePolicyClearPhaseAssignSeamForTests = {
             clearSeamHit.countDown()
-            releaseClear.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (!releaseClear.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                clearSeamExpired.set(true)
+            }
         }
         val requestErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
         val clearErrors = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
@@ -1820,12 +1828,50 @@ class PolicyWriteTest {
             assertTrue(clearSeamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
             assertTrue(inFlightKeysOf(vm).any { it.startsWith("policy-clear:") })
             // 雙停泊且 B 尚未登記 pending、尚未翻相位：無 pending、phase=IDLE、epoch 不變。
+            // pre-release snapshot（clear 仍持鎖、request 尚未釋放）；強化斷言見下方 BLOCKED 證明之後的三元組。
             assertNull(vm.state.value.pendingPolicyWrite)
             assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
             assertEquals(epochBefore, vm.state.value.policyEpoch)
-            // 先放行 requester：A 醒來後在 policySettleLock 上等待（B 持鎖）。
+            assertFalse("request seam hold expired before release was observed — BLOCKED 觀察窗口已被撐破", requestSeamExpired.get())
+            // Release request first, then prove it actually reached the monitor and
+            // BLOCKED behind clear's reservation. This removes the scheduler
+            // ambiguity that previously made the ordering assertion vacuous.
             requestRelease.countDown()
+            // BLOCKED 綁定 synchronized(policySettleLock)（DualViewModel.kt:8649）；若 policySettleLock
+            // 改為 park 型（ReentrantLock/Mutex）或之前插入新 monitor，此 await 會 5s timeout 失敗（AssertionError＋VM dump），不會靜默通過。
+            await(timeoutMs = 5_000L) { requester.state == Thread.State.BLOCKED }
+            // ThreadMXBean 所有者證明：BLOCKED 必須是在 policySettleLock 上、且 owner 是停在 seam 的 clearer 線程。
+            // 注意：JVM 單元測試的 compile classpath 是 android.jar（缺 java.lang.management，直接引用無法通過編譯）；
+            // 執行期是 JVM（一定可用），故以反射取用 ManagementFactory/ThreadInfo——斷言語義與直接引用完全一致。
+            // lockName 結尾比對依 HotSpot 格式（"ClassName@hexIdentityHash"）；OpenJ9 回傳 null/不同格式 → fail-closed（明確失敗，永不誤綠）；若 CI 遷移 OpenJ9，改以 lockOwnerId 為單一判據即可。
+            val mx = Class.forName("java.lang.management.ManagementFactory").getMethod("getThreadMXBean").invoke(null)
+                ?: error("ManagementFactory.getThreadMXBean returned null")
+            // 經公開介面 java.lang.management.ThreadMXBean 查找 getThreadInfo
+            //（宣告類為 public）；直接在實作類（如 sun.management.ThreadImpl）上
+            // 反射 getMethod/invoke 會在存取檢查時 IllegalAccessException。
+            val threadMXBeanClass = Class.forName("java.lang.management.ThreadMXBean")
+            val blockedInfo = threadMXBeanClass.getMethod("getThreadInfo", java.lang.Long.TYPE).invoke(mx, requester.getId())
+            assertNotNull(blockedInfo)
+            val threadInfoClass = Class.forName("java.lang.management.ThreadInfo")
+            val threadState = threadInfoClass.getMethod("getThreadState").invoke(blockedInfo) as Thread.State
+            assertEquals(Thread.State.BLOCKED, threadState)
+            val lockName = threadInfoClass.getMethod("getLockName").invoke(blockedInfo) as String?
+            val settleLockObj = DualViewModel::class.java.getDeclaredField("policySettleLock").apply { isAccessible = true }.get(vm)
+            assertTrue(
+                "requester blocked on unexpected monitor: $lockName",
+                lockName != null && lockName.endsWith(Integer.toHexString(System.identityHashCode(settleLockObj))),
+            )
+            val lockOwnerId = threadInfoClass.getMethod("getLockOwnerId").invoke(blockedInfo) as Long
+            assertEquals(
+                "requester must be blocked behind the clear-owned reservation",
+                clearer.getId(),
+                lockOwnerId,
+            )
+            assertNull("request must not install while clear owns reservation", vm.state.value.pendingPolicyWrite)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals(epochBefore, vm.state.value.policyEpoch)
             // 放行 clear：B 翻 QUEUED（epoch+1）、退出臨界區並 launch 清除協程。
+            assertFalse("clear seam hold expired before release was observed — BLOCKED 觀察窗口已被撐破", clearSeamExpired.get())
             releaseClear.countDown()
             clearer.join(5_000L)
             assertFalse("clearer 未於 5s 內結束", clearer.isAlive)
@@ -1835,7 +1881,7 @@ class PolicyWriteTest {
             assertFalse("requester 未於 5s 內結束", requester.isAlive)
             requestErrors.get()?.let { throw it }
             // 等 clear 完成（store.clear 的 ack 先翻 clearCalls，狀態更新隨後）。
-            await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
+            await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 }
             // 終態相干性（兩種合法結局皆相干，不可假設誰贏）：
             //  (a) A 在 clear 完全結清（key 已移除）後才進 CAS → 安裝 pending，
             //      phase 必為 QUEUED、packages 為 com.example.a；
@@ -1853,10 +1899,18 @@ class PolicyWriteTest {
             } else {
                 assertEquals(PolicyWritePhase.IDLE, st.policyWritePhase)
             }
+            // P2-1 對稱 pin：clear 的結清必經 Known 空集 CLEAR_SUCCESS（INFO）。
+            // outcome (a) request 安裝 pending 不改寫 msg/msgKind/draft/Known；
+            // outcome (b) BUSY 拒絕（msg=BUSY）隨後被結清的 CLEAR_SUCCESS 覆寫；
+            // 兩種結局皆保證：INFO + CLEAR_SUCCESS + Known 空集。
+            assertTrue("draft must be Known after a successful clear", vm.state.value.policyDraftKnown)
+            assertEquals("draft must be empty after a successful clear", emptySet<String>(), vm.state.value.policyDraft)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.CLEAR_SUCCESS).defaultText(), vm.state.value.msg)
             // FakePolicyStore 語義：saveRaw(null)（clear 走的就是這個）也計入 saveCalls；
             // 因此此處必須恰為 1（= clear 那一次），不得有任何 saveRaw(內容) 呼叫。
-            assertEquals(1, fake.saveCalls)
-            assertEquals(1, fake.clearCalls)
+            assertEquals(1, fake.saveCalls.get())
+            assertEquals(1, fake.clearCalls.get())
             // FakePolicyStore 文件語義：clear 成功後端為 Known 空集。
             assertEquals(emptySet<String>(), fake.saved)
             // clear 的 key 不得殘留（clear 結清後 inFlightWrites 不得再含 policy-* key）。
@@ -1870,12 +1924,115 @@ class PolicyWriteTest {
             releaseClear.countDown()
             if (requester.isAlive) {
                 requester.join(1_000L)
-                if (requester.isAlive) requester.interrupt()
+                if (requester.isAlive) {
+                    requester.interrupt()
+                    requester.join(1_000L)
+                }
             }
             if (clearer.isAlive) {
                 clearer.join(1_000L)
-                if (clearer.isAlive) clearer.interrupt()
+                if (clearer.isAlive) {
+                    clearer.interrupt()
+                    clearer.join(1_000L)
+                }
             }
+            assertFalse("leaked request worker thread survived interrupt", requester.isAlive)
+            assertFalse("leaked clear worker thread survived interrupt", clearer.isAlive)
+        }
+    }
+
+    // Post-merge R5-1 regression: a second clear arriving after the first clear
+    // registered its key, but BEFORE the first clear projects QUEUED, must be
+    // refused without allocating a second operation or advancing the phase epoch.
+    // The first clear is parked under policySettleLock, so this checks the
+    // otherwise easily missed IDLE + in-flight reservation window directly.
+    @Test
+    fun p44_clearReservation_secondClearBusyDoesNotAllocateOrAdvanceEpoch() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.seed"))
+        val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
+        await { vm.state.value.policyDraftKnown }
+        val epochBefore = vm.state.value.policyEpoch
+        val registered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val seamExpired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val error = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        vm.beforePolicyClearPhaseAssignSeamForTests = {
+            registered.countDown()
+            if (!release.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                seamExpired.set(true)
+            }
+        }
+        val first = Thread {
+            try {
+                vm.clearPolicyDraft()
+            } catch (t: Throwable) {
+                error.compareAndSet(null, t)
+            }
+        }
+        try {
+            first.start()
+            assertTrue("first clear must register before phase assignment; thread error=${error.get()}", registered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // P2-2：第二次（BUSY）clear 不得耗用 clearGeneration——key 分配點在
+            // DualViewModel.kt:10018，早期 BUSY gate（:9878）之後才會抵達。
+            val clearGenBefore = clearGenerationOf(vm)
+            // 比對完整 policy-* key 集合，不只 policy-clear: 子集。
+            val keysBefore = inFlightKeysOf(vm).filter { it.startsWith("policy-") }.toSet()
+            assertEquals("exactly one reservation (policy-*)", 1, keysBefore.size)
+            assertEquals("early BUSY gate regressed: second clear entered the locked path and projected QUEUED", PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals("early BUSY gate regressed: second clear advanced policyEpoch", epochBefore, vm.state.value.policyEpoch)
+
+            // The second clear takes the early BUSY gate (lock-free inFlightWrites
+            // scan at DualViewModel.kt:9878, evaluated BEFORE any policySettleLock-
+            // acquiring path) — it must not enter the locked phase-update path,
+            // touch the store (read or write), or allocate a key/generation.
+            // Do not reorder it before the reconciling gate, and do not weaken this test to tolerate blocking on the parked clear.
+            val loadsBefore = fake.loadCalls.get()
+            vm.clearPolicyDraft()
+            assertEquals(keysBefore, inFlightKeysOf(vm).filter { it.startsWith("policy-") }.toSet())
+            assertEquals("BUSY 拒絕不得耗用新的 clearGeneration", clearGenBefore, clearGenerationOf(vm))
+            assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals("early BUSY gate regressed: second clear entered the locked path and projected QUEUED", PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertEquals("early BUSY gate regressed: second clear advanced policyEpoch", epochBefore, vm.state.value.policyEpoch)
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertEquals(0, fake.clearCalls.get())
+            assertEquals("BUSY 拒絕不得觸碰 store（任何寫入路徑）", 0, fake.saveCalls.get())
+            assertEquals("BUSY 拒絕不得讀取 store", loadsBefore, fake.loadCalls.get())
+
+            assertFalse("clear seam hold expired before release was observed — 觀察窗口已被撐破", seamExpired.get())
+            release.countDown()
+            first.join(5_000L)
+            assertFalse("first clear did not finish within 5s of release (registration or clear completion)", first.isAlive)
+            error.get()?.let { throw it }
+            await(timeoutMs = 5_000L) {
+                fake.clearCalls.get() == 1 &&
+                    vm.state.value.policyWritePhase == PolicyWritePhase.IDLE &&
+                    vm.state.value.policyDraftKnown &&
+                    vm.state.value.policyDraft.isEmpty() &&
+                    inFlightKeysOf(vm).none { it.startsWith("policy-") }
+            }
+            // P2-1：終態必須是 CLEAR_SUCCESS 成功臂（Known 空集），而非 UNKNOWN/FAILED 臂回到 IDLE。
+            assertEquals("clear must settle as Known empty (CLEAR_SUCCESS), not an Unknown/FAILED arm", emptySet<String>(), fake.saved)
+            assertTrue("draft must be Known after a successful clear", vm.state.value.policyDraftKnown)
+            assertEquals("draft must be empty after a successful clear", emptySet<String>(), vm.state.value.policyDraft)
+            assertEquals(MsgKind.INFO, vm.state.value.msgKind)
+            assertEquals(PolicyText(PolicyTextKind.CLEAR_SUCCESS).defaultText(), vm.state.value.msg)
+            assertEquals("a BUSY second clear must not delete again", 1, fake.clearCalls.get())
+            // saveRaw(null) 也計入 saveCalls：此處恰為 1（clear 那一次）。
+            assertEquals(1, fake.saveCalls.get())
+            assertNull(vm.state.value.pendingPolicyWrite)
+            assertTrue(vm.state.value.policyEpoch > epochBefore)
+        } finally {
+            vm.beforePolicyClearPhaseAssignSeamForTests = null
+            release.countDown()
+            if (first.isAlive) {
+                first.join(1_000L)
+                if (first.isAlive) {
+                    first.interrupt()
+                    first.join(1_000L)
+                }
+            }
+            assertFalse("leaked clear worker thread survived interrupt", first.isAlive)
         }
     }
 
@@ -1972,7 +2129,7 @@ class PolicyWriteTest {
         vm.requestPolicyWrite()
         val pending = vm.state.value.pendingPolicyWrite
         assertNotNull(pending)
-        val savesBefore = fake.saveCalls
+        val savesBefore = fake.saveCalls.get()
 
         // 慢速無關操作先持有 opMutex (跨 onIo 阻塞)。
         vm.cancelSavedSelection()
@@ -1993,7 +2150,7 @@ class PolicyWriteTest {
         blockerRelease.set(true)
         await { !vm.policyOperationInProgress }
 
-        assertEquals(savesBefore, fake.saveCalls)
+        assertEquals(savesBefore, fake.saveCalls.get())
         assertEquals(setOf("com.seed"), fake.saved)
         assertNull(vm.state.value.pendingPolicyWrite)
     }
@@ -2016,7 +2173,7 @@ class PolicyWriteTest {
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
 
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertNull(vm.state.value.pendingPolicyWrite)
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(draftBefore, vm.state.value.policyDraft)
@@ -2041,7 +2198,7 @@ class PolicyWriteTest {
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("未知"))
         assertTrue(vm.state.value.msg.contains("重新整理"))
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -2117,13 +2274,13 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("進行中"))
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // 取消 pending 後回到盲清雙確認流程。本 VM 從未觀察到 Known 草稿
         // （lastKnown==null），故 S4（強制重讀優先）不觸發，維持雙確認語義。
         vm.cancelPolicyWrite(pending)
         assertNull(vm.state.value.pendingPolicyWrite)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // 第一次：僅告警，不執行。
         vm.clearPolicyDraft()
@@ -2133,12 +2290,12 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
         assertFalse(vm.state.value.policyDraftKnown)
         assertNull(vm.state.value.pendingPolicyWrite)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // 第二次：重讀仍 Unknown→abort，不執行、不耗 clear。
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
@@ -2664,7 +2821,7 @@ class PolicyWriteTest {
         await { vm.state.value.msgKind == MsgKind.FAILED }
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
 
         // 重試：第二次 arm 後的第二次點擊（S4）會先強制權威重讀而不刪除；
         // 重讀恢復 Known 後的清除才是 Known 一般單步清除。
@@ -2673,14 +2830,14 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
 
         // S4：本 VM 曾見過 Known 草稿，armed 後點擊先強制 refreshPolicyDraft()，
         // 本點擊不碰 store（refresh 異步執行）。
         vm.clearPolicyDraft()
         await { vm.state.value.policyDraftKnown }
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
 
         // 重讀已恢復 Known → 下一次清除是一般 Known 單步清除。
         vm.clearPolicyDraft()
@@ -2688,7 +2845,7 @@ class PolicyWriteTest {
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
-        assertEquals(2, fake.clearCalls)
+        assertEquals(2, fake.clearCalls.get())
     }
 
     // Phase 2 VM：手動重新整理失敗可觀測（Unknown + CHANNEL 一次 + refreshing 回位）。
@@ -2723,7 +2880,7 @@ class PolicyWriteTest {
         // Unknown 下第一次 clear 僅 arm（不耗 store）。
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // refresh Known 成功必須 disarm。
         fake.saved = setOf("com.remote")
@@ -2740,7 +2897,7 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
         assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -3012,7 +3169,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -3056,7 +3213,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -3104,7 +3261,7 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("來源清單尚未載入"))
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // Phase 3：legacy 無冒號 key 走 byPackageFirst（與 restoreSelectionLocked 一致）。
@@ -3120,7 +3277,7 @@ class PolicyWriteTest {
         assertEquals(setOf("com.example.a"), vm.state.value.pendingPolicyWrite?.packages)
         assertEquals(0, vm.state.value.pendingPolicyWrite?.droppedCount)
         assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // Phase 3：TTL 過期不碰 loading（sibling busy 守衛；本 op 未持有 loading）。
@@ -3144,7 +3301,7 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
         assertTrue(vm.state.value.msg.contains("確認已逾時"))
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // Phase 3：世代單調（request→cancel→request 跨世代，舊世代永不復活）。
@@ -3186,7 +3343,7 @@ class PolicyWriteTest {
             loadRaw = { fake.saved },
             saveRaw = { raw ->
                 if (raw == null) {
-                    fake.clearCalls++
+                    fake.clearCalls.incrementAndGet()
                     clearStarted.countDown()
                     while (!clearRelease.get()) {
                         try {
@@ -3199,7 +3356,7 @@ class PolicyWriteTest {
                     fake.saved = emptySet()
                     true
                 } else {
-                    fake.saveCalls++
+                    fake.saveCalls.incrementAndGet()
                     fake.saved = raw
                     true
                 }
@@ -3214,11 +3371,11 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
 
         clearRelease.set(true)
         await { vm.state.value.policyDraft.isEmpty() }
-        assertEquals(1, fake.clearCalls)
+        assertEquals(1, fake.clearCalls.get())
         assertTrue(vm.state.value.policyDraftKnown)
     }
 
@@ -3275,7 +3432,7 @@ class PolicyWriteTest {
 
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
     }
 
     // 反射讀核對中/在途集合（Stage A review 補測：斷言無殘留）。
@@ -3309,6 +3466,13 @@ class PolicyWriteTest {
         val f = DualViewModel::class.java.getDeclaredField("policyWriteSaving").apply { isAccessible = true }
         @Suppress("UNCHECKED_CAST")
         return (f.get(vm) as MutableSet<String>).toSet()
+    }
+
+    // 反射讀 clearGeneration（R5-1 回歸：BUSY 拒絕的第二次 clear 不得遞增；
+    // clear key 唯一性來源，DualViewModel.kt:3763 宣告）。
+    private fun clearGenerationOf(vm: DualViewModel): Long {
+        val f = DualViewModel::class.java.getDeclaredField("clearGeneration").apply { isAccessible = true }
+        return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
     }
 
     // Stage G1 (T3)：refresh 期中阻塞保留 fence——RECONCILING 期間 refresh 只
@@ -3801,14 +3965,14 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // Stage J3:第二 tap 重讀仍 Unknown→abort（REFRESH_FAILED＋Unknown＋IDLE），
         // 不耗 clear、不刪未見內容。
         now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("重新整理"))
@@ -3820,8 +3984,8 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         // 等完整終態（store 調用＋UI 發布同一語義；僅等 clearCalls 會在負載下撞見
         // store 已調而 UI 更新（CLEAR_SUCCESS INFO）在途，誤判 NONE）。
-        await(timeoutMs = 5_000L) { fake.clearCalls == 1 && vm.state.value.msgKind == MsgKind.INFO }
-        assertEquals(1, fake.clearCalls)
+        await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 && vm.state.value.msgKind == MsgKind.INFO }
+        assertEquals(1, fake.clearCalls.get())
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
@@ -3839,7 +4003,7 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         now = 20_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
         vm.clearPolicyDraft()
@@ -3847,7 +4011,7 @@ class PolicyWriteTest {
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("已逾時"))
         assertTrue(vm.state.value.msg.contains("重新清除"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(
             PolicyText(PolicyTextKind.BLIND_CLEAR_EXPIRED).defaultText(),
@@ -3866,18 +4030,18 @@ class PolicyWriteTest {
         await { !vm.state.value.loading }
 
         vm.clearPolicyDraft()
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         now = 30_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("已逾時"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // Stage J3:第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
         now += 1_000L
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -3892,7 +4056,7 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         vm.reconnectAndRefresh()
         await { !vm.state.value.loading }
@@ -3901,13 +4065,13 @@ class PolicyWriteTest {
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
         assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
         // Stage J3:重 arm 後第二 tap 重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -3923,7 +4087,7 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         vm.onForeground()
         await { !vm.state.value.loading }
@@ -3931,12 +4095,12 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -3953,14 +4117,14 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // unknown-gate confirm：不碰 store 但 bump 版本＋世代。
         val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pending)
         vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        assertEquals(0, fake.saveCalls)
+        assertEquals(0, fake.saveCalls.get())
 
         // 世代已變：第二 tap 重 arm（FIRST），不執行。
         vm.clearPolicyDraft()
@@ -3969,13 +4133,13 @@ class PolicyWriteTest {
             PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(),
             vm.state.value.msg,
         )
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
         // 第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -3992,7 +4156,7 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft()
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         // 以反射注入政策在途 key，模擬寫入進行中（不經 mutex，同步可觀測）。
         val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
@@ -4003,7 +4167,7 @@ class PolicyWriteTest {
             vm.clearPolicyDraft()
             assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
             assertEquals(MsgKind.INFO, vm.state.value.msgKind)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.clearCalls.get())
         } finally {
             keys.remove("policy-write:fake-busy")
         }
@@ -4011,7 +4175,7 @@ class PolicyWriteTest {
         // arm 被保留，但重讀仍 Unknown→abort，不執行。
         vm.clearPolicyDraft()
         Thread.sleep(300)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
@@ -5611,7 +5775,7 @@ class PolicyWriteTest {
         val blockingStore = HookPolicyStore(
             loadRaw = { fake.saved },
             saveRaw = { raw ->
-                fake.saveCalls++
+                fake.saveCalls.incrementAndGet()
                 saveStarted.countDown()
                 while (!saveRelease.get()) {
                     try {
@@ -6658,19 +6822,19 @@ class PolicyWriteTest {
                 }
                 assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
                 assertTrue(vm.state.value.policyEpoch > epochBefore)
-                assertEquals(0, fake.clearCalls)
+                assertEquals(0, fake.clearCalls.get())
 
                 // confirm：同條件下保持 QUEUED（pending 保留可重試，不耗 save）。
                 val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
                 setPendingPolicyWrite(vm, pending)
-                val savesBefore = fake.saveCalls
+                val savesBefore = fake.saveCalls.get()
                 vm.confirmPolicyWrite(pending, pending.generation)
                 await(timeoutMs = 5_000L) {
                     vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText()
                 }
                 assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
                 assertEquals(pending, vm.state.value.pendingPolicyWrite)
-                assertEquals(savesBefore, fake.saveCalls)
+                assertEquals(savesBefore, fake.saveCalls.get())
 
                 // QUEUED 可取消回 IDLE（證明未卡死）。
                 vm.cancelPolicyWrite(pending)
@@ -6757,7 +6921,7 @@ class PolicyWriteTest {
                 }
                 assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
                 assertTrue(vm.state.value.policyEpoch > epochBefore)
-                assertEquals(0, fake.clearCalls)
+                assertEquals(0, fake.clearCalls.get())
                 assertSame(holder, coordinatorTxOf(coord))
                 assertNull(activeTxOf(vm))
             } finally {
@@ -9523,8 +9687,8 @@ class PolicyWriteTest {
             assertFalse(vm.state.value.policyDraftKnown)
             assertFalse(vm.state.value.policyDraftCorrupt)
             assertTrue(tx.deferred.isCancelled)
-            assertEquals(0, fake.saveCalls)
-            assertEquals(0, fake.clearCalls)
+            assertEquals(0, fake.saveCalls.get())
+            assertEquals(0, fake.clearCalls.get())
         } finally {
             try {
                 coord.close()
@@ -10995,7 +11159,7 @@ class PolicyWriteTest {
             vm.confirmPolicyWrite(pending, pending.generation)
             await { vm.state.value.pendingPolicyWrite == null }
             assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
-            assertEquals(0, fake.saveCalls)
+            assertEquals(0, fake.saveCalls.get())
         } finally {
             try { scope.cancel() } catch (_: Exception) { }
         }
@@ -11016,14 +11180,14 @@ class PolicyWriteTest {
 
         vm.clearPolicyDraft() // tap 1：arm＋BLIND_CLEAR_FIRST
         assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
 
         val genBeforeTap2 = freshGenOf(vm)
         vm.clearPolicyDraft() // tap 2：S4 refresh-first；重讀仍 Unknown → 不刪
         await(timeoutMs = 5_000L) {
             freshGenOf(vm) != genBeforeTap2 && !vm.state.value.policyRefreshing
         }
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertTrue(
@@ -11040,7 +11204,7 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) {
             freshGenOf(vm) != genBeforeTap4 && !vm.state.value.policyRefreshing
         }
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
@@ -11130,11 +11294,11 @@ class PolicyWriteTest {
         assertNull(vm.lastKnownPolicyDraftForTests())
 
         vm.clearPolicyDraft() // tap 1：arm
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         // 遠端仍 Unknown：tap 2 → pre-read Unknown → abort（不刪）
         vm.clearPolicyDraft()
         Thread.sleep(400)
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertTrue(vm.state.value.msg.contains("重新整理"))
 
@@ -11143,8 +11307,8 @@ class PolicyWriteTest {
         vm.clearPolicyDraft() // tap 3：重新 arm
         fake.saved = emptySet()
         vm.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
-        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
-        assertEquals(1, fake.clearCalls)
+        await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 }
+        assertEquals(1, fake.clearCalls.get())
     }
 
     // PR #60 r6 Phase 1 (Finding #1): VM 替換邊界——Activity 重開（同行程內新
@@ -11261,13 +11425,13 @@ class PolicyWriteTest {
         assertNull(vmB.lastKnownPolicyDraftForTests())
 
         vmB.clearPolicyDraft() // tap 1：arm（0 刪除）
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         // 圍欄不適用（新行程）→ 經典路徑；pre-read Unknown → REFRESH_FAILED 中止（0 刪除）
         vmB.clearPolicyDraft() // tap 2
         await(timeoutMs = 5_000L) {
             vmB.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
         }
-        assertEquals(0, fake.clearCalls)
+        assertEquals(0, fake.clearCalls.get())
         assertFalse(vmB.state.value.policyDraftKnown)
         assertEquals(
             PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
@@ -11279,8 +11443,8 @@ class PolicyWriteTest {
         vmB.clearPolicyDraft() // tap 3：重新 arm
         fake.saved = emptySet()
         vmB.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
-        await(timeoutMs = 5_000L) { fake.clearCalls == 1 }
-        assertEquals(1, fake.clearCalls)
+        await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 }
+        assertEquals(1, fake.clearCalls.get())
     }
 
     // PR #60 r6 Phase 1 (Finding #1): noteLastKnownDraft 同步寫入 coordinator
