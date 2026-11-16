@@ -154,6 +154,10 @@ jobs:
         run: |
           set -e
           bash scripts/check-exported-components.test.sh
+      - name: Verify-release-apk-signers self-test
+        run: |
+          set -e
+          bash scripts/verify-release-apk-signers.test.sh
       # Artifact-verifier self-test: pins verify-release-artifacts.sh's
       # fail-fast versionName gate (K4/F-1 regression — fail() must be defined
       # before its first call) so the release/PR artifact gate fails closed.
