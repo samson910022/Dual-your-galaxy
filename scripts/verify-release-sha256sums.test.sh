@@ -62,7 +62,7 @@ expected_reason() {
     fail-forged-sums)
       printf 'FAILED' ;;
     fail-empty)
-      printf 'SHA256SUMS.txt' ;;
+      printf 'contains no entries' ;;
     fail-path-traversal)
       printf 'path traversal' ;;
     fail-absolute-path)
