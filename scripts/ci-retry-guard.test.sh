@@ -5,6 +5,25 @@
 # retry (retrying only hides it); every other failure may retry up to the
 # attempt cap and must exit 1 at the cap.
 #
+# Signature detection is two-pass: a line-based `grep -E`, then a
+# CR-dropped, newline-collapsed fallback (`tr -d '\r' | tr '\n' ' '`, with the
+# grep fed via process substitution) with the SAME VERIFICATION_RE. The legacy
+# `.{0,200}` co-occurrence budget survives collapsing (a wrap stands for one
+# extra byte — exactly one, even for CRLF, because CR bytes are dropped), so a
+# proxy-504 body with 'checksum mismatch' but no verification|metadata|artifact
+# wording within the budget still does NOT hard-fail — pinned below by the
+# proxy-504 fixture. A signature SPLIT ACROSS LINES (including across a CRLF
+# boundary) is caught by the fallback and fails fast — pinned below. Also
+# pinned below: a split whose collapsed gap exceeds the 200-byte budget is NOT
+# matched and is retried up to the cap (overbudget-split-signature), a
+# CRLF-wrapped signature fails fast (split-crlf-signature), and the fallback
+# reprint is bounded to 3 `matched:` lines even when more matches exist
+# (split-signatures-many + standalone count check at the end). NUL-gap
+# fixtures pin the `-a` flag that lets GNU grep's `.` span \x00: a NUL byte in
+# the co-occurrence gap fails fast on a single line (nul-gap-singleline,
+# line-based pass) and across a line boundary (nul-gap-split-signature,
+# multiline fallback).
+#
 # Synthetic "gradle" commands are emitted as a bash script written to a temp
 # dir (FAKE_MODE selects the behavior, every invocation is counted in
 # INVOCATIONS_FILE). Invocation shape matches the android.yml call sites:
@@ -16,14 +35,6 @@ set -u
 cd "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GUARD="scripts/ci-retry-guard.sh"
-
-# Known-miss, pinned deliberately (do NOT "fix" by asserting exit 0):
-# the guard applies VERIFICATION_RE with `grep -E`, which is line-based. A
-# verification signature SPLIT ACROSS LINES cannot match, so the guard fails
-# OPEN to its retry path for that shape: it retries up to the attempt cap and
-# exits 1 at the cap (CI still goes red). If the guard ever grows a
-# multi-line signature matcher, update this fixture and this constant.
-KNOWN_MISS_SPLIT_SIGNATURE=1
 
 if [ ! -f "$GUARD" ]; then
   echo "::error::guard script missing: $GUARD" >&2
@@ -102,9 +113,63 @@ case "$mode" in
     echo 'BUILD SUCCESSFUL in 1s'
     exit 0 ;;
   split-signature)
-    # KNOWN-MISS (see KNOWN_MISS_SPLIT_SIGNATURE above): the signature is
-    # printed across two lines, which grep -E cannot match.
+    # Signature printed across two lines: the line-based pass cannot match;
+    # the newline-collapsed fallback can and fails fast.
     printf 'Dependency verification\nfailed for org.junit:junit-bom:5.9.2\n'
+    exit 1 ;;
+  split-checksum-context)
+    # Line 1 carries 'checksum mismatch' with NO verification|metadata|artifact
+    # word on the same line, so the line-based pass does NOT match; line 2
+    # supplies the 'artifact' context word. The collapsed stream has
+    # 'checksum mismatch ... artifact' well within the 200-byte budget, so
+    # the fallback fails fast.
+    printf 'checksum mismatch for org.example:library\nwhile verifying artifact foo\n'
+    exit 1 ;;
+  proxy-504-checksum-no-context)
+    # False-positive resistance pin: 'checksum mismatch' in a proxy-504
+    # transport body, followed by MORE THAN 200 bytes of unrelated filler
+    # before the first verification|metadata|artifact word — beyond the
+    # co-occurrence budget shared by both passes, so this does NOT
+    # hard-fail and is retried up to the cap.
+    printf 'FAILURE: Could not GET https://repo.example.com/org/junit/junit-bom/5.9.2/junit-bom-5.9.2.pom. Received status code 504 from server: Gateway Timeout; checksum mismatch while relaying the response body through the proxy and the mirror kept the connection open and streamed ordinary payload bytes that carry no repository policy wording at all and the client simply saw a truncated body before the artifact download eventually resumed from a different mirror host\n'
+    exit 1 ;;
+  split-signatures-many)
+    # Five wrapped verification signatures; the line-based pass cannot match
+    # any of them, the fallback matches all five — the reprint must bound
+    # itself to head -n 3.
+    for i in 1 2 3 4 5; do
+      printf 'Dependency verification\nfailed for org.example.lib:1.0.0\n'
+    done
+    exit 1 ;;
+  split-crlf-signature)
+    # Same split as split-signature but with CRLF endings; the line-based
+    # pass cannot match line 1, the CR/LF-collapsed fallback can.
+    printf 'Dependency verification\r\nfailed for org.junit:junit-bom:5.9.2\r\n'
+    exit 1 ;;
+  nul-gap-singleline)
+    # A single-line transport body with a NUL byte in the co-occurrence gap
+    # between 'checksum mismatch' and the context word 'artifact' (plus raw
+    # filler bytes). The gap is ~100 bytes, well within the 200-byte budget.
+    # GNU grep's '.' cannot span a NUL without -a, so this pins -a on the
+    # line-based pass. No verification|metadata|artifact wording appears
+    # before the trailing context word.
+    printf 'checksum mismatch \x00\x01\x02 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa artifact\n'
+    exit 1 ;;
+  nul-gap-split-signature)
+    # A wrapped two-line case for the .-window with NULs: line 1 carries
+    # 'checksum mismatch' followed by a NUL and raw high bytes but NO
+    # verification|metadata|artifact word, so neither line matches the
+    # line-based pass; the CR/LF-collapsed fallback matches within budget
+    # only with -a (NUL is a matchable byte).
+    printf 'verification failed: checksum mismatch \x00\xde\xad\xbe\xef\nwhile verifying artifact foo\n'
+    exit 1 ;;
+  overbudget-split-signature)
+    # Fallback MISS pin: 'checksum mismatch' followed by more than 200 bytes
+    # (measured 275) of unrelated filler before the first
+    # verification|metadata|artifact word, so the collapsed co-occurrence
+    # budget is exceeded — neither pass matches and the guard retries to the
+    # cap. Line 2 deliberately contains no verification|metadata wording.
+    printf 'checksum mismatch the response body travelled through a relay and a mirror and carried nothing repository specific whatsoever and the client merely observed a truncated stream of ordinary bytes on the wire before the mirror moved the fetch onto a different host entirely x\nwhile relaying the artifact bytes for org.example:library\n'
     exit 1 ;;
   *)
     echo "fake-gradle: unknown FAKE_MODE '$mode'" >&2
@@ -184,6 +249,12 @@ run_guard 'transient HTTP 504 retried up to cap (invocations == cap)' \
 run_guard 'transient ETIMEDOUT retried up to cap (invocations == cap)' \
   1 2 connect-etimedout \
   2 0 "test etimedout" -- "$FAKE_GRADLE"
+run_guard 'proxy-504 checksum mismatch NOT within 200-byte budget is retried (invocations == cap)' \
+  1 3 proxy-504-checksum-no-context \
+  3 0 "test proxy-504-checksum-no-context" -- "$FAKE_GRADLE"
+run_guard 'overbudget split signature (collapsed gap > 200 bytes) is retried to cap (invocations == cap)' \
+  1 3 overbudget-split-signature \
+  3 0 "test overbudget-split-signature" -- "$FAKE_GRADLE"
 
 # --- (c) silent failure then success on the 2nd attempt ------------------------
 run_guard 'silent failure then success on 2nd attempt (exits 0, invocations 2)' \
@@ -200,13 +271,34 @@ run_guard 'passing command is not retried (exits 0, invocations 1)' \
   0 1 ok \
   3 0 "test ok" -- "$FAKE_GRADLE"
 
-# --- (e) KNOWN-MISS: signature split across lines ------------------------------
-# KNOWN_MISS_SPLIT_SIGNATURE=$KNOWN_MISS_SPLIT_SIGNATURE: line-based grep -E
-# cannot see a cross-line signature. Pinned semantics: fail OPEN to retry, one
-# invocation per attempt up to the cap, exit 1 at the cap (never exit 0).
-run_guard 'KNOWN-MISS split verification signature fails open to retry, exits 1 at cap' \
-  1 3 split-signature \
+# --- (e) multiline fallback: signature split across lines fails fast ---------
+# The guard collapses newlines to spaces and re-matches with the SAME
+# VERIFICATION_RE, so a signature Gradle wrapped across line boundaries still
+# fails fast (exit 1, exactly one invocation).
+run_guard 'split verification signature fails fast via multiline fallback (exit 1, 1 invocation)' \
+  1 1 split-signature \
   3 0 "test split-signature" -- "$FAKE_GRADLE"
+run_guard 'split checksum context fails fast via multiline fallback (exit 1, 1 invocation)' \
+  1 1 split-checksum-context \
+  3 0 "test split-checksum-context" -- "$FAKE_GRADLE"
+run_guard 'split CRLF signature fails fast via multiline fallback (exit 1, 1 invocation)' \
+  1 1 split-crlf-signature \
+  3 0 "test split-crlf-signature" -- "$FAKE_GRADLE"
+run_guard '5 split signatures fail fast via multiline fallback (exit 1, 1 invocation)' \
+  1 1 split-signatures-many \
+  3 0 "test split-signatures-many" -- "$FAKE_GRADLE"
+
+# --- (g) NUL bytes in the co-occurrence gap: -a pins on both passes ---------
+# GNU grep's `.` cannot span \x00 without -a, so a hostile transport body
+# carrying NUL bytes inside the gap failed open even under LC_ALL=C. Both
+# fixtures carry no verification|metadata|artifact wording except the context
+# word after the NULs, within the 200-byte budget.
+run_guard 'NUL byte in gap fails fast (line-based pass, -a)' \
+  1 1 nul-gap-singleline \
+  3 0 "test nul-gap-singleline" -- "$FAKE_GRADLE"
+run_guard 'NUL bytes in wrapped gap fail fast via multiline fallback' \
+  1 1 nul-gap-split-signature \
+  3 0 "test nul-gap-split-signature" -- "$FAKE_GRADLE"
 
 # --- argument validation: exit 2, command never runs (invocations == 0) --------
 run_guard 'argument validation: max-attempts abc' \
@@ -237,6 +329,28 @@ else
   printf '     expected: %s\n' "$EXPECTED_RE_LINE"
   printf '     actual:   %s\n' "$ACTUAL_RE_LINE"
 fi
+
+# --- bound pin: the multiline-fallback reprint is capped at 3 matched: lines -
+# split-signatures-many emits 5 wrapped signatures; the fallback reprint must
+# print at most 3 'matched:' lines even though 5 matches exist. run_guard
+# itself cannot assert this (it only checks rc + invocation count), so run the
+# guard directly and count the reprinted lines.
+total=$((total + 1))
+bound_dir="$(mktemp -d "${TMPDIR:-/tmp}/ci-retry-guard-test.XXXXXX")"
+: > "$bound_dir/invocations"
+INVOCATIONS_FILE="$bound_dir/invocations" FAKE_MODE="split-signatures-many" \
+  bash "$GUARD" 3 0 "test split-signatures-many-bound" -- "$FAKE_GRADLE" >"$bound_dir/output.log" 2>&1
+bound_rc=$?
+bound_count="$(grep -c '^     matched: ' "$bound_dir/output.log" || true)"
+if [ "$bound_rc" = "1" ] && [ "$bound_count" = "3" ]; then
+  matched=$((matched + 1))
+  printf 'PASS fixture fallback reprint bounded to 3 matched: lines (split-signatures-many)\n'
+else
+  mismatched=$((mismatched + 1))
+  printf '::error::FAIL fixture fallback reprint bound (expected exit 1 + 3 matched: lines, got exit %s + %s)\n' "$bound_rc" "$bound_count"
+  sed 's/^/     /' "$bound_dir/output.log"
+fi
+rm -rf "$bound_dir"
 
 echo "----"
 printf 'summary: %d fixtures, %d as expected, %d mismatched\n' "$total" "$matched" "$mismatched"

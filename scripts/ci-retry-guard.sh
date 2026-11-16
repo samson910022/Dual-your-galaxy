@@ -8,6 +8,9 @@
 # dependency-verification signature (Gradle's dependency verification does
 # not fail intermittently — retrying only hides it), the guard prints a
 # ::error:: with the matched lines and exits 1 IMMEDIATELY, with NO retry.
+# Signature detection is two-pass: a line-based grep, then a CR-dropped,
+# newline-collapsed fallback with the SAME VERIFICATION_RE (Gradle wraps long
+# lines, so a signature can be split across line boundaries).
 # All other failures are retried up to <max-attempts>, sleeping
 # <sleep-seconds> between attempts. Exit 0 when the command eventually
 # succeeds; nonzero otherwise.
@@ -15,6 +18,11 @@
 # Deliberately `set -u` + pipefail only: callers assert exit codes, so no
 # `set -e`.
 set -uo pipefail
+# GNU grep in UTF-8 locales treats `.` as a character match, which breaks the
+# 200-byte byte budget and cannot match invalid-UTF-8 gap bytes; CI runners
+# export LANG=C.UTF-8. LC_ALL=C is applied INLINE to the greps (and kept on
+# the tr reprint filters) rather than exported, so the wrapped command's
+# environment is untouched (JDK 17 file.encoding is locale-derived).
 
 if [ "$#" -lt 4 ]; then
   echo "usage: ci-retry-guard.sh <max-attempts> <sleep-seconds> <label> -- <command...>" >&2
@@ -29,6 +37,7 @@ if ! [[ "$2" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 MAX_ATTEMPTS="$1"; SLEEP_SECONDS="$2"; LABEL="$3"; shift 3
+case "$LABEL" in *$'\n'*|*$'\r'*) echo "ci-retry-guard.sh: <label> must not contain CR or LF" >&2; exit 2;; esac
 if [ "${1:-}" = "--" ]; then
   shift
 fi
@@ -50,7 +59,10 @@ fi
 # failure detail Gradle emits ('Signature verification failed: ...'). The bare 'checksum verification failed' branch
 # covers the standalone wording with no trailing verification/metadata/artifact
 # context (the legacy checksum branch requires that trailing context and would
-# miss a bare line). Any of these wordings appearing in a FAILED run is a
+# miss a bare line). The newline-collapsed fallback below re-matches with the
+# SAME regex; after CR-dropping + LF collapsing a wrap stands for one extra
+# byte (a CRLF wrap also stands for one byte). Any of
+# these wordings appearing in a FAILED run is a
 # deterministic dependency-verification failure — retrying only hides it. Note:
 # the legacy checksum branch STILL requires the trailing context; keep the
 # bare alternative in sync when touching it.
@@ -68,9 +80,33 @@ while true; do
   if [ "$rc" -eq 0 ]; then
     exit 0
   fi
-  if grep -Eqi "$VERIFICATION_RE" "$LOG"; then
+  if LC_ALL=C grep -Eaqi "$VERIFICATION_RE" "$LOG"; then
     echo "::error::$LABEL failed with a dependency-verification error — NOT retrying (verification failures are deterministic; fix verification-metadata.xml or the pinned checksums). Matched lines:"
-    grep -Eni "$VERIFICATION_RE" "$LOG"
+    LC_ALL=C grep -Enia "$VERIFICATION_RE" "$LOG" | head -n 3 | LC_ALL=C tr -d '\000-\010\013\014\015-\037\177'
+    exit 1
+  fi
+  # Multiline fallback: Gradle wraps long lines, so a verification signature
+  # can be split across line boundaries and defeat the line-based grep above.
+  # Drop CR bytes and collapse LF to spaces, then re-match with the SAME
+  # VERIFICATION_RE. After collapsing, a LF wrap stands for one extra byte
+  # (CR bytes are dropped, so a CRLF wrap also stands for exactly one extra
+  # byte), so the legacy `.{0,200}` co-occurrence budget survives wraps; the
+  # budget still caps the collapsed gap at 200 bytes. An LF wrap mid-token
+  # cannot match, but CR bytes are dropped everywhere in the collapsed
+  # stream, so a mid-token CR stitches bytes (deliberate, fail-closed-biased
+  # over-match — endorsed because deleting bytes can only strengthen matches,
+  # never create a non-match or fake a clean bill). Note the widened
+  # surface: the co-occurrence alternative can now match across arbitrary line
+  # boundaries anywhere in the log (still bounded to 200 collapsed bytes; the
+  # anchor must still precede the context word), and `artifact` matches as a
+  # substring (e.g. `artifactory`) — accepted trade-off, pinned by the
+  # proxy-504 fixture. A proxy-504 body with 'checksum mismatch' but no
+  # verification/metadata/artifact wording within the budget STILL does not
+  # match. Full attempt output is already teed to the console; print the
+  # matched signature(s) bounded (head -n 3), not the whole collapsed log.
+  if LC_ALL=C grep -Eaqi "$VERIFICATION_RE" < <(tr -d '\r' < "$LOG" | tr '\n' ' '); then
+    echo "::error::$LABEL failed with a dependency-verification error SPLIT ACROSS LINES (multiline match) — NOT retrying (verification failures are deterministic; fix verification-metadata.xml or the pinned checksums)."
+    tr -d '\r' < "$LOG" | tr '\n' ' ' | LC_ALL=C grep -Eaio "$VERIFICATION_RE" | head -n 3 | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | sed 's/^/     matched: /'
     exit 1
   fi
   if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
