@@ -11,6 +11,17 @@
 #     <activity> or <activity-alias> and pass the manifest gates;
 #   * each allowlisted component must carry the expected shape pinned below
 #     (permission present/absent, exported exactly "true");
+#   * android:enabled does NOT opt out of any of these checks. A component
+#     declared android:exported="true" is allowlist-checked, shape-pinned and
+#     covered by the grantUriPermissions / <path-permission> / readPermission /
+#     writePermission / <application permission rules regardless of its
+#     android:enabled value. android:enabled="false" is only the install-time
+#     default; the app can flip it at runtime with
+#     PackageManager.setComponentEnabledSetting() (see
+#     https://developer.android.com/reference/android/content/pm/PackageManager#setComponentEnabledSetting(android.content.ComponentName,int,int) ),
+#     so a disabled-but-exported component is treated exactly like an enabled
+#     exported one. The inert treatment applies ONLY to components that are
+#     NOT exported (exported="false", or absent without an <intent-filter>);
 #   * NO <application> element may carry android:permission (a component-level
 #     default inherited by EVERY component);
 #   * NO <provider> outside ROOT <queries> may carry android:grantUriPermissions
@@ -40,8 +51,11 @@
 #   It also does NOT validate android:authorities (the parity gate owns
 #   authorities), does NOT require any allowlisted component to be present
 #   (the parity gate owns GuardXposedProvider's presence; losing MainActivity
-#   fails other gates), and does NOT treat enabled="false" or
-#   exported="false" as exported — inert components are ignored entirely.
+#   fails other gates), and does NOT treat exported="false" as exported —
+#   non-exported components are ignored entirely. android:enabled is NOT an
+#   exemption: enabled="false" only pins the install-time default and the
+#   runtime can flip it via PackageManager.setComponentEnabledSetting(), so
+#   every exported="true" component is checked regardless of android:enabled.
 #   It does not scan DEX, resources, or code.
 #
 # ROOT-level <queries> blocks (children of <manifest>) declare package
@@ -118,7 +132,11 @@ COMPONENT_KINDS = ("activity", "activity-alias", "service", "receiver", "provide
 #      the UID gate lives in GuardXposedProvider.kt — NOT this gate)
 #
 # Anything outside this list that is exported is, by definition, unexpected
-# new attack surface and fails the gate.
+# new attack surface and fails the gate. android:enabled="false" does NOT
+# exempt a component from this list (or from the shape pins): it is only the
+# install-time default and can be flipped at runtime via
+# PackageManager.setComponentEnabledSetting(), so exported="true" +
+# enabled="false" is treated exactly like enabled="true".
 # ---------------------------------------------------------------------------
 ALLOWLIST = frozenset([
     ("activity", "com.galaxydual.plus.MainActivity"),
@@ -379,10 +397,16 @@ def analyze(elements):
                 f"found '{enabled}'"
             )
             continue
-        if enabled == "false":
-            # enabled="false" is inert: the component never registers with
-            # the system and exports nothing. Ignored entirely (documented).
-            continue
+        # android:enabled is deliberately NOT consulted for the allowlist /
+        # shape-pin checks below: enabled="false" pins only the install-time
+        # default, and the app can flip it at runtime with
+        # PackageManager.setComponentEnabledSetting() (see
+        # https://developer.android.com/reference/android/content/pm/PackageManager#setComponentEnabledSetting(android.content.ComponentName,int,int) ).
+        # Contract: EVERY component with android:exported="true" is checked
+        # against the allowlist (and shape-pinned) regardless of
+        # android:enabled. The inert treatment applies ONLY to components
+        # that are NOT exported (exported="false", or absent without an
+        # <intent-filter>).
 
         exported_attr = attrs.get("exported")
         has_intent_filter = element.get("has_intent_filter", False)
@@ -393,8 +417,10 @@ def analyze(elements):
                     f"merged manifests must be explicit about android:exported"
                 )
             # A component without android:exported and without an intent-filter
-            # is not exported (Android defaults to false pre-S, and merged
-            # manifests must carry the attribute for anything with a filter).
+            # is not exported: on modern Android (12 / S+) an <intent-filter>
+            # forces android:exported to be explicit (already an error above),
+            # and a component with no filter defaults to not exported.
+            # Kept as-is; the merged manifest is authoritative here.
             continue
         if exported_attr not in ("true", "false"):
             errors.append(
@@ -445,10 +471,11 @@ def analyze(elements):
     # (c) <path-permission> under an EXPORTED provider grants path-scoped URI
     # access; an exported provider carrying ANY <path-permission> child (with
     # or without android:permission on the child) is the same data-egress
-    # class as grantUriPermissions and fails closed. Inert providers
-    # (enabled="false" / exported="false") never register, so they are not
-    # checked here. Root-queries-nested providers are not enumerated as
-    # exported, so their subtrees are skipped too.
+    # class as grantUriPermissions and fails closed. Non-exported providers
+    # (exported="false") are not enumerated as exported, so they are not
+    # checked here; enabled="false" does NOT exempt a provider (see above).
+    # Root-queries-nested providers are not enumerated as exported, so their
+    # subtrees are skipped too.
     exported_providers = {id(element): element for element in exported
                           if element["tag"] == "provider"}
     for element in elements:

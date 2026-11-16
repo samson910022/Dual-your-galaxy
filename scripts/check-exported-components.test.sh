@@ -32,7 +32,7 @@ fi
 # NOTE: the count pin catches add/delete drift only — NOT substitution (one
 # fixture swapped for another at the same count). Substitution is routed to
 # review via CODEOWNERS (/scripts/fixtures/).
-EXPECTED_FIXTURE_COUNT=20
+EXPECTED_FIXTURE_COUNT=25
 shopt -s nullglob
 pinned_fixtures=("$FIXTURE_DIR"/*.xml "$FIXTURE_DIR"/*.xmltree.txt)
 if [ "${#pinned_fixtures[@]}" -ne "$EXPECTED_FIXTURE_COUNT" ]; then
@@ -48,6 +48,8 @@ expected_reason() {
     pass-*.xml|pass-*.xmltree.txt)
       printf 'PASS:' ;;
     fail-unallowlisted-service.xml|fail-unallowlisted-receiver.xml|fail-unallowlisted-provider.xml|fail-unallowlisted-activity.xml)
+      printf 'not in the allowlist' ;;
+    fail-unallowlisted-disabled-exported-provider.xml|fail-unallowlisted-disabled-exported-service.xml|fail-unallowlisted-disabled-exported-receiver.xml|fail-unallowlisted-disabled-exported.xmltree.txt)
       printf 'not in the allowlist' ;;
     fail-application-nested-queries.xml)
       printf 'not in the allowlist' ;;
