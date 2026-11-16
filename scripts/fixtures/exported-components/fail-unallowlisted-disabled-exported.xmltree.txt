@@ -1,0 +1,50 @@
+# fail-unallowlisted-disabled-exported: `aapt2 dump xmltree` rendering of
+# the merged DEBUG manifest PLUS an exported+disabled <provider>
+# (com.example.QuietProvider, android:enabled="false"). android:enabled is
+# only the install-time default and can be flipped at runtime with
+# PackageManager.setComponentEnabledSetting(), so the gate must treat it
+# exactly like an enabled exported component: not in the allowlist ⇒ the
+# gate must fail. Regression tripwire for "add it disabled, enable it at
+# runtime" bypasses in --aapt2-xmltree mode. Lines not matching the E:/A:
+# grammar are ignored by the parser.
+N: android=http://schemas.android.com/apk/res/android (line=2)
+  E: manifest (line=2)
+    A: package="com.galaxydual.plus.debug" (Raw: "com.galaxydual.plus.debug")
+      E: application (line=3)
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Galaxy Dual Plus" (Raw: "Galaxy Dual Plus")
+          E: activity (line=4)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.MainActivity" (Raw: "com.galaxydual.plus.MainActivity")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+              E: intent-filter (line=7)
+                  E: action (line=8)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+                  E: category (line=9)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+          E: provider (line=12)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="rikka.shizuku.ShizukuProvider" (Raw: "rikka.shizuku.ShizukuProvider")
+            A: http://schemas.android.com/apk/res/android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL" (Raw: "android.permission.INTERACT_ACROSS_USERS_FULL")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+            A: http://schemas.android.com/apk/res/android:multiprocess(0x01010013)=false
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.shizuku" (Raw: "com.galaxydual.plus.debug.shizuku")
+          E: provider (line=19)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.GuardXposedProvider" (Raw: "com.galaxydual.plus.GuardXposedProvider")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.XposedService" (Raw: "com.galaxydual.plus.debug.XposedService")
+          E: provider (line=24)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.startup.InitializationProvider" (Raw: "androidx.startup.InitializationProvider")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.androidx-startup" (Raw: "com.galaxydual.plus.debug.androidx-startup")
+          E: provider (line=33)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.example.QuietProvider" (Raw: "com.example.QuietProvider")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+            A: http://schemas.android.com/apk/res/android:enabled(0x0101000e)=false
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.example.quiet" (Raw: "com.example.quiet")
+          E: receiver (line=39)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.profileinstaller.ProfileInstallReceiver" (Raw: "androidx.profileinstaller.ProfileInstallReceiver")
+            A: http://schemas.android.com/apk/res/android:permission(0x01010006)="android.permission.DUMP" (Raw: "android.permission.DUMP")
+            A: http://schemas.android.com/apk/res/android:enabled(0x0101000e)=true
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+            A: http://schemas.android.com/apk/res/android:directBootAware(0x01010505)=false
+              E: intent-filter (line=45)
+                  E: action (line=46)
+                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.profileinstaller.action.INSTALL_PROFILE" (Raw: "androidx.profileinstaller.action.INSTALL_PROFILE")
