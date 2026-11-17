@@ -759,6 +759,7 @@ class DualHook : XposedModule() {
             logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
             return result
         }
+        logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
         return try {
             val raw = result as? List<*> ?: run {
                 logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
@@ -808,7 +809,15 @@ class DualHook : XposedModule() {
                 { pkg -> try { applicationInfo(pkg)?.enabled == true } catch (_: Throwable) { false } },
             )
             // Identity-preserving fast path: nothing merged => original object.
-            if (merged === original) return result
+            if (merged === original) {
+                if (logBbcNoMergeOnce(pid)) {
+                    val preds = extra.take(4).joinToString(", ") { pkg ->
+                        "$pkg: installed=${applicationInfo(pkg) != null}, enabled=${applicationInfo(pkg)?.enabled == true}"
+                    } + if (extra.size > 4) ", …(+${extra.size - 4} more)" else ""
+                    logi("BBC-HOOK merge added 0 packages (policy=${extra.size}: $preds) (pid=$pid)")
+                }
+                return result
+            }
             if (logBbcMergedOnce(pid)) {
                 logi("BBC-HOOK merged +${merged.size - original.size} packages (total ${merged.size}, pid=$pid)")
             }
@@ -855,6 +864,7 @@ class DualHook : XposedModule() {
 
     // First merge per process logs; subsequent merges stay silent.
     private fun logBbcMergedOnce(pid: Int): Boolean = bbcMergedLog.add("pid:$pid")
+    private fun logBbcNoMergeOnce(pid: Int): Boolean = bbcMergedLog.add("nomerge:$pid")
 
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
