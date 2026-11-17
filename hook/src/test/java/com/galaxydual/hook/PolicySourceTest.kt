@@ -13,7 +13,7 @@ class PolicySourceTest {
     fun staticSeedIsEmptyObserveOnly() {
         assertTrue(PolicySource.STATIC_SEED.isEmpty())
         assertTrue(PolicySource.effective().isEmpty())
-        assertFalse(PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE)
+        assertTrue(PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE)
     }
 
     @Test
@@ -50,8 +50,13 @@ class PolicySourceTest {
 
     @Test
     fun effectiveMergesSeedAndRemoteUnionOnly() {
-        // Merge/sanitize behavior is covered via the test seam; runtime default
-        // gate stays closed (fail-closed) and is covered separately.
+        // Merge/sanitize behavior is covered via the test seam; the runtime
+        // default is now open (gate=true, verified on-device; see
+        // docs/TAB7_BBC_INJECTION_PLAN.md) and is covered separately below.
+        assertEquals(
+            setOf("a", "b", "c"),
+            PolicySource.effective(setOf("a", "b"), setOf("b", "c")),
+        )
         assertEquals(
             setOf("a", "b", "c"),
             PolicySource.effective(setOf("a", "b"), setOf("b", "c"), nonEmptyPolicyGateOpen = true),
@@ -60,11 +65,12 @@ class PolicySourceTest {
 
     @Test
     fun effectiveSanitizesBothSides() {
-        // Merge/sanitize behavior is covered via the test seam; runtime default
-        // gate stays closed (fail-closed) and is covered separately.
+        // Merge/sanitize behavior is covered via the test seam; the runtime
+        // default is now open (gate=true, verified on-device; see
+        // docs/TAB7_BBC_INJECTION_PLAN.md).
         assertEquals(
             setOf("a"),
-            PolicySource.effective(setOf("a", "bad pkg"), setOf("bad/remote"), nonEmptyPolicyGateOpen = true),
+            PolicySource.effective(setOf("a", "bad pkg"), setOf("bad/remote")),
         )
     }
 
@@ -74,12 +80,20 @@ class PolicySourceTest {
     }
 
     @Test
-    fun nonEmptyPolicyBlockedWhenGateClosedFailClosed() {
-        // Default gate (omitted) is closed: sanitized non-empty merge must not
-        // reach callers. This is a code gate only, not device verification.
-        assertTrue(
-            PolicySource.effective(setOf("a", "b"), setOf("c")).isEmpty(),
+    fun nonEmptyPolicyAllowedWhenGateOpenDefault() {
+        // Default gate (omitted) is now open after on-device verification on
+        // Galaxy Tab S7 (One UI 5 / Android 13) and Galaxy S23 Ultra
+        // (One UI 9 / Android 17): sanitized non-empty merge MUST reach callers.
+        assertEquals(
+            setOf("a", "b", "c"),
+            PolicySource.effective(setOf("a", "b"), setOf("c")),
         )
+    }
+
+    @Test
+    fun nonEmptyPolicyBlockedWhenGateClosedFailClosed() {
+        // The fail-closed seam stays: with the gate explicitly closed, a
+        // sanitized non-empty merge must NOT reach callers.
         assertTrue(
             PolicySource.effective(setOf("a", "b"), setOf("c"), nonEmptyPolicyGateOpen = false).isEmpty(),
         )
@@ -88,9 +102,9 @@ class PolicySourceTest {
     @Test
     fun sanitizedNonEmptyPolicyBlockedWhenGateClosedFailClosed() {
         // Even when one side sanitizes to empty, a remaining sanitized non-empty
-        // result is still blocked while the gate is closed.
+        // result is still blocked while the gate is closed (explicit seam).
         assertTrue(
-            PolicySource.effective(setOf("a", "bad pkg"), setOf("bad/remote")).isEmpty(),
+            PolicySource.effective(setOf("a", "bad pkg"), setOf("bad/remote"), nonEmptyPolicyGateOpen = false).isEmpty(),
         )
     }
 }

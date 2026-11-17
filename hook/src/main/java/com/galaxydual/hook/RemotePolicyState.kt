@@ -22,9 +22,9 @@ import android.util.Log
 //
 // Covered by JVM unit tests (RemotePolicyStateTest, hand-rolled fake
 // SharedPreferences). PolicySource.sanitize is also locked by tests.
-// Behavior is observe-only whenever the group is absent/empty
-// (PolicySource.effective == emptySet => fail-closed through
-// NON_EMPTY_POLICY_EFFECTIVE_GATE).
+// Observe-only whenever the group is absent/empty (effective() returns empty
+// regardless of the gate). NON_EMPTY_POLICY_EFFECTIVE_GATE ships open; the
+// explicit fail-closed seam is locked by PolicySourceTest.
 internal object RemotePolicyState {
     private const val TAG = "GalaxyDualHook"
     internal const val GROUP = "galaxydual_policy"

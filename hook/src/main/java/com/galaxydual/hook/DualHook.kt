@@ -548,9 +548,10 @@ class DualHook : XposedModule() {
 
     // Effective policy for this process: static seed + the RemotePreferences
     // snapshot (RemotePolicyState; warmed by ensureRemotePolicyState() at the
-    // injection points). IPC-free. While the gate stays closed,
-    // PolicySource.effective returns emptySet() regardless of the inputs, so
-    // behavior is unchanged until NON_EMPTY_POLICY_EFFECTIVE_GATE flips. The
+    // injection points). IPC-free. With NON_EMPTY_POLICY_EFFECTIVE_GATE open
+    // (shipped default, on-device verified), a non-empty effective policy
+    // reaches the injection points here; with the gate closed, effective()
+    // returns emptySet() regardless of the inputs (fail-closed seam). The
     // remote snapshot is always sanitized inside PolicySource.effective.
     // Single seam for any future policy work. NOTE: not covered by JVM tests
     // (instantiating DualHook needs the framework); the decision logic inside
@@ -639,11 +640,12 @@ class DualHook : XposedModule() {
     }
 
     // --- BBC (com.samsung.bbc) injector: Dual Messenger available-apps list ---
-    // UNION-only, fail-closed, observe-only with an empty effective policy
-    // (today's state: NON_EMPTY_POLICY_EFFECTIVE_GATE is closed, so
-    // effectivePolicy() returns empty here). Any unexpected ROM shape, null,
-    // exception, or non-String element returns the ORIGINAL result object.
-    // Device-verified evidence lives in docs/TAB7_BBC_INJECTION_PLAN.md.
+    // UNION-only, fail-closed. With an empty effective policy (the common case:
+    // user has not ticked anything in the policy editor) effectivePolicy()
+    // returns emptySet() and the hook is a no-op returning Samsung's original
+    // result object, identical to not hooking at all. Any unexpected ROM shape,
+    // null, exception, or non-String element also returns the ORIGINAL result
+    // object. Device-verified evidence lives in docs/TAB7_BBC_INJECTION_PLAN.md.
 
     private val REMOTE_POLICY_GROUP = RemotePolicyState.GROUP
 
