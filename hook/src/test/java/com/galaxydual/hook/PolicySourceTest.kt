@@ -31,6 +31,7 @@ class PolicySourceTest {
         assertFalse(PolicySource.isValidPackage("quote\"x"))
         assertFalse(PolicySource.isValidPackage("slash/x"))
         assertFalse(PolicySource.isValidPackage("dollar\$x"))
+        assertFalse(PolicySource.isValidPackage("com.openai.chatgpt\$top!"))
     }
 
     @Test

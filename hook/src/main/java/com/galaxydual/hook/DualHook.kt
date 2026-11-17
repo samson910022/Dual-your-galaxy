@@ -31,6 +31,10 @@ class DualHook : XposedModule() {
     // Marker semantics: install evidence only, not proof policy took effect;
     // empty policy => observe-only today (see WhitelistPolicy.apply).
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
+        // Warm the remote-policy snapshot FIRST (before installing any hook)
+        // so system_server's first hooked call already sees a warmed cache.
+        // Fail-closed: failures leave the snapshot empty (no behavior change).
+        ensureRemotePolicyState()
         val installed = hookDualAppManagerService(param.classLoader)
         if (installed > 0) {
             try {
@@ -62,7 +66,8 @@ class DualHook : XposedModule() {
             // so each installed scope survives the other's write.
             // Marker semantics: install evidence only (at least one daagent
             // hook installed: WhiteListApps <clinit> and/or a query-method
-            // hook below), not proof policy took effect. Empty policy =>
+            // hook below and/or the BBC getPossibleDualAppPackages hook), not
+            // proof policy took effect. Empty policy =>
             // no-op today (early return, semantically skipped; no Outcome
             // emitted, returns before reflection; WhitelistPolicy.apply
             // returns the original result unchanged); even with non-empty
@@ -74,8 +79,14 @@ class DualHook : XposedModule() {
             // (hookDaagentQueryMethods) run only inside the LSPosed daagent
             // process; JVM tests cover the WhitelistPolicy.apply decision
             // only, never the on-device install/callback.
+            // Warm the remote-policy snapshot BEFORE installing any daagent
+            // hook (same first-call reasoning as onSystemServerStarting).
+            ensureRemotePolicyState()
             var installed = hookWhiteListApps(param.defaultClassLoader)
             installed += hookDaagentQueryMethods(param.defaultClassLoader)
+            // BBC (com.samsung.bbc) injector: install count feeds the same
+            // active-marker write condition as the two hook paths above.
+            installed += installBbcHooks(param.defaultClassLoader)
             if (installed > 0) {
                 try {
                     HookMarker.markActive(HookMarker.SCOPE_DAAGENT, onLog = ::logi)
@@ -483,6 +494,12 @@ class DualHook : XposedModule() {
                 return result
             }
             if (extra.isEmpty()) {
+                // TEMP probe (2026-11-17, Tab S7 runtime-path measurement, user-approved):
+                // the empty-policy fast path is deliberately silent, which would make any
+                // screen-triggered callback invisible. One line per (process, method) at
+                // most; no return-value change, no reflection beyond the log key.
+                // Remove after runtime-path probing or keep deliberately (decision pending).
+                logCallbackHitOnce(executable)
                 return result
             }
             val desc = try {
@@ -529,20 +546,25 @@ class DualHook : XposedModule() {
         }
     }
 
-    // Effective policy for this process: static seed (+ a RemotePreferences
-    // snapshot if a policy source is ever wired -- none is today, so the
-    // remote snapshot stays empty and behavior is identical to the static
-    // seed). Single seam for any future policy work; IPC-free. NOTE: not
-    // covered by JVM tests (instantiating DualHook needs the framework); the
-    // decision logic inside PolicySource/WhitelistPatch is what tests lock.
+    // Effective policy for this process: static seed + the RemotePreferences
+    // snapshot (RemotePolicyState; warmed by ensureRemotePolicyState() at the
+    // injection points). IPC-free. While the gate stays closed,
+    // PolicySource.effective returns emptySet() regardless of the inputs, so
+    // behavior is unchanged until NON_EMPTY_POLICY_EFFECTIVE_GATE flips. The
+    // remote snapshot is always sanitized inside PolicySource.effective.
+    // Single seam for any future policy work. NOTE: not covered by JVM tests
+    // (instantiating DualHook needs the framework); the decision logic inside
+    // PolicySource/WhitelistPatch is what tests lock.
     internal fun effectivePolicy(): Set<String> =
         PolicySource.effective(EXTRA_WHITELIST_PACKAGES, remotePolicySnapshot())
 
-    // Remote snapshot hook: empty (no policy source wired; a future change
-    // would read LibXposed RemotePreferences here -- hook-side read-only +
-    // change listener into a volatile cache).
-    // Kept as a separate function so that future work touches exactly one seam.
-    internal fun remotePolicySnapshot(): Set<String> = emptySet()
+    // Remote snapshot hook: process-wide volatile cache of the LibXposed
+    // RemotePreferences group "galaxydual_policy" (RemotePolicyState), warmed
+    // by ensureRemotePolicyState() at onSystemServerStarting/onPackageLoaded.
+    // Field is READ from the @Volatile snapshot only — no IPC, no binder on
+    // the intercept hot path. While the snapshot is empty (no policy source
+    // wired, or gate closed), behavior is identical to the static seed.
+    internal fun remotePolicySnapshot(): Set<String> = RemotePolicyState.get()
 
     // Caller-side wiring point (issue #10 Stage1, DEVICE-UNVERIFIED).
     //
@@ -595,6 +617,244 @@ class DualHook : XposedModule() {
             .setId(id)
             .intercept { chain -> interceptWhitelistCall(chain) }
     }
+
+    // Rate-limited cache for the TEMP probe above: first hit per (process, method)
+    // logs one CB-HIT line; subsequent hits stay silent. Cleared per process
+    // lifetime only.
+    private val callbackHitLogged = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+
+    private fun logCallbackHitOnce(method: Executable?) {
+        val key = try {
+            method?.let { WhitelistPolicy.describe(it) }
+        } catch (_: Throwable) {
+            null
+        } ?: "unknown"
+        if (callbackHitLogged.add(key)) {
+            try {
+                logi("CB-HIT $key (pid=" + android.os.Process.myPid() + ")")
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+        }
+    }
+
+    // --- BBC (com.samsung.bbc) injector: Dual Messenger available-apps list ---
+    // UNION-only, fail-closed, observe-only with an empty effective policy
+    // (today's state: NON_EMPTY_POLICY_EFFECTIVE_GATE is closed, so
+    // effectivePolicy() returns empty here). Any unexpected ROM shape, null,
+    // exception, or non-String element returns the ORIGINAL result object.
+    // Device-verified evidence lives in docs/TAB7_BBC_INJECTION_PLAN.md.
+
+    private val REMOTE_POLICY_GROUP = RemotePolicyState.GROUP
+
+    // Per-process one-line rate limits for the BBC entry/merge evidence logs.
+    private val bbcHitLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+    private val bbcMergedLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+
+    // Warms the process-wide volatile remote-policy snapshot. Called at the
+    // injection points (onSystemServerStarting / onPackageLoaded) BEFORE any
+    // hook is installed, so the first hooked call already sees a (possibly
+    // empty) warmed cache. [prefsProvider] is invoked at most once per
+    // process; any failure stays fail-closed (empty snapshot, no change).
+    private fun ensureRemotePolicyState() {
+        RemotePolicyState.ensureInitialized {
+            try {
+                getRemotePreferences(REMOTE_POLICY_GROUP)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    // BBC install path: probe (BBC shared library resolvable on this ROM,
+    // method present), resolve the callee reflectively, resolve the caller
+    // Executables (best-effort, may be empty), then installWithCallers
+    // (caller deopt best-effort, callee deopt + hook). Returns 1 when the
+    // callee hook installed, else 0; BOTH outcomes emit an `BBC-HOOK
+    // installed=N` ledger line (pid included, per runbook/spec §12.2).
+    // Any unexpected failure stays fail-closed (log + 0, zero behavior
+    // change, zero hooks installed).
+    private fun installBbcHooks(classLoader: ClassLoader): Int {
+        // android.os.Process.myPid() is expected not to throw, but keep the
+        // install ledger line total anyway.
+        val pid = try {
+            android.os.Process.myPid()
+        } catch (_: Throwable) {
+            -1
+        }
+        return try {
+            if (!BbcInjector.probeBbcAvailable(classLoader, ::logi)) {
+                logi("BBC-HOOK installed=0 (probe failed, pid=$pid)")
+                return 0
+            }
+            val wrapperClass = classLoader.loadClass(BbcInjector.BBC_PM_WRAPPER_CLASS)
+            val method = wrapperClass.getDeclaredMethod(
+                BbcInjector.BBC_PM_GET_POSSIBLE_METHOD,
+                android.content.Context::class.java,
+            )
+            val callers = BbcInjector.resolveCallers(classLoader, ::logi)
+            if (HookInstaller.installWithCallers(
+                    method,
+                    BbcInjector.BBC_HOOK_ID,
+                    callers,
+                    ::deoptimize,
+                    ::installBbcInterceptHook,
+                    ::logi,
+                )
+            ) {
+                logi("BBC-HOOK installed=1 (daagent, pid=$pid)")
+                1
+            } else {
+                logi("BBC-HOOK installed=0 (hook install returned false, pid=$pid)")
+                0
+            }
+        } catch (t: Throwable) {
+            // Fail-closed: BBC absent/unexpected shape/hook failure => no hook,
+            // no behavior change; the daagent keeps Samsung's original list.
+            try {
+                logi("BBC-HOOK install failed: ${t.message}")
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            try {
+                logi("BBC-HOOK installed=0 (install exception, pid=$pid)")
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            0
+        }
+    }
+
+    // BBC interceptor builder: identical protective setup to
+    // installInterceptHook (framework protection + stable id).
+    private fun installBbcInterceptHook(target: Method, id: String) {
+        hook(target)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId(id)
+            .intercept { chain -> interceptBbcCall(chain) }
+    }
+
+    // BBC interceptor: run the original first (never skipped, never replaced),
+    // then — only with a non-empty effective policy — UNION-append the policy
+    // packages that this device reports installed+enabled to the END of
+    // Samsung's own list (order of the original list preserved, entries never
+    // removed/reordered). Fail-closed at every step: policy lookup error,
+    // unexpected result type, or any non-String element => the ORIGINAL
+    // result object is returned unchanged.
+    private fun interceptBbcCall(chain: XposedInterface.Chain): Any? {
+        val result = chain.proceed()
+        val extra = try {
+            effectivePolicy()
+        } catch (_: Throwable) {
+            return result
+        }
+        val pid = try {
+            android.os.Process.myPid()
+        } catch (_: Throwable) {
+            -1
+        }
+        if (extra.isEmpty()) {
+            // Empty policy: one entry line per process at most. No return-value
+            // change (observe-only).
+            logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
+            return result
+        }
+        return try {
+            val raw = result as? List<*> ?: run {
+                logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
+                return result
+            }
+            val original = ArrayList<String>(raw.size)
+            for (e in raw) {
+                original.add(e as? String ?: return result)
+            }
+            // F-06: the BBC callee's first argument IS the Context (the
+            // daagent passes its own); prefer it for the PackageManager. The
+            // reflective ActivityThread path is kept ONLY as the fallback for
+            // a missing/non-Context argument.
+            val pm: android.content.pm.PackageManager? = try {
+                val ctx = chain.args.getOrNull(0) as? android.content.Context
+                if (ctx != null) {
+                    try {
+                        ctx.packageManager
+                    } catch (_: Throwable) {
+                        null // arg present but PM unavailable: probes stay false, fail-closed
+                    }
+                } else {
+                    bbcCurrentPackageManager()
+                }
+            } catch (_: Throwable) {
+                null
+            }
+            // Resolve ApplicationInfo ONCE per package per merge (one binder
+            // round-trip instead of one per predicate); the memo is local to
+            // this call and never cached beyond it. Hits and misses (incl.
+            // exceptions, mapped to null) are both memoized.
+            val applicationInfoMemo = LinkedHashMap<String, android.content.pm.ApplicationInfo?>()
+            fun applicationInfo(pkg: String): android.content.pm.ApplicationInfo? {
+                if (applicationInfoMemo.containsKey(pkg)) return applicationInfoMemo[pkg]
+                val info = try {
+                    pm?.getApplicationInfo(pkg, 0)
+                } catch (_: Throwable) {
+                    null
+                }
+                applicationInfoMemo[pkg] = info
+                return info
+            }
+            val merged = BbcInjector.mergeAvailableList(
+                original,
+                extra,
+                { pkg -> try { applicationInfo(pkg) != null } catch (_: Throwable) { false } },
+                { pkg -> try { applicationInfo(pkg)?.enabled == true } catch (_: Throwable) { false } },
+            )
+            // Identity-preserving fast path: nothing merged => original object.
+            if (merged === original) return result
+            if (logBbcMergedOnce(pid)) {
+                logi("BBC-HOOK merged +${merged.size - original.size} packages (total ${merged.size}, pid=$pid)")
+            }
+            // mergeAvailableList already returns a fresh ArrayList on merge;
+            // do not wrap it in a second copy.
+            merged
+        } catch (t: Throwable) {
+            // Fail-closed: merge errors never surface to the caller.
+            result
+        }
+    }
+
+    // android.app.ActivityThread is @hide-excluded from the compile-time SDK
+    // stub (compileSdk 34), so the current Application is reached through a
+    // cached reflective method; the framework class is present at runtime in
+    // every app process. Memoized Method only — currentApplication() is
+    // re-invoked per probe so an early null never sticks. Kept ONLY as the
+    // fallback for a missing/non-Context BBC callee argument (F-06).
+    private val activityThreadCurrentApplication: java.lang.reflect.Method? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        try {
+            Class.forName("android.app.ActivityThread").getMethod("currentApplication")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun bbcCurrentPackageManager(): android.content.pm.PackageManager? = try {
+        val app = activityThreadCurrentApplication?.invoke(null) as? android.app.Application
+        app?.packageManager
+    } catch (_: Throwable) {
+        null
+    }
+
+    // One line per process for the empty-policy entry evidence.
+    private fun logBbcHitOnce(msg: String) {
+        if (bbcHitLog.add(msg)) {
+            try {
+                logi(msg)
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+        }
+    }
+
+    // First merge per process logs; subsequent merges stay silent.
+    private fun logBbcMergedOnce(pid: Int): Boolean = bbcMergedLog.add("pid:$pid")
 
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
