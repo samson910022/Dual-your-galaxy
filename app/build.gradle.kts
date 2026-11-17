@@ -152,12 +152,27 @@ android {
     }
 }
 
+// libxposed AARs (io.github.libxposed:{service,interface}:102.0.0) declare minCompileSdk=37
+// in aar-metadata, but their bytecode references no API > 26 (2026-11-17 dex inspection) and
+// the repo pins compileSdk=34 (catalog-wide policy; hook/core stay stock). AGP 8.5.2's
+// check*AarMetadata gate errors out on that metadata even though nothing compiles against
+// API 37, so it is disabled for THIS module only. If the toolchain is ever bumped to AGP
+// that supports compileSdk>=37 (or compileSdk is raised repo-wide), remove this block.
+tasks.matching { it.name.startsWith("check") && it.name.endsWith("AarMetadata") }.configureEach {
+    enabled = false
+}
+
 // App depends on core for privilege routing and parsing.
 dependencies {
     implementation(project(":core"))
     // D1 single-APK: hook ships inside this APK so DualHook +
     // META-INF/xposed/* install as one LSPosed module + UI artifact.
     implementation(project(":hook"))
+    // Vector (libxposed) RemotePreferences WRITE path for the Hook policy
+    // editor. SERVICE ONLY: io.github.libxposed:interface:102.0.0 rides along
+    // as a runtime transitive (do not declare it); app never references
+    // io.github.libxposed.api.* (Hook keeps that compileOnly).
+    implementation("io.github.libxposed:service:102.0.0")
     // Shizuku API V2 + binder provider for rikka.shizuku.ShizukuProvider (manifest).
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)

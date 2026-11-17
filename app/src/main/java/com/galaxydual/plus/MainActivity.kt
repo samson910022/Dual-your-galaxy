@@ -36,6 +36,7 @@ package com.galaxydual.plus
 // by UiState.pendingRemove (syncRemoveDialog): confirm calls
 // vm.confirmRemove(), cancel/back calls vm.cancelRemove(). Rotation re-shows
 // the same pending from the retained ViewModel with no re-send.
+import android.content.Intent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -1376,6 +1377,42 @@ class MainActivity : ComponentActivity() {
         channelCard.addView(hookRow)
         channelCard.addView(hookDiagHint)
         tabEngineLayout.addView(channelCard)
+
+        // Island 2.5: Hook policy editor entry (RemotePreferences whitelist seed)
+        val policyCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_island_card)
+            val p = dp(14)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+        val policyCardTitle = TextView(this).apply {
+            text = "Hook 政策編輯"
+            textSize = 14f
+            setTextColor(getColor(R.color.oneui_text_primary))
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        val policyCardSub = TextView(this).apply {
+            text = "RemotePreferences 白名單種子（預設空＝observe-only；變更需 BBC-hook 生效）"
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(10)
+            }
+        }
+        val policyEditBtn = Button(this).apply {
+            text = "編輯 Hook 政策…"
+            setOnClickListener { startActivity(Intent(this@MainActivity, PolicyActivity::class.java)) }
+        }
+        policyCard.addView(policyCardTitle)
+        policyCard.addView(policyCardSub)
+        policyCard.addView(policyEditBtn)
+        tabEngineLayout.addView(policyCard)
 
         // Island 3: System Hook Diagnostics Checklist
         val checklistCard = LinearLayout(this).apply {
