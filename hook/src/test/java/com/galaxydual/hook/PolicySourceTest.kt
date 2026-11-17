@@ -31,6 +31,11 @@ class PolicySourceTest {
         assertTrue(PolicySource.STATIC_SEED.isEmpty())
         assertTrue(PolicySource.effective().isEmpty())
         assertFalse(PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE)
+        // BBC injector effect switch pinned: true since 2026-11-17 (owner-authorized,
+        // BBC-only effect surface; Stage-1 gate above stays sealed). Flipping requires
+        // explicit owner review of the entire BBC path — pre-/post-unification evidence
+        // lives in docs/TAB7_BBC_INJECTION_PLAN.md Addendum A/B.
+        assertTrue(PolicySource.BBC_AVAILABLE_APPS_INJECTION)
     }
 
     @Test

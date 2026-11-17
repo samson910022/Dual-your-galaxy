@@ -66,17 +66,18 @@ object PolicySource {
     @Volatile
     internal var remotePolicyReader: () -> Set<String>? = { emptySet() }
 
-    // CONTRACT (equality-only, S7): tokens accepted here are used ONLY for
-    // equality matching / set membership against the (seed ∪ sanitized remote)
-    // policy sets — never for anything else. This grammar is a deliberate
-    // SUPERSET of the Android package grammar (it admits '-', '..' and
-    // separator oddities such as "a-", "..", "com..x"), which is safe only
-    // because of that equality-only use: today no code path feeds a token to
-    // PackageManager, a URI, a file path, an Intent/ComponentName, logging,
-    // or display output on the strength of this check. ANY future reuse
-    // beyond equality matching (PackageManager lookup, logging, display,
-    // Intent/ComponentName/Uri/file paths) MUST re-validate against a real
-    // Android package grammar (e.g. dot-separated segments of
+    // CONTRACT (equality-only, S7): tokens are used for equality matching /
+    // set membership against the (seed ∪ sanitized remote) policy sets, and —
+    // since 2026-11-18 — for the BBC injector only: (a)
+    // PackageManager.getApplicationInfo name lookup (never a path/command/
+    // URI), and (b) a once-per-process, ≤4-token logcat diagnostic. This
+    // grammar is a deliberate SUPERSET of the Android package grammar (it
+    // admits '-', '..' and separator oddities such as "a-", "..", "com..x"),
+    // which is safe only under those two consumers and equality-only use —
+    // nothing else feeds a token to PackageManager, a URI, a file path, a
+    // shell, an Intent/ComponentName, or display output on the strength of
+    // this check. ANY future reuse beyond these MUST re-validate against a
+    // real Android package grammar (e.g. dot-separated segments of
     // [A-Za-z][A-Za-z0-9_]*) and MUST NOT rely on this regex. Do not loosen
     // it further without re-checking every consumer of effective()/sanitize().
     fun isValidPackage(pkg: String): Boolean =

@@ -3,7 +3,7 @@
 
 狀態：**Draft v2（待人審）**　|　日期：2026-11-17（v2：依 SPEC_REVIEW 28 項修正）　|　**2026-11-18：unified build 遷移紀錄見文末 Addendum B；本文多處仍引用 `galaxydual_policy`（pre-unification group），自 unified tree 起政策 group 改為 `dual_policy`／key `extra_whitelist_packages`。**
 裝置基準：SM-T870（Android 13, One UI 5, DAAgent 3.3.00.0, Vector v2.2 / API 102）。裝置序號不寫入 repo。
-非目標 ROM：S24／One UI 9（本 spec 以 Tab S7 為證據基準；其他 ROM 只做候選級保留）
+非目標 ROM：S24（本 spec 以 Tab S7 為證據基準；2026-11-17 另驗 S23 Ultra／One UI 9，證據為 pre-unification build，見 Addendum A；其他 ROM 只做候選級保留）
 授權：MIT original（借鑑思路見 `docs/CREDITS.md`，不複製任何第三方代碼；OneUIX=AGPL 禁止複製，DualAppMod=Apache-2.0 僅思路）
 
 ---
@@ -17,7 +17,7 @@
 - 內容：`classes.dex`（70,152 B, DEX 039, 65 classes, 979 strings）＋`META-INF/MANIFEST.MF`
 - 註冊：`cmd package list libraries` → `library:com.samsung.bbc`
 - DAAgent 宣告：`<uses-library android:name="com.samsung.bbc"/>`（line=195, required 未設＝true）；`knoxsdk` required=true
-- 註記： BBC 庫「存在+uses-library 宣告」為靜態事實；**BBC 類別在 daagent 進程 classloader 可解析 = 未實機驗證（見 §6 spike，為 BBC-injector 硬前置）**
+- 註記： BBC 庫「存在+uses-library 宣告」為靜態事實；**BBC 類別在 daagent 進程 classloader 可解析已驗證（兩裝置皆有 spike OK 證據：S7 `BBC-SPIKE ok com.samsung.android.da.daagent.fwwrapper.PmWrapper#getPossibleDualAppPackages (pid=7812)`；S23 `BBC-SPIKE ok … (pid=21472)`，s4_gate_true_bbc.log／s23_bbc_evidence_20261117.log）**
 
 ### 0.2 呼叫鏈（disassembly 偏移量照抄，詳 ROM_ANALYSIS_TABS7.md / RUNTIME_FINDINGS_TABS7.md）
 
@@ -167,7 +167,7 @@ adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk   # serial 
 adb -s <serial> reboot
 adb -s <serial> logcat -d | grep -E "GalaxyDualHook|BBC-HOOK|BBC-SPIKE"
 adb -s <serial> shell su -c 'stat -c %y /data/system/galaxydual_hook.active' 2>&1
-# gate=true A/B 流程：見 docs/../VERIFY_TABS7_RUNBOOK.md（清單收集、Shopee 步驟、負對照、回滾）
+# BBC-only 效應閘（pre-unification build）A/B 流程：見 VERIFY_TABS7_RUNBOOK.md（裝置驗證記錄目錄，未入 repo：清單收集、Shopee 步驟、負對照、回滾）
 ```
 
 ## 8. Project Structure
@@ -218,7 +218,7 @@ internal fun mergeAvailableList(
   1. spike 通過日誌（§6）
   2. hook 安裝 log（deopt+hooked + `installed=1`）
   3. gate=false：清單逐列相同（螢幕截圖）＋`BBC-HOOK` 僅 entry log，無 merge 行為
-  4. gate=true（device-verified A/B，target=`com.shopee.tw`）：
+  4. gate=true（pre-unification device-verified A/B，target=`com.shopee.tw`）：
      - "可用的應用程式" 出現 Shopee；Popup；啟用；「Dual Messenger 應用程式」出現 Shopee
      - `pm list packages --user 95 | grep shopee`（應顯示）；`pm path --user 95 com.shopee.tw`；分身啟動（使用者實測）＋重新開機後仍在
   5. RemotePreferences live-swap（不重開機）：App 寫入→cache 更新→清單差異重現；/cb=off 時 fail-closed；
@@ -239,7 +239,7 @@ internal fun mergeAvailableList(
 1. `:hook:testDebugUnitTest` 全綠；`assembleDebug` 成功 — ☑ unified tree Stage 8.1：1921 JVM tests 全綠、`assembleDebug` OK（orchestrator 2026-11-18 記錄）。
 2. spike 通過；`BBC-HOOK installed=1`（或 fail-closed 記 `BBC-HOOK skip` 且行為不變） — ☑（2026-11-17，pre-unification build，兩裝置；S23 `BBC-HOOK installed=1 (daagent, pid=21472)`、Tab S7 pid 7812/18538/21602；unified build 重驗 = Stage 8.3 BBC1）。
 3. gate=false（預設）零行為差異 — ☑（unified tree Stage-1 封緘 `false` 即預設，零行為變更由 `PolicySourceTest`／`EffectivePolicyCacheTest`（gate-closed 零讀取）鎖定；pre-unification build 亦曾以 gate=false 基線驗證）。
-4. BBC 清單出現、可啟用、分身安裝/啟動成功 — ☑（2026-11-17，pre-unification build：S23 Ultra 端對端雙開 ChatGPT `u95_a431`；Tab S7 Firefox 雙開 `u95_a306`）；unified build 重驗 = Stage 8.3（BBC3/BBC4/BBC5）。
+4. BBC 清單出現、可啟用、分身安裝/啟動成功 — ☑ S23 Ultra（2026-11-17，pre-unification build：端對端雙開 ChatGPT `u95_a431`，持久化證據 `s23_bbc_evidence_20261117.log`）／⚠️ Tab S7（BBC merge +0、Firefox/Gemini 列可見＋toggle 可見（截圖 `10_dualmessenger_page.png`）；dual-install 僅有 session 觀察、無持久化檔案證據）；Shopee 無法納入清單（disabled，installed∧enabled 謂詞正確跳過，非失敗）；unified build 重驗 = Stage 8.3（BBC3/BBC4/BBC5、S23 Ultra）。
 5. RemotePreferences 寫入在**不重開機**情況下可見 — 語義已更正：pre-unification build 以 RemotePreferences listener push 即時可見（observer 於 daagent 行程即時更新）；unified build **無**跨行程推送（API 102），新鮮度＝TTL 輪詢（≤60s）＋重啟語義（`EffectivePolicyCache`：60s TTL／5s 失敗節流／single-flight／50ms stall 預算）。unified build reader 接線重驗 = Stage 8.3（BBC2/BBC3）— ☐ 未測。
 6. §1.4 hard gate 5 項各有 Tab S7／S23 證據；任何一項未達 ⇒ gate=false、BBC-injector observe-only（不得有 UNVERIFIED 直接上線） — ☑（2026-11-17，pre-unification build，docs/HOOK.md §1.4 items 1–5；unified build 重驗 = Stage 8.3（BBC1–BBC6））— ☐ 未測（unified）。
 7. 連續 2 次重開機正常；`logcat -b crash | grep -i galaxydual` 空 — ☐ 未測（pre-unification build 未做；unified build Stage 8.3 若有時間窗執行，之前不得宣稱通過）。
@@ -281,7 +281,7 @@ internal fun mergeAvailableList(
 
 **裝置 1：Galaxy Tab S7（SM-T870，Android 13／One UI 5，DAAgent 3.3.00.0，Vector v2.2 API 102）**
 - Gate=false 基線：`BBC-HOOK installed=1 (daagent, pid=…)`、`BBC-HOOK callback …`＋`RemotePreferences initial load: 0 package(s)`；Samsung 可用清單不受影響。
-- Gate=true：勾選 Firefox＋Gemini → `RemotePreferences updated`／callback nonempty → `BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw installed=true, enabled=false, org.mozilla.firefox installed=true, enabled=true, com.google.android.apps.bard installed=true, enabled=true)`。**merge added 0 是正確結論**：Firefox／Gemini 已在 Samsung 執行期 dual_app 白名單（AIDL 傳回、裝置持久化，非框架常數）；注入位元一致、零回歸。toggle 在設定頁可操作，雙開實例（`org.mozilla.firefox`）已安裝並以 `u95_a306` 執行。
+- Gate=true：勾選 Firefox＋Gemini → `callback nonempty` → `BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw installed=true, enabled=false, org.mozilla.firefox installed=true, enabled=true, com.google.android.apps.bard installed=true, enabled=true)`（§capture 為 logcat 直接擷錄，S23 Ultra 則在 LSPosed verbose mirror）。**merge added 0 是正確結論**：Firefox／Gemini 已在 Samsung 執行期 dual_app 白名單（AIDL 傳回、裝置持久化，非框架常數）；注入位元一致、零回歸。toggle 在設定頁可操作（截圖 `10_dualmessenger_page.png`）；双開安裝觀察存在（同 session `pm path --user 95 org.mozilla.firefox` 回應 dual APK paths；截圖 `11_firefox_dual.png` 為 Firefox first-run 畫面），**但未持久化為檔案：無 `u95_*` 進程持久證據，不得引用**。
 - BBC 演算法（`PmWrapper.getPossibleDualAppPackages`）在 S7 BBC：installed ∩ enabled ∩ `SemDualAppManager.getAllWhitelistedPackages()`。
 
 **裝置 2：Galaxy S23 Ultra（SM-S9180，Android 17／One UI 9 `90000`，DAAgent 3.7.00.0，`ro.build.version.sdk=37`，KernelSU Next + Zygisk-LSPosed，BBC jar 33,946 bytes，classes.dex 33,644 bytes）**
@@ -289,7 +289,7 @@ internal fun mergeAvailableList(
 - Caller deopt：`DualAppActivity#getAvailableApps`／`#updateDualAppList` 在 One UI 9 **找不到目標**（已改名/內聯），hook 自動 `skipped`（不影響 BBC callback——hook 裝在 BBC callee 本體）。
 - Policy editor（Phase 4 picker 版）：搜尋＋勾選 `com.openai.chatgpt` →
   `RemotePreferences updated: 1 package(s)`（live push、無需重啟）→
-  **20:54 首次開頁 `BBC-HOOK callback getPossibleDualAppPackages (pid=21472)`,
+  **22:54 首次開頁 `BBC-HOOK callback getPossibleDualAppPackages (pid=21472)`,
   23:01 政策生效後 `BBC-HOOK callback (nonempty, pid=21472)` →
   `BBC-HOOK merged +1 packages (total 7, pid=21472)`**。
 - Samsung 設定頁（Dual Messenger）在「應用程式」區出現 **ChatGPT** 與 Telegram 並列，可切換；

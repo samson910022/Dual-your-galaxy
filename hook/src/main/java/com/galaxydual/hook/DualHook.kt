@@ -682,11 +682,32 @@ class DualHook : XposedModule() {
     // BBC 路徑專屬：以與白名單查詢一致的 EffectivePolicyCache 讀取政策，
     // 但以 BBC_AVAILABLE_APPS_INJECTION 作為自己的效應開關（Stage-1 封緘不受
     // 影響，兩邊各自 fail-closed；TTL 60s／failureCooldown 5s／single-flight／50ms
-    // budget 與白名單查詢同一佇列語義）。
+    // budget 與白名單查詢同一佇列語義，grace/deadline 直接比照 effectivePolicy
+    // 的取樣方式採樣，不會漂移）。
     private fun bbcPolicy(): Set<String> = try {
+        val t0Sample = DeadlineBudget.sampleClock()
+        val clockOk = t0Sample.clockOk
+        val t0 = t0Sample.nanos
+        val graceAtEntry: Long = if (!clockOk) {
+            0L
+        } else try {
+            DeadlineBudget.graceAtEntry(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        val deadlineMs: Long = if (!clockOk) {
+            -1L
+        } else try {
+            val n = DeadlineBudget.nowNanos()
+            if (n == DeadlineBudget.NO_START_NANOS) -1L else (n / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+        } catch (_: Throwable) {
+            -1L
+        }
         effectiveCache.get(
             EXTRA_WHITELIST_PACKAGES,
             nonEmptyPolicyGateOpen = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            followerGraceMs = graceAtEntry,
+            deadlineMs = deadlineMs,
         ) { policyRead() }
     } catch (_: Throwable) { emptySet() }
 
@@ -1121,15 +1142,23 @@ class DualHook : XposedModule() {
     // result object is returned unchanged.
     private fun interceptBbcCall(chain: XposedInterface.Chain): Any? {
         val result = chain.proceed()
-        val extra = try {
-            bbcPolicy()
-        } catch (_: Throwable) {
-            return result
-        }
         val pid = try {
             android.os.Process.myPid()
         } catch (_: Throwable) {
             -1
+        }
+        // Fail-fast on unexpected ROM shapes before paying for the policy
+        // lookup (type-check is cheaper than a binder read).
+        if (result !is List<*>) {
+            if (logBbcBadTypeOnce(pid)) {
+                logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
+            }
+            return result
+        }
+        val extra = try {
+            bbcPolicy()
+        } catch (_: Throwable) {
+            return result
         }
         if (extra.isEmpty()) {
             // Empty policy: one entry line per process at most. No return-value
@@ -1139,10 +1168,9 @@ class DualHook : XposedModule() {
         }
         logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
         return try {
-            val raw = result as? List<*> ?: run {
-                logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
-                return result
-            }
+            // result is already known to be a List<*> (checked above).
+            @Suppress("UNCHECKED_CAST")
+            val raw = result as List<*>
             val original = ArrayList<String>(raw.size)
             for (e in raw) {
                 original.add(e as? String ?: return result)
@@ -1261,6 +1289,13 @@ class DualHook : XposedModule() {
     // Merge-path failure ledger (logged once per process, never swallowed).
     private fun logBbcMergeFailOnce(pid: Int): Boolean = try {
         bbcMergedLog.add("mergefail:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Bad-result-type ledger (logged once per process, never swallowed).
+    private fun logBbcBadTypeOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("badtype:$pid")
     } catch (_: Throwable) {
         false
     }

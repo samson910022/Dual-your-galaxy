@@ -321,8 +321,12 @@ class PolicyActivity : ComponentActivity() {
             countHintView.text = hintText()
         }
         if (::writeBarBtn.isInitialized) {
-            writeBarBtn.text = "寫入政策草稿（${ticks.size}）"
-            writeBarBtn.isEnabled = phaseIsIdle
+            writeBarBtn.isEnabled = phaseIsIdle && policyDraftKnown
+            writeBarBtn.text = if (policyDraftKnown) {
+                "寫入政策草稿（${ticks.size}）"
+            } else {
+                getString(R.string.policy_unknown_refresh)
+            }
         }
     }
 

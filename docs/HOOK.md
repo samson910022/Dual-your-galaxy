@@ -27,7 +27,7 @@
 - owner-user 需求：hook 讀 user 0；草稿必須由 owner user 寫入（非 owner
   用戶的寫入不會被 hook 讀到）。「hook 讀 user 0」為 assertion，非實機證明；
   app 寫入後 hook 是否真讀到，需 on-device 端到端證明（DEVICE-UNVERIFIED；
-  BBC 注入面 2026-11-17 裝置已驗證，見 §1.3a／§1.4／`docs/ACCEPTANCE.md` §6）。
+  BBC 注入面 2026-11-17 裝置已驗證（pre-unification 證據），見 §1.3a／§1.4／`docs/ACCEPTANCE.md` §6）。
 - 跨行程新鮮度（P1-1，已修正為 POLL ONLY，API 102.0.0 無推送）：
   LSPosed API 102.0.0 的 `IXposedService` **沒有**遠端偏好回調 transaction；
   `RemotePreferences` 在 daemon 抓取 `mMap` 一次後只通知**同行程**監聽器；
@@ -283,11 +283,10 @@ Samsung Dual Messenger 頁的「可用的應用程式」清單由 DAAgent 呼叫
 （兩條入口均經此：`DualAppActivity` 頁面渲染、`DAUtility.getWhiteListPkgs(true)`
 遙測）；BBC 類在 daagent 行程 boot classpath 解析。清單語義為
 `installed ∩ enabled ∩ SemDualAppManager.getAllWhitelistedPackages()`（BBC 內部實作）。
-BBC jar 於 Tab S7（One UI 5）與 S23 Ultra（One UI 9）為**同一 BBC 庫**（One UI 9 僅新增 static final 常數，`PmWrapper` 方法簽名完全一致；`Lcom/samsung/android/bbccommon/*`＋`fwwrapper/PmWrapper`，演算法逐字相同）。
+BBC jar 於 Tab S7（One UI 5）與 S23 Ultra（One UI 9）結構相同：`Lcom/samsung/android/bbccommon/*`＋`fwwrapper/PmWrapper`，`getPossibleDualAppPackages` 演算法**位元相同**（opcode-identical：74 16-bit code units，無任何新增 static final 常數，方法簽名完全一致，雙 dump 逐字比對）。
 
 本模組在 daagent 內 hook BBC 方法（PRIMARY anchor，PUBLIC STATIC，policy 面的唯一擴點），將**政策包集合**（`dual_policy/extra_whitelist_packages`；由 `PolicySource.effective` union-only 合併後再經 `EffectivePolicyCache` 容量約束讀取，見 §1.1；BBC 路徑效應閘 `PolicySource.BBC_AVAILABLE_APPS_INJECTION = true`）自我合併進 BBC 清單
-之尾端（`BbcInjector.mergeAvailableList`：候選包若已存在、或未通過 installed/enabled 謂詞則跳過；至少一個新增才回傳**同一物件原地附加**的新清單，
-零新增回傳 Samsung 原始物件——fail-closed / identity fast path 不變；PROTECTIVE）。
+之尾端（`BbcInjector.mergeAvailableList`：候選包若已存在、或未通過 installed/enabled 謂詞則跳過；至少一個新增才回傳**全新的** `ArrayList`（逐字複製 Samsung 清單後於尾端追加政策包；Samsung 原始清單物件永不原地修改）；零新增回傳 Samsung 原始物件——fail-closed / identity fast path 不變；PROTECTIVE）。
 包含 BBC 所有可呼叫路徑，列表因此擴大為
 `installed ∩ enabled ∩ (Samsung whitelist ∪ 政策包)`，只有可見條目數增加，
 Samsung 原始驗證路徑不動；Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` 封緘不受影響。
@@ -296,7 +295,7 @@ Samsung 原始驗證路徑不動；Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_
 
 | 裝置 | BBC | 操作 | BBC-HOOK 證據（擷錄原文） | 結果 |
 | --- | --- | --- | --- | --- |
-| Galaxy Tab S7（SM-T870，Android 13 / One UI 5，DAAgent 3.3.00.0） | BBC 驗證 | 政策勾選 `org.mozilla.firefox`、`com.google.android.apps.bard`（改名 Gemini） | `BBC-HOOK installed=1 (daagent, pid=21602)`；`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=21602)`；`BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw: installed=true, enabled=false, org.mozilla.firefox: installed=true, enabled=true, com.google.android.apps.bard: installed=true, enabled=true) (pid=21602)`（firefox/bard 已在 Samsung 執行期白名單：union no-op，注入零回歸） | 兩 app 出現在「可用」清單、可切換，已建立雙開並以 `u95_a306` 執行 |
+| Galaxy Tab S7（SM-T870，Android 13 / One UI 5，DAAgent 3.3.00.0） | BBC 驗證 | 政策勾選 `org.mozilla.firefox`、`com.google.android.apps.bard`（改名 Gemini） | `BBC-HOOK installed=1 (daagent, pid=21602)`；`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=21602)`；`BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw: installed=true, enabled=false, org.mozilla.firefox: installed=true, enabled=true, com.google.android.apps.bard: installed=true, enabled=true) (pid=21602)`（firefox/bard 已在 Samsung 執行期白名單：union no-op，注入零回歸） | 兩 app 出現在「可用」清單、可切換（截圖 `10_dualmessenger_page.png`：Firefox/Gemini 列顯示、toggle 可見）；雙開安裝觀察存在（2026-11-17 同 session `pm path --user 95 org.mozilla.firefox` 回應 dual APK paths；截圖 `11_firefox_dual.png` 為 Firefox first-run 畫面），**但未持久化為檔案證據：無 `u95_*` 進程持久證據，不得引用**；BBC 合併為 no-op（merge +0） |
 | Galaxy S23 Ultra（SM-S9180，Android 17 / One UI 9「90000」，DAAgent 3.7.00.0，BBC jar 33,946 bytes，KernelSU + Zygisk-LSPosed） | BBC 驗證（`PmWrapper` 新增 static final 常數、方法完全一致；BBC dump 證據：BBC jar `Lcom/samsung/android/bbccommon/*` + `fwwrapper/PmWrapper`，演算法 `installed ∩ enabled ∩ SemDualAppManager` 與 S7 位元一致） | 政策勾選 `com.openai.chatgpt`（BBC 不含 `com.openai.chatgpt`） | `BBC-HOOK installed=1 (daagent, pid=21472)`；`BBC-HOOK callback getPossibleDualAppPackages (pid=21472)` → `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=21472)` → **`BBC-HOOK merged +1 packages (total 7, pid=21472)`**（2026-11-17 22:54/23:01 LSPosed verbose mirror） | Samsung 頁「應用程式」區出現 ChatGPT 條目且可切換；已建立雙開並以 `u95_a431` 執行（`u0_a431` 主行程並存；`pm path --user 95 com.openai.chatgpt` 列出 base＋split APK，見 `s23_bbc_evidence_20261117.log`） |
 
 S23 Ultra 之 BBC-HOOK 行僅出現於 LSPosed verbose mirror（`/data/adb/lspd/log/verbose_*.log`；`adb shell su -c 'grep …verbose_*.log'`），logcat 僅見 `RemotePreferences initial load: 0 package(s)` 與 `RemotePreferences updated: 1 package(s)` 兩行（`s23_bbc_gate_true.log`）；Tab S7 之 BBC-HOOK 行直接出現於 logcat（`s4_gate_true_bbc.log`，如 `BBC-HOOK installed=1 (daagent, pid=7812)`、`BBC-HOOK merge added 0 packages…`）。兩者皆為合法擷錄路徑。
@@ -356,7 +355,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 4. ✅ user／profile isolation 語義：BBC 路徑候選包 predicated on
    `installed(ApplicationInfo!=null ∧ enabled==true)`；userId 過濾面不擴充
    （`*Installed*Whitelist*` 複合查詢維持 fail-closed 排除），雙開實例落在
-   目標 ROM 的 dual profile（兩台實機實測為 user 95，`u95_a306`／`u95_a431`），
+   目標 ROM 的 dual profile（S23 Ultra 實機實測 user 95：`u95_a431`，持久化記錄見 `s23_bbc_evidence_20261117.log`；Tab S7 的安裝觀察僅存在於未持久化的 session 輸出，無 `u95_a306` 檔案證據，不得引作定案），
    可正常 launch；未觸及 user 150（Knox）。
 5. ✅ 目標 ROM 上**受控空政策 vs 非空政策對照**（pre-unification build）：Tab S7（`RemotePreferences initial load: 0→3 package(s)`；
    空政策 BBC callback 回傳原始物件；非空時 `BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw: installed=true, enabled=false, org.mozilla.firefox: installed=true, enabled=true, com.google.android.apps.bard: installed=true, enabled=true)`＝Samsung 白名單
@@ -520,7 +519,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   dual instance installed and launched (u95_a431). Full capture: `s23_bbc_evidence_20261117.log`
   (LSPosed verbose mirror) with corroborating 2-line logcat `s23_bbc_gate_true.log`. Tab S7 —
   `BBC-HOOK merge added 0 packages (policy=3: …)` (Firefox/Bard already in Samsung's runtime
-  whitelist → no-op); Firefox dual install+launch verified (u95_a306); `s4_gate_true_bbc.log`.
+  whitelist → no-op); Firefox listed with toggles visible; merge no-op; `s4_gate_true_bbc.log`.
   Unified build shares the same BBC algorithm (BBC jar byte-equivalent on both devices) but the
   reader path changed — evidence does NOT carry over automatically; re-verification = Stage 8.3
   (S23 Ultra, BBC1-BBC6; BBC6 rollback untested). See `docs/ACCEPTANCE.md` §6.
@@ -550,7 +549,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   non-scope processes get `detach()`.
 - **JVM tests prove pure decision/selection logic only** (not on-device class presence,
   signatures/return types, hook installation, callback interception, or that eligible overloads
-  are hit on Samsung DAAgent/LSPosed). The BBC effect seam is device-verified (2026-11-17);
+  are hit on Samsung DAAgent/LSPosed). The BBC effect seam is device-verified (2026-11-17, pre-unification evidence);
   the Stage-1 gate stays sealed: a code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) — this is a code gate, not device verification, and Stage 1 defaults remain unchanged;
   the fail-closed gate seam remains unit-tested.

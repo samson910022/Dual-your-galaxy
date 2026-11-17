@@ -220,6 +220,40 @@ class BbcInjectorTest {
     }
 
     @Test
+    fun overlongPolicyTokenIsDroppedBeforeValidCheck() {
+        val original = listOf("com.samsung.a")
+        val longOk = "a".repeat(PolicySource.MAX_PACKAGE_LENGTH + 1) // grammar-valid, over length cap
+        val merged = BbcInjector.mergeAvailableList(
+            original,
+            setOf(longOk, "com.ok.app"),
+            allInstalled,
+            allEnabled,
+        )
+        assertEquals(listOf("com.samsung.a", "com.ok.app"), merged)
+    }
+
+    @Test
+    fun policyStoppingAtMaxEntriesIsHonored() {
+        val original = listOf("com.samsung.a")
+        // MAX_POLICY_ENTRIES policy entries, all of them unique tokens:
+        // the merge accepts the cap verbatim (no more than MAX entries added).
+        val cap = PolicySource.MAX_POLICY_ENTRIES
+        val policy = LinkedHashSet<String>()
+        for (i in 0 until cap) policy.add("com.policy.pad$i")
+        val merged = BbcInjector.mergeAvailableList(original, policy, allInstalled, allEnabled)
+        // original (1) + exactly MAX_POLICY_ENTRIES merged entries
+        assertEquals(1 + cap, merged.size)
+        // One beyond the cap never reaches the merge: the set passed here
+        // already holds the cap; adding the +1 next entry is the merge's
+        // saturating semantics — verify with a CAP+1 distinct set:
+        val policyPlusOne = LinkedHashSet(policy)
+        policyPlusOne.add("com.policy.pad.one.extra")
+        val merged2 = BbcInjector.mergeAvailableList(original, policyPlusOne, allInstalled, allEnabled)
+        assertEquals(1 + cap, merged2.size)
+        assertEquals("com.samsung.a", merged2.first())
+    }
+
+    @Test
     fun predicatesThrowingEverywhereReturnsOriginalByIdentity() {
         // Total failure of both probes => fail-closed: original object, no merge.
         val original = listOf("com.samsung.a")

@@ -13,7 +13,7 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 
 - `app`: UI layer, owns user actions and status display.
 - `core`: pure-Kotlin privilege routing, command gateway, and `pm` output parsing.
-- `hook`: LSPosed module (API 102), loaded only inside target Samsung processes. BBC injector anchors `PmWrapper#getPossibleDualAppPackages` (union-only append of user-written policy items into Samsung's 「可用的應用程式」 list; PROTECTIVE / identity fast-path / fail-closed; device-verified 2026-11-17); its effect switch is `BBC_AVAILABLE_APPS_INJECTION=true` — independent of, and not opening, the sealed Stage-1 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false` (see `docs/HOOK.md` §1.3a／§1.4).
+- `hook`: LSPosed module (API 102), loaded only inside target Samsung processes. BBC injector anchors `PmWrapper#getPossibleDualAppPackages` (union-only append of user-written policy items into Samsung's 「可用的應用程式」 list; PROTECTIVE / identity fast-path / fail-closed; device-verified 2026-11-17, pre-unification evidence); its effect switch is `BBC_AVAILABLE_APPS_INJECTION=true` — independent of, and not opening, the sealed Stage-1 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false` (see `docs/HOOK.md` §1.3a／§1.4).
 
 ## GuardXposedProvider (policy provider parity)
 
