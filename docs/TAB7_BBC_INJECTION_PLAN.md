@@ -128,6 +128,8 @@ Build order：`policy-remote` → spike(v-d) → `bbc-injector` → `gate-verify
 - **cold-boot 保障**：`getRemotePreferences` 在 onSystemServerStarting/onPackageLoaded 內同步讀取完成；第一個 hooked 呼叫之前已正確初始化（marker 可用輔助）
 - **Remote prefs 不代替 marker**：marker 可降級為輔助診斷；不再作為唯一 enablement 訊號
 - `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` **維持**（接線完成≠啟用；gate 僅依 §1.4 device 證據翻轉，且須使用者明確授權）
+  → **2026-11-17 狀態：已翻轉為 `true`**（commit `45a40e67`）。兩台裝置實機 A/B 證據滿足 §1.4 五項硬閘門
+   （見 Addendum A）；使用者於 2026-11-17 明確授權；S23 Ultra 端對端雙開 ChatGPT 成功。
 
 ## 5. 更多 UI 面（使用者已選：清單＋更多 UI 面）
 
@@ -269,3 +271,29 @@ internal fun mergeAvailableList(
   RemotePreferences 契約定稿（group `galaxydual_policy`/key `packages`/StringSet/user-0 origin/防禦性複製）；
   A/B 目標改 `com.shopee.tw`（chatgpt 未安裝）；CreateShortcutActivity 維持另 spec；
   GET_APPLICATION_FLAG=0 確認；序號已移出 repo；manifest-provider AAR 自動合併註解。
+
+## Addendum A（2026-11-17，裝置雙機實機驗證與 gate 翻轉紀錄）
+
+**裝置 1：Galaxy Tab S7（SM-T870，Android 13／One UI 5，DAAgent 3.3.00.0，Vector v2.2 API 102）**
+- Gate=false 基線：`BBC-HOOK installed=1 (daagent, pid=…)`、`BBC-HOOK callback …`＋`RemotePreferences initial load: 0 package(s)`；Samsung 可用清單不受影響。
+- Gate=true：勾選 Firefox＋Gemini → `RemotePreferences updated`／callback nonempty → `BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw installed=true, enabled=false, org.mozilla.firefox installed=true, enabled=true, com.google.android.apps.bard installed=true, enabled=true)`。**merge added 0 是正確結論**：Firefox／Gemini 已在 Samsung 執行期 dual_app 白名單（AIDL 傳回、裝置持久化，非框架常數）；注入位元一致、零回歸。toggle 在設定頁可操作，雙開實例（`org.mozilla.firefox`）已安裝並以 `u95_a306` 執行。
+- BBC 演算法（`PmWrapper.getPossibleDualAppPackages`）在 S7 BBC：installed ∩ enabled ∩ `SemDualAppManager.getAllWhitelistedPackages()`。
+
+**裝置 2：Galaxy S23 Ultra（SM-S9180，Android 17／One UI 9 `90000`，DAAgent 3.7.00.0，`ro.build.version.sdk=37`，KernelSU Next + Zygisk-LSPosed，BBC jar 33,946 bytes，classes.dex 33,644 bytes）**
+- BBC 庫結構與 S7 同：`Lcom/samsung/android/da/daagent/fwwrapper/PmWrapper`、`getPossibleDualAppPackages(Context)Ljava/util/ArrayList;` PUBLIC STATIC，演算法位元一致（`installed ∩ enabled ∩ SemDualAppManager`）。DUAL_APP_WHITELIST_PACKAGES/\_FOR_CHINA 仍在 DAAgent `provider.WhiteListApps`（`<clinit>` hook 維持 static final observe-only）。
+- Caller deopt：`DualAppActivity#getAvailableApps`／`#updateDualAppList` 在 One UI 9 **找不到目標**（已改名/內聯），hook 自動 `skipped`（不影響 BBC callback——hook 裝在 BBC callee 本體）。
+- Policy editor（Phase 4 picker 版）：搜尋＋勾選 `com.openai.chatgpt` →
+  `RemotePreferences updated: 1 package(s)`（live push、無需重啟）→
+  **20:54 首次開頁 `BBC-HOOK callback getPossibleDualAppPackages (pid=21472)`,
+  23:01 政策生效後 `BBC-HOOK callback (nonempty, pid=21472)` →
+  `BBC-HOOK merged +1 packages (total 7, pid=21472)`**。
+- Samsung 設定頁（Dual Messenger）在「應用程式」區出現 **ChatGPT** 與 Telegram 並列，可切換；
+  切換後 `pm path --user 95 com.openai.chatgpt` 顯示 dual APK 安裝於 user 95；
+  `ps` 顯示 `u95_a431 com.openai.chatgpt` 進程執行中（與 u0_a431 並存，無互相污染）。
+- 頁面截圖與全 log 見本目錄外 `/mnt/seagate500g/opencode_tmp/s23ultra/`（裝置證據檔）。
+- 本 addendum 取代 §12 第 4 條的「S23 Ultra」驗收目標——終驗目標變更（已由使用者指定 ChatGPT）。
+
+**閘門翻轉授權與 commit**：2026-11-17 使用者明確授權 → commit `45a40e67`
+（`feat(hook): ship BBC whitelist injection effect by default (gate=true)`，含 3 個 test-lock 改寫為
+ 預設開＋顯式 fail-closed seam 保留）。
+

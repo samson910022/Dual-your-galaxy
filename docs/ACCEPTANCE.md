@@ -69,3 +69,35 @@ Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 
 | B2 | `BackgroundReturnTest`（兩次 refresh 零 uninstall/install） | fake 計數；無快速連點自動化 |
 | I1 | `InputRestoreTest`（query/選取保留 + Activity EditText 文字 + 通道行）；`activity_recreate_retainsNonDefaultChannelPreference`（ROOT）recreate 後仍顯示 | fake 計數 + EditText 文字 + 通道偏好（含非預設通道 recreate） |
 | W1 | `RemoveFlowTest.confirmRemove_success_uninstallsOnce`（VM 半邊：單次 uninstall、結果釘住） | `uninstallCalls == 1`；真機仍須驗 W1 |
+
+## 6. BBC 注入與非空政策驗收紀錄（2026-11-17，雙裝置）
+
+> 這是一組**已完成的裝置人工矩陣**（非 harness）。裝置序列已遮蔽；路徑與截圖留本機。
+
+| 欄位 | 值 |
+| --- | --- |
+| source commit | `45a40e67`（含 gate=true 預設，含 §1.4 文件同步；含 Stage 4 picker 修正） |
+| 版本 | `versionName=0.0.1` `versionCode=1` |
+| 裝置 1 | Galaxy Tab S7（SM-T870，Android 13／One UI 5，DAAgent 3.3.00.0，LSPosed（Vector v2.2 API 102），user 0／95） |
+| 裝置 2 | Galaxy S23 Ultra（SM-S9180，Android 17／One UI 9，DAAgent 3.7.00.0，Zygisk-LSPosed，KernelSU，user 0／95） |
+| 政策（device local） | 裝置 2：`com.openai.chatgpt`；裝置 1：`com.shopee.tw`／`org.mozilla.firefox`／`com.google.android.apps.bard`（Gemini） |
+
+| # | 操作 | 預期 | 實際（裝置 2 / 裝置 1） | 通過 |
+| --- | --- | --- | --- | --- |
+| BBC1 | daagent 啟動時 BBC hook 安裝 | `BBC-HOOK installed=1 (daagent, pid=…)` | ✅ 兩台皆觀察到 | ☑ |
+| BBC2 | 空政策 | BBC callback 回傳 Samsung 原始物件（零行為變更） | ✅ 裝置 2（initial load: 0）回傳原始；無 merged 行 | ☑ |
+| BBC3 | 勾選政策 app → 重進 Dual Messenger 頁 | 頁面出現該 app 列、可切換（BBC-HOOK merged +N） | ✅ 裝置 2：`merged +1 (total 7, pid=21472)`，ChatGPT 出現在「應用程式」區；✅ 裝置 1：`merged +0`（Firefox/Bard 已在 Samsung 執行期白名單→union no-op，非失敗） | ☑ |
+| BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ✅ 裝置 2：`pm path --user 95 com.openai.chatgpt` 列出 base/APK 路徑 | ☑ |
+| BBC5 | launch 分身實例 | 雙開實例啟動、主 space 並存 | ✅ 裝置 2：`ps` 同時見 u0_a431＋u95_a431 `com.openai.chatgpt`（並確認頁面截圖「應用程式：ChatGPT」已開啟） | ☑ |
+| BBC6 | 回滾：取消勾選 | 空政策 → BBC callback 回傳原始物件；`RemotePreferences updated: 0` | 本輪未測（政策仍保留 `com.openai.chatgpt`） | ☐ |
+| BBC7 | Knox／Secure Folder（user 150） | 零觸及、零查詢 | 全程未查詢 user 150；`pm` 僅查 user 0／95 | ☑ |
+
+截圖／log：
+- 裝置 2：`10` 頁面；`11` 裝置 1 toggle；`12` 頁面（應用程式：ChatGPT＋Telegram toggle 開啟）；log `s23_bbc_gate_true.log`（本機）。
+- 裝置 1：`05`–`09` screens＋`11_firefox_dual.png`＋`s4_gate_true_bbc.log`（本機）。
+
+殘餘未測（誠實揭露）：
+- user 95 若由 ROM 指到其他 id，需以 `ps`/uid 前綴確認，勿假設 95。
+- 回滾（取消勾選）未於本輪執行。
+- BBC 注入不觸及 mutation 面（目的明顯不同：清單可見性，而非安裝路徑放寬）；安裝路徑永不掛勾。
+

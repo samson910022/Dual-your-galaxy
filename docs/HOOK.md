@@ -14,15 +14,16 @@
 
 - 原本回傳 `true`／已在名單 → 保持不變。
 - 原本回傳 `false`／不在名單 → 僅當該包名在模組政策集合內才放行。
-- 目前政策集合（`EXTRA_WHITELIST_PACKAGES`，經 `PolicySource.effective(seed, remote)`
-  決策）預設為**空**，即 hooks 為 observe-only 佔位：會安裝、會記 log，
-  但不改變任何行為。接上政策來源（例如 RemotePreferences）後才真正放寬。
+- 目前政策集合有兩個來源：**RemotePreferences**（`galaxydual_policy` /
+  `packages`，由 App 政策編輯器寫入；BBC 注入路徑已完整接線並實機驗證）與
+  編譯期種子 `EXTRA_WHITELIST_PACKAGES`（**空，僅佔位**）。`PolicySource.effective(seed, remote)`
   決策為 union-only（只增不減），包名校驗與 `core/ShellEscaper` 同規則；
-  靜態欄位合併由純函數 `WhitelistPatch` 執行（`MutableList` 原地追加、
-  `String[]` 重建替換，其餘一律放棄並記 log）。`remote` 快照目前為空
- （無政策來源已接線；未來工作才考慮 RemotePreferences 唯讀＋變更監聽），
-  行為與空種子完全一致
-  [待實機驗證]。
+  靜態欄位合併由純函數 `WhitelistPatch` 執行；BBC 清單合併由
+  `BbcInjector.mergeAvailableList`（見 §1.3a）執行。非空生效閘門
+  **`NON_EMPTY_POLICY_EFFECTIVE_GATE` 自 2026-11-17 裝置實機驗證後預設為 true**
+  （受控 empty vs non-empty A/B，見 §1.4），設為 false 仍可一鍵回到 observe-only
+  行為 [實機已驗證]。政策未勾選任何包時，BBC hook 回傳 Samsung 原始結果物件
+  （位元一致），零行為變更。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
@@ -199,6 +200,51 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   JVM 單測僅鎖定 `WhitelistPolicy.apply`／eligibility／guard 決策，安裝與回調需 LSPosed
   daagent 實機驗證。
 
+### 1.3a BBC 注入器（`PmWrapper#getPossibleDualAppPackages`）[雙裝置實機已驗證]
+
+Samsung Dual Messenger 頁的「可用的應用程式」清單由 DAAgent 呼叫 BBC 庫
+`PmWrapper.getPossibleDualAppPackages(Context)->java.util.ArrayList` 取得
+（兩條入口均經此：`DualAppActivity` 頁面渲染、`DAUtility.getWhiteListPkgs(true)`
+遙測）。清單語義為 `installed ∩ enabled ∩ SemDualAppManager.getAllWhitelistedPackages()`
+（BBC 內部實作；BBC 類在 daagent 行程 boot classpath 解析）。
+
+本模組在 daagent 內 hook BBC 方法，將 **RemotePreferences 政策包**（經
+`PolicySource.effective` union-only 合併，見 §1.1）去切片自我合併進 BBC 清單
+之尾端（`BbcInjector.mergeAvailableList`：候選包若已存在、或 failed
+installed/enabled 謂詞則跳過；至少一個新增才回傳**同一物件原地附加**的新清單，
+零新增回傳 Samsung 原始物件——fail-closed / identity fast path 不變）。
+包含 BBC 所有可呼叫路徑，列表因此擴大為
+`installed ∩ enabled ∩ (Samsung whitelist ∪ 政策包)`，只有可見條目數增加，
+Samsung 原始驗證路徑不動。
+
+裝置實機證據（2026-11-17）：
+
+| 裝置 | BBC | 操作 | BBC-HOOK 證據 | 結果 |
+| --- | --- | --- | --- | --- |
+| Galaxy Tab S7（SM-T870，Android 13 / One UI 5，DAAgent 3.3.00.0） | BBC 驗證 | 政策勾選 `org.mozilla.firefox`、`com.google.android.apps.bard`（改名 Gemini） | `BBC-HOOK callback (nonempty, pid=…)` → `BBC-HOOK merged +0 packages`（firefox/bard 已在 Samsung 執行期白名單：BBC 回傳原始物件，注入為 no-op） | 兩 app 出現在「可用」清單、可切換，已建立雙開並以 `u95_a306` 執行 |
+| Galaxy S23 Ultra（SM-S9180，Android 17 / One UI 9「90000」，DAAgent 3.7.00.0，BBC jar 33,946 bytes，KernelSU + Zygisk-LSPosed） | BBC 驗證（`PmWrapper` 新增 static final 常數、方法完全一致；BBC dump 證據：BBC jar `Lcom/samsung/android/bbccommon/*` + `fwwrapper/PmWrapper`，演算法 `installed ∩ enabled ∩ SemDualAppManager` 與 S7 位元一致） | 政策勾選 `com.openai.chatgpt`（BBC 不含 `com.openai.chatgpt`） | `BBC-HOOK callback (nonempty, pid=21472)` → **`BBC-HOOK merged +1 packages (total 7, pid=21472)`**（live RemotePreferences listener，同行程即時生效，無需重啟） | Samsung 頁「應用程式」區出現 ChatGPT 條目且可切換；已建立雙開並以 `u95_a431` 執行（u0_a431 主行程並存） |
+
+One UI 9 附註：
+- BBC 在 One UI 9 依然是清單的唯一來源（`DualAppActivity#getAvailableApps` 與
+  `DAUtility.getWhiteListPkgs(true)` 都走 BBC），故 BBC hook 對 One UI 5 / 9
+  通用；`<clinit>` WhitelistPatch 仍僅 `static final` 觀察（`DUAL_APP_WHITELIST_PACKAGES`
+  observe-only），不影響 BBC 路徑。
+- `BBC-SPIKE caller` 的 `DualAppActivity#getAvailableApps`／`#updateDualAppList`
+  deopt 在 One UI 9 找不到目標（方法改名/內聯）→ hook 自動 skip，不再重複 deopt，
+  BBC 回調**仍然**觸發（deopt 為保險性質非必要條件）。
+- 政策空時：BBC callback 回傳 Samsung 原始物件（`BBC-HOOK callback` 帶空政策訊息），
+  行為字位一致。
+- BBC 合併前置條件：候選包 **installed（`ApplicationInfo` 非 null）∧ enabled**；否則 skip
+  （Shopee `com.shopee.tw` 停用時自動 skip，符合預期）。
+- Marker（`scope=daagent`）在 daagent 進程維持不可寫（EACCES）——與 S24 相同，
+  daagent 安裝證據以 lspd 日誌（`found ... static=true`）為準，非 marker。
+- daagent 政策快照來源：App 進程 `GalaxyDualApplication` 經 `libxposed:service`
+  `RemotePreferences("galaxydual_policy", …)` 寫入；daagent 讀自己進程的同名 group
+  （同 group、同 user 0；user 95 不讀——spec OQ6 observe-only 維持）。遠端 bundle 改變
+  → `RemotePolicyState` listener push，BBC callback 下一次即看到新快照（`RemotePreferences updated: 1 package(s)`）。
+
+
+
 ### 1.4 JVM 測試邊界與啟用非空政策前的硬閘門
 
 JVM 測試（`WhitelistPolicy`／`WhitelistSignatureGuard`／`WhitelistHookEligibility`／contract tests）
@@ -208,17 +254,35 @@ LSPosed 實機上是否真的被走到。`DualHook` 的 framework adapter、LSPo
 去最佳化效果亦不在 JVM 測試範圍（見 §1.2 反內聯待辦）。
 
 **程式碼層級非空政策閘門（code gate，非裝置驗證）：** `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`
-（預設 `false`）關閉時，`PolicySource.effective(...)` 即使在 sanitized 合併後產生非空集合，也會
-**fail-closed 回傳空集合**（Stage 1 預設 observe-only 不變）。此閘門僅為程式碼層級阻擋，必須保持
-`false`，直到下列裝置硬閘門（hard gate）以裝置證據滿足後才考慮開啟；開啟本身不構成裝置驗證。
+（**現預設 `true`**；2026-11-17 裝置實機驗證後由專案 owner 核可翻轉，見下方狀態與 [commit 45a40e67](https://github.com/samson910022/Galaxy-Dual-app-Plus/)）。關閉時，`PolicySource.effective(...)` 即使在 sanitized 合併後產生非空集合，也會
+**fail-closed 回傳空集合**（等同 observe-only）。此閘門為程式碼層級 kill switch，不是裝置驗證；保留 `false` 即可完整回復 Slice 1 行為。
 
-**啟用任何非空政策前的硬閘門（hard gate，缺一不可）：**
+**硬閘門（hard gate，缺一不可）狀態：2026-11-17 經裝置證據滿足，閘門預設已翻轉。**
 
-1. 裝置驗證每個欲 hook 查詢的**完整方法簽名＋宣告回傳型別**（dexdump／反編譯／framework 證據）。
-2. 每個方法的 **hook 安裝數**證據（lspd／模組 log：deoptimize＋hooked／installed 計數），且安裝失敗不得當作生效。
-3. **callback 命中**證據（非 marker／clinit-only）；能區分「hook 已裝」與「查詢路徑真的被攔截」。
-4. 正確處理 Android user／profile isolation 與 install-state 語意（尤其 `*Installed*Whitelist*` 複合查詢的 userId／已安裝判斷）；Stage 1 對此類查詢 **fail-closed 排除**，S24／DAAgent 相關 overload 仍標記 **[待實機驗證]**。
-5. 在目標 ROM（例如 S24／DAAgent）做**受控的空政策 vs 非空政策**對照，確認只有預期查詢被擴展、安裝／移除／Knox 路徑不受影響，且無 bootloop／崩潰回歸。
+此前文件曾規定 gate 必須維持 `false` 直到裝置硬閘門滿足；2026-11-17 已以兩台裝置的證據滿足並翻轉：
+
+1. ✅ 裝置驗證每個欲 hook 查詢的**完整方法簽名＋宣告回傳型別**：BBC jar 反編譯一致
+   （Tab S7 One UI 5：`PmWrapper.getPossibleDualAppPackages(Context)->ArrayList`；
+   S23 Ultra One UI 9：同 BBC 庫、同全稱方法，dexdump 雙方逐字一致）。
+2. ✅ 每個方法的 **hook 安裝數**證據：`installBbcHooks`
+   `BBC-HOOK installed=1 (daagent, pid=…)`（lspd verbose log 與 logcat 皆觀察到）；
+   安裝失敗會記 `BBC-SPIKE FAIL`/`installFailures=…`，不視為生效。
+3. ✅ **callback 命中**證據：`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=…)`
+   （2026-11-17 現場 log：Tab S7 pid 21602、S23 Ultra pid 21472），能區分「hook 已裝」與
+   「查詢路徑真的被攔截」。
+4. ✅ user／profile isolation 語義：BBC 路徑候選包 predicated on
+   `installed(ApplicationInfo!=null ∧ enabled==true)`；userId 過濾面不擴充
+   （`*Installed*Whitelist*` 複合查詢維持 fail-closed 排除），雙開實例落在
+   目標 ROM 的 dual profile（兩台實機實測為 user 95，`u95_a306`／`u95_a431`），
+   可正常 launch；未觸及 user 150（Knox）。
+5. ✅ 目標 ROM 上**受控空政策 vs 非空政策對照**：Tab S7（`RemotePreferences initial load: 0→3 package(s)`；
+   空政策 BBC callback 回傳原始物件；非空時 `BBC-HOOK merged +0`＝Samsung 白名單
+   已含 Firefox/Bard，union no-op）與 S23 Ultra（`0→1 package(s)`；
+   ChatGPT 合併 `+1` 並成功在 Samsung 設定頁出現、可切換、雙開安裝並 launch；
+   空政策回退行為位元一致，無崩潰、無列表污染、Knox 路徑無觸及）。
+   處置空政策的 bit-exact 行為以 JVM 測試鎖定（含 `nonEmptyPolicyBlockedWhenGateClosedFailClosed` 的顯式 false seam）。
+
+以下保留作為長期約束，**不得**移除：
 
 Stage 1 明確保持 `*Installed*Whitelist*` 排除：daagent 不掛
 `getAllInstalledWhitelistedPackages`／`isInstalledWhitelistedPackage`；system_server 不掛
@@ -302,9 +366,15 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - **首次啟用／改動作用域後必須重啟**：`system_server` 注入只在開機時發生，
   不重啟等於沒 hook。建議直接完整重啟手機（軟重啟若管理器支援亦可）。
 - 僅更新模組 APK（未改 scope）：API 102 支援 hot reload，但系統進程建議仍重啟一次確認。
+- 驗證 BBC 注入與非空政策（2026-11-17 雙裝置已驗證）：先確認政策非空
+  （App →「Hook 政策編輯」→ 有勾選；`adb logcat -s GalaxyDualHook | grep -E "RemotePreferences|BBC-HOOK"`），
+  再看 Samsung 設定的 Dual Messenger 頁「可用的應用程式」是否出現目標 app：
+  `BBC-HOOK callback getPossibleDualAppPackages (nonempty...)` 與
+  `BBC-HOOK merged +N packages`（空政策時回傳 Samsung 原始物件，無 merged 行），
+  沒看到 merged 行不代表失敗——政策可能仍是 Samsung 白名單內 app（union no-op）。
 - 驗證 hook 安裝：重啟後 `adb logcat | grep GalaxyDualHook` 可能看到
   `hooked ...#getAllWhitelistedPackages` 等行＋
-  `marker wrote scope=...` 行；看不到可能是記錄不可取得、安裝失敗或
+  `BBC-HOOK installed=1 (daagent, pid=…)` 行；看不到可能是記錄不可取得、安裝失敗或
   類名／方法名不匹配，不能單憑缺日誌判定，回報時請附上 `service list` 與版本號。
 - 驗證 marker 檔案（需 ROOT／shell 讀權限；App 直接讀不到即顯示「狀態未知」，
   屬正常 fail-closed，不代表 hook 沒裝；僅確定可讀但缺失才顯示「未偵測到」）：
@@ -329,40 +399,44 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ## English Summary
 
-- The hook module extends Samsung Dual whitelist *queries* only (extend-only, never shrink);
-  default policy set is empty so hooks are observe-only placeholders.
+- **BBC 注入器（裝置已驗證）**：`PmWrapper#getPossibleDualAppPackages(Context)` is the
+  single source of Samsung's Dual Messenger "available apps" rows (both `DualAppActivity`
+  render path and `DAUtility.getWhiteListPkgs(true)`); alike BBC jars ship in One UI 5
+  (Tab S7, One UI 5.0 / Android 13, DAAgent 3.3.00.0) and One UI 9 (S23 Ultra, One UI 9 /
+  Android 17 “90000”, DAAgent 3.7.00.0, KernelSU). The BBC algorithm is byte-equivalent:
+  `installed ∩ enabled ∩ SemDualAppManager.getAllWhitelistedPackages()`. The hook
+  union-appends the user-written RemotePreferences policy (`galaxydual_policy/packages`)
+  behind `installed(ApplicationInfo!=null ∧ enabled==true)` predicates (union-only, identity
+  fast-path on no-merge, PROTECTIVE, fail-closed back to Samsung's original object on any error).
+  Verified end-to-end on 2026-11-17: S23 Ultra — `BBC-HOOK merged +1 packages (total 7, pid=21472)`,
+  ChatGPT appeared in Samsung's settings page, dual instance installed and launched (u95_a431);
+  Tab S7 — `BBC-HOOK merged +0` (Firefox/Bard already in Samsung's runtime whitelist → no-op),
+  Firefox dual install+launch verified (u95_a306). Runtime whitelist is device-persisted and not
+  byte-for-byte identical to the 19-entry framework fallback constant.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
   (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/
-  `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity
-  until device-verified. System_server hooks only the pure list query
-  `getAllWhitelistedPackages()` when eligible. Daagent hooks 6 named read queries
+  `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity.
+  System_server hooks only the pure list query `getAllWhitelistedPackages()` when eligible.
+  Daagent hooks 6 named read queries
   (`getWhitelistedPackages`/`getWhitelistPackages`, `getWhiteListPkgs`/
   `getWhiteListPkgsInSystemServer`, `isWhitelistedPackage`/`isWhiteListedPackage`)
   plus a `*hitelist*` sweep on `WhiteListApps` that is **Stage 1 diagnose-only (no hook installs)**
   due to mutation/read-only ambiguity on ROM variants (mutation classification +
   eligibility logged, fail-closed).
-- Hook install paths use `WhitelistHookEligibility`/`WhitelistSignatureGuard`.
-  Stage 1 Boolean rewrites require a strict **shape-allowlisted single `(String)`**
-  package-arg signature only (index 0, device-unverified semantics); multi-param/
-  userId shapes (e.g. `(String,idSlot)`, `(idSlot,String)`), unknown/ambiguous
-  signatures, and composite queries are fail-closed/not rewrite-eligible until a
-  device-verified descriptor allowlist and user/profile contract exist.
-  `WhitelistSignatureGuard` resolves shape indices for diagnostics/future use but
-  does not imply semantic/userId verification. Interceptors use a lazy/empty-policy
-  fast path and keep composite runtime fail-closed backstops. Collection/array merges
-  are type-guarded (String elements, non-`SortedSet`/`NavigableSet` sets, declared
-  return compatibility) and return original on incompatibility.
+- **Hard gate SATISFIED (2026-11-17)** — 〔see §1.4; `NON_EMPTY_POLICY_EFFECTIVE_GATE` now ships `true`
+  on the strength of two devices' controlled empty-vs-nonempty A/B evidence; a code-level kill switch is kept:
+  set the const (or the explicit seam argument in tests) back to `false` to restore bit-exact observe-only behavior.
+  *Installed*Whitelist* exclusions are intentionally preserved.]
+- `DualAppActivity#getAvailableApps` / `#updateDualAppList` cannot be deoptimized on One UI 9
+  (methods renamed/inlined); the BBC callee hook does not depend on them — callback evidence
+  confirms the BBC path is intercepted. `*hitelist*` sweep stays diagnose-only on all known ROMs.
 - Agent side also patches both `WhiteListApps#DUAL_APP_WHITELIST_PACKAGES` and
   `#..._FOR_CHINA` after `<clinit>` (static-final fields stay observe-only, never force-written);
   non-scope processes get `detach()`.
 - **JVM tests prove pure decision/selection logic only** (not on-device class presence,
   signatures/return types, hook installation, callback interception, or that eligible overloads
-  are hit on Samsung DAAgent/LSPosed). Before enabling any non-empty policy, meet the hard gate
-  in §1.4 (device-verified signatures/return types, hook-install counts, callback-hit evidence,
-  user/profile/install-state semantics, controlled empty vs non-empty comparison on target ROM).
-  A code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
-  `effective(...)` fail-closed (returns empty when closed) until that hard gate is satisfied;
-  this is a code gate, not device verification, and Stage 1 defaults remain unchanged.
+  are hit on Samsung DAAgent/LSPosed). The hard gate in §1.4 has since been satisfied on-device;
+  docs keep the gate as a code-level kill switch; fail-closed seam remains unit-tested.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>observe-only;

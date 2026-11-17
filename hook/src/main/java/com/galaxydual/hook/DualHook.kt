@@ -494,12 +494,7 @@ class DualHook : XposedModule() {
                 return result
             }
             if (extra.isEmpty()) {
-                // TEMP probe (2026-11-17, Tab S7 runtime-path measurement, user-approved):
-                // the empty-policy fast path is deliberately silent, which would make any
-                // screen-triggered callback invisible. One line per (process, method) at
-                // most; no return-value change, no reflection beyond the log key.
-                // Remove after runtime-path probing or keep deliberately (decision pending).
-                logCallbackHitOnce(executable)
+                // Empty-policy fast path stays silent by design.
                 return result
             }
             val desc = try {
@@ -617,26 +612,6 @@ class DualHook : XposedModule() {
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
             .setId(id)
             .intercept { chain -> interceptWhitelistCall(chain) }
-    }
-
-    // Rate-limited cache for the TEMP probe above: first hit per (process, method)
-    // logs one CB-HIT line; subsequent hits stay silent. Cleared per process
-    // lifetime only.
-    private val callbackHitLogged = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
-
-    private fun logCallbackHitOnce(method: Executable?) {
-        val key = try {
-            method?.let { WhitelistPolicy.describe(it) }
-        } catch (_: Throwable) {
-            null
-        } ?: "unknown"
-        if (callbackHitLogged.add(key)) {
-            try {
-                logi("CB-HIT $key (pid=" + android.os.Process.myPid() + ")")
-            } catch (_: Throwable) {
-                // Logging must never break the hook path.
-            }
-        }
     }
 
     // --- BBC (com.samsung.bbc) injector: Dual Messenger available-apps list ---
