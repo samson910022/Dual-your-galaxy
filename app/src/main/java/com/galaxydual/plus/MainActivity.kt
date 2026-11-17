@@ -39,6 +39,7 @@ package com.galaxydual.plus
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -1686,6 +1687,28 @@ class MainActivity : ComponentActivity() {
             addView(refreshPolicyBtn, rowParams())
         }
         techCard.addView(policyRow)
+        // BBC 注入政策（Dual Messenger 可用應用程式清單）編輯入口：右側
+        // outlined 按鈕，啟動 PolicyActivity（Not exported；寫入仍走 VM
+        // pending → 確認對話框 → confirmPolicyWrite 流程，見 DualViewModel）。
+        val editPolicyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        val editPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_edit_policy)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            val hp = dp(14)
+            setPadding(hp, 0, hp, 0)
+            setOnClickListener { startActivity(Intent(this@MainActivity, PolicyActivity::class.java)) }
+        }
+        editPolicyRow.addView(editPolicyBtn)
+        techCard.addView(editPolicyRow)
         tabEngineLayout.addView(techCard)
 
         // Engine Action Buttons
@@ -6845,7 +6868,10 @@ internal fun userIdFromUid(uid: Int): Int = if (uid < 0) -1 else uid / 100_000
 // remains a NoOp placeholder.
 // DEVICE-UNVERIFIED: marker read + LSPosed placeholder behavior never ran
 // on a device (staleness/SELinux limits documented in HookMarker).
-private class DualViewModelFactory(
+// internal (was file-private): PolicyActivity acquires the same factory so its
+// ViewModel wiring is identical to MainActivity's (same dual_policy store,
+// same owner-user gates, same policyText/plural resource resolution).
+internal class DualViewModelFactory(
     private val appContext: Context,
     private val appPackageName: String,
 ) : ViewModelProvider.Factory {

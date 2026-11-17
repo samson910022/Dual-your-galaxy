@@ -56,6 +56,8 @@
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
+    <!-- BBC injection policy (Dual Messenger available-apps list) editor entry; right side of the techCard policy block. -->
+    <string name="action_edit_policy">Edit app list</string>
     <string name="policy_draft_format">Whitelist policy (draft, effect unverified): %1$d items</string>
     <string name="policy_draft_unknown">Whitelist policy (draft, effect unverified): unknown (unreadable or corrupt — see the status banner at the top; tap Refresh draft to retry)</string>
     <string name="policy_write_title">Write whitelist policy draft</string>

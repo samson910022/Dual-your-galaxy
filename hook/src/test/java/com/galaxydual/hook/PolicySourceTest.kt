@@ -46,6 +46,7 @@ class PolicySourceTest {
         assertFalse(PolicySource.isValidPackage("has space"))
         assertFalse(PolicySource.isValidPackage("semi;colon"))
         assertFalse(PolicySource.isValidPackage("quote\"x"))
+        assertFalse(PolicySource.isValidPackage("com.openai.chatgpt\$top!"))
         assertFalse(PolicySource.isValidPackage("slash/x"))
         assertFalse(PolicySource.isValidPackage("dollar\$x"))
     }

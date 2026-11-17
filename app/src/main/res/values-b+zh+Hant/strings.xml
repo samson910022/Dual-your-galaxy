@@ -61,6 +61,8 @@
     <string name="action_refresh_policy_draft">重新整理草稿</string>
     <string name="refresh_policy_draft_cd">重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
     <string name="refresh_policy_draft_cd_refreshing">正在重新讀取遠端政策草稿（唯讀，不寫入分身）</string>
+    <!-- BBC 注入政策（Dual Messenger 可用應用程式清單）編輯入口；techCard 政策區右側。 -->
+    <string name="action_edit_policy">編輯應用清單</string>
     <string name="policy_draft_format">白名單政策（草稿・未保證生效）：%1$d 項</string>
     <string name="policy_draft_unknown">白名單政策（草稿・未保證生效）：狀態未知（無法讀取或內容損壞），請見上方狀態說明，或點「重新整理草稿」重試</string>
     <string name="policy_write_title">確認寫入白名單政策草稿</string>

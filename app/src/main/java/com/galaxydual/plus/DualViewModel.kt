@@ -8473,8 +8473,48 @@ class DualViewModel(
         }
     }
 
-    // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。
+    /**
+     * 由政策編輯頁直接提供完整的新政策候選集合——與 requestPolicyWrite() 走
+     * 同一個 pending／CAS／確認對話框流程，兩者的唯一區別是：policy 集合由
+     * 參數給定，不經 catalog selection 推導、不影響 selectedKeys 狀態。
+     * 其餘 gates（owner uid、pending-BUSY、in-flight/RECONCILING、orphanDrop、
+     * Corrupt/Unknown、coordinator/世代 fence）與 requestPolicyWrite() 完全一致。
+     */
+    fun replacePolicyDraft(packages: Set<String>) {
+        if (!policyWriteGatesPass()) return
+        requestPolicyWriteFor(packages, catalogDropped = 0)
+    }
+
+    // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。與
+    // replacePolicyDraft 共用同一 private body（requestPolicyWriteFor＝sanitize
+    // 尾段；policyWriteGatesPass＝共享 gates）；catalog 專屬門控與 mapped 推導
+    // 穿插在與舊版完全相同的序列位置（1:1 呼叫序列不變）。
     fun requestPolicyWrite() {
+        if (!policyWriteGatesPass()) return
+        // Stage2 專屬門控（catalog selection 模型）：空勾選拒絕。
+        if (_state.value.selectedKeys.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.EMPTY_SELECTION)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        // Phase 3：catalog 空守衛（與「勾選已不在清單」區分：空 catalog 是載入
+        // 時序問題而非使用者選錯，訊息明示「尚未載入」，免誤導重選）。
+        if (_state.value.sourceCatalog.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.CATALOG_LOADING)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        val (mapped, catalogDropped) = selectedPackagesForPolicy()
+        requestPolicyWriteFor(mapped, catalogDropped)
+    }
+
+    // 共享 gates（與原 requestPolicyWrite 的序列 1:1 一致）：pending →
+    // inFlightWrites → reconciling → owner uid → orphanDrop/revision stale →
+    // policyDraftKnown（Corrupt/Unknown）。回傳 false＝gate 已拒絕（拒絕訊息
+    // 已寫入 state；呼叫端直接 return，不進入兩階段流程）。
+    private fun policyWriteGatesPass(): Boolean {
         // pending 的確認寫入排隊中時不得靜默 supersede 它 —— 明確拒絕
         // （BUSY），與 clear 的 A3-5 對稱門控同形：狀態保持（pending 保留，
         // 待使用者確認或取消後再建新 pending），避免覆蓋活躍 QUEUED pending 的
@@ -8483,7 +8523,7 @@ class DualViewModel(
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
-            return
+            return false
         }
         // 5.1.1:不再以全域 loading 旗標阻擋新請求 (refresh/其他操作進行中
         // 仍可開啟確認對話框),但若政策寫入 confirm 正在進行中則拒絕,避免
@@ -8493,7 +8533,7 @@ class DualViewModel(
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
-            return
+            return false
         }
         // Stage A：核對中拒絕新請求（BUSY；render 按鈕亦因非 IDLE 禁用，此為
         // 程式化調用兜底，pending 保留，請勿重試）。
@@ -8501,7 +8541,7 @@ class DualViewModel(
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
             }
-            return
+            return false
         }
         // owner-user 門控:hook 只讀 user 0;非 owner 實例寫入的 group 不會被
         // 看到,故直接拒絕且不建 pending (不進入兩階段流程)。
@@ -8512,7 +8552,7 @@ class DualViewModel(
                     msgKind = MsgKind.CHANNEL,
                 )
             }
-            return
+            return false
         }
         // Stage I2 / O1: 陳舊修訂與 orphanDropGen 門控（fail-closed：未見新修訂
         // 或 orphan placeholder 被丟棄時，強制重讀刷新，不得覆寫未見修訂）。
@@ -8525,7 +8565,7 @@ class DualViewModel(
                     msgKind = MsgKind.CHANNEL,
                 )
             }
-            return
+            return false
         }
         // P2 #3:先前遠端政策未知時拒絕建 pending (fail closed,避免整包覆寫
         // 未曾示出的內容)。store 為 null 時走既有 null-store 路徑,不在此攔截。
@@ -8542,30 +8582,24 @@ class DualViewModel(
                     msgKind = MsgKind.CHANNEL,
                 )
             }
-            return
+            return false
         }
-        if (_state.value.selectedKeys.isEmpty()) {
-            _state.update {
-                it.copy(msg = policyText(PolicyText(PolicyTextKind.EMPTY_SELECTION)), msgKind = MsgKind.INVALID)
-            }
-            return
-        }
-        // Phase 3：catalog 空守衛（與「勾選已不在清單」區分：空 catalog 是載入
-        // 時序問題而非使用者選錯，訊息明示「尚未載入」，免誤導重選）。
-        if (_state.value.sourceCatalog.isEmpty()) {
-            _state.update {
-                it.copy(msg = policyText(PolicyText(PolicyTextKind.CATALOG_LOADING)), msgKind = MsgKind.INVALID)
-            }
-            return
-        }
-        val (mapped, catalogDropped) = selectedPackagesForPolicy()
-        // Phase 5 polish：request 建 pending 前先 sanitize（與 confirm 同消毒）：
+        return true
+    }
+
+    // requestPolicyWrite() 與 replacePolicyDraft() 的共用 body（policy 集合由
+    // 參數給定）：gates 已於 policyWriteGatesPass() 通過；sanitize → dropped
+    // 計算 → 空集 CATALOG_MISSING 門控 → DROPPED 警語 → S8 obs-rev 門控 →
+    // policySettleLock CAS 安裝（generation 每次重配）。
+    private fun requestPolicyWriteFor(packages: Set<String>, catalogDropped: Int) {
+        // Phase 5 polish：建 pending 前先對候選集合消毒（與 confirm 同消毒）：
         // 顯示數與寫入數一致；dropped 拆 catalog 缺失＋非法文法兩類（後者經
         // sanitizeHookPolicy 計數：除文法另有長度上限 256／總量上限 512，
-        // 故 invalidDropped 亦含超長／超量被截斷者；此處 catalog 映射已做
-        // isValidPackage 前置，故通常為 0，仍顯式計算以防映射/消毒漂移）。
-        val sanitized = sanitizeHookPolicy(mapped)
-        val invalidDropped = mapped.size - sanitized.size
+        // 故 invalidDropped 亦含超長／超量被截斷者；catalog 路徑此處已做
+        // isValidPackage 前置，故通常為 0；顯式集合（replacePolicyDraft）
+        // 無前置，非法 token 於此計入 dropped）。
+        val sanitized = sanitizeHookPolicy(packages)
+        val invalidDropped = packages.size - sanitized.size
         val dropped = catalogDropped + invalidDropped
         if (sanitized.isEmpty()) {
             _state.update {

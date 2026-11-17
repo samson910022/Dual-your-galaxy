@@ -36,6 +36,12 @@ object PolicySource {
     // hook cache 60s / failure-cooldown 5s).
     const val NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = false
 
+    // BBC 注入器效應開關（2026-11-17 裝置實機驗證後預設開）：只放寬 BBC 產生的
+    // 「Dual Messenger 可用的應用程式」清單（union-only append，fail-closed），
+    // 不影響 Stage-1 白名單查詢／system_server／<clinit> 路徑（封緘不變）。
+    // 設為 false 即 BBC 零行為變更，與 Stage-1 閘相互獨立（docs/HOOK.md §1.3a／§1.4）。
+    const val BBC_AVAILABLE_APPS_INJECTION: Boolean = true
+
     // Remote policy prefs group/key, single-sourced here and referenced by the
     // app-side writer and the hook-side reader. Renaming either abandons any
     // persisted draft (breaking change; review required).

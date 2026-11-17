@@ -9,17 +9,25 @@ package com.galaxydual.hook
 // UNVERIFIED candidates consumed by DualHook.hookDaagentQueryMethods().
 // Read-query candidates only; install/remove paths are never listed.
 object DaagentQueryHooks {
-    // Stage1 daagent read-query class candidates (DEVICE-UNVERIFIED).
+    // Stage1 daagent read-query class candidates (DEVICE-UNVERIFIED unless noted).
     // S24 evidence pins the WhiteListApps holder (static-final => ObserveOnly)
     // and names these query holders (DualAppDBHelper / DAUtility /
     // DualAppManager) without pinning their package layout, so subpackage
     // variants are all tried; every loadable class is hooked.
+    // Tab S7 / One UI 5 (DAAgent 3.3.00.0, dexdump 2026-11-17): the read-only
+    // aggregate entry `utils.DAUtility#getWhiteListPkgs(Z)Ljava/util/ArrayList;`
+    // exists (Z==0: local daApps whitelist fast path; Z!=0: install-filtered
+    // branch — composite-ish semantics, kept extend-only and never rewritten).
+    // The `utils` package spelling was device-verified (the previous `util.`
+    // candidate missed it; classesLoaded=2/8, overloadsMatched=0 on-device);
+    // the other variants stay as cross-ROM candidates.
     internal val DAAGENT_QUERY_CLASS_CANDIDATES = listOf(
         "com.samsung.android.da.daagent.provider.DualAppDBHelper",
         "com.samsung.android.da.daagent.db.DualAppDBHelper",
         "com.samsung.android.da.daagent.DualAppDBHelper",
         "com.samsung.android.da.daagent.provider.DAUtility",
         "com.samsung.android.da.daagent.util.DAUtility",
+        "com.samsung.android.da.daagent.utils.DAUtility",
         "com.samsung.android.da.daagent.DAUtility",
         "com.samsung.android.da.daagent.provider.DualAppManager",
         "com.samsung.android.da.daagent.DualAppManager",
