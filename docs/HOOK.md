@@ -94,7 +94,7 @@
   `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速），
   並以 `PolicyRefreshGateProcessCapTest` 鎖定 epoch 與 process 預算分離（invalidate 只重置 epoch）、drained 探針
   不消耗 process 預算、cap 耗盡後一律 fail-closed（拒絕換新 executor）、以及雙 gate 實例預算互相獨立。
-- BBC 注入是本模組**唯一帶開啟效應閘的政策消費者**：BBC 清單合併由 `BbcInjector.mergeAvailableList`（見 §1.3a）執行，讀同一批政策集合（見上一條），效應開關為 `PolicySource.BBC_AVAILABLE_APPS_INJECTION = true`（Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` 不受影響、亦不得靠 BBC 開關繞過）。政策未勾選任何包時，BBC hook 回傳 Samsung 原始結果物件（位元一致），零行為變更。裝置證據 2026-11-17 於 pre-unification build 取得（政策 group `galaxydual_policy`；見 §1.3a 與 `docs/ACCEPTANCE.md` §6 provenance）；unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1–BBC6 全通過；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）。
+- BBC 注入是本模組**唯一帶開啟效應閘的政策消費者**：BBC 清單合併由 `BbcInjector.mergeAvailableList`（見 §1.3a）執行，讀同一批政策集合（見上一條），效應開關為 `PolicySource.BBC_AVAILABLE_APPS_INJECTION = true`（Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` 不受影響、亦不得靠 BBC 開關繞過）。政策未勾選任何包時，BBC hook 回傳 Samsung 原始結果物件（位元一致），零行為變更。裝置證據 2026-11-17 於 pre-unification build 取得（政策 group `galaxydual_policy`；見 §1.3a 與 `docs/ACCEPTANCE.md` §6 provenance）；unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1–BBC3 重驗 OK；BBC4/BBC5 launch 不可用（app SSAID 崩潰）；BBC6=系統自動卸載；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
@@ -270,13 +270,13 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
   （`WhitelistPolicy.apply`：有政策才翻 `true`／合併集合，空政策原樣返回 observe-only）。
   JVM 單測僅鎖定 `WhitelistPolicy.apply`／eligibility／guard 決策，安裝與回調需 LSPosed
   daagent 實機驗證。
-- 持久化與生效的區分：App 端成功持久化草稿（`HookPolicyStore` save/clear → LSPosed remote preferences group `dual_policy`）僅證明寫入通道，**不**代表 daagent（或 system_server）已套用或撤銷任何政策。白名單 Stage-1 查詢面仍 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更）；BBC 注入面 2026-11-17 於 pre-unification build 裝置已驗證（見 §1.3a／§1.4），unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1–BBC6 全通過；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）（見 `docs/ACCEPTANCE.md` §6）。
+- 持久化與生效的區分：App 端成功持久化草稿（`HookPolicyStore` save/clear → LSPosed remote preferences group `dual_policy`）僅證明寫入通道，**不**代表 daagent（或 system_server）已套用或撤銷任何政策。白名單 Stage-1 查詢面仍 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更）；BBC 注入面 2026-11-17 於 pre-unification build 裝置已驗證（見 §1.3a／§1.4），unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1–BBC3 重驗 OK；BBC4/BBC5 launch 不可用（app SSAID 崩潰）；BBC6=系統自動卸載；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）（見 `docs/ACCEPTANCE.md` §6）。
 
 
-### 1.3a BBC 注入器（`PmWrapper#getPossibleDualAppPackages`）[裝置雙機實機證據 2026-11-17 pre-unification／2026-11-18 unified build（S23 Ultra，BBC1–BBC6 全通過）]
+### 1.3a BBC 注入器（`PmWrapper#getPossibleDualAppPackages`）[裝置雙機實機證據 2026-11-17 pre-unification／2026-11-18 unified build（S23 Ultra，BBC1–BBC3 重驗 OK；BBC4/BBC5 launch 不可用（app SSAID 崩潰）；BBC6=系統自動卸載）]
 
 > provenance 聲明（先讀）
-> 以下所有 log 與裝置行為，除非另有標注，皆為 **2026-11-17 於 pre-unification build**（政策 group `galaxydual_policy`／key `packages`，RemotePreferences listener 模型）實測所得。**2026-11-18 已於 unified build（`unify/bbc-on-main`）以 S23 Ultra 全 BBC1–BBC6 重驗完畢（含 BBC6 回滾）**；證據 `s23_bbc_unified_20261118.log`／`s23u_02..04`，全數通過；讀者功能驗收（寫入→BBC 生效）已獲證明。
+> 以下所有 log 與裝置行為，除非另有標注，皆為 **2026-11-17 於 pre-unification build**（政策 group `galaxydual_policy`／key `packages`，RemotePreferences listener 模型）實測所得。**2026-11-18 已於 unified build（`unify/bbc-on-main`）以 S23 Ultra 重驗（BBC1–BBC3 通過；BBC4/BBC5 app 無法啟動（SSAID 衝突）；BBC6=系統自動卸載分身，見 `BBC6_SSAID_INCIDENT.md`，詳該文件）。**證據 `s23_bbc_unified_20261118.log`／`s23u_02..04`。
 
 Samsung Dual Messenger 頁的「可用的應用程式」清單由 DAAgent 呼叫 BBC 庫
 `PmWrapper.getPossibleDualAppPackages(Context)->java.util.ArrayList` 取得
@@ -302,7 +302,7 @@ S23 Ultra 之 BBC-HOOK 行僅出現於 LSPosed verbose mirror（`/data/adb/lspd/
 
 附帶說明（unified build 與 pre-unification build 的差異）：
 - BBC **不需要** empty-policy warm-up：`EffectivePolicyCache` 於 daagent 首個查詢時惰性讀取（TTL 輪詢），首次呼叫即得到與重啟後相同語義；政策空 ⇒ Samsung 原物件原樣回傳（identity fast path）。
-- 讀者模型改變：pre-unification build 以 RemotePreferences listener push 即時生效（"live push"，見舊文案）；unified build **無**跨行程推送（API 102）——寫入後最晚於下一次 60s TTL poll 或 daagent 重啟看到新集合（無需額外步驟）。**unified build 的 reader 接線已於 2026-11-18 重驗**（S23 Ultra，BBC1–BBC6 全通過，`BBC-HOOK merged +1 packages (total 7, pid=…)` 之 `nonempty` 重現、callback 非空於空政策狀態下不帶 nonempty；見下）。
+- 讀者模型改變：pre-unification build 以 RemotePreferences listener push 即時生效（"live push"，見舊文案）；unified build **無**跨行程推送（API 102）——寫入後最晚於下一次 60s TTL poll 或 daagent 重啟看到新集合（無需額外步驟）。**unified build 的 reader 接線已於 2026-11-18 重驗**（S23 Ultra，BBC1–BBC3 重驗 OK；BBC4/BBC5 launch 不可用（app SSAID 崩潰）；BBC6=系統自動卸載，`BBC-HOOK merged +1 packages (total 7, pid=…)` 之 `nonempty` 重現、callback 非空於空政策狀態下不帶 nonempty；見下）。
 - BBC 合併（BBC merge、PROTECTIVE、identity fast path）、`installed ∧ enabled` 謂詞、`BBC_AVAILABLE_APPS_INJECTION` 效應閘皆為 S5/S9 共用、不動；Stage-1 sealed gate 無變。
 - caller deopt：One UI 9 的 `DualAppActivity#getAvailableApps`／`#updateDualAppList` **找不到目標**（方法改名/內聯）→ hook 自動 skip（`BBC-SPIKE caller: … not found; skipped`），不影響 BBC callee 本體 hook——BBC callback **仍然**觸發（deopt 為保險性質非必要條件）。
 - 政策空時：BBC callback 回傳 Samsung 原始物件（`BBC-HOOK callback (pid=…)` 不帶 `nonempty`），行為位元一致。
@@ -331,7 +331,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 | 開關 | 值 | 治理面 | 備註 |
 | --- | --- | --- | --- |
 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（Stage-1，sealed） | `const val false` | 白名單查詢面：`effective()` 的 sanitized 非空合併一律回空；`getAllWhitelistedPackages`／daagent 查詢 hook／`<clinit>` 合併 | 常閉；2026-11-17 使用者授權涵蓋的只有 BBC 效應面，全域翻閘授權**從未給過**；未來翻轉需另一份 SAMSUNG 階段 spec＋明示授權 |
-| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true` | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 亦已驗（BBC1–BBC6 全通過）；設 `false` 即 BBC 零行為變更 |
+| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true` | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 重驗 2026-11-18（BBC1–BBC3 OK；BBC4/BBC5 launch 失敗；BBC6=系統自動卸載分身）；設 `false` 即 BBC 零行為變更 |
 
 **程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
 
@@ -340,9 +340,9 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 | S1 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（`const val = false`，編譯期封緘，執行期不可翻轉） | `effective()` 的 sanitized 非空合併一律回空集合 | `PolicySourceTest`（gate 預設關閉斷言） |
 | S2 | `EffectivePolicyCache.get()` 閘門關閉短路（Stage C） | 關閉時直接回空，不碰 reader、不加鎖、不讀時鐘（零 IPC 讀取） | `EffectivePolicyCacheTest`（gate-closed 零讀取） |
 
-**硬閘門（hard gate，缺一不可）狀態：**以上裝置證據（2026-11-17 pre-unification + **2026-11-18 unified build 重驗（S23 Ultra；BBC1–BBC6 全通過，含 BBC6 回滾）**；unified build 共享 `dual_policy/extra_whitelist_packages`→`EffectivePolicyCache` 輪詢讀者，讀者接線已於 2026-11-18 重驗）滿足後，專案 owner 2026-11-17 授權 BBC 效應開關 `BBC_AVAILABLE_APPS_INJECTION=true`；Stage-1 閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE` **未曾翻轉、維持封緘 `false`**。
+**硬閘門（hard gate，缺一不可）狀態：**以上裝置證據（2026-11-17 pre-unification + **2026-11-18 unified build 重驗（S23 Ultra；BBC1–BBC3 重驗；BBC4/BBC5 app 無法啟動；BBC6=系統自動卸載分身）**；unified build 共享 `dual_policy/extra_whitelist_packages`→`EffectivePolicyCache` 輪詢讀者，讀者接線已於 2026-11-18 重驗）滿足後，專案 owner 2026-11-17 授權 BBC 效應開關 `BBC_AVAILABLE_APPS_INJECTION=true`；Stage-1 閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE` **未曾翻轉、維持封緘 `false`**。
 
-> provenance 摘要：本節裝置證據僅代表 pre-unification build 之 BBC 合併行為（BBC jar 於兩裝置逐字等價，見 §1.3a）；unified build 的 BBC 注入效應由 `PolicySource.BBC_AVAILABLE_APPS_INJECTION` 治理，reader 接線已驗（2026-11-18，BBC1–BBC6 全通過；`BBC-HOOK merged +1 packages (total 7, pid=…)` 重現）。詳 `docs/ACCEPTANCE.md` §6。
+> provenance 摘要：本節裝置證據僅代表 pre-unification build 之 BBC 合併行為（BBC jar 於兩裝置逐字等價，見 §1.3a）；unified build 的 BBC 注入效應由 `PolicySource.BBC_AVAILABLE_APPS_INJECTION` 治理，reader 接線已驗（2026-11-18，BBC1–BBC3 重驗 OK；BBC4/BBC5 launch 不可用（app SSAID 崩潰）；BBC6=系統自動卸載；`BBC-HOOK merged +1 packages (total 7, pid=…)` 重現）。詳 `docs/ACCEPTANCE.md` §6。
 
 1. ✅ 裝置驗證每個欲 hook 查詢的**完整方法簽名＋宣告回傳型別**（pre-unification build，BBC 查詢法）：BBC jar 反編譯一致
    （Tab S7 One UI 5：`PmWrapper.getPossibleDualAppPackages(Context)->ArrayList`；
@@ -364,7 +364,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
    空政策回退行為位元一致，無崩潰、無列表污染、Knox 路徑無觸及）。
 6. ⏳ **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy/extra_whitelist_packages`；`extra_whitelist_version` 版本序號 bump **未實作**，不得作為本閘門的前提）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。**unified build 已驗（2026-11-18，BBC3 非空觀察：`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=…)` + `BBC-HOOK merged +1 packages (total 7, pid=…)`；BBC2 空政策 baseline 亦通過：callback 帶 `pid=…` 不帶 nonempty）**
 
-上述 1–5 為 pre-unification build 之裝置證據（2026-11-17）；unified build 已重驗＝2026-11-18（S23 Ultra，BBC1–BBC6 全通過），BBC6 回滾亦為 ☑。
+上述 1–5 為 pre-unification build 之裝置證據（2026-11-17）；unified build unified build 重驗＝2026-11-18（S23 Ultra；BBC1–BBC3；BBC4/BBC5 launch 失敗；BBC6 毀滅分身——不得標 ☑）。
 
 以下保留作為長期約束，**不得**移除：
 
@@ -499,7 +499,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ## English Summary
 
-- **BBC injector (device-verified 2026-11-17 pre-unification; re-verified 2026-11-18 on the unified build, BBC1-BBC6)**: `PmWrapper#getPossibleDualAppPackages(Context)` is the
+- **BBC injector (device-verified 2026-11-17 pre-unification; re-verified 2026-11-18 on the unified build, BBC1– BBC3 only — BBC4/BBC5 launch fails; BBC6 destroys the dual app)**: `PmWrapper#getPossibleDualAppPackages(Context)` is the
   single source of Samsung's Dual Messenger "available apps" rows (both `DualAppActivity`
   render path and `DAUtility.getWhiteListPkgs(true)`); alike BBC jars ship in One UI 5
   (Tab S7, One UI 5.0 / Android 13, DAAgent 3.3.00.0) and One UI 9 (S23 Ultra, One UI 9 /
@@ -521,8 +521,8 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   `BBC-HOOK merge added 0 packages (policy=3: …)` (Firefox/Bard already in Samsung's runtime
   whitelist → no-op); Firefox listed with toggles visible; merge no-op; `s4_gate_true_bbc.log`.
   Unified build shares the same BBC algorithm (BBC jar byte-equivalent on both devices) but the
-  reader path changed — evidence did not carry over automatically; re-verification = Stage 8.3 (DONE 2026-11-18, BBC1-BBC6 incl. BBC6 rollback)
-  (S23 Ultra, BBC1-BBC6; BBC6 rollback untested). See `docs/ACCEPTANCE.md` §6.
+  reader path changed — evidence did not carry over automatically; re-verification = Stage 8.3 (DONE 2026-11-18, BBC1–BBC3 re-verified; BBC4/BBC5 unusable; BBC6 destroyed the dual app (see BBC6_SSAID_INCIDENT.md))
+  (S23 Ultra, full re-verify). See `docs/ACCEPTANCE.md` §6.
   Runtime whitelist is device-persisted and not byte-for-byte identical to the 19-entry framework
   fallback constant.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
@@ -538,7 +538,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - **Stage-1 gate SEALED (unified tree)** — 〔see §1.4; `NON_EMPTY_POLICY_EFFECTIVE_GATE` stays sealed `false`
   forever until a future spec on Samsung stages; the BBC effect switch `BBC_AVAILABLE_APPS_INJECTION=true` shipped
   on the strength of two devices' 2026-11-17 empty-vs-nonempty A/B evidence plus explicit user authorization
-  (pre-unification build; unified build re-verified 2026-11-18, BBC1-BBC6). A code-level kill switch is kept:
+  (pre-unification build; unified build re-verified 2026-11-18, BBC1– BBC3 only — BBC4/BBC5 launch fails; BBC6 destroys the dual app). A code-level kill switch is kept:
   set the BBC const back to `false` to restore bit-exact observe-only BBC behavior.
   *Installed*Whitelist* exclusions are intentionally preserved.]
 - `DualAppActivity#getAvailableApps` / `#updateDualAppList` cannot be deoptimized on One UI 9
