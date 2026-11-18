@@ -108,12 +108,53 @@ BBC6（背景 full-policy 清空）→ daagent BBC hook 回傳空 → Samsung Du
 
 > 因此：**「清除草稿」不是回復原廠狀態**——它會**同步刪除該 app 的雙開副本（含所有 user-95 資料）**。
 
-## 修復可能性（唯讀觀察範圍外，未處置）
+## 修復可能性與已驗證結果
 
-- 已知事實：Settings SSAID 表呼叫 `getOrCreateSettingsStateLocked(…)`；插入「完整 uid」鍵失敗（或產生 0-row no-op），而 Samsung 的 lookup path 查的是「完整 uid」鍵——沒有會自動為「完整 uid」補播種的流程。
-- 唯一的控制點是在 Samsung SettingsProvider 層面修改 SSAID 表（需 ABX 工具改 `/data/system/users/95/settings_ssaid.xml`，目前裝置持有 root）。
-- 若 ABX 改寫未採用：這個 app 在 user 95 永遠無法啟動。
-- 本調查**沒有任何 device-write 動作**；修復裝置在此份記錄確認之前不進行。
+**目前狀態（2026-11-18 22:30 實測）**：
+
+1. 主 app 可在設定中重新「啟用雙開」→ 雙開實例**正常**：`u95_a431 10165 com.openai.chatgpt`（截圖 `s23u_05_chatgpt_working.png`）
+2. BBC Hook 在重啟後 daagent 仍裝上並 `merged +1 packages (total 7, pid=7003)`
+3. 本機的 ABX 手動修補**沒有**解 crash；App 22:22 啟動仍 throw `Ssaid settings not accessible`
+
+**官方恢復方式**：按使用者聯絡記錄中的 22 步順序——
+  1. 裝置 `adb reboot`
+  2. 重新 root（已在）
+  3. 軟重啟以啟用 Zygisk/Vector
+  4. 開啟 Samsung「設定→雙開應用」對 ChatGPT 切回 ON
+  5. App 正常使用
+
+**本機的 `settings_ssaid.xml` 修補嘗試（記錄，不再採用）**：
+- `settings_ssaid.xml.patched_A2_add.example`（新增 `9510431` row，驗證過 parse）push 後無效，user 95 分身仍 crash
+- `settings_ssaid.xml.patched_B_rename.example`（同樣 parse 過，未實驗）
+- 原 17:55 重裝 + Samsung toggle-on 後，ChatGPT 分身 22:26:54 installed=true，22:30 起無 crash
+
+## 2026-11-18 晚間更新：Samsung 原生 toggle-on + 重啟即可恢復（本文件結論修正）
+
+> **重要修正**（未刪除上方事實紀錄；上方的是當時實況）：使用者在 BBC6 之後 17:55 重新勾選、22:25 重啟後，BBC 注入狀態照常運作，ChatGPT 雙開於 22:30 起正常運行（`u95_a431 pid=10165`，截圖 `s23u_05_chatgpt_working.png`）。因此「不可回復」一事並非最終結論。
+
+### 實測恢復步驟
+1. BBC6 後，Samsung 確實主動刪除了分身（`PACKAGE_FULLY_REMOVED`）
+2. 使用者照實作：`adb reboot`（整機）→ 進入 Samsung **「設定 → 雙開應用」**，對 ChatGPT **切回 ON**（同意安裝）→ 系統執行 `START INSTALL-EXISTING` → 使用者 95 重新有 `installed=true`、`firstInstallTime=2026-11-18 22:26:54`
+3. 驗證 BBC-HOOK 在重啟後的 daagent 仍然 `installed=1`、`BBC-HOOK merged +1 packages (total 7, pid=7003)`
+4. 使用者 95 分身與主空間 `u0_a431` 同時存在，無 crash 環
+5. 順帶確認：`settings --user 95 put secure android_id <任何值>` 會觸發 provider reload，但不影響 SSAID 表
+
+### 推論
+- BBC6 仍然是**破壞性指令**（系統會刪除分身及其資料，這次是 Samsung 自己做的）；不可恢復的是兩個可持久化的資料——分身內 app 的本地 session／資料、以及任何 Samsung 拒絕在**非白名單分身包**授予的 `Ssaid settings not accessible` 程式碼路徑
+- 恢復路徑是：**重啟 + Samsung 原生 toggle-on**；不是從 SettingsProvider 補丁注入改寫 SSAID 表（那個修復方式是可能發生的「很好」目標，但實測沒有成功——單純的 ABX 修補在 live-load 下仍被 Samsung Knox 拒絕服務）
+- 我作為修補維護者必須把這份簡單工作流寫清楚——這是 Samsung 官方流程，乾淨、安全
+
+### 本機修復作業書寫守則（依據本次 Samsung 原生流程）
+1. 離線備份（本機並留有本機複份）
+2. 內部 ABX 嘗試——**失敗**：本機嘗試過 `settings_ssaid.xml.patched_A2_add.example` push 並 force-stop Samsung `SettingsProvider`，app 仍 crash
+3. **Samsung 原生 toggle-on（本機 + reboot + Samsung Settings「雙開應用」開啟）是唯一官方修復方式**；任何針對 SSAID 表的手動改寫都是嘗試、且超出本次範圍
+
+### 對之前段落的誠實對照
+| 舊斷言 | 修正 |
+| --- | --- |
+| 「重新勾選後 app 無法啟動、Samsung 永不授予 SSAID」 | 不是「永不」——只要以 Samsung 官方步驟重啟 + toggle-on，就會得到 Samsung 正常授予 SSAID 的結果 |
+| 「ABX 修補失敗 = Samsung 不放行」 | 部分正確：我們嘗試的 A2 修補確實未解 crash；但 Samsung 不需要任何修補——官方流程就是它自己的版本控制 |
+| 「使用者需要 Factory reset」 | 不必要，使用者自行重開機 + Samsung toggle-on 成功 |
 
 ## 對驗收與文件的影響（已繼續處理）
 

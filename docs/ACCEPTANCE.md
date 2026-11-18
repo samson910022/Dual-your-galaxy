@@ -95,12 +95,14 @@ Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 
 | BBC3 | 勾選政策 app → 重進頁面 | ChatGPT 出現在清單 | ✅ `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=1519)`；**`BBC-HOOK merged +1 packages (total 7, pid=1519)`**；頁面截圖 `s23u_02_bbc3.png`（ChatGPT 列出現，可切換） | ☑ |
 | BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ✅ `pm path --user 95 com.openai.chatgpt` 列出 base＋split APK（本檔同名段落） | ☑ |
 | BBC5 | launch 分身實例 | 雙開實例啟動、主 profile 並存 | ✅ `am start --user 95 -n com.openai.chatgpt/.MainActivity` 後 `ps` 同時見 u95_a431、u0_a431（本檔同名段落） | ☑ |
-| BBC6 | **破壞性卸載（不是回滾）：清空政策 → Samsung 系統刪除分身副本（資料全清）** | 空政策 daagent 啟動 → possible-list 空 → Samsung DualAppManagerService 直接發 `START DELETE PACKAGE`（`caller{1000}`）：S23-flag；2026-11-17 亦同（BBC1 pid=29265 政策空）；除 app uncinstall，user-95 資料隨之清除。重新勾選時 Samsung 重新安裝但 **SSAID 衝突：$APP 無法啟動**（詳 `BBC6_SSAID_INCIDENT.md`） | ❌ 違反性結果：app 被卸載、重新安裝後崩潰。本項 **不通過**、不得標 ☑ |
+| BBC6 | **破壞性卸載（不是回滾）：清空政策 → Samsung 系統刪除分身副本（資料全清）** | 空政策 daagent 啟動 → possible-list 空 → Samsung DualAppManagerService 直接發 `START DELETE PACKAGE`（`caller{1000}`）：2026-11-18 驗證成立；2026-11-17 亦同（BBC1 pid=29265 政策空）；**恢復方式**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝、ChatGPT 分身於 22:30 正常運行（`u95_a431 pid=10165`，`s23u_05_chatgpt_working.png` 證據） | ❌ 不通過、不得標 ☑；BBC6 屬破壞性指令；詳 `BBC6_SSAID_INCIDENT.md` |
 | BBC7 | Knox／Secure Folder（user 150） | 零觸及、零查詢 | ✅ 全程未查詢 user 150；所有 `pm` 查詢僅 user 0／95 | ☑ |
 
 BBC6 注意事項（unified build）：
 - 空政策清除的正規流程是**主畫面「清除草稿」**；編輯器「寫入政策草稿（N）」在 N=0 時被 VM 拒絕（CATALOG_MISSING 分支，目前僅顯示 VM 訊息，無確認對話框）。
 - BBC6 不是回滾——是「清除政策＝系統刪除分身」。見 `BBC6_SSAID_INCIDENT.md`。
+- **恢復**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝、分身正常；BBC3 merged +1 仍生效。
+- 驗證 BBC6 政策清空後三星會呼叫 `PACKAGE_FULLY_REMOVED`（`START DELETE PACKAGE`）；使用者自行重開機 + Samsung 原生 toggle-on 即恢復；不必、也不應嘗試 ABX 修補 ssaid.xml（見 incident）。
 
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。
