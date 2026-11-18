@@ -98,6 +98,13 @@
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
     <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
+    <!-- Issue #73 (zh/Hant parity: same keys): pre-clear dual-app warning (BBC6: emptying the policy means Samsung auto-uninstalls the dual copies, user-95 data unrecoverable). -->
+    <string name="pre_clear_title">Dual-app reminder before clearing policy</string>
+    <string name="pre_clear_message">These apps are installed in your dual profile (user 95): %1$s\n\nSamsung may automatically delete the dual copies (including user-95 data, unrecoverable) when the policy becomes empty. Turn off Dual Apps for these apps in Samsung Settings \u2192 Apps \u2192 Dual apps first, then clear.</string>
+    <string name="pre_clear_confirm_proceed">Continue clearing (agree to uninstall dual copies)</string>
+    <string name="pre_clear_cancel">Cancel clearing</string>
+    <string name="pre_clear_root_uninstall">ROOT: turn off dual copies for me (erases data)</string>
+    <string name="pre_clear_root_uninstall_confirm">This erases the dual-copy data and all app data. Are you sure?</string>
     <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
     <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
     <string name="policy_blind_clear_expired">Clear confirmation expired (over 5 minutes); clear again to confirm. Refresh first if reachable.</string>

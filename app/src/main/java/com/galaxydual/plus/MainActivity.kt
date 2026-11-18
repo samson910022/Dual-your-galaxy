@@ -1024,11 +1024,12 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             minimumHeight = dp(48)
             contentDescription = getString(R.string.clear_policy_draft_cd)
-            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper，直調 VM
+            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper；先經 issue #73
+            // 雙開提醒攔截（user-95 探測＋警告對話框），通過後才直調 VM
             // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
             // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
-            setOnClickListener { vm.onClearPolicyButtonTap() }
+            setOnClickListener { requestPreClearWarning(proceed = { vm.onClearPolicyButtonTap() }) }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -5889,6 +5890,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Issue #73：清除草稿前先探測 user-95 分身安裝狀態並顯示警告對話框
+    // （BBC6：政策清空＝Samsung 自動系統刪分身，user-95 資料不可復原）。
+    // 僅當持久化草稿非空才探測；空草稿直接進 VM（VM 仍掌握 corrupt/unknown/blind-clear 語義）。
+    // pendingClearConfirm：probe／警告對話框期間忽略再次點擊，避免重複彈窗
+    // （警告對話框本身為 modal；此旗標覆蓋 probe 在途窗口與對話框存活期）。
+    private var pendingClearConfirm = false
+
+    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}) {
+        val set = try {
+            vm.state.value.policyDraft
+        } catch (_: Exception) {
+            emptySet()
+        }
+        if (set.isEmpty()) {
+            proceed()
+            return
+        }
+        if (pendingClearConfirm) return
+        pendingClearConfirm = true
+        lifecycleScope.launch {
+            val installed = try {
+                probeDualAppsInUser95(set)
+            } catch (e: CancellationException) {
+                pendingClearConfirm = false
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "pre-clear dual-profile probe failed", e)
+                emptyList()
+            }
+            if (isFinishing || isDestroyed) {
+                pendingClearConfirm = false
+                return@launch
+            }
+            if (installed.isEmpty()) {
+                pendingClearConfirm = false
+                proceed()
+                return@launch
+            }
+            showPreClearWarning(
+                this@MainActivity,
+                installed,
+                onProceed = { pendingClearConfirm = false; proceed() },
+                onCancel = { pendingClearConfirm = false; onCancel() },
+            )
+        }
+    }
+
     companion object {
         // Test seam: allow instrumentation to inject a fake-backed ViewModel
         // (zero device writes) without changing production defaults. Null in
@@ -7049,5 +7097,173 @@ internal class DualViewModelFactory(
             } catch (_: Exception) {
                 false
             }
+    }
+}
+
+// ===== Issue #73：清除政策前雙開提醒（BBC6；user-95 分身探測／ROOT 代關）=====
+// MainActivity「清除草稿」與 PolicyActivity「寫入政策草稿（清空）」兩處共用的
+// 實作（頂層 internal；spec 原稿為 private 成員＋PolicyActivity 端重複實作，但
+// STRICT 範圍禁止新檔案、且重複兩份探測／對話框邏輯易漂移，故收斂為單份共用）。
+//
+// 盡力而為語義：探測失敗／卸載失敗只記 log，不阻擋清除主流程（清除仍由 VM 自有
+// 守衛把關；ROOT 代關失敗仍 proceed——使用者意圖優先，BBC6 風險由警告文案與
+// 「二次確認」承載，不由靜默攔截承載）。
+//
+// shell 備註：pkg tokens 全部來自 vm.state.value.policyDraft（VM 入 store 前已經
+// isValidPackage 驗證，[a-zA-Z0-9._-]，不含空白／引號／分號），以空格 join 後
+// 直接內插進 for 清單是安全的；整個指令字串作為單一 su -c 參數傳入（argv form，
+// 不經第二層 shell 引捨／ Runtime.exec）。split 於 caller 端以 whitespace 完成
+// （package 名不含空白）。
+//
+// 與 spec 草稿的明文差異（見交付報告）：
+// 1) 探測判定由 [ -n "$out" ] 改為 case "$out" in package:*——pm path 對未安裝
+//    的套件會把錯誤輸出寫進 stdout/stderr，經 2>&1 合併後 $out 非空，原式會
+//    把「未安裝」全部誤判為「已安裝」（假 positive，且觸發無謂警告／誤導 ROOT
+//    代關清單）；以 package: 前綴行判定才能等同「真的印出了 APK 路徑」。
+// 2) probe／uninstall 為 suspend（spec 草稿省略了 suspend 修飾子；Gateway.run 是
+//    suspend，兩函數必須 suspend 或以 runBlocking 擋主執行緒）。
+// 3) 共用實作為頂層 internal 而非各呼叫端 private 成員（理由如上）。
+// 512 == PolicySource.MAX_POLICY_ENTRIES; raising from 200 so every legitimate
+// draft fits argv limits (512 × ~40 B ≈ 20 KB) and disclosure stays complete.
+internal const val MAX_DUAL_PROBE_PKGS = 512
+
+// 警告對話框中套件清單的顯示上限（超出以省略號標示截斷；不截斷 ROOT 代關對象）。
+private const val PRE_CLEAR_LIST_MAX = 20
+private const val PRE_CLEAR_TAG = "PreClear"
+
+internal fun buildDualProbeCommand(pkgs: List<String>): String {
+    val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
+    return "for pkg in ${capped.joinToString(" ")}; do " +
+        "out=\$(pm path --user 95 \"\$pkg\" 2>&1); " +
+        "case \"\$out\" in package:*) echo \"INST \$pkg\";; esac; done"
+}
+
+internal fun parseDualProbeOutput(out: String): List<String> =
+    out.lineSequence()
+        .map { it.trim() }
+        .filter { it.startsWith("INST ") }
+        .map { it.removePrefix("INST ").trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .toList()
+
+internal fun buildDualUninstallCommand(pkgs: List<String>): String {
+    val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
+    return "for pkg in ${capped.joinToString(" ")}; do pm uninstall --user 95 \"\$pkg\"; done"
+}
+
+internal suspend fun probeDualAppsInUser95(pkgs: Collection<String>): List<String> {
+    if (pkgs.isEmpty()) return emptyList()
+    val cmd = buildDualProbeCommand(pkgs.toList())
+    val result = try {
+        SuCmdGateway().run(cmd)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(PRE_CLEAR_TAG, "dual-profile probe exec failed", e)
+        return emptyList()
+    }
+    if (result.exit != 0) {
+        Log.w(PRE_CLEAR_TAG, "dual-profile probe exit=${result.exit} err=${result.err.take(200)}")
+    }
+    // 盡力解析 stdout 的 INST 行（exit 非零／stderr 非空不硬失敗；truncate 只影響尾行）。
+    return parseDualProbeOutput(result.out)
+}
+
+internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolean {
+    if (pkgs.isEmpty()) return true
+    val cmd = buildDualUninstallCommand(pkgs.toList())
+    return try {
+        val result = SuCmdGateway().run(cmd)
+        // 每個 pm uninstall 的失敗通常以 stdout 的 "Failure [DELETE_FAILED_*]" 行呈現，
+        // stderr 非空或整體 exit 非零亦視為失敗——回 false；呼叫端只記 log，仍 proceed。
+        val noFailureLine = result.out.lineSequence().none {
+            val line = it.trim()
+            line.startsWith("Failure", ignoreCase = true) ||
+                line.startsWith("DELETE_FAILED", ignoreCase = true)
+        }
+        result.exit == 0 && result.err.isBlank() && noFailureLine
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(PRE_CLEAR_TAG, "dual-profile uninstall exec failed", e)
+        false
+    }
+}
+
+// 清除政策前雙開提醒對話框。
+// onProceed＝繼續清除（Positive，不二次確認；對話框文字已明示「同意卸載分身」）。
+// onCancel＝取消清除（Negative／返回鍵／點擊外部／ROOT 代關二次確認中取消；呼叫端負責還原勾選等）。
+// Neutral（ROOT 代關）先補一道不可復原的二次確認；確認後對 installed 全部套用
+// pm uninstall --user 95，失敗仍 proceed（只記 log；使用者意圖優先）。
+internal fun showPreClearWarning(
+    host: ComponentActivity,
+    installed: List<String>,
+    onProceed: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    if (installed.isEmpty()) {
+        onProceed()
+        return
+    }
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    val sorted = installed.sorted()
+    val shown = sorted.take(PRE_CLEAR_LIST_MAX)
+    val list = shown.joinToString("\n") + if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…" else ""
+    val message = try {
+        host.getString(R.string.pre_clear_message, list)
+    } catch (e: Exception) {
+        Log.w(PRE_CLEAR_TAG, "pre-clear message build failed", e)
+        onCancel()
+        return
+    }
+    try {
+        AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_title)
+            .setMessage(message)
+            .setCancelable(true)
+            .setPositiveButton(R.string.pre_clear_confirm_proceed) { _, _ -> onProceed() }
+            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+            .setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
+                // ROOT 代關＝清除分身資料，不可復原 → 二次確認（ONE confirm only）。
+                // 取消（含返回鍵）= 完整取消語義：不放行、不執行卸載，旗標重置；
+                // 呼叫端 onCancel 生效（PolicyActivity 勾選還原＝安全側，MA/寫入路徑為 no-op）。
+                try {
+                    AlertDialog.Builder(host)
+                        .setTitle(R.string.pre_clear_root_uninstall)
+                        .setMessage(R.string.pre_clear_root_uninstall_confirm)
+                        .setCancelable(true)
+                        .setPositiveButton(android.R.string.ok) { _, _ ->
+                            host.lifecycleScope.launch {
+                                val ok = try {
+                                    uninstallDualAppsInUser95(installed)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Log.w(PRE_CLEAR_TAG, "dual-profile uninstall failed", e)
+                                    false
+                                }
+                                if (!ok) {
+                                    Log.w(PRE_CLEAR_TAG, "dual-profile uninstall reported failure; proceeding anyway")
+                                }
+                                onProceed()
+                            }
+                        }
+                        .setNegativeButton(R.string.dialog_cancel) { _, _ -> onCancel() }
+                        .setOnCancelListener { onCancel() }
+                        .show()
+                } catch (e: Exception) {
+                    Log.w(PRE_CLEAR_TAG, "pre-clear root-uninstall confirm failed to show", e)
+                    onCancel()
+                }
+            }
+            .setOnCancelListener { onCancel() }
+            .show()
+    } catch (e: Exception) {
+        // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
+        Log.w(PRE_CLEAR_TAG, "pre-clear warning failed to show", e)
+        onCancel()
     }
 }
