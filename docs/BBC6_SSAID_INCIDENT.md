@@ -67,7 +67,7 @@
 17:30:00      →  使用者嘗試「寫入政策草稿（0）」，VM 拒絕（CATALOG_MISSING，無確認對話框）
 17:31:31.000  →  使用者按「清除草稿」（MainActivity techCard 入口）
 17:31:32.586  →  DualAppActivity 啟動（trigger for BBC6）
-17:31:32.910  →  LSPosed: BBC-HOOK installed=1 (daagent, pid=8239)
+17:31:32.913  →  LSPosed: BBC-HOOK installed=1 (daagent, pid=8239)
 17:31:32.950  →  PackageManager: START INSTALL-EXISTING permissioncontroller (install-needed)
 17:31:32.952  →  START DELETE PACKAGE pkg{com.openai.chatgpt} user{95} caller{1000}   ← 系統刪除
 17:31:32.957  →  START INSTALL-EXISTING permissioncontroller (second permission)

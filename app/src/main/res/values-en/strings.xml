@@ -108,6 +108,8 @@
     <string name="pre_clear_probe_failed_title">Probe failed to check dual-app status · dual copies may still be erased</string>
     <string name="pre_clear_probe_failed_message">Root access is unavailable or the environment is unsupported, so installed dual copies cannot be enumerated safely. Samsung may still delete the dual copies (with user-95 data, unrecoverable) when the policy is cleared. If unsure, turn off Dual Apps for the affected apps in Samsung Settings first.</string>
     <string name="pre_clear_probe_failed_proceed">Clear anyway</string>
+    <string name="pre_clear_editor_try_anyway">Continue anyway (empty - the VM rejects empty writes)</string>
+    <string name="pre_clear_editor_keep_unticked">Keep unselected (does not clear the policy yet)</string>
     <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
     <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
     <string name="policy_blind_clear_expired">Clear confirmation expired (over 5 minutes); clear again to confirm. Refresh first if reachable.</string>

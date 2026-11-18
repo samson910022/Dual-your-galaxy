@@ -126,7 +126,7 @@ class PolicyActivity : ComponentActivity() {
         lastSyncedDraft.orEmpty()
     }
 
-    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}) {
+    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}, proceedLabelRes: Int = R.string.pre_clear_confirm_proceed) {
         val persisted = persistedPolicyDraft()
         if (persisted.isEmpty()) {
             proceed()
@@ -155,6 +155,7 @@ class PolicyActivity : ComponentActivity() {
                     this@PolicyActivity,
                     onProceed = { pendingClearConfirm = false; proceed() },
                     onCancel = { pendingClearConfirm = false; onCancel() },
+                    proceedLabelRes = proceedLabelRes,
                 )
                 return@launch
             }
@@ -168,6 +169,7 @@ class PolicyActivity : ComponentActivity() {
                 installed,
                 onProceed = { pendingClearConfirm = false; proceed() },
                 onCancel = { pendingClearConfirm = false; onCancel() },
+                proceedLabelRes = proceedLabelRes,
             )
         }
     }
@@ -407,7 +409,10 @@ class PolicyActivity : ComponentActivity() {
         // Issue #73：候選集空且持久化草稿非空＝整組清除（BBC6 風險）→
         // 先探測 user-95 分身安裝並顯示警告；取消則不寫入。
         if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
-            requestPreClearWarning(proceed = { performWritePolicy() })
+            // VM 永遠拒絕空集合寫入（CATALOG_MISSING／Two-phase 管線的整組契約），
+            // 因此編輯器路徑的「繼續」不會真的清除——只是帶使用者看完警告後，
+            // performWritePolicy() 仍走 VM 並失敗落在狀態列。按鈕標籤必須如實說明。
+            requestPreClearWarning(proceed = { performWritePolicy() }, proceedLabelRes = R.string.pre_clear_editor_try_anyway)
             return
         }
         performWritePolicy()
@@ -646,6 +651,8 @@ class PolicyActivity : ComponentActivity() {
                     // （持久化草稿將被寫成空＝BBC6 風險）→ 先探測 user-95 分身並警告；
                     // 繼續＝保持未勾選，取消＝還原此勾選（行內恢復）。
                     if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
+                        // proceed 為 no-op（僅保持未勾選；真正的「清空政策」只在
+                        // 「寫入政策草稿（0）」或 MainActivity 清除草稿時發生）——按鈕必須如實說明。
                         requestPreClearWarning(
                             proceed = {},
                             onCancel = {
@@ -653,6 +660,7 @@ class PolicyActivity : ComponentActivity() {
                                 renderList()
                                 updateCounter()
                             },
+                            proceedLabelRes = R.string.pre_clear_editor_keep_unticked,
                         )
                     }
                 }

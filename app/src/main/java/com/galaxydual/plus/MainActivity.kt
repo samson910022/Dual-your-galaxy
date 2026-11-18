@@ -7215,6 +7215,7 @@ internal fun showPreClearWarning(
     installed: List<String>,
     onProceed: () -> Unit,
     onCancel: () -> Unit,
+    proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
 ) {
     if (installed.isEmpty()) {
         onProceed()
@@ -7236,7 +7237,7 @@ internal fun showPreClearWarning(
             .setTitle(R.string.pre_clear_title)
             .setMessage(message)
             .setCancelable(true)
-            .setPositiveButton(R.string.pre_clear_confirm_proceed) { _, _ -> onProceed() }
+            .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
             .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
             .setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
                 // ROOT 代關＝清除分身資料，不可復原 → 二次確認（ONE confirm only）。
@@ -7290,6 +7291,7 @@ internal fun showPreClearProbeFailedWarning(
     host: ComponentActivity,
     onProceed: () -> Unit,
     onCancel: () -> Unit,
+    proceedLabelRes: Int = R.string.pre_clear_probe_failed_proceed,
 ) {
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
     try {
@@ -7297,7 +7299,7 @@ internal fun showPreClearProbeFailedWarning(
             .setTitle(R.string.pre_clear_probe_failed_title)
             .setMessage(R.string.pre_clear_probe_failed_message)
             .setCancelable(true)
-            .setPositiveButton(R.string.pre_clear_probe_failed_proceed) { _, _ -> onProceed() }
+            .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
             .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
             .setOnCancelListener { onCancel() }
             .show()

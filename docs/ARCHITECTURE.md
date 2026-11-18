@@ -157,7 +157,7 @@ val privilege: Privilege = when {
   preferences — whole-set two-phase write (`HookPolicyStore`, group
   `dual_policy`/key `extra_whitelist_packages`, owner-user write); hook read via
   `EffectivePolicyCache` TTL poll. BBC injection effect is device-verified
-  (2026-11-17, pre-unification build; re-verified 2026-11-18 on the unified build, BBC1– BBC3 only)
+  (2026-11-17, pre-unification build; re-verified 2026-11-18 on the unified build, BBC1/BBC2/BBC3 only)
   BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app — not untested, broken (see BBC6_SSAID_INCIDENT.md).
 
 ## PmOutputParser

@@ -499,7 +499,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ## English Summary
 
-- **BBC injector (device-verified 2026-11-17 pre-unification; re-verified 2026-11-18 on the unified build, BBC1– BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app)**: `PmWrapper#getPossibleDualAppPackages(Context)` is the
+- **BBC injector (device-verified 2026-11-17 pre-unification; re-verified 2026-11-18 on the unified build, BBC1/BBC2/BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app)**: `PmWrapper#getPossibleDualAppPackages(Context)` is the
   single source of Samsung's Dual Messenger "available apps" rows (both `DualAppActivity`
   render path and `DAUtility.getWhiteListPkgs(true)`); alike BBC jars ship in One UI 5
   (Tab S7, One UI 5.0 / Android 13, DAAgent 3.3.00.0) and One UI 9 (S23 Ultra, One UI 9 /
@@ -538,7 +538,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 - **Stage-1 gate SEALED (unified tree)** — 〔see §1.4; `NON_EMPTY_POLICY_EFFECTIVE_GATE` stays sealed `false`
   forever until a future spec on Samsung stages; the BBC effect switch `BBC_AVAILABLE_APPS_INJECTION=true` shipped
   on the strength of two devices' 2026-11-17 empty-vs-nonempty A/B evidence plus explicit user authorization
-  (pre-unification build; unified build re-verified 2026-11-18, BBC1– BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app). A code-level kill switch is kept:
+  (pre-unification build; unified build re-verified 2026-11-18, BBC1/BBC2/BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app). A code-level kill switch is kept:
   set the BBC const back to `false` to restore bit-exact observe-only BBC behavior.
   *Installed*Whitelist* exclusions are intentionally preserved.]
 - `DualAppActivity#getAvailableApps` / `#updateDualAppList` cannot be deoptimized on One UI 9

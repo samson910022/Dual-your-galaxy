@@ -111,6 +111,8 @@
     <string name="pre_clear_probe_failed_title">無法探測分身狀態 · 仍可能卸載分身</string>
     <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身會被 Samsung 隨政策清空一併刪除（含 user-95 資料、無法復原）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。</string>
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>
+    <string name="pre_clear_editor_try_anyway">仍然繼續（零項目，VM 將拒絕寫入）</string>
+    <string name="pre_clear_editor_keep_unticked">保持未勾選（此步不會清除政策）</string>
     <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理</string>
     <!-- Stage D：blind-clear 確認逾時（arm 超過 5 分鐘，需重 arm；CHANNEL 口徑）。 -->
     <string name="policy_blind_clear_expired">清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理</string>
