@@ -18,16 +18,17 @@
    Ssaid settings not accessible`，由 `SettingsProvider$SettingsRegistry.generateSsaidLocked
    (:4653)` 拋出。user 0 同一 app 無 crash；user 95 僅此 app crash（exit-info 證據）。
 4. 根因為 **Settings SSAID 表對這個 app 播種了一個 `appId` 鍵
-   (`"10431"` → `[REDACTED-SSAID-U95]`)**（2026-05 的雙開設定建立階段寫入），
+   (`"10431"` → `<fc8baf3f…（系統 SSAID hash，已遮蔽）>`)**（2026-05 的雙開設定建立階段寫入），
    而 AOSP 衍生後的 Settings lookup key 是 "complete uid"（`"9510431"`＝95×100000+431）
    — 表中沒有這個鍵 → 系統產生路徑失敗。
 5. onPackageRemoved只清 type-1（system）設定，**不改 type-3（SSAID）**；
    `onUidRemovedLocked(9510431)` 嘗試刪除、但表中根本沒有這個鍵，**100% no-op**。
    播種的 `10431` 條目活過了 BBC6／活過卸載／活過重灌。
-6. **主 app（user 0）無損；Telegram／Facebook appmanager（Samsung 官方雙開白名單）無損**
+6. **晚間恢復（2026-11-18 22:30，使用者回報）**：整機重啟 + Samsung「設定→雙開應用」原生 toggle-on 後，ChatGPT 分身**使用者回報正常啟動**（截圖 `s23u_05_chatgpt_working.png`；pid 未收錄於 repo 擷錄）。上文 1–5 均為事件當下狀態，以此恢復紀錄為準。
+7. **主 app（user 0）無損；Telegram／Facebook appmanager（Samsung 官方雙開白名單）無損**
    ——它們從不呼叫 `android_id`，或 Samsung 為它們走了另外的播種流程（本表未證實，待驗）。
 
-## 目前事實（2026-11-18 裝置）
+## 事件當下事實（2026-11-18 17:xx；22:30 恢復見後述『晚間更新』，本表為當時狀態留存）
 
 | 項目 | 值 |
 | --- | --- |
@@ -38,16 +39,16 @@
 | user 95 install | `true`（after BBC6→clear→Samsung 自動卸載→再 toggle ON） |
 | user 95 first install | 2026-11-18 17:55:40（掛了 SHA runtime 17:21 首灌；兩次實為新灌） |
 | user 95 `pccCeDataInode/De` | `-1 / -1`（僅此 app 異常；Telegram／Facebook 為 `0/0`） |
-| user 95 launch | **CRASH** `IllegalStateException: Ssaid settings not accessible` |
-| user 95 app Launch | 失敗 4 次（exit-info uid=9510431：#0 2026-11-18 17:58:54.522 pid=17674，#1 17:58:41.471，#2 17:58:41.440，#3 17:58:34.965，#4 17:56:03.152）— 即 **BBC6 重裝後第一次啟動即失敗，永久不可回復** |
+| user 95 launch | **CRASH**（BBC6 刪除分身後的重裝版本；22:30 恢復後使用者回報可正常啟動）`IllegalStateException: Ssaid settings not accessible` |
+| user 95 app Launch | BBC6 刪除分身後的**重裝版本**啟動崩潰（exit-info uid=9510431：#0 2026-11-18 17:58:54.522 pid=17674，#1 17:58:41.471，#2 17:58:41.440，#3 17:58:34.965，#4 17:56:03.152）— BBC6 之前、於 17:22 分身已可正常啟動（pid=3568 持續 ~9 分鐘正常 UI session），BBC6 後 SSAID 拒絕。 **可恢復**：裝置重啟 + Samsung 雙開應用切開；新 cycle（2026-11-18 22:30）已驗證用戶回報為可正常啟動（截圖 `s23u_05_chatgpt_working.png`）|
 | user 0 launch | ✅ 正常 |
 | Firefox on u95 | `installed=false`（不是可參照對照） |
 | Telegram on u95 | `installed=true`，無 SSAID 表積極（系統白名單 app 可能走其他流程） |
-| `settings --user 0 get secure android_id` | `[REDACTED-ANDROID-ID-U0]` |
-| `settings --user 95 get secure android_id` | `[REDACTED-ANDROID-ID-U95]` |
-| User-0 SSAID 表 ChatGPT entry | `10431` → `[REDACTED-SSAID-U0]`（mtime 2026-11-17 04:18:00） |
-| User-95 SSAID 表 ChatGPT entry | `10431` → `[REDACTED-SSAID-U95]`（mtime 2026-11-18 17:22:21.354） |
-| User-95 SSAID 表 條目數 | 322 筆，全部 appId keyed，全部 value `[REDACTED-ANDROID-ID-U95]`（即 u95 android_id） |
+| `settings --user 0 get secure android_id` | `<u0 android_id（已遮蔽）>` |
+| `settings --user 95 get secure android_id` | `<u95 android_id（已遮蔽）>` |
+| User-0 SSAID 表 ChatGPT entry | `10431` → `<8ca73ab6…（系統 SSAID hash，已遮蔽）>`（mtime 2026-11-17 04:18:00） |
+| User-95 SSAID 表 ChatGPT entry | `10431` → `<fc8baf3f…（系統 SSAID hash，已遮蔽）>`（mtime 2026-11-18 17:22:21.354） |
+| User-95 SSAID 表 條目數 | 約 324 筆：322 筆 full-uid 鍵（值為 u95 android_id）＋ 1 筆 appId 鍵 `10431`＋1 筆 preserve 列（依本機 `INVESTIGATION_SSAID_BBC6.md`／`abx_notes.md`）；**不是**「全部 appId keyed」
 
 ## 時間線（2026-11-18，UTC+08:00）
 
@@ -61,7 +62,7 @@
 17:21:54      →  START INSTALL-EXISTING userId{95} pkg{com.openai.chatgpt}   ← BBC4 新裝
 17:22:20.742  →  雙開 activity Record 啟動成功： pid=3568（真實 UI session）
 17:22:20.922  →  window focused；APP_CALLED_RESTART_INPUT_API
-17:22:21.354  →  user-95 SSAID 表 mtime 更新（ChatGPT 10431→[REDACTED-SSAID-U95] 寫入）
+17:22:21.354  →  user-95 SSAID 表 mtime 更新（SSAID 內容已遮蔽）
 17:22:48      →  使用者離開 app，nandswap start pid=3568
 17:30:00      →  使用者嘗試「寫入政策草稿（0）」，VM 拒絕（CATALOG_MISSING，無確認對話框）
 17:31:31.000  →  使用者按「清除草稿」（MainActivity techCard 入口）
@@ -91,10 +92,10 @@
 | 假設 | 證據／結論 |
 | --- | --- |
 | 「BBC6 卸載是使用者干預」 | 無：Samsung 使用 system uid 1000，bundle 的 updateDualAppData 來自 daagent 進程，你沒有操作任何 toggle |
-| 「app 從一開始就不能啟動」 | 反駁：17:22:20 pid=3568 完整 UI 動作，>30 分鐘無當機；exit-info 17:56 才首次 crash |
+| 「app 從一開始就不能啟動」 | 反駁：17:22:20 pid=3568 完整 UI 動作；17:22:48 離開 app，17:31:33 BBC6 刪除，exit-info 17:56 才首次 crash（BBC6 之前無 crash 紀錄） |
 | 「主空間同樣 crash」 | 反駁：user 0 uid=10431 `exit-info` 無任何 `APP CRASH` 記錄 |
 | 「Firefox 也有這個問題」 | Firefox 沒裝 u95（`installed=false`），無法對照；先前 BBC 測試是在 Tab S7 user 0／95 上的 Firefox 實例（但 Tab S7 SSAID 未調查） |
-| 「Toggle OFF → 再 ON 可修復」 | **實測不可修復**：關閉→完整卸載→重新安裝（17:55:40），之後每次啟動仍崩潰（pid=15625 起至 pid=17674）。因為播種鍵寫入是 fixed 的，卸載不重寫播種，重裝不產生新的 SSAID 行 |
+| 「Toggle OFF → 再 ON 可修復」 | **部分成立**：當天 17:55 卸載→重裝後 toggle-on 仍 crash（pid=15625 起至 pid=17674）；稍後晚間整機重啟 + Samsung 原生 toggle-on（22:26 安裝）後，**使用者回報**可正常啟動（截圖 `s23u_05_chatgpt_working.png`；pid 未收錄於 repo 擷錄） |
 | 「Telegram／Facebook 也會這樣」 | 目前無法實驗對等第三方，只能列「未知」，不能回答 |
 | 「BBC6 是可復原的 rollback」 | **不是**：BBC6 的「政策清空」被 Samsung 強解釋為可能安裝的雙開應用集合空，觸發 `START DELETE PACKAGE` |
 
@@ -110,11 +111,11 @@ BBC6（背景 full-policy 清空）→ daagent BBC hook 回傳空 → Samsung Du
 
 ## 修復可能性與已驗證結果
 
-**目前狀態（2026-11-18 22:30 實測）**：
+**恢復狀態（2026-11-18 22:30；使用者回報，截圖佐證；pid 未收錄於 repo 擷錄）**：
 
-1. 主 app 可在設定中重新「啟用雙開」→ 雙開實例**正常**：`u95_a431 10165 com.openai.chatgpt`（截圖 `s23u_05_chatgpt_working.png`）
-2. BBC Hook 在重啟後 daagent 仍裝上並 `merged +1 packages (total 7, pid=7003)`
-3. 本機的 ABX 手動修補**沒有**解 crash；App 22:22 啟動仍 throw `Ssaid settings not accessible`
+1. 主 app 可在設定中重新「啟用雙開」→ 雙開實例**使用者回報正常**（截圖 `s23u_05_chatgpt_working.png` 顯示歡迎／首次啟動畫面；`u95_a431 pid=10165` 為使用者口述，**無 repo 擷錄**）
+2. BBC Hook 在重啟後 daagent 仍裝上並 `merged +1 packages (total 7, pid=7003)`（**pid=7003 未收錄於 repo 擷錄**；屬使用者回報等級）
+3. 本機曾嘗試 Settings SSAID ABX 手動修補（A2：新增 `9510431` 列），但**無 log／exit-info 擷錄留存**；據此**無法斷言**「A2 已實測無效」，也不再採用該項作為任何結論依據。下列 root-cause 分析（uid-keyed lookup vs appId-keyed 播種列）仍由 dump 材料支撐（u95 SSAID strings；abx_notes；exit-info 17:56–17:58）
 
 **官方恢復方式**：按使用者聯絡記錄中的 22 步順序——
   1. 裝置 `adb reboot`
@@ -124,18 +125,18 @@ BBC6（背景 full-policy 清空）→ daagent BBC hook 回傳空 → Samsung Du
   5. App 正常使用
 
 **本機的 `settings_ssaid.xml` 修補嘗試（記錄，不再採用）**：
-- `settings_ssaid.xml.patched_A2_add.example`（新增 `9510431` row，驗證過 parse）push 後無效，user 95 分身仍 crash
+- `settings_ssaid.xml.patched_A2_add.example`（新增 `9510431` row，驗證過 parse）：push 之事於當晚 session 中進行，**但無 log／exit-info 擷錄可復核其結果**；不再主張「A2 已實測無效」
 - `settings_ssaid.xml.patched_B_rename.example`（同樣 parse 過，未實驗）
 - 原 17:55 重裝 + Samsung toggle-on 後，ChatGPT 分身 22:26:54 installed=true，22:30 起無 crash
 
 ## 2026-11-18 晚間更新：Samsung 原生 toggle-on + 重啟即可恢復（本文件結論修正）
 
-> **重要修正**（未刪除上方事實紀錄；上方的是當時實況）：使用者在 BBC6 之後 17:55 重新勾選、22:25 重啟後，BBC 注入狀態照常運作，ChatGPT 雙開於 22:30 起正常運行（`u95_a431 pid=10165`，截圖 `s23u_05_chatgpt_working.png`）。因此「不可回復」一事並非最終結論。
+> **重要修正**（未刪除上方事實紀錄；上方的是當時實況）：使用者在 BBC6 之後 17:55 重新勾選、22:25 重啟後，BBC 注入狀態照常運作；**使用者回報** ChatGPT 雙開於 22:30 起正常運行（`u95_a431 pid=10165` 為口述、未收錄於 repo；截圖 `s23u_05_chatgpt_working.png` 僅顯示歡迎畫面）。因此「不可回復」一事並非最終結論。
 
-### 實測恢復步驟
+### 恢復步驟（2026-11-18 22:30 使用者回報）
 1. BBC6 後，Samsung 確實主動刪除了分身（`PACKAGE_FULLY_REMOVED`）
 2. 使用者照實作：`adb reboot`（整機）→ 進入 Samsung **「設定 → 雙開應用」**，對 ChatGPT **切回 ON**（同意安裝）→ 系統執行 `START INSTALL-EXISTING` → 使用者 95 重新有 `installed=true`、`firstInstallTime=2026-11-18 22:26:54`
-3. 驗證 BBC-HOOK 在重啟後的 daagent 仍然 `installed=1`、`BBC-HOOK merged +1 packages (total 7, pid=7003)`
+3. 使用者回報 BBC-HOOK 在重啟後 daagent 仍然 `installed=1`、`BBC-HOOK merged +1 packages (total 7, pid=7003)`（**pid 未收錄於 repo 擷錄**）
 4. 使用者 95 分身與主空間 `u0_a431` 同時存在，無 crash 環
 5. 順帶確認：`settings --user 95 put secure android_id <任何值>` 會觸發 provider reload，但不影響 SSAID 表
 
@@ -146,14 +147,14 @@ BBC6（背景 full-policy 清空）→ daagent BBC hook 回傳空 → Samsung Du
 
 ### 本機修復作業書寫守則（依據本次 Samsung 原生流程）
 1. 離線備份（本機並留有本機複份）
-2. 內部 ABX 嘗試——**失敗**：本機嘗試過 `settings_ssaid.xml.patched_A2_add.example` push 並 force-stop Samsung `SettingsProvider`，app 仍 crash
+2. 內部 ABX 嘗試——**結果未留存擷錄**：A2 push＋force-stop Samsung `SettingsProvider` 一事僅由 session 回憶，**無 log 可復核**；不再主張其失敗與否
 3. **Samsung 原生 toggle-on（本機 + reboot + Samsung Settings「雙開應用」開啟）是唯一官方修復方式**；任何針對 SSAID 表的手動改寫都是嘗試、且超出本次範圍
 
 ### 對之前段落的誠實對照
 | 舊斷言 | 修正 |
 | --- | --- |
 | 「重新勾選後 app 無法啟動、Samsung 永不授予 SSAID」 | 不是「永不」——只要以 Samsung 官方步驟重啟 + toggle-on，就會得到 Samsung 正常授予 SSAID 的結果 |
-| 「ABX 修補失敗 = Samsung 不放行」 | 部分正確：我們嘗試的 A2 修補確實未解 crash；但 Samsung 不需要任何修補——官方流程就是它自己的版本控制 |
+| 「ABX 修補失敗 = Samsung 不放行」 | 無法成立：A2 修補結果未有擷錄，無法斷言。可斷言的是——**Samsung 原生 toggle-on 恢復路徑**（重啟 + 官方流程），不需要任何修補 |
 | 「使用者需要 Factory reset」 | 不必要，使用者自行重開機 + Samsung toggle-on 成功 |
 
 ## 對驗收與文件的影響（已繼續處理）

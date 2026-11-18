@@ -135,6 +135,7 @@ class PolicyActivity : ComponentActivity() {
         if (pendingClearConfirm) return
         pendingClearConfirm = true
         lifecycleScope.launch {
+            var probeFailed = false
             val installed = try {
                 probeDualAppsInUser95(persisted)
             } catch (e: CancellationException) {
@@ -142,10 +143,19 @@ class PolicyActivity : ComponentActivity() {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "pre-clear dual-profile probe failed", e)
+                probeFailed = true
                 emptyList()
             }
             if (isFinishing || isDestroyed) {
                 pendingClearConfirm = false
+                return@launch
+            }
+            if (probeFailed) {
+                showPreClearProbeFailedWarning(
+                    this@PolicyActivity,
+                    onProceed = { pendingClearConfirm = false; proceed() },
+                    onCancel = { pendingClearConfirm = false; onCancel() },
+                )
                 return@launch
             }
             if (installed.isEmpty()) {

@@ -72,7 +72,7 @@ Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 
 
 ## 6. BBC 注入驗收紀錄（2026-11-17 雙裝置 pre-unification；2026-11-18 unified build 重驗）
 
-> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 完整重驗（BBC1–BBC3 重驗；BBC4/BBC5 app 無法啟動（SSAID）；BBC6=系統自動卸載分身，資料清除），結論補錄如下；2026-11-17 段落作為 reference 保留。**
+> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 完整重驗（BBC1–BBC3 重驗；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，資料清除），結論補錄如下；2026-11-17 段落作為 reference 保留。**
 
 > 裝置序列已遮蔽；路徑與截圖留本機。擷錄檔不入 repo。
 
@@ -93,20 +93,20 @@ Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 
 | BBC1 | daagent 啟動時 BBC hook 安裝 | `BBC-HOOK installed=1 (daagent, pid=…)` | ✅ `BBC-HOOK installed=1 (daagent, pid=29265)`（verbose mirror，force-stop daagent 後首次開頁） | ☑ |
 | BBC2 | 空政策 | BBC callback 回傳 Samsung 原始物件（零行為變更） | ✅ `BBC-HOOK callback getPossibleDualAppPackages (pid=29265)`（不帶 `nonempty`／無 merged 行） | ☑ |
 | BBC3 | 勾選政策 app → 重進頁面 | ChatGPT 出現在清單 | ✅ `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=1519)`；**`BBC-HOOK merged +1 packages (total 7, pid=1519)`**；頁面截圖 `s23u_02_bbc3.png`（ChatGPT 列出現，可切換） | ☑ |
-| BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ✅ `pm path --user 95 com.openai.chatgpt` 列出 base＋split APK（本檔同名段落） | ☑ |
-| BBC5 | launch 分身實例 | 雙開實例啟動、主 profile 並存 | ✅ `am start --user 95 -n com.openai.chatgpt/.MainActivity` 後 `ps` 同時見 u95_a431、u0_a431（本檔同名段落） | ☑ |
-| BBC6 | **破壞性卸載（不是回滾）：清空政策 → Samsung 系統刪除分身副本（資料全清）** | 空政策 daagent 啟動 → possible-list 空 → Samsung DualAppManagerService 直接發 `START DELETE PACKAGE`（`caller{1000}`）：2026-11-18 驗證成立；2026-11-17 亦同（BBC1 pid=29265 政策空）；**恢復方式**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝、ChatGPT 分身於 22:30 正常運行（`u95_a431 pid=10165`，`s23u_05_chatgpt_working.png` 證據） | ❌ 不通過、不得標 ☑；BBC6 屬破壞性指令；詳 `BBC6_SSAID_INCIDENT.md` |
+| BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ⚠️ `pm path --user 95 com.openai.chatgpt` 於 2026-11-18 **17:56 的 `s23_bbc_unified_reenable_20261118.log`（本機）** 量測：含 base＋split APK 多行輸出（`# exit=0`）；此 log **未由本 repo 收錄**，不可獨立驗證，僅有裝置端 session 記錄相映；本節不再將之視為可重查證據 | ☑（caveat） |
+| BBC5 | launch 分身實例 | 雙開實例啟動、主 profile 並存 | ⚠️ 進程案由 `INVESTIGATION_SSAID_BBC6.md`（unified build 於 17:21–17:30 確有 u95 分身進程且系統未強制其退出）；本節**沒有同時 `ps` 擷錄 U95 + U0 的證據**；`s23u_05_chatgpt_working.png`（22:31 截圖）顯示分身以第一次啟動歡迎畫面可見，無崩潰；不得稱證據 `u95_a431 pid=10165` — 該 pid 為 user 自陳、未收錄 log | ☑（caveat） |
+| BBC6 | **破壞性卸載（不是回滾）：清空政策 → Samsung 系統刪除分身副本（資料全清）** | 空政策 daagent 啟動 → possible-list 空 → Samsung DualAppManagerService 直接發 `START DELETE PACKAGE`（`caller{1000}`）：2026-11-18 驗證成立；2026-11-17 亦同（BBC1 pid=29265 政策空）；**恢復方式**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝、ChatGPT 分身於 22:30 **使用者回報**正常運行（`u95_a431 pid=10165` 為口述、未收錄於 repo；截圖 `s23u_05_chatgpt_working.png`） | ❌ 不通過、不得標 ☑；BBC6 屬破壞性指令；詳 `BBC6_SSAID_INCIDENT.md` |
 | BBC7 | Knox／Secure Folder（user 150） | 零觸及、零查詢 | ✅ 全程未查詢 user 150；所有 `pm` 查詢僅 user 0／95 | ☑ |
 
 BBC6 注意事項（unified build）：
 - 空政策清除的正規流程是**主畫面「清除草稿」**；編輯器「寫入政策草稿（N）」在 N=0 時被 VM 拒絕（CATALOG_MISSING 分支，目前僅顯示 VM 訊息，無確認對話框）。
 - BBC6 不是回滾——是「清除政策＝系統刪除分身」。見 `BBC6_SSAID_INCIDENT.md`。
-- **恢復**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝、分身正常；BBC3 merged +1 仍生效。
+- **恢復**：裝置 `adb reboot` → Samsung「設定→雙開應用」對目標 app 切回 ON → Samsung 重新安裝；**使用者回報**分身正常（pid 未收錄於 repo 擷錄）；BBC3 merged +1 生效與否亦以使用者回報為準。
 - 驗證 BBC6 政策清空後三星會呼叫 `PACKAGE_FULLY_REMOVED`（`START DELETE PACKAGE`）；使用者自行重開機 + Samsung 原生 toggle-on 即恢復；不必、也不應嘗試 ABX 修補 ssaid.xml（見 incident）。
 
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。
-- 擷錄檔命名不含序號，存放於裝置證據目錄（本機 `/mnt/seagate500g/opencode_tmp/s23ultra/`），不入 repo；本節證據欄位僅記檔名。
+- 擷錄檔命名不含序號，存放於本機裝置證據目錄（私有，不入 repo），不入 repo；本節證據欄位僅記檔名。
 
 ### 2026-11-17 紀錄（pre-unification build，reference）
 

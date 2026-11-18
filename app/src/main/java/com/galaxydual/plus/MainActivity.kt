@@ -5910,6 +5910,7 @@ class MainActivity : ComponentActivity() {
         if (pendingClearConfirm) return
         pendingClearConfirm = true
         lifecycleScope.launch {
+            var probeFailed = false
             val installed = try {
                 probeDualAppsInUser95(set)
             } catch (e: CancellationException) {
@@ -5917,10 +5918,19 @@ class MainActivity : ComponentActivity() {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "pre-clear dual-profile probe failed", e)
+                probeFailed = true
                 emptyList()
             }
             if (isFinishing || isDestroyed) {
                 pendingClearConfirm = false
+                return@launch
+            }
+            if (probeFailed) {
+                showPreClearProbeFailedWarning(
+                    this@MainActivity,
+                    onProceed = { pendingClearConfirm = false; proceed() },
+                    onCancel = { pendingClearConfirm = false; onCancel() },
+                )
                 return@launch
             }
             if (installed.isEmpty()) {
@@ -7168,8 +7178,10 @@ internal suspend fun probeDualAppsInUser95(pkgs: Collection<String>): List<Strin
     if (result.exit != 0) {
         Log.w(PRE_CLEAR_TAG, "dual-profile probe exit=${result.exit} err=${result.err.take(200)}")
     }
-    // 盡力解析 stdout 的 INST 行（exit 非零／stderr 非空不硬失敗；truncate 只影響尾行）。
+    // 從輸出只擷取「INST <pkg>」行，再以 isValidPackage grammar 過濾非法 token，
+    // 作為避免 su 執行無法預期字串的防線（合法資料來源仍為已寫入草稿的套件名）。
     return parseDualProbeOutput(result.out)
+        .filter { PolicySource.isValidPackage(it) }
 }
 
 internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolean {
@@ -7233,7 +7245,11 @@ internal fun showPreClearWarning(
                 try {
                     AlertDialog.Builder(host)
                         .setTitle(R.string.pre_clear_root_uninstall)
-                        .setMessage(R.string.pre_clear_root_uninstall_confirm)
+                        .setMessage(
+                            host.getString(R.string.pre_clear_root_uninstall_confirm) +
+                                "\n\n" + shown.joinToString("\n") +
+                                if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…（共 ${sorted.size} 個，僅顯示前 $PRE_CLEAR_LIST_MAX 筆）" else "",
+                        )
                         .setCancelable(true)
                         .setPositiveButton(android.R.string.ok) { _, _ ->
                             host.lifecycleScope.launch {
@@ -7264,6 +7280,29 @@ internal fun showPreClearWarning(
     } catch (e: Exception) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
         Log.w(PRE_CLEAR_TAG, "pre-clear warning failed to show", e)
+        onCancel()
+    }
+}
+
+// 無 Root 或環境不支援時的探測失敗警告——告知使用者「無法判斷哪些分身會被刪除」，
+// 為防止靜默放行，只提供「仍然清除」（繼承 PolicyActivity 的「同意卸載分身」語義）與取消。
+internal fun showPreClearProbeFailedWarning(
+    host: ComponentActivity,
+    onProceed: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    try {
+        AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_probe_failed_title)
+            .setMessage(R.string.pre_clear_probe_failed_message)
+            .setCancelable(true)
+            .setPositiveButton(R.string.pre_clear_probe_failed_proceed) { _, _ -> onProceed() }
+            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+            .setOnCancelListener { onCancel() }
+            .show()
+    } catch (e: Exception) {
+        Log.w(PRE_CLEAR_TAG, "pre-clear probe-failed warning failed to show", e)
         onCancel()
     }
 }
