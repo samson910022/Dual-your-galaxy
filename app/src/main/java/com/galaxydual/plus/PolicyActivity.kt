@@ -33,6 +33,7 @@ import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -56,6 +57,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 
 class PolicyActivity : ComponentActivity() {
 
@@ -109,6 +111,55 @@ class PolicyActivity : ComponentActivity() {
     // Bounded icon cache (LRU-ish eviction of oldest entry).
     private val iconCache = object : LinkedHashMap<String, Drawable>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Drawable>?): Boolean = size > 64
+    }
+
+    // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
+    // 刪除 user-95 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
+    // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
+    // pendingClearConfirm：probe／警告對話框存活期忽略再次操作，避免重複彈窗。
+    private var pendingClearConfirm = false
+
+    // 目前持久化草稿（UiState.policyDraft 即已保存之草稿）；讀取失敗時退回最後同步鏡像。
+    private fun persistedPolicyDraft(): Set<String> = try {
+        vm.state.value.policyDraft
+    } catch (_: Exception) {
+        lastSyncedDraft.orEmpty()
+    }
+
+    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}) {
+        val persisted = persistedPolicyDraft()
+        if (persisted.isEmpty()) {
+            proceed()
+            return
+        }
+        if (pendingClearConfirm) return
+        pendingClearConfirm = true
+        lifecycleScope.launch {
+            val installed = try {
+                probeDualAppsInUser95(persisted)
+            } catch (e: CancellationException) {
+                pendingClearConfirm = false
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "pre-clear dual-profile probe failed", e)
+                emptyList()
+            }
+            if (isFinishing || isDestroyed) {
+                pendingClearConfirm = false
+                return@launch
+            }
+            if (installed.isEmpty()) {
+                pendingClearConfirm = false
+                proceed()
+                return@launch
+            }
+            showPreClearWarning(
+                this@PolicyActivity,
+                installed,
+                onProceed = { pendingClearConfirm = false; proceed() },
+                onCancel = { pendingClearConfirm = false; onCancel() },
+            )
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -343,6 +394,16 @@ class PolicyActivity : ComponentActivity() {
             showInfo(getString(R.string.policy_unknown_refresh))
             return
         }
+        // Issue #73：候選集空且持久化草稿非空＝整組清除（BBC6 風險）→
+        // 先探測 user-95 分身安裝並顯示警告；取消則不寫入。
+        if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
+            requestPreClearWarning(proceed = { performWritePolicy() })
+            return
+        }
+        performWritePolicy()
+    }
+
+    private fun performWritePolicy() {
         // The policy set comes from the editor's checked list, never from the
         // catalog selection; selectedKeys is left untouched by the VM.
         vm.replacePolicyDraft(HashSet(ticks))
@@ -567,7 +628,24 @@ class PolicyActivity : ComponentActivity() {
             setOnCheckedChangeListener { _, checked ->
                 // Local-only: no store write here. The write goes through
                 // 「寫入政策草稿」→ pending → confirm dialog.
-                if (checked) ticks.add(pkg) else ticks.remove(pkg)
+                if (checked) {
+                    ticks.add(pkg)
+                } else {
+                    ticks.remove(pkg)
+                    // Issue #73：單筆取消導致 ticks 清空＝整組清除的前置狀態
+                    // （持久化草稿將被寫成空＝BBC6 風險）→ 先探測 user-95 分身並警告；
+                    // 繼續＝保持未勾選，取消＝還原此勾選（行內恢復）。
+                    if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
+                        requestPreClearWarning(
+                            proceed = {},
+                            onCancel = {
+                                ticks.add(pkg)
+                                renderList()
+                                updateCounter()
+                            },
+                        )
+                    }
+                }
                 updateCounter()
             }
         }
@@ -614,5 +692,6 @@ class PolicyActivity : ComponentActivity() {
 
     companion object {
         private const val MAX_LIST_ROWS = 200
+        private const val TAG = "PolicyActivity"
     }
 }

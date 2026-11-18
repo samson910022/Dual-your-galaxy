@@ -101,6 +101,13 @@
     <string name="policy_refresh_failed">重新整理政策草稿失敗：遠端內容未知</string>
     <string name="policy_refreshed">已重新整理政策草稿</string>
     <string name="policy_cleared">已清除政策草稿（不影響已安裝分身與目前勾選）</string>
+    <!-- Issue #73：清除政策前雙開提醒（BBC6：政策清空＝Samsung 自動刪分身，user-95 資料不可復原）。三語系同鍵。-->
+    <string name="pre_clear_title">清除政策前 · 雙開提醒</string>
+    <string name="pre_clear_message">這些 app 目前在雙開分身（user 95）已安裝：%1$s\n\nSamsung 會在政策為空時自動刪除分身（含 user-95 資料、無法復原）。請先到 Samsung「設定 → 應用程式 → 雙開應用」把這些 app 的雙開關掉後再清除。</string>
+    <string name="pre_clear_confirm_proceed">繼續清除（同意卸載分身）</string>
+    <string name="pre_clear_cancel">取消清除</string>
+    <string name="pre_clear_root_uninstall">ROOT 代為關閉分身（清除資料）</string>
+    <string name="pre_clear_root_uninstall_confirm">這會清除分身資料與所有應用資料，確定？</string>
     <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理</string>
     <!-- Stage D：blind-clear 確認逾時（arm 超過 5 分鐘，需重 arm；CHANNEL 口徑）。 -->
     <string name="policy_blind_clear_expired">清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理</string>
