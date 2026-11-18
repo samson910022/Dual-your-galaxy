@@ -56,7 +56,7 @@ val privilege: Privilege = when {
 > 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
 >（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
 > 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
-> 未驗 —— (3)callback 可驗日誌缺（`system_server`／daagent 查詢面）、(4)非空政策之白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（sealed false，零行為變更 by design；BBC 注入面已於 2026-11-17 驗證——pre-unification build：`BBC-HOOK merged +1 packages (total 7, pid=21472)`；unified build 待 Stage 8.3 重驗，BBC6 ☐ 未測）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
+> 未驗 —— (3)callback 可驗日誌缺（`system_server`／daagent 查詢面）、(4)非空政策之白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（sealed false，零行為變更 by design；BBC 注入面已於 2026-11-17 驗證——pre-unification build：`BBC-HOOK merged +1 packages (total 7, pid=21472)`；unified build 已驗 2026-11-18，BBC1–BBC6 全通過（含 BBC6 ☑））、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
 > 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
@@ -115,7 +115,7 @@ val privilege: Privilege = when {
 > | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
 > | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
 > | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據；任何未來翻轉需另一份 SAMSUNG 階段 spec＋使用者明示授權 |
-> | BBC 注入效應開關（`BBC_AVAILABLE_APPS_INJECTION=true`） | —（code gate，非裝置驗證） | BBC merge 僅擴展 Dual Messenger「可用的應用程式」清單，PROTECTIVE／union-only／identity fast-path／fail-closed；裝置證據 2026-11-17（S23 Ultra／Tab S7，pre-unification build）；unified build 待 Stage 8.3 重驗（BBC6 ☐ 未測）；Stage-1 封緘不受影響 | 效應面僅限 BBC 清單可見性；設 `false` 即 BBC 零行為變更；2026-11-17 授權涵蓋僅 BBC 注入面 |
+> | BBC 注入效應開關（`BBC_AVAILABLE_APPS_INJECTION=true`） | —（code gate，非裝置驗證） | BBC merge 僅擴展 Dual Messenger「可用的應用程式」清單，PROTECTIVE／union-only／identity fast-path／fail-closed；裝置證據 2026-11-17（S23 Ultra／Tab S7，pre-unification build）；unified build 已驗 2026-11-18（BBC1–BBC6 全通過，含 BBC6 ☑）；Stage-1 封緘不受影響 | 效應面僅限 BBC 清單可見性；設 `false` 即 BBC 零行為變更；2026-11-17 授權涵蓋僅 BBC 注入面 |
 > | 政策 Tx 結清／coordinator（Stage G1/G2） | —（VM 語義，非裝置驗證） | JVM 鎖定（`PolicyWriteTest`：settle helper／世代拆分／跨 VM 認領（auto-recheck 間接覆蓋）；reconciler 總預算 15 秒） | JVM 綠燈不等於裝置驗收；旋轉重建實機恢復未驗 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
@@ -157,7 +157,7 @@ val privilege: Privilege = when {
   preferences — whole-set two-phase write (`HookPolicyStore`, group
   `dual_policy`/key `extra_whitelist_packages`, owner-user write); hook read via
   `EffectivePolicyCache` TTL poll. BBC injection effect is device-verified
-  (2026-11-17, pre-unification build); unified build pending Stage 8.3
+  (2026-11-17, pre-unification build; re-verified 2026-11-18 on the unified build, BBC1-BBC6 incl. BBC6)
   re-verification, BBC6 rollback untested).
 
 ## PmOutputParser
@@ -192,7 +192,7 @@ val privilege: Privilege = when {
    `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
 
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
-- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效。BBC 注入面 2026-11-17 裝置已驗證（pre-unification build；`BBC-HOOK merged +1 packages (total 7, pid=21472)`）；unified build 讀者接線待 Stage 8.3 重驗（BBC6 ☐ 未測）；白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更 by design）。
+- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效。BBC 注入面 2026-11-17 裝置已驗證（pre-unification build；`BBC-HOOK merged +1 packages (total 7, pid=21472)`）；unified build 讀者接線已於 2026-11-18 重驗（BBC1–BBC6 全通過）；白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更 by design）。
 - Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例；`extra_whitelist_version` 版本序號 **規劃中／未實作**，新鮮度目前僅靠 TTL＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活）。handover 登記給行程級 `PolicyTxCoordinator`（其 reconciler 跑在 coordinator 的 app-scoped 域，不隨 VM 死亡），負責把 Tx 收斂回 `IDLE`／終態；joinable（armed／已交接）Tx 由 init reclaim 的兄弟 VM 認領為 `RECONCILING` 並 join 同一 deferred；僅「owner 存活且 Tx 未 arm（PREPARING）」的兄弟 VM 見 `BUSY`，直到 owner 終態後自行收斂；不一律 `BUSY`；`RECONCILING` 相位的「稍後刷新」僅為手動 late-join 提示；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。

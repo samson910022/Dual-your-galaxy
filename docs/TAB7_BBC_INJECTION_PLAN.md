@@ -237,14 +237,14 @@ internal fun mergeAvailableList(
 ## 12. Success Criteria（現況：2026-11-18 unified tree 對照；□＝未測／待驗）
 
 1. `:hook:testDebugUnitTest` 全綠；`assembleDebug` 成功 — ☑ unified tree Stage 8.1：1921 JVM tests 全綠、`assembleDebug` OK（orchestrator 2026-11-18 記錄）。
-2. spike 通過；`BBC-HOOK installed=1`（或 fail-closed 記 `BBC-HOOK skip` 且行為不變） — ☑（2026-11-17，pre-unification build，兩裝置；S23 `BBC-HOOK installed=1 (daagent, pid=21472)`、Tab S7 pid 7812/18538/21602；unified build 重驗 = Stage 8.3 BBC1）。
+2. spike 通過；`BBC-HOOK installed=1`（或 fail-closed 記 `BBC-HOOK skip` 且行為不變） — ☑（2026-11-17，pre-unification build，兩裝置；S23 `BBC-HOOK installed=1 (daagent, pid=21472)`、Tab S7 pid 7812/18538/21602；unified build 重驗 = 已驗（2026-11-18，BBC1；`BBC-HOOK installed=1 (daagent, pid=29265)`）。
 3. gate=false（預設）零行為差異 — ☑（unified tree Stage-1 封緘 `false` 即預設，零行為變更由 `PolicySourceTest`／`EffectivePolicyCacheTest`（gate-closed 零讀取）鎖定；pre-unification build 亦曾以 gate=false 基線驗證）。
-4. BBC 清單出現、可啟用、分身安裝/啟動成功 — ☑ S23 Ultra（2026-11-17，pre-unification build：端對端雙開 ChatGPT `u95_a431`，持久化證據 `s23_bbc_evidence_20261117.log`）／⚠️ Tab S7（BBC merge +0、Firefox/Gemini 列可見＋toggle 可見（截圖 `10_dualmessenger_page.png`）；dual-install 僅有 session 觀察、無持久化檔案證據）；Shopee 無法納入清單（disabled，installed∧enabled 謂詞正確跳過，非失敗）；unified build 重驗 = Stage 8.3（BBC3/BBC4/BBC5、S23 Ultra）。
-5. RemotePreferences 寫入在**不重開機**情況下可見 — 語義已更正：pre-unification build 以 RemotePreferences listener push 即時可見（observer 於 daagent 行程即時更新）；unified build **無**跨行程推送（API 102），新鮮度＝TTL 輪詢（≤60s）＋重啟語義（`EffectivePolicyCache`：60s TTL／5s 失敗節流／single-flight／50ms stall 預算）。unified build reader 接線重驗 = Stage 8.3（BBC2/BBC3）— ☐ 未測。
-6. §1.4 hard gate 5 項各有 Tab S7／S23 證據；任何一項未達 ⇒ gate=false、BBC-injector observe-only（不得有 UNVERIFIED 直接上線） — ☑（2026-11-17，pre-unification build，docs/HOOK.md §1.4 items 1–5；unified build 重驗 = Stage 8.3（BBC1–BBC6））— ☐ 未測（unified）。
+4. BBC 清單出現、可啟用、分身安裝/啟動成功 — ☑ S23 Ultra（2026-11-17，pre-unification build：端對端雙開 ChatGPT `u95_a431`，持久化證據 `s23_bbc_evidence_20261117.log`）／⚠️ Tab S7（BBC merge +0、Firefox/Gemini 列可見＋toggle 可見（截圖 `10_dualmessenger_page.png`）；dual-install 僅有 session 觀察、無持久化檔案證據）；Shopee 無法納入清單（disabled，installed∧enabled 謂詞正確跳過，非失敗）；unified build 重驗 = 已驗（2026-11-18，BBC3 `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=1519)` + `BBC-HOOK merged +1 packages (total 7, pid=1519)`；BBC4 `pm path --user 95 com.openai.chatgpt` 回應 dual APK paths；BBC5 `am start --user 95 -n com.openai.chatgpt/.MainActivity` 顯示 u95_a431 與 u0_a431 並存）。
+5. RemotePreferences 寫入在**不重開機**情況下可見 — 語義已更正：pre-unification build 以 RemotePreferences listener push 即時可見（observer 於 daagent 行程即時更新）；unified build **無**跨行程推送（API 102），新鮮度＝TTL 輪詢（≤60s）＋重啟語義（`EffectivePolicyCache`：60s TTL／5s 失敗節流／single-flight／50ms stall 預算）。unified build reader 接線重驗 = 已驗（2026-11-18；BBC2 空政策 bit-exact（pid=29265 callback 帶 `(pid=29265)` 不帶 nonempty）；BBC3 ≥ `nonempty`＋`merged +1`（pid=1519））。
+6. §1.4 hard gate 5 項各有 Tab S7／S23 證據；任何一項未達 ⇒ gate=false、BBC-injector observe-only（不得有 UNVERIFIED 直接上線） — ☑（2026-11-17，pre-unification build，docs/HOOK.md §1.4 items 1–5；unified build 重驗 = 已驗（2026-11-18，BBC1–BBC6 全通過，含 BBC6 回滾）。
 7. 連續 2 次重開機正常；`logcat -b crash | grep -i galaxydual` 空 — ☐ 未測（pre-unification build 未做；unified build Stage 8.3 若有時間窗執行，之前不得宣稱通過）。
 8. Docs 同步：`docs/HOOK.md`、`docs/CREDITS.md`（OneUIX/DualAppMod 思路引用）、`README.md`、`docs/USAGE.md`、`docs/ACCEPTANCE.md`、`docs/ARCHITECTURE.md` 一致更新，且**不寫**序號/個人在 repo — ☑（2026-11-18 docs 同步：衝突解消＋unified 遷移紀錄＋Addendum B；序號未入 repo）。
-9. **BBC6 回滾（取消勾選 → 空政策 → BBC merged 0 → toggle 列消失 → 政策 UX 可再開關）** — ☐ 未測（unified build Stage 8.3 必測；pre-unification build 未執行）。
+9. **BBC6 回滾（取消勾選 → 空政策 → BBC merged 0 → toggle 列消失 → 政策 UX 可再開關）** — ☑ unified build 2026-11-18 已驗（BBC6：清除→寫入 0→callback 帶 `(pid=8239)` 不帶 nonempty 無 merged 行→再勾選→merged +1（pid=9255）；pre-unification build 亦未執行）。
 
 ## 13. 實作前必答（Open Questions）
 
@@ -318,6 +318,23 @@ internal fun mergeAvailableList(
    - 舊 «write-per-toggle» 行為已移除——一律整組寫入＋確認（含 BBC 編輯器路徑）。
 5. **Caller deopt（One UI 9，dumps 在案）**：`DualAppActivity#getAvailableApps`／`#updateDualAppList` 在 One UI 9 找不到目標（方法改名/內聯，hook 自動 `BBC-SPIKE caller: … not found; skipped`）——不影響 BBC callee 本體 hook；BBC callback 依舊觸發（deopt 為保險性質非必要條件）。
 6. **證據效力與重驗**：2026-11-17 所有裝置證據（Addendum A，兩裝置 A/B；`merged +1 packages (total 7, pid=21472)`、`BBC-HOOK merge added 0 packages …`）皆在 `galaxydual_policy` group + listener push 模型上取得。**同一 BBC 演算法、同一 union-only／identity fast-path fail-closed 語義帶入 unified build（BBC jar 於兩裝置逐字等價），但 App→hook 讀者路徑已更換，證據不自動移植。**
-   unified build 重驗 = **Stage 8.3（S23 Ultra，BBC1–BBC6；BBC6 回滾必測，未測 ☐）**；證據刷新 `docs/ACCEPTANCE.md` §6；BBC1–BBC5 預期沿用（相同 merge 機制），BBC3（`merged +N` 觀察）依賴 reader 輪詢時序（≤60s 或重啟 daagent 後觀察）。
+   unified build 重驗 = **已驗（2026-11-18，S23 Ultra，BBC1–BBC6 全通過，含 BBC6 回滾；證據 `s23_bbc_unified_20261118.log`（unified build APK：commit 3e9ccede；APK sha256=953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f）；結論以 `docs/ACCEPTANCE.md` §6 補錄為準）
 7. **freshness 實務**：unified build 政策寫入後，daagent 最晚於下一次 60s TTL poll 或自身重啟看到新集合；`BBC-HOOK` log 判讀：空政策 → `BBC-HOOK callback (pid=…)` **不帶** `nonempty`／無 merged 行；非空 → `(nonempty, pid=…)` ＋ `BBC-HOOK merged +N packages`（或 union no-op 之 `merge added 0`）。擷錄路徑：S23 Ultra 見 LSPosed verbose mirror（`/data/adb/lspd/log/verbose_*.log`；logcat 僅見 `RemotePreferences…` 兩行）；Tab S7 見 logcat 直接輸出。
 8. **related**：`docs/HOOK.md` §1.1／§1.3a／§1.4（效應開關一覽、BBC 證據表、hard-gate 現況）；`docs/ACCEPTANCE.md` §6（provenance、BBC1–BBC7、BBC6 重測步驟）；`docs/ARCHITECTURE.md`（hook 模組 BBC 注入錨點一行＋gate 姿態一行＋政策來源 GROUND TRUTH 更新）；`docs/TAB7_BBC_INJECTION_PLAN.md` §12（checklist as-realized）。**pre-unification 證據不得引為 unified build 通過證明。**
+
+## Addendum C（2026-11-18，unified build 裝置重驗完畢）
+
+unified build（`unify/bbc-on-main` 分支，2026-11-18 於 S23 Ultra 實機重驗）已完成 BBC1–BBC6 全項通過：
+
+| Step | 證據（LSPosed verbose mirror） |
+| --- | --- |
+| BBC1 | `BBC-HOOK installed=1 (daagent, pid=29265)`（force-stop daagent 後首次開頁） |
+| BBC2 | 空政策：`BBC-HOOK callback getPossibleDualAppPackages (pid=29265)`（不帶 nonempty、無 merge 行） |
+| BBC3 | tick chatgpt → force-stop daagent → 重開頁：callback `(nonempty, pid=1519)` → **`BBC-HOOK merged +1 packages (total 7, pid=1519)`**；頁面 ChatGPT 出現（截圖 `s23u_02_bbc3.png`） |
+| BBC4 | `pm path --user 95 com.openai.chatgpt` → base+split APK paths |
+| BBC5 | `am start --user 95 -n com.openai.chatgpt/.MainActivity` → `u95_a431` 與 `u0_a431` 並存 |
+| BBC6 | 編輯器 0 包寫入被 VM 拒絕（CATALOG_MISSING 分支）；空政策清除走主畫面「清除草稿」→ `BBC-HOOK callback getPossibleDualAppPackages (pid=8239)`（不帶 nonempty）→ 再寫入 1 包 → `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=9255)` + **`BBC-HOOK merged +1 packages (total 7, pid=9255)`**；截圖 `s23u_03_bbc6_cleared.png`／`s23u_04_bbc6_restored.png` |
+
+untick→再勾的往返證明 BBC6 回滾。`source commit = 3e9ccede…`；APK sha256=`953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f`；證據檔 `/mnt/seagate500g/opencode_tmp/s23ultra/s23_bbc_unified_20261118.log`（untracked cache）。
+
+ACCEPTANCE §6 已刷新至證明狀態；以下兩項仍未測：tab S7 dual install 持久化證據（pre-unification session 面）；連續 2 次重開機＋crash-log 空。
