@@ -1020,7 +1020,9 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             minimumHeight = dp(48)
             contentDescription = getString(R.string.write_policy_cd)
-            setOnClickListener { vm.requestPolicyWrite() }
+            // Phase C：寫入前先算 old-minus-candidate delta，對 installed user95 彈警告；
+            // proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢。
+            setOnClickListener { requestPreWriteWarning(proceed = { binding -> vm.requestPolicyWrite(binding) }) }
         }
         clearPolicyBtn = Button(this).apply {
             text = getString(R.string.action_clear_policy_draft)
@@ -1034,7 +1036,8 @@ class MainActivity : ComponentActivity() {
             // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
             // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
-            setOnClickListener { requestPreClearWarning(proceed = { vm.onClearPolicyButtonTap() }) }
+            // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM。
+            setOnClickListener { requestPreClearWarning(proceed = { binding -> vm.onClearPolicyButtonTap(binding) }) }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -5897,31 +5900,50 @@ class MainActivity : ComponentActivity() {
 
     // Issue #73：清除草稿前先探測 user-95 分身安裝狀態並顯示警告對話框
     // （BBC6：政策清空＝Samsung 自動系統刪分身，user-95 資料不可復原）。
-    // 僅當持久化草稿非空才探測；空草稿直接進 VM（VM 仍掌握 corrupt/unknown/blind-clear 語義）。
+    // Phase C：
+    // - old-minus-candidate delta：清除候選為空集，delta=old 全量；僅對 delta 探測。
+    // - Unknown stale 非空不得當授權依據：!known 一律走 cannot-determine 對話框
+    //  （probe-failed 警告），不走空 fast-path。
+    // - Activity probe 只告知不授權：VM 提交前另做權威重讀（clear pre-IO 重讀）。
+    // - proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢要求重探。
     // pendingClearConfirm：probe／警告對話框期間忽略再次點擊，避免重複彈窗
     // （警告對話框本身為 modal；此旗標覆蓋 probe 在途窗口與對話框存活期）。
+    // 跨屏仍各私有（Main/Editor 各自持有），但警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
-    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}) {
-        // Do not trust persisted content on read failure: fail-closed to the
-        // probe-failed warning instead of proceeding as if empty.
-        val set: Set<String>? = try {
-            vm.state.value.policyDraft
-        } catch (_: RuntimeException) {
-            null
+    private fun requestPreClearWarning(
+        proceed: (PolicyWarningBinding) -> Unit,
+        onCancel: () -> Unit = {},
+    ) {
+        // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
+        val snap: PolicyWarningSnapshot = try {
+            vm.snapshotPolicyForWarning()
+        } catch (_: Exception) {
+            PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
         }
-        if (set == null) {
+        val binding = snap.binding
+        // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+        // stale 非空不得當授權依據；即使 stale 為空亦不可信（重讀前不得放行）。
+        if (!snap.known) {
             if (pendingClearConfirm) return
             pendingClearConfirm = true
             showPreClearProbeFailedWarning(
                 this@MainActivity,
-                onProceed = { pendingClearConfirm = false; proceed() },
+                onProceed = { pendingClearConfirm = false; proceed(binding) },
                 onCancel = { pendingClearConfirm = false; onCancel() },
             )
             return
         }
-        if (set.isEmpty()) {
-            proceed()
+        val old = snap.draft
+        // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
+        if (old.isEmpty()) {
+            proceed(binding)
+            return
+        }
+        // Phase C：清除 delta=old 全量（候選空集）。
+        val delta = policyRemovalDelta(old, emptySet())
+        if (delta.isEmpty()) {
+            proceed(binding)
             return
         }
         if (pendingClearConfirm) return
@@ -5931,8 +5953,9 @@ class MainActivity : ComponentActivity() {
             // 僅 Ok(empty) 直接放行；Ok(non-empty) 走雙開提醒；Failed 一律走
             // 探測失敗警告（此前 probeFailed 僅 exception 才置位，exit/stderr/
             // Failure/截斷皆靜默當空，失敗警告為死碼；現皆歸 Failed 使其變活）。
+            // Phase C：僅探 delta（old-minus-candidate），非全量 old。
             val probe = try {
-                probeDualAppsInUser95(set)
+                probeDualAppsInUser95(delta)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
@@ -5948,21 +5971,105 @@ class MainActivity : ComponentActivity() {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
                         this@MainActivity,
-                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
-                    if (probe.installed.isEmpty()) {
+                    if (!shouldWarnForDelta(probe.installed)) {
                         pendingClearConfirm = false
-                        proceed()
+                        proceed(binding)
                         return@launch
                     }
                     showPreClearWarning(
                         this@MainActivity,
                         probe.installed,
-                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                    )
+                }
+            }
+        }
+    }
+
+    // Phase C：Main 寫入入口 delta 警告（N→M 覆寫）。
+    // old=已保存草稿（Known 才權威），candidate=當下勾選映射；delta=old-candidate
+    // 為被移除包；僅對 delta 探測 user95 installed，installed 非空即警告。
+    // Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+    // proceed 攜綁定進 VM（vm.requestPolicyWrite(binding)），提交前比對失配作廢。
+    private fun requestPreWriteWarning(
+        proceed: (PolicyWarningBinding) -> Unit,
+        onCancel: () -> Unit = {},
+    ) {
+        val snap: PolicyWarningSnapshot = try {
+            vm.snapshotPolicyForWarning()
+        } catch (_: Exception) {
+            PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
+        }
+        val binding = snap.binding
+        if (!snap.known) {
+            if (pendingClearConfirm) return
+            pendingClearConfirm = true
+            showPreClearProbeFailedWarning(
+                this@MainActivity,
+                onProceed = { pendingClearConfirm = false; proceed(binding) },
+                onCancel = { pendingClearConfirm = false; onCancel() },
+            )
+            return
+        }
+        val old = snap.draft
+        val candidate: Set<String> = try {
+            vm.writeCandidateForWarning()
+        } catch (_: Exception) {
+            emptySet()
+        }
+        // 空候選（空勾選／空 catalog／映射全捨）交由 VM 門控（EMPTY_SELECTION／
+        // CATALOG_LOADING／CATALOG_MISSING），此處不警告直接進 VM。
+        if (candidate.isEmpty()) {
+            proceed(binding)
+            return
+        }
+        val delta = policyRemovalDelta(old, candidate)
+        if (delta.isEmpty()) {
+            proceed(binding)
+            return
+        }
+        if (pendingClearConfirm) return
+        pendingClearConfirm = true
+        lifecycleScope.launch {
+            val probe = try {
+                probeDualAppsInUser95(delta)
+            } catch (e: CancellationException) {
+                pendingClearConfirm = false
+                throw e
+            } catch (e: Exception) {
+                preClearLog("pre-clear dual-profile probe failed", e)
+                DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+            }
+            if (isFinishing || isDestroyed) {
+                pendingClearConfirm = false
+                return@launch
+            }
+            when (probe) {
+                is DualProbeResult.Failed -> {
+                    showPreClearProbeFailedWarning(
+                        this@MainActivity,
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                    )
+                    return@launch
+                }
+                is DualProbeResult.Ok -> {
+                    if (!shouldWarnForDelta(probe.installed)) {
+                        pendingClearConfirm = false
+                        proceed(binding)
+                        return@launch
+                    }
+                    showPreClearWarning(
+                        this@MainActivity,
+                        probe.installed,
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
                     )
                 }

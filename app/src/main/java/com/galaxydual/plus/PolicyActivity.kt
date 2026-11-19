@@ -115,32 +115,70 @@ class PolicyActivity : ComponentActivity() {
     // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
     // 刪除 user-95 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
     // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
+    // Phase C：
+    // - N→M 覆寫：old-minus-candidate delta，對 installed user95 彈警告；
+    //   proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢。
+    // - N→0 採 A 案：禁清到底——空集連警告都不彈，導引去 Main 清除；
+    //   刪現有「警告+恆拒」死路（pre_clear_editor_* 不再使用）。
+    // - Unknown stale 非空不得當授權依據：!known 一律走 cannot-determine 對話框，
+    //   不走空 fast-path。Activity probe 只告知不授權（VM 另做權威重讀）。
     // pendingClearConfirm：probe／警告對話框存活期忽略再次操作，避免重複彈窗。
+    // 跨屏仍各私有（Main/Editor 各自持有），警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
-    // 目前持久化草稿（UiState.policyDraft 即已保存之草稿）；讀取失敗回 null，
-    // 呼叫端 fail-closed 走探測失敗警告，不信任 lastSyncedDraft 鏡像。
-    private fun persistedPolicyDraftOrNull(): Set<String>? = try {
-        vm.state.value.policyDraft
-    } catch (_: RuntimeException) {
-        null
+    // Phase C A 案：編輯器空集導引（禁清到底）。
+    // 空集連警告都不彈，改文案＋按鈕導引去 Main 清除。
+    private fun showEditorEmptyGuide() {
+        if (isFinishing || isDestroyed) return
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.policy_editor_empty_guide_title)
+                .setMessage(R.string.policy_editor_empty_guide_message)
+                .setCancelable(true)
+                .setPositiveButton(R.string.policy_editor_empty_guide_go_main) { _, _ -> finish() }
+                .setNegativeButton(R.string.dialog_cancel, null)
+                .show()
+        } catch (_: RuntimeException) {
+            // Best effort: 對話框失敗不影響 ticks（已還原／未寫入）。
+        }
     }
 
-    private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}, proceedLabelRes: Int = R.string.pre_clear_confirm_proceed) {
-        val persisted = persistedPolicyDraftOrNull()
-        if (persisted == null) {
+    // 目前持久化草稿快照（Phase C：改走 VM 快照，含 Known＋綁定）。
+    // 讀取失敗回 Unknown 空快照，呼叫端 fail-closed 走探測失敗警告。
+    private fun policyWarningSnapshotOrUnknown(): PolicyWarningSnapshot = try {
+        vm.snapshotPolicyForWarning()
+    } catch (_: Exception) {
+        PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
+    }
+
+    private fun requestEditorWriteWarning(
+        candidate: Set<String>,
+        proceed: (PolicyWarningBinding) -> Unit,
+        onCancel: () -> Unit = {},
+    ) {
+        val snap = policyWarningSnapshotOrUnknown()
+        val binding = snap.binding
+        // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+        if (!snap.known) {
             if (pendingClearConfirm) return
             pendingClearConfirm = true
             showPreClearProbeFailedWarning(
                 this@PolicyActivity,
-                onProceed = { pendingClearConfirm = false; proceed() },
+                onProceed = { pendingClearConfirm = false; proceed(binding) },
                 onCancel = { pendingClearConfirm = false; onCancel() },
-                proceedLabelRes = proceedLabelRes,
             )
             return
         }
-        if (persisted.isEmpty()) {
-            proceed()
+        val old = snap.draft
+        // Phase C：候選先消毒（與 VM 寫入同文法），delta=old-minus-消毒後候選。
+        val sanitizedCandidate = try {
+            sanitizeHookPolicy(candidate)
+        } catch (_: Exception) {
+            emptySet()
+        }
+        val delta = policyRemovalDelta(old, sanitizedCandidate)
+        if (delta.isEmpty()) {
+            proceed(binding)
             return
         }
         if (pendingClearConfirm) return
@@ -148,8 +186,9 @@ class PolicyActivity : ComponentActivity() {
         lifecycleScope.launch {
             // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
             // Failed 一律走探測失敗警告；Ok(non-empty) 走雙開提醒。
+            // Phase C：僅探 delta（old-minus-candidate）。
             val probe = try {
-                probeDualAppsInUser95(persisted)
+                probeDualAppsInUser95(delta)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
@@ -165,24 +204,22 @@ class PolicyActivity : ComponentActivity() {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
                         this@PolicyActivity,
-                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
-                        proceedLabelRes = proceedLabelRes,
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
-                    if (probe.installed.isEmpty()) {
+                    if (!shouldWarnForDelta(probe.installed)) {
                         pendingClearConfirm = false
-                        proceed()
+                        proceed(binding)
                         return@launch
                     }
                     showPreClearWarning(
                         this@PolicyActivity,
                         probe.installed,
-                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
-                        proceedLabelRes = proceedLabelRes,
                     )
                 }
             }
@@ -419,24 +456,30 @@ class PolicyActivity : ComponentActivity() {
             showInfo(getString(R.string.policy_unknown_refresh))
             return
         }
-        // Issue #73：候選集空且持久化草稿非空＝整組清除（BBC6 風險）→
-        // 先探測 user-95 分身安裝並顯示警告；取消則不寫入。
-        // Unknown persisted content (null) also triggers the warning (fail-closed).
-        val persistedForEmptyCheck = persistedPolicyDraftOrNull()
-        if (ticks.isEmpty() && (persistedForEmptyCheck == null || persistedForEmptyCheck.isNotEmpty())) {
-            // VM 永遠拒絕空集合寫入（CATALOG_MISSING／Two-phase 管線的整組契約），
-            // 因此編輯器路徑的「繼續」不會真的清除——只是帶使用者看完警告後，
-            // performWritePolicy() 仍走 VM 並失敗落在狀態列。按鈕標籤必須如實說明。
-            requestPreClearWarning(proceed = { performWritePolicy() }, proceedLabelRes = R.string.pre_clear_editor_try_anyway)
+        // Phase C A 案：編輯器禁清到底——空集連警告都不彈，導引去 Main 清除
+        // （改文案＋按鈕）；刪現有「警告＋恆拒」死路。
+        if (editorEmptyShouldGuide(ticks.isEmpty())) {
+            showEditorEmptyGuide()
             return
         }
-        performWritePolicy()
+        // Phase C N→M：old-minus-candidate delta，對 installed user95 彈警告；
+        // proceed 攜綁定進 VM，提交前比對失配作廢。
+        val candidate = HashSet(ticks)
+        requestEditorWriteWarning(
+            candidate = candidate,
+            proceed = { binding -> performWritePolicy(binding) },
+        )
     }
 
-    private fun performWritePolicy() {
+    private fun performWritePolicy(binding: PolicyWarningBinding? = null) {
         // The policy set comes from the editor's checked list, never from the
         // catalog selection; selectedKeys is left untouched by the VM.
-        vm.replacePolicyDraft(HashSet(ticks))
+        // Phase C：攜警告綁定進 VM（提交前比對，失配作廢要求重探）。
+        if (binding != null) {
+            vm.replacePolicyDraft(HashSet(ticks), binding)
+        } else {
+            vm.replacePolicyDraft(HashSet(ticks))
+        }
         val cur = try {
             vm.state.value
         } catch (_: RuntimeException) {
@@ -662,23 +705,14 @@ class PolicyActivity : ComponentActivity() {
                     ticks.add(pkg)
                 } else {
                     ticks.remove(pkg)
-                    // Issue #73：單筆取消導致 ticks 清空＝整組清除的前置狀態
-                    // （持久化草稿將被寫成空＝BBC6 風險）→ 先探測 user-95 分身並警告；
-                    // 繼續＝保持未勾選，取消＝還原此勾選（行內恢復）。
-                    // Unknown persisted content (null) also triggers the warning (fail-closed).
-                    val persistedForUncheck = persistedPolicyDraftOrNull()
-                    if (ticks.isEmpty() && (persistedForUncheck == null || persistedForUncheck.isNotEmpty())) {
-                        // proceed 為 no-op（僅保持未勾選；真正的「清空政策」只在
-                        // 「寫入政策草稿（0）」或 MainActivity 清除草稿時發生）——按鈕必須如實說明。
-                        requestPreClearWarning(
-                            proceed = {},
-                            onCancel = {
-                                ticks.add(pkg)
-                                renderList()
-                                updateCounter()
-                            },
-                            proceedLabelRes = R.string.pre_clear_editor_keep_unticked,
-                        )
+                    // Phase C A 案：編輯器禁清到底——單筆取消導致 ticks 清空時，
+                    // 空集連警告都不彈，立即還原並導引去 Main 清除
+                    // （改文案＋按鈕；刪「警告＋恆拒」死路）。
+                    if (editorEmptyShouldGuide(ticks.isEmpty())) {
+                        ticks.add(pkg)
+                        renderList()
+                        updateCounter()
+                        showEditorEmptyGuide()
                     }
                 }
                 updateCounter()

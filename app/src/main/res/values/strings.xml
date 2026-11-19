@@ -118,6 +118,10 @@
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>
     <string name="pre_clear_editor_try_anyway">仍然繼續（零項目，VM 將拒絕寫入）</string>
     <string name="pre_clear_editor_keep_unticked">保持未勾選（此步不會清除政策）</string>
+    <!-- Phase C（A 案：編輯器禁清到底）：空集不警告、導引去 Main 清除。三語系同鍵。 -->
+    <string name="policy_editor_empty_guide_title">無法在編輯器清空政策</string>
+    <string name="policy_editor_empty_guide_message">編輯器不允許將政策清到底（空集）。如需清除全部政策，請返回主畫面使用「清除草稿」——政策為空時 Samsung 會自動刪除分身及其資料（無法復原），請先確認雙開分身已關閉。</string>
+    <string name="policy_editor_empty_guide_go_main">返回主畫面清除</string>
     <string name="policy_blind_clear_first">遠端內容未知，清除將刪除未見內容（具破壞性且無法復原），請於5分鐘內再次清除以確認；若可連線建議先重新整理</string>
     <!-- Stage D：blind-clear 確認逾時（arm 超過 5 分鐘，需重 arm；CHANNEL 口徑）。 -->
     <string name="policy_blind_clear_expired">清除確認已逾時（超過5分鐘），請重新清除以確認；建議先重新整理</string>

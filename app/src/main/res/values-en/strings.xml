@@ -115,6 +115,10 @@
     <string name="pre_clear_probe_failed_proceed">Clear anyway</string>
     <string name="pre_clear_editor_try_anyway">Continue anyway (empty - the VM rejects empty writes)</string>
     <string name="pre_clear_editor_keep_unticked">Keep unselected (does not clear the policy yet)</string>
+    <!-- Phase C (Option A: editor forbids clearing to empty): empty set shows no warning, guides to Main clear. Synced across all three locales. -->
+    <string name="policy_editor_empty_guide_title">Cannot clear policy in editor</string>
+    <string name="policy_editor_empty_guide_message">The editor does not allow clearing the policy to empty. To clear all policies, return to the main screen and use “Clear draft” — an empty policy causes Samsung to auto-delete clones and their data (unrecoverable); confirm dual-app copies are turned off first.</string>
+    <string name="policy_editor_empty_guide_go_main">Back to main to clear</string>
     <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
     <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
     <string name="policy_blind_clear_expired">Clear confirmation expired (over 5 minutes); clear again to confirm. Refresh first if reachable.</string>

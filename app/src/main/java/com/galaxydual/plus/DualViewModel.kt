@@ -229,6 +229,10 @@ data class PendingPolicyWrite(
     // 不得覆寫未見 B。
     // -1L=legacy 注入（跳過 revision 檢查，僅走 stale/unknown 門控）。
     val baseCoordinatorRevision: Long = -1L,
+    // Phase C (issue #3/#4/#5)：警告綁定 freshGen（顯示 fence）。
+    // request 時快照 policyFreshnessGen；confirm pre-IO 比對失配即 abort
+    //（UNKNOWN_REFRESH），與 baseDraftVersion 同形。-1L=legacy 注入（跳過檢查）。
+    val baseFreshGen: Long = -1L,
 )
 
 data class PendingRemove(
@@ -238,6 +242,30 @@ data class PendingRemove(
     val profileLabel: String,
     val requestedAtMs: Long,
     val generation: Long = removeGeneration.incrementAndGet(),
+)
+
+// Phase C (issue #3/#4/#5)：政策覆寫警告綁定。
+//
+// Activity 在 probe 前快照此三元組（observedSnapshot.rev＋policyDraftVersion＋
+// policyFreshnessGen），警告對話框的 proceed 將其攜入 VM；VM 在提交前比對，
+// 任一失配即作廢要求重探（UNKNOWN_REFRESH，不碰 store）。
+// - rev：權威觀察修訂（本 VM 實際讀到顯示草稿時的 rev，非 currentRevision 借用）。
+// - draftVersion：顯示 fence（寫入成功/失敗才 bump）。
+// - freshGen：顯示 TOCTOU（重疊 load/refresh 推進）。
+// -1L=legacy（跳過對應檢查，僅走 stale/unknown 門控，保既有測試綠）。
+data class PolicyWarningBinding(
+    val rev: Long,
+    val draftVersion: Long,
+    val freshGen: Long,
+)
+
+// Phase C：警告快照（Activity 計算 old-minus-candidate delta 用）。
+// draft=快照當下已保存草稿拷貝；known/corrupt=同刻 Known 旗標。
+data class PolicyWarningSnapshot(
+    val draft: Set<String>,
+    val known: Boolean,
+    val corrupt: Boolean,
+    val binding: PolicyWarningBinding,
 )
 
 // PR-7 P2 (issue #26, 階段 1):批次執行逐項結果。
@@ -3780,6 +3808,10 @@ class DualViewModel(
     private val blindClearArmedAtMs = AtomicLong(-1L)
     private val blindClearArmedVersion = AtomicLong(-1L)
     private val blindClearArmedFreshGen = AtomicLong(-1L)
+    // Phase C：盲清 arm 另攜權威 rev（observedSnapshot.rev）。
+    // 第二 tap 比對失配即視為 stale（期間有外來修訂推進）→重 arm。
+    // -1L=legacy/未觀察（跳過 rev 檢查，僅走 version/freshGen 門控）。
+    private val blindClearArmedRev = AtomicLong(-1L)
 
     // S4（blind-clear defense-in-depth）：行程級（process-lifetime）最後一次
     // 「已驗證 Known」的政策草稿快照（null＝從未觀察到），由 app-scoped
@@ -3833,12 +3865,14 @@ class DualViewModel(
         blindClearArmedAtMs.set(nowMonoMs())
         blindClearArmedVersion.set(policyDraftVersion.get())
         blindClearArmedFreshGen.set(policyFreshnessGen.get())
+        blindClearArmedRev.set(try { observedSnapshot.get().rev } catch (_: Exception) { -1L })
     }
 
     private fun disarmBlindClear() {
         blindClearArmedAtMs.set(-1L)
         blindClearArmedVersion.set(-1L)
         blindClearArmedFreshGen.set(-1L)
+        blindClearArmedRev.set(-1L)
     }
     // Stage L4 P2#3 corrupt-repair 兩步確認（與盲清 Unavailable 分離，平行 arm）：
     // Corrupt 下第一次修復請求僅告警並 arm，第二次才執行（防靜默單步刪除）。
@@ -7076,6 +7110,81 @@ class DualViewModel(
         -1L
     }
 
+    // Phase C：警告綁定快照（Activity probe 前調用）。
+    // 回傳當下 observed rev＋version＋freshGen 三元組（fail-closed：讀取拋出即 -1）。
+    internal fun currentWarningBinding(): PolicyWarningBinding = try {
+        PolicyWarningBinding(
+            rev = try { observedSnapshot.get().rev } catch (_: Exception) { -1L },
+            draftVersion = try { policyDraftVersion.get() } catch (_: Exception) { -1L },
+            freshGen = try { policyFreshnessGen.get() } catch (_: Exception) { -1L },
+        )
+    } catch (_: Exception) {
+        PolicyWarningBinding(-1L, -1L, -1L)
+    }
+
+    // Phase C：警告快照（old draft＋Known 旗標＋綁定），供 Activity 計算
+    // old-minus-candidate delta。draft 為防禦拷貝；Known false 時 draft 為 stale，
+    // 呼叫端不得以其走空 fast-path（見 Activity 側 Unknown→cannot-determine）。
+    internal fun snapshotPolicyForWarning(): PolicyWarningSnapshot = try {
+        val s = _state.value
+        PolicyWarningSnapshot(
+            draft = HashSet(s.policyDraft),
+            known = s.policyDraftKnown,
+            corrupt = s.policyDraftCorrupt,
+            binding = currentWarningBinding(),
+        )
+    } catch (_: Exception) {
+        PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
+    }
+
+    // Phase C：綁定新鮮度檢查（VM 提交前比對）。
+    // null=legacy（跳過檢查，保既有測試綠；即使 stale 亦放行，由既有門控兜底）。
+    // 非 null 時三元組全等＋非 stale＋coordinator 修訂一致才新鮮。
+    // -1 哨兵：如實比對，-1 與 -1 相等即通過（coordinator==null legacy 路徑），
+    // 非 -1 與 -1 失配即作廢；coordinator 側 -1（legacy／未觀察）跳過修訂比對，
+    // 僅走本地三元組門控（保既有測試綠）。
+    // 跨 VM：binding.rev 必須等於 coordinator.currentRevision()（權威修訂）。
+    // B 提交後 coordinator 已推進而 A 本地三元組尚未變化（collector 未至）時，
+    // 僅比本地三元組會誤判新鮮而覆寫未見 B；此處直接比對權威修訂，
+    // 覆蓋該窗口（含 rev 重置：reset 回 0 即與舊綁定失配作廢）。
+    internal fun isWarningBindingFresh(binding: PolicyWarningBinding?): Boolean {
+        if (binding == null) return true
+        return try {
+            if (policyRevisionStale.get()) return false
+            val cur = currentWarningBinding()
+            if (cur.rev != binding.rev ||
+                cur.draftVersion != binding.draftVersion ||
+                cur.freshGen != binding.freshGen
+            ) return false
+            val coord = policyTxCoordinator
+            if (coord != null && binding.rev != -1L) {
+                val curRev = try { coord.currentRevision() } catch (_: Exception) { -1L }
+                if (curRev == -1L) return false
+                if (binding.rev != curRev) return false
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    // Phase C：主寫入候選集（供 MainActivity 警告前計算 delta）。
+    // 與 requestPolicyWrite() 同映射（catalog＋文法前置），僅不建 pending、
+    // 不碰 store、不寫 msg；空勾選/空 catalog 回空（呼叫端交由 VM 門控處理，
+    // 不在此警告）。
+    internal fun writeCandidateForWarning(): Set<String> = try {
+        val (mapped, _) = selectedPackagesForPolicy()
+        HashSet(sanitizeHookPolicy(mapped))
+    } catch (_: Exception) {
+        emptySet()
+    }
+
+    internal fun policyFreshGenForTests(): Long = try {
+        policyFreshnessGen.get()
+    } catch (_: Exception) {
+        -1L
+    }
+
     // Stage A：核對中守衛（phase OR 集合雙層，防 state/集合瞬時窗口漂移）。
     // request/cancel/clear/confirm 入口共用：核對中一律拒絕新寫入（BUSY/進行中），
     // cancel 靜默 no-op（pending 保留，沿用 SAVING 語義）。
@@ -8479,18 +8588,39 @@ class DualViewModel(
      * 參數給定，不經 catalog selection 推導、不影響 selectedKeys 狀態。
      * 其餘 gates（owner uid、pending-BUSY、in-flight/RECONCILING、orphanDrop、
      * Corrupt/Unknown、coordinator/世代 fence）與 requestPolicyWrite() 完全一致。
+     * Phase C：warningBinding 為 Activity 警告綁定（probe 前快照 rev/version/freshGen）；
+     * 非 null 時先比對失配即作廢（UNKNOWN_REFRESH，不建 pending）。
      */
-    fun replacePolicyDraft(packages: Set<String>) {
+    fun replacePolicyDraft(packages: Set<String>, warningBinding: PolicyWarningBinding? = null) {
         if (!policyWriteGatesPass()) return
-        requestPolicyWriteFor(packages, catalogDropped = 0)
+        if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
+        requestPolicyWriteFor(packages, catalogDropped = 0, warningBinding = warningBinding)
     }
 
     // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。與
     // replacePolicyDraft 共用同一 private body（requestPolicyWriteFor＝sanitize
     // 尾段；policyWriteGatesPass＝共享 gates）；catalog 專屬門控與 mapped 推導
     // 穿插在與舊版完全相同的序列位置（1:1 呼叫序列不變）。
-    fun requestPolicyWrite() {
+    // Phase C：warningBinding 同上（Main 寫入入口攜 Activity 探測綁定）。
+    fun requestPolicyWrite(warningBinding: PolicyWarningBinding? = null) {
         if (!policyWriteGatesPass()) return
+        if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
+        }
         // Stage2 專屬門控（catalog selection 模型）：空勾選拒絕。
         if (_state.value.selectedKeys.isEmpty()) {
             _state.update {
@@ -8507,7 +8637,7 @@ class DualViewModel(
             return
         }
         val (mapped, catalogDropped) = selectedPackagesForPolicy()
-        requestPolicyWriteFor(mapped, catalogDropped)
+        requestPolicyWriteFor(mapped, catalogDropped, warningBinding = warningBinding)
     }
 
     // 共享 gates（與原 requestPolicyWrite 的序列 1:1 一致）：pending →
@@ -8590,8 +8720,12 @@ class DualViewModel(
     // requestPolicyWrite() 與 replacePolicyDraft() 的共用 body（policy 集合由
     // 參數給定）：gates 已於 policyWriteGatesPass() 通過；sanitize → dropped
     // 計算 → 空集 CATALOG_MISSING 門控 → DROPPED 警語 → S8 obs-rev 門控 →
-    // policySettleLock CAS 安裝（generation 每次重配）。
-    private fun requestPolicyWriteFor(packages: Set<String>, catalogDropped: Int) {
+    // Phase C 警告綁定門控 → policySettleLock CAS 安裝（generation 每次重配）。
+    private fun requestPolicyWriteFor(
+        packages: Set<String>,
+        catalogDropped: Int,
+        warningBinding: PolicyWarningBinding? = null,
+    ) {
         // Phase 5 polish：建 pending 前先對候選集合消毒（與 confirm 同消毒）：
         // 顯示數與寫入數一致；dropped 拆 catalog 缺失＋非法文法兩類（後者經
         // sanitizeHookPolicy 計數：除文法另有長度上限 256／總量上限 512，
@@ -8635,6 +8769,18 @@ class DualViewModel(
                 }
                 return
             }
+        }
+        // Phase C：警告綁定門控（Activity probe 前快照 rev/version/freshGen）。
+        // 失配即作廢要求重探（UNKNOWN_REFRESH，不建 pending）。
+        // null=legacy（跳過檢查，保既有測試綠）。
+        if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
         }
         // Phase 3：建 pending 即進 QUEUED（同一 _state.update 翻相位＋epoch+1；
         // dropped 警語在上一次 emission，第二次 copy 保留其 msg 不覆寫）。
@@ -8720,6 +8866,9 @@ class DualViewModel(
                     msgKind = MsgKind.INFO,
                 )
             } else {
+                // Phase C：baseFreshGen 僅警告綁定路徑攜帶（legacy 無綁定即 -1 跳過
+                // confirm 權威重讀與 freshGen 比對，保既有測試綠；新 UI 一律攜綁定）。
+                val wantFreshGen = warningBinding != null
                 cur.copy(
                     pendingPolicyWrite = PendingPolicyWrite(
                         packages = sanitized,
@@ -8729,6 +8878,11 @@ class DualViewModel(
                         baseDraftVersion = policyDraftVersion.get(),
                         baseCoordinatorRevision = try {
                             observedSnapshot.get().rev
+                        } catch (_: Exception) {
+                            -1L
+                        },
+                        baseFreshGen = if (!wantFreshGen) -1L else try {
+                            policyFreshnessGen.get()
                         } catch (_: Exception) {
                             -1L
                         },
@@ -9135,6 +9289,53 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // Phase C：VM 內權威重讀（複用 clear pre-IO 重讀模式）。
+                    // Activity probe 只告知不授權；此處為授權依據。
+                    // Unknown（Unavailable/Corrupt）即 abort fail-closed，
+                    // 不碰 store save、不建 Tx。
+                    // 僅警告綁定路徑執行（baseFreshGen != -1L）；legacy 直接注入
+                    // （baseFreshGen==-1L）跳過，保既有測試綠（新 UI 一律攜綁定）。
+                    if (pendingAtCall.baseFreshGen != -1L) {
+                        run {
+                            val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                            val preRead: LoadResult = try {
+                                withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
+                            } catch (te: TimeoutCancellationException) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                LoadResult.Unavailable
+                            } catch (e: CancellationException) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                throw e
+                            } catch (_: Exception) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                LoadResult.Unavailable
+                            }
+                            if (preRead is LoadResult.Unknown) {
+                                val preCorrupt = preRead is LoadResult.Corrupt
+                                synchronized(policySettleLock) {
+                                    inFlightWrites.remove(key)
+                                    policyWriteSaving.remove(key)
+                                    markPolicyUnknownLocked()
+                                    _state.update { curWrite ->
+                                        if (curWrite.pendingPolicyWrite != pendingAtCall) return@update curWrite
+                                        curWrite.copy(
+                                            pendingPolicyWrite = null,
+                                            policyWritePhase = PolicyWritePhase.IDLE,
+                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                            policyDraftKnown = false,
+                                            policyDraftCorrupt = preCorrupt,
+                                            msg = policyText(
+                                                if (preCorrupt) PolicyText(PolicyTextKind.CORRUPT_DETECTED)
+                                                else PolicyText(PolicyTextKind.UNKNOWN_REFRESH),
+                                            ),
+                                            msgKind = MsgKind.CHANNEL,
+                                        )
+                                    }
+                                }
+                                return@withLock
+                            }
+                        }
+                    }
                     var h1Deferred: Deferred<Boolean>? = null
                     val h1Coord = policyTxCoordinator
                     if (h1Coord != null) {
@@ -9239,8 +9440,10 @@ class DualViewModel(
                                 h1Coord.withCommitLock {
                                     currentCoroutineContext().ensureActive()
                                     drainForeignUpdatesUnderCommitLock(tx, h1Coord)
-                                    val baseMismatchPreIo = pendingAtCall.baseDraftVersion != -1L &&
-                                        pendingAtCall.baseDraftVersion != policyDraftVersion.get()
+                                    val baseMismatchPreIo = (pendingAtCall.baseDraftVersion != -1L &&
+                                        pendingAtCall.baseDraftVersion != policyDraftVersion.get()) ||
+                                        (pendingAtCall.baseFreshGen != -1L &&
+                                            pendingAtCall.baseFreshGen != policyFreshnessGen.get())
                                     val coordActive = try { h1Coord.activeTx.get() } catch (_: Exception) { null }
                                     val coordActiveOk = (coordActive == null || coordActive === tx)
                                     val revOk = (pendingAtCall.baseCoordinatorRevision == -1L ||
@@ -9314,8 +9517,10 @@ class DualViewModel(
                         }
                     }
                     if (h1Coord == null) {
-                        val baseMismatchNoCoord = pendingAtCall.baseDraftVersion != -1L &&
-                            pendingAtCall.baseDraftVersion != policyDraftVersion.get()
+                        val baseMismatchNoCoord = (pendingAtCall.baseDraftVersion != -1L &&
+                            pendingAtCall.baseDraftVersion != policyDraftVersion.get()) ||
+                            (pendingAtCall.baseFreshGen != -1L &&
+                                pendingAtCall.baseFreshGen != policyFreshnessGen.get())
                         if (baseMismatchNoCoord || policyRevisionStale.get()) {
                             synchronized(policySettleLock) {
                                 inFlightWrites.remove(key)
@@ -9880,10 +10085,11 @@ class DualViewModel(
     // §政策寫入流程 and the A3-3 claim sites.
     // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／freshGen
     // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
-    // EXPIRED 文案），再判世代（version／freshGen 失配→重 arm＋FIRST 文案），
+    // EXPIRED 文案），再判世代（version／freshGen／rev 失配→重 arm＋FIRST 文案），
     // 兩者皆過才 disarm 執行。BUSY／RECONCILING 拒絕一律保留既有 arm（不碰
-    // 三元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
-    fun clearPolicyDraft() {
+    // 四元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
+    // Phase C：rev 亦納入世代綁定（observedSnapshot.rev），覆蓋警告綁修訂後作廢。
+    fun clearPolicyDraft(warningBinding: PolicyWarningBinding? = null) {
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
         // 清除不會被 hook 看到，故直接拒絕且不碰 store。Stage D：同步 disarm
         //（非 owner tap 不得殘留 arm，免切回 owner 後單步誤刪）。
@@ -9903,6 +10109,19 @@ class DualViewModel(
         if (_state.value.pendingPolicyWrite != null) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.BUSY)), msgKind = MsgKind.INFO)
+            }
+            return
+        }
+        // Phase C：警告綁定門控（Activity probe 前快照 rev/version/freshGen）。
+        // 失配即作廢要求重探（UNKNOWN_REFRESH＋disarm，不碰 store）。
+        // null=legacy（跳過檢查，保既有測試綠）。
+        if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
+            disarmBlindClear()
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
             }
             return
         }
@@ -9947,7 +10166,7 @@ class DualViewModel(
                 }
                 return
             }
-            // 第二次：先判 TTL，再判世代；任一失敗即重 arm（視為新的第一次），
+            // 第二次：先判 TTL，再判世代（含 rev）；任一失敗即重 arm（視為新的第一次），
             // 兩者皆過才 disarm 落到正常清除路徑。
             val now = nowMonoMs()
             val armedAt = blindClearArmedAtMs.get()
@@ -9961,8 +10180,11 @@ class DualViewModel(
                 }
                 return
             }
+            val armedRev = blindClearArmedRev.get()
+            val curRev = try { observedSnapshot.get().rev } catch (_: Exception) { -1L }
             if (blindClearArmedVersion.get() != policyDraftVersion.get() ||
-                blindClearArmedFreshGen.get() != policyFreshnessGen.get()
+                blindClearArmedFreshGen.get() != policyFreshnessGen.get() ||
+                (armedRev != -1L && curRev != -1L && armedRev != curRev)
             ) {
                 armBlindClearLocked()
                 _state.update {
@@ -12277,7 +12499,9 @@ class DualViewModel(
     // VM 內經 pure clearPolicyButtonRoute(known,corrupt,armed) 判定（僅
     // !known&&corrupt 走修復；Known（含髒 Corrupt 殘留）／Unavailable 一律 CLEAR，
     // 維持原盲清／正常清除語義），純函數僅作 VM 內部決策 helper／JVM 可測。
-    fun onClearPolicyButtonTap() {
+    // Phase C：warningBinding 為 Activity 警告綁定（probe 前快照）；CLEAR 路徑透傳，
+    // 修復路徑維持原語義（不透傳綁定，修復自有 rev 門控）。
+    fun onClearPolicyButtonTap(warningBinding: PolicyWarningBinding? = null) {
         when (
             clearPolicyButtonRoute(
                 _state.value.policyDraftKnown,
@@ -12287,7 +12511,7 @@ class DualViewModel(
         ) {
             ClearPolicyButtonRoute.REPAIR_CONFIRM -> confirmRepairCorruptDraft()
             ClearPolicyButtonRoute.REPAIR_REQUEST -> requestRepairCorruptDraft()
-            ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft()
+            ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft(warningBinding = warningBinding)
         }
     }
 
@@ -15033,3 +15257,26 @@ internal fun clearPolicyButtonRoute(
     if (!(!known && corrupt)) ClearPolicyButtonRoute.CLEAR
     else if (repairArmed) ClearPolicyButtonRoute.REPAIR_CONFIRM
     else ClearPolicyButtonRoute.REPAIR_REQUEST
+
+// Phase C 純函數（JVM 可測，不碰 VM/Activity）：
+// - policyRemovalDelta：old-minus-candidate（被移除包集合）。
+//   舊=已保存草稿（Known 時權威，Unknown 時 stale 不得為授權依據）；
+//   候選=新政策集合（Main 寫入映射／Editor ticks／清除空集）。
+// - isWarningBindingFreshPure：警告綁定新鮮度（rev/version/freshGen 全等）。
+// - editorEmptyShouldGuide：編輯器空集導引（A 案：禁清到底，空集不警告、導引去 Main 清除）。
+// - shouldWarnForDelta：delta 安裝非空即警告（Activity probe Ok(non-empty) 才彈列表警告）。
+internal fun policyRemovalDelta(old: Set<String>, candidate: Set<String>): Set<String> = old - candidate
+
+internal fun isWarningBindingFreshPure(
+    currentRev: Long,
+    currentVersion: Long,
+    currentFreshGen: Long,
+    binding: PolicyWarningBinding,
+): Boolean =
+    currentRev == binding.rev &&
+        currentVersion == binding.draftVersion &&
+        currentFreshGen == binding.freshGen
+
+internal fun editorEmptyShouldGuide(ticksEmpty: Boolean): Boolean = ticksEmpty
+
+internal fun shouldWarnForDelta(deltaInstalled: List<String>): Boolean = deltaInstalled.isNotEmpty()
