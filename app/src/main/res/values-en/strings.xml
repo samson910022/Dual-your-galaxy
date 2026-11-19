@@ -49,10 +49,10 @@
     <string name="action_write_policy">Write policy</string>
     <string name="write_policy_cd">Write current checks into the whitelist policy draft (draft only, never installs clones)</string>
     <string name="action_clear_policy_draft">Clear policy draft</string>
-    <string name="clear_policy_draft_cd">Drop the saved policy draft (never touches installed clones or current checks)</string>
+    <string name="clear_policy_draft_cd">Drop the saved policy draft (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
     <!-- Stage L4 fix(a): corrupt-repair mode button (two-tap confirm: first tap arms with backup warning, second executes). -->
     <string name="action_repair_policy_draft">Repair corrupt draft</string>
-    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; never touches installed clones or current checks)</string>
+    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
@@ -60,6 +60,8 @@
     <string name="action_edit_policy">Edit app list</string>
     <string name="policy_draft_format">Whitelist policy (draft, effect unverified): %1$d items</string>
     <string name="policy_draft_unknown">Whitelist policy (draft, effect unverified): unknown (unreadable or corrupt — see the status banner at the top; tap Refresh draft to retry)</string>
+    <!-- PolicyActivity editor header (same wording as policy_cleared / pre_clear_message: empty policy causes Samsung to auto-delete clones and their data). -->
+    <string name="policy_editor_intro">Policy is a union-only whitelist extension (empty by default = observe-only); changes go through “Write policy draft” → confirmation dialog (checking ≠ installing); the hook reads it on its next poll (up to ~60s / or after reboot). Disabled or uninstalled apps are filtered by the BBC hook. Note: an empty policy causes Samsung to auto-delete clones and their data (unrecoverable).</string>
     <string name="policy_write_title">Write whitelist policy draft</string>
     <plurals name="policy_write_message">
         <item quantity="one">This will write the following %1$d package into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook is designed to poll this draft — a non-empty draft may relax the whitelist on its next poll or restart; effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it (up to the 60s TTL, or after a restart), but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
@@ -97,7 +99,10 @@
     <string name="policy_repaired_no_backup">Cleared the corrupt policy draft, but the backup failed: the old corrupt content was not preserved</string>
     <string name="policy_refresh_failed">Failed to refresh policy draft: remote content unknown</string>
     <string name="policy_refreshed">Policy draft refreshed</string>
-    <string name="policy_cleared">Policy draft cleared (installed clones and current checks untouched)</string>
+    <!-- Issue #73 BBC6 honest wording: an empty policy causes Samsung to auto-delete
+         clones and their data (incl. user-95, unrecoverable); must not claim
+         "untouched". Same wording as pre_clear_message. Synced across all three locales. -->
+    <string name="policy_cleared">Policy draft cleared (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
     <!-- Issue #73 (zh/Hant parity: same keys): pre-clear dual-app warning (BBC6: emptying the policy means Samsung auto-uninstalls the dual copies, user-95 data unrecoverable). -->
     <string name="pre_clear_title">Dual-app reminder before clearing policy</string>
     <string name="pre_clear_message">These apps are installed in your dual profile (user 95): %1$s\n\nSamsung may automatically delete the dual copies (including user-95 data, unrecoverable) when the policy becomes empty. Turn off Dual Apps for these apps in Samsung Settings \u2192 Apps \u2192 Dual apps first, then clear.</string>
@@ -227,7 +232,7 @@
     <string name="auto_degrade_no_channel">Auto probing found no usable channel (no su and Shizuku not passed), currently read-only; authorize Shizuku or gain ROOT then tap Reconnect and refresh.</string>
     <!-- p28-1 review: manual package-name inline validation (was mixed Chinese/English
          in MainActivity.packageInputError). %1$d=max chars (MAX_PACKAGE_INPUT_CHARS). -->
-    <!-- %1$d 恆為固定上限（MAX_PACKAGE_INPUT_CHARS），非可變計數，不適用 plurals。 -->
+    <!-- %1$d is a fixed bound (MAX_PACKAGE_INPUT_CHARS), not a variable count, so plurals do not apply. -->
     <string name="input_too_long" tools:ignore="PluralsCandidate">Input too long (over %1$d characters), rejected</string>
     <string name="invalid_package">invalid package</string>
     <!-- p28-1 review: channel group semantic label (announced after the HorizontalScrollView wrap). -->

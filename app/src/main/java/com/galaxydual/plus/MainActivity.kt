@@ -87,7 +87,12 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.CloneOutcome
+import com.galaxydual.core.CmdGateway
+import com.galaxydual.core.CmdResult
 import com.galaxydual.core.DualRepository
+// Alias: core TRUNCATION_MARKER ("[truncated]") is distinct from the local UI
+// TRUNCATION_MARKER (" [truncated]") used for remove-label shortening below.
+import com.galaxydual.core.TRUNCATION_MARKER as CORE_TRUNCATION_MARKER
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
@@ -5898,10 +5903,22 @@ class MainActivity : ComponentActivity() {
     private var pendingClearConfirm = false
 
     private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}) {
-        val set = try {
+        // Do not trust persisted content on read failure: fail-closed to the
+        // probe-failed warning instead of proceeding as if empty.
+        val set: Set<String>? = try {
             vm.state.value.policyDraft
-        } catch (_: Exception) {
-            emptySet()
+        } catch (_: RuntimeException) {
+            null
+        }
+        if (set == null) {
+            if (pendingClearConfirm) return
+            pendingClearConfirm = true
+            showPreClearProbeFailedWarning(
+                this@MainActivity,
+                onProceed = { pendingClearConfirm = false; proceed() },
+                onCancel = { pendingClearConfirm = false; onCancel() },
+            )
+            return
         }
         if (set.isEmpty()) {
             proceed()
@@ -5910,40 +5927,46 @@ class MainActivity : ComponentActivity() {
         if (pendingClearConfirm) return
         pendingClearConfirm = true
         lifecycleScope.launch {
-            var probeFailed = false
-            val installed = try {
+            // Phase B：probe 回傳 DualProbeResult（Ok/Failed），不再以空清單吞失敗。
+            // 僅 Ok(empty) 直接放行；Ok(non-empty) 走雙開提醒；Failed 一律走
+            // 探測失敗警告（此前 probeFailed 僅 exception 才置位，exit/stderr/
+            // Failure/截斷皆靜默當空，失敗警告為死碼；現皆歸 Failed 使其變活）。
+            val probe = try {
                 probeDualAppsInUser95(set)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
             } catch (e: Exception) {
-                Log.w(TAG, "pre-clear dual-profile probe failed", e)
-                probeFailed = true
-                emptyList()
+                preClearLog("pre-clear dual-profile probe failed", e)
+                DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
                 pendingClearConfirm = false
                 return@launch
             }
-            if (probeFailed) {
-                showPreClearProbeFailedWarning(
-                    this@MainActivity,
-                    onProceed = { pendingClearConfirm = false; proceed() },
-                    onCancel = { pendingClearConfirm = false; onCancel() },
-                )
-                return@launch
+            when (probe) {
+                is DualProbeResult.Failed -> {
+                    showPreClearProbeFailedWarning(
+                        this@MainActivity,
+                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                    )
+                    return@launch
+                }
+                is DualProbeResult.Ok -> {
+                    if (probe.installed.isEmpty()) {
+                        pendingClearConfirm = false
+                        proceed()
+                        return@launch
+                    }
+                    showPreClearWarning(
+                        this@MainActivity,
+                        probe.installed,
+                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                    )
+                }
             }
-            if (installed.isEmpty()) {
-                pendingClearConfirm = false
-                proceed()
-                return@launch
-            }
-            showPreClearWarning(
-                this@MainActivity,
-                installed,
-                onProceed = { pendingClearConfirm = false; proceed() },
-                onCancel = { pendingClearConfirm = false; onCancel() },
-            )
         }
     }
 
@@ -7115,9 +7138,12 @@ internal class DualViewModelFactory(
 // 實作（頂層 internal；spec 原稿為 private 成員＋PolicyActivity 端重複實作，但
 // STRICT 範圍禁止新檔案、且重複兩份探測／對話框邏輯易漂移，故收斂為單份共用）。
 //
-// 盡力而為語義：探測失敗／卸載失敗只記 log，不阻擋清除主流程（清除仍由 VM 自有
-// 守衛把關；ROOT 代關失敗仍 proceed——使用者意圖優先，BBC6 風險由警告文案與
-// 「二次確認」承載，不由靜默攔截承載）。
+// 盡力而為語義（Phase B 修訂）：探測以 DualProbeResult 回傳，不再以空清單
+// 吞失敗。exit!=0／stderr 非空／Failure 行／截斷（truncated 旗標、
+// [truncated] 標記、輸入超上限箝制）／gateway 拋例外皆歸 Failed，呼叫端
+// 一律走探測失敗警告（fail-closed，不靜默放行）；僅 Ok(empty) 直接放行，
+// Ok(non-empty) 走雙開提醒。卸載失敗仍只記 log 並 proceed（使用者意圖優先，
+// BBC6 風險由警告文案與「二次確認」承載，不由靜默攔截承載）。
 //
 // shell 備註：pkg tokens 全部來自 vm.state.value.policyDraft（VM 入 store 前已經
 // isValidPackage 驗證，[a-zA-Z0-9._-]，不含空白／引號／分號），以空格 join 後
@@ -7143,6 +7169,7 @@ private const val PRE_CLEAR_TAG = "PreClear"
 
 internal fun buildDualProbeCommand(pkgs: List<String>): String {
     val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .filter { PolicySource.isValidPackage(it) }
         .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
     return "for pkg in ${capped.joinToString(" ")}; do " +
         "out=\$(pm path --user 95 \"\$pkg\" 2>&1); " +
@@ -7160,28 +7187,105 @@ internal fun parseDualProbeOutput(out: String): List<String> =
 
 internal fun buildDualUninstallCommand(pkgs: List<String>): String {
     val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .filter { PolicySource.isValidPackage(it) }
         .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
     return "for pkg in ${capped.joinToString(" ")}; do pm uninstall --user 95 \"\$pkg\"; done"
 }
 
-internal suspend fun probeDualAppsInUser95(pkgs: Collection<String>): List<String> {
-    if (pkgs.isEmpty()) return emptyList()
-    val cmd = buildDualProbeCommand(pkgs.toList())
-    val result = try {
-        SuCmdGateway().run(cmd)
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        Log.w(PRE_CLEAR_TAG, "dual-profile probe exec failed", e)
-        return emptyList()
+// Phase B（P1 #2）：探測結果以 Ok/Failed 明確區分，不再以空清單吞失敗。
+// Ok(installed)：探測成功完成，installed 為已安裝分身（可為空）；
+// Failed(reason)：探測不可信，reason 為穩定短字串（有界 take(200)），呼叫端
+// 一律走探測失敗警告。JVM 可測（seam 注入 gateway；純判定另見 decideDualProbeResult）。
+internal sealed interface DualProbeResult {
+    data class Ok(val installed: List<String>) : DualProbeResult
+    data class Failed(val reason: String) : DualProbeResult
+}
+
+// 純判定（JVM 可測，無 Android 依賴）：CmdResult → DualProbeResult。
+// fail-closed 口徑：timedOut／transportUnknown／truncated 旗標、
+// [truncated] 標記、exit!=0、stderr 非空、Failure 行任一命中即 Failed；
+// 僅全通過才解析 INST 行（再以 isValidPackage 過濾非法 token）。
+internal fun decideDualProbeResult(result: CmdResult): DualProbeResult {
+    if (result.timedOut) {
+        val detail = result.err.ifBlank { "unknown" }.take(200)
+        return DualProbeResult.Failed("timeout: $detail")
+    }
+    if (result.transportUnknown) {
+        return DualProbeResult.Failed("transport-unknown: ${result.err.take(200)}")
+    }
+    if (result.truncated ||
+        result.out.contains(CORE_TRUNCATION_MARKER) ||
+        result.err.contains(CORE_TRUNCATION_MARKER)
+    ) {
+        return DualProbeResult.Failed("truncated: output capped")
     }
     if (result.exit != 0) {
-        Log.w(PRE_CLEAR_TAG, "dual-profile probe exit=${result.exit} err=${result.err.take(200)}")
+        return DualProbeResult.Failed("exit=${result.exit} err=${result.err.take(200)}")
+    }
+    if (result.err.isNotBlank()) {
+        return DualProbeResult.Failed("stderr: ${result.err.take(200)}")
+    }
+    val failureLine = result.out.lineSequence().firstOrNull {
+        val line = it.trim()
+        line.startsWith("Failure", ignoreCase = true) ||
+            line.startsWith("DELETE_FAILED", ignoreCase = true)
+    }
+    if (failureLine != null) {
+        return DualProbeResult.Failed("failure-line: ${failureLine.trim().take(200)}")
     }
     // 從輸出只擷取「INST <pkg>」行，再以 isValidPackage grammar 過濾非法 token，
     // 作為避免 su 執行無法預期字串的防線（合法資料來源仍為已寫入草稿的套件名）。
-    return parseDualProbeOutput(result.out)
+    val installed = parseDualProbeOutput(result.out)
         .filter { PolicySource.isValidPackage(it) }
+    return DualProbeResult.Ok(installed)
+}
+
+internal suspend fun probeDualAppsInUser95(
+    pkgs: Collection<String>,
+    gateway: CmdGateway = SuCmdGateway(),
+): DualProbeResult {
+    val distinct = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .distinct().sorted()
+    if (distinct.isEmpty()) return DualProbeResult.Ok(emptyList())
+    // Probe entry does not trust persisted/lastSynced content: re-validate
+    // grammar here before building the shell command.
+    val valid = distinct.filter { PolicySource.isValidPackage(it) }
+    if (valid.size != distinct.size) {
+        preClearLog("dual-profile probe dropped invalid: ${distinct.size - valid.size}")
+    }
+    if (valid.isEmpty()) {
+        return DualProbeResult.Failed("failure-line: invalid packages")
+    }
+    // 輸入超上限即截斷（buildDualProbeCommand 僅取前 N）：部分探測不可信，
+    // 直接歸 Failed（fail-closed），不呼叫 gateway。
+    if (valid.size > MAX_DUAL_PROBE_PKGS) {
+        preClearLog("dual-profile probe capped: ${valid.size} > $MAX_DUAL_PROBE_PKGS")
+        return DualProbeResult.Failed("truncated: capped ${valid.size} > $MAX_DUAL_PROBE_PKGS")
+    }
+    val cmd = buildDualProbeCommand(valid)
+    val result = try {
+        gateway.run(cmd)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("dual-profile probe exec failed", e)
+        return DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+    }
+    val decided = decideDualProbeResult(result)
+    if (decided is DualProbeResult.Failed) {
+        preClearLog("dual-profile probe failed: ${decided.reason}")
+    }
+    return decided
+}
+
+// JVM 單元測試相容：android.util.Log 在 JVM 單元測試為 stub（拋
+// "not mocked" RuntimeException），此處吞掉以保純邏輯可測；生產仍經 Logcat。
+internal fun preClearLog(msg: String, e: Throwable? = null) {
+    try {
+        if (e != null) Log.w(PRE_CLEAR_TAG, msg, e) else Log.w(PRE_CLEAR_TAG, msg)
+    } catch (_: RuntimeException) {
+        // JVM unit-test stub: ignore.
+    }
 }
 
 internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolean {
@@ -7189,6 +7293,15 @@ internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolea
     val cmd = buildDualUninstallCommand(pkgs.toList())
     return try {
         val result = SuCmdGateway().run(cmd)
+        // Reuse decideDualProbeResult fail-closed signals: truncated output,
+        // timeout, or transport loss is never a success, even with exit 0.
+        if (result.timedOut || result.transportUnknown || result.truncated ||
+            result.out.contains(CORE_TRUNCATION_MARKER) ||
+            result.err.contains(CORE_TRUNCATION_MARKER)
+        ) {
+            preClearLog("dual-profile uninstall truncated/unknown: timedOut=${result.timedOut} transportUnknown=${result.transportUnknown} truncated=${result.truncated}")
+            return false
+        }
         // 每個 pm uninstall 的失敗通常以 stdout 的 "Failure [DELETE_FAILED_*]" 行呈現，
         // stderr 非空或整體 exit 非零亦視為失敗——回 false；呼叫端只記 log，仍 proceed。
         val noFailureLine = result.out.lineSequence().none {
@@ -7200,12 +7313,16 @@ internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolea
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        Log.w(PRE_CLEAR_TAG, "dual-profile uninstall exec failed", e)
+        preClearLog("dual-profile uninstall exec failed", e)
         false
     }
 }
 
 // 清除政策前雙開提醒對話框。
+// Phase B：僅接受 Ok(non-empty)的 installed 清單。Ok(empty) 由呼叫端直接放行
+// （requestPreClearWarning 的 Ok(empty) 分支），Failed 一律走探測失敗警告；
+// 此處空清單視為程式錯誤，fail-closed 走 onCancel（不再靜默 onProceed），
+// 避免空警告誤放行。
 // onProceed＝繼續清除（Positive，不二次確認；對話框文字已明示「同意卸載分身」）。
 // onCancel＝取消清除（Negative／返回鍵／點擊外部／ROOT 代關二次確認中取消；呼叫端負責還原勾選等）。
 // Neutral（ROOT 代關）先補一道不可復原的二次確認；確認後對 installed 全部套用
@@ -7218,7 +7335,8 @@ internal fun showPreClearWarning(
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
 ) {
     if (installed.isEmpty()) {
-        onProceed()
+        preClearLog("pre-clear warning called with empty list; treating as cancelled")
+        onCancel()
         return
     }
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
@@ -7227,8 +7345,8 @@ internal fun showPreClearWarning(
     val list = shown.joinToString("\n") + if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…" else ""
     val message = try {
         host.getString(R.string.pre_clear_message, list)
-    } catch (e: Exception) {
-        Log.w(PRE_CLEAR_TAG, "pre-clear message build failed", e)
+    } catch (e: RuntimeException) {
+        preClearLog("pre-clear message build failed", e)
         onCancel()
         return
     }
@@ -7259,11 +7377,11 @@ internal fun showPreClearWarning(
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
-                                    Log.w(PRE_CLEAR_TAG, "dual-profile uninstall failed", e)
+                                    preClearLog("dual-profile uninstall failed", e)
                                     false
                                 }
                                 if (!ok) {
-                                    Log.w(PRE_CLEAR_TAG, "dual-profile uninstall reported failure; proceeding anyway")
+                                    preClearLog("dual-profile uninstall reported failure; proceeding anyway")
                                 }
                                 onProceed()
                             }
@@ -7271,16 +7389,16 @@ internal fun showPreClearWarning(
                         .setNegativeButton(R.string.dialog_cancel) { _, _ -> onCancel() }
                         .setOnCancelListener { onCancel() }
                         .show()
-                } catch (e: Exception) {
-                    Log.w(PRE_CLEAR_TAG, "pre-clear root-uninstall confirm failed to show", e)
+                } catch (e: RuntimeException) {
+                    preClearLog("pre-clear root-uninstall confirm failed to show", e)
                     onCancel()
                 }
             }
             .setOnCancelListener { onCancel() }
             .show()
-    } catch (e: Exception) {
+    } catch (e: RuntimeException) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
-        Log.w(PRE_CLEAR_TAG, "pre-clear warning failed to show", e)
+        preClearLog("pre-clear warning failed to show", e)
         onCancel()
     }
 }
@@ -7303,8 +7421,8 @@ internal fun showPreClearProbeFailedWarning(
             .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
             .setOnCancelListener { onCancel() }
             .show()
-    } catch (e: Exception) {
-        Log.w(PRE_CLEAR_TAG, "pre-clear probe-failed warning failed to show", e)
+    } catch (e: RuntimeException) {
+        preClearLog("pre-clear probe-failed warning failed to show", e)
         onCancel()
     }
 }

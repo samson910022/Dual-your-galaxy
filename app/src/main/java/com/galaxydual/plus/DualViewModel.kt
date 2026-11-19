@@ -14948,7 +14948,7 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.NO_STORE_READ -> "無政策 store，無法讀取草稿"
     PolicyTextKind.WRITE_SUCCESS -> "已寫入政策草稿 $count 項（勾選≠安裝，可隨時清除）"
     PolicyTextKind.WRITE_FAILED -> "寫入政策失敗"
-    PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（不影響已安裝分身與目前勾選）"
+    PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（注意：政策為空時Samsung會自動刪除分身及其資料，無法復原）"
     PolicyTextKind.CLEAR_FAILED -> "清除草稿失敗"
     // Dedicated string (R.string.policy_refreshed): JVM default mirrors the
     // resource verbatim; production resolves via resources (see factory).

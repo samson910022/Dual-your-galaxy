@@ -33,7 +33,6 @@ import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -119,15 +118,27 @@ class PolicyActivity : ComponentActivity() {
     // pendingClearConfirm：probe／警告對話框存活期忽略再次操作，避免重複彈窗。
     private var pendingClearConfirm = false
 
-    // 目前持久化草稿（UiState.policyDraft 即已保存之草稿）；讀取失敗時退回最後同步鏡像。
-    private fun persistedPolicyDraft(): Set<String> = try {
+    // 目前持久化草稿（UiState.policyDraft 即已保存之草稿）；讀取失敗回 null，
+    // 呼叫端 fail-closed 走探測失敗警告，不信任 lastSyncedDraft 鏡像。
+    private fun persistedPolicyDraftOrNull(): Set<String>? = try {
         vm.state.value.policyDraft
-    } catch (_: Exception) {
-        lastSyncedDraft.orEmpty()
+    } catch (_: RuntimeException) {
+        null
     }
 
     private fun requestPreClearWarning(proceed: () -> Unit, onCancel: () -> Unit = {}, proceedLabelRes: Int = R.string.pre_clear_confirm_proceed) {
-        val persisted = persistedPolicyDraft()
+        val persisted = persistedPolicyDraftOrNull()
+        if (persisted == null) {
+            if (pendingClearConfirm) return
+            pendingClearConfirm = true
+            showPreClearProbeFailedWarning(
+                this@PolicyActivity,
+                onProceed = { pendingClearConfirm = false; proceed() },
+                onCancel = { pendingClearConfirm = false; onCancel() },
+                proceedLabelRes = proceedLabelRes,
+            )
+            return
+        }
         if (persisted.isEmpty()) {
             proceed()
             return
@@ -135,42 +146,46 @@ class PolicyActivity : ComponentActivity() {
         if (pendingClearConfirm) return
         pendingClearConfirm = true
         lifecycleScope.launch {
-            var probeFailed = false
-            val installed = try {
+            // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
+            // Failed 一律走探測失敗警告；Ok(non-empty) 走雙開提醒。
+            val probe = try {
                 probeDualAppsInUser95(persisted)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
             } catch (e: Exception) {
-                Log.w(TAG, "pre-clear dual-profile probe failed", e)
-                probeFailed = true
-                emptyList()
+                preClearLog("pre-clear dual-profile probe failed", e)
+                DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
                 pendingClearConfirm = false
                 return@launch
             }
-            if (probeFailed) {
-                showPreClearProbeFailedWarning(
-                    this@PolicyActivity,
-                    onProceed = { pendingClearConfirm = false; proceed() },
-                    onCancel = { pendingClearConfirm = false; onCancel() },
-                    proceedLabelRes = proceedLabelRes,
-                )
-                return@launch
+            when (probe) {
+                is DualProbeResult.Failed -> {
+                    showPreClearProbeFailedWarning(
+                        this@PolicyActivity,
+                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        proceedLabelRes = proceedLabelRes,
+                    )
+                    return@launch
+                }
+                is DualProbeResult.Ok -> {
+                    if (probe.installed.isEmpty()) {
+                        pendingClearConfirm = false
+                        proceed()
+                        return@launch
+                    }
+                    showPreClearWarning(
+                        this@PolicyActivity,
+                        probe.installed,
+                        onProceed = { pendingClearConfirm = false; proceed() },
+                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        proceedLabelRes = proceedLabelRes,
+                    )
+                }
             }
-            if (installed.isEmpty()) {
-                pendingClearConfirm = false
-                proceed()
-                return@launch
-            }
-            showPreClearWarning(
-                this@PolicyActivity,
-                installed,
-                onProceed = { pendingClearConfirm = false; proceed() },
-                onCancel = { pendingClearConfirm = false; onCancel() },
-                proceedLabelRes = proceedLabelRes,
-            )
         }
     }
 
@@ -223,9 +238,7 @@ class PolicyActivity : ComponentActivity() {
         column.addView(statusView)
 
         column.addView(TextView(this).apply {
-            text = "政策=union-only 白名單擴充（預設空＝ observe-only）；變更經「寫入政策草稿」→ " +
-                "確認對話框（勾選≠安裝）；寫入後 hook 於下次輪詢（最長約 60 秒／或重啟）讀取生效。" +
-                "已停用或未安裝的 App 會被BBC hook 過濾。"
+            text = getString(R.string.policy_editor_intro)
             textSize = 11f
             setTextColor(getColor(R.color.oneui_text_secondary))
             layoutParams = LinearLayout.LayoutParams(
@@ -408,7 +421,9 @@ class PolicyActivity : ComponentActivity() {
         }
         // Issue #73：候選集空且持久化草稿非空＝整組清除（BBC6 風險）→
         // 先探測 user-95 分身安裝並顯示警告；取消則不寫入。
-        if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
+        // Unknown persisted content (null) also triggers the warning (fail-closed).
+        val persistedForEmptyCheck = persistedPolicyDraftOrNull()
+        if (ticks.isEmpty() && (persistedForEmptyCheck == null || persistedForEmptyCheck.isNotEmpty())) {
             // VM 永遠拒絕空集合寫入（CATALOG_MISSING／Two-phase 管線的整組契約），
             // 因此編輯器路徑的「繼續」不會真的清除——只是帶使用者看完警告後，
             // performWritePolicy() 仍走 VM 並失敗落在狀態列。按鈕標籤必須如實說明。
@@ -424,7 +439,7 @@ class PolicyActivity : ComponentActivity() {
         vm.replacePolicyDraft(HashSet(ticks))
         val cur = try {
             vm.state.value
-        } catch (_: Throwable) {
+        } catch (_: RuntimeException) {
             null
         }
         val pending = cur?.pendingPolicyWrite
@@ -507,7 +522,7 @@ class PolicyActivity : ComponentActivity() {
                 if (!ack.isChecked) return@setOnClickListener
                 val live = try {
                     vm.state.value.pendingPolicyWrite
-                } catch (_: Throwable) {
+                } catch (_: RuntimeException) {
                     null
                 } ?: run { dialog?.dismiss(); return@setOnClickListener }
                 vm.confirmPolicyWrite(live, live.generation)
@@ -523,7 +538,7 @@ class PolicyActivity : ComponentActivity() {
         if (total > POLICY_DIALOG_DISPLAY_MAX) return false
         val phase = try {
             vm.state.value.policyWritePhase
-        } catch (_: Throwable) {
+        } catch (_: RuntimeException) {
             PolicyWritePhase.RECONCILING
         }
         return phase != PolicyWritePhase.RECONCILING
@@ -650,7 +665,9 @@ class PolicyActivity : ComponentActivity() {
                     // Issue #73：單筆取消導致 ticks 清空＝整組清除的前置狀態
                     // （持久化草稿將被寫成空＝BBC6 風險）→ 先探測 user-95 分身並警告；
                     // 繼續＝保持未勾選，取消＝還原此勾選（行內恢復）。
-                    if (ticks.isEmpty() && persistedPolicyDraft().isNotEmpty()) {
+                    // Unknown persisted content (null) also triggers the warning (fail-closed).
+                    val persistedForUncheck = persistedPolicyDraftOrNull()
+                    if (ticks.isEmpty() && (persistedForUncheck == null || persistedForUncheck.isNotEmpty())) {
                         // proceed 為 no-op（僅保持未勾選；真正的「清空政策」只在
                         // 「寫入政策草稿（0）」或 MainActivity 清除草稿時發生）——按鈕必須如實說明。
                         requestPreClearWarning(
@@ -710,6 +727,5 @@ class PolicyActivity : ComponentActivity() {
 
     companion object {
         private const val MAX_LIST_ROWS = 200
-        private const val TAG = "PolicyActivity"
     }
 }
