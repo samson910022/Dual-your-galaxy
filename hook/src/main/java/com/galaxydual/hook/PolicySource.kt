@@ -47,6 +47,14 @@ object PolicySource {
     // persisted draft (breaking change; review required).
     const val POLICY_PREFS_NAME = "dual_policy"
     const val POLICY_KEY_EXTRA_PACKAGES = "extra_whitelist_packages"
+    // Phase A P0 (BBC sticky last-good): explicit-empty version key. Written
+    // atomically with POLICY_KEY_EXTRA_PACKAGES by HookPolicyStore.save/clear
+    // (same commit, monotonic +1 per write). Hook side treats empty+version as
+    // intentional Cleared (shrink allowed); empty without version as Unknown
+    // (sticky, never shrink). Non-empty without version stays Good for old-
+    // draft backward compat (pre-version drafts still merge). Renaming either
+    // abandons persisted drafts (breaking change; review required).
+    const val POLICY_KEY_EXTRA_VERSION = "extra_whitelist_version"
 
     // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 hardened).
     //

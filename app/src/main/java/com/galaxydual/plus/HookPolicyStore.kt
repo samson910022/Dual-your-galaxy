@@ -1010,11 +1010,58 @@ fun remoteHookPolicyStore(
                 // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
                 val ownToken = prePoison(prefs)
                 try {
-                    val ok: Boolean = if (raw == null) {
-                        prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES).commit()
-                    } else {
-                        prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
-                            .commit()
+                    // Phase A P0 policy_version 同步寫入（與包集合同一 commit
+                    // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
+                    // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
+                    // 視為 Good（向後相容），空+無版本永不視為故意清除。
+                    // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
+                    val curVer: Long = try {
+                        val has = try {
+                            prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        if (!has) {
+                            0L
+                        } else try {
+                            val v = prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 0L)
+                            if (v < 0L) 0L else v
+                        } catch (_: ClassCastException) {
+                            0L
+                        } catch (_: Throwable) {
+                            0L
+                        }
+                    } catch (_: Throwable) {
+                        0L
+                    }
+                    val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
+                    // 版本寫入 best-effort：測試 stub 可能不支援 putLong
+                    // （UnsupportedOperationException），此時仍須落盤包集合
+                    // （版本缺席由 hook 視為 Unknown sticky，不破壞既有語義）。
+                    val ed = try {
+                        if (raw == null) {
+                            prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+                        } else {
+                            prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (e: Throwable) {
+                        throw e
+                    }
+                    try {
+                        ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Throwable) {
+                        // putLong 不支援（測試 stub）：保留包集合寫入，版本缺席。
+                    }
+                    val ok: Boolean = try {
+                        ed.commit()
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (e: Throwable) {
+                        throw e
                     }
                     if (ok) {
                         val cleared = clearPoison(prefs, ownToken)

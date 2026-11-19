@@ -9,6 +9,8 @@ import io.github.libxposed.api.XposedModuleInterface
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 // LSPosed entry point (Modern Xposed API, API 102, interceptor-chain model).
 //
@@ -679,12 +681,15 @@ class DualHook : XposedModule() {
         return policy
     }
 
-    // BBC 路徑專屬：以與白名單查詢一致的 EffectivePolicyCache 讀取政策，
-    // 但以 BBC_AVAILABLE_APPS_INJECTION 作為自己的效應開關（Stage-1 封緘不受
-    // 影響，兩邊各自 fail-closed；TTL 60s／failureCooldown 5s／single-flight／50ms
-    // budget 與白名單查詢同一佇列語義，grace/deadline 直接比照 effectivePolicy
-    // 的取樣方式採樣，不會漂移）。
-    private fun bbcPolicy(): Set<String> = try {
+    // BBC 路徑專屬：以獨立 EffectivePolicyCache(bbcCache, sticky)讀取政策，
+    // 以 BBC_AVAILABLE_APPS_INJECTION 作為自己的效應開關（Stage-1 封緘不受
+    // 影響；白名單 effectiveCache 維持 fail-closed，零影響）。
+    // Phase A P0 sticky last-good：null/拋/contention/deadline/clock 失敗回
+    // 上次成功非空快照；僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期
+    // /invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
+    // TTL 60s／failureCooldown 5s／single-flight／50ms budget 語義與白名單
+    // 一致，grace/deadline 取樣方式比照 effectivePolicy，不漂移。
+    private fun bbcPolicy(): EffectivePolicyCache.BbcPolicy = try {
         val t0Sample = DeadlineBudget.sampleClock()
         val clockOk = t0Sample.clockOk
         val t0 = t0Sample.nanos
@@ -703,13 +708,15 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             -1L
         }
-        effectiveCache.get(
+        bbcCache.getBbc(
             EXTRA_WHITELIST_PACKAGES,
-            nonEmptyPolicyGateOpen = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            bbcGateOpen = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
-        ) { policyRead() }
-    } catch (_: Throwable) { emptySet() }
+        ) { policyReadBbcVersioned() }
+    } catch (_: Throwable) {
+        EffectivePolicyCache.BbcPolicy.Unknown(emptySet())
+    }
 
     // Policy read shared by effectivePolicy() (whitelist query path, reached
     // only with the Stage-1 gate open) and bbcPolicy() (BBC injector path):
@@ -847,6 +854,104 @@ class DualHook : XposedModule() {
             }
             null
         }
+    }
+
+    // Phase A P0 BBC versioned prefs read: returns Pair(packages, version)
+    // where packages==null signals a failed read (framework absent / IPC
+    // failure, throttled log via bbcCache.shouldLogFailure) and version==null
+    // signals "no version proof" (key absent or unreadable). Never throws.
+    // Empty + version!=null is the ONLY intentional-clear signal the BBC
+    // cache may shrink on; empty + version==null is Unknown (sticky).
+    private fun readRemotePrefsVersioned(): Pair<Set<String>?, Long?> {
+        return try {
+            val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+            registerPolicyChangeListener(prefs)
+            val pkgs: Set<String>? = try {
+                prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet()).orEmpty()
+            } catch (t: Throwable) {
+                if (bbcCache.shouldLogFailure()) {
+                    logi("BBC remote policy read failed: ${shortEx(t)}: ${shortMsg(t)}")
+                }
+                return Pair(null, null)
+            }
+            val ver: Long? = try {
+                if (!prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)) {
+                    null
+                } else {
+                    prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L).takeIf { it >= 1L }
+                }
+            } catch (_: Throwable) {
+                null
+            }
+            Pair(pkgs, ver)
+        } catch (t: Throwable) {
+            if (bbcCache.shouldLogFailure()) {
+                try {
+                    logi("BBC remote policy read failed: ${shortEx(t)}: ${shortMsg(t)}")
+                } catch (_: Throwable) {
+                }
+            }
+            Pair(null, null)
+        }
+    }
+
+    // Phase A P0 BBC versioned policy read (shared 50ms end-to-end budget):
+    // capability probe + single 50ms total + versioned prefs read. Maps
+    // capability-false to Unknown (null,null) — a missing capability is a
+    // failure for BBC (keep last-good), never an intentional clear (whitelist
+    // maps it to emptySet/cached; BBC must not shrink on it). Deadline
+    // exhaustion maps to Unknown as well (failed read => 5s cooldown +
+    // sticky). Contention propagates as PolicyRefreshContentionException so
+    // the BBC cache serves sticky WITHOUT renewing its cooldown (herd fix).
+    private fun policyReadBbcVersioned(): Pair<Set<String>?, Long?> {
+        val t0Sample = DeadlineBudget.sampleClock()
+        val t0 = t0Sample.nanos
+        val clockOk = t0Sample.clockOk
+        fun remainingMs(): Long = if (!clockOk) {
+            0L
+        } else try {
+            DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        var rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return Pair(null, null)
+        }
+        val capTimeout = minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)
+        val capable = isRemoteCapable(capTimeout) ?: return Pair(null, null)
+        if (!capable) return Pair(null, null)
+        rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return Pair(null, null)
+        }
+        // Gate-bounded versioned read: the gate only supports Set<String>?,
+        // so the version travels via an AtomicReference set inside the
+        // worker lambda (happens-before via Future.get).
+        val versionHolder = AtomicReference<Long?>(null)
+        val versionPresent = AtomicBoolean(false)
+        val pkgs: Set<String>? = policyRefreshGate.readBoundedOrThrow(
+            reader = {
+                val (p, v) = readRemotePrefsVersioned()
+                if (v != null) {
+                    versionHolder.set(v)
+                    versionPresent.set(true)
+                }
+                p
+            },
+            timeoutMs = rem,
+        )
+        if (pkgs == null) return Pair(null, null)
+        val ver = if (versionPresent.get()) versionHolder.get() else null
+        return Pair(pkgs, ver)
     }
 
     // PROP_CAP_REMOTE probe via RemoteCapabilityLatch (P2-1). A framework
@@ -1155,17 +1260,40 @@ class DualHook : XposedModule() {
             }
             return result
         }
-        val extra = try {
+        val bbcResult = try {
             bbcPolicy()
         } catch (_: Throwable) {
             return result
         }
-        if (extra.isEmpty()) {
-            // Empty policy: one entry line per process at most. No return-value
-            // change (observe-only).
-            logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
-            return result
+        // Phase A P0 explicit-empty token: Good(non-empty) merges; Cleared
+        // (empty+version) is an intentional clear (no merge, no Unknown log);
+        // Unknown (null/version-absent/contention/deadline/clock) keeps
+        // last-good with a once-per-process keep-last-good log.
+        val extra: Set<String> = when (bbcResult) {
+            is EffectivePolicyCache.BbcPolicy.Cleared -> {
+                logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
+                return result
+            }
+            is EffectivePolicyCache.BbcPolicy.Good -> bbcResult.packages
+            is EffectivePolicyCache.BbcPolicy.Unknown -> {
+                if (logBbcUnknownOnce(pid)) {
+                    val kept = try {
+                        bbcResult.lastGood.size
+                    } catch (_: Throwable) {
+                        -1
+                    }
+                    logi("BBC-HOOK unknown-policy keep-last-good (kept=$kept, pid=$pid)")
+                }
+                if (bbcResult.lastGood.isEmpty()) {
+                    logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
+                    return result
+                }
+                bbcResult.lastGood
+            }
         }
+        // Good is non-empty by contract (empty-with-proof is Cleared, empty
+        // without proof is Unknown-empty and returned above), so no empty
+        // guard is needed here: BbcInjector returns the original for empty.
         logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
         return try {
             // result is already known to be a List<*> (checked above).
@@ -1300,6 +1428,15 @@ class DualHook : XposedModule() {
         false
     }
 
+    // Phase A P0: Unknown-policy keep-last-good ledger (once per process).
+    // Fires when bbcPolicy() is Unknown (null/version-absent/contention/
+    // deadline/clock) and the interceptor keeps serving the sticky snapshot.
+    private fun logBbcUnknownOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("unknown:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
     // BOTH candidate fields are attempted (the ROM may read the _FOR_CHINA
@@ -1403,6 +1540,23 @@ class DualHook : XposedModule() {
             },
         )
 
+        // Phase A P0 BBC independent cache (sticky last-good). Separate
+        // instance from the whitelist effectiveCache so the whitelist path
+        // (NON_EMPTY_POLICY_EFFECTIVE_GATE=false, fail-closed) sees zero
+        // behavior change; BBC TTL/invalidate never discard last-good here
+        // (only the sticky cap does). Same 60s TTL / 5s cooldown /
+        // single-flight shape, independent counters + throttled BBC log.
+        private val bbcCache = EffectivePolicyCache(
+            onLog = { msg ->
+                try {
+                    Log.i(TAG, msg)
+                } catch (_: Throwable) {
+                    // Diagnostics only.
+                }
+            },
+            stickyLastGood = true,
+        )
+
         // Bounded refresh executor (P1-2, hardened K4 P2#6): zero-queue single
         // daemon thread shared by all policy refreshes so a slow binder read
         // never pins the hooked query thread beyond
@@ -1502,6 +1656,13 @@ class DualHook : XposedModule() {
                 remoteCapableFalseCached = null
                 remoteCapabilityProbeFailureLogged = false
                 effectiveCache.invalidate()
+                // Phase A P0: BBC cache has its own generation/single-flight;
+                // invalidate it too so the next BBC query re-reads, but its
+                // sticky last-good survives (unlike the whitelist seed-only).
+                try {
+                    bbcCache.invalidate()
+                } catch (_: Throwable) {
+                }
                 try {
                     policyRefreshGate.invalidate()
                 } catch (_: Throwable) {

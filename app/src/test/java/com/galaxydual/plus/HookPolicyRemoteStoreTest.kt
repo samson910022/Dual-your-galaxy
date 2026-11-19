@@ -62,6 +62,9 @@ class HookPolicyRemoteStoreTest {
         var commitThrows = false
         var corruptType = false
         var cancelOnAll = false
+        // Phase A P0:模擬不支援 putLong 的 MinimalPrefs（舊 stub）：putLong 擲出，
+        // 驗證 save 仍落盤包集合（版本缺席由 hook 視為 Unknown sticky）。
+        var putLongThrows = false
         // A3-1: 備份 commit 成功後，getAll 回報的 BACKUP_KEY 與實際寫入不一致
         // （模擬讀回被外部污染/後備讀不一致）→ backup 讀回驗證必須失敗。
         var mismatchBackupOnRead = false
@@ -130,6 +133,7 @@ class HookPolicyRemoteStoreTest {
             }
 
             override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                if (putLongThrows) throw UnsupportedOperationException("MinimalPrefs: no putLong")
                 pending[key!!] = value
                 removed.remove(key)
                 return this
@@ -1739,6 +1743,67 @@ class HookPolicyRemoteStoreTest {
             store.loadForRepair()
         } finally {
             testIdentityCheckHook = null
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase A P0 policy_version 原子寫入：save->ver1、save->ver2、clear->包缺席
+    // +ver3，且包集合與版本同一 commit 落盤（commitCalls 每次 +1、apply 0）。
+    @Test
+    fun versionAtomic_saveSaveClear_monotonicSameCommit() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("com.example.a")))
+            assertEquals(1, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertEquals(setOf("com.example.a"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+
+            assertTrue(store.save(setOf("com.example.b")))
+            assertEquals(2, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertEquals(setOf("com.example.b"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertEquals(2L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+
+            assertTrue(store.clear())
+            assertEquals(3, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+            assertEquals(3L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // Phase A P0 MinimalPrefs 相容：Editor.putLong 擲出（不支援版本鍵）時仍須
+    // 落盤包集合（版本缺席）；hook 側 empty+無版本視為 Unknown sticky（永不收縮）。
+    @Test
+    fun versionPutLongThrows_stillPersistsPackage_hookSeesUnknown() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            // 非空包仍落盤（向後相容：hook 側非空+無版本為 Good）。
+            assertTrue(store.save(setOf("com.example.a")))
+            assertEquals(setOf("com.example.a"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+            // 空包 + 無版本：hook 側必須視為 Unknown（sticky，永不收縮為 Cleared）。
+            assertTrue(store.save(emptySet()))
+            assertEquals(emptySet<String>(), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+            val cache = com.galaxydual.hook.EffectivePolicyCache(
+                nowMs = { 1_000L },
+                stickyLastGood = true,
+            )
+            val unk = cache.getBbc(emptySet(), reader = {
+                val pkgs: Set<String>? = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf())?.toSet()
+                Pair<Set<String>?, Long?>(pkgs, null)
+            })
+            assertTrue(unk is com.galaxydual.hook.EffectivePolicyCache.BbcPolicy.Unknown)
+        } finally {
             resetRemotePoisonForTests()
         }
     }
