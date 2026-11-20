@@ -336,7 +336,7 @@ Start proc(40.219【口述】) → DELETE   = +479ms（起點無擷錄，僅供�
 - 三次 DELETE→callback 延遲 **118／116／144ms 同方向、同量級**（144ms 較前兩次大約大 28ms）：政策（空／非空／ENTRY-6筆）與回調內容（EMPTY／nonempty／nonempty）翻轉，
   延遲量級不動 → 刪除不依賴本次 hook 回調（TIMELINE §7 §判定-1 的第三次複現）。
 - **Phase A sticky（未做對照）**：sticky／keep-last-good 讀取成功【口述】；與 sticky 值是否相關未做對照，不斷言無關（ENTRY／callback／merged 均正常落盤僅記現象）。
-- 殘留問題轉 issue 追蹤：見 **issue #75**（號碼稍後填）。候選項（不展開，僅佔位）：下次冷啟動復發風險與觀察代價；
+- 殘留問題轉 issue 追蹤：見 issue #75。候選項（不展開，僅佔位）：下次冷啟動復發風險與觀察代價；
   Bundle Parcel 仍未解碼（H3）；verify 無包名（H4）；H5 僅在「先回後刪」形態復活。
 
 ### 8.5 誠實標註（本追記專用；§6 原表不動）
