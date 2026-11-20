@@ -1170,6 +1170,11 @@ class DualHook : XposedModule() {
     private val bbcHitLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
     private val bbcMergedLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
 
+    // Caller-identification entry ledger (once per process, pid-keyed like
+    // bbcMergedLog): the BBC-ENTRY read-only diagnosis fires at most once per
+    // process so the open-page hot path never spams logcat.
+    private val bbcEntryLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+
     // BBC install path: probe (BBC shared library resolvable on this ROM,
     // method present), resolve the callee reflectively, resolve the caller
     // Executables (best-effort, may be empty), then installWithCallers
@@ -1246,6 +1251,19 @@ class DualHook : XposedModule() {
     // unexpected result type, or any non-String element => the ORIGINAL
     // result object is returned unchanged.
     private fun interceptBbcCall(chain: XposedInterface.Chain): Any? {
+        // Read-only entry capture FIRST (no semantics): wall-clock + caller
+        // stack snippet. Both best-effort; any failure yields a fallback and
+        // the entry log is skipped when the caller snippet is empty.
+        val entryTsMs: Long = try {
+            System.currentTimeMillis()
+        } catch (_: Throwable) {
+            0L
+        }
+        val entryCaller: String = try {
+            BbcInjector.callerSnippet(Thread.currentThread().stackTrace)
+        } catch (_: Throwable) {
+            ""
+        }
         val result = chain.proceed()
         val pid = try {
             android.os.Process.myPid()
@@ -1255,6 +1273,8 @@ class DualHook : XposedModule() {
         // Fail-fast on unexpected ROM shapes before paying for the policy
         // lookup (type-check is cheaper than a binder read).
         if (result !is List<*>) {
+            // Read-only entry diagnosis for the bad-type shape (size unknown).
+            logBbcEntryOnce(pid, entryTsMs, entryCaller, -1, false)
             if (logBbcBadTypeOnce(pid)) {
                 logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
             }
@@ -1271,6 +1291,13 @@ class DualHook : XposedModule() {
         // last-good with a once-per-process keep-last-good log.
         val extra: Set<String> = when (bbcResult) {
             is EffectivePolicyCache.BbcPolicy.Cleared -> {
+                // Read-only entry: intentional-clear path (empty policy).
+                val entrySize = try {
+                    result.size
+                } catch (_: Throwable) {
+                    -1
+                }
+                logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, false)
                 logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
                 return result
             }
@@ -1285,6 +1312,13 @@ class DualHook : XposedModule() {
                     logi("BBC-HOOK unknown-policy keep-last-good (kept=$kept, pid=$pid)")
                 }
                 if (bbcResult.lastGood.isEmpty()) {
+                    // Read-only entry: unknown-policy with nothing kept.
+                    val entrySize = try {
+                        result.size
+                    } catch (_: Throwable) {
+                        -1
+                    }
+                    logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, false)
                     logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
                     return result
                 }
@@ -1294,6 +1328,21 @@ class DualHook : XposedModule() {
         // Good is non-empty by contract (empty-with-proof is Cleared, empty
         // without proof is Unknown-empty and returned above), so no empty
         // guard is needed here: BbcInjector returns the original for empty.
+        // Read-only entry diagnosis (once per process, never branches merge):
+        // result size + whether Samsung's list already contains a policy
+        // entry (boolean only, no package literals). Any failure skips the
+        // line; merge/gate/write/return semantics below are untouched.
+        val entrySize = try {
+            result.size
+        } catch (_: Throwable) {
+            -1
+        }
+        val entryContains = try {
+            BbcInjector.originalContainsPolicy(result, extra)
+        } catch (_: Throwable) {
+            false
+        }
+        logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, entryContains)
         logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
         return try {
             // result is already known to be a List<*> (checked above).
@@ -1398,6 +1447,31 @@ class DualHook : XposedModule() {
         }
         if (added) {
             logi(msg)
+        }
+    }
+
+    // Caller-identification entry diagnosis (once per process, pid-keyed).
+    // Read-only: formats one BBC-ENTRY line (ts/pid/size/containsPolicy
+    // boolean/caller snippet) and never affects merge/gate/write/return
+    // semantics. Fully total: an empty caller snippet (stack unavailable)
+    // or any formatting failure skips the line silently.
+    private fun logBbcEntryOnce(pid: Int, tsMs: Long, caller: String, resultSize: Int, containsPolicy: Boolean) {
+        try {
+            if (caller.isEmpty()) return
+            val added = try {
+                bbcEntryLog.add("entry:$pid")
+            } catch (_: Throwable) {
+                false
+            }
+            if (!added) return
+            val line = try {
+                BbcInjector.formatBbcEntryDiag(tsMs, pid, caller, resultSize, containsPolicy)
+            } catch (_: Throwable) {
+                return
+            }
+            logi(line)
+        } catch (_: Throwable) {
+            // Diagnostics only: never break the hook path.
         }
     }
 

@@ -105,6 +105,134 @@ internal object BbcInjector {
         return if (added.isEmpty()) original else ArrayList(original).apply { addAll(added) }
     }
 
+    // --- Caller-identification read-only diagnostics (2026-11-21, Plan §4) ---
+    // Pure + total helpers for the interceptBbcCall entry log. Framework-free
+    // so JVM tests lock them; the hook path only interpolates their output
+    // into one throttled logi line and never branches on it (no merge /
+    // gate / write / return-semantics change). Privacy: only sizes + one
+    // boolean + Samsung/ROM class+method simple names enter the log — never
+    // package-name literals, never PII. Line numbers are intentionally
+    // omitted (class+method is enough to pin the caller; keeps the line
+    // bounded and avoids leaking build-specific line tables).
+    internal const val BBC_CALLER_MAX_FRAMES = 8
+    internal const val BBC_CALLER_MAX_CHARS = 600
+    internal const val BBC_ENTRY_MAX_CHARS = 1000
+
+    // Short caller snippet from a stack trace: drops hook-infra frames, keeps
+    // the first maxFrames caller frames as SimpleClass#method joined by
+    // " <- " (innermost first). Never throws; null/empty/hostile => "" and
+    // the call site skips the entry log.
+    internal fun callerSnippet(
+        trace: Array<StackTraceElement>?,
+        maxFrames: Int = BBC_CALLER_MAX_FRAMES,
+    ): String {
+        return try {
+            if (trace == null || trace.isEmpty()) return ""
+            val cap = try {
+                maxFrames.coerceAtLeast(0)
+            } catch (_: Throwable) {
+                0
+            }
+            if (cap <= 0) return ""
+            val parts = ArrayList<String>(cap)
+            for (el in trace) {
+                if (parts.size >= cap) break
+                val cls: String = try {
+                    el.className
+                } catch (_: Throwable) {
+                    continue
+                }
+                // Skip our own + framework-dispatch frames so the first kept
+                // frame is the Samsung/ROM caller, not the hook itself.
+                if (cls == "java.lang.Thread" ||
+                    cls.startsWith("com.galaxydual.hook.") ||
+                    cls.startsWith("io.github.libxposed.")
+                ) {
+                    continue
+                }
+                val method: String = try {
+                    el.methodName ?: ""
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (method.isEmpty()) continue
+                val shortCls = try {
+                    HookLog.shortName(cls)
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (shortCls.isEmpty()) continue
+                val safeMethod = try {
+                    HookLog.normalizeLogPart(method).take(100)
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (safeMethod.isEmpty()) continue
+                parts.add("$shortCls#$safeMethod")
+            }
+            try {
+                parts.joinToString(" <- ").take(BBC_CALLER_MAX_CHARS)
+            } catch (_: Throwable) {
+                ""
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    // Read-only membership probe: does Samsung's original list already contain
+    // any policy entry? Never throws; hostile collections fail closed to
+    // false (the entry log then records containsPolicy=false). Bounded
+    // traversal (4096) so a hostile oversized list cannot pin the hook.
+    internal fun originalContainsPolicy(original: List<*>, policy: Set<String>): Boolean {
+        return try {
+            if (original.isEmpty()) return false
+            if (policy.isEmpty()) return false
+            var seen = 0
+            for (e in original) {
+                if (seen++ >= 4096) break
+                val pkg = try {
+                    e as? String
+                } catch (_: Throwable) {
+                    continue
+                } ?: continue
+                val hit = try {
+                    policy.contains(pkg)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (hit) return true
+            }
+            false
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    // Single entry-diagnosis line. Inputs are already desensitized (size +
+    // boolean + caller snippet); this function takes no package strings by
+    // construction, so package literals cannot leak. Never throws; bounded
+    // to BBC_ENTRY_MAX_CHARS after control-char sanitizing.
+    internal fun formatBbcEntryDiag(
+        tsMs: Long,
+        pid: Int,
+        caller: String,
+        resultSize: Int,
+        containsPolicy: Boolean,
+    ): String {
+        return try {
+            val safeCaller = try {
+                HookLog.normalizeLogPart(caller)
+            } catch (_: Throwable) {
+                ""
+            }.take(BBC_CALLER_MAX_CHARS)
+            "BBC-ENTRY ts=$tsMs pid=$pid size=$resultSize containsPolicy=$containsPolicy caller=$safeCaller"
+                .take(BBC_ENTRY_MAX_CHARS)
+        } catch (_: Throwable) {
+            "BBC-ENTRY pid=$pid"
+        }
+    }
+
     // Probe whether the BBC shared library resolves on this ROM. Never throws.
     internal fun probeBbcAvailable(classLoader: ClassLoader, log: (String) -> Unit): Boolean {
         return try {
