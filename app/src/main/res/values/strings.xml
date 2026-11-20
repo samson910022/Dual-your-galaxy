@@ -116,6 +116,13 @@
     <string name="pre_clear_probe_failed_title">無法探測分身狀態 · 仍可能卸載分身</string>
     <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身會被 Samsung 隨政策清空一併刪除（含 user-95 資料、無法復原）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。</string>
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>
+    <!-- Phase D：ROOT 卸載後驗證三選一（重跑 probe；殘留非空即失敗；失敗不默認 proceed）。 -->
+    <string name="pre_clear_uninstall_verify_title">卸載後驗證 · 請明確選擇</string>
+    <string name="pre_clear_uninstall_verify_success">卸載後重探 user 95：已無殘留分身，可繼續清除政策。</string>
+    <string name="pre_clear_uninstall_verify_residual">卸載後重探 user 95 仍有殘留分身：%1$s\n\n「驗證成功，繼續清除」已禁用；如確定要清除請選「仍要清除（自擔風險）」，或取消後手動關閉雙開。</string>
+    <string name="pre_clear_uninstall_verify_failed">卸載後重探無法完成（%1$s），殘留未知。\n\n「驗證成功，繼續清除」已禁用；如確定要清除請選「仍要清除（自擔風險）」，或取消後重試。</string>
+    <string name="pre_clear_verify_proceed">驗證成功，繼續清除</string>
+    <string name="pre_clear_force_proceed">仍要清除（自擔風險）</string>
     <string name="pre_clear_editor_try_anyway">仍然繼續（零項目，VM 將拒絕寫入）</string>
     <string name="pre_clear_editor_keep_unticked">保持未勾選（此步不會清除政策）</string>
     <!-- Phase C（A 案：編輯器禁清到底）：空集不警告、導引去 Main 清除。三語系同鍵。 -->

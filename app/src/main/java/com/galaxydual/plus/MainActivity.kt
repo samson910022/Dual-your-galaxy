@@ -177,21 +177,39 @@ class MainActivity : ComponentActivity() {
     private lateinit var refreshPolicyBtn: Button
     private var policyWriteDialog: AlertDialog? = null
     private var serviceBindListener: (() -> Unit)? = null
-    private var shownPolicyWrite: PendingPolicyWrite? = null
+    // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型
+    // PolicyConfirmDialogState；既有欄位名保留為委派屬性，行為不變，rotation/onDestroy
+    // 語義與 Editor 單一來源）。
+    private val policyConfirmState = PolicyConfirmDialogState()
+    private var shownPolicyWrite: PendingPolicyWrite?
+        get() = policyConfirmState.shownPending
+        set(v) { policyConfirmState.shownPending = v }
     // Phase 5：已顯示 dialog 的 saving 相位快照（early-return 偵測 QUEUED→SAVING
     // 翻轉，翻轉沿播報一次；僅 UI 播報用，不參與門控）。
-    private var shownPolicyWriteSaving: Boolean = false
-    private var policyAcknowledged = false
-    private var policyAckGeneration: Long? = null
+    private var shownPolicyWriteSaving: Boolean
+        get() = policyConfirmState.shownSaving
+        set(v) { policyConfirmState.shownSaving = v }
+    private var policyAcknowledged: Boolean
+        get() = policyConfirmState.acknowledged
+        set(v) { policyConfirmState.acknowledged = v }
+    private var policyAckGeneration: Long?
+        get() = policyConfirmState.ackGeneration
+        set(v) { policyConfirmState.ackGeneration = v }
     // Stage J4 (dialog trap)：RECONCILING 期使用者 Back/觸外/取消導致的本地 dismiss
     // 世代（僅 UI 層抑制重建，不調 vm.cancelPolicyWrite、不清 VM fence；pending 仍在，
     // reconciler／late-join 照常結清；該世代終態 IDLE 或新世代即清除）。
-    private var policyWriteDismissedForReconcilingGen: Long? = null
+    private var policyWriteDismissedForReconcilingGen: Long?
+        get() = policyConfirmState.dismissedForReconcilingGen
+        set(v) { policyConfirmState.dismissedForReconcilingGen = v }
     // Stage B P2 dialog 完整清單（方案 A Toggle）：展開/收合純 UI 開關。
     // rest>0 才顯示 Toggle；in-place 切換保 ack；世代重置同步重置 expanded；
-    // 旋轉經 KEY_POLICY_EXPANDED(/GEN) 保留，同世代保留、跨世代重置。
-    private var policyWriteExpanded = false
-    private var policyWriteExpandedGeneration: Long? = null
+    // 旋轉經 holder saveToBundle/restoreFromBundle 保留，同世代保留、跨世代重置。
+    private var policyWriteExpanded: Boolean
+        get() = policyConfirmState.expanded
+        set(v) { policyConfirmState.expanded = v }
+    private var policyWriteExpandedGeneration: Long?
+        get() = policyConfirmState.expandedGeneration
+        set(v) { policyConfirmState.expandedGeneration = v }
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
@@ -475,28 +493,11 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
-        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）→ 不再保留。
-        // Consent 是 session-scoped：Bundle 還原的 ack 與 per-process 世代計數器
-        // 撞代（process 死後計數器重置，舊 Bundle 的 gen 會誤配新世代）。dialog
-        // 首個 render 本來就會清掉它，此處直接移除這個脆弱的還原窗口。
-        policyAcknowledged = false
-        policyAckGeneration = null
-        // Stage B P2：完整清單展開開關保留（同世代旋轉保留，跨世代重置見 sync）。
-        policyWriteExpanded = savedInstanceState?.getBoolean(KEY_POLICY_EXPANDED) ?: false
-        policyWriteExpandedGeneration =
-            if (savedInstanceState?.containsKey(KEY_POLICY_EXPANDED_GEN) == true) {
-                savedInstanceState.getLong(KEY_POLICY_EXPANDED_GEN)
-            } else {
-                null
-            }
-        // Stage J4：RECONCILING 期本地抑制世代保留（旋轉重建不丟抑制；跨世代/
-        // 終態清除仍由 syncPolicyWriteDialog 負責，此處僅恢復原始值）。
-        policyWriteDismissedForReconcilingGen =
-            if (savedInstanceState?.containsKey(KEY_POLICY_WRITE_DISMISSED_GEN) == true) {
-                savedInstanceState.getLong(KEY_POLICY_WRITE_DISMISSED_GEN)
-            } else {
-                null
-            }
+        // Stage2：政策寫入確認 consent 為 session-scoped，永不經 Bundle 持久化
+        // (holder 明確拆分：ack 不存、shown 不還原；見 PolicyConfirmDialogState 檔頭).
+        // 兩屏統一走 holder saveToBundle/restoreFromBundle (舊手寫 KEY 已刪)：
+        // 還原後 ack 強制清除，expanded/dismissed 世代保留由 holder 處理.
+        policyConfirmState.restoreFromBundle(savedInstanceState)
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -587,14 +588,14 @@ class MainActivity : ComponentActivity() {
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
-        // Stage2：政策寫入確認勾選綁定世代保留 → 不再寫入 Bundle（consent 為
-        // session-scoped；見 onCreate 還原處說明）。
-        // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
-        outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
-        if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
-        // Stage J4：RECONCILING 期本地抑制世代保留（同世代旋轉保留；跨世代/終態
-        // 清除見 syncPolicyWriteDialog：pending 清除、世代不匹配不抑制、非 RECONCILING 清除）。
-        if (policyWriteDismissedForReconcilingGen != null) outState.putLong(KEY_POLICY_WRITE_DISMISSED_GEN, policyWriteDismissedForReconcilingGen!!)
+        // Stage2：政策寫入確認 consent 為 session-scoped，永不寫入 Bundle
+        // (ack 不存；見 PolicyConfirmDialogState 檔頭)；兩屏統一走 holder
+        // saveToBundle (expanded/dismissed 世代保留；shown 不存；舊手寫 KEY 已刪).
+        try {
+            policyConfirmState.saveToBundle(outState)
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
 
     override fun onDestroy() {
@@ -622,8 +623,9 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         policyWriteDialog = null
-        shownPolicyWrite = null
-        shownPolicyWriteSaving = false
+        // Phase D：onDestroy 經 holder 結清 (shown/ack/expanded/dismissed；VM fence
+        // 不受影響；與 Editor 同源).
+        policyConfirmState.onPendingCleared()
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -4241,7 +4243,8 @@ class MainActivity : ComponentActivity() {
         }
         // Stage J4：confirm 門控沿用舊 policySaving 語義（SAVING||RECONCILING 即禁確認）；
         // cancelable 拆分（SAVING 不可取消，RECONCILING 可取消僅 dismiss）。
-        val confirmSaving = policySaving || policyReconciling
+        // Phase D single source：confirmSaving 一律經 policyConfirmSaving 映射.
+        val confirmSaving = policyConfirmSaving(policySaving, policyReconciling)
         // Nit：直接以 (policySaving, policyReconciling) 調雙參真相
         // (!saving || reconciling)；舊 savingOnly 中介與此等價（真值表一致），故省去。
         val cancelable = policyDialogShouldBeCancelable(policySaving, policyReconciling)
@@ -4468,9 +4471,10 @@ class MainActivity : ComponentActivity() {
             // RECONCILING 才禁用（QUEUED 可確認，避免 request 即 QUEUED 導致恆
             // 禁用死鎖；核對中請勿重試）；世代守衛在 VM。
             // Stage L4: 點擊亦經可檢視上界（display≡inspectability，超限禁寫）。
+            // Phase D single source：live phase→confirmSaving 經 policyConfirmSaving.
             val curPolicySaving = try {
                 val ph = vm.state.value.policyWritePhase
-                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
+                policyConfirmSaving(ph == PolicyWritePhase.SAVING, ph == PolicyWritePhase.RECONCILING)
             } catch (_: Exception) {
                 confirmSaving
             }
@@ -6113,13 +6117,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
-        // Stage2：政策寫入確認勾選綁定世代 → 不再經 Bundle 持久化（consent 為
-        // session-scoped；舊 key policyAck/policyAckGen 已廢棄）。
-        // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
-        private const val KEY_POLICY_EXPANDED = "policyExpanded"
-        private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"
-        // Stage J4：RECONCILING 期本地抑制世代（同世代旋轉保留，跨世代/終態清除見 sync）。
-        private const val KEY_POLICY_WRITE_DISMISSED_GEN = "policyWriteDismissedGen"
+        // Stage2/Phase D：政策寫入確認改走 PolicyConfirmDialogState holder
+        // saveToBundle/restoreFromBundle (兩屏 Bundle 格式統一；ack 不存、shown 不還原、
+        // session-scoped 見 holder 檔頭；舊手寫 policyExpanded*/policyWriteDismissedGen 已刪).
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -6872,6 +6872,12 @@ internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !p
 internal fun policyDialogShouldBeCancelable(saving: Boolean, reconciling: Boolean): Boolean =
     !saving || reconciling
 
+// Phase D confirm-saving 映射 single source：SAVING || RECONCILING 即禁確認
+// (QUEUED 才可確認). Main / Editor 兩屏 sync / showConfirmDialog 一律經此，
+// 真值表 (F,F)->F、(T,F)->T、(F,T)->T、(T,T)->T 由 JVM 鎖定.
+internal fun policyConfirmSaving(saving: Boolean, reconciling: Boolean): Boolean =
+    saving || reconciling
+
 internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
     storedGeneration != pendingGeneration
 
@@ -7271,7 +7277,7 @@ internal class DualViewModelFactory(
 internal const val MAX_DUAL_PROBE_PKGS = 512
 
 // 警告對話框中套件清單的顯示上限（超出以省略號標示截斷；不截斷 ROOT 代關對象）。
-private const val PRE_CLEAR_LIST_MAX = 20
+internal const val PRE_CLEAR_LIST_MAX = 20
 private const val PRE_CLEAR_TAG = "PreClear"
 
 internal fun buildDualProbeCommand(pkgs: List<String>): String {
@@ -7468,6 +7474,9 @@ internal fun showPreClearWarning(
                 // ROOT 代關＝清除分身資料，不可復原 → 二次確認（ONE confirm only）。
                 // 取消（含返回鍵）= 完整取消語義：不放行、不執行卸載，旗標重置；
                 // 呼叫端 onCancel 生效（PolicyActivity 勾選還原＝安全側，MA/寫入路徑為 no-op）。
+                // Phase D：二次確認通過後先執行卸載，再重跑 probeDualAppsInUser95 驗證：
+                // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
+                // 仍要清除自擔／取消），失敗 never 默認 proceed。
                 try {
                     AlertDialog.Builder(host)
                         .setTitle(R.string.pre_clear_root_uninstall)
@@ -7479,18 +7488,51 @@ internal fun showPreClearWarning(
                         .setCancelable(true)
                         .setPositiveButton(android.R.string.ok) { _, _ ->
                             host.lifecycleScope.launch {
-                                val ok = try {
+                                try {
                                     uninstallDualAppsInUser95(installed)
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
                                     preClearLog("dual-profile uninstall failed", e)
-                                    false
                                 }
-                                if (!ok) {
-                                    preClearLog("dual-profile uninstall reported failure; proceeding anyway")
+                                // Phase D post-verify: re-probe the same warned set.
+                                // Residual non-empty (or probe failure) = verification
+                                // failure; never auto-proceed — explicit 3-choice below.
+                                val postProbe: DualProbeResult = try {
+                                    probeDualAppsInUser95(installed)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    preClearLog("post-uninstall re-probe failed", e)
+                                    DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
                                 }
-                                onProceed()
+                                if (host.isFinishing || host.isDestroyed) {
+                                    try { onCancel() } catch (_: Exception) { }
+                                    return@launch
+                                }
+                                val outcome = decideUninstallVerifyResult(postProbe)
+                                when (outcome) {
+                                    is UninstallVerifyOutcome.VerifiedEmpty ->
+                                        preClearLog("post-uninstall re-probe verified empty")
+                                    is UninstallVerifyOutcome.Residual ->
+                                        preClearLog("post-uninstall re-probe residual: ${outcome.remaining.size}")
+                                    is UninstallVerifyOutcome.ProbeFailed ->
+                                        preClearLog("post-uninstall re-probe failed: ${outcome.reason}")
+                                }
+                                try {
+                                    showUninstallVerifyDialog(
+                                        host = host,
+                                        outcome = outcome,
+                                        onClearVerified = { onProceed() },
+                                        onForceClear = { onProceed() },
+                                        onCancel = { onCancel() },
+                                    )
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    preClearLog("uninstall verify dialog failed", e)
+                                    try { onCancel() } catch (_: Exception) { }
+                                }
                             }
                         }
                         .setNegativeButton(R.string.dialog_cancel) { _, _ -> onCancel() }
@@ -7506,6 +7548,81 @@ internal fun showPreClearWarning(
     } catch (e: RuntimeException) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
         preClearLog("pre-clear warning failed to show", e)
+        onCancel()
+    }
+}
+
+// Phase D：ROOT 卸載後驗證三選一對話框（重跑 probe；殘留非空即失敗）。
+// - Positive「驗證成功，繼續清除」僅 VerifiedEmpty 啟用；Residual/ProbeFailed 一律禁用
+//   (isEnabled=false＋click guard no-op 雙層強制，見 uninstallVerifyPositiveClickShouldProceed).
+// - Neutral「仍要清除（自擔風險）」全 outcome 可點（明確自擔）；Negative／Back／觸外＝取消。
+// - 失敗 never 默認 proceed：本函數不自動呼叫任何 proceed，須使用者明確點按。
+// - DEVICE-UNVERIFIED (dialog widget／isFinishing／neutral-negative 路徑)：JVM 僅鎖定
+//   純謂詞 (decide／positiveEnabled／click guard／截斷)，widget 行為見 PhaseD 手測矩陣.
+internal fun showUninstallVerifyDialog(
+    host: ComponentActivity,
+    outcome: UninstallVerifyOutcome,
+    onClearVerified: () -> Unit,
+    onForceClear: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    val message: String = try {
+        when (outcome) {
+            is UninstallVerifyOutcome.VerifiedEmpty ->
+                host.getString(R.string.pre_clear_uninstall_verify_success)
+            is UninstallVerifyOutcome.Residual -> {
+                // 截斷與 JVM seam 同源 (uninstallVerifyResidualDisplay；上界見
+                // UNINSTALL_VERIFY_LIST_MAX，與 PRE_CLEAR_LIST_MAX 同值 20).
+                val (shown, rest) = uninstallVerifyResidualDisplay(outcome.remaining, PRE_CLEAR_LIST_MAX)
+                val list = shown.joinToString("\n") +
+                    if (rest > 0) "\n…" else ""
+                host.getString(R.string.pre_clear_uninstall_verify_residual, list)
+            }
+            is UninstallVerifyOutcome.ProbeFailed ->
+                host.getString(R.string.pre_clear_uninstall_verify_failed, outcome.reason)
+        }
+    } catch (e: RuntimeException) {
+        preClearLog("uninstall verify message build failed", e)
+        onCancel()
+        return
+    }
+    try {
+        val dialog = AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_uninstall_verify_title)
+            .setMessage(message)
+            .setCancelable(true)
+            .setPositiveButton(R.string.pre_clear_verify_proceed, null)
+            .setNeutralButton(R.string.pre_clear_force_proceed, null)
+            .setNegativeButton(R.string.pre_clear_cancel, null)
+            .setOnCancelListener { onCancel() }
+            .show()
+        val positiveEnabled = uninstallVerifyPositiveEnabled(outcome)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
+            isEnabled = positiveEnabled
+            setOnClickListener {
+                // 禁用強制：Residual/Failed 下 click 一律 no-op (不 dismiss、不 proceed).
+                if (!uninstallVerifyPositiveClickShouldProceed(outcome)) return@setOnClickListener
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onClearVerified()
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
+            isEnabled = true
+            setOnClickListener {
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onForceClear()
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.apply {
+            isEnabled = true
+            setOnClickListener {
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onCancel()
+            }
+        }
+    } catch (e: RuntimeException) {
+        preClearLog("uninstall verify dialog failed to show", e)
         onCancel()
     }
 }

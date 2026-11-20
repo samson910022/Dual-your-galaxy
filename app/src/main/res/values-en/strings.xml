@@ -113,6 +113,13 @@
     <string name="pre_clear_probe_failed_title">Probe failed to check dual-app status · dual copies may still be erased</string>
     <string name="pre_clear_probe_failed_message">Root access is unavailable or the environment is unsupported, so installed dual copies cannot be enumerated safely. Samsung may still delete the dual copies (with user-95 data, unrecoverable) when the policy is cleared. If unsure, turn off Dual Apps for the affected apps in Samsung Settings first.</string>
     <string name="pre_clear_probe_failed_proceed">Clear anyway</string>
+    <!-- Phase D: post-uninstall re-probe three-choice (residual non-empty = fail; failure never auto-proceeds). -->
+    <string name="pre_clear_uninstall_verify_title">Post-uninstall check · choose explicitly</string>
+    <string name="pre_clear_uninstall_verify_success">Re-probed user 95 after uninstall: no residual dual copies. You may continue clearing.</string>
+    <string name="pre_clear_uninstall_verify_residual">Re-probe after uninstall still shows residual copies in user 95: %1$s\n\n“Verified, continue clearing” is disabled; choose “Clear anyway (at my own risk)” to proceed, or cancel and turn off Dual Apps manually.</string>
+    <string name="pre_clear_uninstall_verify_failed">Post-uninstall re-probe could not complete (%1$s); residual state unknown.\n\n“Verified, continue clearing” is disabled; choose “Clear anyway (at my own risk)” to proceed, or cancel and retry.</string>
+    <string name="pre_clear_verify_proceed">Verified, continue clearing</string>
+    <string name="pre_clear_force_proceed">Clear anyway (at my own risk)</string>
     <string name="pre_clear_editor_try_anyway">Continue anyway (empty - the VM rejects empty writes)</string>
     <string name="pre_clear_editor_keep_unticked">Keep unselected (does not clear the policy yet)</string>
     <!-- Phase C (Option A: editor forbids clearing to empty): empty set shows no warning, guides to Main clear. Synced across all three locales. -->

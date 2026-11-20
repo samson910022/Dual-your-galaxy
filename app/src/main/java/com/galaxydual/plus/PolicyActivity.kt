@@ -112,6 +112,11 @@ class PolicyActivity : ComponentActivity() {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Drawable>?): Boolean = size > 64
     }
 
+    // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型；
+    // pending+generation+ack(in-memory session-scoped)+expanded+SAVING/RECONCILING cancel語義+旋轉保留+onDestroy dismiss)。
+    // Editor 至少 dialog 欄位化＋onDestroy dismiss＋onSaveInstanceState 世代保留（見下）。
+    private var policyConfirmDialog: AlertDialog? = null
+    private val policyConfirmState = PolicyConfirmDialogState()
     // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
     // 刪除 user-95 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
     // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
@@ -228,6 +233,10 @@ class PolicyActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Phase D：旋轉保留世代 (expanded/dismissed 世代；pending 本體由 retained VM 重播).
+        // consent 為 session-scoped：ack 永不寫入 Bundle，還原強制清除
+        // (見 PolicyConfirmDialogState 檔頭；與 Main 同源).
+        policyConfirmState.restoreFromBundle(savedInstanceState)
 
         val root = ScrollView(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -381,6 +390,13 @@ class PolicyActivity : ComponentActivity() {
                         renderList()
                     }
                     updateCounter()
+                    // Phase D：state-driven dialog sync（同 MainActivity syncPolicyWriteDialog
+                    // 精簡版：旋轉由 retained VM 重播 pending 重建 dialog；終態/取消關閉）。
+                    try {
+                        syncPolicyConfirmDialog(s.pendingPolicyWrite, s.policyWritePhase)
+                    } catch (_: Exception) {
+                        // Best effort: sync 失敗不殺 collector。
+                    }
                 }
             }
         }
@@ -391,7 +407,26 @@ class PolicyActivity : ComponentActivity() {
         refresh()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Phase D：世代保留 (expanded/dismissed；pending 本體由 VM 保留；
+        // ack session-scoped 不存、shown 不存，見 holder 檔頭).
+        try {
+            policyConfirmState.saveToBundle(outState)
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
     override fun onDestroy() {
+        // Phase D：onDestroy dismiss（避免舊 Activity 的 window 洩漏；VM fence 不受影響）。
+        try {
+            policyConfirmDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        policyConfirmDialog = null
+        policyConfirmState.onPendingCleared()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -496,6 +531,28 @@ class PolicyActivity : ComponentActivity() {
 
     private fun showConfirmDialog(pending: PendingPolicyWrite) {
         if (isFinishing || isDestroyed) return
+        // Phase D shared semantics: SAVING/RECONCILING both block confirm (QUEUED only);
+        // cancel splits (SAVING no-op w/ toast, RECONCILING local-dismiss, else VM cancel).
+        // confirmSaving 經 policyConfirmSaving (single source，與 Main 同源).
+        val phase = try {
+            vm.state.value.policyWritePhase
+        } catch (_: RuntimeException) {
+            PolicyWritePhase.RECONCILING
+        }
+        val reconciling = phase == PolicyWritePhase.RECONCILING
+        val saving = phase == PolicyWritePhase.SAVING
+        // Stage J4 local suppression: already dismissed this generation during
+        // RECONCILING — do not rebuild (VM fence retained).
+        if (policyConfirmState.shouldSuppressForReconciling(pending, reconciling)) return
+        if (!reconciling) policyConfirmState.clearDismissIfNotReconciling(false)
+        // Phase D single source：confirmSaving 經 policyConfirmSaving 映射 (SAVING||RECONCILING).
+        val confirmSaving = policyConfirmSaving(saving, reconciling)
+        val cancelable = policyDialogShouldBeCancelable(saving, reconciling)
+        // Same-generation retains ack (rotation); cross-generation resets.
+        if (policyAckShouldReset(policyConfirmState.ackGeneration, pending.generation)) {
+            policyConfirmState.acknowledged = false
+            policyConfirmState.ackGeneration = null
+        }
         val total = pending.packages.size
         val sorted = pending.packages.sorted()
         val shown = sorted.take(POLICY_DIALOG_DISPLAY_MAX)
@@ -537,54 +594,150 @@ class PolicyActivity : ComponentActivity() {
             setText(R.string.policy_write_acknowledge)
             textSize = 12f
             minHeight = dp(48)
-            isChecked = false
+            isChecked = policyConfirmState.acknowledged &&
+                policyConfirmState.ackGeneration == pending.generation
         }
         container.addView(ack)
 
-        var dialog: AlertDialog? = null
-        ack.setOnCheckedChangeListener { _, checked ->
-            dialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
-                confirmAllowed(total, checked)
+        try {
+            policyConfirmDialog?.dismiss()
+        } catch (_: Exception) {
         }
-        dialog = AlertDialog.Builder(this)
+        policyConfirmState.onDialogShown(pending, confirmSaving)
+        ack.setOnCheckedChangeListener { _, checked ->
+            policyConfirmState.onAckChanged(checked, pending.generation)
+            policyConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyWriteCanConfirmInspectable(total, checked, confirmSaving)
+        }
+        policyConfirmDialog = AlertDialog.Builder(this)
             .setTitle(R.string.policy_write_title)
             .setMessage(resources.getQuantityString(R.plurals.policy_write_message, total, total))
             .setView(container)
-            .setCancelable(true)
+            .setCancelable(cancelable)
             // 「確認寫入」/「取消」：與主列表流程同鍵同義（VM 世代守衛再驗一次）。
             .setPositiveButton(R.string.policy_write_positive, null)
-            .setNegativeButton(R.string.dialog_cancel) { _, _ -> vm.cancelPolicyWrite(pending) }
-            .setOnCancelListener { vm.cancelPolicyWrite(pending) }
+            .setNegativeButton(R.string.dialog_cancel, null)
+            .setOnCancelListener {
+                val recNow = try {
+                    vm.state.value.policyWritePhase == PolicyWritePhase.RECONCILING
+                } catch (_: Exception) {
+                    reconciling
+                }
+                if (recNow) {
+                    policyConfirmState.onLocalDismissForReconciling(pending)
+                    try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
+                    policyConfirmDialog = null
+                } else {
+                    vm.cancelPolicyWrite(pending)
+                }
+            }
             .show()
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
-            isEnabled = false
+        policyConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
+            isEnabled = policyWriteCanConfirmInspectable(total, ack.isChecked, confirmSaving)
             setOnClickListener {
                 // Positive fires only with the ack checked (gate below + here);
                 // VM re-validates everything else (generation CAS, RECONCILING,
                 // in-flight, coordinator fences) — the dialog is not authority.
+                // SAVING/RECONCILING both block confirm (re-read live phase;
+                // Phase D single source：經 policyConfirmSaving 映射).
+                val curSaving = try {
+                    val ph = vm.state.value.policyWritePhase
+                    policyConfirmSaving(ph == PolicyWritePhase.SAVING, ph == PolicyWritePhase.RECONCILING)
+                } catch (_: RuntimeException) {
+                    true
+                }
                 if (!ack.isChecked) return@setOnClickListener
+                if (!policyWriteCanConfirmInspectable(total, ack.isChecked, curSaving)) return@setOnClickListener
                 val live = try {
                     vm.state.value.pendingPolicyWrite
                 } catch (_: RuntimeException) {
                     null
-                } ?: run { dialog?.dismiss(); return@setOnClickListener }
+                } ?: run { try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }; return@setOnClickListener }
                 vm.confirmPolicyWrite(live, live.generation)
             }
         }
+        policyConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.apply {
+            // SAVING keeps clickable for the toast (not silent no-op); RECONCILING
+            // local-dismisses; else VM cancel. Mirrors MainActivity negative arm.
+            isEnabled = true
+            setOnClickListener {
+                val phNow = try {
+                    vm.state.value.policyWritePhase
+                } catch (_: Exception) {
+                    if (reconciling) PolicyWritePhase.RECONCILING
+                    else if (saving) PolicyWritePhase.SAVING else PolicyWritePhase.IDLE
+                }
+                if (phNow == PolicyWritePhase.SAVING) {
+                    try {
+                        android.widget.Toast.makeText(
+                            this@PolicyActivity,
+                            getString(R.string.policy_write_cancel_denied),
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    } catch (_: Exception) {
+                    }
+                } else if (phNow == PolicyWritePhase.RECONCILING) {
+                    policyConfirmState.onLocalDismissForReconciling(pending)
+                    try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
+                    policyConfirmDialog = null
+                } else {
+                    vm.cancelPolicyWrite(pending)
+                }
+            }
+        }
+        policyConfirmDialog?.setCancelable(cancelable)
+        try {
+            policyConfirmDialog?.setCanceledOnTouchOutside(cancelable)
+        } catch (_: Exception) {
+        }
     }
 
-    // Minimal replica of MainActivity's policyWriteCanConfirmInspectable gate:
-    // ack checked + total <= 200 + phase != RECONCILING. The VM re-validates
-    // everything else (SAVING / BUSY / revision fences) on confirm.
-    private fun confirmAllowed(total: Int, acknowledged: Boolean): Boolean {
-        if (!acknowledged) return false
-        if (total > POLICY_DIALOG_DISPLAY_MAX) return false
-        val phase = try {
-            vm.state.value.policyWritePhase
-        } catch (_: RuntimeException) {
-            PolicyWritePhase.RECONCILING
+    // Phase D: state-driven sync (Main syncPolicyWriteDialog 精簡版). Null pending
+    // dismisses; same-instance showing only refreshes gates; RECONCILING local
+    // suppression honored; rotation re-shows from retained VM pending.
+    private fun syncPolicyConfirmDialog(pending: PendingPolicyWrite?, phase: PolicyWritePhase) {
+        if (isFinishing || isDestroyed) return
+        val reconciling = phase == PolicyWritePhase.RECONCILING
+        if (pending == null) {
+            try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
+            policyConfirmDialog = null
+            policyConfirmState.onPendingCleared()
+            return
         }
-        return phase != PolicyWritePhase.RECONCILING
+        if (reconciling && policyConfirmState.shouldSuppressForReconciling(pending, true)) {
+            try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
+            policyConfirmDialog = null
+            return
+        }
+        if (!reconciling) policyConfirmState.clearDismissIfNotReconciling(false)
+        val saving = phase == PolicyWritePhase.SAVING
+        // Phase D single source：confirmSaving 經 policyConfirmSaving 映射.
+        val confirmSaving = policyConfirmSaving(saving, reconciling)
+        if (policyConfirmDialog?.isShowing == true && policyConfirmState.shownPending == pending) {
+            policyConfirmDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                policyWriteCanConfirmInspectable(pending.packages.size, policyConfirmState.acknowledged, confirmSaving)
+            policyConfirmDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
+            val cancelable = policyDialogShouldBeCancelable(saving, reconciling)
+            policyConfirmDialog?.setCancelable(cancelable)
+            try { policyConfirmDialog?.setCanceledOnTouchOutside(cancelable) } catch (_: Exception) { }
+            policyConfirmState.onSavingFlip(confirmSaving)
+            return
+        }
+        // Not showing (rotation / first show): rebuild with retained ack generation.
+        showConfirmDialog(pending)
+    }
+
+    // Shared gate (Main single source): ack + total<=200 + not (SAVING||RECONCILING).
+    // Kept as thin delegate so call sites read identically on both screens.
+    // Phase D single source：saving 映射經 policyConfirmSaving.
+    private fun confirmAllowed(total: Int, acknowledged: Boolean): Boolean {
+        val savingNow = try {
+            val ph = vm.state.value.policyWritePhase
+            policyConfirmSaving(ph == PolicyWritePhase.SAVING, ph == PolicyWritePhase.RECONCILING)
+        } catch (_: RuntimeException) {
+            true
+        }
+        return policyWriteCanConfirmInspectable(total, acknowledged, savingNow)
     }
 
     private fun renderList() {
