@@ -261,11 +261,11 @@ class PolicyActivity : ComponentActivity() {
             ).apply { bottomMargin = dp(10) }
 
             addView(Button(this@PolicyActivity).apply {
-                text = "返回"
+                text = getString(R.string.policy_editor_back)
                 setOnClickListener { finish() }
             })
             addView(TextView(this@PolicyActivity).apply {
-                text = "Hook 政策（Dual Messenger 可用應用程式）"
+                text = getString(R.string.policy_editor_title)
                 textSize = 15f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(getColor(R.color.oneui_text_primary))
@@ -324,7 +324,7 @@ class PolicyActivity : ComponentActivity() {
 
         // "show system apps" toggle (default off).
         includeSystemCheck = CheckBox(this).apply {
-            text = "顯示系統應用（政策通常只需用於第三方）"
+            text = getString(R.string.policy_editor_show_system)
             textSize = 12f
             setTextColor(getColor(R.color.oneui_text_secondary))
             setOnCheckedChangeListener { _, _ ->
@@ -351,8 +351,13 @@ class PolicyActivity : ComponentActivity() {
         column.addView(listContainer)
 
         // 「寫入政策草稿」bar button：顯示目前勾選數；on press 走 VM 兩階段流程。
+        // Phase E：文案經 policy_editor_write_draft_format 資源化（三語系同鍵）。
         writeBarBtn = Button(this).apply {
-            text = "寫入政策草稿（0）"
+            text = try {
+                getString(R.string.policy_editor_write_draft_format, 0)
+            } catch (_: Exception) {
+                "寫入政策草稿（0）"
+            }
             background = getDrawable(R.drawable.bg_pill_button_secondary)
             setTextColor(getColor(R.color.oneui_text_primary))
             textSize = 12f
@@ -454,24 +459,86 @@ class PolicyActivity : ComponentActivity() {
         )
     }
 
+    // Phase E 孤兒條目：ticks 中不在 catalog 的包名（已解除安裝／篩選剔除後殘留）。
+    // catalog 未載入（catalogCache==null）時回空集，避免載入中誤判全孤兒。
+    // 隱私：呼叫端僅用 size 計數呈現＋一鍵移除；log 亦只記計數，不記包名原文
+    // （與 MainActivity preClearLog 計數口徑一致）。
+    internal fun orphanTicks(): Set<String> {
+        val cache = catalogCache ?: return emptySet()
+        if (cache.isEmpty()) return emptySet()
+        return try {
+            val names = cache.map { it.packageName }.toSet()
+            orphanPackagesOf(ticks, names)
+        } catch (_: Exception) {
+            emptySet()
+        }
+    }
+
     private fun hintText(): String {
         val policySize = ticks.size
-        return if (hintTotal > MAX_LIST_ROWS) {
-            "顯示前 ${MAX_LIST_ROWS} 筆（共 $hintTotal 筆，已勾選 $policySize）；請用搜尋縮小範圍"
-        } else {
-            "共 $hintVisible 筆 · 已勾選 $policySize"
+        return try {
+            if (hintTotal > MAX_LIST_ROWS) {
+                getString(
+                    R.string.policy_editor_hint_capped_format,
+                    MAX_LIST_ROWS,
+                    hintTotal,
+                    policySize,
+                )
+            } else {
+                getString(R.string.policy_editor_hint_format, hintVisible, policySize)
+            }
+        } catch (_: Exception) {
+            if (hintTotal > MAX_LIST_ROWS) {
+                "顯示前 ${MAX_LIST_ROWS} 筆（共 $hintTotal 筆，已勾選 $policySize）；請用搜尋縮小範圍"
+            } else {
+                "共 $hintVisible 筆 · 已勾選 $policySize"
+            }
         }
     }
 
     private fun updateCounter() {
-        counterView.text = "目前 ${ticks.size} 個包名"
+        // Phase E：計數行經 policy_editor_counter plurals 資源化＋複用
+        // policy_dropped 後綴呈現孤兒數（三語系同鍵；JVM 無 Activity 資源時回退硬編碼）。
+        val orphanCount = try {
+            orphanTicks().size
+        } catch (_: Exception) {
+            0
+        }
+        counterView.text = try {
+            val base = resources.getQuantityString(
+                R.plurals.policy_editor_counter,
+                ticks.size,
+                ticks.size,
+            )
+            if (orphanCount > 0) {
+                val suffix = resources.getQuantityString(
+                    R.plurals.policy_dropped,
+                    orphanCount,
+                    orphanCount,
+                )
+                "$base\n$suffix"
+            } else {
+                base
+            }
+        } catch (_: Exception) {
+            val base = "目前 ${ticks.size} 個包名"
+            if (orphanCount > 0) {
+                "$base\n已捨去 $orphanCount 項不在來源清單的勾選"
+            } else {
+                base
+            }
+        }
         if (::countHintView.isInitialized) {
             countHintView.text = hintText()
         }
         if (::writeBarBtn.isInitialized) {
             writeBarBtn.isEnabled = phaseIsIdle && policyDraftKnown
             writeBarBtn.text = if (policyDraftKnown) {
-                "寫入政策草稿（${ticks.size}）"
+                try {
+                    getString(R.string.policy_editor_write_draft_format, ticks.size)
+                } catch (_: Exception) {
+                    "寫入政策草稿（${ticks.size}）"
+                }
             } else {
                 getString(R.string.policy_unknown_refresh)
             }
@@ -611,7 +678,7 @@ class PolicyActivity : ComponentActivity() {
         }
         policyConfirmDialog = AlertDialog.Builder(this)
             .setTitle(R.string.policy_write_title)
-            .setMessage(resources.getQuantityString(R.plurals.policy_write_message, total, total))
+            .setMessage(policyEditorConfirmMessage(pending))
             .setView(container)
             .setCancelable(cancelable)
             // 「確認寫入」/「取消」：與主列表流程同鍵同義（VM 世代守衛再驗一次）。
@@ -692,6 +759,31 @@ class PolicyActivity : ComponentActivity() {
         }
     }
 
+    // Phase E：編輯器確認訊息複用 policy_dropped 後綴（與 MainActivity.policyWriteMessage
+    // 同口徑：主模板 policy_write_message＋dropped 後綴；三語系同鍵；JVM 無資源時回退硬編碼）。
+    // docs/USAGE.md 政策 TTL 對照表為真相單一來源（App 側確認 5 分鐘 vs hook 側 60 秒），此處僅呈現，不重定義。
+    internal fun policyEditorConfirmMessage(pending: PendingPolicyWrite): String {
+        val total = pending.packages.size
+        var message = try {
+            resources.getQuantityString(R.plurals.policy_write_message, total, total)
+        } catch (_: Exception) {
+            "政策寫入（$total 項）"
+        }
+        if (pending.droppedCount > 0) {
+            val suffix = try {
+                resources.getQuantityString(
+                    R.plurals.policy_dropped,
+                    pending.droppedCount,
+                    pending.droppedCount,
+                )
+            } catch (_: Exception) {
+                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+            }
+            message += "\n$suffix"
+        }
+        return message
+    }
+
     // Phase D: state-driven sync (Main syncPolicyWriteDialog 精簡版). Null pending
     // dismisses; same-instance showing only refreshes gates; RECONCILING local
     // suppression honored; rotation re-shows from retained VM pending.
@@ -751,7 +843,11 @@ class PolicyActivity : ComponentActivity() {
             catalogLoading = true
             listContainer.removeAllViews()
             listContainer.addView(TextView(this).apply {
-                text = "載入中…"
+                text = try {
+                    getString(R.string.policy_editor_loading)
+                } catch (_: Exception) {
+                    "載入中…"
+                }
                 textSize = 13f
                 setTextColor(getColor(R.color.oneui_text_secondary))
                 setPadding(0, dp(16), 0, dp(16))
@@ -783,10 +879,18 @@ class PolicyActivity : ComponentActivity() {
 
         if (visible.isEmpty()) {
             listContainer.addView(TextView(this).apply {
-                text = when {
-                    catalog.isEmpty() -> "無法列舉已安裝應用（PackageManager 回傳空或失敗）"
-                    query.isBlank() -> "無可用的應用（會被目前的系統應用篩選剔除）；請勾選「顯示系統應用」試試"
-                    else -> "無符合「$query」的應用"
+                text = try {
+                    when {
+                        catalog.isEmpty() -> getString(R.string.policy_editor_empty_catalog)
+                        query.isBlank() -> getString(R.string.policy_editor_empty_filtered)
+                        else -> getString(R.string.policy_editor_empty_nomatch_format, query)
+                    }
+                } catch (_: Exception) {
+                    when {
+                        catalog.isEmpty() -> "無法列舉已安裝應用（PackageManager 回傳空或失敗）"
+                        query.isBlank() -> "無可用的應用（會被目前的系統應用篩選剔除）；請勾選「顯示系統應用」試試"
+                        else -> "無符合「$query」的應用"
+                    }
                 }
                 textSize = 13f
                 setTextColor(getColor(R.color.oneui_text_secondary))
@@ -798,6 +902,60 @@ class PolicyActivity : ComponentActivity() {
                 listContainer.addView(row.first)
                 iconRows.add(entry.packageName to row.second)
             }
+        }
+
+        // Phase E 孤兒區段：catalog 缺失 ticks（不在來源清單）獨立成段＋一鍵移除。
+        // 標題／按鈕皆帶參資源化（三語系同鍵）；移除僅動本地 ticks，不碰 store，
+        // 實際寫入仍走「寫入政策草稿」→pending→確認兩階段。
+        val orphans = try {
+            orphanTicks().sorted()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (orphans.isNotEmpty()) {
+            listContainer.addView(TextView(this).apply {
+                text = try {
+                    getString(R.string.policy_editor_orphan_header_format, orphans.size)
+                } catch (_: Exception) {
+                    "不在來源清單（${orphans.size}）"
+                }
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(getColor(R.color.oneui_text_primary))
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(12); bottomMargin = dp(4) }
+            })
+            for (pkg in orphans) {
+                listContainer.addView(TextView(this).apply {
+                    text = pkg
+                    textSize = 11f
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(getColor(R.color.oneui_text_secondary))
+                    contentDescription = try {
+                        getString(R.string.policy_editor_orphan_item_cd_format, pkg)
+                    } catch (_: Exception) {
+                        "不在來源清單的勾選：$pkg"
+                    }
+                    setPadding(0, dp(2), 0, dp(2))
+                })
+            }
+            listContainer.addView(Button(this).apply {
+                text = try {
+                    getString(R.string.policy_editor_orphan_remove_format, orphans.size)
+                } catch (_: Exception) {
+                    "一鍵移除不在來源清單的勾選（${orphans.size}）"
+                }
+                isEnabled = phaseIsIdle
+                minimumHeight = dp(48)
+                setOnClickListener {
+                    if (!phaseIsIdle) return@setOnClickListener
+                    ticks.removeAll(orphans.toSet())
+                    renderList()
+                    updateCounter()
+                }
+            })
         }
 
         countHintView.text = hintText()
@@ -848,7 +1006,11 @@ class PolicyActivity : ComponentActivity() {
         val box = CheckBox(this).apply {
             isChecked = inPolicy
             isEnabled = phaseIsIdle
-            contentDescription = "切換 ${entry.label}（$pkg）的 Hook 政策勾選"
+            contentDescription = try {
+                getString(R.string.policy_editor_toggle_cd_format, entry.label, pkg)
+            } catch (_: Exception) {
+                "切換 ${entry.label}（$pkg）的 Hook 政策勾選"
+            }
             minHeight = dp(48)
             minWidth = dp(48)
             setOnCheckedChangeListener { _, checked ->
@@ -914,5 +1076,18 @@ class PolicyActivity : ComponentActivity() {
 
     companion object {
         private const val MAX_LIST_ROWS = 200
+    }
+}
+
+// Phase E 孤兒判定純函數（JVM 可測，無 Android 依賴）：ticks 中不在 catalog 包名集合者。
+// 空 catalog（尚未載入／確實無應用）回空集，避免載入中誤判全孤兒；呼叫端僅用 size
+// 計數呈現＋一鍵移除，log 亦只記計數，不記包名原文（隱私：log 包名改計數）。
+internal fun orphanPackagesOf(ticks: Set<String>, catalogPackageNames: Set<String>): Set<String> {
+    if (catalogPackageNames.isEmpty()) return emptySet()
+    if (ticks.isEmpty()) return emptySet()
+    return try {
+        ticks.filterTo(LinkedHashSet()) { it !in catalogPackageNames }
+    } catch (_: Exception) {
+        emptySet()
     }
 }

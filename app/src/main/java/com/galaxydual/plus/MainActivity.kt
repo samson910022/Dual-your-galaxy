@@ -7401,11 +7401,16 @@ internal fun preClearLog(msg: String, e: Throwable? = null) {
     }
 }
 
-internal suspend fun uninstallDualAppsInUser95(pkgs: Collection<String>): Boolean {
+// Phase E：gateway 可注入（JVM 測試經 FakeGateway 覆蓋 error/partial/Unknown/cancel/race；
+// 生產預設仍走 SuCmdGateway）。隱私：log 只記計數／狀態旗標，不記包名原文（log 包名改計數）。
+internal suspend fun uninstallDualAppsInUser95(
+    pkgs: Collection<String>,
+    gateway: CmdGateway = SuCmdGateway(),
+): Boolean {
     if (pkgs.isEmpty()) return true
     val cmd = buildDualUninstallCommand(pkgs.toList())
     return try {
-        val result = SuCmdGateway().run(cmd)
+        val result = gateway.run(cmd)
         // Reuse decideDualProbeResult fail-closed signals: truncated output,
         // timeout, or transport loss is never a success, even with exit 0.
         if (result.timedOut || result.transportUnknown || result.truncated ||
@@ -7483,7 +7488,17 @@ internal fun showPreClearWarning(
                         .setMessage(
                             host.getString(R.string.pre_clear_root_uninstall_confirm) +
                                 "\n\n" + shown.joinToString("\n") +
-                                if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…（共 ${sorted.size} 個，僅顯示前 $PRE_CLEAR_LIST_MAX 筆）" else "",
+                                if (sorted.size > PRE_CLEAR_LIST_MAX) {
+                                    try {
+                                        host.getString(
+                                            R.string.pre_clear_list_truncated_format,
+                                            sorted.size,
+                                            PRE_CLEAR_LIST_MAX,
+                                        )
+                                    } catch (_: Exception) {
+                                        "\n…（共 ${sorted.size} 個，僅顯示前 $PRE_CLEAR_LIST_MAX 筆）"
+                                    }
+                                } else "",
                         )
                         .setCancelable(true)
                         .setPositiveButton(android.R.string.ok) { _, _ ->

@@ -65,12 +65,36 @@
     <string name="action_edit_policy">編輯應用清單</string>
     <string name="policy_draft_format">白名單政策（草稿・未保證生效）：%1$d 項</string>
     <string name="policy_draft_unknown">白名單政策（草稿・未保證生效）：狀態未知（無法讀取或內容損壞），請見上方狀態說明，或點「重新整理草稿」重試</string>
-    <!-- PolicyActivity 編輯器頂部說明（與 policy_cleared／pre_clear_message 同口徑：政策為空時Samsung自動刪除分身及其資料）。 -->
-    <string name="policy_editor_intro">政策=union-only 白名單擴充（預設空＝ observe-only）；變更經「寫入政策草稿」→確認對話框（勾選≠安裝）；寫入後 hook 於下次輪詢（最長約 60 秒／或重啟）讀取生效。已停用或未安裝的 App 會被 BBC hook 過濾。注意：政策為空時 Samsung 會自動刪除分身及其資料（無法復原）。</string>
+    <!-- PolicyActivity 編輯器頂部說明（與 policy_cleared／pre_clear_message 同口徑：政策為空時Samsung自動刪除分身及其資料）。
+         Phase E TTL 口徑（docs/USAGE.md 政策 TTL 對照表：hook 側快取 60 秒／無跨行程推送）：寫入後最快約60秒可見；若60秒後未生效請重啟後再看（無即時推送）。 -->
+    <string name="policy_editor_intro">政策=union-only 白名單擴充（預設空＝ observe-only）；變更經「寫入政策草稿」→確認對話框（勾選≠安裝）；寫入後最快約60秒可見；若60秒後未生效請重啟後再看（無即時推送）。已停用或未安裝的 App 會被 BBC hook 過濾。注意：政策為空時 Samsung 會自動刪除分身及其資料（無法復原）。</string>
+    <!-- Phase E：編輯器硬中文資源化（前身 PolicyActivity.kt 硬編碼字面；三語系同鍵）。 -->
+    <string name="policy_editor_back">返回</string>
+    <string name="policy_editor_title">Hook 政策（Dual Messenger 可用應用程式）</string>
+    <string name="policy_editor_show_system">顯示系統應用（政策通常只需用於第三方）</string>
+    <string name="policy_editor_loading">載入中…</string>
+    <string name="policy_editor_empty_catalog">無法列舉已安裝應用（PackageManager 回傳空或失敗）</string>
+    <string name="policy_editor_empty_filtered">無可用的應用（會被目前的系統應用篩選剔除）；請勾選「顯示系統應用」試試</string>
+    <string name="policy_editor_empty_nomatch_format">無符合「%1$s」的應用</string>
+    <string name="policy_editor_toggle_cd_format">切換 %1$s（%2$s）的 Hook 政策勾選</string>
+    <string name="policy_editor_hint_capped_format">顯示前 %1$d 筆（共 %2$d 筆，已勾選 %3$d）；請用搜尋縮小範圍</string>
+    <string name="policy_editor_hint_format">共 %1$d 筆 · 已勾選 %2$d</string>
+    <string name="policy_editor_write_draft_format">寫入政策草稿（%1$d）</string>
+    <plurals name="policy_editor_counter">
+        <item quantity="one">目前 %1$d 個包名</item>
+        <item quantity="other">目前 %1$d 個包名</item>
+    </plurals>
+    <!-- Phase E 孤兒條目 UI：catalog 缺失 ticks 區段＋一鍵移除（計數行／確認框複用 policy_dropped 後綴）。 -->
+    <string name="policy_editor_orphan_header_format">不在來源清單（%1$d）</string>
+    <string name="policy_editor_orphan_remove_format">一鍵移除不在來源清單的勾選（%1$d）</string>
+    <string name="policy_editor_orphan_item_cd_format">不在來源清單的勾選：%1$s</string>
+    <!-- Phase E：pre-clear 截斷計數模板資源化（前身 MainActivity.kt 硬編碼拼接；帶參 string）。 -->
+    <string name="pre_clear_list_truncated_format">\n…（共 %1$d 個，僅顯示前 %2$d 筆）</string>
+    <string name="pre_clear_uninstall_verify_truncated_suffix_format">…（僅顯示前 %1$d 項，共 %2$d 項）</string>
     <string name="policy_write_title">確認寫入白名單政策草稿</string>
     <plurals name="policy_write_message">
-        <item quantity="one">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）。注意：hook 以輪詢設計讀取此草稿，非空草稿可能於其下次輪詢或重啟後放寬白名單——效果未經實機驗證，不保證生效；清除草稿後，hook 於下次重讀（最長約 60 秒／或重啟）起停止後續放寬，但已放寬的項目不會自動還原。\n須勾選下方確認框才會啟用「確認寫入」。</item>
-        <item quantity="other">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）。注意：hook 以輪詢設計讀取此草稿，非空草稿可能於其下次輪詢或重啟後放寬白名單——效果未經實機驗證，不保證生效；清除草稿後，hook 於下次重讀（最長約 60 秒／或重啟）起停止後續放寬，但已放寬的項目不會自動還原。\n須勾選下方確認框才會啟用「確認寫入」。</item>
+        <item quantity="one">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）。注意：hook 以輪詢設計讀取此草稿（無即時推送）：寫入後最快約60秒可見；若60秒後未生效請重啟後再看；非空草稿可能於其下次輪詢或重啟後放寬白名單——效果未經實機驗證，不保證生效；清除草稿後，hook 於下次重讀或重啟起停止後續放寬，但已放寬的項目不會自動還原。\n須勾選下方確認框才會啟用「確認寫入」。</item>
+        <item quantity="other">將把以下 %1$d 個包名寫入白名單政策草稿（dual_policy；勾選≠安裝，可隨時清除）。注意：hook 以輪詢設計讀取此草稿（無即時推送）：寫入後最快約60秒可見；若60秒後未生效請重啟後再看；非空草稿可能於其下次輪詢或重啟後放寬白名單——效果未經實機驗證，不保證生效；清除草稿後，hook 於下次重讀或重啟起停止後續放寬，但已放寬的項目不會自動還原。\n須勾選下方確認框才會啟用「確認寫入」。</item>
     </plurals>
     <string name="policy_write_acknowledge">我已確認上述包名為要放寬白名單的對象。</string>
     <string name="policy_write_positive">確認寫入</string>

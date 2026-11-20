@@ -57,6 +57,11 @@ internal object BbcInjector {
     // - `enabled`/`installed` lookups are caller-injected so JVM tests can
     //   verify the pure decision without PackageManager.
     // - Never throws (call site wraps try/catch, but we keep it total anyway).
+    //
+    // Phase E 效能基準（JVM，見 BbcMergeTimingTest）：N=50/200/512 政策合併耗時皆為
+    // 微秒級（線性 O(original+policy)，N=512 亦遠小於 50ms）；hook 熱路徑 50ms 預算
+    // （PolicyRefreshBudget）治理的是 IPC＋等待，不是此純內存合併——PM 解析
+    // （PmOutputParser）同樣不在 50ms 內，兩者預算獨立（見 PmOutputParser 檔頭聲明）。
     internal fun mergeAvailableList(
         original: List<String>,
         policy: Set<String>,

@@ -60,12 +60,36 @@
     <string name="action_edit_policy">Edit app list</string>
     <string name="policy_draft_format">Whitelist policy (draft, effect unverified): %1$d items</string>
     <string name="policy_draft_unknown">Whitelist policy (draft, effect unverified): unknown (unreadable or corrupt — see the status banner at the top; tap Refresh draft to retry)</string>
-    <!-- PolicyActivity editor header (same wording as policy_cleared / pre_clear_message: empty policy causes Samsung to auto-delete clones and their data). -->
-    <string name="policy_editor_intro">Policy is a union-only whitelist extension (empty by default = observe-only); changes go through “Write policy draft” → confirmation dialog (checking ≠ installing); the hook reads it on its next poll (up to ~60s / or after reboot). Disabled or uninstalled apps are filtered by the BBC hook. Note: an empty policy causes Samsung to auto-delete clones and their data (unrecoverable).</string>
+    <!-- PolicyActivity editor header (same wording as policy_cleared / pre_clear_message: empty policy causes Samsung to auto-delete clones and their data).
+         Phase E TTL wording (docs/USAGE.md policy TTL table: hook-side cache 60s / no cross-process push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again (no push). -->
+    <string name="policy_editor_intro">Policy is a union-only whitelist extension (empty by default = observe-only); changes go through “Write policy draft” → confirmation dialog (checking ≠ installing); visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again (no push). Disabled or uninstalled apps are filtered by the BBC hook. Note: an empty policy causes Samsung to auto-delete clones and their data (unrecoverable).</string>
+    <!-- Phase E: editor hardcoded-Chinese resourcing (was literals in PolicyActivity.kt; same keys across locales). -->
+    <string name="policy_editor_back">Back</string>
+    <string name="policy_editor_title">Hook policy (Dual Messenger available apps)</string>
+    <string name="policy_editor_show_system">Show system apps (policy usually only for third-party)</string>
+    <string name="policy_editor_loading">Loading…</string>
+    <string name="policy_editor_empty_catalog">Cannot list installed apps (PackageManager empty or failed)</string>
+    <string name="policy_editor_empty_filtered">No available apps (filtered by system-app filter); try checking “Show system apps”</string>
+    <string name="policy_editor_empty_nomatch_format">No apps matching “%1$s”</string>
+    <string name="policy_editor_toggle_cd_format">Toggle Hook policy for %1$s (%2$s)</string>
+    <string name="policy_editor_hint_capped_format">Showing first %1$d of %2$d (%3$d selected); narrow with search</string>
+    <string name="policy_editor_hint_format">%1$d shown · %2$d selected</string>
+    <string name="policy_editor_write_draft_format">Write policy draft (%1$d)</string>
+    <plurals name="policy_editor_counter">
+        <item quantity="one">Currently %1$d package</item>
+        <item quantity="other">Currently %1$d packages</item>
+    </plurals>
+    <!-- Phase E orphan UI: catalog-missing ticks section + one-click removal (counter/confirm reuse policy_dropped suffix). -->
+    <string name="policy_editor_orphan_header_format">Not in source list (%1$d)</string>
+    <string name="policy_editor_orphan_remove_format">Remove all not-in-source selections (%1$d)</string>
+    <string name="policy_editor_orphan_item_cd_format">Not-in-source selection: %1$s</string>
+    <!-- Phase E: pre-clear truncation count template resourcing (was hardcoded concat in MainActivity.kt; parameterized string). -->
+    <string name="pre_clear_list_truncated_format">\n… (%1$d total, showing first %2$d)</string>
+    <string name="pre_clear_uninstall_verify_truncated_suffix_format">… (showing first %1$d of %2$d)</string>
     <string name="policy_write_title">Write whitelist policy draft</string>
     <plurals name="policy_write_message">
-        <item quantity="one">This will write the following %1$d package into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook is designed to poll this draft — a non-empty draft may relax the whitelist on its next poll or restart; effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it (up to the 60s TTL, or after a restart), but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
-        <item quantity="other">This will write the following %1$d packages into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook is designed to poll this draft — a non-empty draft may relax the whitelist on its next poll or restart; effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it (up to the 60s TTL, or after a restart), but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
+        <item quantity="one">This will write the following %1$d package into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again; a non-empty draft may relax the whitelist on its next poll or restart — effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it or restarts, but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
+        <item quantity="other">This will write the following %1$d packages into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again; a non-empty draft may relax the whitelist on its next poll or restart — effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it or restarts, but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
     </plurals>
     <string name="policy_write_acknowledge">I confirm the packages above should be relaxed in the whitelist.</string>
     <string name="policy_write_positive">Write policy</string>
