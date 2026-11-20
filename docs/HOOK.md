@@ -35,17 +35,22 @@
   因此 hook 行程註冊的 `OnSharedPreferenceChangeListener` **永遠不會**因
   app 行程寫入而觸發——舊文案「daemon 推送＋invalidate 近乎即時」為誤述，
   已更正。`DualHook` 保留註冊僅為同行程 hygiene（防 stale-instance 洩漏），
-  新鮮度**不依賴**它。新鮮度機制＝**輪詢**：
+  新鮮度**不依賴**它。新鮮度機制＝**輪詢＋版本證明（PR #74 Phase 3 已實作）**：
   `EffectivePolicyCache` TTL（`maxCacheAgeMs` 60 秒）到期後下次讀取重讀同一
   cached 實例；因實例永久快取，輪詢仍可能讀到舊值直到**重啟**（daemon 重建
-  才重同步權威值）。（寫入側的「版本／序列鍵」方案——`dual_policy` 內另存
-  `extra_whitelist_version` 單調序號，hook 側比對序號判定是否過期——**規劃中／未實作**：
-  目前沒有任何代碼讀寫該鍵，見下），讀者目前僅能以 TTL＋重啟語義判定新鮮度，
+  才重同步權威值）。寫入側 `HookPolicyStore` 在 `dual_policy` 同 group 另存單調
+  `extra_whitelist_version`（每次 save/clear＋1，與 packages 同一 atomic commit）；
+  hook 側 BBC 讀取走 seqlock 自洽快照（version-before → 防禦性 copy → version-after，
+  不一致即 fail-closed 回 Unknown），並以 **Good（非空）／Cleared（空＋版本證明）**
+  單調版本閘拒絕重放與陳舊值。此為「可觀測的新鮮度證據」，**不是**跨行程推送替代：
+  版本亦經同一永久快取實例，底層 `mMap` 可能仍陳舊，新鮮度仍受 TTL＋重啟語義節制，
+  不保證 60s 內或下一次 poll 看到新集合；重啟 hook 行程後才保證讀到新值。
   重啟語義見 §2.3。端到端仍需 on-device 驗證
   （DEVICE-UNVERIFIED）。
    hook 側 TTL 一覽（皆見 `EffectivePolicyCache`，與 App 側 TTL 對照見 `docs/USAGE.md` 政策 TTL 對照表）：
    - 快取 TTL `maxCacheAgeMs` 60 秒：到期後下次讀取 fail-closed 回 seed（`invalidated=true`），不復活過期值；TTL 到期不 bump 世代（到期前已發起的在途新鮮讀仍可滿足到期）。能力缺失（`PROP_CAP_REMOTE` false→`emptySet()` 成功空讀）同樣被快取 60 秒，故 false 有效重試＝max(60 秒 TTL，5 秒 latch 內閘)；latch 5 秒僅在快取 miss（TTL 到期／`invalidate()`）後才可達。
    - 失敗節流 `failureCooldownMs` 5 秒：遠端讀取失敗（null／拋出，未被快取）後不重試 reader，回 `last-known-good`（未 invalidate 時）或 seed；`invalidate()` 顯式重置節流。注意與上條區分：失敗（未快取）由 5 秒節流，能力-false 空讀（已快取）由 60 秒 TTL 閘控。
+   - BBC sticky `BBC_STICKY_MAX_AGE_MS` 30 分鐘：讀取失敗／Unknown 時沿用最近一次成功集合（Good 非空或 Cleared 空＋版本證明）的**有界降解視窗**上限，超過即 fail-closed 回空；這**不是**冷啟動刪除的結構性修正——DELETE 早於 BBC 回調且回調非空，sticky 對該路徑無對照證據（見 `BBC_COLDSTART_DELETE_INCIDENT.md` §8.4）。清除草稿後亦可能因本地快取／sticky 在最多 30 分鐘內沿用舊集合，無即時停止保證。
     - 能力熔斷開啟期間（capability gate 卡住／爭用，`PolicyRefreshContentionException` 被 `isRemoteCapable` 吞掉而回 null，見 DualHook catch-site KDoc：閘門級 herd fix 經此路徑被繞開）：`EffectivePolicyCache` 將該 null 視為失敗讀取並續期 5 秒 `failureCooldownMs`——TTL 到期（invalidated=true）後的每次 5 秒節流重試都會再次續期節流，完整能力的刷新路徑被壓在 seed-only，直到 5 秒節流的能力探針成功為止——此條僅如實記錄既有行為，明確不改代碼。
     - reconciler 總預算 `POLICY_RECONCILE_TOTAL_BUDGET_MS` 15 秒（App 側，Stage F2/G2）：reconciler join＋3 讀＋退避合計有界；handover 登記的 Tx 由行程級 coordinator 的 app-scoped 域接手，reconciler 不隨 VM 死亡；超限即誠實 unresolved（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留＋`RECONCILING` 續留，Tx 存活）——有 ground truth 則收斂回 `IDLE`，無 ground truth 則維持 `RECONCILING`（joinable（armed／已交接）的兄弟 VM 由 init reclaim 認領為 `RECONCILING` 並 join 同一 deferred；僅「owner 存活且 Tx 未 arm（PREPARING）」的兄弟 VM 見 `BUSY`，直到 owner 終態後自行收斂；不一律 `BUSY`；「稍後刷新」僅為手動 late-join 提示）（見 `docs/USAGE.md` 政策 TTL 對照表）。
     - 單次 auto-recheck（App 側，Stage G2）：`deferred.invokeOnCompletion` 在 handoverTx 登記時掛單次權威重查（`boundedReconcileRead`，coordinator app-scoped 域＋`Dispatchers.IO` 共用 IO 池，容量有界讀取 wrapper，非獨立 pool，不耗 reconciler 三讀預算）→走 settle helper（deferred 完成＋Known==預期才結清）；Unknown 保持 unresolved＋`UNRESOLVED_REFRESH`（按鈕即重新整理草稿，待手動 refresh late-join）。terminal-publish arbitration（Stage P2）= Tx-scoped adoption-epoch fence：busy-waiter 與 async-init 認領在 commitMutex 內 bump 共享 `PolicyTx.adoptionEpoch`（sync-init 認領（joinable）不再於 init 內直接 bump：init 的 commitMutex tryLock 快照僅為「建議性」觀察，認領本身——本地 CAS＋adoptionEpoch bump＋RECONCILING fence flip——一律經 launchReclaimAsync 於 commitMutex 內線性化，與 busy-waiter 及 async-init 同臂，詳見 DualViewModel.kt sync-init 註記；三臂的 fence 皆於 claim 時與同一 mutex 內比對，為 fail-closed。attach 時快照，claim 時於同一 mutex 內比對，fence 失敗即 EPOCH_STALE（不消耗 claim、不 bump rev、不發布）；讀取橫跨認領的 worker retain 並讓位 adopter；舊 worker 在認領 bump 前線性化則合法勝出（linearization point = claim CAS inside commitMutex，順序以 mutex 到達為準）。
@@ -61,13 +66,15 @@
   on-device 證明——若 LSPosed 同 group 永回同一快取實例則此層生產永不命中，
   若 wrapper 共享底層 mMap 則仍有污染風險。TODO(on-device)：驗證 daemon 重建
   後新實例是否重同步權威值、同 group 是否回同一實例、wrapper 是否共享 mMap。
-  版本／序列鍵（P1-1 poll 配套，**規劃中／未實作**，DEVICE-UNVERIFIED）：此方案尚未接線——
-  沒有任何代碼讀寫 `extra_whitelist_version`（寫入側 save/clear 不 bump、hook 側重讀不比對）。
-  規劃內容為：寫入側在同 group 另存單調 `extra_whitelist_version`（Long，每次 save/clear＋1），
-  hook 側重讀時比對序號（舊序號＝過期，沿用 TTL 回退），App 側 reconciler／refresh 以序號
-  判定是否需重讀。即使將來實作，序號本身亦經同一永久快取實例，故仍受重啟語義約束（daemon
-  重建前序號亦可能過期），僅為「可觀測的新鮮度證據」，非推送替代。目前新鮮度僅靠 TTL＋重啟語義，
-  不得假設序號存在。
+  版本／序列鍵（P1-1 poll 配套，**PR #74 Phase 3 已實作**，端到端仍 DEVICE-UNVERIFIED）：
+  寫入側 `HookPolicyStore` 已在同 group 另存單調 `extra_whitelist_version`（Long，每次
+  save/clear＋1，與 packages 同一 atomic commit）；hook 側 BBC 讀取以 seqlock 自洽快照
+  （version-before → 防禦性 copy → version-after，不一致 fail-closed 回 Unknown）搭配
+  **Good（非空）／Cleared（空＋版本證明）**單調版本閘，拒絕重放／陳舊值（含內容感知的
+  同版本再接受規則）；App 側 reconciler／refresh 以版本判定是否需重讀。版本本身仍經同一
+  永久快取實例，底層 mMap 可能仍陳舊，故仍受 TTL＋重啟語義約束（daemon 重建前版本亦可能
+  過期），僅為「可觀測的新鮮度證據」，**非推送替代**；不保證 60s 內或下一次 poll 看到新集合，
+  重啟 hook 行程後才保證讀到新值。DevOps 端無須額外操作，但端到端 read-after-write 仍待實機證明。
 - App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
   Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
@@ -94,7 +101,7 @@
   `EffectivePolicyDeadlineTest` 鎖定端到端 total（雙 40ms 截斷、快慢合併、contention 不續節流、grace 0 快速），
   並以 `PolicyRefreshGateProcessCapTest` 鎖定 epoch 與 process 預算分離（invalidate 只重置 epoch）、drained 探針
   不消耗 process 預算、cap 耗盡後一律 fail-closed（拒絕換新 executor）、以及雙 gate 實例預算互相獨立。
-- BBC 注入是本模組**唯一帶開啟效應閘的政策消費者**：BBC 清單合併由 `BbcInjector.mergeAvailableList`（見 §1.3a）執行，讀同一批政策集合（見上一條），效應開關為 `PolicySource.BBC_AVAILABLE_APPS_INJECTION = true`（Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` 不受影響、亦不得靠 BBC 開關繞過）。政策未勾選任何包時，BBC hook 回傳 Samsung 原始結果物件（位元一致），零行為變更。裝置證據 2026-11-17 於 pre-unification build 取得（政策 group `galaxydual_policy`；見 §1.3a 與 `docs/ACCEPTANCE.md` §6 provenance）；unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）。
+- BBC 注入是本模組**唯一帶開啟效應閘的政策消費者**：BBC 清單合併由 `BbcInjector.mergeAvailableList`（見 §1.3a）執行，讀同一批政策集合（見上一條），效應開關為 `PolicySource.BBC_AVAILABLE_APPS_INJECTION = true`（Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE = false` 不受影響、亦不得靠 BBC 開關繞過）。政策未勾選任何包時，BBC hook 回傳 Samsung 原始結果物件——**位元一致僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`**。〔11-20/11-21 更新優先，見 §1.3a provenance 註記〕裝置證據 2026-11-17 於 pre-unification build 取得（政策 group `galaxydual_policy`；見 §1.3a 與 `docs/ACCEPTANCE.md` §6 provenance）；unified build 已於 2026-11-18 裝置重驗（S23 Ultra，BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載；證據 `s23_bbc_unified_20261118.log`，結論以 `docs/ACCEPTANCE.md` §6 為準）。
 
 安裝／移除分身仍走 `pm install-existing --user <dualId>` 通道（見 `docs/USAGE.md`），
 hook 不介入。
@@ -277,6 +284,8 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
 
 > provenance 聲明（先讀）
 > 以下所有 log 與裝置行為，除非另有標注，皆為 **2026-11-17 於 pre-unification build**（政策 group `galaxydual_policy`／key `packages`，RemotePreferences listener 模型）實測所得。**2026-11-18 已於 unified build（`unify/bbc-on-main`）以 S23 Ultra 重驗（BBC1/BBC2/BBC3 OK；BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，見 `BBC6_SSAID_INCIDENT.md`，詳該文件）。**證據 `s23_bbc_unified_20261118.log`／`s23u_02..04`。
+>
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 之 11-20 callback 仍誤標為『空回調』，待手動更正；以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節所有 11-17/11-18 證據段落皆受此更新節制。
 
 Samsung Dual Messenger 頁的「可用的應用程式」清單由 DAAgent 呼叫 BBC 庫
 `PmWrapper.getPossibleDualAppPackages(Context)->java.util.ArrayList` 取得
@@ -302,10 +311,10 @@ S23 Ultra 之 BBC-HOOK 行僅出現於 LSPosed verbose mirror（`/data/adb/lspd/
 
 附帶說明（unified build 與 pre-unification build 的差異）：
 - BBC **不需要** empty-policy warm-up：`EffectivePolicyCache` 於 daagent 首個查詢時惰性讀取（TTL 輪詢），首次呼叫即得到與重啟後相同語義；政策空 ⇒ Samsung 原物件原樣回傳（identity fast path）。
-- 讀者模型改變：pre-unification build 以 RemotePreferences listener push 即時生效（"live push"，見舊文案）；unified build **無**跨行程推送（API 102）——寫入後最晚於下一次 60s TTL poll 或 daagent 重啟看到新集合（無需額外步驟）。**unified build 的 reader 接線已於 2026-11-18 重驗**（S23 Ultra，BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載，`BBC-HOOK merged +1 packages (total 7, pid=…)` 之 `nonempty` 重現、callback 非空於空政策狀態下不帶 nonempty；見下）。
+- 讀者模型改變：pre-unification build 以 RemotePreferences listener push 即時生效（"live push"，見舊文案）；unified build **無**跨行程推送（API 102）——**60 秒僅為 hook 行程本地快取 TTL**；到期重讀的是同一個永久快取的 `RemotePreferences` 實例，底層 `mMap` 可能仍陳舊。**不保證 60s 內或下一次 poll 看到新集合；重啟 hook 行程後才保證讀到新值（無即時推送）。** 版本鍵（Phase 3）為可觀測新鮮度證據，非推送替代，見 §1.1。**unified build 的 reader 接線已於 2026-11-18 重驗**（S23 Ultra，BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載，`BBC-HOOK merged +1 packages (total 7, pid=…)` 之 `nonempty` 重現、callback 非空於空政策狀態下不帶 nonempty；見下）。
 - BBC 合併（BBC merge、PROTECTIVE、identity fast path）、`installed ∧ enabled` 謂詞、`BBC_AVAILABLE_APPS_INJECTION` 效應閘皆為 S5/S9 共用、不動；Stage-1 sealed gate 無變。
 - caller deopt：One UI 9 的 `DualAppActivity#getAvailableApps`／`#updateDualAppList` **找不到目標**（方法改名/內聯）→ hook 自動 skip（`BBC-SPIKE caller: … not found; skipped`），不影響 BBC callee 本體 hook——BBC callback **仍然**觸發（deopt 為保險性質非必要條件）。
-- 政策空時：BBC callback 回傳 Samsung 原始物件（`BBC-HOOK callback (pid=…)` 不帶 `nonempty`），行為位元一致。
+- 政策空時：BBC callback 回傳 Samsung 原始物件（`BBC-HOOK callback (pid=…)` 不帶 `nonempty`），**位元一致僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`**。
 - BBC 合併前置條件：候選包 **installed（`ApplicationInfo` 非 null）∧ enabled**；否則 skip
   （Shopee `com.shopee.tw` 停用時自動 skip，符合預期）。
 - Marker（`scope=daagent`）在 daagent 進程維持不可寫（EACCES）——與 S24 相同，
@@ -331,7 +340,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 | 開關 | 值 | 治理面 | 備註 |
 | --- | --- | --- | --- |
 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（Stage-1，sealed） | `const val false` | 白名單查詢面：`effective()` 的 sanitized 非空合併一律回空；`getAllWhitelistedPackages`／daagent 查詢 hook／`<clinit>` 合併 | 常閉；2026-11-17 使用者授權涵蓋的只有 BBC 效應面，全域翻閘授權**從未給過**；未來翻轉需另一份 SAMSUNG 階段 spec＋明示授權 |
-| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true` | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 重驗 2026-11-18（BBC1/BBC2/BBC3 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身）；設 `false` 即 BBC 零行為變更 |
+| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true` | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 重驗 2026-11-18（BBC1/BBC2/BBC3 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身）；設 `false` 即 BBC 回傳物件與原物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`） |
 
 **程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
 
@@ -361,10 +370,10 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
    空政策 BBC callback 回傳原始物件；非空時 `BBC-HOOK merge added 0 packages (policy=3: com.shopee.tw: installed=true, enabled=false, org.mozilla.firefox: installed=true, enabled=true, com.google.android.apps.bard: installed=true, enabled=true)`＝Samsung 白名單
    已含 Firefox/Bard，union no-op）與 S23 Ultra（`0→1 package(s)`；
    ChatGPT 合併 `BBC-HOOK merged +1 packages (total 7, pid=21472)` 並成功在 Samsung 設定頁出現、可切換、雙開安裝並 launch；
-   空政策回退行為位元一致，無崩潰、無列表污染、Knox 路徑無觸及）。
-6. ⏳ **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy/extra_whitelist_packages`；`extra_whitelist_version` 版本序號 bump **未實作**，不得作為本閘門的前提）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。**unified build 已驗（2026-11-18，BBC3 非空觀察：`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=…)` + `BBC-HOOK merged +1 packages (total 7, pid=…)`；BBC2 空政策 baseline 亦通過：callback 帶 `pid=…` 不帶 nonempty）**
+   空政策回退之回傳物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`），無崩潰、無列表污染、Knox 路徑無觸及）。
+6. ⏳ **寫入→hook 可觀測傳播**（P1-1 poll 模型，缺一不可）：App 寫入草稿（`dual_policy/extra_whitelist_packages`；`extra_whitelist_version` 版本序號 bump **Phase 3 已實作**（HookPolicyStore save/clear＋1，與 packages 同一 atomic commit；hook 側 seqlock＋Good/Cleared版本閘），但版本僅為可觀測新鮮度證據、非推送前提）後，需在 hook 側觀測到傳播——TTL 輪詢重讀命中新集合（附 logcat＋時間戳，證明非陳舊快取），或重啟後 hook 讀到新值（重啟語義對照）。無推送即時性宣稱：兩次觀測間隔須落在 TTL／重啟語義內，單次「寫後立即讀到」不得當作推送證據。JVM 以 `CrossProcessFreshnessContractTest` 鎖定「無跨行程通知」契約（invalidate 僅本地、TTL 始為輪詢機制）。**unified build 已驗（2026-11-18，BBC3 非空觀察：`BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=…)` + `BBC-HOOK merged +1 packages (total 7, pid=…)`；BBC2 空政策 baseline 亦通過：callback 帶 `pid=…` 不帶 nonempty）**
 
-上述 1–5 為 pre-unification build 之裝置證據（2026-11-17）；unified build 重驗＝2026-11-18（S23 Ultra；BBC1–BBC3；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 毀滅分身——不得標 ☑）。
+上述 1–5 為 pre-unification build 之裝置證據（2026-11-17）；unified build 重驗＝2026-11-18（S23 Ultra；BBC1–BBC3；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 毀滅分身——不得標 ☑）。〔11-20/11-21 更新優先於此 11-18 結論：非空政策下亦遭冷啟動刪除，DELETE 早於回調 116–144ms，見 §1.3a provenance 註記與 `BBC_COLDSTART_DELETE_INCIDENT.md`〕
 
 以下保留作為長期約束，**不得**移除：
 
@@ -463,7 +472,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   `BBC-HOOK callback getPossibleDualAppPackages (nonempty...)` 與
   `BBC-HOOK merged +N packages`（空政策時回傳 Samsung 原始物件，無 merged 行），
   沒看到 merged 行不代表失敗——政策可能仍是 Samsung 白名單內 app（union no-op）。
-  **TTL 新鮮度**：unified build 無跨行程推送（API 102）——寫入後最晚於下一次 60s TTL poll（`EffectivePolicyCache.maxCacheAgeMs`）或重啟後 hook 讀到新集合；不需重啟 app、無需額外步驟；60s 內看不到變化屬預期，不構成異常（重啟語義見 §1.1）。
+  **TTL 新鮮度（誠實口徑）**：unified build 無跨行程推送（API 102）——**60 秒僅為 hook 行程本地快取 TTL**（`EffectivePolicyCache.maxCacheAgeMs`）；到期重讀的是同一個永久快取的 `RemotePreferences` 實例，底層 `mMap` 可能仍陳舊。**不保證 60s 內或下一次 poll 看到新集合；重啟 hook 行程後才保證讀到新值（無即時推送）。** 60s 內看不到變化不構成異常；版本鍵（Phase 3）為可觀測新鮮度證據，非推送替代（重啟語義見 §1.1）。
 - 驗證 hook 安裝：重啟後 `adb logcat | grep GalaxyDualHook` 可能看到
   `hooked ...#getAllWhitelistedPackages` 等行＋
   `BBC-HOOK installed=1 (daagent, pid=…)` 行；看不到可能是記錄不可取得、安裝失敗或
@@ -510,9 +519,14 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   predicates (union-only, identity fast-path on no-merge, PROTECTIVE, fail-closed back to Samsung's
   original object on any error), read via `EffectivePolicyCache` (60s TTL poll, 5s failure cooldown,
   single-flight, 50ms stall budget; no cross-process listener push on API 102 — freshness = TTL poll
-  + reboot semantics only). Effect gate: `BBC_AVAILABLE_APPS_INJECTION=true` (`PolicySource.kt`;
+  + reboot semantics only; the 60s is only the local cache TTL and the permanently cached
+  RemotePreferences mMap may stay stale, so neither "within 60s" nor "on the next poll" is guaranteed
+  — only a hook-process restart guarantees the new value). Phase 3 adds a monotonic version key with a
+  hook-side seqlock snapshot and Good/Cleared version gates as observable freshness evidence, **not**
+  a push substitute. Effect gate: `BBC_AVAILABLE_APPS_INJECTION=true` (`PolicySource.kt`;
   governs only the BBC merge) vs Stage-1 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false` (sealed; whitelist
-  queries / system_server / <clinit> unchanged, bit-exact, installs unchanged).
+  queries / system_server / <clinit> unchanged, bit-identical return object only — not evidence of
+  unchanged device behavior, see the cold-start deletion note below — installs unchanged).
   Evidence (pre-unification build, 2026-11-17): S23 Ultra — `BBC-HOOK installed=1 (daagent, pid=21472)`,
   `BBC-HOOK callback getPossibleDualAppPackages (pid=21472)`, `… (nonempty, pid=21472)`,
   `BBC-HOOK merged +1 packages (total 7, pid=21472)`; ChatGPT appeared in Samsung's settings page,
@@ -525,6 +539,13 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   (S23 Ultra, full re-verify). See `docs/ACCEPTANCE.md` §6.
   Runtime whitelist is device-persisted and not byte-for-byte identical to the 19-entry framework
   fallback constant.
+
+  > **2026-11-20/11-21 update (supersedes this document's 11-18 conclusion)**: even under a non-empty
+  > policy, a daagent cold start was followed by Samsung deleting the u95 clone as system uid, with
+  > DELETE preceding the BBC callback by 116–144 ms; toggle-ON restores it but all data is wiped.
+  > The 11-18 "only empty policy deletes" / "bit-identical return = zero behavior change" claim does
+  > not describe the cold-start risk. See `docs/BBC_COLDSTART_DELETE_INCIDENT.md`, issue #75 (issue #75 still mislabels the 11-20 callback as 'empty'; manual correction pending; `BBC_COLDSTART_DELETE_INCIDENT.md` is authoritative). All
+  > 11-17/11-18 verification paragraphs above are qualified by this note.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
   (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/
   `isInstalledWhitelistedPackage`) are excluded due to install-state/userId ambiguity.
@@ -539,7 +560,9 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   forever until a future spec on Samsung stages; the BBC effect switch `BBC_AVAILABLE_APPS_INJECTION=true` shipped
   on the strength of two devices' 2026-11-17 empty-vs-nonempty A/B evidence plus explicit user authorization
   (pre-unification build; unified build re-verified 2026-11-18, BBC1/BBC2/BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app). A code-level kill switch is kept:
-  set the BBC const back to `false` to restore bit-exact observe-only BBC behavior.
+  set the BBC const back to `false` to make the BBC callback return object bit-identical to
+  Samsung's original object (this refers only to the returned object, not to unchanged device
+  behavior — cold-start deletion see `BBC_COLDSTART_DELETE_INCIDENT.md`).
   *Installed*Whitelist* exclusions are intentionally preserved.]
 - `DualAppActivity#getAvailableApps` / `#updateDualAppList` cannot be deoptimized on One UI 9
   (methods renamed/inlined); the BBC callee hook does not depend on them — callback evidence
@@ -555,6 +578,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   the fail-closed gate seam remains unit-tested.
 - Install the APK in both owner and dual (e.g. user 95) users, enable the module with
   `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
-- The marker proves hook installation only, not policy effect (empty=>observe-only;
+- The marker proves hook installation only, not policy effect (empty=>observe-only on the callback
+  return object, not a guarantee of device safety — cold-start deletion see `BBC_COLDSTART_DELETE_INCIDENT.md`;
   static-final holder fields may remain `ObserveOnly`, reflection failures `Skipped`; see
   `DualHook`/`WhitelistPatch`).

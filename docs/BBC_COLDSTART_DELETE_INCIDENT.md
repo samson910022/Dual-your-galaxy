@@ -1,8 +1,9 @@
 # BBC 非空政策下冷啟動刪除事件（2026-11-20 17:53）完整紀錄
 
 > Repo：`Dual-your-galaxy`，分支 `unify/bbc-on-main`（@ `ae8db116`）。
-> 本文為 untracked 新增文件，只記錄 2026-11-20 17:53 事件；不做任何結論外推。
-> 凡標【擷錄】者，backup 內有原文可對；凡標【口述】者，為對話事實、無逐字擷錄留存。
+> 本文隨 PR #74 於 HEAD 一併提交（tracked）；§0–§7 為 2026-11-20 17:53 事件記錄，
+> §8–§9 為 2026-11-21 addendum。凡標【擷錄】者，backup 內有原文可對；
+> 凡標【口述】者，為對話事實、無逐字擷錄留存。
 > 裝置未再觸碰；logcat 全文 36 MB 僅引用行號，不貼全文。
 
 ## 0. 事件一句話
@@ -232,13 +233,13 @@ package:/data/app/~~lwAYb0omxnzHPRdRsbrUyg==/com.openai.chatgpt-MyO48A02iZRaJ38W
 | `dumpsys_u95_postrecovery.txt` | 398 B／6 行 | 恢復後 dumpsys（`installed=true`，`firstInstallTime=2026-11-20 18:05:46`，§3.1 逐字貼） |
 | `old-base.apk` | 9,218,185 B | 被替換舊包；`sha256 = 953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f`（本地唯讀重算） |
 
-*（本文件結束；未 commit，留 untracked／working tree。）*
+*（§0–§7 11-20 記錄結束；§8–§9 見下。）*
 
 ---
 
 > 以下為 2026-11-21 追記（append-only；§0–§7 原文未動）。
 > 追記時 repo：`unify/bbc-on-main @ e3953b56`（本文件頭註 `ae8db116` 為 11-20 寫檔時點，不改）。
-> 本次未碰裝置（追記為離線寫檔）；不改其他檔；不 commit／不 push。PII 零入庫。
+> 本次未碰裝置（追記為離線寫檔）；PII 零入庫。本 addendum 與本文其餘章節一併隨 PR #74 提交於 HEAD。
 
 ## 8. 11-21 BBC-ENTRY 重現：調用端落定（pid=30228）
 
@@ -359,4 +360,4 @@ Start proc(40.219【口述】) → DELETE   = +479ms（起點無擷錄，僅供�
 | `new-bbc-entry.apk` | 9,121,361 B | 上機新包（ENTRY 唯讀進入日誌版） | `e4fdc78fe86b7646bd0eb5c13a24a9d498cc238d75bb460ca138d234b1c2cb31` |
 | `before_repro.apk` | 9,121,361 B | 重裝前備份包 | `d7b60b0f8e22aa72c22e99089a55ec038f4293dff85746ba0ffb42723d0d84e6` |
 
-*（追記結束；留 dirty 不 commit、不 push。）*
+*（§8–§9 11-21 addendum 結束；本文隨 PR #74 提交於 HEAD。）*

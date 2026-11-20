@@ -49,10 +49,10 @@
     <string name="action_write_policy">Write policy</string>
     <string name="write_policy_cd">Write current checks into the whitelist policy draft (draft only, never installs clones)</string>
     <string name="action_clear_policy_draft">Clear policy draft</string>
-    <string name="clear_policy_draft_cd">Drop the saved policy draft (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
+    <string name="clear_policy_draft_cd">Drop the saved policy draft (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable). On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <!-- Stage L4 fix(a): corrupt-repair mode button (two-tap confirm: first tap arms with backup warning, second executes). -->
     <string name="action_repair_policy_draft">Repair corrupt draft</string>
-    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
+    <string name="repair_policy_draft_cd">Repair the corrupt policy draft (attempt backup then clear, backup may fail; needs two taps to confirm; note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable). On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <string name="action_refresh_policy_draft">Refresh draft</string>
     <string name="refresh_policy_draft_cd">Re-read the remote policy draft (read-only, never installs clones)</string>
     <string name="refresh_policy_draft_cd_refreshing">Re-reading the remote policy draft (read-only, never installs clones)</string>
@@ -60,9 +60,12 @@
     <string name="action_edit_policy">Edit app list</string>
     <string name="policy_draft_format">Whitelist policy (draft, effect unverified): %1$d items</string>
     <string name="policy_draft_unknown">Whitelist policy (draft, effect unverified): unknown (unreadable or corrupt — see the status banner at the top; tap Refresh draft to retry)</string>
-    <!-- PolicyActivity editor header (same wording as policy_cleared / pre_clear_message: empty policy causes Samsung to auto-delete clones and their data).
-         Phase E TTL wording (docs/USAGE.md policy TTL table: hook-side cache 60s / no cross-process push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again (no push). -->
-    <string name="policy_editor_intro">Policy is a union-only whitelist extension (empty by default = observe-only); changes go through “Write policy draft” → confirmation dialog (checking ≠ installing); visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again (no push). Disabled or uninstalled apps are filtered by the BBC hook. Note: an empty policy causes Samsung to auto-delete clones and their data (unrecoverable).</string>
+    <!-- PolicyActivity editor header (same wording as policy_cleared / pre_clear_message: empty policy causes Samsung to auto-delete clones and their data;
+         also notes cold-start deletions under a non-empty policy on 11-20/11-21).
+         Honest TTL wording (docs/USAGE.md policy TTL table): the 60s is only the hook process’s local cache TTL; the RemotePreferences instance is
+         permanently cached and its underlying mMap may stay stale; no guarantee of seeing the new set within 60s or on the next poll; only restarting
+         the hook process guarantees reading the new value (no cross-process push); see BBC_COLDSTART_DELETE_INCIDENT.md. -->
+    <string name="policy_editor_intro">Policy is a union-only whitelist extension (empty by default = observe-only); changes go through “Write policy draft” → confirmation dialog (checking ≠ installing); the 60s is only the hook process’s local cache TTL; on expiry it re-reads the same permanently cached RemotePreferences instance whose underlying mMap may still be stale. There is no guarantee of seeing the new set within 60s or on the next poll; only restarting the hook process guarantees reading the new value (no cross-process push). Disabled or uninstalled apps are filtered by the BBC hook. Note: an empty policy causes Samsung to auto-delete clones and their data (unrecoverable). On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <!-- Phase E: editor hardcoded-Chinese resourcing (was literals in PolicyActivity.kt; same keys across locales). -->
     <string name="policy_editor_back">Back</string>
     <string name="policy_editor_title">Hook policy (Dual Messenger available apps)</string>
@@ -79,7 +82,9 @@
         <item quantity="one">Currently %1$d package</item>
         <item quantity="other">Currently %1$d packages</item>
     </plurals>
-    <!-- Phase E orphan UI: catalog-missing ticks section + one-click removal (counter/confirm reuse policy_dropped suffix). -->
+    <!-- Phase E orphan UI: catalog-missing ticks section + one-click removal. R11: orphan ticks are STILL in the
+         policy draft, so the counter uses policy_orphan_pending; the confirm dialog uses policy_dropped_future
+         (future tense); policy_dropped stays for the actual drop result (MainActivity result message / PolicyTextKind.DROPPED). -->
     <string name="policy_editor_orphan_header_format">Not in source list (%1$d)</string>
     <string name="policy_editor_orphan_remove_format">Remove all not-in-source selections (%1$d)</string>
     <string name="policy_editor_orphan_item_cd_format">Not-in-source selection: %1$s</string>
@@ -88,8 +93,8 @@
     <string name="pre_clear_uninstall_verify_truncated_suffix_format">… (showing first %1$d of %2$d)</string>
     <string name="policy_write_title">Write whitelist policy draft</string>
     <plurals name="policy_write_message">
-        <item quantity="one">This will write the following %1$d package into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again; a non-empty draft may relax the whitelist on its next poll or restart — effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it or restarts, but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
-        <item quantity="other">This will write the following %1$d packages into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no push): visible at the earliest ~60s after writing; if not effective after 60s, reboot and check again; a non-empty draft may relax the whitelist on its next poll or restart — effect is unverified on-device and not guaranteed; clearing the draft stops further relaxation once the hook re-reads it or restarts, but entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
+        <item quantity="one">This will write the following %1$d package into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no cross-process push): the 60s is only the hook process’s local cache TTL; on expiry it re-reads the same permanently cached RemotePreferences instance whose underlying mMap may still be stale. There is no guarantee of seeing the new set within 60s or on the next poll; only restarting the hook process guarantees reading the new value (no push); a non-empty draft may relax the whitelist — effect is unverified on-device and not guaranteed; after clearing, the hook may keep using the old set for up to 30 minutes due to local cache/sticky relaxation; no immediate stop is guaranteed; only restarting the hook process guarantees a re-read of the empty set, and entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
+        <item quantity="other">This will write the following %1$d packages into the whitelist policy draft (dual_policy; ticking ≠ installing, can be cleared anytime). Note: the hook reads this draft by polling (no cross-process push): the 60s is only the hook process’s local cache TTL; on expiry it re-reads the same permanently cached RemotePreferences instance whose underlying mMap may still be stale. There is no guarantee of seeing the new set within 60s or on the next poll; only restarting the hook process guarantees reading the new value (no push); a non-empty draft may relax the whitelist — effect is unverified on-device and not guaranteed; after clearing, the hook may keep using the old set for up to 30 minutes due to local cache/sticky relaxation; no immediate stop is guaranteed; only restarting the hook process guarantees a re-read of the empty set, and entries already relaxed are not automatically reverted.\nTick the confirmation box below to enable "Write policy".</item>
     </plurals>
     <string name="policy_write_acknowledge">I confirm the packages above should be relaxed in the whitelist.</string>
     <string name="policy_write_positive">Write policy</string>
@@ -126,10 +131,10 @@
     <!-- Issue #73 BBC6 honest wording: an empty policy causes Samsung to auto-delete
          clones and their data (incl. user-95, unrecoverable); must not claim
          "untouched". Same wording as pre_clear_message. Synced across all three locales. -->
-    <string name="policy_cleared">Policy draft cleared (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable)</string>
+    <string name="policy_cleared">Policy draft cleared (note: an empty policy causes Samsung to auto-delete clones and their data, unrecoverable; on 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion)</string>
     <!-- Issue #73 (zh/Hant parity: same keys): pre-clear dual-app warning (BBC6: emptying the policy means Samsung auto-uninstalls the dual copies, user-95 data unrecoverable). -->
     <string name="pre_clear_title">Dual-app reminder before clearing policy</string>
-    <string name="pre_clear_message">These apps are installed in your dual profile: %1$s\n\nSamsung may automatically delete the dual copies (including dual-profile data, unrecoverable) when the policy becomes empty. Turn off Dual Apps for these apps in Samsung Settings \u2192 Apps \u2192 Dual apps first, then clear.</string>
+    <string name="pre_clear_message">These apps are installed in your dual profile: %1$s\n\nSamsung may automatically delete the dual copies (including dual-profile data, unrecoverable) when the policy becomes empty. Turn off Dual Apps for these apps in Samsung Settings \u2192 Apps \u2192 Dual apps first, then clear. On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <string name="pre_clear_confirm_proceed">Continue clearing (agree to uninstall dual copies)</string>
     <string name="pre_clear_cancel">Cancel clearing</string>
     <string name="pre_clear_root_uninstall">ROOT: turn off dual copies for me (erases data)</string>
@@ -137,7 +142,7 @@
     <!-- Phase1 review(HIGH/TOCTOU): fail-closed notice when the verified uid is no longer valid at click time. -->
     <string name="pre_clear_target_changed">The dual profile target changed, so automatic uninstall was cancelled. Please confirm again and retry.</string>
     <string name="pre_clear_probe_failed_title">Probe failed to check dual-app status · dual copies may still be erased</string>
-    <string name="pre_clear_probe_failed_message">Root access is unavailable or the environment is unsupported, so installed dual copies cannot be enumerated safely. Samsung may still delete the dual copies (with dual-profile data, unrecoverable) when the policy is cleared. If unsure, turn off Dual Apps for the affected apps in Samsung Settings first.</string>
+    <string name="pre_clear_probe_failed_message">Root access is unavailable or the environment is unsupported, so installed dual copies cannot be enumerated safely. Samsung may still delete the dual copies (with dual-profile data, unrecoverable) when the policy is cleared. If unsure, turn off Dual Apps for the affected apps in Samsung Settings first. On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <string name="pre_clear_probe_failed_proceed">Clear anyway</string>
     <!-- Phase D: post-uninstall re-probe three-choice (residual non-empty = fail; failure never auto-proceeds). -->
     <string name="pre_clear_uninstall_verify_title">Post-uninstall check · choose explicitly</string>
@@ -150,7 +155,7 @@
     <string name="pre_clear_editor_keep_unticked">Keep unselected (does not clear the policy yet)</string>
     <!-- Phase C (Option A: editor forbids clearing to empty): empty set shows no warning, guides to Main clear. Synced across all three locales. -->
     <string name="policy_editor_empty_guide_title">Cannot clear policy in editor</string>
-    <string name="policy_editor_empty_guide_message">The editor does not allow clearing the policy to empty. To clear all policies, return to the main screen and use “Clear draft” — an empty policy causes Samsung to auto-delete clones and their data (unrecoverable); confirm dual-app copies are turned off first.</string>
+    <string name="policy_editor_empty_guide_message">The editor does not allow clearing the policy to empty. To clear all policies, return to the main screen and use “Clear draft” — an empty policy causes Samsung to auto-delete clones and their data (unrecoverable); confirm dual-app copies are turned off first. On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <string name="policy_editor_empty_guide_go_main">Back to main to clear</string>
     <string name="policy_blind_clear_first">Remote content unknown; clearing will delete unseen content (destructive and irreversible). Clear again within 5 minutes to confirm; refresh first if reachable.</string>
     <!-- Stage D: blind-clear confirmation expired (armed over 5 minutes, needs re-arm; CHANNEL). -->
@@ -158,6 +163,16 @@
     <plurals name="policy_dropped">
         <item quantity="one">Dropped %1$d checked item not in the source list</item>
         <item quantity="other">Dropped %1$d checked items not in the source list</item>
+    </plurals>
+    <!-- R11: orphan counter — the ticks are still in the policy draft until the user taps "Remove all". -->
+    <plurals name="policy_orphan_pending">
+        <item quantity="one">%1$d checked item is not in the source list (still in the policy draft; tap “Remove all” to drop it)</item>
+        <item quantity="other">%1$d checked items are not in the source list (still in the policy draft; tap “Remove all” to drop them)</item>
+    </plurals>
+    <!-- R11: the confirm-dialog suffix is future tense (the write has not happened yet). -->
+    <plurals name="policy_dropped_future">
+        <item quantity="one">Will drop %1$d checked item that is not in the source list</item>
+        <item quantity="other">Will drop %1$d checked items that are not in the source list</item>
     </plurals>
     <plurals name="policy_written">
         <item quantity="one">Wrote %1$d package into the policy draft (checks never install, clear anytime)</item>

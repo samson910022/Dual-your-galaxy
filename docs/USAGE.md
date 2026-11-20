@@ -12,6 +12,8 @@
 
 > **2026-11-05 更新**：[S24 調查與追蹤計畫](UX_REVIEW_S24.md) 彙整既有 #6/#9 的正常 SHELL clone/remove、手動通道證據，以及新發現與 issues #21–#29。本文較舊 F4a 的「無實機／Factory 靜態選路」敘述屬歷史階段，不代表手動重選仍未實作；未完成項目仍不得宣稱可用。
 
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 之 11-20 callback 仍誤標為『空回調』，待手動更正；以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節與下文所有 11-17/11-18 驗收段皆受此更新節制。
+
 ## 0. 狀態標示（與 README 一致）
 
 - [已支援] profile 基本防護（排除 user0、拒絕候選歧義；完整平台身分待 #21）、`pm` 命令封裝
@@ -27,7 +29,7 @@ Hook 誠實聲明（`docs/HOOK.md` 第 1.1／1.3a／1.4 節，本文引用不再
 BBC 注入路徑（unified build：`EffectivePolicyCache` 輪詢讀 `dual_policy/extra_whitelist_packages`（整組取代、owner-user 寫入）；pre-unification evidence：`galaxydual_policy/packages`）
 在 2026-11-17 經 pre-unification build 實機觀察（S23 Ultra One UI 9 端對端雙開 ChatGPT；Tab S7 驗注入 no-op 與位元一致回退；`BBC_AVAILABLE_APPS_INJECTION=true` 僅治理 BBC 清單 union-append）；
 Stage-1 白名單查詢閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘常閉，白名單查詢／`<clinit>`／system_server 面預設 observe-only、零行為變更；
-政策空時的 hook 回傳 Samsung 原始物件（零行為變更）；本文凡提及其他「hook 通道／白名單放寬」（例如 mutation 面、Stage-1 白名單查詢）
+政策空時的 hook 回傳物件與 Samsung 原始物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`）；本文凡提及其他「hook 通道／白名單放寬」（例如 mutation 面、Stage-1 白名單查詢）
 仍指設計意圖，不是現有效果。unified build 讀者接線於 2026-11-18 重驗（S23 Ultra；見 `docs/ACCEPTANCE.md` §6；BBC6 毀滅分身，不覆蓋）。
 
 ## 1. 通道選擇與優先順序（`core` 純函數 [已支援]＋真通道已接線（ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）；自動路由順序為 su ROOT → Shizuku → NONE，下列為手動 picker 表面）
@@ -261,8 +263,9 @@ adb shell pm uninstall --user <dualId> com.example.chat
 | 寫入確認 `POLICY_CONFIRM_TTL_MS` | 5 分鐘 | App | dialog pending 逾時→清 pending＋`TTL_EXPIRED` 訊息，不碰 draft（零寫入） |
 | blind-clear arm `BLIND_CLEAR_TTL_MS` | 5 分鐘（與上同值，別名） | App | arm 逾時→重 arm＋`policy_blind_clear_expired` 文案，需重新確認 |
 | store IO `POLICY_IO_TIMEOUT_MS` | 10 秒 | App | confirm／clear 持 `opMutex` 橫跨有界超時；超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op；終態正常回 `IDLE`，唯有界讀耗盡（3 次皆 Unknown 且曾逾時）／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留），可由後續 `refreshPolicyDraft` late-join 結清回 `IDLE`（讀到 Known 且原 save 已完成：成功→Known＋成功訊息，失敗→`FAILED`＋Unknown）；核對中 `refresh()`／`reconnect()`／`selectChannel`／`onForeground` 的 probe＋refresh 一律跳過（保留核對提示），`refreshPolicyDraft` 期中讓位（覆寫 msg/draft 但不碰 phase/pending，reconciler 只比 version＋ownership，期中 yielding 只推 freshness 不致丟棄） |
-| 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 輪詢重讀同一 `RemotePreferences` 實例（poll-only，無跨行程推送，新鮮度僅靠 TTL 輪詢＋重啟，見 `docs/HOOK.md` §1.1），非 App 側 5 分鐘 |
+| 快取 `EffectivePolicyCache.maxCacheAgeMs` | 60 秒 | hook | 60 秒僅為 hook 行程本地快取 TTL；到期重讀的是同一個永久快取的 `RemotePreferences` 實例，底層 `mMap` 可能仍陳舊（poll-only，無跨行程推送）。**不保證 60s 內或下一次 poll 看到新集合；重啟 hook 行程後才保證讀到新值**；版本鍵（Phase 3）為可觀測證據非推送替代，見 `docs/HOOK.md` §1.1，非 App 側 5 分鐘 |
 | 失敗節流 `failureCooldownMs` | 5 秒 | hook | 遠端讀取失敗後查詢節流，不重試 reader（`last-known-good` 保留或回 seed，見 `docs/HOOK.md` §1.1） |
+| BBC sticky last-good `BBC_STICKY_MAX_AGE_MS` | 30 分鐘 | hook | 讀取失敗時沿用最近成功集合的上限，超過即 fail-closed 回空；這是**有界降解視窗**，不是冷啟動刪除的結構性修正（DELETE 早於回調且回調非空，sticky 對該路徑無對照證據，見 `BBC_COLDSTART_DELETE_INCIDENT.md` §8.4）。清除草稿後亦可能因本地快取／sticky 在最多 30 分鐘內沿用舊集合，無即時停止保證。 |
 | 單次 auto-recheck（Stage G2） | 1 次（`invokeOnCompletion` 單次；讀 `withTimeout(policyIoTimeoutMs)`，coordinator app-scoped 域＋`Dispatchers.IO` 共用 IO 池，`boundedReconcileRead` 容量有界讀取 wrapper，非獨立 pool） | App | deferred 完成即觸發單次權威重查（不耗 reconciler 三讀預算，走 settle helper）；Unknown→unresolved＋`UNRESOLVED_REFRESH` 待手動 refresh late-join |
 
 ## English Summary

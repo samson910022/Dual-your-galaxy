@@ -1,18 +1,22 @@
 # BBC6 政策清空 → 三星自動卸載分身 → SSAID 崩潰：完整調查紀錄（2026-11-18）
 
 > 定位：BBC 注入功能裝置驗收期間發生的單一事件（2026-11-18），以唯讀方式調查
-> 其原因與後果。本文件記錄：**全清政策 = 觸發 Samsung 自動卸載分身**，
+> 其原因與後果。本文件記錄 11-18 觀察到的**政策清空與 Samsung 自動卸載分身的關聯**，
 > 以及卸載後 app 仍裝回但啟動閃退的 SSAID 原因。
+> **2026-11-20/11-21 更新**：非空政策下亦發生冷啟動 deletion，原「清空才刪／清空即觸發」因果已撤回；
+> 詳 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8，該文更新優先於本文 11-18 結論。
 >
 > **目前裝置只事實**，不執行任何裝置動作；未核實的全部標為「未核實」。
 
 ## TL;DR
 
-1. **「清除草稿／取消勾選全部」被 Samsung 系統理解為「分身候選集為空」**，啟動
-   `DualAppManagerService` 的對帳，直接以 system uid 發出 `START DELETE PACKAGE`
-   刪除 user 95 的雙開副本，連帶 `PACKAGE_FULLY_REMOVED` 廣播。
-   這不是 `AppPolicyWriter`／`VM`／`BBC hook` 的決定；是 Samsung 對 policy
-   possible list 變化的固有反應。BBC6 的「清掉政策」就是卸載分身指令。
+1. **11-18 觀察**：「清除草稿／取消勾選全部」（政策為空）之後，daagent 冷啟動時
+   Samsung 以 system uid 發出 `START DELETE PACKAGE` 刪除 user 95 雙開副本，連帶
+   `PACKAGE_FULLY_REMOVED` 廣播。**原「空政策 → possible-list 空 → Samsung 刪除」
+   的因果鏈已撤回**：11-20/11-21 兩次 deletion 皆在**非空政策**（`nonempty` +
+   `merged +1 total 7`）下發生，且 DELETE 早於 BBC 回調 116–144ms；實際觸發機制
+   未證實（見 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8）。非空不保證安全，
+   刪除後資料全清、無法復原。
 2. 使用者稍後在 Samsung Dual Messenger 頁重新 ON，裝置自動執行 `START INSTALL-EXISTING`。
 3. **但重新安裝後 app 每次啟動都崩潰**：`IllegalStateException:
    Ssaid settings not accessible`，由 `SettingsProvider$SettingsRegistry.generateSsaidLocked
@@ -97,7 +101,7 @@
 | 「Firefox 也有這個問題」 | Firefox 沒裝 u95（`installed=false`），無法對照；先前 BBC 測試是在 Tab S7 user 0／95 上的 Firefox 實例（但 Tab S7 SSAID 未調查） |
 | 「Toggle OFF → 再 ON 可修復」 | **部分成立**：當天 17:55 卸載→重裝後 toggle-on 仍 crash（pid=15625 起至 pid=17674）；稍後晚間整機重啟 + Samsung 原生 toggle-on（22:26 安裝）後，**使用者回報**可正常啟動（截圖 `s23u_05_chatgpt_working.png`；pid 未收錄於 repo 擷錄） |
 | 「Telegram／Facebook 也會這樣」 | 目前無法實驗對等第三方，只能列「未知」，不能回答 |
-| 「BBC6 是可復原的 rollback」 | **不是**：BBC6 的「政策清空」被 Samsung 強解釋為可能安裝的雙開應用集合空，觸發 `START DELETE PACKAGE` |
+| 「BBC6 是可復原的 rollback」 | **不是**：BBC6 是破壞性的系統刪除分身（user-95 資料全清）；11-18 觀察到其後伴隨政策清空，但「清空政策即觸發刪除」的因果已由 11-20/11-21 非空政策 deletion 撤回，見 `BBC_COLDSTART_DELETE_INCIDENT.md` §8 |
 
 ## 裝置自動執行的步驟（從 logcat）
 
@@ -105,9 +109,9 @@
 
 ## BBC6／SSAID 之間的關聯
 
-BBC6（背景 full-policy 清空）→ daagent BBC hook 回傳空 → Samsung DualAppManagerService 重新計算可雙開集合 → 判定 "這個 app 不應該在可能清單" → 啟動 `START DELETE PACKAGE`、`PACKAGE_FULLY_REMOVED`、`SettingsProvider: Receive onPackageRemoved(userId:95)` → 並導致資料與包源全部被移除。
+**11-18 觀察（關聯，非因果）**：背景 full-policy 清空後，daagent 冷啟動時 `START DELETE PACKAGE`（17:31:32.952）先於 BBC 空回調（17:31:33.070），其後 `PACKAGE_FULLY_REMOVED`、`SettingsProvider: Receive onPackageRemoved(userId:95)`，資料與包源全部被移除。**此因果鏈已撤回**：11-20/11-21 兩次 deletion 在非空政策（回調 `nonempty` + `merged +1 total 7`）下發生，DELETE 早於回調 116–144ms；實際觸發未知（見 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8）。
 
-> 因此：**「清除草稿」不是回復原廠狀態**——它會**同步刪除該 app 的雙開副本（含所有 user-95 資料）**。
+> 因此：**「清除草稿」不是回復原廠狀態**（11-18 觀察到其後伴隨刪除；但 11-20/11-21 未清草稿、政策非空時亦遭刪除），非空不保證安全；恢復＝toggle-ON 重裝，但所有 user-95 資料已清除、無法復原。
 
 ## 修復可能性與已驗證結果
 

@@ -511,8 +511,9 @@ class PolicyActivity : ComponentActivity() {
     }
 
     private fun updateCounter() {
-        // Phase E：計數行經 policy_editor_counter plurals 資源化＋複用
-        // policy_dropped 後綴呈現孤兒數（三語系同鍵；JVM 無 Activity 資源時回退硬編碼）。
+        // Phase E：計數行經 policy_editor_counter plurals 資源化；R11：孤兒後綴改用
+        // policy_orphan_pending（孤兒仍在政策草稿中，須點「一鍵移除」才會移除，不得稱「已捨去」）。
+        // 三語系同鍵；JVM 無 Activity 資源時回退硬編碼。
         val orphanCount = try {
             orphanTicks().size
         } catch (_: Exception) {
@@ -526,7 +527,7 @@ class PolicyActivity : ComponentActivity() {
             )
             if (orphanCount > 0) {
                 val suffix = resources.getQuantityString(
-                    R.plurals.policy_dropped,
+                    R.plurals.policy_orphan_pending,
                     orphanCount,
                     orphanCount,
                 )
@@ -537,7 +538,7 @@ class PolicyActivity : ComponentActivity() {
         } catch (_: Exception) {
             val base = "目前 ${ticks.size} 個包名"
             if (orphanCount > 0) {
-                "$base\n已捨去 $orphanCount 項不在來源清單的勾選"
+                "$base\n有 $orphanCount 項勾選不在來源清單（仍在政策草稿中，須點「一鍵移除」才會移除）"
             } else {
                 base
             }
@@ -788,8 +789,9 @@ class PolicyActivity : ComponentActivity() {
         }
     }
 
-    // Phase E：編輯器確認訊息複用 policy_dropped 後綴（與 MainActivity.policyWriteMessage
-    // 同口徑：主模板 policy_write_message＋dropped 後綴；三語系同鍵；JVM 無資源時回退硬編碼）。
+    // Phase E：編輯器確認訊息主模板 policy_write_message＋dropped 後綴（與 MainActivity.policyWriteMessage
+    // 同口徑）；R11：確認對話框尚未寫入，後綴改用 policy_dropped_future 未來式（「將捨去」）。
+    // 三語系同鍵；JVM 無資源時回退硬編碼。
     // docs/USAGE.md 政策 TTL 對照表為真相單一來源（App 側確認 5 分鐘 vs hook 側 60 秒），此處僅呈現，不重定義。
     internal fun policyEditorConfirmMessage(pending: PendingPolicyWrite): String {
         val total = pending.packages.size
@@ -801,12 +803,12 @@ class PolicyActivity : ComponentActivity() {
         if (pending.droppedCount > 0) {
             val suffix = try {
                 resources.getQuantityString(
-                    R.plurals.policy_dropped,
+                    R.plurals.policy_dropped_future,
                     pending.droppedCount,
                     pending.droppedCount,
                 )
             } catch (_: Exception) {
-                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+                "將捨去 ${pending.droppedCount} 項不在來源清單的勾選"
             }
             message += "\n$suffix"
         }
