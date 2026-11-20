@@ -49,24 +49,88 @@ class DualProbeResultTest {
 
     @Test
     fun cleanOutput_returnsOkInstalled() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\nINST com.b.app\n", err = ""))
+        // Phase1 review(P2): requested set requires a PROBE_RC line.
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\nINST com.b.app\n", err = ""))
         val res = probe(listOf("com.a.app", "com.b.app"), gw)
         assertTrue(res is DualProbeResult.Ok)
         assertEquals(listOf("com.a.app", "com.b.app"), (res as DualProbeResult.Ok).installed)
     }
 
     @Test
+    fun missingProbeRc_mapsToFailed() {
+        // Phase1 review(P2): all markers present but no PROBE_RC => Failed (not Ok).
+        val res = decideDualProbeResult(
+            CmdResult(0, "CLEAN com.a.app\n", ""),
+            setOf("com.a.app"),
+        )
+        assertTrue("missing PROBE_RC must be Failed, got: $res", res is DualProbeResult.Failed)
+        assertEquals("probe-rc: missing", (res as DualProbeResult.Failed).reason)
+        // Legacy pure seam (no requested set) still tolerates absent PROBE_RC.
+        val legacy = decideDualProbeResult(CmdResult(0, "INST com.a.app\n", ""))
+        assertTrue(legacy is DualProbeResult.Ok)
+    }
+
+    @Test
     fun cleanEmptyOutput_returnsOkEmpty() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "", err = ""))
+        // R02: Ok(empty) only when every requested pkg has a CLEAN marker.
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nCLEAN com.a.app\n", err = ""))
         val res = probe(listOf("com.a.app"), gw)
         assertTrue(res is DualProbeResult.Ok)
         assertEquals(emptyList<String>(), (res as DualProbeResult.Ok).installed)
     }
 
     @Test
+    fun missingMarker_mapsToFailed() {
+        // Requested com.b.app has no marker at all -> FAIL (never Ok(empty)).
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nCLEAN com.a.app\n", err = ""))
+        val res = probe(listOf("com.a.app", "com.b.app"), gw)
+        assertTrue("missing marker must be Failed, got: $res", res is DualProbeResult.Failed)
+        assertTrue((res as DualProbeResult.Failed).reason.startsWith("missing-marker:"))
+        assertEquals(1, gw.calls)
+    }
+
+    @Test
+    fun injectedInstNotRequested_isDropped() {
+        // F4 cross-check: INST evil.pkg is not in requested set -> dropped;
+        // com.a.app is CLEAN -> Ok(empty) with no leaked marker token.
+        val gw = FakeGateway(
+            CmdResult(exit = 0, out = "PROBE_RC=0\nCLEAN com.a.app\nINST evil.pkg\n", err = ""),
+        )
+        val res = probe(listOf("com.a.app"), gw)
+        assertTrue(res is DualProbeResult.Ok)
+        assertEquals(emptyList<String>(), (res as DualProbeResult.Ok).installed)
+    }
+
+    @Test
+    fun ambiguousMarker_mapsToFailed() {
+        val res = decideDualProbeResult(
+            CmdResult(0, "PROBE_RC=0\nINST com.a.app\nCLEAN com.a.app\n", ""),
+            setOf("com.a.app"),
+        )
+        assertTrue("contradictory markers must be Failed, got: $res", res is DualProbeResult.Failed)
+        assertTrue((res as DualProbeResult.Failed).reason.startsWith("ambiguous-marker:"))
+    }
+
+    @Test
+    fun failMarkerAndProbeRc_mapsToFailed() {
+        val failMarker = decideDualProbeResult(
+            CmdResult(0, "PROBE_RC=0\nCLEAN com.a.app\nFAIL com.b.app\n", ""),
+            setOf("com.a.app", "com.b.app"),
+        )
+        assertTrue(failMarker is DualProbeResult.Failed)
+        assertTrue((failMarker as DualProbeResult.Failed).reason.startsWith("probe-failed:"))
+        val rc = decideDualProbeResult(
+            CmdResult(0, "PROBE_RC=1\nCLEAN com.a.app\n", ""),
+            setOf("com.a.app"),
+        )
+        assertTrue(rc is DualProbeResult.Failed)
+        assertTrue((rc as DualProbeResult.Failed).reason.startsWith("probe-rc:"))
+    }
+
+    @Test
     fun invalidTokensFiltered_stillOk() {
         // Invalid tokens are dropped by isValidPackage but the probe stays trustworthy -> Ok.
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\nINST bad token!\n", err = ""))
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\nINST bad token!\n", err = ""))
         val res = probe(listOf("com.a.app"), gw)
         assertTrue("invalid tokens must be filtered but stay Ok, got: $res", res is DualProbeResult.Ok)
         assertEquals(listOf("com.a.app"), (res as DualProbeResult.Ok).installed)
@@ -174,7 +238,8 @@ class DualProbeResultTest {
     @Test
     fun maxBoundary_512_returnsOkWithOneCall() {
         val pkgs = (1..MAX_DUAL_PROBE_PKGS).map { "com.example.p$it" }
-        val gw = FakeGateway(CmdResult(exit = 0, out = "", err = ""))
+        val cleanLines = pkgs.joinToString("\n") { "CLEAN $it" }
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\n$cleanLines\n", err = ""))
         val res = probe(pkgs, gw)
         assertTrue("MAX boundary must be Ok, got: $res", res is DualProbeResult.Ok)
         assertEquals(1, gw.calls)
@@ -206,7 +271,7 @@ class DualProbeResultTest {
     // Critical: whitespace-only stderr is blank -> Ok.
     @Test
     fun whitespaceStderr_returnsOk() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\n", err = "   "))
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\n", err = "   "))
         val res = probe(listOf("com.a.app"), gw)
         assertTrue("whitespace stderr must be Ok, got: $res", res is DualProbeResult.Ok)
         assertEquals(listOf("com.a.app"), (res as DualProbeResult.Ok).installed)
@@ -279,20 +344,20 @@ class DualProbeResultTest {
     // High: dirty input (whitespace / blanks / dupes / invalid) is sanitized, valid still probes.
     @Test
     fun dirtyInput_sanitizedAndProbesValid() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\n", err = ""))
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\nCLEAN com.b.app\n", err = ""))
         val res = probe(listOf("  com.a.app  ", "", "   ", "com.a.app", "bad pkg!", "com.b.app"), gw)
         assertTrue("dirty input must stay Ok for valid subset, got: $res", res is DualProbeResult.Ok)
         assertEquals(1, gw.calls)
         assertTrue((gw.lastCmd ?: "").contains("--user 95"))
     }
 
-    // High: probe gateway command always targets user 95.
+    // High: probe gateway command always targets the passed (test-wrapper) user 95.
     @Test
     fun fakeGateway_cmdContainsUser95() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "", err = ""))
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nCLEAN com.a.app\n", err = ""))
         probe(listOf("com.a.app"), gw)
         assertTrue((gw.lastCmd ?: "").contains("--user 95"))
-        assertTrue((gw.lastCmd ?: "").contains("pm path"))
+        assertTrue((gw.lastCmd ?: "").contains("pm list packages"))
     }
 
     // Medium: decide is a pure split seam (no gateway touch).
@@ -356,7 +421,7 @@ class DualProbeResultTest {
 
     @Test
     fun dirtyInput_cmdSanitized() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\n", err = ""))
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\nCLEAN com.b.app\n", err = ""))
         val res = probe(listOf("  com.a.app  ", "", "   ", "com.a.app", "bad pkg!", "com.b.app"), gw)
         assertTrue(res is DualProbeResult.Ok)
         val cmd = gw.lastCmd ?: ""

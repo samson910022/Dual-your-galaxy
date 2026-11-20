@@ -5902,8 +5902,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Issue #73：清除草稿前先探測 user-95 分身安裝狀態並顯示警告對話框
-    // （BBC6：政策清空＝Samsung 自動系統刪分身，user-95 資料不可復原）。
+    // Issue #73：清除草稿前先探測 verified target 分身安裝狀態並顯示警告對話框
+    // （BBC6：政策清空＝Samsung 自動系統刪分身，分身資料不可復原）。
     // Phase C：
     // - old-minus-candidate delta：清除候選為空集，delta=old 全量；僅對 delta 探測。
     // - Unknown stale 非空不得當授權依據：!known 一律走 cannot-determine 對話框
@@ -5958,8 +5958,10 @@ class MainActivity : ComponentActivity() {
             // 探測失敗警告（此前 probeFailed 僅 exception 才置位，exit/stderr/
             // Failure/截斷皆靜默當空，失敗警告為死碼；現皆歸 Failed 使其變活）。
             // Phase C：僅探 delta（old-minus-candidate），非全量 old。
+            // R05/NEW-1：uid 必須來自 verified target；unverified => Failed 警告。
+            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
             val probe = try {
-                probeDualAppsInUser95(delta)
+                probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
@@ -5991,6 +5993,9 @@ class MainActivity : ComponentActivity() {
                         probe.installed,
                         onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
+                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
+                        userId = verifiedUid,
+                        rootUninstallAllowed = verifiedUid != null,
                     )
                 }
             }
@@ -5999,7 +6004,7 @@ class MainActivity : ComponentActivity() {
 
     // Phase C：Main 寫入入口 delta 警告（N→M 覆寫）。
     // old=已保存草稿（Known 才權威），candidate=當下勾選映射；delta=old-candidate
-    // 為被移除包；僅對 delta 探測 user95 installed，installed 非空即警告。
+    // 為被移除包；僅對 delta 探測 verified target installed，installed 非空即警告。
     // Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
     // proceed 攜綁定進 VM（vm.requestPolicyWrite(binding)），提交前比對失配作廢。
     private fun requestPreWriteWarning(
@@ -6042,8 +6047,10 @@ class MainActivity : ComponentActivity() {
         if (pendingClearConfirm) return
         pendingClearConfirm = true
         lifecycleScope.launch {
+            // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
+            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
             val probe = try {
-                probeDualAppsInUser95(delta)
+                probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
@@ -6075,6 +6082,9 @@ class MainActivity : ComponentActivity() {
                         probe.installed,
                         onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
+                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
+                        userId = verifiedUid,
+                        rootUninstallAllowed = verifiedUid != null,
                     )
                 }
             }
@@ -6285,6 +6295,38 @@ internal fun shouldShowBlankInputReason(isBlank: Boolean, busy: Boolean, writeBl
 // UI 層即時門控（fail-closed 對齊，不取代 VM 守衛）。
 internal fun verifiedTargetAvailable(s: UiState): Boolean =
     s.inventory.targetId > 0 && s.inventory.targetSerial != null
+
+// R05/NEW-1 / Phase1 review(HIGH)：pre-clear 破壞性路徑（probe／uninstall／
+// ROOT 代關按鈕）唯一的 uid 來源。
+//
+// 授權不變數（invariant）：只有「新鮮且已驗證」的 target 才授權破壞性動作——
+// targetId>0、targetSerial 已知，且 inventory.freshness == FRESH。STALE／UNKNOWN
+// 明確保留 targetId/targetSerial（見 InventorySnapshot），若只看 id/serial 仍會在
+// profile remap（95→96）後拿到陳舊 id 而誤授權 pm uninstall／probe 到錯誤 profile，
+// 故一律回 null = fail-closed。
+//
+// 為何不再追加 Confirmed pin 欄位：UiState 沒有比 FRESH 更權威且便宜的 Confirmed
+// pin（inventory.freshness==FRESH 已是 pinned verify 成功的產物）；因此本路徑的安全
+// 條件是「FRESH + click-time re-resolve」——警告顯示時解析的 id 只是候選，真正執行前
+// 必須經 preClearUidStillValid 以當下 vm.state.value 重解析確認（見 showPreClearWarning）。
+// 字面 95 只是 device hypothesis（profile 可被 remap），永不授權破壞性動作。
+internal fun resolvePreClearDualUserId(s: UiState): Int? =
+    if (verifiedTargetAvailable(s) && s.inventory.freshness == InventoryFreshness.FRESH) {
+        s.inventory.targetId
+    } else {
+        null
+    }
+
+// Phase1 review(HIGH)：ROOT 代關 Neutral OK 點擊當下的 TOCTOU fence（純函數、JVM 可測）。
+// captured=警告顯示時解析的 id；live=點擊瞬間從 vm.state.value 重解析的 id。
+// 只有兩者皆非 null、皆 >0 且相等才放行；null／mismatch（含 remap 95→96）一律 false。
+internal fun preClearUidStillValid(captured: Int?, live: Int?): Boolean =
+    captured != null && live != null && captured > 0 && live > 0 && captured == live
+
+// showPreClearWarning 的 ROOT 代關 Neutral 顯示條件（純函數、JVM 可測）：
+// 只有 resolved verified id（>0）才准顯示；null/<=0 一律 false。
+internal fun preClearRootUninstallAllowed(userId: Int?): Boolean =
+    userId != null && userId > 0
 
 // P2-2 clone/remove enablement（純函數，JVM 可測；render + TextWatcher 共用）。
 // 三條件：非 busy、可寫（writeBlockReason == null）、手動輸入可用。
@@ -7246,7 +7288,7 @@ internal class DualViewModelFactory(
     }
 }
 
-// ===== Issue #73：清除政策前雙開提醒（BBC6；user-95 分身探測／ROOT 代關）=====
+// ===== Issue #73：清除政策前雙開提醒（BBC6；verified-user 分身探測／ROOT 代關）=====
 // MainActivity「清除草稿」與 PolicyActivity「寫入政策草稿（清空）」兩處共用的
 // 實作（頂層 internal；spec 原稿為 private 成員＋PolicyActivity 端重複實作，但
 // STRICT 範圍禁止新檔案、且重複兩份探測／對話框邏輯易漂移，故收斂為單份共用）。
@@ -7258,20 +7300,21 @@ internal class DualViewModelFactory(
 // Ok(non-empty) 走雙開提醒。卸載失敗仍只記 log 並 proceed（使用者意圖優先，
 // BBC6 風險由警告文案與「二次確認」承載，不由靜默攔截承載）。
 //
-// shell 備註：pkg tokens 全部來自 vm.state.value.policyDraft（VM 入 store 前已經
-// isValidPackage 驗證，[a-zA-Z0-9._-]，不含空白／引號／分號），以空格 join 後
-// 直接內插進 for 清單是安全的；整個指令字串作為單一 su -c 參數傳入（argv form，
-// 不經第二層 shell 引捨／ Runtime.exec）。split 於 caller 端以 whitespace 完成
-// （package 名不含空白）。
+// R02：shell probe 不再以 pm path 的 ROM 特定錯誤文字判定「未安裝」。改以
+// 單一 `pm list packages --user <uid>` 的 stdout 作為 deterministic source of
+// truth：先抓 rc 成 PROBE_RC=<n>，再對每個 requested pkg 輸出三選一 marker
+// INST/CLEAN/FAIL。任何 FAIL、marker 缺失、PROBE_RC!=0、gateway 失敗訊號皆
+// Failed；Ok(empty) 僅在每個 requested pkg 都有 CLEAN marker 時成立。
 //
-// 與 spec 草稿的明文差異（見交付報告）：
-// 1) 探測判定由 [ -n "$out" ] 改為 case "$out" in package:*——pm path 對未安裝
-//    的套件會把錯誤輸出寫進 stdout/stderr，經 2>&1 合併後 $out 非空，原式會
-//    把「未安裝」全部誤判為「已安裝」（假 positive，且觸發無謂警告／誤導 ROOT
-//    代關清單）；以 package: 前綴行判定才能等同「真的印出了 APK 路徑」。
-// 2) probe／uninstall 為 suspend（spec 草稿省略了 suspend 修飾子；Gateway.run 是
-//    suspend，兩函數必須 suspend 或以 runBlocking 擋主執行緒）。
-// 3) 共用實作為頂層 internal 而非各呼叫端 private 成員（理由如上）。
+// R05/NEW-1：uid 由 verified target pipeline 顯式傳入（resolvePreClearDualUserId），
+// 不再硬編碼 95；unverified => probe Failed / uninstall 不執行 / ROOT 按鈕不顯示。
+//
+// F4：所有進入 shell 的包名 token 改用 PolicySource.isValidShellPackage（嚴格
+// Android grammar），不再用 equality-only 的 isValidPackage。
+//
+// shell 備註：pkg tokens 全部來自 caller 端已驗證的包名集合；以空格 join 後
+// 直接內插進 for 清單是安全的；整個指令字串作為單一 su -c 參數傳入（argv form，
+// 不經第二層 shell 引捨／Runtime.exec）。uid 為 Int，內插至 --user 亦安全。
 // 512 == PolicySource.MAX_POLICY_ENTRIES; raising from 200 so every legitimate
 // draft fits argv limits (512 × ~40 B ≈ 20 KB) and disclosure stays complete.
 internal const val MAX_DUAL_PROBE_PKGS = 512
@@ -7280,29 +7323,83 @@ internal const val MAX_DUAL_PROBE_PKGS = 512
 internal const val PRE_CLEAR_LIST_MAX = 20
 private const val PRE_CLEAR_TAG = "PreClear"
 
-internal fun buildDualProbeCommand(pkgs: List<String>): String {
-    val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
-        .filter { PolicySource.isValidPackage(it) }
+// R02 markers: one explicit, unambiguous outcome per requested package.
+internal const val DUAL_PROBE_INST = "INST"
+internal const val DUAL_PROBE_CLEAN = "CLEAN"
+internal const val DUAL_PROBE_FAIL = "FAIL"
+internal const val DUAL_PROBE_RC = "PROBE_RC"
+
+private fun shellProbePkgs(pkgs: List<String>): List<String> =
+    pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .filter { PolicySource.isValidShellPackage(it) }
         .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
-    return "for pkg in ${capped.joinToString(" ")}; do " +
-        "out=\$(pm path --user 95 \"\$pkg\" 2>&1); " +
-        "case \"\$out\" in package:*) echo \"INST \$pkg\";; esac; done"
+
+// uid 為 verified dual id（>0），由 caller 顯式傳入，永不硬編碼 95。
+internal fun buildDualProbeCommand(pkgs: List<String>, userId: Int): String {
+    val capped = shellProbePkgs(pkgs)
+    // `pm list packages --user <uid>` 是 deterministic truth source（僅在 rc==0
+    // 時採信其 package: 行）；不視 ROM 特定 error text 為判斷依據。
+    // 每個 requested pkg 恰 emit 一個 marker；rc!=0 => FAIL（不因 stdout 含
+    // package: 行而誤判 installed，fake pm exit 1 + package: 行必須 Failed）。
+    // _BAD: ROM 可能把 error text 寫進 stdout 且仍 exit 0；任何非 package: 行
+    // 都視為不可信輸出（全數 FAIL），不因「找不到 package:<pkg>」而假裝 CLEAN。
+    // Phase1 review(MEDIUM)：ROM/pty 可能在每行尾補 \r（CRLF）；先將整段輸出
+    // 正規化為 _PN（strip CR），_BAD 檢查與 grep 比對一律用 _PN，避免
+    // "package:com.a.app\r" 通過 _BAD 卻讓精確 grep 落空而誤判 CLEAN（fail-open）。
+    return "_PL=\$(pm list packages --user $userId); _RC=\$?; " +
+        "_PN=\$(printf '%s\\n' \"\$_PL\" | tr -d '\\r'); " +
+        "_BAD=0; for _l in \$_PN; do case \"\$_l\" in package:*) ;; *) _BAD=1;; esac; done; " +
+        "echo \"$DUAL_PROBE_RC=\$_RC\"; " +
+        "for pkg in ${capped.joinToString(" ")}; do " +
+        "if [ \$_RC -ne 0 ] || [ \$_BAD -ne 0 ]; then echo \"$DUAL_PROBE_FAIL \$pkg\"; " +
+        "elif printf '%s\\n' \"\$_PN\" | grep -Fxq \"package:\$pkg\"; then echo \"$DUAL_PROBE_INST \$pkg\"; " +
+        "else echo \"$DUAL_PROBE_CLEAN \$pkg\"; fi; done"
 }
 
+// R02 parser：回傳完整 marker 集合（ LinkedHashSet 保留首次出現順序）。
+internal data class DualProbeMarkers(
+    val installed: Set<String>,
+    val clean: Set<String>,
+    val failed: Set<String>,
+    val probeRc: Int?,
+) {
+    val allMarked: Set<String> get() = installed + clean + failed
+}
+
+internal fun parseDualProbeMarkers(out: String): DualProbeMarkers {
+    val inst = LinkedHashSet<String>()
+    val clean = LinkedHashSet<String>()
+    val failed = LinkedHashSet<String>()
+    var rc: Int? = null
+    out.lineSequence().map { it.trim() }.forEach { line ->
+        when {
+            line.startsWith("$DUAL_PROBE_RC=") -> {
+                rc = line.removePrefix("$DUAL_PROBE_RC=").trim().toIntOrNull()
+            }
+            line.startsWith("$DUAL_PROBE_INST ") ->
+                line.removePrefix("$DUAL_PROBE_INST ").trim().takeIf { it.isNotEmpty() }?.let(inst::add)
+            line.startsWith("$DUAL_PROBE_CLEAN ") ->
+                line.removePrefix("$DUAL_PROBE_CLEAN ").trim().takeIf { it.isNotEmpty() }?.let(clean::add)
+            line.startsWith("$DUAL_PROBE_FAIL ") ->
+                line.removePrefix("$DUAL_PROBE_FAIL ").trim().takeIf { it.isNotEmpty() }?.let(failed::add)
+        }
+    }
+    return DualProbeMarkers(inst, clean, failed, rc)
+}
+
+// 向後相容的 pure seam：只解 INST 行（順序去重），新的完整判定見 decideDualProbeResult。
 internal fun parseDualProbeOutput(out: String): List<String> =
     out.lineSequence()
         .map { it.trim() }
-        .filter { it.startsWith("INST ") }
-        .map { it.removePrefix("INST ").trim() }
+        .filter { it.startsWith("$DUAL_PROBE_INST ") }
+        .map { it.removePrefix("$DUAL_PROBE_INST ").trim() }
         .filter { it.isNotEmpty() }
         .distinct()
         .toList()
 
-internal fun buildDualUninstallCommand(pkgs: List<String>): String {
-    val capped = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
-        .filter { PolicySource.isValidPackage(it) }
-        .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
-    return "for pkg in ${capped.joinToString(" ")}; do pm uninstall --user 95 \"\$pkg\"; done"
+internal fun buildDualUninstallCommand(pkgs: List<String>, userId: Int): String {
+    val capped = shellProbePkgs(pkgs)
+    return "for pkg in ${capped.joinToString(" ")}; do pm uninstall --user $userId \"\$pkg\"; done"
 }
 
 // Phase B（P1 #2）：探測結果以 Ok/Failed 明確區分，不再以空清單吞失敗。
@@ -7317,8 +7414,13 @@ internal sealed interface DualProbeResult {
 // 純判定（JVM 可測，無 Android 依賴）：CmdResult → DualProbeResult。
 // fail-closed 口徑：timedOut／transportUnknown／truncated 旗標、
 // [truncated] 標記、exit!=0、stderr 非空、Failure 行任一命中即 Failed；
-// 僅全通過才解析 INST 行（再以 isValidPackage 過濾非法 token）。
-internal fun decideDualProbeResult(result: CmdResult): DualProbeResult {
+// PROBE_RC!=0 或任何 FAIL marker 亦 Failed。R02：Ok(empty) 僅在每個 requested
+// pkg 都有 CLEAN marker 時成立；缺任何 marker 一律 Failed。
+// requested 省略時保留舊 pure-seam 行為（只解 INST 行），供既有純判定測試使用。
+internal fun decideDualProbeResult(
+    result: CmdResult,
+    requested: Set<String> = emptySet(),
+): DualProbeResult {
     if (result.timedOut) {
         val detail = result.err.ifBlank { "unknown" }.take(200)
         return DualProbeResult.Failed("timeout: $detail")
@@ -7346,23 +7448,61 @@ internal fun decideDualProbeResult(result: CmdResult): DualProbeResult {
     if (failureLine != null) {
         return DualProbeResult.Failed("failure-line: ${failureLine.trim().take(200)}")
     }
-    // 從輸出只擷取「INST <pkg>」行，再以 isValidPackage grammar 過濾非法 token，
-    // 作為避免 su 執行無法預期字串的防線（合法資料來源仍為已寫入草稿的套件名）。
-    val installed = parseDualProbeOutput(result.out)
-        .filter { PolicySource.isValidPackage(it) }
+    val markers = parseDualProbeMarkers(result.out)
+    if (markers.probeRc != null && markers.probeRc != 0) {
+        return DualProbeResult.Failed("probe-rc: ${markers.probeRc}")
+    }
+    // Phase1 review(P2)：有 requested 集合時 PROBE_RC 為必要證據——缺行代表指令
+    // 未如預期執行（例如 gateway 吞掉 echo），即便所有 marker 齊全也不得 Ok。
+    if (requested.isNotEmpty() && markers.probeRc == null) {
+        return DualProbeResult.Failed("probe-rc: missing")
+    }
+    if (markers.failed.isNotEmpty()) {
+        return DualProbeResult.Failed("probe-failed: ${markers.failed.take(3).joinToString(",")}")
+    }
+    if (requested.isEmpty()) {
+        // Legacy pure seam: no requested set to cross-check.
+        return DualProbeResult.Ok(parseDualProbeOutput(result.out))
+    }
+    // R02：每個 requested pkg 必須恰有一個 marker；缺 marker / 矛盾 marker == FAIL。
+    val ambiguous = requested.filter { pkg ->
+        (if (pkg in markers.installed) 1 else 0) +
+            (if (pkg in markers.clean) 1 else 0) +
+            (if (pkg in markers.failed) 1 else 0) > 1
+    }
+    if (ambiguous.isNotEmpty()) {
+        return DualProbeResult.Failed("ambiguous-marker: ${ambiguous.take(3).joinToString(",")}")
+    }
+    val unmarked = requested - markers.allMarked
+    if (unmarked.isNotEmpty()) {
+        return DualProbeResult.Failed("missing-marker: ${unmarked.take(3).joinToString(",")}")
+    }
+    // F4 cross-check：INST 必須是 requested 的子集，且通過嚴格 shell grammar；
+    // 注入的 INST evil.pkg 直接丟棄，不得進入 installed。
+    val installed = markers.installed.toList()
+        .filter { it in requested && PolicySource.isValidShellPackage(it) }
+    if (installed.isEmpty() && !markers.clean.containsAll(requested)) {
+        return DualProbeResult.Failed("probe-incomplete: no CLEAN for ${requested.take(3).joinToString(",")}")
+    }
     return DualProbeResult.Ok(installed)
 }
 
-internal suspend fun probeDualAppsInUser95(
+// R05/NEW-1：uid 為 verified target id（resolvePreClearDualUserId 的結果）。
+// null = target unverified => fail-closed Failed，且不呼叫 gateway。
+internal suspend fun probeDualApps(
     pkgs: Collection<String>,
+    userId: Int?,
     gateway: CmdGateway = SuCmdGateway(),
 ): DualProbeResult {
+    if (userId == null) {
+        return DualProbeResult.Failed("target-unverified: no verified dual user id")
+    }
     val distinct = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
         .distinct().sorted()
     if (distinct.isEmpty()) return DualProbeResult.Ok(emptyList())
     // Probe entry does not trust persisted/lastSynced content: re-validate
-    // grammar here before building the shell command.
-    val valid = distinct.filter { PolicySource.isValidPackage(it) }
+    // strict shell grammar here before building the shell command.
+    val valid = distinct.filter { PolicySource.isValidShellPackage(it) }
     if (valid.size != distinct.size) {
         preClearLog("dual-profile probe dropped invalid: ${distinct.size - valid.size}")
     }
@@ -7375,7 +7515,7 @@ internal suspend fun probeDualAppsInUser95(
         preClearLog("dual-profile probe capped: ${valid.size} > $MAX_DUAL_PROBE_PKGS")
         return DualProbeResult.Failed("truncated: capped ${valid.size} > $MAX_DUAL_PROBE_PKGS")
     }
-    val cmd = buildDualProbeCommand(valid)
+    val cmd = buildDualProbeCommand(valid, userId)
     val result = try {
         gateway.run(cmd)
     } catch (e: CancellationException) {
@@ -7384,12 +7524,24 @@ internal suspend fun probeDualAppsInUser95(
         preClearLog("dual-profile probe exec failed", e)
         return DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
     }
-    val decided = decideDualProbeResult(result)
+    val decided = decideDualProbeResult(result, valid.toSet())
     if (decided is DualProbeResult.Failed) {
-        preClearLog("dual-profile probe failed: ${decided.reason}")
+        // Phase1 review(LOW)：log 合約為「counts/status only」——reason 可能內嵌包名原文
+        // （probe-failed/missing-marker/ambiguous-marker/probe-incomplete），僅供 UI 顯示；
+        // 此處只記計數，不把包名寫入 log。
+        val markers = parseDualProbeMarkers(result.out)
+        preClearLog(
+            "dual-profile probe failed: status=failed requested=${valid.size} " +
+                "failed=${markers.failed.size} missing=${(valid.toSet() - markers.allMarked).size}",
+        )
     }
     return decided
 }
+
+// Phase1 review(P2)：probeDualAppsInUser95 / uninstallDualAppsInUser95 測試的包裝
+// 已移出生產源碼，僅存在於 src/test（PreClearTestHelpers.kt）。生產路徑一律用
+// probeDualApps / uninstallDualApps + resolvePreClearDualUserId，源碼中不含任何
+// 可呼叫的硬編碼 95 路徑。
 
 // JVM 單元測試相容：android.util.Log 在 JVM 單元測試為 stub（拋
 // "not mocked" RuntimeException），此處吞掉以保純邏輯可測；生產仍經 Logcat。
@@ -7403,12 +7555,18 @@ internal fun preClearLog(msg: String, e: Throwable? = null) {
 
 // Phase E：gateway 可注入（JVM 測試經 FakeGateway 覆蓋 error/partial/Unknown/cancel/race；
 // 生產預設仍走 SuCmdGateway）。隱私：log 只記計數／狀態旗標，不記包名原文（log 包名改計數）。
-internal suspend fun uninstallDualAppsInUser95(
+// R05/NEW-1：uid 必須是 verified id；null（unverified）=> 绝不執行 pm uninstall。
+internal suspend fun uninstallDualApps(
     pkgs: Collection<String>,
+    userId: Int?,
     gateway: CmdGateway = SuCmdGateway(),
 ): Boolean {
+    if (userId == null) {
+        preClearLog("dual-profile uninstall refused: target unverified")
+        return false
+    }
     if (pkgs.isEmpty()) return true
-    val cmd = buildDualUninstallCommand(pkgs.toList())
+    val cmd = buildDualUninstallCommand(pkgs.toList(), userId)
     return try {
         val result = gateway.run(cmd)
         // Reuse decideDualProbeResult fail-closed signals: truncated output,
@@ -7444,13 +7602,25 @@ internal suspend fun uninstallDualAppsInUser95(
 // onProceed＝繼續清除（Positive，不二次確認；對話框文字已明示「同意卸載分身」）。
 // onCancel＝取消清除（Negative／返回鍵／點擊外部／ROOT 代關二次確認中取消；呼叫端負責還原勾選等）。
 // Neutral（ROOT 代關）先補一道不可復原的二次確認；確認後對 installed 全部套用
-// pm uninstall --user 95，失敗仍 proceed（只記 log；使用者意圖優先）。
+// pm uninstall --user <verified uid>，失敗仍 proceed（只記 log；使用者意圖優先）。
+// R05/NEW-1：只有 verified target 存在（rootUninstallAllowed && userId != null）
+// 才顯示 ROOT 代關 Neutral；unverified 時該按鈕完全不出現，杜絕 unresolved uid
+// 的破壞性 pm uninstall。兩參數預設皆為 fail-closed（false / null）。
+//
+// Phase1 review(HIGH/TOCTOU)：userId 是警告顯示時解析的候選值，可能被 remap／轉 STALE。
+// resolveLiveUserId 由呼叫端綁定 vm.state.value（即 { resolvePreClearDualUserId(vm.state.value) }），
+// 在二次確認 OK 點擊當下重新解析；只有 preClearUidStillValid(captured, live) 成立才執行
+// uninstall／re-probe，否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
+// 參數無預設值：任何新呼叫端都必須明確提供重解析來源（fail-closed 編譯期約束）。
 internal fun showPreClearWarning(
     host: ComponentActivity,
     installed: List<String>,
     onProceed: () -> Unit,
     onCancel: () -> Unit,
+    resolveLiveUserId: () -> Int?,
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
+    userId: Int? = null,
+    rootUninstallAllowed: Boolean = false,
 ) {
     if (installed.isEmpty()) {
         preClearLog("pre-clear warning called with empty list; treating as cancelled")
@@ -7458,6 +7628,7 @@ internal fun showPreClearWarning(
         return
     }
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    val canRootUninstall = rootUninstallAllowed && preClearRootUninstallAllowed(userId)
     val sorted = installed.sorted()
     val shown = sorted.take(PRE_CLEAR_LIST_MAX)
     val list = shown.joinToString("\n") + if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…" else ""
@@ -7469,17 +7640,19 @@ internal fun showPreClearWarning(
         return
     }
     try {
-        AlertDialog.Builder(host)
+        val builder = AlertDialog.Builder(host)
             .setTitle(R.string.pre_clear_title)
             .setMessage(message)
             .setCancelable(true)
             .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
             .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
-            .setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
+        // R05/NEW-1：unverified target 完全不顯示 ROOT 代關 Neutral。
+        if (canRootUninstall) {
+            builder.setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
                 // ROOT 代關＝清除分身資料，不可復原 → 二次確認（ONE confirm only）。
                 // 取消（含返回鍵）= 完整取消語義：不放行、不執行卸載，旗標重置；
                 // 呼叫端 onCancel 生效（PolicyActivity 勾選還原＝安全側，MA/寫入路徑為 no-op）。
-                // Phase D：二次確認通過後先執行卸載，再重跑 probeDualAppsInUser95 驗證：
+                // Phase D：二次確認通過後先執行卸載，再重跑 probeDualApps 驗證：
                 // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
                 // 仍要清除自擔／取消），失敗 never 默認 proceed。
                 try {
@@ -7502,9 +7675,27 @@ internal fun showPreClearWarning(
                         )
                         .setCancelable(true)
                         .setPositiveButton(android.R.string.ok) { _, _ ->
+                            // Phase1 review(HIGH/TOCTOU)：執行前以「當下」vm.state.value 重解析，
+                            // 永不重用警告顯示時捕獲的 userId（可能 remap 95→96／轉 STALE）。
+                            val liveUid = try {
+                                resolveLiveUserId()
+                            } catch (e: Exception) {
+                                preClearLog("root-uninstall re-resolve failed", e)
+                                null
+                            }
+                            if (!preClearUidStillValid(userId, liveUid)) {
+                                // fail-closed：不 uninstall、不 re-probe、不 proceed。
+                                preClearLog("root-uninstall aborted: verified uid no longer valid")
+                                try {
+                                    Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
+                                } catch (_: Exception) { }
+                                try { onCancel() } catch (_: Exception) { }
+                                return@setPositiveButton
+                            }
+                            val effectiveUid = liveUid!!
                             host.lifecycleScope.launch {
                                 try {
-                                    uninstallDualAppsInUser95(installed)
+                                    uninstallDualApps(installed, effectiveUid)
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
@@ -7514,7 +7705,7 @@ internal fun showPreClearWarning(
                                 // Residual non-empty (or probe failure) = verification
                                 // failure; never auto-proceed — explicit 3-choice below.
                                 val postProbe: DualProbeResult = try {
-                                    probeDualAppsInUser95(installed)
+                                    probeDualApps(installed, effectiveUid)
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
@@ -7532,7 +7723,8 @@ internal fun showPreClearWarning(
                                     is UninstallVerifyOutcome.Residual ->
                                         preClearLog("post-uninstall re-probe residual: ${outcome.remaining.size}")
                                     is UninstallVerifyOutcome.ProbeFailed ->
-                                        preClearLog("post-uninstall re-probe failed: ${outcome.reason}")
+                                        // log 只記狀態，不記 reason（可能內嵌包名原文）。
+                                        preClearLog("post-uninstall re-probe failed: status=failed expected=${installed.size}")
                                 }
                                 try {
                                     showUninstallVerifyDialog(
@@ -7558,8 +7750,9 @@ internal fun showPreClearWarning(
                     onCancel()
                 }
             }
-            .setOnCancelListener { onCancel() }
-            .show()
+        }
+        builder.setOnCancelListener { onCancel() }
+        builder.show()
     } catch (e: RuntimeException) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
         preClearLog("pre-clear warning failed to show", e)

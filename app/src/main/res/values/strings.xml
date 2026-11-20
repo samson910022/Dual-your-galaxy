@@ -132,18 +132,20 @@
     <string name="policy_cleared">已清除政策草稿（注意：政策為空時Samsung會自動刪除分身及其資料，無法復原）</string>
     <!-- Issue #73：清除政策前雙開提醒（BBC6：政策清空＝Samsung 自動刪分身，user-95 資料不可復原）。三語系同鍵。-->
     <string name="pre_clear_title">清除政策前 · 雙開提醒</string>
-    <string name="pre_clear_message">這些 app 目前在雙開分身（user 95）已安裝：%1$s\n\nSamsung 會在政策為空時自動刪除分身（含 user-95 資料、無法復原）。請先到 Samsung「設定 → 應用程式 → 雙開應用」把這些 app 的雙開關掉後再清除。</string>
+    <string name="pre_clear_message">這些 app 目前在雙開分身已安裝：%1$s\n\nSamsung 會在政策為空時自動刪除分身（含雙開分身資料、無法復原）。請先到 Samsung「設定 → 應用程式 → 雙開應用」把這些 app 的雙開關掉後再清除。</string>
     <string name="pre_clear_confirm_proceed">繼續清除（同意卸載分身）</string>
     <string name="pre_clear_cancel">取消清除</string>
     <string name="pre_clear_root_uninstall">ROOT 代為關閉分身（清除資料）</string>
     <string name="pre_clear_root_uninstall_confirm">這會清除以下分身的資料與所有應用資料，確定？</string>
+    <!-- Phase1 review(HIGH/TOCTOU)：點擊當下 verified uid 失效（remap／轉 STALE）時的 fail-closed 提示。 -->
+    <string name="pre_clear_target_changed">雙開分身目標已變更，已取消代為關閉分身，請重新確認後再試。</string>
     <string name="pre_clear_probe_failed_title">無法探測分身狀態 · 仍可能卸載分身</string>
-    <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身會被 Samsung 隨政策清空一併刪除（含 user-95 資料、無法復原）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。</string>
+    <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身會被 Samsung 隨政策清空一併刪除（含雙開分身資料、無法復原）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。</string>
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>
     <!-- Phase D：ROOT 卸載後驗證三選一（重跑 probe；殘留非空即失敗；失敗不默認 proceed）。 -->
     <string name="pre_clear_uninstall_verify_title">卸載後驗證 · 請明確選擇</string>
-    <string name="pre_clear_uninstall_verify_success">卸載後重探 user 95：已無殘留分身，可繼續清除政策。</string>
-    <string name="pre_clear_uninstall_verify_residual">卸載後重探 user 95 仍有殘留分身：%1$s\n\n「驗證成功，繼續清除」已禁用；如確定要清除請選「仍要清除（自擔風險）」，或取消後手動關閉雙開。</string>
+    <string name="pre_clear_uninstall_verify_success">卸載後重探雙開分身：已無殘留分身，可繼續清除政策。</string>
+    <string name="pre_clear_uninstall_verify_residual">卸載後重探雙開分身仍有殘留分身：%1$s\n\n「驗證成功，繼續清除」已禁用；如確定要清除請選「仍要清除（自擔風險）」，或取消後手動關閉雙開。</string>
     <string name="pre_clear_uninstall_verify_failed">卸載後重探無法完成（%1$s），殘留未知。\n\n「驗證成功，繼續清除」已禁用；如確定要清除請選「仍要清除（自擔風險）」，或取消後重試。</string>
     <string name="pre_clear_verify_proceed">驗證成功，繼續清除</string>
     <string name="pre_clear_force_proceed">仍要清除（自擔風險）</string>

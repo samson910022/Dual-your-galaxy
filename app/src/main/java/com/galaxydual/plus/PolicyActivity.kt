@@ -118,10 +118,10 @@ class PolicyActivity : ComponentActivity() {
     private var policyConfirmDialog: AlertDialog? = null
     private val policyConfirmState = PolicyConfirmDialogState()
     // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
-    // 刪除 user-95 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
+    // 刪除 verified target 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
     // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
     // Phase C：
-    // - N→M 覆寫：old-minus-candidate delta，對 installed user95 彈警告；
+    // - N→M 覆寫：old-minus-candidate delta，對 installed dual 彈警告；
     //   proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢。
     // - N→0 採 A 案：禁清到底——空集連警告都不彈，導引去 Main 清除；
     //   刪現有「警告+恆拒」死路（pre_clear_editor_* 不再使用）。
@@ -192,8 +192,10 @@ class PolicyActivity : ComponentActivity() {
             // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
             // Failed 一律走探測失敗警告；Ok(non-empty) 走雙開提醒。
             // Phase C：僅探 delta（old-minus-candidate）。
+            // R05/NEW-1：uid 由 verified target 解析，unverified => Failed 警告。
+            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
             val probe = try {
-                probeDualAppsInUser95(delta)
+                probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
                 pendingClearConfirm = false
                 throw e
@@ -225,6 +227,9 @@ class PolicyActivity : ComponentActivity() {
                         probe.installed,
                         onProceed = { pendingClearConfirm = false; proceed(binding) },
                         onCancel = { pendingClearConfirm = false; onCancel() },
+                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
+                        userId = verifiedUid,
+                        rootUninstallAllowed = verifiedUid != null,
                     )
                 }
             }

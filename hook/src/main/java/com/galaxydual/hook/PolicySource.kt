@@ -91,6 +91,18 @@ object PolicySource {
     fun isValidPackage(pkg: String): Boolean =
         pkg.isNotEmpty() && PKG.matches(pkg)
 
+    // Strict Android package grammar for values that become SHELL ARGV TOKENS
+    // (pre-clear dual probe/uninstall builders in :app). Unlike isValidPackage
+    // (equality-only superset that admits '-', '..', "com..x", leading digits),
+    // this rejects anything that is not a dot-separated sequence of
+    // [A-Za-z][A-Za-z0-9_]* segments with at least one dot, and bounds the
+    // length to MAX_PACKAGE_LENGTH. Use this — never isValidPackage — for any
+    // token interpolated into a pm command or re-filtered out of probe output.
+    private val SHELL_PKG = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
+
+    fun isValidShellPackage(pkg: String): Boolean =
+        pkg.length <= MAX_PACKAGE_LENGTH && SHELL_PKG.matches(pkg)
+
     // Drops invalid tokens and any non-String element (defensively:
     // RemotePreferences snapshots cross process boundaries as Java collections,
     // and a corrupt prefs entry can carry any object); never throws.

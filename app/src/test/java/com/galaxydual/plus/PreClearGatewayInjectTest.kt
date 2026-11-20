@@ -18,6 +18,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -176,7 +177,7 @@ class PreClearGatewayInjectTest {
 
     @Test
     fun probe_race_concurrentAllSettle() {
-        val gw = FakeGateway(CmdResult(exit = 0, out = "INST com.a.app\n", err = ""), delayMs = 5)
+        val gw = FakeGateway(CmdResult(exit = 0, out = "PROBE_RC=0\nINST com.a.app\n", err = ""), delayMs = 5)
         val results = runBlocking {
             (1..10).map { async { probeDualAppsInUser95(listOf("com.a.app"), gw) } }.awaitAll()
         }
@@ -194,5 +195,100 @@ class PreClearGatewayInjectTest {
         } catch (_: CancellationException) {
             // Expected.
         }
+    }
+
+    // ---- R05/NEW-1: verified uid threading + unverified fail-closed ----
+
+    @Test
+    fun probe_unverifiedTarget_failsClosedWithoutGatewayCall() {
+        val gw = FakeGateway(CmdResult(0, "PROBE_RC=0\nCLEAN com.a.app\n", ""))
+        val res = runBlocking { probeDualApps(listOf("com.a.app"), null, gw) }
+        assertTrue("unverified probe must be Failed, got: $res", res is DualProbeResult.Failed)
+        assertTrue((res as DualProbeResult.Failed).reason.startsWith("target-unverified:"))
+        assertEquals(0, gw.calls)
+    }
+
+    @Test
+    fun uninstall_unverifiedTarget_refusedWithoutGatewayCall() {
+        val gw = FakeGateway(CmdResult(0, "", ""))
+        assertFalse(runBlocking { uninstallDualApps(listOf("com.a.app"), null, gw) })
+        assertEquals(0, gw.calls)
+    }
+
+    @Test
+    fun probe_andUninstall_useExplicitVerifiedUid() {
+        val probeGw = FakeGateway(CmdResult(0, "PROBE_RC=0\nCLEAN com.a.app\n", ""))
+        val probe = runBlocking { probeDualApps(listOf("com.a.app"), 101, probeGw) }
+        assertTrue(probe is DualProbeResult.Ok)
+        assertTrue((probeGw.lastCmd ?: "").contains("--user 101"))
+        assertFalse((probeGw.lastCmd ?: "").contains("--user 95"))
+
+        val uninstallGw = FakeGateway(CmdResult(0, "", ""))
+        assertTrue(runBlocking { uninstallDualApps(listOf("com.a.app"), 101, uninstallGw) })
+        assertTrue((uninstallGw.lastCmd ?: "").contains("--user 101"))
+        assertFalse((uninstallGw.lastCmd ?: "").contains("--user 95"))
+    }
+
+    // ---- Phase1 review(HIGH): stale target gate must not authorize destructive actions ----
+
+    @Test
+    fun resolvePreClearDualUserId_staleOrUnknown_returnsNull_freshReturnsId() {
+        // STALE/UNKNOWN explicitly retain targetId/targetSerial — a remapped profile
+        // (95 -> 96) would otherwise keep yielding a non-null stale id.
+        val stale = UiState(
+            inventory = InventorySnapshot(
+                targetId = 95,
+                targetSerial = 7,
+                freshness = InventoryFreshness.STALE,
+            ),
+        )
+        assertNull("STALE must fail closed", resolvePreClearDualUserId(stale))
+        val unknown = UiState(
+            inventory = InventorySnapshot(
+                targetId = 95,
+                targetSerial = 7,
+                freshness = InventoryFreshness.UNKNOWN,
+            ),
+        )
+        assertNull("UNKNOWN must fail closed", resolvePreClearDualUserId(unknown))
+        val fresh = UiState(
+            inventory = InventorySnapshot(
+                targetId = 95,
+                targetSerial = 7,
+                freshness = InventoryFreshness.FRESH,
+            ),
+        )
+        assertEquals(95, resolvePreClearDualUserId(fresh))
+        val freshRemapped = UiState(
+            inventory = InventorySnapshot(
+                targetId = 96,
+                targetSerial = 7,
+                freshness = InventoryFreshness.FRESH,
+            ),
+        )
+        assertEquals(96, resolvePreClearDualUserId(freshRemapped))
+        // serial null / id<=0 remain fail-closed even when FRESH.
+        assertNull(
+            resolvePreClearDualUserId(
+                UiState(inventory = InventorySnapshot(targetId = 95, freshness = InventoryFreshness.FRESH)),
+            ),
+        )
+        assertNull(
+            resolvePreClearDualUserId(
+                UiState(inventory = InventorySnapshot(targetId = -1, targetSerial = 7, freshness = InventoryFreshness.FRESH)),
+            ),
+        )
+    }
+
+    @Test
+    fun preClearUidStillValid_nullOrMismatch_failsClosed() {
+        assertTrue(preClearUidStillValid(95, 95))
+        assertTrue(preClearUidStillValid(96, 96))
+        assertFalse(preClearUidStillValid(null, 95))
+        assertFalse(preClearUidStillValid(95, null))
+        assertFalse(preClearUidStillValid(95, 96)) // remap 95 -> 96 at click time
+        assertFalse(preClearUidStillValid(null, null))
+        assertFalse(preClearUidStillValid(0, 0))
+        assertFalse(preClearUidStillValid(-1, -1))
     }
 }

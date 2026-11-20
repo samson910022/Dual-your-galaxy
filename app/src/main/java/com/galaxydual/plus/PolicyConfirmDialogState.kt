@@ -178,8 +178,8 @@ internal class PolicyConfirmDialogState {
 
 // ===== Phase D: ROOT uninstall post-verify (re-probe, residual non-empty = fail) =====
 //
-// After a ROOT uninstall (pm uninstall --user 95 over the warned set), the
-// caller MUST re-run probeDualAppsInUser95 over the same set: any residual
+// After a ROOT uninstall (pm uninstall --user <verified uid> over the warned set),
+// the caller MUST re-run probeDualApps over the same set with that verified uid: any residual
 // non-empty install is a verification failure. The outcome feeds a three-choice
 // dialog ([verify success -> clear] / [still clear at own risk] / [cancel]);
 // a failure never auto-proceeds (fail-closed, explicit choice required).
@@ -229,11 +229,11 @@ internal fun uninstallVerifyResidualDisplay(
 // fallback keeps the same three-way semantics for tests).
 internal fun uninstallVerifyMessageFallback(outcome: UninstallVerifyOutcome): String = when (outcome) {
     is UninstallVerifyOutcome.VerifiedEmpty ->
-        "卸載後驗證成功：user 95 已無殘留分身，可繼續清除。"
+        "卸載後驗證成功：雙開分身已無殘留，可繼續清除。"
     is UninstallVerifyOutcome.Residual -> {
         val (shown, rest) = uninstallVerifyResidualDisplay(outcome.remaining)
         val tail = if (rest > 0) "…（僅顯示前 ${shown.size} 項，共 ${outcome.remaining.size} 項）" else ""
-        "卸載後驗證失敗：user 95 仍有殘留分身（${outcome.remaining.size}）：${shown.joinToString(", ")}$tail。請選「仍要清除」自擔風險，或取消後手動關閉雙開。"
+        "卸載後驗證失敗：雙開分身仍有殘留分身（${outcome.remaining.size}）：${shown.joinToString(", ")}$tail。請選「仍要清除」自擔風險，或取消後手動關閉雙開。"
     }
     is UninstallVerifyOutcome.ProbeFailed ->
         "卸載後驗證無法完成（探測失敗：${outcome.reason}）。殘留未知：請選「仍要清除」自擔風險，或取消後重試。"
