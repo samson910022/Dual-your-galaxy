@@ -274,6 +274,19 @@ class EffectivePolicyCache(
 
     // Phase A P0 Security MEDIUM: version monotonicity helpers. Must be called
     // under [lock].
+    //
+    // F3 (documented limitation — option (b)): the writer's version counter is
+    // a bare Long with no on-disk epoch (the key format is fixed and shared
+    // cross-process, so an epoch/floor cannot be persisted here without a
+    // writer-side format change). When the counter wraps from MAX-1/MAX to 1,
+    // [observeBbcVersionLocked] resets the high-water to 1 to admit the new
+    // 1,2,3... sequence. From that point a replayed mid-range value (e.g. 500)
+    // is greater than the new high-water and therefore ACCEPTED — wraparound
+    // reopens the replay window until the new sequence itself passes that
+    // value. This is practically unreachable in production (it needs ~9.22e18
+    // committed writes on one install); see the pinning test
+    // `bbcVersionWraparoundReopensReplayWindowDocumentedBbc`. Do not "fix" this
+    // by storing an epoch in the version key — that changes the key format.
     private fun isBbcVersionWraparound(last: Long, v: Long): Boolean =
         last >= Long.MAX_VALUE - 1L && v == 1L
 
@@ -286,9 +299,53 @@ class EffectivePolicyCache(
         return isBbcVersionWraparound(last, v)
     }
 
+    // R06 (P1) / F2: version gate for Good(non-empty). Deliberate rule choice:
+    // reject NON-INCREASING versions (v <= last high-water) with two narrow
+    // exceptions so existing fail-open-for-Good semantics are preserved:
+    //   1. writer wraparound (v==1 after MAX-1/MAX) — identical to the Cleared
+    //      path;
+    //   2. a same-version Good when the high-water was set by a GOOD (lastBbc-
+    //      ClearedVersion != last) — preserves the existing same-version Good
+    //      re-acceptance after an intervening failed read. F2: this branch is
+    //      now CONTENT-AWARE (see below). A same-version Cleared->Good replay
+    //      IS still rejected (lastBbcClearedVersion == last), which is the
+    //      revoke-then-re-attach case this gate must stop.
+    // Strictly older versions (except wraparound) are always rejected.
+    //
+    // F2 (same-version content): when v == last and the high-water came from a
+    // Good, accept ONLY a content-compatible re-acceptance — the candidate set
+    // must be content-equivalent to, or a strict shrink of, the last accepted
+    // good snapshot (cached, or sticky last-good after invalidate/TTL). A
+    // candidate that re-introduces a package removed at this version (i.e. is
+    // NOT a subset of that snapshot) is a stale replay and is rejected as
+    // Unknown, so it can no longer re-attach a revoked package. Comparing
+    // against BOTH cached and sticky keeps the legacy
+    // successEmptyWithoutVersionKeepsLastGoodBbc (same-version same-content
+    // re-acceptance after a failed read) working.
+    private fun isGoodVersionAcceptableLocked(v: Long, candidate: Set<String>): Boolean {
+        if (v < 1L) return false
+        val last = lastBbcSeenVersion
+        if (last < 0L) return true
+        if (v > last) return true
+        if (isBbcVersionWraparound(last, v)) return true
+        if (v == last && lastBbcClearedVersion != last) {
+            val canonical = cached.takeIf { it.isNotEmpty() }
+                ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
+                ?: return true
+            // Equal (a re-read of the current state) or a strict subset (a
+            // legitimate same-version shrink) is safe: no previously removed
+            // package can come back. Any other set is a stale replay.
+            return canonical.containsAll(candidate)
+        }
+        return false
+    }
+
     private fun observeBbcVersionLocked(v: Long?) {
         if (v == null || v < 1L) return
         val last = lastBbcSeenVersion
+        // On wraparound this intentionally lowers the high-water to 1 (see F3
+        // note on isBbcVersionWraparound: the replay window reopens, documented
+        // and pinned by test rather than fixed with a key-format change).
         if (last < 0L || v > last || isBbcVersionWraparound(last, v)) {
             lastBbcSeenVersion = v
         }
@@ -801,7 +858,10 @@ class EffectivePolicyCache(
     //
     // Reader contract: Pair(packages, version) where packages==null means a
     // failed read (null / throw / contention / deadline / clock upstream);
-    // packages non-empty means Good (version ignored for old-draft compat);
+    // packages non-empty means Good — a null version is the UNGATED legacy
+    // old-draft path (trusted only before any versioned state exists), while a
+    // PRESENT version is monotonic-gated against downgrade/replay (R06 + F1/F2
+    // — see isGoodVersionAcceptableLocked);
     // packages empty + version!=null means Cleared (intentional clear, shrink
     // allowed and cached); packages empty + version==null means Unknown
     // (indistinguishable from "never written", never cached, sticky served).
@@ -1067,8 +1127,10 @@ class EffectivePolicyCache(
         // Unknown (failed); empty + null version => Unknown (no proof, never
         // shrink); empty + version => Cleared candidate (monotonicity checked
         // under lock: reject 0/duplicate/replay except writer wraparound to 1);
-        // non-empty => Good (version ignored for old-draft compat, but a
-        // present >=1 version still advances the seen gate against downgrades).
+        // non-empty => Good. Only version == null is the ungated legacy draft;
+        // a PRESENT version is monotonic-gated under lock (reject 0/downgrade/
+        // replay, content-aware at equal version; see isGoodVersionAcceptableLocked)
+        // and, when accepted, advances the seen gate.
         var unknownRead = readFailed || readPair == null
         var remoteForMerge: Set<String>? = null
         var clearedVersion: Long? = null
@@ -1158,6 +1220,49 @@ class EffectivePolicyCache(
                         } catch (_: Throwable) {
                         }
                         noteBbcFallback("cleared-rejected")
+                        return BbcPolicy.Unknown(sticky ?: emptySet())
+                    }
+                    // R06 (P1): BBC Good(non-empty) with a version must pass the
+                    // monotonic + content gate (isGoodVersionAcceptableLocked) —
+                    // previously only Cleared(empty) did, so a stale/replayed
+                    // versioned Good (e.g. Good({A},v5) -> Cleared(v6) -> stale
+                    // Good({A},v5)) was accepted and re-attached revoked A,
+                    // persisting via sticky.
+                    //
+                    // F1: a non-empty read with NO version (goodVersion == null)
+                    // is only trusted BEFORE any versioned state exists
+                    // (lastBbcSeenVersion < 0 — the legacy old-draft path, kept
+                    // working exactly as today). Once a versioned Good/Cleared
+                    // has been accepted — including every versioned Cleared
+                    // (lastBbcClearedVersion >= 1) — an unversioned non-empty
+                    // read may be a stale pre-version draft or a corrupt/CCE
+                    // version key replayed from the cached RemotePreferences
+                    // map, so it MUST be rejected as Unknown(sticky) just like a
+                    // bad version. Checked before any cached/sticky/high-water
+                    // mutation, so rejection overwrites nothing.
+                    val noVersionGoodRejected =
+                        goodVersion == null && clearedVersion == null && // unversioned non-empty Good only (not a Cleared candidate)
+                            (lastBbcSeenVersion >= 0L || lastBbcClearedVersion >= 1L)
+                    if ((goodVersion != null && !isGoodVersionAcceptableLocked(goodVersion, merged)) ||
+                        noVersionGoodRejected
+                    ) {
+                        lastFailureMs = now1
+                        val sticky = try {
+                            stickyIfValidLocked(now1)
+                        } catch (_: Throwable) {
+                            lastGoodSticky
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            bbcUnknownCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback(
+                            if (goodVersion == null) "good-rejected-no-version" else "good-rejected",
+                        )
                         return BbcPolicy.Unknown(sticky ?: emptySet())
                     }
                     val unmod = try {

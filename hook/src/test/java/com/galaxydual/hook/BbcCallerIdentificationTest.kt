@@ -137,4 +137,63 @@ class BbcCallerIdentificationTest {
         assertTrue(line.startsWith("BBC-ENTRY "))
         assertTrue(line.contains("size=-1"))
     }
+
+    // --- R10 (P2): lazy caller capture gated by the once-per-pid ledger ---
+
+    @Test
+    fun entryLoggerInvokesSupplierExactlyOnceForSamePid() {
+        val ledger = HashSet<String>()
+        val sink = mutableListOf<String>()
+        val logger = BbcInjector.BbcEntryLogger(ledger) { sink.add(it) }
+        var captures = 0
+        val supplier = { captures++; "PmWrapper#getPossibleDualAppPackages" }
+        repeat(5) { logger.logOnce(100, 1L, 3, false, supplier) }
+        assertEquals(1, captures)
+        assertEquals(1, sink.size)
+        assertEquals(setOf("entry:100"), ledger)
+        assertTrue(sink.single().startsWith("BBC-ENTRY "))
+        assertTrue(sink.single().contains("pid=100"))
+    }
+
+    @Test
+    fun entryLoggerDifferentPidInvokesSupplierOnceMore() {
+        val ledger = HashSet<String>()
+        val sink = mutableListOf<String>()
+        val logger = BbcInjector.BbcEntryLogger(ledger) { sink.add(it) }
+        var captures = 0
+        val supplier = { captures++; "PmWrapper#getPossibleDualAppPackages" }
+        repeat(5) { logger.logOnce(100, 1L, 3, false, supplier) }
+        repeat(5) { logger.logOnce(200, 2L, 4, true, supplier) }
+        assertEquals(2, captures)
+        assertEquals(2, sink.size)
+        assertEquals(setOf("entry:100", "entry:200"), ledger)
+    }
+
+    @Test
+    fun entryLoggerEmptyCallerEmitsNoLineThenRealCallerLogsOnce() {
+        // F5: an empty-caller attempt emits no line and no ledger entry, but
+        // must release the capture guard too — otherwise a later real-caller
+        // attempt for the same pid returns early and never logs.
+        val ledger = HashSet<String>()
+        val sink = mutableListOf<String>()
+        val logger = BbcInjector.BbcEntryLogger(ledger) { sink.add(it) }
+        var captures = 0
+        // First attempt: unresolvable caller -> no line, no ledger entry.
+        assertFalse(logger.logOnce(300, 1L, 3, false, { captures++; "" }))
+        assertEquals(1, captures)
+        assertTrue(sink.isEmpty())
+        assertTrue(ledger.isEmpty())
+        // Second attempt, SAME pid with a real caller: exactly one line.
+        assertTrue(logger.logOnce(300, 2L, 4, false, { captures++; "PmWrapper#getPossibleDualAppPackages" }))
+        assertEquals(2, captures)
+        assertEquals(1, sink.size)
+        assertEquals(setOf("entry:300"), ledger)
+        assertTrue(sink.single().startsWith("BBC-ENTRY "))
+        assertTrue(sink.single().contains("pid=300"))
+        // A third attempt is a fast path: ledger already claimed -> no capture,
+        // no extra line. At most one SUCCESSFUL capture/log per pid holds.
+        assertFalse(logger.logOnce(300, 3L, 5, false, { captures++; "PmWrapper#getPossibleDualAppPackages" }))
+        assertEquals(2, captures)
+        assertEquals(1, sink.size)
+    }
 }

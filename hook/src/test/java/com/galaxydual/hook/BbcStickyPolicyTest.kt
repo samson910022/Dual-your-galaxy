@@ -338,4 +338,319 @@ class BbcStickyPolicyTest {
         assertEquals(once, twice)
         assertEquals(listOf("com.samsung.a", "com.policy.x", "com.policy.y"), once)
     }
+
+    // --- R06 (P1): versioned Good(non-empty) monotonic gate ---
+
+    @Test
+    fun goodRejectsStaleReplayAfterClearedBbc() {
+        // Good({A},5) -> Cleared(6) -> stale Good({A},5) must be Unknown:
+        // revoked A is never re-attached, sticky stays the Cleared snapshot
+        // (empty), and the high-water mark is NOT lowered to 5.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        cache.invalidate()
+        val cleared = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) })
+        assertTrue(cleared is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(6L, (cleared as EffectivePolicyCache.BbcPolicy.Cleared).version)
+        val stickyBefore = cache.bbcStickyFallbackCount.get()
+        val unknownBefore = cache.bbcUnknownCount.get()
+        cache.invalidate()
+        val stale = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+        assertTrue(stale is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (stale as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(stickyBefore + 1, cache.bbcStickyFallbackCount.get())
+        assertTrue(cache.bbcUnknownCount.get() >= unknownBefore + 1)
+        // Seen-version not lowered: Cleared(6) is still a duplicate (rejected),
+        // while Cleared(7) is accepted — proving the gate still sits at 6.
+        cache.invalidate()
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) }) is EffectivePolicyCache.BbcPolicy.Unknown)
+        cache.invalidate()
+        val ok = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 7L) })
+        assertTrue(ok is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(7L, (ok as EffectivePolicyCache.BbcPolicy.Cleared).version)
+    }
+
+    @Test
+    fun goodRejectsDuplicateVersionAfterClearedBbc() {
+        // Non-increasing rule: a Cleared->Good replay of the SAME version is
+        // rejected too (not just strictly older versions).
+        val (cache, _) = bbcCacheAt(1_000L)
+        val cleared = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) })
+        assertTrue(cleared is EffectivePolicyCache.BbcPolicy.Cleared)
+        cache.invalidate()
+        val dup = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 6L) })
+        assertTrue(dup is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (dup as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        // High-water unchanged at 6.
+        cache.invalidate()
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) }) is EffectivePolicyCache.BbcPolicy.Unknown)
+    }
+
+    @Test
+    fun goodVersionWraparoundAcceptedBbc() {
+        // Wraparound semantics match the Cleared path: version 1 after a huge
+        // seen version is accepted for Good too.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A"), Long.MAX_VALUE) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val wrapped = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
+        assertTrue(wrapped is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (wrapped as EffectivePolicyCache.BbcPolicy.Good).packages)
+        // A normal forward Cleared(2) advances the high-water; the subsequent
+        // Good(2) replays the just-Cleared version and is rejected.
+        cache.invalidate()
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(emptySet(), 2L) }) is EffectivePolicyCache.BbcPolicy.Cleared)
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 2L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+    }
+
+    // --- R07 (P1): self-consistent versioned prefs read (seqlock) ---
+
+    @Test
+    fun tornVersionedPrefsReadFailsClosedBbc() {
+        val (cache, _) = bbcCacheAt(1_000L)
+        // Seed a last-good at version 5 (sticky {A}, high-water 5).
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        var versionReads = 0
+        val torn = object : BbcVersionedPrefsView {
+            override fun contains(key: String) = true
+            override fun getLong(key: String, defValue: Long): Long {
+                versionReads++
+                // Version changes BETWEEN the two reads -> torn snapshot.
+                return if (versionReads == 1) 5L else 6L
+            }
+            override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String> =
+                mutableSetOf("A")
+        }
+        val read = readBbcVersionedPrefs(torn)
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+        assertEquals(null, read.version)
+        assertEquals(2, versionReads)
+        cache.invalidate()
+        val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A"), (result as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        // High-water NOT advanced to 6: a Cleared(6) is still accepted.
+        cache.invalidate()
+        val cleared = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) })
+        assertTrue(cleared is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(6L, (cleared as EffectivePolicyCache.BbcPolicy.Cleared).version)
+    }
+
+    @Test
+    fun consistentVersionedPrefsReadKeepsSemanticsBbc() {
+        var versionReads = 0
+        val consistent = object : BbcVersionedPrefsView {
+            override fun contains(key: String) = true
+            override fun getLong(key: String, defValue: Long): Long {
+                versionReads++
+                return 5L
+            }
+            override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String> =
+                mutableSetOf("A")
+        }
+        val good = readBbcVersionedPrefs(consistent)
+        assertFalse(good.failed)
+        assertEquals(setOf("A"), good.packages)
+        assertEquals(5L, good.version)
+        assertEquals(2, versionReads)
+
+        // empty + version => Cleared candidate; empty + null version => Unknown;
+        // non-empty + null version => Good (legacy, no-version draft).
+        val clearedRead = readBbcVersionedPrefs(object : BbcVersionedPrefsView {
+            override fun contains(key: String) = true
+            override fun getLong(key: String, defValue: Long) = 7L
+            override fun getStringSet(key: String, defValue: MutableSet<String>) = mutableSetOf<String>()
+        })
+        assertFalse(clearedRead.failed)
+        assertEquals(emptySet<String>(), clearedRead.packages)
+        assertEquals(7L, clearedRead.version)
+
+        val absentRead = readBbcVersionedPrefs(object : BbcVersionedPrefsView {
+            override fun contains(key: String) = false
+            override fun getLong(key: String, defValue: Long) = defValue
+            override fun getStringSet(key: String, defValue: MutableSet<String>) = mutableSetOf<String>()
+        })
+        assertFalse(absentRead.failed)
+        assertEquals(emptySet<String>(), absentRead.packages)
+        assertEquals(null, absentRead.version)
+
+        val legacyRead = readBbcVersionedPrefs(object : BbcVersionedPrefsView {
+            override fun contains(key: String) = false
+            override fun getLong(key: String, defValue: Long) = defValue
+            override fun getStringSet(key: String, defValue: MutableSet<String>) = mutableSetOf("A")
+        })
+        assertFalse(legacyRead.failed)
+        assertEquals(setOf("A"), legacyRead.packages)
+        assertEquals(null, legacyRead.version)
+    }
+
+    // --- F1: unversioned Good must not replay after versioned state ---
+
+    @Test
+    fun nullVersionGoodAcceptedBeforeAnyVersionedStateBbc() {
+        // Control: with NO prior versioned state (lastBbcSeenVersion < 0), a
+        // non-empty read with a null version stays the ungated legacy Good,
+        // exactly as before.
+        val (cache, _) = bbcCacheAt(1_000L)
+        val res = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), null) })
+        assertTrue(res is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (res as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun nullVersionGoodRejectedAfterVersionedClearedBbc() {
+        // F1: Good({A},5) -> Cleared(6) -> unversioned Good({A}, null) must be
+        // Unknown(sticky): a stale pre-version draft / corrupt (CCE) version
+        // key cannot re-attach revoked A after an intentional clear.
+        val logs = mutableListOf<String>()
+        val (cache, _) = bbcCacheAt(1_000L, logs)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val cleared = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) })
+        assertTrue(cleared is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(6L, (cleared as EffectivePolicyCache.BbcPolicy.Cleared).version)
+        val stickyBefore = cache.bbcStickyFallbackCount.get()
+        val unknownBefore = cache.bbcUnknownCount.get()
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), null) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        // Sticky is the empty Cleared snapshot: A is never merged back.
+        assertEquals(emptySet<String>(), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(stickyBefore + 1, cache.bbcStickyFallbackCount.get())
+        assertTrue(cache.bbcUnknownCount.get() >= unknownBefore + 1)
+        assertTrue(logs.any { it.contains("good-rejected-no-version") })
+        // High-water still 6: Cleared(6) is a duplicate (rejected), Cleared(7)
+        // is accepted — the rejected unversioned Good overwrote nothing.
+        cache.invalidate()
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) }) is EffectivePolicyCache.BbcPolicy.Unknown)
+        cache.invalidate()
+        val ok = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 7L) })
+        assertTrue(ok is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(7L, (ok as EffectivePolicyCache.BbcPolicy.Cleared).version)
+    }
+
+    // --- F2: same-version Good is content-aware ---
+
+    @Test
+    fun goodSameVersionDifferentContentRejectedBbc() {
+        // At the current high-water (set by a Good), a non-empty read whose
+        // content differs by RE-ADDING a removed package is a stale replay and
+        // must be rejected as Unknown, retaining the last accepted set {B}.
+        val logs = mutableListOf<String>()
+        val (cache, _) = bbcCacheAt(1_000L, logs)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("B"), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertTrue(logs.any { it.contains("good-rejected") })
+    }
+
+    @Test
+    fun goodSameVersionShrinkThenOldContentReplayRejectedBbc() {
+        // Exact replay sequence: Good({A,B},5) -> Good({B},5) (a legitimate
+        // same-version shrink) -> replay Good({A,B},5). The final replay must
+        // be Unknown and retain {B}; A is never re-attached.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val shrunk = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 5L) })
+        assertTrue(shrunk is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (shrunk as EffectivePolicyCache.BbcPolicy.Good).packages)
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("B"), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+    }
+
+    @Test
+    fun goodSameVersionSameContentStillAcceptedBbc() {
+        // Control: a content-equivalent re-acceptance at the same version
+        // (after a failed read / invalidate) stays Good — compares against
+        // sticky as well as cached (preserves successEmptyWithoutVersion...).
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val failed = cache.getBbc(emptySet(), reader = { Pair(null, null) })
+        assertTrue(failed is EffectivePolicyCache.BbcPolicy.Unknown)
+        cache.invalidate()
+        val reaccepted = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+        assertTrue(reaccepted is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (reaccepted as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    // --- F3: documented wraparound replay-window limitation (option (b)) ---
+
+    @Test
+    fun bbcVersionWraparoundReopensReplayWindowDocumentedBbc() {
+        // PINNED DOCUMENTED BEHAVIOR (F3 option (b)): the version key carries no
+        // epoch (key format fixed), so after Good(MAX) -> Good(1) the high-water
+        // resets to 1 and a mid-range replay Good(500) is ACCEPTED. This needs
+        // ~9.22e18 committed writes to be reachable in production. If an epoch
+        // scheme is added later, change this test to expect Unknown.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A"), Long.MAX_VALUE) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val wrapped = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
+        assertTrue(wrapped is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (wrapped as EffectivePolicyCache.BbcPolicy.Good).packages)
+        cache.invalidate()
+        val midRangeReplay = cache.getBbc(emptySet(), reader = { Pair(setOf("C"), 500L) })
+        assertTrue(midRangeReplay is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("C"), (midRangeReplay as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    // --- R07 (cheap): defensive copy + getStringSet failure ---
+
+    @Test
+    fun versionedPrefsReadReturnsDefensiveCopyBbc() {
+        val live = mutableSetOf("A", "B")
+        val view = object : BbcVersionedPrefsView {
+            override fun contains(key: String) = true
+            override fun getLong(key: String, defValue: Long) = 5L
+            override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String> = live
+        }
+        val read = readBbcVersionedPrefs(view)
+        assertFalse(read.failed)
+        assertEquals(setOf("A", "B"), read.packages)
+        // Mutating the live set after the read must not change the snapshot.
+        live.add("C")
+        assertEquals(setOf("A", "B"), read.packages)
+    }
+
+    @Test
+    fun versionedPrefsGetStringSetFailureFailsClosedBbc() {
+        val view = object : BbcVersionedPrefsView {
+            override fun contains(key: String) = true
+            override fun getLong(key: String, defValue: Long) = 5L
+            override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String> =
+                throw RuntimeException("prefs dead")
+        }
+        val read = readBbcVersionedPrefs(view)
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+        assertEquals(null, read.version)
+    }
 }

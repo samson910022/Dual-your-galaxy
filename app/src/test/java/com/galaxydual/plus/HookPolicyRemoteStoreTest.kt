@@ -57,6 +57,9 @@ class HookPolicyRemoteStoreTest {
             private set
         var getStringSetCalls = 0
             private set
+        // NEW-2: record the version committed by each successful commit so a
+        // concurrency test can assert distinct + monotonically increasing bump.
+        val committedVersions = java.util.Collections.synchronizedList(mutableListOf<Long>())
         // 測試開關:模擬 commit 失敗 / commit 拋出 / 型別錯亂 (見各專用測試)。
         var commitSucceeds = true
         var commitThrows = false
@@ -172,6 +175,7 @@ class HookPolicyRemoteStoreTest {
             override fun commit(): Boolean {
                 flush()
                 commitCalls++
+                (data[PolicySource.POLICY_KEY_EXTRA_VERSION] as? Long)?.let { committedVersions.add(it) }
                 if (commitThrows) throw RuntimeException("commit binder dead")
                 return commitSucceeds
             }
@@ -1803,6 +1807,40 @@ class HookPolicyRemoteStoreTest {
                 Pair<Set<String>?, Long?>(pkgs, null)
             })
             assertTrue(unk is com.galaxydual.hook.EffectivePolicyCache.BbcPolicy.Unknown)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // NEW-2 (P2): concurrent save() calls must each bump the version exactly
+    // once — distinct + monotonically increasing committed versions, no lost
+    // saves. Before the versionCommitLock, two threads could read the same
+    // curVer and commit duplicate versions (later rejected by the hook's gate).
+    @Test
+    fun concurrentSavesCommitDistinctMonotonicVersions() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            val n = 16
+            val start = java.util.concurrent.CountDownLatch(1)
+            val threads = (0 until n).map { i ->
+                Thread {
+                    start.await()
+                    assertTrue("save #$i must succeed", store.save(setOf("com.example.$i")))
+                }
+            }
+            threads.forEach { it.start() }
+            start.countDown()
+            threads.forEach { it.join(15_000) }
+            assertFalse("all writer threads finished", threads.any { it.isAlive })
+
+            val versions = prefs.committedVersions.toList()
+            assertEquals("one committed version per save", n, versions.size)
+            assertEquals("all committed versions distinct", n, versions.distinct().size)
+            assertEquals("committed versions monotonically increasing", versions.sorted(), versions)
+            assertEquals("versions are exactly 1..N", (1L..n.toLong()).toList(), versions)
+            assertEquals(n.toLong(), prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
         } finally {
             resetRemotePoisonForTests()
         }

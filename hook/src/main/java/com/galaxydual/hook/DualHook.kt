@@ -12,6 +12,68 @@ import java.lang.reflect.Modifier
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+// --- R07 (P1): torn {packages, version} prefs read guard (framework-free seam) ---
+// Minimal view of the SharedPreferences calls the BBC versioned read needs.
+// Production adapts the real SharedPreferences exactly once (in
+// readRemotePrefsVersioned); JVM tests supply a fake that can swap values
+// BETWEEN the two version reads to prove the seqlock double read fails closed.
+internal interface BbcVersionedPrefsView {
+    fun contains(key: String): Boolean
+    fun getLong(key: String, defValue: Long): Long
+    fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String>?
+}
+
+// Outcome of the self-consistent read. `failed` is true on a torn snapshot
+// (version-before != version-after) or any read failure; the caller maps that
+// to the Unknown signal (null packages, null version) with throttled logging.
+internal data class BbcVersionedRead(
+    val packages: Set<String>?,
+    val version: Long?,
+    val failed: Boolean,
+    // F4 (optional diagnostic): the two seqlock reads, retained only to restore
+    // mismatch detail in the torn-snapshot log. Defaults keep existing callers
+    // (and tests) source-compatible; values are package/version numbers only.
+    val versionBefore: Long? = null,
+    val versionAfter: Long? = null,
+)
+
+// Seqlock-style snapshot: version-before -> defensive COPY of the package set
+// (never trust a live cross-process collection) -> version-after. The pair is
+// accepted ONLY when both version reads agree (both-absent == null agrees too).
+// Empty+version remains a Cleared candidate, empty+null stays Unknown, non-empty
+// is Good (version may be null for the legacy no-version draft). Never throws.
+internal fun readBbcVersionedPrefs(view: BbcVersionedPrefsView): BbcVersionedRead {
+    fun version(): Long? = try {
+        if (!view.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)) {
+            null
+        } else {
+            view.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L).takeIf { it >= 1L }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+    var before: Long? = null
+    var after: Long? = null
+    return try {
+        before = version()
+        val live = view.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, LinkedHashSet())
+        // Defensive snapshot: a concurrent commit may mutate the live set while
+        // we iterate; a CTE/CME here fails closed via the outer catch.
+        val pkgs: Set<String> = if (live == null) emptySet() else LinkedHashSet(live)
+        after = version()
+        if (before != after) {
+            BbcVersionedRead(
+                null, null, failed = true,
+                versionBefore = before, versionAfter = after,
+            )
+        } else {
+            BbcVersionedRead(pkgs, before, failed = false)
+        }
+    } catch (_: Throwable) {
+        BbcVersionedRead(null, null, failed = true)
+    }
+}
+
 // LSPosed entry point (Modern Xposed API, API 102, interceptor-chain model).
 //
 // Entry class listed in META-INF/xposed/java_init.list (exactly one line).
@@ -865,25 +927,32 @@ class DualHook : XposedModule() {
     private fun readRemotePrefsVersioned(): Pair<Set<String>?, Long?> {
         return try {
             val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+            if (prefs == null) return Pair(null, null)
             registerPolicyChangeListener(prefs)
-            val pkgs: Set<String>? = try {
-                prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, emptySet()).orEmpty()
-            } catch (t: Throwable) {
-                if (bbcCache.shouldLogFailure()) {
-                    logi("BBC remote policy read failed: ${shortEx(t)}: ${shortMsg(t)}")
+            // R07 (P1): the writer commits packages+version in one atomic commit,
+            // but a reader-side snapshot must be self-consistent. Adapt the real
+            // SharedPreferences to the framework-free view ONCE here; the seam
+            // does version-before / defensive set copy / version-after and fails
+            // closed on any mismatch or read failure.
+            val read = readBbcVersionedPrefs(object : BbcVersionedPrefsView {
+                override fun contains(key: String): Boolean = prefs.contains(key)
+                override fun getLong(key: String, defValue: Long): Long = prefs.getLong(key, defValue)
+                override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String>? =
+                    prefs.getStringSet(key, defValue)
+            })
+            if (read.failed && bbcCache.shouldLogFailure()) {
+                try {
+                    // F4: restore the before/after mismatch detail (numbers
+                    // only, no package strings); throttling is unchanged —
+                    // still gated by shouldLogFailure() above.
+                    logi(
+                        "BBC remote policy read failed: torn/inconsistent snapshot " +
+                            "versionBefore=${read.versionBefore} versionAfter=${read.versionAfter}",
+                    )
+                } catch (_: Throwable) {
                 }
-                return Pair(null, null)
             }
-            val ver: Long? = try {
-                if (!prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)) {
-                    null
-                } else {
-                    prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L).takeIf { it >= 1L }
-                }
-            } catch (_: Throwable) {
-                null
-            }
-            Pair(pkgs, ver)
+            Pair(read.packages, read.version)
         } catch (t: Throwable) {
             if (bbcCache.shouldLogFailure()) {
                 try {
@@ -1175,6 +1244,11 @@ class DualHook : XposedModule() {
     // process so the open-page hot path never spams logcat.
     private val bbcEntryLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
 
+    // R10 (P2): the caller stack snippet is captured LAZILY through this seam —
+    // only after the once-per-pid ledger claim succeeds. Same ledger + log sink
+    // as before; format/desensitization unchanged.
+    private val bbcEntryLogger = BbcInjector.BbcEntryLogger(bbcEntryLog, ::logi)
+
     // BBC install path: probe (BBC shared library resolvable on this ROM,
     // method present), resolve the callee reflectively, resolve the caller
     // Executables (best-effort, may be empty), then installWithCallers
@@ -1251,15 +1325,16 @@ class DualHook : XposedModule() {
     // unexpected result type, or any non-String element => the ORIGINAL
     // result object is returned unchanged.
     private fun interceptBbcCall(chain: XposedInterface.Chain): Any? {
-        // Read-only entry capture FIRST (no semantics): wall-clock + caller
-        // stack snippet. Both best-effort; any failure yields a fallback and
-        // the entry log is skipped when the caller snippet is empty.
+        // Read-only entry timestamp FIRST (cheap, no semantics). R10 (P2): the
+        // caller STACK capture is deferred behind a lazy supplier — it is only
+        // materialized by the entry logger AFTER the once-per-pid ledger claim
+        // succeeds, so fast-path exits and repeated calls never pay for it.
         val entryTsMs: Long = try {
             System.currentTimeMillis()
         } catch (_: Throwable) {
             0L
         }
-        val entryCaller: String = try {
+        fun entryCaller(): String = try {
             BbcInjector.callerSnippet(Thread.currentThread().stackTrace)
         } catch (_: Throwable) {
             ""
@@ -1274,7 +1349,7 @@ class DualHook : XposedModule() {
         // lookup (type-check is cheaper than a binder read).
         if (result !is List<*>) {
             // Read-only entry diagnosis for the bad-type shape (size unknown).
-            logBbcEntryOnce(pid, entryTsMs, entryCaller, -1, false)
+            logBbcEntryOnce(pid, entryTsMs, ::entryCaller, -1, false)
             if (logBbcBadTypeOnce(pid)) {
                 logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
             }
@@ -1297,7 +1372,7 @@ class DualHook : XposedModule() {
                 } catch (_: Throwable) {
                     -1
                 }
-                logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, false)
+                logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, false)
                 logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
                 return result
             }
@@ -1318,7 +1393,7 @@ class DualHook : XposedModule() {
                     } catch (_: Throwable) {
                         -1
                     }
-                    logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, false)
+                    logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, false)
                     logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
                     return result
                 }
@@ -1342,7 +1417,7 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             false
         }
-        logBbcEntryOnce(pid, entryTsMs, entryCaller, entrySize, entryContains)
+        logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, entryContains)
         logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
         return try {
             // result is already known to be a List<*> (checked above).
@@ -1453,26 +1528,17 @@ class DualHook : XposedModule() {
     // Caller-identification entry diagnosis (once per process, pid-keyed).
     // Read-only: formats one BBC-ENTRY line (ts/pid/size/containsPolicy
     // boolean/caller snippet) and never affects merge/gate/write/return
-    // semantics. Fully total: an empty caller snippet (stack unavailable)
-    // or any formatting failure skips the line silently.
-    private fun logBbcEntryOnce(pid: Int, tsMs: Long, caller: String, resultSize: Int, containsPolicy: Boolean) {
-        try {
-            if (caller.isEmpty()) return
-            val added = try {
-                bbcEntryLog.add("entry:$pid")
-            } catch (_: Throwable) {
-                false
-            }
-            if (!added) return
-            val line = try {
-                BbcInjector.formatBbcEntryDiag(tsMs, pid, caller, resultSize, containsPolicy)
-            } catch (_: Throwable) {
-                return
-            }
-            logi(line)
-        } catch (_: Throwable) {
-            // Diagnostics only: never break the hook path.
-        }
+    // semantics. R10 (P2): the caller stack snippet is now supplied LAZILY and
+    // captured only after the once-per-pid ledger claim succeeds (delegated to
+    // BbcEntryLogger). An empty caller snippet or any failure skips the line.
+    private fun logBbcEntryOnce(
+        pid: Int,
+        tsMs: Long,
+        callerSupplier: () -> String,
+        resultSize: Int,
+        containsPolicy: Boolean,
+    ) {
+        bbcEntryLogger.logOnce(pid, tsMs, resultSize, containsPolicy, callerSupplier)
     }
 
     // First merge per process logs; subsequent merges stay silent.

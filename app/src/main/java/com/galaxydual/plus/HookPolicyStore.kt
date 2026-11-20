@@ -139,6 +139,25 @@ internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPr
 
 internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
 
+// NEW-2 (P2): process-wide lock serializing the version
+// read->increment->putLong->commit in remoteHookPolicyStore.saveRaw. Without
+// it two concurrent save() calls can read the same current version and commit
+// duplicate versions; a duplicate later presented as Cleared is then rejected
+// by the hook's monotonic gate. Top-level (not per-store) because multiple
+// store instances share the same prefs/version key in one process.
+//
+// SINGLE-WRITER INVARIANT (Phase 3 review F4): in-process, saveRaw is the ONLY
+// writer of the version key, and it always does so under this lock — no other
+// code path in this tree writes that key. Cross-process, two writers can in
+// principle commit the same version, but duplicate/out-of-order versions are
+// bounded on the reader side by R06's monotonic version gate (rejects 0 /
+// duplicate / replay / downgrade, content-aware at equal version) plus R07's
+// seqlock (version-before == version-after around the defensive package-set
+// copy), so a torn or duplicate commit cannot replay a revoked package. A
+// duplicate writer is therefore not reachable as a correctness bug in this
+// tree; if a future writer of the version key is added, it MUST take this lock.
+internal val versionCommitLock = Any()
+
 // A3-8: overflow 閂每行程 log-once（永久 fail-closed 狀態必須可診斷；逐次讀
 // log 會污染 log buffer，故 once-per-process）。resetRemotePoisonForTests 重置。
 internal val poisonOverflowOnceLogged = AtomicBoolean(false)
@@ -1010,58 +1029,68 @@ fun remoteHookPolicyStore(
                 // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
                 val ownToken = prePoison(prefs)
                 try {
-                    // Phase A P0 policy_version 同步寫入（與包集合同一 commit
-                    // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
-                    // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
-                    // 視為 Good（向後相容），空+無版本永不視為故意清除。
-                    // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
-                    val curVer: Long = try {
-                        val has = try {
-                            prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                    // NEW-2 (P2): serialize the whole version
+                    // read->increment->putLong->commit under ONE process-wide
+                    // lock so two concurrent save() calls can never read the
+                    // same current version and commit duplicates (a duplicate
+                    // later presented as Cleared would be rejected by the hook's
+                    // monotonic gate). The lock includes the commit so packages
+                    // + version stay in the same atomic commit; poison bookkeeping
+                    // below stays outside the lock (minimal scope).
+                    val ok: Boolean = synchronized(versionCommitLock) {
+                        // Phase A P0 policy_version 同步寫入（與包集合同一 commit
+                        // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
+                        // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
+                        // 視為 Good（向後相容），空+無版本永不視為故意清除。
+                        // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
+                        val curVer: Long = try {
+                            val has = try {
+                                prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                            } catch (_: Throwable) {
+                                false
+                            }
+                            if (!has) {
+                                0L
+                            } else try {
+                                val v = prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 0L)
+                                if (v < 0L) 0L else v
+                            } catch (_: ClassCastException) {
+                                0L
+                            } catch (_: Throwable) {
+                                0L
+                            }
                         } catch (_: Throwable) {
-                            false
+                            0L
                         }
-                        if (!has) {
-                            0L
-                        } else try {
-                            val v = prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 0L)
-                            if (v < 0L) 0L else v
-                        } catch (_: ClassCastException) {
-                            0L
+                        val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
+                        // 版本寫入 best-effort：測試 stub 可能不支援 putLong
+                        // （UnsupportedOperationException），此時仍須落盤包集合
+                        // （版本缺席由 hook 視為 Unknown sticky，不破壞既有語義）。
+                        val ed = try {
+                            if (raw == null) {
+                                prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+                            } else {
+                                prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
+                        }
+                        try {
+                            ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
+                        } catch (ce: CancellationException) {
+                            throw ce
                         } catch (_: Throwable) {
-                            0L
+                            // putLong 不支援（測試 stub）：保留包集合寫入，版本缺席。
                         }
-                    } catch (_: Throwable) {
-                        0L
-                    }
-                    val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
-                    // 版本寫入 best-effort：測試 stub 可能不支援 putLong
-                    // （UnsupportedOperationException），此時仍須落盤包集合
-                    // （版本缺席由 hook 視為 Unknown sticky，不破壞既有語義）。
-                    val ed = try {
-                        if (raw == null) {
-                            prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
-                        } else {
-                            prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
+                        try {
+                            ed.commit()
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
                         }
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (e: Throwable) {
-                        throw e
-                    }
-                    try {
-                        ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (_: Throwable) {
-                        // putLong 不支援（測試 stub）：保留包集合寫入，版本缺席。
-                    }
-                    val ok: Boolean = try {
-                        ed.commit()
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (e: Throwable) {
-                        throw e
                     }
                     if (ok) {
                         val cleared = clearPoison(prefs, ownToken)

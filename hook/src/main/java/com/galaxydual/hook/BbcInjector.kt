@@ -233,6 +233,83 @@ internal object BbcInjector {
         }
     }
 
+    // R10 (P2): once-per-pid entry logger with a LAZY caller supplier. The
+    // expensive stack capture (Thread.currentThread().stackTrace) is deferred:
+    // the supplier is invoked only after the once-per-pid ledger claim, so a
+    // hot path that exits early — or a pid already logged — never pays for it.
+    // `ledger` and `sink` are injected so JVM tests can swap them; production
+    // passes DualHook.bbcEntryLog + logi. Format/desensitization are unchanged
+    // (still formatBbcEntryDiag; no package literals ever reach this seam).
+    internal class BbcEntryLogger(
+        private val ledger: MutableSet<String>,
+        private val sink: (String) -> Unit,
+    ) {
+        // Cheap guard: at most ONE IN-FLIGHT stack capture per pid. On an empty
+        // caller (unresolvable snippet) the guard is released together with the
+        // ledger claim (see F5 in logOnce), so a later real-caller attempt can
+        // still capture; at most one SUCCESSFUL capture/log per pid is emitted.
+        private val captureGuard = java.util.Collections.synchronizedSet(HashSet<String>())
+
+        fun logOnce(
+            pid: Int,
+            tsMs: Long,
+            resultSize: Int,
+            containsPolicy: Boolean,
+            callerSupplier: () -> String,
+        ): Boolean {
+            return try {
+                // At most ONE capture attempt per pid (cheap guard first, so a
+                // repeat call never re-adds the ledger entry it is about to
+                // decline). Capture is gated by the once-per-process ledger
+                // claim below; both guards must pass before the supplier runs.
+                if (!captureGuard.add("entry:$pid")) return false
+                val added = try {
+                    ledger.add("entry:$pid")
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!added) return false
+                // Capture ONLY after the ledger claim succeeds.
+                val caller = try {
+                    callerSupplier()
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (caller.isEmpty()) {
+                    // Same as the old behavior: an empty caller never leaves a
+                    // ledger entry. F5: also release the capture guard — if we
+                    // kept it, a later real-caller attempt for this pid would
+                    // return early at `captureGuard.add` and never log. At most
+                    // one SUCCESSFUL capture/log per pid still holds (the
+                    // ledger claim is re-checked on every attempt).
+                    try {
+                        ledger.remove("entry:$pid")
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        captureGuard.remove("entry:$pid")
+                    } catch (_: Throwable) {
+                    }
+                    return false
+                }
+                val line = try {
+                    BbcInjector.formatBbcEntryDiag(tsMs, pid, caller, resultSize, containsPolicy)
+                } catch (_: Throwable) {
+                    return false
+                }
+                return try {
+                    sink(line)
+                    true
+                } catch (_: Throwable) {
+                    false
+                }
+            } catch (_: Throwable) {
+                // Diagnostics never break the hook path.
+                false
+            }
+        }
+    }
+
     // Probe whether the BBC shared library resolves on this ROM. Never throws.
     internal fun probeBbcAvailable(classLoader: ClassLoader, log: (String) -> Unit): Boolean {
         return try {
