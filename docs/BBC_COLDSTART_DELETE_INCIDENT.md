@@ -233,3 +233,130 @@ package:/data/app/~~lwAYb0omxnzHPRdRsbrUyg==/com.openai.chatgpt-MyO48A02iZRaJ38W
 | `old-base.apk` | 9,218,185 B | 被替換舊包；`sha256 = 953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f`（本地唯讀重算） |
 
 *（本文件結束；未 commit，留 untracked／working tree。）*
+
+---
+
+> 以下為 2026-11-21 追記（append-only；§0–§7 原文未動）。
+> 追記時 repo：`unify/bbc-on-main @ e3953b56`（本文件頭註 `ae8db116` 為 11-20 寫檔時點，不改）。
+> 本次未碰裝置（追記為離線寫檔）；不改其他檔；不 commit／不 push。PII 零入庫。
+
+## 8. 11-21 BBC-ENTRY 重現：調用端落定（pid=30228）
+
+### 8.1 重現操作日誌＋時序（時間為 UTC+08，11-21 凌晨）
+
+上機三步（host 經 adb；命令原文與逐字輸出未收錄）【口述】：
+
+| # | 動作 | 結果／旁證 |
+|---|------|-----------|
+| 1 | 備份現包（`before_repro.apk`） | 本地 sha256 `d7b60b0f8e22aa72c22e99089a55ec038f4293dff85746ba0ffb42723d0d84e6`（backup 實檔唯讀重算【可重現】） |
+| 2 | `install -r` 新包（BBC-ENTRY 唯讀進入日誌版，`new-bbc-entry.apk`） | 本地 sha256 `e4fdc78fe86b7646bd0eb5c13a24a9d498cc238d75bb460ca138d234b1c2cb31`（backup 實檔唯讀重算【可重現】）；保資料（刪前分身在裝見 PHONE_C640 基線 §3：`firstInstallTime=2026-11-20 18:05:46`＋7 次完整 nonempty 三元組） |
+| 3 | `force-stop com.samsung.android.da.daagent` | 舊 daagent 被殺；之後待開頁（未立即開頁）【口述】 |
+
+開頁重現（使用者手持開 Dual Messenger／DualApp 頁）【口述】→ daagent 冷啟動，新 pid=**30228**：
+
+> `Start proc 40.219` 起點無摘錄留存【口述，timeline 檔內無此行，僅作參考】；
+> 以下毫秒時序凡標 `T:Ln` 者皆為【擷錄】，出自 `timeline_20261121_repro.txt` 對應行；
+> 該檔共 21 行：`L1` 為 ssh 告警噪音，`L2`–`L16` 為事件摘錄，`L17`–`L21` 為事後唯讀驗證的 adbd 请求行（輸出未收錄）。
+
+| 時間 | 事件 | 來源 |
+|---|---|---|
+| 03:26:40.219 | `Start proc …daagent`（新 pid=30228，冷啟動）【口述；無擷錄】 | —（無；事後 `L21` 的 `grep "Start proc.*daagent"` 请求行證明查過，輸出未收錄） |
+| 03:26:40.566 | `BBC-HOOK installed=1 (daagent, pid=30228)`（`7614-1a1fa6cdba9-2-e`） | `T:L2`【擷錄】 |
+| 03:26:40.693 | `START INSTALL-EXISTING userId{95} pkg{com.samsung.android.permissioncontroller}` | `T:L3`【擷錄】 |
+| 03:26:40.697 | `START INSTALL-EXISTING userId{95} pkg{com.samsung.android.packageinstaller}` | `T:L4`【擷錄】 |
+| 03:26:40.698 | `START INSTALL-EXISTING userId{95} pkg{com.android.permissioncontroller}` | `T:L5`【擷錄】 |
+| **03:26:40.698** | **`START DELETE PACKAGE: observer{132051203}`**（摘錄內單次；本摘錄僅 1 行，`pkg{…}／caller{…}` 行未收錄於此檔，全量未收錄，不斷言唯一；刪除對象 chatgpt u95 以 FULLY 鏈 L10–L15 旁證＋【口述】） | `T:L6`【擷錄；摘錄內單次】 |
+| 03:26:40.710 | `updateDualAppData …dataSize=1120` | `T:L7`【擷錄】 |
+| 03:26:40.712 | `updateDualAppData …dataSize=284` | `T:L8`【擷錄】 |
+| 03:26:40.811 | `updateDualAppData …dataSize=160` | `T:L9`【擷錄】 |
+| 03:26:40.835 | `Intent delay: Delaying Broadcast: 1000ms, …PACKAGE_FULLY_REMOVED/u95`（入隊） | `T:L10`【擷錄】 |
+| 03:26:40.842 | `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=30228)`（`-2-15`） | `T:L11`【擷錄】 |
+| 03:26:40.843 | `BBC-HOOK merged +1 packages (total 7, pid=30228)`（`-2-16`） | `T:L12`【擷錄】 |
+| 03:26:41.210 | `RollbackManager: broadcast=ACTION_PACKAGE_FULLY_REMOVED pkg=com.openai.chatgpt` | `T:L13`【擷錄】 |
+| 03:26:41.348 | `AppSearchManagerService: Handling …FULLY_REMOVED … com.openai.chatgpt` | `T:L14`【擷錄】 |
+| 03:26:42.049 | `PersistedStoragePackageUninstalledReceiver: Received …FULLY_REMOVED for com.openai.chatgpt for u95`（鏈尾） | `T:L15`【擷錄】 |
+| 03:26:50.459 | `…PACKAGE_FULLY_REMOVED, package = com.samsung.android.rubin.app, userId = 0`（他包噪音，非 chatgpt） | `T:L16`【擷錄；排除】 |
+| 03:27:22–03:28:25 | 事後唯讀驗證 5 條 adbd 请求（`grep BBC-HOOK`／`DELETE／FULLY_REMOVED／chatgpt` 計數／`crash -b crash`／`REAL_DELETE／PKG_LINE／CALLER_LINE／START_PROC／INSTALLED_FALSE`） | `T:L17`–`L21`【擷錄請求行；輸出未收錄】 |
+
+間隔（毫秒相減，±1ms）：
+
+```
+installed(40.566) → DELETE(40.698)   = +132ms
+DELETE(40.698) → ENTRY(40.811)       = +113ms
+DELETE(40.698) → callback(40.842)    = +144ms
+ENTRY(40.811) → callback(40.842)     =  +31ms（同一次查詢的進入→返回）
+callback(40.842) → merged(40.843)    =   +1ms
+DELETE → FULLY_REMOVED 入隊(40.835)   = +137ms
+DELETE → Rollback(41.210)            = +512ms → AppSearch(41.348) +650ms → PersistedStorage(42.049) +1351ms ≈ 1.35s（FULLY_REMOVED 完整鏈）
+Start proc(40.219【口述】) → DELETE   = +479ms（起點無擷錄，僅供參考；見 §8.4 誠實附註）
+```
+
+### 8.2 ENTRY 行逐字引用＋解讀（調用端落定）
+
+`verbose_bbcentry_20261121.log:L2` 逐字【擷錄】（`L1` 為 ssh 告警噪音，排除）：
+
+```
+[ 2026-11-21T03:26:40.842     1000: 30228: 30228 I/LSPosedFramework ] (com.samsung.android.da.daagent)[com.galaxydual.plus.debug,GalaxyDualHook,7614-1a1fa6cdba9-2-14,0,1] BBC-ENTRY ts=1795202800811 pid=30228 size=6 containsPolicy=false caller=VMStack#getThreadStackTrace <- k2#intercept <- m#proceed <- Heeck#getPossibleDualAppPackages <- DualAppActivity#onResume <- Instrumentation#callActivityOnResume <- Activity#performResume <- ActivityThread#performResumeActivity
+```
+
+解讀（每點標等級）：
+
+- 調用端：`DualAppActivity#onResume → Heeck#getPossibleDualAppPackages`【擷錄】。
+  `Heeck` 為混淆名，對應 hook 點 `PmWrapper#getPossibleDualAppPackages(Context)->ArrayList`
+  （PLAN_CALLER_IDENTIFICATION.md §已知-1 同一 hook 點；PHONE_C640_DEEPDIVE.md §2.2 `BBC-SPIKE ok …PmWrapper#…` 同一真名）。
+  此前猜測的 `DualAppActivity#getAvailableApps／#updateDualAppList` 在此 ROM 不存在
+  （TIMELINE §7.1-F `not found; skipped`＋DEEPDIVE §2.3 pid=6288 復現）；本次 ENTRY 僅為刪後一次查詢的進入行，
+  刪前是否查過另缺行證。
+- 名單快照：`size=6 containsPolicy=false`【擷錄】——Samsung 傳入本次查詢的原始名單為 6 筆、**不含政策包**；
+  hook 隨後 `merged +1 (total 7)`（`T:L12`）才補上政策包。`containsPolicy` 僅記布林值，不記包名原文。
+- 時序含義：ENTRY（進入，40.811）晚於 DELETE（40.698）**+113ms**，
+  callback（返回 nonempty，40.842）晚於 DELETE **+144ms**。
+  刪除時刻 Samsung 依據的名單仍無行證；僅能說刪後這次查詢傳入為 6 筆自有名冊，不作刪除依據推斷。
+- H1／H2：H1（開頁快照／不等回調即刪）支持增強，但刪前名單仍缺直接觀測，不轉正確認；
+  H2（調用名猜錯＋首次查詢競態）缺口收窄但未關閉——調用端真名在本次刪後查詢中落定（`onResume` 鏈），
+  但 DELETE 前是否查過／查到幾筆仍無行證。
+  H3／H4／H5 維持 TIMELINE §7.3 原結論（本次 ENTRY 不解 Bundle Parcel、不碰 verify 歸屬、不新增第二次 DELETE）。
+
+### 8.3 恢復記錄（使用者切ON；免重啟；crash 零）
+
+| 時間 | 動作 | 結果 |
+|---|---|---|
+| 03:37:34 | 使用者（手持）在 Dual Messenger 頁把 ChatGPT 切回 **ON**（同意安裝）【口述】 | `START INSTALL-EXISTING userId{95} pkg{com.openai.chatgpt}`（時間點【口述】；log 行未收錄於 backup） |
+| 恢復後 | `pm path --user 95 com.openai.chatgpt` | base＋3 splits 齊全【口述；逐字輸出未收錄】 |
+| 恢復後 | 可打開、不崩；crash 緩衝區 chatgpt／FATAL 零命中 | 【口述＋命令旁證】：`T:L20` 有 `logcat -b crash … grep -i chatgpt/FATAL` 及計數請求行，但**輸出未收錄**，零命中為對話事實、無二重擷錄 |
+| 恢復後 | 免重啟、無 SSAID 崩 | 【口述】；與 BBC6（11-18 重啟＋SSAID 崩）對照：本次與 11-20 兩次皆免重啟不崩 |
+| 之後 | 停手，未再動（未再開頁重現、未再 toggle） | 【口述】 |
+
+### 8.4 結論收斂
+
+- **開頁 START→DELETE 間隔相近（366／372ms），n=2 不稱定時**：START 定義為 `ActivityTaskManager: START … DualAppActivity` 開頁行；
+  兩減式為 BBC6 `17:31:32.586 → 17:31:32.952 = 366ms`、11-20 `17:53:18.602 → 17:53:18.974 = 372ms`；
+  僅記間隔相近，樣本 n=2，不稱定時。11-21 開頁原點無擷錄（`Start proc 40.219` 為口述，算得 Start proc→DELETE +479ms，
+  起點定義不同、基線不可比，不計入平均，僅列供參考）；DELETE→callback **144ms** 與前兩次（118ms／116ms）同方向、同量級（較前兩次大約大 28ms），模式未破。
+- 三次 DELETE→callback 延遲 **118／116／144ms 同方向、同量級**（144ms 較前兩次大約大 28ms）：政策（空／非空／ENTRY-6筆）與回調內容（EMPTY／nonempty／nonempty）翻轉，
+  延遲量級不動 → 刪除不依賴本次 hook 回調（TIMELINE §7 §判定-1 的第三次複現）。
+- **Phase A sticky（未做對照）**：sticky／keep-last-good 讀取成功【口述】；與 sticky 值是否相關未做對照，不斷言無關（ENTRY／callback／merged 均正常落盤僅記現象）。
+- 殘留問題轉 issue 追蹤：見 **issue #75**（號碼稍後填）。候選項（不展開，僅佔位）：下次冷啟動復發風險與觀察代價；
+  Bundle Parcel 仍未解碼（H3）；verify 無包名（H4）；H5 僅在「先回後刪」形態復活。
+
+### 8.5 誠實標註（本追記專用；§6 原表不動）
+
+| 事實 | 等級 | 說明 |
+|---|---|---|
+| 上機三步（備份／重裝 ENTRY 包／force-stop、待開頁、開頁重現） | 【口述】 | 命令原文與輸出未收錄；sha 以 backup 實檔重算補強（§8.1） |
+| `Start proc 40.219`／`pkg{chatgpt},user{95},caller{1000}` 行（11-21） | 【口述】 | `T:L6` 僅 1 行 DELETE，無 pkg／caller 行；對象以 FULLY 鏈＋對話事實認定 |
+| `T:L2`–`L16` 事件行、ENTRY `L2` 全文 | 【擷錄】 | 行號可復現（§8.1–§8.2） |
+| 03:37:34 切ON、INSTALL-EXISTING、pm path 4 splits 齊、crash 零、可打開不崩、停手 | 【口述】（＋`T:L17`–`L21` 请求行旁證，輸出未收錄） | 無恢復後新 log 擷錄 |
+| Phase A sticky 讀取成功 | 【口述】 | 無擷錄；與 sticky 值是否相關未做對照，不作相關性斷言 |
+| 見 issue #75 | 佔位，號碼待填 | — |
+
+## 9. 原始檔清單追記（backup dir，只讀引用；§7 原表不動）
+
+| 檔名 | 大小／行數 | 內容 | sha256（實檔重算） |
+|---|---|---|---|
+| `verbose_bbcentry_20261121.log` | 550 B／2 行（L1 ssh 噪音＋L2 ENTRY 正文） | BBC-ENTRY 逐字行（§8.2） | —（短文本，不列 sha） |
+| `timeline_20261121_repro.txt` | 4,344 B／21 行 | 11-21 重現窗口摘錄＋事後唯讀驗證请求行（§8.1） | —（短文本，不列 sha） |
+| `new-bbc-entry.apk` | 9,121,361 B | 上機新包（ENTRY 唯讀進入日誌版） | `e4fdc78fe86b7646bd0eb5c13a24a9d498cc238d75bb460ca138d234b1c2cb31` |
+| `before_repro.apk` | 9,121,361 B | 重裝前備份包 | `d7b60b0f8e22aa72c22e99089a55ec038f4293dff85746ba0ffb42723d0d84e6` |
+
+*（追記結束；留 dirty 不 commit、不 push。）*
