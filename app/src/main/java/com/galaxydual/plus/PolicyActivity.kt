@@ -131,6 +131,14 @@ class PolicyActivity : ComponentActivity() {
     // 跨屏仍各私有（Main/Editor 各自持有），警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
+    // R03：旗標翻轉時立即重建列，讓勾選控制項在 probe 啟動前就禁用；
+    // 取消／完成／例外路徑同樣立刻恢復。
+    private fun setPendingClearConfirm(value: Boolean) {
+        pendingClearConfirm = value
+        try { renderList() } catch (_: Exception) { /* Best effort. */ }
+        try { updateCounter() } catch (_: Exception) { /* Best effort. */ }
+    }
+
     // Phase C A 案：編輯器空集導引（禁清到底）。
     // 空集連警告都不彈，改文案＋按鈕導引去 Main 清除。
     private fun showEditorEmptyGuide() {
@@ -158,36 +166,37 @@ class PolicyActivity : ComponentActivity() {
 
     private fun requestEditorWriteWarning(
         candidate: Set<String>,
-        proceed: (PolicyWarningBinding) -> Unit,
+        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
         val snap = policyWarningSnapshotOrUnknown()
-        val binding = snap.binding
-        // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
-        if (!snap.known) {
-            if (pendingClearConfirm) return
-            pendingClearConfirm = true
-            showPreClearProbeFailedWarning(
-                this@PolicyActivity,
-                onProceed = { pendingClearConfirm = false; proceed(binding) },
-                onCancel = { pendingClearConfirm = false; onCancel() },
-            )
-            return
-        }
-        val old = snap.draft
         // Phase C：候選先消毒（與 VM 寫入同文法），delta=old-minus-消毒後候選。
+        // R03：消毒結果即凍結候選，probe／對話框期間一律寫這一份。
         val sanitizedCandidate = try {
             sanitizeHookPolicy(candidate)
         } catch (_: Exception) {
             emptySet()
         }
+        val warnedBinding = snap.binding.withWarning(snap.draft, sanitizedCandidate)
+        // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+        if (!snap.known) {
+            if (pendingClearConfirm) return
+            setPendingClearConfirm(true)
+            showPreClearProbeFailedWarning(
+                this@PolicyActivity,
+                onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, sanitizedCandidate) },
+                onCancel = { setPendingClearConfirm(false); onCancel() },
+            )
+            return
+        }
+        val old = snap.draft
         val delta = policyRemovalDelta(old, sanitizedCandidate)
         if (delta.isEmpty()) {
-            proceed(binding)
+            proceed(warnedBinding, sanitizedCandidate)
             return
         }
         if (pendingClearConfirm) return
-        pendingClearConfirm = true
+        setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
             // Failed 一律走探測失敗警告；Ok(non-empty) 走雙開提醒。
@@ -197,36 +206,36 @@ class PolicyActivity : ComponentActivity() {
             val probe = try {
                 probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 throw e
             } catch (e: Exception) {
                 preClearLog("pre-clear dual-profile probe failed", e)
                 DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 return@launch
             }
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
                         this@PolicyActivity,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, sanitizedCandidate) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
                     if (!shouldWarnForDelta(probe.installed)) {
-                        pendingClearConfirm = false
-                        proceed(binding)
+                        setPendingClearConfirm(false)
+                        proceed(warnedBinding, sanitizedCandidate)
                         return@launch
                     }
                     showPreClearWarning(
                         this@PolicyActivity,
                         probe.installed,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, sanitizedCandidate) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                         resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
                         userId = verifiedUid,
                         rootUninstallAllowed = verifiedUid != null,
@@ -537,7 +546,8 @@ class PolicyActivity : ComponentActivity() {
             countHintView.text = hintText()
         }
         if (::writeBarBtn.isInitialized) {
-            writeBarBtn.isEnabled = phaseIsIdle && policyDraftKnown
+            // R03：probe／警告對話框在途時連入口也鎖住（除了 phaseIsIdle）。
+            writeBarBtn.isEnabled = phaseIsIdle && policyDraftKnown && !pendingClearConfirm
             writeBarBtn.text = if (policyDraftKnown) {
                 try {
                     getString(R.string.policy_editor_write_draft_format, ticks.size)
@@ -556,7 +566,7 @@ class PolicyActivity : ComponentActivity() {
     }
 
     private fun onWritePolicyClicked() {
-        if (!phaseIsIdle) return
+        if (!phaseIsIdle || pendingClearConfirm) return
         if (!policyDraftKnown) {
             // Main-style Unknown guidance: 不寫入（fail-closed）；使用者先
             // 在 MainActivity「重新整理草稿」後返回。
@@ -570,22 +580,36 @@ class PolicyActivity : ComponentActivity() {
             return
         }
         // Phase C N→M：old-minus-candidate delta，對 installed user95 彈警告；
-        // proceed 攜綁定進 VM，提交前比對失配作廢。
+        // R03：proceed 攜「綁定＋警告前凍結候選」，寫入時不再重讀 ticks。
         val candidate = HashSet(ticks)
         requestEditorWriteWarning(
             candidate = candidate,
-            proceed = { binding -> performWritePolicy(binding) },
+            proceed = { binding, frozen -> performWritePolicy(binding, frozen) },
         )
     }
 
-    private fun performWritePolicy(binding: PolicyWarningBinding? = null) {
-        // The policy set comes from the editor's checked list, never from the
-        // catalog selection; selectedKeys is left untouched by the VM.
-        // Phase C：攜警告綁定進 VM（提交前比對，失配作廢要求重探）。
+    private fun performWritePolicy(binding: PolicyWarningBinding?, candidate: Set<String>) {
+        // The policy set is the editor's checked list snapshot taken before the
+        // warning probe, never re-read from live ticks; selectedKeys is left
+        // untouched by the VM. Phase C：綁定提交前比對，失配作廢要求重探。
         if (binding != null) {
-            vm.replacePolicyDraft(HashSet(ticks), binding)
+            // R03 (PR #74) Phase 2：在真正持有 Editor live 候選處重算並比對指紋。
+            // VM 的 isWarningBindingFresh 刻意不解指紋來源（Main selectedKeys 與
+            // Editor ticks 天生不同），故此處是唯一可正確判定 Editor 候選漂移的
+            // 位置。pendingClearConfirm 為主要 UI 凍結，此為 defense-in-depth。
+            // 失配走 VM 單一訊息出口 UNKNOWN_REFRESH/CHANNEL，零 store 寫入。
+            val liveEditorCandidate = try {
+                sanitizeHookPolicy(HashSet(ticks))
+            } catch (_: Exception) {
+                emptySet()
+            }
+            if (!isWarningCandidateFresh(binding, liveEditorCandidate)) {
+                vm.rejectStaleWarningBinding()
+                return
+            }
+            vm.replacePolicyDraft(HashSet(candidate), binding)
         } else {
-            vm.replacePolicyDraft(HashSet(ticks))
+            vm.replacePolicyDraft(HashSet(candidate))
         }
         val cur = try {
             vm.state.value
@@ -952,10 +976,11 @@ class PolicyActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     "一鍵移除不在來源清單的勾選（${orphans.size}）"
                 }
-                isEnabled = phaseIsIdle
+                // R03：警告在途時禁止改動候選（含一鍵移除孤兒勾選）。
+                isEnabled = phaseIsIdle && !pendingClearConfirm
                 minimumHeight = dp(48)
                 setOnClickListener {
-                    if (!phaseIsIdle) return@setOnClickListener
+                    if (!phaseIsIdle || pendingClearConfirm) return@setOnClickListener
                     ticks.removeAll(orphans.toSet())
                     renderList()
                     updateCounter()
@@ -1010,7 +1035,8 @@ class PolicyActivity : ComponentActivity() {
 
         val box = CheckBox(this).apply {
             isChecked = inPolicy
-            isEnabled = phaseIsIdle
+            // R03：警告 probe／對話框期間凍結勾選，無法在背後改動候選。
+            isEnabled = phaseIsIdle && !pendingClearConfirm
             contentDescription = try {
                 getString(R.string.policy_editor_toggle_cd_format, entry.label, pkg)
             } catch (_: Exception) {
@@ -1039,7 +1065,7 @@ class PolicyActivity : ComponentActivity() {
             }
         }
         row.addView(box)
-        row.setOnClickListener { if (phaseIsIdle) box.toggle() }
+        row.setOnClickListener { if (phaseIsIdle && !pendingClearConfirm) box.toggle() }
 
         return row to icon
     }

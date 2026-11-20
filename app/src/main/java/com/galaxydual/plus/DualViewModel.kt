@@ -233,6 +233,11 @@ data class PendingPolicyWrite(
     // request 時快照 policyFreshnessGen；confirm pre-IO 比對失配即 abort
     //（UNKNOWN_REFRESH），與 baseDraftVersion 同形。-1L=legacy 注入（跳過檢查）。
     val baseFreshGen: Long = -1L,
+    // R04 (PR #74)：警告時向使用者展示的 old 草稿快照。提交前權威重讀若得到
+    // LoadResult.Known 且內容與此集合不同（coordinator fence 未見的跨流程漂移），
+    // 即 fail-closed 中止（UNKNOWN_REFRESH），不得整包覆寫未被告知的內容。
+    // null＝legacy 注入／無警告綁定，跳過內容比對（保既有測試綠）。
+    val baseWarnedOld: Set<String>? = null,
 )
 
 data class PendingRemove(
@@ -257,7 +262,31 @@ data class PolicyWarningBinding(
     val rev: Long,
     val draftVersion: Long,
     val freshGen: Long,
-)
+    // R03 (PR #74)：警告時凍結的候選集合指紋（確定性；排序＋每元素長度前綴）。
+    // 指紋本身不帶來源資訊（Main 選取 vs Editor ticks 皆可用此欄），故 VM 的
+    // isWarningBindingFresh 不再重算 writeCandidateForWarning()——那會把
+    // Editor 凍結候選永遠拿去跟 Main 的 selectedKeys 比對而誤殺。候選新鮮度
+    // 改由真正持有 live 候選的 Activity 用 isWarningCandidateFresh 檢查
+    // （MainActivity: writeCandidateForWarning()；PolicyActivity: sanitize ticks）。
+    // null＝無候選檢查（clear 路徑／legacy 注入）。
+    // 註：binding 不持久化至 Bundle（Activity onSaveInstanceState 未攜它），
+    // 故指紋以 String 保存即可；日後若持久化亦只存此 String，不存 Set。
+    val candidateFingerprint: String? = null,
+    // R04 (PR #74)：警告訊息所依據的 old 草稿快照；requestPolicyWriteFor
+    // 將其複製進 PendingPolicyWrite.baseWarnedOld，供 confirm 前權威重讀比對。
+    val warnedOld: Set<String>? = null,
+    // R03 可選：警告當下 selectedPackagesForPolicy().second 的 catalog 捨棄數。
+    // 凍結候選路徑不再重導 catalog，故把警告時的正確 dropped 數隨 binding 帶進
+    // requestPolicyWriteForWarning，避免 DROPPED 訊息在 Main 路徑丟失。
+    val warningDropped: Int = 0,
+) {
+    // 以警告當下的 old/candidate 凍結綁定。candidate==null 表示不做候選漂移
+    // 檢查（clear 路徑）；warnedOld 永遠存防禦拷貝，避免外部集合後續變動。
+    fun withWarning(old: Set<String>, candidate: Set<String>?): PolicyWarningBinding = copy(
+        warnedOld = HashSet(old),
+        candidateFingerprint = candidate?.let { candidateFingerprintFor(it) },
+    )
+}
 
 // Phase C：警告快照（Activity 計算 old-minus-candidate delta 用）。
 // draft=快照當下已保存草稿拷貝；known/corrupt=同刻 Known 旗標。
@@ -7113,10 +7142,13 @@ class DualViewModel(
     // Phase C：警告綁定快照（Activity probe 前調用）。
     // 回傳當下 observed rev＋version＋freshGen 三元組（fail-closed：讀取拋出即 -1）。
     internal fun currentWarningBinding(): PolicyWarningBinding = try {
+        // R03 可選：警告當下的 catalog 捨棄數（凍結候選不再重導，故於此快照）。
+        val dropped = try { selectedPackagesForPolicy().second } catch (_: Exception) { 0 }
         PolicyWarningBinding(
             rev = try { observedSnapshot.get().rev } catch (_: Exception) { -1L },
             draftVersion = try { policyDraftVersion.get() } catch (_: Exception) { -1L },
             freshGen = try { policyFreshnessGen.get() } catch (_: Exception) { -1L },
+            warningDropped = dropped,
         )
     } catch (_: Exception) {
         PolicyWarningBinding(-1L, -1L, -1L)
@@ -7147,6 +7179,13 @@ class DualViewModel(
     // B 提交後 coordinator 已推進而 A 本地三元組尚未變化（collector 未至）時，
     // 僅比本地三元組會誤判新鮮而覆寫未見 B；此處直接比對權威修訂，
     // 覆蓋該窗口（含 rev 重置：reset 回 0 即與舊綁定失配作廢）。
+    //
+    // R03 (PR #74) Phase 2 修正：候選指紋「不在此處」重算。binding 只攜指紋，
+    // 不攜來源；Editor 的凍結候選來自 ticks，VM 的 writeCandidateForWarning()
+    // 卻永遠讀 Main 的 selectedKeys/sourceCatalog，兩者天生不同。於此重算會把
+    // 每一次真實 Editor 寫入誤殺為 UNKNOWN_REFRESH。候選新鮮度改由持有 live
+    // 候選的 Activity 呼叫 isWarningCandidateFresh（見下與兩 Activity proceed）。
+    // 本函式維持原樣的 rev/draftVersion/freshGen/coordinator 檢查，一字未減。
     internal fun isWarningBindingFresh(binding: PolicyWarningBinding?): Boolean {
         if (binding == null) return true
         return try {
@@ -7165,6 +7204,18 @@ class DualViewModel(
             true
         } catch (_: Exception) {
             false
+        }
+    }
+
+    // Phase 2 單一訊息出口：警告綁定／候選失配的拒絕訊息（UNKNOWN_REFRESH/CHANNEL）。
+    // replacePolicyDraft/requestPolicyWrite/requestPolicyWriteForWarning 與兩個
+    // Activity 的候選新鮮度防禦檢查共用同一出口，零 store 寫入。
+    fun rejectStaleWarningBinding() {
+        _state.update {
+            it.copy(
+                msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                msgKind = MsgKind.CHANNEL,
+            )
         }
     }
 
@@ -8590,16 +8641,13 @@ class DualViewModel(
      * Corrupt/Unknown、coordinator/世代 fence）與 requestPolicyWrite() 完全一致。
      * Phase C：warningBinding 為 Activity 警告綁定（probe 前快照 rev/version/freshGen）；
      * 非 null 時先比對失配即作廢（UNKNOWN_REFRESH，不建 pending）。
+     * 候選指紋的新鮮度已改由呼叫端（PolicyActivity.performWritePolicy）在擁有
+     * Editor live ticks 處用 isWarningCandidateFresh 檢查；VM 不再跨來源重算。
      */
     fun replacePolicyDraft(packages: Set<String>, warningBinding: PolicyWarningBinding? = null) {
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
-            _state.update {
-                it.copy(
-                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                    msgKind = MsgKind.CHANNEL,
-                )
-            }
+            rejectStaleWarningBinding()
             return
         }
         requestPolicyWriteFor(packages, catalogDropped = 0, warningBinding = warningBinding)
@@ -8613,12 +8661,7 @@ class DualViewModel(
     fun requestPolicyWrite(warningBinding: PolicyWarningBinding? = null) {
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
-            _state.update {
-                it.copy(
-                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
-                    msgKind = MsgKind.CHANNEL,
-                )
-            }
+            rejectStaleWarningBinding()
             return
         }
         // Stage2 專屬門控（catalog selection 模型）：空勾選拒絕。
@@ -8638,6 +8681,40 @@ class DualViewModel(
         }
         val (mapped, catalogDropped) = selectedPackagesForPolicy()
         requestPolicyWriteFor(mapped, catalogDropped, warningBinding = warningBinding)
+    }
+
+    // R03 (PR #74)：Main 寫入入口的「凍結候選」版本。與 requestPolicyWrite 的
+    // gates／freshness／空勾選／空 catalog 守衛逐項同形，差異只有一處：寫入集合
+    // 由 Activity 在警告前快照的 packages 給定，絕不再從當下 selectedKeys 重導出。
+    // probe／對話框期間的勾選漂移由 MainActivity 在 proceed 處以
+    // isWarningCandidateFresh(live=writeCandidateForWarning()) 攔截（失配即
+    // UNKNOWN_REFRESH、零寫入）；VM 不再跨來源重算指紋。若 binding 無指紋
+    // （legacy／clear），仍照凍結集合寫入。
+    fun requestPolicyWriteForWarning(packages: Set<String>, warningBinding: PolicyWarningBinding? = null) {
+        if (!policyWriteGatesPass()) return
+        if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
+            rejectStaleWarningBinding()
+            return
+        }
+        if (_state.value.selectedKeys.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.EMPTY_SELECTION)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        if (_state.value.sourceCatalog.isEmpty()) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.CATALOG_LOADING)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        // 明確集合（已由呼叫端 sanitize），不再查 catalog selection；
+        // dropped 沿用警告當下的 catalog 捨棄數（binding 攜帶），避免訊息丟失。
+        requestPolicyWriteFor(
+            packages,
+            catalogDropped = warningBinding?.warningDropped ?: 0,
+            warningBinding = warningBinding,
+        )
     }
 
     // 共享 gates（與原 requestPolicyWrite 的序列 1:1 一致）：pending →
@@ -8886,6 +8963,9 @@ class DualViewModel(
                         } catch (_: Exception) {
                             -1L
                         },
+                        // R04：把警告所依據的 old 集合綁進 pending，confirm 前
+                        // 權威重讀 Known 漂移即中止。null=legacy 跳過比對。
+                        baseWarnedOld = warningBinding?.warnedOld?.let { HashSet(it) },
                     ),
                     policyWritePhase = PolicyWritePhase.QUEUED,
                     // Allocated INSIDE the CAS lambda on purpose: the monotonic
@@ -9293,25 +9373,17 @@ class DualViewModel(
                     // Activity probe 只告知不授權；此處為授權依據。
                     // Unknown（Unavailable/Corrupt）即 abort fail-closed，
                     // 不碰 store save、不建 Tx。
+                    // R04：Known 也不代表授權——若後端內容與警告時的 old 快照
+                    // 不同（coordinator fence 未見的漂移），同樣 fail-closed
+                    // 中止，避免整包覆寫使用者未曾被告知的刪除。
                     // 僅警告綁定路徑執行（baseFreshGen != -1L）；legacy 直接注入
                     // （baseFreshGen==-1L）跳過，保既有測試綠（新 UI 一律攜綁定）。
                     if (pendingAtCall.baseFreshGen != -1L) {
                         run {
-                            val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
-                            val preRead: LoadResult = try {
-                                withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
-                            } catch (te: TimeoutCancellationException) {
-                                try { preJob.cancel() } catch (_: Exception) { }
-                                LoadResult.Unavailable
-                            } catch (e: CancellationException) {
-                                try { preJob.cancel() } catch (_: Exception) { }
-                                throw e
-                            } catch (_: Exception) {
-                                try { preJob.cancel() } catch (_: Exception) { }
-                                LoadResult.Unavailable
-                            }
-                            if (preRead is LoadResult.Unknown) {
-                                val preCorrupt = preRead is LoadResult.Corrupt
+                            // Unknown 與 Known 漂移共用同一清理路徑：清
+                            // in-flight、mark unknown、清 pending、回 IDLE、
+                            // UNKNOWN_REFRESH/CHANNEL，零 store save。
+                            fun abortUnknownRefresh(preCorrupt: Boolean) {
                                 synchronized(policySettleLock) {
                                     inFlightWrites.remove(key)
                                     policyWriteSaving.remove(key)
@@ -9332,7 +9404,33 @@ class DualViewModel(
                                         )
                                     }
                                 }
-                                return@withLock
+                            }
+                            val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
+                            val preRead: LoadResult = try {
+                                withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
+                            } catch (te: TimeoutCancellationException) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                LoadResult.Unavailable
+                            } catch (e: CancellationException) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                throw e
+                            } catch (_: Exception) {
+                                try { preJob.cancel() } catch (_: Exception) { }
+                                LoadResult.Unavailable
+                            }
+                            when {
+                                preRead is LoadResult.Unknown -> {
+                                    abortUnknownRefresh(preRead is LoadResult.Corrupt)
+                                    return@withLock
+                                }
+                                preRead is LoadResult.Known &&
+                                    pendingAtCall.baseWarnedOld != null &&
+                                    preRead.packages != pendingAtCall.baseWarnedOld -> {
+                                    // baseWarnedOld==null 是 legacy（跳過），
+                                    // 新警告綁定路徑內容漂移即拒絕。
+                                    abortUnknownRefresh(false)
+                                    return@withLock
+                                }
                             }
                         }
                     }
@@ -15266,6 +15364,24 @@ internal fun clearPolicyButtonRoute(
 // - editorEmptyShouldGuide：編輯器空集導引（A 案：禁清到底，空集不警告、導引去 Main 清除）。
 // - shouldWarnForDelta：delta 安裝非空即警告（Activity probe Ok(non-empty) 才彈列表警告）。
 internal fun policyRemovalDelta(old: Set<String>, candidate: Set<String>): Set<String> = old - candidate
+
+// R03 (PR #74) Phase 2：候選集合的確定性指紋。排序＋【每元素長度前綴】，
+// 故與迭代順序無關，且即使元素本身含分隔符也不會與另一集合碰撞（舊版只加
+// 集合尺寸前綴＋NUL 分隔，元素含 NUL 時 "a\0b","c" 與 "a","b\0c" 會撞）。
+// 格式："<size>|" + 依序 "<len>:<element>" 直接串接；解析唯一。
+internal fun candidateFingerprintFor(candidate: Set<String>): String =
+    "${candidate.size}|" + candidate.sorted().joinToString("") { "${it.length}:${it}" }
+
+// R03 (PR #74) Phase 2：source-agnostic 候選新鮮度檢查。binding 只帶指紋，
+// live 候選由「真正知道來源」的呼叫端傳入：
+// - MainActivity proceed：vm.writeCandidateForWarning()（Main 選取映射）
+// - PolicyActivity.performWritePolicy：sanitizeHookPolicy(HashSet(ticks))（Editor）
+// null 指紋＝legacy／clear 路徑，跳過檢查（保既有跳過語義）。
+internal fun isWarningCandidateFresh(
+    binding: PolicyWarningBinding,
+    liveCandidate: Set<String>,
+): Boolean = binding.candidateFingerprint == null ||
+    candidateFingerprintFor(liveCandidate) == binding.candidateFingerprint
 
 internal fun isWarningBindingFreshPure(
     currentRev: Long,

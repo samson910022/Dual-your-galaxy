@@ -6,6 +6,17 @@
 // - blindClear rev推進重arm＋armedRev==-1旁路
 // - legacy豁免（null綁定＋baseFreshGen==-1）
 // - delta接線（空集/安裝空/Editor指引/clear作廢disarm＋BUSY優先/coordinator失配/reset作廢）
+//
+// R03 (PR #74) Phase 2 架構：候選指紋的新鮮度檢查已從 VM.isWarningBindingFresh
+// 移到持有 live 候選的呼叫端（MainActivity: writeCandidateForWarning()，
+// PolicyActivity: sanitizeHookPolicy(ticks)），經 source-agnostic 純函式
+// isWarningCandidateFresh 完成；VM 只保留 rev/draftVersion/freshGen/coordinator。
+//
+// DEVICE-UNVERIFIED（無 emulator 可用）：`pendingClearConfirm` 的 UI 凍結
+// （probe／警告對話框存活期禁用勾選／再次點擊）只存在於 Activity，JVM 單元測試
+// 無法覆蓋，故本檔不新增任何無法本地執行的 instrumentation 測試。此旗標是主要
+// 競態守衛；isWarningCandidateFresh 是 defense-in-depth，其 JVM 覆蓋見 7a/7b/7c2
+// 與下方 editorWrite_nonNullFingerprintFromTicks 測。
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope
@@ -39,6 +50,8 @@ class PolicyPhaseCRequiredTest {
         val saveCalls = AtomicInteger(0)
         val clearCalls = AtomicInteger(0)
         val loadCalls = AtomicInteger(0)
+        // R03 測試用：記錄每一次實際寫入的內容，便於證明「變異後候選零寫入」。
+        val saves = CopyOnWriteArrayList<Set<String>>()
         val store: HookPolicyStore = HookPolicyStore(
             loadRaw = {
                 loadCalls.incrementAndGet()
@@ -52,9 +65,11 @@ class PolicyPhaseCRequiredTest {
                 if (raw == null) {
                     clearCalls.incrementAndGet()
                     saved = emptySet()
+                    saves.add(emptySet())
                     true
                 } else {
                     saved = raw
+                    saves.add(HashSet(raw))
                     true
                 }
             },
@@ -137,6 +152,12 @@ class PolicyPhaseCRequiredTest {
         (f.get(vm) as AtomicBoolean).set(stale)
     }
 
+    // R03：建立來源清單並勾選指定包名（appKey 形式 "0:<pkg>"）。
+    private fun seedSelection(vm: DualViewModel, catalog: List<String>, selected: Set<String>) {
+        vm.setSourceCatalog(catalog.map { SourceAppEntry(it, it, 0, false) })
+        for (pkg in selected) vm.setSelected("0:$pkg", true)
+    }
+
     private fun isBlindClearArmed(vm: DualViewModel): Boolean {
         return try {
             val m = DualViewModel::class.java.getDeclaredMethod("isBlindClearArmed").apply { isAccessible = true }
@@ -194,24 +215,78 @@ class PolicyPhaseCRequiredTest {
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
 
-    // 2b. Known漂移不abort靠fence：權威重讀Known內容漂移仍放行（不以內容比對作廢）。
+    // 2b. R04：Known 漂移也必須 fail-closed（不再只靠 coordinator fence）。
+    // 提交前權威重讀得到 Known 但內容 ≠ 警告時的 old 快照 → 中止、零 save、
+    // 草稿不被覆寫（否則使用者未曾被告知的包會被整包移除）。
     @Test
-    fun confirmReread_knownDrift_doesNotAbortReliesOnFence() {
-        val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
-        // 無coordinator：本地fence不變，僅後端內容漂移。
+    fun confirmReread_knownDrift_abortsWithoutOverwrite() {
+        val warnedOld = setOf("com.a.app", "com.b.app")
+        val fake = FakePolicyStore(initialDraft = warnedOld)
+        // 無 coordinator：本地 fence 不變，仅後端內容漂移（fence 看不到）。
         val vm = makeVm(fake.store, policyIoTimeoutMs = 500L, coordinator = null)
-        val binding = vm.currentWarningBinding()
+        val binding = vm.currentWarningBinding().withWarning(warnedOld, null)
         vm.replacePolicyDraft(setOf("com.b.app"), binding)
         val pending = vm.state.value.pendingPolicyWrite
         assertNotNull(pending)
-        // 提交前遠端漂移為另一Known（非Unknown），重讀不得abort。
+        assertEquals(warnedOld, pending!!.baseWarnedOld)
+        // 提交前遠端漂移為另一 Known（非 Unknown）。
         fake.saved = setOf("com.x.app")
-        vm.confirmPolicyWrite(pending!!, pending.generation)
+        vm.confirmPolicyWrite(pending, pending.generation)
         await { vm.state.value.pendingPolicyWrite == null }
-        // 放行：確實寫入候選（fence未失配即不攔）。
-        assertEquals(1, fake.saveCalls.get())
-        assertTrue(vm.state.value.policyDraftKnown)
-        assertEquals(setOf("com.b.app"), vm.state.value.policyDraft)
+        // 拒絕：零 save、草稿維持警告所依據的舊值、UNKNOWN_REFRESH/CHANNEL。
+        assertEquals(0, fake.saveCalls.get())
+        assertFalse(vm.state.value.policyDraftKnown)
+        assertEquals(warnedOld, vm.state.value.policyDraft)
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
+    // 2b-2. R04 跨流程（直接外部寫入）：在 A 的警告與確認之間，另一進程直接
+    // 對同一後端 `store.save(setOf("com.z.app"))`——不建立第二個 VM、不觸碰任何
+    // VM Generation。此測【不可能】經既有的 baseFreshGen／coordinator fence 通過：
+    // 那兩個 fence 只讀 VM 自己的 policyFreshnessGen 與 observed rev，外部 store
+    // 寫入完全不推進它們（舊版「建立 vmB」會推進檔案層級 policyFreshnessGen，
+    // 讓 vmA 在 baseFreshGen fence 就 abort，形成假陽性，從未走到新的 Known
+    // 內容比對）。維持單一 VM 後，唯一能抓到漂移的是 confirm pre-IO 的
+    // baseWarnedOld 內容比對（R04）。
+    @Test
+    fun confirmReread_externalKnownDrift_abortsWithoutOverwrite() {
+        val warnedOld = setOf("com.a.app", "com.b.app")
+        val saveCalls = AtomicInteger(0)
+        val backend = AtomicReference<Set<String>?>(warnedOld)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                saveCalls.incrementAndGet()
+                backend.set(raw ?: emptySet())
+                true
+            },
+        )
+        // 單一 VM：警告→確認之間所有 VM 世代（baseFreshGen/observed rev）不變。
+        val vmA = makeVm(store, initialDraft = warnedOld, coordinator = null, policyIoTimeoutMs = 500L)
+        val bindingA = vmA.currentWarningBinding().withWarning(warnedOld, null)
+        vmA.replacePolicyDraft(setOf("com.b.app"), bindingA)
+        val pendingA = vmA.state.value.pendingPolicyWrite
+        assertNotNull(pendingA)
+        assertEquals(warnedOld, pendingA!!.baseWarnedOld)
+
+        // 直接外部寫入（跨流程等價）：不經任何 VM，故 A 的 fence 完全看不到。
+        store.save(setOf("com.z.app"))
+        assertEquals(setOf("com.z.app"), backend.get())
+        val savesBefore = saveCalls.get()
+
+        vmA.confirmPolicyWrite(pendingA, pendingA.generation)
+        await { vmA.state.value.pendingPolicyWrite == null }
+        // A 的 confirm 不得再寫入：計數不變、後端仍是外部寫入的值、草稿仍為
+        // 警告所依據的 warnedOld，且以 UNKNOWN_REFRESH/CHANNEL 告知。
+        assertEquals("confirm must not save after external known drift", savesBefore, saveCalls.get())
+        assertEquals(setOf("com.z.app"), backend.get())
+        assertEquals(warnedOld, vmA.state.value.policyDraft)
+        assertFalse(vmA.state.value.policyDraftKnown)
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vmA.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vmA.state.value.msgKind)
+        assertEquals(PolicyWritePhase.IDLE, vmA.state.value.policyWritePhase)
     }
 
     // 3. 跨屏雙VM：共用FakePolicyStore+PolicyTxCoordinator，A綁定後B寫入推進，A舊綁定replace/request/clear皆作廢。
@@ -594,5 +669,206 @@ class PolicyPhaseCRequiredTest {
         assertFalse(isWarningBindingFreshPure(2L, 2L, 3L, b))
         assertFalse(isWarningBindingFreshPure(1L, 9L, 3L, b))
         assertFalse(isWarningBindingFreshPure(1L, 2L, 9L, b))
+    }
+
+    // ===== R03 (PR #74)：警告候選凍結＋漂移作廢 =====
+
+    // 7a. 警告時凍結候選 → 勾選變更（只動 selectedKeys/selectionGen）→
+    // isWarningCandidateFresh 必須失配作廢（原本錯誤地回 true）。
+    // Phase 2：候選檢查已從 VM.isWarningBindingFresh 移到持有 live 候選的
+    // Activity／純 helper；世代三元組檢查仍留在 VM，故漂移後 isWarningBindingFresh
+    // 依然為 true（選取變更不推進任何版本），只有 source-agnostic helper 抓到漂移。
+    @Test
+    fun warningBinding_candidateDrift_voidsFreshness() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app", "com.c.app"))
+        val vm = makeVm(fake.store)
+        seedSelection(vm, listOf("com.a.app", "com.b.app", "com.c.app"), setOf("com.a.app", "com.b.app"))
+        val candidate = vm.writeCandidateForWarning()
+        assertEquals(setOf("com.a.app", "com.b.app"), candidate)
+        val binding = vm.currentWarningBinding().withWarning(setOf("com.a.app", "com.b.app", "com.c.app"), candidate)
+        assertTrue(vm.isWarningBindingFresh(binding))
+        assertTrue(isWarningCandidateFresh(binding, candidate))
+        // probe／對話框期間改勾選：只改 selectedKeys／selectionGen。
+        vm.setSelected("0:com.c.app", true)
+        vm.setSelected("0:com.a.app", false)
+        assertEquals(setOf("com.b.app", "com.c.app"), vm.writeCandidateForWarning())
+        // 世代不變 → VM 綁定新鮮度仍 true；但 Main live 候選已漂移 → helper false。
+        assertTrue(vm.isWarningBindingFresh(binding))
+        assertFalse(isWarningCandidateFresh(binding, vm.writeCandidateForWarning()))
+    }
+
+    // 7b. 凍結寫入：即使當下勾選（live candidate）已不同，Main 入口仍寫警告前
+    // 凍結的集合，且變異後的集合零寫入。Phase 2：指紋漂移的拒絕點已由
+    // VM.isWarningBindingFresh 移到 MainActivity.proceed 的
+    // isWarningCandidateFresh(live=writeCandidateForWarning())；JVM 無 Activity，
+    // 故於此直接斷言 helper 抓到漂移、且不呼叫 VM request（等價於 Activity 放棄
+    // proceed），再以無指紋綁定隔離「凍結集合本身」的語義。
+    @Test
+    fun frozenCandidate_mainEntry_writesFrozenSetOnly_afterLiveSelectionDrift() {
+        val warnedOld = setOf("com.a.app", "com.b.app", "com.c.app")
+        val frozen = setOf("com.a.app", "com.b.app")
+        val mutated = setOf("com.b.app", "com.c.app")
+        val fake = FakePolicyStore(initialDraft = warnedOld)
+        val vm = makeVm(fake.store)
+        // 警告前候選＝frozen；警告後 live selection 漂移為 mutated。
+        seedSelection(vm, listOf("com.a.app", "com.b.app", "com.c.app"), setOf("com.a.app", "com.b.app"))
+        val warnedBinding = vm.currentWarningBinding().withWarning(warnedOld, vm.writeCandidateForWarning())
+        assertTrue(vm.isWarningBindingFresh(warnedBinding))
+        assertTrue(isWarningCandidateFresh(warnedBinding, frozen))
+        vm.setSelected("0:com.c.app", true)
+        vm.setSelected("0:com.a.app", false)
+        assertEquals(mutated, vm.writeCandidateForWarning())
+
+        // 指紋綁定已因漂移作廢（Activity guard 會在此中止、零寫入）。
+        assertFalse(isWarningCandidateFresh(warnedBinding, vm.writeCandidateForWarning()))
+        // 直接走 Activity 用的共用訊息出口，鎖住 UNKNOWN_REFRESH/CHANNEL＋零寫入。
+        vm.rejectStaleWarningBinding()
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(0, fake.saveCalls.get())
+
+        // 無指紋綁定（clear/legacy 相容路徑）：仍需寫「凍結集合」而非 live candidate。
+        val legacyBinding = vm.currentWarningBinding().withWarning(warnedOld, null)
+        vm.requestPolicyWriteForWarning(frozen, legacyBinding)
+        val pending = vm.state.value.pendingPolicyWrite
+        assertNotNull(pending)
+        assertEquals(frozen, pending!!.packages)
+        assertEquals(warnedOld, pending.baseWarnedOld)
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(1, fake.saveCalls.get())
+        assertEquals(frozen, fake.saved)
+        assertTrue(fake.saves.none { it == mutated })
+    }
+
+    // 7c. Main／Editor 兩入口等價：兩者都接受明確集合，不從 live selectedKeys
+    // 重導；pending 內容與 baseWarnedOld 一致。confirm 寫入分別由 7b/7c2
+    // 單 VM 測試覆蓋（policyDraftVersion/freshGen 為檔案層級全局，雙 VM 同時
+    // confirm 會互相踩到彼此的 baseFreshGen fence，與本修復無關）。
+    @Test
+    fun mainAndEditorEntryPoints_bothFreezeCandidateIntoPending() {
+        val warnedOld = setOf("com.a.app", "com.b.app", "com.c.app")
+        val frozen = setOf("com.a.app", "com.b.app")
+        val mutated = setOf("com.b.app", "com.c.app")
+
+        // Main seam：live selection 為 mutated，但傳入 frozen。
+        val fakeMain = FakePolicyStore(initialDraft = warnedOld)
+        val vmMain = makeVm(fakeMain.store)
+        // Editor seam（對應 performWritePolicy → replacePolicyDraft(frozen, binding)）。
+        val fakeEditor = FakePolicyStore(initialDraft = warnedOld)
+        val vmEditor = makeVm(fakeEditor.store)
+        // policyDraftVersion / policyFreshnessGen 是檔案層級全局，兩 VM 必須
+        // 都建立／收斂後再排隊，否則先排隊者會被後建立 VM 的刷新踩到 baseFreshGen。
+        seedSelection(vmMain, listOf("com.a.app", "com.b.app", "com.c.app"), mutated)
+        seedSelection(vmEditor, listOf("com.a.app", "com.b.app", "com.c.app"), mutated)
+        // Deterministic convergence instead of a fixed sleep.
+        await { vmMain.writeCandidateForWarning() == mutated && vmEditor.writeCandidateForWarning() == mutated }
+        assertEquals(mutated, vmMain.writeCandidateForWarning())
+
+        val mainBinding = vmMain.currentWarningBinding().withWarning(warnedOld, null)
+        vmMain.requestPolicyWriteForWarning(frozen, mainBinding)
+        val mainPending = vmMain.state.value.pendingPolicyWrite
+        assertNotNull(mainPending)
+        val editorBinding = vmEditor.currentWarningBinding().withWarning(warnedOld, null)
+        vmEditor.replacePolicyDraft(frozen, editorBinding)
+        val editorPending = vmEditor.state.value.pendingPolicyWrite
+        assertNotNull(editorPending)
+
+        // 兩入口等價：集合與警告 old 快照一致，皆非 live mutated 集合。
+        assertEquals(mainPending!!.packages, editorPending!!.packages)
+        assertEquals(frozen, mainPending.packages)
+        assertEquals(warnedOld, mainPending.baseWarnedOld)
+        assertEquals(warnedOld, editorPending.baseWarnedOld)
+        assertTrue(frozen != mutated)
+        // 兩者 pending 皆未寫 store（confirm 才寫）。
+        assertEquals(0, fakeMain.saveCalls.get())
+        assertEquals(0, fakeEditor.saveCalls.get())
+    }
+
+    // 7c2. Editor seam（performWritePolicy → replacePolicyDraft(frozen, binding)）：
+    // 即使 Main 的 live selectedKeys 指向別的集合，Editor 的綁定指紋仍來自
+    // 自己的凍結候選（frozen），confirm 必須寫 frozen、永不寫 mutated。
+    // binding 用【非 null】真實指紋（舊版會在 VM 內拿 Main candidate 重算而
+    // 誤殺此路徑），此測同時鎖住 Phase 2 的 source-agnostic helper 語義。
+    @Test
+    fun frozenCandidate_editorEntry_writesFrozenSetOnly_afterLiveSelectionDrift() {
+        val warnedOld = setOf("com.a.app", "com.b.app", "com.c.app")
+        val frozen = setOf("com.a.app", "com.b.app")
+        val mutated = setOf("com.b.app", "com.c.app")
+        val fake = FakePolicyStore(initialDraft = warnedOld)
+        val vm = makeVm(fake.store)
+        seedSelection(vm, listOf("com.a.app", "com.b.app", "com.c.app"), mutated)
+        await { vm.writeCandidateForWarning() == mutated }
+        val binding = vm.currentWarningBinding().withWarning(warnedOld, frozen)
+        assertNotNull(binding.candidateFingerprint)
+        assertTrue(isWarningCandidateFresh(binding, frozen))
+        assertFalse(isWarningCandidateFresh(binding, mutated))
+        // 真實 Editor 路徑：binding 指紋與 VM 的 Main candidate 不同，仍須建 pending。
+        vm.replacePolicyDraft(frozen, binding)
+        val pending = vm.state.value.pendingPolicyWrite
+        assertNotNull(pending)
+        assertEquals(frozen, pending!!.packages)
+        assertEquals(warnedOld, pending.baseWarnedOld)
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals("msg=${vm.state.value.msg}", 1, fake.saveCalls.get())
+        assertEquals(frozen, fake.saved)
+        assertTrue(fake.saves.none { it == mutated })
+        assertTrue(fake.saves.none { it == vm.writeCandidateForWarning() })
+    }
+
+    // 7c3. CRITICAL REGRESSION（Phase 2）：真實 Editor 路徑——binding 攜【非 null】
+    // 且來自 Editor ticks 的指紋，而 ticks != vm.writeCandidateForWarning()（VM 只看
+    // Main 的 selectedKeys，此測刻意留空）。舊版在 VM.isWarningBindingFresh 內重算
+    // Main candidate，必失配 → UNKNOWN_REFRESH → 無 pending、無 save；故此測在
+    // pre-fix 程式碼必失敗。修復後：(a) pending 安裝、(b) confirm 寫 frozen 集合、
+    // (c) helper 對 ticks 為 true、對 changedTicks 為 false。
+    @Test
+    fun editorWrite_nonNullFingerprintFromTicks_installsPendingAndWritesFrozen() {
+        val warnedOld = setOf("com.a.app", "com.b.app", "com.c.app")
+        val ticks = setOf("com.a.app", "com.b.app") // Editor-local 凍結候選
+        val changedTicks = setOf("com.b.app", "com.c.app")
+        val fake = FakePolicyStore(initialDraft = warnedOld)
+        val vm = makeVm(fake.store, initialDraft = warnedOld)
+        // Main candidate 刻意與 Editor ticks 不同（未 seed 任何 selection）。
+        assertTrue(vm.writeCandidateForWarning().isEmpty())
+        assertTrue(ticks != vm.writeCandidateForWarning())
+
+        val binding = vm.currentWarningBinding().withWarning(warnedOld, ticks)
+        assertNotNull(binding.candidateFingerprint)
+        // (c) source-agnostic helper：只認傳入的 live 候選，不碰 VM 的 Main candidate。
+        assertTrue(isWarningCandidateFresh(binding, ticks))
+        assertFalse(isWarningCandidateFresh(binding, changedTicks))
+
+        // (a) 真實 Editor seam：即使 Main candidate 不同，仍須安裝 pending。
+        vm.replacePolicyDraft(HashSet(ticks), binding)
+        val pending = vm.state.value.pendingPolicyWrite
+        assertNotNull(pending)
+        assertEquals(ticks, pending!!.packages)
+        assertEquals(warnedOld, pending.baseWarnedOld)
+
+        // (b) confirm 寫入凍結集合；changedTicks／Main candidate 永不寫入。
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals("msg=${vm.state.value.msg}", 1, fake.saveCalls.get())
+        assertEquals(ticks, fake.saved)
+        assertTrue(fake.saves.none { it == changedTicks })
+        assertTrue(fake.saves.none { it == vm.writeCandidateForWarning() })
+    }
+
+    // 7d. 純函數：指紋確定性（與迭代順序無關、不同集合不同指紋）。
+    @Test
+    fun pure_candidateFingerprintFor_isDeterministic() {
+        val a = candidateFingerprintFor(setOf("com.a.app", "com.b.app"))
+        val b = candidateFingerprintFor(setOf("com.b.app", "com.a.app"))
+        assertEquals(a, b)
+        assertFalse(a == candidateFingerprintFor(setOf("com.b.app", "com.c.app")))
+        assertFalse(a == candidateFingerprintFor(setOf("com.a.app")))
+        // 每元素長度前綴：舊版「size + NUL」會撞的兩組，現在必須不同。
+        val nulA = candidateFingerprintFor(setOf("a\u0000b", "c"))
+        val nulB = candidateFingerprintFor(setOf("a", "b\u0000c"))
+        assertFalse(nulA == nulB)
+        assertTrue(nulA.contains("3:a"))
     }
 }

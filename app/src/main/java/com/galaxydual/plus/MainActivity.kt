@@ -1023,8 +1023,13 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             contentDescription = getString(R.string.write_policy_cd)
             // Phase C：寫入前先算 old-minus-candidate delta，對 installed user95 彈警告；
-            // proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢。
-            setOnClickListener { requestPreWriteWarning(proceed = { binding -> vm.requestPolicyWrite(binding) }) }
+            // R03：proceed 攜「綁定＋警告前凍結候選」進 VM，寫入凍結集合而非
+            // 從當下勾選重導；候選漂移／綁定失配皆作廢。
+            setOnClickListener {
+                requestPreWriteWarning(
+                    proceed = { binding, frozen -> vm.requestPolicyWriteForWarning(frozen, binding) },
+                )
+            }
         }
         clearPolicyBtn = Button(this).apply {
             text = getString(R.string.action_clear_policy_draft)
@@ -1038,8 +1043,13 @@ class MainActivity : ComponentActivity() {
             // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
             // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
-            // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM。
-            setOnClickListener { requestPreClearWarning(proceed = { binding -> vm.onClearPolicyButtonTap(binding) }) }
+            // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM
+            // （第二參數為凍結候選，clear 路徑固定空集，VM 清除入口忽略它）。
+            setOnClickListener {
+                requestPreClearWarning(
+                    proceed = { binding, _ -> vm.onClearPolicyButtonTap(binding) },
+                )
+            }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -3038,8 +3048,10 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
+        // R03：probe／警告對話框在途（pendingClearConfirm）時亦視為 busy，
+        // 勾選／選取控制項全數凍結，避免已警告候選與實際寫入集合漂移。
         // renderClonedApps 的移除鈕與稍後按鈕/dialog 共用此 blockKey，不重算。
-        val busy = s.loading
+        val busy = s.loading || pendingClearConfirm
         // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
         // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
         val blockKey = if (busy) null else writeBlockReason(s)
@@ -3491,10 +3503,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (::writePolicyBtn.isInitialized) {
-                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                // R03：probe／警告對話框在途時連入口也鎖住（除了 phaseIsIdle）。
+                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE && !pendingClearConfirm
             }
             if (::clearPolicyBtn.isInitialized) {
-                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE && !pendingClearConfirm
                 // Stage L4 fix(a) 修復模式標籤：Corrupt 下重貼 repair 文案＋CD，
                 // 使 TalkBack 可感知「修復（兩步確認）」而非「清除」；msg 播報仍走
                 // VM 的 CORRUPT_DETECTED / REPAIR_FIRST 資源文案。非 Corrupt 回原
@@ -5169,7 +5182,8 @@ class MainActivity : ComponentActivity() {
     // 按鈕文字/勾選啟用狀態每輪都更新（busy 時勾選區不可改，見 render）。
     private fun renderSourceList(s: UiState) {
         val visible = sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
-        val busy = s.loading
+        // R03：probe／警告對話框在途時勾選不可改（指紋未變分支亦每輪同步 enabled）。
+        val busy = s.loading || pendingClearConfirm
         // PR-37 Phase C #6 a11y：文字與 contentDescription 每輪隨 state 同步
         //（按鈕類型不變，最小改動；開關語義靠文案「顯示中/已隱藏＋點兩下切換」傳達）。
         systemToggleBtn.text = if (s.includeSystemApps) {
@@ -5915,8 +5929,32 @@ class MainActivity : ComponentActivity() {
     // 跨屏仍各私有（Main/Editor 各自持有），但警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
+    // R03：旗標翻轉時立即重渲染，讓勾選／選取控制項在 probe 啟動前就禁用；
+    // 取消／完成／例外路徑同樣立刻恢復。render 在測試路徑（未 buildUi）可能
+    // 失敗，best-effort 不影響警告流程本身。
+    private fun setPendingClearConfirm(value: Boolean) {
+        pendingClearConfirm = value
+        try {
+            render(vm.state.value)
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // R03 (PR #74) Phase 2：Main proceed 的候選新鮮度防禦檢查。
+    // pendingClearConfirm（probe／對話框存活期凍結操作）是主要守衛；此檢查是
+    // defense-in-depth——在真正持有 Main live 候選處重算 writeCandidateForWarning()
+    // 並與警告時凍結的指紋比對。VM 的 isWarningBindingFresh 刻意不解指紋來源，
+    // 故不可在那裡重算（Editor 的 ticks 永遠不等於 Main 的 selectedKeys）。
+    // 失配即走 VM 單一訊息出口 emit UNKNOWN_REFRESH，回 false → 零 store 寫入。
+    private fun mainWarningCandidateFresh(binding: PolicyWarningBinding): Boolean {
+        if (isWarningCandidateFresh(binding, vm.writeCandidateForWarning())) return true
+        vm.rejectStaleWarningBinding()
+        return false
+    }
+
     private fun requestPreClearWarning(
-        proceed: (PolicyWarningBinding) -> Unit,
+        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
         // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
@@ -5925,33 +5963,35 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
         }
-        val binding = snap.binding
+        // R03：清除路徑沒有候選漂移問題（候選固定空集），只把 warnedOld 凍結
+        // 進綁定供 VM 使用；candidateFingerprint 保持 null（無候選檢查）。
+        val warnedBinding = snap.binding.withWarning(snap.draft, null)
         // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
         // stale 非空不得當授權依據；即使 stale 為空亦不可信（重讀前不得放行）。
         if (!snap.known) {
             if (pendingClearConfirm) return
-            pendingClearConfirm = true
+            setPendingClearConfirm(true)
             showPreClearProbeFailedWarning(
                 this@MainActivity,
-                onProceed = { pendingClearConfirm = false; proceed(binding) },
-                onCancel = { pendingClearConfirm = false; onCancel() },
+                onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                onCancel = { setPendingClearConfirm(false); onCancel() },
             )
             return
         }
         val old = snap.draft
         // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
         if (old.isEmpty()) {
-            proceed(binding)
+            proceed(warnedBinding, emptySet())
             return
         }
         // Phase C：清除 delta=old 全量（候選空集）。
         val delta = policyRemovalDelta(old, emptySet())
         if (delta.isEmpty()) {
-            proceed(binding)
+            proceed(warnedBinding, emptySet())
             return
         }
         if (pendingClearConfirm) return
-        pendingClearConfirm = true
+        setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：probe 回傳 DualProbeResult（Ok/Failed），不再以空清單吞失敗。
             // 僅 Ok(empty) 直接放行；Ok(non-empty) 走雙開提醒；Failed 一律走
@@ -5963,36 +6003,36 @@ class MainActivity : ComponentActivity() {
             val probe = try {
                 probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 throw e
             } catch (e: Exception) {
                 preClearLog("pre-clear dual-profile probe failed", e)
                 DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 return@launch
             }
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
                         this@MainActivity,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
                     if (!shouldWarnForDelta(probe.installed)) {
-                        pendingClearConfirm = false
-                        proceed(binding)
+                        setPendingClearConfirm(false)
+                        proceed(warnedBinding, emptySet())
                         return@launch
                     }
                     showPreClearWarning(
                         this@MainActivity,
                         probe.installed,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                         resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
                         userId = verifiedUid,
                         rootUninstallAllowed = verifiedUid != null,
@@ -6006,9 +6046,10 @@ class MainActivity : ComponentActivity() {
     // old=已保存草稿（Known 才權威），candidate=當下勾選映射；delta=old-candidate
     // 為被移除包；僅對 delta 探測 verified target installed，installed 非空即警告。
     // Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
-    // proceed 攜綁定進 VM（vm.requestPolicyWrite(binding)），提交前比對失配作廢。
+    // R03：proceed 攜「綁定＋probe 前凍結候選」進 VM（vm.requestPolicyWriteForWarning），
+    // 不再於 proceed 時重導當下勾選；候選漂移／綁定失配皆作廢要求重探。
     private fun requestPreWriteWarning(
-        proceed: (PolicyWarningBinding) -> Unit,
+        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
         val snap: PolicyWarningSnapshot = try {
@@ -6016,72 +6057,82 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
         }
-        val binding = snap.binding
-        if (!snap.known) {
-            if (pendingClearConfirm) return
-            pendingClearConfirm = true
-            showPreClearProbeFailedWarning(
-                this@MainActivity,
-                onProceed = { pendingClearConfirm = false; proceed(binding) },
-                onCancel = { pendingClearConfirm = false; onCancel() },
-            )
-            return
-        }
         val old = snap.draft
+        // R03：警告前凍結候選（probe／對話框期間不得再變）。
         val candidate: Set<String> = try {
             vm.writeCandidateForWarning()
         } catch (_: Exception) {
             emptySet()
         }
+        val warnedBinding = snap.binding.withWarning(old, candidate)
+        if (!snap.known) {
+            if (pendingClearConfirm) return
+            setPendingClearConfirm(true)
+            showPreClearProbeFailedWarning(
+                this@MainActivity,
+                onProceed = {
+                    setPendingClearConfirm(false)
+                    if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                },
+                onCancel = { setPendingClearConfirm(false); onCancel() },
+            )
+            return
+        }
         // 空候選（空勾選／空 catalog／映射全捨）交由 VM 門控（EMPTY_SELECTION／
         // CATALOG_LOADING／CATALOG_MISSING），此處不警告直接進 VM。
         if (candidate.isEmpty()) {
-            proceed(binding)
+            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
             return
         }
         val delta = policyRemovalDelta(old, candidate)
         if (delta.isEmpty()) {
-            proceed(binding)
+            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
             return
         }
         if (pendingClearConfirm) return
-        pendingClearConfirm = true
+        setPendingClearConfirm(true)
         lifecycleScope.launch {
             // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
             val verifiedUid = resolvePreClearDualUserId(vm.state.value)
             val probe = try {
                 probeDualApps(delta, verifiedUid)
             } catch (e: CancellationException) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 throw e
             } catch (e: Exception) {
                 preClearLog("pre-clear dual-profile probe failed", e)
                 DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
-                pendingClearConfirm = false
+                setPendingClearConfirm(false)
                 return@launch
             }
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
                         this@MainActivity,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = {
+                            setPendingClearConfirm(false)
+                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
                     if (!shouldWarnForDelta(probe.installed)) {
-                        pendingClearConfirm = false
-                        proceed(binding)
+                        setPendingClearConfirm(false)
+                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
                         return@launch
                     }
                     showPreClearWarning(
                         this@MainActivity,
                         probe.installed,
-                        onProceed = { pendingClearConfirm = false; proceed(binding) },
-                        onCancel = { pendingClearConfirm = false; onCancel() },
+                        onProceed = {
+                            setPendingClearConfirm(false)
+                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
                         resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
                         userId = verifiedUid,
                         rootUninstallAllowed = verifiedUid != null,
