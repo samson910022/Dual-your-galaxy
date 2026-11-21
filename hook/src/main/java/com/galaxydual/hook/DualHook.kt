@@ -67,35 +67,45 @@ internal data class BbcVersionedRead(
 
 // Seqlock-style snapshot: version-before -> defensive COPY of the package set
 // (never trust a live cross-process collection) -> version-after. The pair is
-// accepted ONLY when both version reads agree (both-absent == null agrees too).
-// Empty+version remains a Cleared candidate, empty+null stays Unknown, non-empty
-// is Good (version may be null for the legacy no-version draft). Never throws.
+// accepted ONLY when both probes agree AND neither is Invalid/Unavailable
+// (both-Absent == confirmed legacy absence). Empty+version remains a Cleared
+// candidate, empty+null stays Unknown, non-empty is Good (version may be null
+// for the legacy no-version draft). Never throws.
 internal fun readBbcVersionedPrefs(view: BbcVersionedPrefsView): BbcVersionedRead {
-    fun version(): Long? = try {
-        if (!view.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)) {
-            null
-        } else {
-            view.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L).takeIf { it >= 1L }
-        }
-    } catch (_: Throwable) {
-        null
-    }
-    var before: Long? = null
-    var after: Long? = null
+    // N03: adapt the view ONCE per probe to the shared framework-free model.
+    // A read failure / corrupt value is now a distinct outcome instead of
+    // collapsing to "absent" (which used to allow a legacy replay).
+    fun probe(): VersionProbeResult = probeVersion(object : VersionPrefsView {
+        override fun containsVersion(): Boolean =
+            view.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+
+        override fun readVersion(defValue: Long): Long =
+            view.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+    })
+    var before: VersionProbeResult = VersionProbeResult.Unavailable
+    var after: VersionProbeResult = VersionProbeResult.Unavailable
     return try {
-        before = version()
+        before = probe()
         val live = view.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, LinkedHashSet())
         // Defensive snapshot: a concurrent commit may mutate the live set while
         // we iterate; a CTE/CME here fails closed via the outer catch.
         val pkgs: Set<String> = if (live == null) emptySet() else LinkedHashSet(live)
-        after = version()
-        if (before != after) {
+        after = probe()
+        val failed = before is VersionProbeResult.Unavailable ||
+            before is VersionProbeResult.Invalid ||
+            after is VersionProbeResult.Unavailable ||
+            after is VersionProbeResult.Invalid ||
+            before != after
+        if (failed) {
             BbcVersionedRead(
                 null, null, failed = true,
-                versionBefore = before, versionAfter = after,
+                versionBefore = (before as? VersionProbeResult.Present)?.value,
+                versionAfter = (after as? VersionProbeResult.Present)?.value,
             )
         } else {
-            BbcVersionedRead(pkgs, before, failed = false)
+            // Both probes equal and neither failed => both Absent (version=null,
+            // confirmed legacy absence) or both Present(v).
+            BbcVersionedRead(pkgs, (before as? VersionProbeResult.Present)?.value, failed = false)
         }
     } catch (_: Throwable) {
         BbcVersionedRead(null, null, failed = true)

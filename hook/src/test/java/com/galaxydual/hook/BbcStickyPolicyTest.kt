@@ -40,6 +40,18 @@ class BbcStickyPolicyTest {
         return field.get(cache) as Long
     }
 
+    // N03: minimal seam for the new version-probe tests — build a view from
+    // injected lambdas. Existing anonymous view tests are left untouched.
+    private fun versionedView(
+        contains: () -> Boolean = { true },
+        getLong: (defValue: Long) -> Long = { it },
+        getStringSet: () -> MutableSet<String> = { mutableSetOf("A") },
+    ): BbcVersionedPrefsView = object : BbcVersionedPrefsView {
+        override fun contains(key: String): Boolean = contains()
+        override fun getLong(key: String, defValue: Long): Long = getLong(defValue)
+        override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String> = getStringSet()
+    }
+
     @Test
     fun successNonEmptyWithoutVersionIsGoodBbc() {
         // Old-draft backward compat: non-empty WITHOUT version proof stays
@@ -792,5 +804,121 @@ class BbcStickyPolicyTest {
             true
         })
         assertEquals(0, runtimeReads)
+    }
+
+    // --- N03: version-key read failure must NOT masquerade as absence ---
+
+    @Test
+    fun versionContainsThrowsBothProbesFailsClosedBbc() {
+        // contains() throwing is a failure (Unavailable), never "key absent":
+        // no legacy Good replay, no packages, Unknown on a fresh cache.
+        val read = readBbcVersionedPrefs(versionedView(
+            contains = { throw RuntimeException("contains dead") },
+        ))
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+        assertEquals(null, read.version)
+        val (cache, _) = bbcCacheAt(1_000L)
+        val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (result as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+    }
+
+    @Test
+    fun versionGetLongThrowsBothProbesFailsClosedBbc() {
+        // Key confirmed present but the value read throws: both probes fail.
+        val read = readBbcVersionedPrefs(versionedView(
+            getLong = { throw RuntimeException("binder dead") },
+        ))
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+        assertEquals(null, read.version)
+        val (cache, _) = bbcCacheAt(1_000L)
+        val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Unknown)
+    }
+
+    @Test
+    fun versionProbeThrowsOnSecondCallFailsClosedBbc() {
+        // Seqlock: first probe is Present(5), second fails — mismatch/failure on
+        // either read fails closed. Diagnostic fields retain the Present value.
+        var probeCalls = 0
+        val read = readBbcVersionedPrefs(versionedView(
+            getLong = {
+                probeCalls++
+                if (probeCalls == 1) 5L else throw RuntimeException("binder died mid-read")
+            },
+        ))
+        assertTrue(read.failed)
+        assertEquals(2, probeCalls)
+        assertEquals(null, read.packages)
+        assertEquals(5L, read.versionBefore)
+        assertEquals(null, read.versionAfter)
+    }
+
+    @Test
+    fun versionInvalidPresentValueFailsClosedBbc() {
+        // Present but < 1 is Invalid, NOT absent — fails closed even though
+        // both probes agree. Covers 0L and -1L; no version diagnostic emitted.
+        for (bad in listOf(0L, -1L)) {
+            val read = readBbcVersionedPrefs(versionedView(getLong = { bad }))
+            assertTrue(read.failed)
+            assertEquals(null, read.packages)
+            assertEquals(null, read.version)
+            assertEquals(null, read.versionBefore)
+            assertEquals(null, read.versionAfter)
+        }
+    }
+
+    @Test
+    fun versionProbeClassCastIsInvalidNotAbsentBbc() {
+        // The shared model's wrong-type arm: CCE is Invalid (corrupt), not
+        // Absent and not a generic Unavailable. Both readers/writers share it.
+        val probe = probeVersion(object : VersionPrefsView {
+            override fun containsVersion(): Boolean = true
+            override fun readVersion(defValue: Long): Long =
+                throw ClassCastException("version key held a String")
+        })
+        assertTrue(probe is VersionProbeResult.Invalid)
+        val read = readBbcVersionedPrefs(versionedView(
+            getLong = { throw ClassCastException("version key held a String") },
+        ))
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+    }
+
+    @Test
+    fun versionProbeFailureOnPrepopulatedCacheStaysStickyBbc() {
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        cache.invalidate()
+        // Version probe throws while the package read still returns {B}: the
+        // seqlock must drop those packages (null) and keep the sticky {A}.
+        val read = readBbcVersionedPrefs(versionedView(
+            contains = { throw RuntimeException("contains dead") },
+            getStringSet = { mutableSetOf("B") },
+        ))
+        assertTrue(read.failed)
+        assertEquals(null, read.packages)
+        val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A"), (result as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+    }
+
+    @Test
+    fun versionConfirmedAbsentStillLegacyGoodBbc() {
+        // Control: contains=false on BOTH probes is a genuine absence — the
+        // legacy no-version {A} draft stays Good and is not failed closed.
+        val read = readBbcVersionedPrefs(versionedView(
+            contains = { false },
+            getStringSet = { mutableSetOf("A") },
+        ))
+        assertFalse(read.failed)
+        assertEquals(setOf("A"), read.packages)
+        assertEquals(null, read.version)
+        val (cache, _) = bbcCacheAt(1_000L)
+        val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (result as EffectivePolicyCache.BbcPolicy.Good).packages)
     }
 }
