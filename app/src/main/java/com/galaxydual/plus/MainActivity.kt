@@ -304,6 +304,9 @@ class MainActivity : ComponentActivity() {
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
+    // PR #74 R2 N05：BBC 開關的單一 latest-intent actor。對話框重建時先 dispose
+    // 舊實例，Activity.onDestroy 再 dispose 最後一個，避免孤兒 consumer 持有舊 View。
+    private var bbcToggleController: BbcInjectionToggleController? = null
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 避免舊 Activity 的 window 洩漏；與既有 export/settings dialog 同一生命周期語義）。
     private val destructiveDialogHandles = DestructiveDialogHandles()
@@ -642,6 +645,10 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
+        // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
+        // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
+        bbcToggleController?.dispose()
+        bbcToggleController = null
         // PR-74 A3：破壞性路徑的三個對話框 handle 逐一 best-effort dismiss + null
         // （單一 handle 失敗不阻斷後續；dismissDialogHandle 為 JVM 可測純函式）。
         destructiveDialogHandles.preClearWarning =
@@ -2364,6 +2371,8 @@ class MainActivity : ComponentActivity() {
     // honestly that this may need a hook-process restart or a reboot and is NOT
     // a guard against Samsung's cold-start deletion (issue #75).
     private fun buildBbcInjectionToggle(): View {
+        // A fresh dialog rebuild replaces (and disposes) the previous actor.
+        bbcToggleController?.dispose()
         val toggle = CheckBox(this).apply {
             text = getString(R.string.settings_bbc_injection_label)
             // Read at dialog open; best-effort (store defaults true on any failure).
@@ -2371,25 +2380,40 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             setCompoundDrawablePadding(dp(8))
         }
+        val initialChecked = toggle.isChecked
         val summary = TextView(this).apply {
             text = getString(R.string.settings_bbc_injection_summary)
         }
-        // Last value the store actually accepted. On a failed commit the hook
-        // still injects with the old value, so leaving the CheckBox toggled
-        // would be a lie; restore it (guarded against re-entering the listener).
-        var lastGood = toggle.isChecked
+        // PR #74 R2 N05：單一 actor 接管 lastGood 與 generation；連點不再各起
+        // 一條 IO coroutine。restoring 守衛仍必要：controller 的 onRestored 會在
+        // Main 設定 isChecked，不可再觸發一次 onToggle。
         var restoring = false
+        bbcToggleController = BbcInjectionToggleController(
+            scope = lifecycleScope,
+            store = { enabled ->
+                withContext(Dispatchers.IO) {
+                    bbcPolicyStore().setBbcInjectionEnabled(enabled)
+                }
+            },
+            initialValue = initialChecked,
+            onRestored = { lastGood ->
+                restoring = true
+                toggle.isChecked = lastGood
+                restoring = false
+            },
+            onFailed = {
+                if (!isFinishing && !isDestroyed) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        R.string.settings_bbc_injection_write_failed,
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
+        )
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
-            writeBbcInjectionPreference(
-                enabled = checked,
-                onSuccess = { lastGood = checked },
-                onFailure = {
-                    restoring = true
-                    toggle.isChecked = lastGood
-                    restoring = false
-                },
-            )
+            bbcToggleController?.onToggle(checked)
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2403,34 +2427,6 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ))
-        }
-    }
-
-    // Keep the prefs commit off the main thread (it can hit the LSPosed binder).
-    // lifecycleScope resumes on Main, so onFailure() may restore the CheckBox
-    // directly. A failed write is best-effort: report it AND roll the UI back
-    // to the last value the store accepted (retry by toggling again).
-    private fun writeBbcInjectionPreference(
-        enabled: Boolean,
-        onSuccess: () -> Unit,
-        onFailure: () -> Unit,
-    ) {
-        lifecycleScope.launch {
-            val ok = withContext(Dispatchers.IO) {
-                bbcPolicyStore().setBbcInjectionEnabled(enabled)
-            }
-            if (ok) {
-                onSuccess()
-            } else {
-                onFailure()
-                if (!isFinishing && !isDestroyed) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        R.string.settings_bbc_injection_write_failed,
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-            }
         }
     }
 
